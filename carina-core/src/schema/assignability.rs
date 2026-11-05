@@ -177,7 +177,11 @@ fn identity_leaf<R: PatternForm>(kind: &AttrTypeKind<R>) -> Option<IdentityLeaf<
             ordered: _,
             constraints: _,
         }
-        | AttrTypeKind::Map { key: _, value: _ }
+        | AttrTypeKind::Map {
+            key: _,
+            value: _,
+            constraints: _,
+        }
         | AttrTypeKind::Struct {
             name: _,
             fields: _,
@@ -252,6 +256,7 @@ impl<'a, R: PatternForm> AssignmentSink<'a, R> {
             | AttrTypeKind::Map {
                 key: _,
                 value: element_type,
+                constraints: _,
             } => Some(self.rebind(element_type)),
             AttrTypeKind::UnloadedSchemaType(_)
             | AttrTypeKind::Reference {
@@ -470,7 +475,11 @@ fn nominal_scalar_constraints<'a, R: PatternForm>(
             ordered: _,
             constraints: _,
         }
-        | AttrTypeKind::Map { key: _, value: _ }
+        | AttrTypeKind::Map {
+            key: _,
+            value: _,
+            constraints: _,
+        }
         | AttrTypeKind::Struct {
             name: _,
             fields: _,
@@ -653,7 +662,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -710,7 +723,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -763,7 +780,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -812,7 +833,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -859,7 +884,18 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 source_refs,
                 sink_refs,
             ),
-            (Map { key: lk, value: lv }, Map { key: rk, value: rv }) => TypeAssignability::all([
+            (
+                Map {
+                    key: lk,
+                    value: lv,
+                    constraints: _,
+                },
+                Map {
+                    key: rk,
+                    value: rv,
+                    constraints: _,
+                },
+            ) => TypeAssignability::all([
                 lk.in_schema(self.defs).assignment_on_paths(
                     sink.rebind(rk),
                     check,
@@ -910,7 +946,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     field_groups: _,
                 },
-                Map { value, key: _ },
+                Map {
+                    value,
+                    key: _,
+                    constraints: _,
+                },
             ) => TypeAssignability::all(fields.iter().map(|field| {
                 field.field_type.in_schema(self.defs).assignment_on_paths(
                     sink.rebind(value),
@@ -1161,7 +1201,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -1209,7 +1253,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -1257,7 +1305,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     resource_type: _,
                 }
                 | StringLiteralSet { values: _ }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -1268,7 +1320,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Ref(_),
             ) => TypeAssignability::from_bool(left.is_assignable_to_known(right)),
             (
-                Map { key: _, value: _ },
+                Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                },
                 String {
                     binding: _,
                     pattern: _,

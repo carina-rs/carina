@@ -1,9 +1,10 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **21**.
+The current protocol and minimum supported provider protocol are both **22**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 22 | 22 | Optional entry-count bound on `Map` attribute types. |
 | 21 | 21 | Required provider-wide identity assignability declarations in the schema envelope. |
 | 20 | 20 | Create-outcome names describe cloud knowledge; identifier-bearing payloads are `create-identified` and `resume-identified`. |
 | 19 | 19 | Per-leaf desired normalization with scoped, exactly-once deferred handles. |
@@ -12,6 +13,22 @@ The current protocol and minimum supported provider protocol are both **21**.
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 22
+
+Protocol v22 adds an optional `length` field to the `map` attribute type, with
+the same `[min, max]` shape and serde rules as the `list` type's `length`. An
+unbounded endpoint is written as `null`, for example `[null, 10]` or `[2, null]`.
+A missing `length` means the map has no entry-count bound.
+
+Hosts enforce the bound during validation, planning, and LSP diagnostics, the
+same way they enforce a list's item-count bound. The bound counts entries. Type
+assignability does not compare collection count bounds for either lists or maps
+(carina-rs/carina#4264).
+
+`PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both 22. A version-21
+host would ignore the new field and silently drop the bound, so hosts and
+providers must rebuild together.
 
 ## Version 21
 

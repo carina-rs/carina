@@ -1934,6 +1934,8 @@ pub enum AttributeType {
         inner: Box<AttributeType>,
         /// Key type constraint for map keys.
         key: Box<AttributeType>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        length: Option<(Option<u64>, Option<u64>)>,
     },
     #[serde(rename = "struct")]
     Struct {

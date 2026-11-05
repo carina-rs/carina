@@ -6543,6 +6543,7 @@ mod tests {
                 proto_attr(
                     "tags",
                     proto::AttributeType::Map {
+                        length: None,
                         inner: Box::new(proto_string()),
                         key: Box::new(proto_string()),
                     },
@@ -7408,6 +7409,7 @@ mod tests {
                 proto_attr(
                     "tags",
                     proto::AttributeType::Map {
+                        length: None,
                         inner: Box::new(proto_string()),
                         key: Box::new(proto_string()),
                     },

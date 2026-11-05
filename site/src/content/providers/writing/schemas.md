@@ -165,6 +165,7 @@ Provider-populated attributes can still be marked `deferred_populate` when the A
 - Refined scalars carry extra rules: `refined_string(identity, pattern, length, to_dsl)`, `refined_int(identity, range)` and `refined_float(identity, range)`, plus the `_with_validator` forms described in [Validators and type identities](#validators-and-type-identities).
 - Collections: `list(inner)`, `unordered_list(inner)` for lists whose order the API does not keep, `map(value)` and `map_with_key(key, value)`.
 - Refined lists: `refined_list(element_type, ordered, length, elements)`, with an explicit `ListElements::AllowDuplicates` or `ListElements::Unique` policy.
+- Refined maps: `refined_map(key, value, length)`, where `length` bounds the number of entries.
 - Enums: `enum_(identity, values, dsl_aliases, validate, to_dsl)`.
 - Structs: `struct_(name, fields)`, with fields built from `StructField`.
 - Unions: `union(members)`, for a value that may take one of several shapes.

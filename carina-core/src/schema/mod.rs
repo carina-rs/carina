@@ -264,6 +264,22 @@ impl ListConstraints {
     }
 }
 
+/// Entry-count policy enforced when walking a map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapConstraints {
+    length: Option<(Option<u64>, Option<u64>)>,
+}
+
+impl MapConstraints {
+    pub(crate) const fn new(length: Option<(Option<u64>, Option<u64>)>) -> Self {
+        Self { length }
+    }
+
+    pub const fn length(self) -> Option<(Option<u64>, Option<u64>)> {
+        self.length
+    }
+}
+
 /// Per-resource operational configuration for provider timeouts and retries.
 pub use carina_provider_protocol::{OperationConfig, ReadBackBudget, ValidatorType};
 pub use resolved_attr_type::ResolvedAttrType;
@@ -1599,6 +1615,7 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     Map {
         key: Box<PatternAttributeType<R>>,
         value: Box<PatternAttributeType<R>>,
+        constraints: MapConstraints,
     },
     /// Struct (named object with typed fields)
     Struct {
@@ -1693,6 +1710,7 @@ pub enum Shape<'a, R: PatternForm = Draft> {
     Map {
         key: &'a PatternAttributeType<R>,
         value: &'a PatternAttributeType<R>,
+        constraints: MapConstraints,
     },
     /// Named struct — see [`AttrTypeKind::Struct`].
     Struct { name: &'a str },
@@ -1803,10 +1821,15 @@ impl<R: PatternForm> fmt::Debug for Shape<'_, R> {
                 .field("ordered", ordered)
                 .field("constraints", constraints)
                 .finish_non_exhaustive(),
-            Shape::Map { key, value } => f
+            Shape::Map {
+                key,
+                value,
+                constraints,
+            } => f
                 .debug_struct("Shape::Map")
                 .field("key", key)
                 .field("value", value)
+                .field("constraints", constraints)
                 .finish(),
             Shape::Struct { name } => f.debug_struct("Shape::Struct").field("name", name).finish(),
             Shape::Union => f.debug_tuple("Shape::Union").finish(),
@@ -1887,6 +1910,7 @@ pub enum RawShape<'a, R: PatternForm = Draft> {
     Map {
         key: &'a PatternAttributeType<R>,
         value: &'a PatternAttributeType<R>,
+        constraints: MapConstraints,
     },
     /// Named struct — see [`AttrTypeKind::Struct`].
     Struct {
@@ -1975,10 +1999,15 @@ impl<R: PatternForm> fmt::Debug for RawShape<'_, R> {
                 .field("ordered", ordered)
                 .field("constraints", constraints)
                 .finish_non_exhaustive(),
-            RawShape::Map { key, value } => f
+            RawShape::Map {
+                key,
+                value,
+                constraints,
+            } => f
                 .debug_struct("RawShape::Map")
                 .field("key", key)
                 .field("value", value)
+                .field("constraints", constraints)
                 .finish(),
             RawShape::Struct {
                 name,
@@ -2579,6 +2608,7 @@ impl Schema {
             AttrTypeKind::Map {
                 key,
                 value: value_type,
+                constraints,
             } => {
                 let Some(map) = (match concrete {
                     ConcreteValueRef::Map(map) => Some(map),
@@ -2593,6 +2623,9 @@ impl Schema {
                     ));
                     return;
                 };
+                if let Err(error) = constraints.check(map.len()) {
+                    out.push((path.clone(), error));
+                }
                 let mut first_value_error = None;
                 for (map_key, map_value) in map {
                     let next_path = path.push_field(map_key.clone());
@@ -2858,8 +2891,13 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
             }
             Ok(())
         }
-        AttrTypeKind::Map { key, value: val_ty } => {
+        AttrTypeKind::Map {
+            key,
+            value: val_ty,
+            constraints,
+        } => {
             if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
+                constraints.check(map.len())?;
                 for (k, v) in map.iter() {
                     let key_val: Value<P, B> = lift_map_key(key, k, defs);
                     if let Err(inner_err) =
@@ -3047,10 +3085,15 @@ impl<R: PatternForm> fmt::Debug for PatternAttributeType<R> {
                 .field("ordered", ordered)
                 .field("constraints", constraints)
                 .finish(),
-            AttrTypeKind::Map { key, value } => f
+            AttrTypeKind::Map {
+                key,
+                value,
+                constraints,
+            } => f
                 .debug_struct("Map")
                 .field("key", key)
                 .field("value", value)
+                .field("constraints", constraints)
                 .finish(),
             AttrTypeKind::Struct {
                 name,
@@ -3426,9 +3469,14 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 ordered: *ordered,
                 constraints: *constraints,
             },
-            AttrTypeKind::Map { key, value } => Shape::Map {
+            AttrTypeKind::Map {
+                key,
+                value,
+                constraints,
+            } => Shape::Map {
                 key: key.as_ref(),
                 value: value.as_ref(),
+                constraints: *constraints,
             },
             AttrTypeKind::Struct { name, .. } => Shape::Struct {
                 name: name.as_str(),
@@ -3527,9 +3575,14 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 ordered: *ordered,
                 constraints: *constraints,
             },
-            AttrTypeKind::Map { key, value } => RawShape::Map {
+            AttrTypeKind::Map {
+                key,
+                value,
+                constraints,
+            } => RawShape::Map {
                 key: key.as_ref(),
                 value: value.as_ref(),
+                constraints: *constraints,
             },
             AttrTypeKind::Struct {
                 name,
@@ -3898,10 +3951,20 @@ impl<R: PatternForm> PatternAttributeType<R> {
 
     /// Create a Map type with a typed key constraint.
     pub fn map_with_key(key: PatternAttributeType<R>, value: PatternAttributeType<R>) -> Self {
+        Self::refined_map(key, value, None)
+    }
+
+    /// Create a Map type with protocol-carried refinement metadata.
+    pub fn refined_map(
+        key: PatternAttributeType<R>,
+        value: PatternAttributeType<R>,
+        length: Option<(Option<u64>, Option<u64>)>,
+    ) -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::Map {
                 key: Box::new(key),
                 value: Box::new(value),
+                constraints: MapConstraints::new(length),
             },
         }
     }
@@ -4599,7 +4662,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     .in_schema(self.defs)
                     .resolved_type_name_on_path(visited_refs, expand_constraints)
             ),
-            AttrTypeKind::Map { key, value } if expand_constraints => format!(
+            AttrTypeKind::Map {
+                key,
+                value,
+                constraints: _,
+            } if expand_constraints => format!(
                 "Map<key: {}, value: {}>",
                 key.in_schema(self.defs)
                     .resolved_type_name_on_path(visited_refs, true),
@@ -4927,7 +4994,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -4968,7 +5039,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5013,7 +5088,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5040,7 +5119,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5083,7 +5166,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5133,7 +5220,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5179,7 +5270,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5222,7 +5317,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5493,6 +5592,25 @@ impl KnownListElement {
 struct ListConstraintError {
     index: Option<usize>,
     error: Box<TypeError>,
+}
+
+impl MapConstraints {
+    fn check(self, count: usize) -> Result<(), TypeError> {
+        if let Some((min, max)) = self.length {
+            let count_u64 = count as u64;
+            if min.is_some_and(|min| count_u64 < min) || max.is_some_and(|max| count_u64 > max) {
+                return Err(TypeError::LengthOutOfRange {
+                    value: format!("{count} entries").into(),
+                    length: count,
+                    min,
+                    max,
+                    attribute: None,
+                    type_name: Some("Map".to_string()),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ListConstraints {
@@ -5913,9 +6031,11 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
             AT::Map {
                 key,
                 value: value_type,
+                constraints,
             },
             ConcreteValueRef::Map(map),
         ) => {
+            constraints.check(map.len()).ok()?;
             let mut exactness = FitExactness::GENERIC_MAP;
             let mut entry_fits = Vec::with_capacity(map.len());
             for (map_key, map_value) in map {
@@ -10401,6 +10521,7 @@ fn identified_declaration_kind(
         RawShape::Map {
             key: _key,
             value: _value,
+            constraints: _,
         } => None,
         RawShape::Struct {
             name: _name,
@@ -10473,6 +10594,7 @@ fn identified_declaration_scalar_kind(
         RawShape::Map {
             key: _key,
             value: _value,
+            constraints: _,
         } => None,
         RawShape::Struct {
             name: _name,
@@ -10525,7 +10647,11 @@ fn visit_identified_declarations(
             ordered: _,
             constraints: _constraints,
         } => visit_identified_declarations(element_type, visitor),
-        RawShape::Map { key, value } => {
+        RawShape::Map {
+            key,
+            value,
+            constraints: _,
+        } => {
             visit_identified_declarations(key, visitor);
             visit_identified_declarations(value, visitor);
         }
@@ -10749,7 +10875,11 @@ fn validate_identified_scalar_kind_consistency(
             seen,
             issues,
         ),
-        RawShape::Map { key, value } => {
+        RawShape::Map {
+            key,
+            value,
+            constraints: _,
+        } => {
             validate_identified_scalar_kind_consistency(
                 key,
                 location.with_suffix(".key"),
@@ -11102,7 +11232,11 @@ fn validate_type_definition(
             visited_definitions,
             issues,
         ),
-        AttrTypeKind::Map { key, value } => {
+        AttrTypeKind::Map {
+            key,
+            value,
+            constraints: _,
+        } => {
             validate_type_definition(
                 key,
                 defs,
@@ -11239,7 +11373,11 @@ fn collect_identity_paths_in_type(
             false,
             collection,
         ),
-        AttrTypeKind::Map { key, value } => {
+        AttrTypeKind::Map {
+            key,
+            value,
+            constraints: _,
+        } => {
             collect_identity_paths_in_type(
                 key,
                 defs,

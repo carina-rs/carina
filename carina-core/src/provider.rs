@@ -5707,7 +5707,12 @@ pub fn merge_default_tags<S, D>(
             let Some(tags) = schema.attributes.get("tags") else {
                 return false;
             };
-            let Shape::Map { key, value } = schema.shape_of(&tags.attr_type) else {
+            let Shape::Map {
+                key,
+                value,
+                constraints: _,
+            } = schema.shape_of(&tags.attr_type)
+            else {
                 return false;
             };
             matches!(schema.shape_of(key), Shape::String { .. })
@@ -7331,7 +7336,11 @@ fn collect_type_names_from_type(
         } => {
             collect_type_names_from_type(inner, names);
         }
-        RawShape::Map { key, value: inner } => {
+        RawShape::Map {
+            key,
+            value: inner,
+            constraints: _,
+        } => {
             collect_type_names_from_type(key, names);
             collect_type_names_from_type(inner, names);
         }
