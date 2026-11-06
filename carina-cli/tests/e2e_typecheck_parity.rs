@@ -5924,6 +5924,312 @@ fn wasm_style_engine() -> DiagnosticEngine {
     DiagnosticEngine::new(Arc::new(loaded_providers), provider_names)
 }
 
+// carina#4276: local and provider checks must accept the same leaf / Union arm.
+// Keep CLI and LSP assertions in separate tests so both failures are observable.
+fn single_value_walk_cli_errors(
+    factories: Vec<Box<dyn ProviderFactory>>,
+    fixture: &TempDir,
+) -> Vec<String> {
+    let diagnostics = carina_cli::commands::validate::validate_diagnostics_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        carina_cli::wiring::LoadedProviderFactory::for_test(factories),
+        Default::default(),
+    );
+    let errors: Vec<_> = diagnostics
+        .errors
+        .iter()
+        .map(|error| carina_cli::error::format_error_with_source_chain(error))
+        .collect();
+    eprintln!(
+        "CLI errors={errors:#?}\nwarnings={:#?}",
+        diagnostics.warnings
+    );
+    assert!(
+        diagnostics.warnings.is_empty(),
+        "{:#?}",
+        diagnostics.warnings
+    );
+    errors
+}
+
+fn single_value_walk_lsp_diagnostics(
+    factories: Vec<Box<dyn ProviderFactory>>,
+    fixture: &TempDir,
+) -> Vec<tower_lsp::lsp_types::Diagnostic> {
+    let provider_names = factories
+        .iter()
+        .map(|factory| factory.name().to_string())
+        .collect();
+    let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(factories),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let engine = DiagnosticEngine::new(Arc::new(loaded), provider_names);
+    lsp_diagnostics(&engine, fixture, "main.crn")
+}
+
+fn single_value_walk_lsp_errors(
+    factories: Vec<Box<dyn ProviderFactory>>,
+    fixture: &TempDir,
+) -> Vec<String> {
+    single_value_walk_lsp_diagnostics(factories, fixture)
+        .into_iter()
+        .filter(|diagnostic| {
+            diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+        })
+        .map(|diagnostic| diagnostic.message)
+        .collect()
+}
+
+// Nested portable findings retain main's warning severity; count those as
+// validation findings while excluding the block-syntax authoring hint.
+fn single_value_walk_lsp_value_findings(
+    factories: Vec<Box<dyn ProviderFactory>>,
+    fixture: &TempDir,
+) -> Vec<String> {
+    single_value_walk_lsp_diagnostics(factories, fixture)
+        .into_iter()
+        .filter(|diagnostic| {
+            matches!(
+                diagnostic.severity,
+                Some(
+                    tower_lsp::lsp_types::DiagnosticSeverity::ERROR
+                        | tower_lsp::lsp_types::DiagnosticSeverity::WARNING
+                )
+            )
+        })
+        .map(|diagnostic| diagnostic.message)
+        .collect()
+}
+
+fn single_value_walk_f03_fixture() -> (TempDir, SchemaRegistry) {
+    let fixture = write_fixture(&[
+        (
+            "providers.crn",
+            include_str!("fixtures/single_value_walk/f03_portable_length/providers.crn"),
+        ),
+        (
+            "main.crn",
+            include_str!("fixtures/single_value_walk/f03_portable_length/main.crn"),
+        ),
+    ]);
+    let params = AttributeType::refined_string(
+        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        None,
+        Some((None, Some(3))),
+        None,
+    );
+    let schemas = single_schema_map(
+        ResourceSchema::new("ec2.vpc")
+            .attribute(AttributeSchema::optional("params", params).build()),
+    );
+    (fixture, schemas)
+}
+
+fn assert_single_value_walk_f03_errors(errors: &[String]) {
+    assert_eq!(
+        errors.len(),
+        1,
+        "F03 must emit exactly one local error: {errors:#?}"
+    );
+    assert!(
+        errors[0].contains("Invalid value 'abcd' for 'params' (VpcId)")
+            && errors[0].contains("length 4 is outside allowed range [, 3]"),
+        "F03 must retain the local length diagnostic: {errors:#?}",
+    );
+    assert!(
+        !errors[0].contains("rejected `VpcId`"),
+        "F03 must skip provider declaration validation after local rejection: {errors:#?}",
+    );
+}
+
+#[test]
+fn single_value_walk_f03_cli_reports_only_local_length_error() {
+    let (fixture, schemas) = single_value_walk_f03_fixture();
+    let errors = single_value_walk_cli_errors(factories_for(&schemas), &fixture);
+    assert_single_value_walk_f03_errors(&errors);
+}
+
+#[test]
+fn single_value_walk_f03_lsp_reports_only_local_length_error() {
+    let (fixture, schemas) = single_value_walk_f03_fixture();
+    let errors = single_value_walk_lsp_errors(factories_for(&schemas), &fixture);
+    assert_single_value_walk_f03_errors(&errors);
+}
+
+fn single_value_walk_m01_fixture() -> TempDir {
+    write_fixture(&[
+        (
+            "providers.crn",
+            include_str!("fixtures/single_value_walk/m01_union_provider/providers.crn"),
+        ),
+        (
+            "main.crn",
+            include_str!("fixtures/single_value_walk/m01_union_provider/main.crn"),
+        ),
+    ])
+}
+
+fn single_value_walk_m01_vpc_id_type() -> AttributeType {
+    AttributeType::refined_string(
+        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        None,
+        None,
+        None,
+    )
+}
+
+fn single_value_walk_m01_factories(params: AttributeType) -> Vec<Box<dyn ProviderFactory>> {
+    let schema = ResourceSchema::new("test.Sink")
+        .attribute(AttributeSchema::optional("params", params).build())
+        .validate()
+        .expect("M01 schema must be valid");
+    vec![Box::new(WasmStyleProviderFactory {
+        name: "awsccmock".to_string(),
+        schemas: vec![schema],
+    })]
+}
+
+type SingleValueDiagnostics = fn(Vec<Box<dyn ProviderFactory>>, &TempDir) -> Vec<String>;
+
+fn single_value_walk_m01_rejects_union(diagnostics: SingleValueDiagnostics) {
+    let fixture = single_value_walk_m01_fixture();
+    eprintln!("M01 CONTROL scalar provider rejection");
+    let control = diagnostics(
+        single_value_walk_m01_factories(single_value_walk_m01_vpc_id_type()),
+        &fixture,
+    );
+    assert_eq!(control.len(), 1, "M01 scalar control: {control:#?}");
+    assert!(
+        control[0].contains("must start with 'vpc-'"),
+        "M01 control must exercise the provider validator: {control:#?}",
+    );
+
+    eprintln!("M01 TARGET Union<Int,VpcId>");
+    let errors = diagnostics(
+        single_value_walk_m01_factories(AttributeType::union(vec![
+            AttributeType::int(),
+            single_value_walk_m01_vpc_id_type(),
+        ])),
+        &fixture,
+    );
+    assert!(
+        !errors.is_empty(),
+        "M01 must reject 'bad': Int rejects a String and VpcId rejects its prefix",
+    );
+}
+
+#[test]
+fn single_value_walk_m01_cli_rejects_union_without_valid_arm() {
+    single_value_walk_m01_rejects_union(single_value_walk_cli_errors);
+}
+
+#[test]
+fn single_value_walk_m01_lsp_rejects_union_without_valid_arm() {
+    single_value_walk_m01_rejects_union(single_value_walk_lsp_errors);
+}
+
+#[test]
+fn single_value_walk_union_accepts_an_arm_that_passes_both_stages() {
+    let fixture = single_value_walk_m01_fixture();
+    for value in ["bad", "vpc-valid"] {
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            format!("awsccmock.test.Sink {{ params = \"{value}\" }}\n"),
+        )
+        .unwrap();
+        for diagnostics in [single_value_walk_cli_errors, single_value_walk_lsp_errors] {
+            let errors = diagnostics(
+                single_value_walk_m01_factories(AttributeType::union(vec![
+                    single_value_walk_m01_vpc_id_type(),
+                    AttributeType::string(),
+                ])),
+                &fixture,
+            );
+            assert!(
+                errors.is_empty(),
+                "String accepts the complete value: {errors:#?}"
+            );
+        }
+    }
+}
+
+fn single_value_walk_nested_fixture(with_sibling: bool) -> (TempDir, AttributeType) {
+    let main = if with_sibling {
+        r#"awsccmock.test.Sink { params = [{ entries = { bad = "abcd", sibling = "bad" } }] }"#
+    } else {
+        r#"awsccmock.test.Sink { params = [{ entries = { bad = "abcd" } }] }"#
+    };
+    let fixture = write_fixture(&[
+        (
+            "providers.crn",
+            include_str!("fixtures/single_value_walk/m01_union_provider/providers.crn"),
+        ),
+        ("main.crn", main),
+    ]);
+    let leaf = AttributeType::refined_string(
+        Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+        None,
+        Some((None, Some(3))),
+        None,
+    );
+    let params = AttributeType::list(AttributeType::struct_(
+        "Entry",
+        vec![StructField::optional("entries", AttributeType::map(leaf)).build()],
+    ));
+    (fixture, params)
+}
+
+#[test]
+fn single_value_walk_nested_local_failure_skips_provider_rejection() {
+    let (fixture, params) = single_value_walk_nested_fixture(false);
+    for diagnostics in [
+        single_value_walk_cli_errors,
+        single_value_walk_lsp_value_findings,
+    ] {
+        let errors = diagnostics(single_value_walk_m01_factories(params.clone()), &fixture);
+        assert_eq!(errors.len(), 1, "one nested local failure: {errors:#?}");
+        assert!(
+            errors[0].contains("length 4 is outside allowed range [, 3]"),
+            "{errors:#?}"
+        );
+        assert!(!errors[0].contains("rejected `VpcId`"), "{errors:#?}");
+    }
+}
+
+#[test]
+fn single_value_walk_valid_sibling_still_reports_provider_rejection() {
+    let (fixture, params) = single_value_walk_nested_fixture(true);
+    for diagnostics in [
+        single_value_walk_cli_errors,
+        single_value_walk_lsp_value_findings,
+    ] {
+        let errors = diagnostics(single_value_walk_m01_factories(params.clone()), &fixture);
+        assert_eq!(
+            errors.len(),
+            2,
+            "both sibling failures, once each: {errors:#?}"
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.contains("length 4 is outside allowed range [, 3]"))
+                .count(),
+            1,
+            "{errors:#?}"
+        );
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.contains("must start with 'vpc-'"))
+                .count(),
+            1,
+            "{errors:#?}"
+        );
+    }
+}
+
 fn wasm_style_flow_log_schema() -> ResourceSchema {
     let identity = carina_core::schema::TypeIdentity::new(
         Some("aws"),

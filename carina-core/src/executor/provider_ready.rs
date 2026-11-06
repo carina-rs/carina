@@ -1498,7 +1498,12 @@ mod provider_config_tests {
         let schema = registry
             .get(owner, &resource_type, crate::schema::SchemaKind::Resource)
             .expect("routing fixture schema must be registered under its owner");
-        crate::parser::custom_type_lookup_for_schema(resolver, schema)
+        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, schema);
+        move |declaration, value| {
+            crate::schema::RootlessType::new(declaration.clone())
+                .validate_with_lookup(value, &lookup)
+                .map_err(|errors| errors.into_iter().next().expect("validation failure"))
+        }
     }
 
     fn test_custom_type_validator(
@@ -2014,6 +2019,62 @@ mod provider_config_tests {
 
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(*seen_values.lock().unwrap(), ["60", "-61", "1.25"]);
+    }
+
+    #[test]
+    fn combined_walk_canonicalization_errors_keep_owner_attribution_at_every_entry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let declaration = PatternAttributeType::refined_float(
+            Some(TypeIdentity::new(Some("shared"), ["number"], "Number")),
+            None,
+        );
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(RoutingFactory {
+            name: "owner",
+            declaration: declaration.clone(),
+            sibling_declaration: None,
+            accepted: None,
+            validate_calls: Arc::clone(&calls),
+            seen_values: None,
+        })];
+        let declaration = admit_declaration(declaration);
+        let value = Value::Concrete(ConcreteValue::Int(9_007_199_254_740_993));
+        let expected = TypeError::from(
+            crate::provider::validate_custom_type_declaration_with_factory(
+                factories[0].as_ref(),
+                crate::parser::IdentifiedCustomTypeDeclaration::new(&declaration).unwrap(),
+                &value,
+            )
+            .unwrap_err(),
+        );
+        let registry = test_schema_registry(&factories);
+        let schema = registry
+            .get("owner", "test.owner", crate::schema::SchemaKind::Resource)
+            .unwrap();
+        let resolver = test_schema_path_resolver(&factories);
+        let attributes = HashMap::from([("value".to_string(), value.clone())]);
+        for errors in [
+            schema.validate_with_resolver(&attributes, &|_| false, &resolver),
+            schema.validate_known_values_with_resolver(&attributes, &|_| false, &resolver),
+            schema.validate_selected_known_values_with_resolver(
+                &attributes,
+                &HashSet::from(["value".to_string()]),
+                &|_| false,
+                &resolver,
+            ),
+        ] {
+            assert_eq!(
+                errors.unwrap_err(),
+                vec![expected.clone().with_attribute("value")]
+            );
+        }
+        let lookup = crate::parser::custom_type_lookup_for_factory(factories[0].as_ref());
+        assert_eq!(
+            crate::schema::RootlessType::new(declaration)
+                .validate_with_lookup(&value, &lookup)
+                .unwrap_err(),
+            vec![expected],
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

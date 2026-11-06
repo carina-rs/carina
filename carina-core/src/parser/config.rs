@@ -892,6 +892,13 @@ pub trait CustomTypeResolver: Send + Sync {
         value: &'a Value,
     ) -> Result<(), CustomTypeValidationError>;
 
+    /// Dispatch an already checked declaration using its sealed canonical proof.
+    fn validate_validated(
+        &self,
+        owner: &str,
+        value: crate::schema::LocallyValidatedCustomType<'_>,
+    ) -> Result<(), CustomTypeValidationError>;
+
     /// Resolve every declaration of every requested owner from the same
     /// authoritative catalog used for runtime validation. Implementations
     /// must fail when any requested owner/declaration is unavailable.
@@ -962,6 +969,20 @@ where
     ) -> Result<(), CustomTypeValidationError> {
         self(target, value)
     }
+
+    fn validate_validated(
+        &self,
+        owner: &str,
+        value: crate::schema::LocallyValidatedCustomType<'_>,
+    ) -> Result<(), CustomTypeValidationError> {
+        self(
+            CustomTypeValidationTarget::Declaration {
+                owner,
+                declaration: value.declaration(),
+            },
+            value.value(),
+        )
+    }
 }
 
 /// Provider custom-type registration state.
@@ -989,7 +1010,7 @@ enum ProviderCustomTypeState {
     },
     Loaded {
         known: BTreeSet<OwnedTypeIdentity>,
-        resolver: CustomTypeValidatorFn,
+        resolver: std::sync::Arc<dyn CustomTypeResolver>,
         enum_lookup: CustomTypeEnumLookupFn,
         annotation_lookup: CustomTypeDeclarationLookupFn,
         projection_lookup: CustomTypeProjectionLookupFn,
@@ -1018,7 +1039,7 @@ impl ProviderCustomTypes {
         Self {
             state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known: known.into_iter().collect(),
-                resolver,
+                resolver: std::sync::Arc::new(resolver),
                 enum_lookup: Box::new(|_| Ok(None)),
                 projection_lookup: Box::new(|projection| {
                     Err(CustomTypeValidationError::MissingDeclaration {
@@ -1061,7 +1082,7 @@ impl ProviderCustomTypes {
         Self {
             state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known,
-                resolver: Box::new(move |target, value| validation_source.validate(target, value)),
+                resolver: validation_source,
                 enum_lookup: Box::new(move |owned| source.enum_declaration(owned)),
                 annotation_lookup: Box::new(move |owned| {
                     declaration_source.annotation_declaration(owned)
@@ -1293,8 +1314,31 @@ impl CustomTypeResolver for ProviderCustomTypes {
                 annotation_lookup: _annotation_lookup,
                 projection_lookup: _,
                 assignability_closures: _assignability_closures,
-            } => resolver(target, value),
+            } => resolver.validate(target, value),
             ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
+        }
+    }
+
+    fn validate_validated(
+        &self,
+        owner: &str,
+        value: crate::schema::LocallyValidatedCustomType<'_>,
+    ) -> Result<(), CustomTypeValidationError> {
+        match self.state.as_ref() {
+            ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
+            ProviderCustomTypeState::Partial {
+                loaded,
+                failed_providers,
+            } => {
+                if failed_providers.contains(owner) {
+                    Err(CustomTypeValidationError::ProvidersNotLoaded)
+                } else {
+                    loaded.validate_validated(owner, value)
+                }
+            }
+            ProviderCustomTypeState::Loaded { resolver, .. } => {
+                resolver.validate_validated(owner, value)
+            }
         }
     }
 
@@ -1461,7 +1505,9 @@ impl LoadedProviderContext {
             custom_types: ProviderCustomTypes {
                 state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                     known: BTreeSet::new(),
-                    resolver: Box::new(|_target, _value| Ok(())),
+                    resolver: std::sync::Arc::new(
+                        |_target: CustomTypeValidationTarget<'_>, _value: &Value| Ok(()),
+                    ),
                     enum_lookup: Box::new(|_owned| Ok(None)),
                     projection_lookup: Box::new(|projection| {
                         Err(CustomTypeValidationError::MissingDeclaration {

@@ -12849,7 +12849,8 @@ mod validate_collect_tests {
 
         let errors = Schema::flat(AttributeType::map(unstable)).validate_collect(&value);
 
-        assert_eq!(calls.load(Ordering::SeqCst), 5);
+        // The single value walk invokes the native callback exactly once.
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(errors.len(), 1, "errors: {errors:#?}");
         assert!(matches!(
             &errors[0].1,

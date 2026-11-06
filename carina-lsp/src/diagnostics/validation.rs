@@ -3,35 +3,51 @@
 use super::{DiagnosticEngine, render_merged, render_schema_diagnostic};
 use crate::document::Document;
 use carina_core::parser::{AnalysisResourceRef, Located};
-use carina_core::resource::{ParserPlaceholder, RelativeBindingName, Value as GenericValue};
-use carina_core::schema::{EffectiveType, FieldPathStep, TypeError, ValidatedResourceSchema};
+use carina_core::schema::{FieldPath, FieldPathStep, TypeError, ValidatedResourceSchema};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
-
 impl DiagnosticEngine {
-    /// Validate a container once and attach each path-tagged error to the
-    /// authored key, list element, or nearest authored computed parent.
+    // Preserve the original renderer fixtures without adding validation to
+    // the production rendering path.
+    #[cfg(test)]
     pub(super) fn validate_container_value(
         &self,
         doc: &Document,
         resource: &AnalysisResourceRef<'_>,
         attr_name: &str,
-        value: &Value,
-        effective_type: &EffectiveType<'_>,
+        value: &super::Value,
+        effective_type: &carina_core::schema::EffectiveType<'_>,
+    ) -> (Vec<Diagnostic>, bool) {
+        self.render_container_findings(
+            doc,
+            resource,
+            attr_name,
+            &effective_type.validate_collect(value),
+        )
+    }
+
+    /// Attach each cached path-tagged error to the
+    /// authored key, list element, or nearest authored computed parent.
+    pub(super) fn render_container_findings(
+        &self,
+        doc: &Document,
+        resource: &AnalysisResourceRef<'_>,
+        attr_name: &str,
+        findings: &[(FieldPath, TypeError)],
     ) -> (Vec<Diagnostic>, bool) {
         let mut diagnostics = Vec::new();
         let mut reported_duplicate = false;
-        for (path, error) in effective_type.validate_collect(value) {
+        for (path, error) in findings {
+            let error = error.clone();
             let is_duplicate = super::is_duplicate_list_error(&error);
             let is_item_error = path
                 .steps()
                 .iter()
                 .any(|step| matches!(step, FieldPathStep::Index(_)));
             let location = if is_duplicate {
-                resource.attribute_value_location(attr_name, &path)
+                resource.attribute_value_location(attr_name, path)
             } else {
-                resource.attribute_path_location(attr_name, &path)
+                resource.attribute_path_location(attr_name, path)
             };
             let attribute = if is_item_error
                 && !is_duplicate
@@ -61,7 +77,7 @@ impl DiagnosticEngine {
                         .is_some())
             {
                 let finding = Located::new(
-                    resource.attribute_value_location(attr_name, &path).clone(),
+                    resource.attribute_value_location(attr_name, path).clone(),
                     finding.detail().clone(),
                 );
                 render_schema_diagnostic(

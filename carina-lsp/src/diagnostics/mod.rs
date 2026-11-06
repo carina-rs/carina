@@ -1484,6 +1484,25 @@ impl DiagnosticRun<'_> {
                     let schema = validated_schema.as_schema();
                     // Build block_name -> canonical_name map for this schema
                     let bn_map = schema.block_name_map();
+                    let mut resolved_attrs = semantic_resource_attributes
+                        .as_ref()
+                        .map(carina_core::resource::attrs_to_hashmap)
+                        .unwrap_or_else(|| rref.resolved_attributes());
+                    for value in resolved_attrs.values_mut() {
+                        if let Some(evaluated) =
+                            carina_core::parser::evaluate_static_value_for_validation(
+                                value,
+                                self.provider_context.catalog(),
+                            )
+                        {
+                            *value = evaluated;
+                        }
+                    }
+                    let value_validation = validated_schema.validate_values_with_resolver(
+                        &resolved_attrs,
+                        &|attr| resource_quoted_string_attrs.contains(attr),
+                        self.provider_context.catalog().custom_type_resolver(),
+                    );
                     let mut reported_attribute_diagnostics = HashSet::new();
                     for (attr_name, authored_attr_value) in resource_attributes.iter() {
                         let location = rref.attribute_value_location(
@@ -1557,6 +1576,7 @@ impl DiagnosticRun<'_> {
                                 .effective_attribute(canonical_name)
                                 .expect("validated schema attributes must have effective views");
                             let effective_type = effective_attribute.value_type();
+                            let value_findings = value_validation.attribute(attr_name);
                             // The shared resource-level validator below owns read-only
                             // assignments. Skip type and authoring guidance here so it
                             // emits the single writability diagnostic, matching core.
@@ -1640,8 +1660,7 @@ impl DiagnosticRun<'_> {
                                 effective_type.shape(),
                                 carina_core::schema::Shape::Enum { .. }
                             ) && let Some(diag) = build_enum_diagnostic(
-                                &effective_attribute,
-                                attr_value,
+                                value_findings.and_then(|findings| findings.local_error()),
                                 attr_name,
                                 resource_quoted_string_attrs.contains(attr_name),
                                 doc,
@@ -1734,9 +1753,9 @@ impl DiagnosticRun<'_> {
                                 // for computed Access values. Callers do not
                                 // classify binding kinds independently.
                                 (_, value @ Value::Deferred(DeferredValue::Coalesce { .. })) => {
-                                    effective_attribute
-                                        .validate(value)
-                                        .err()
+                                    value_findings
+                                        .and_then(|findings| findings.local_error())
+                                        .cloned()
                                         .map(|error| error.with_attribute(attr_name).to_string())
                                         .or_else(|| {
                                             carina_core::validation::check_deferred_access_type(
@@ -1827,8 +1846,10 @@ impl DiagnosticRun<'_> {
                                 // namespace-shape fallback) — surface the
                                 // plain message so the user still sees a
                                 // diagnostic, just without the quick-fix.
-                                (carina_core::schema::Shape::Enum { .. }, value) => {
-                                    effective_attribute.validate(value).err().map(|e| {
+                                (carina_core::schema::Shape::Enum { .. }, _value) => value_findings
+                                    .and_then(|findings| findings.local_error())
+                                    .cloned()
+                                    .map(|e| {
                                         let tagged = e.with_attribute(attr_name);
                                         let reshaped =
                                             if resource_quoted_string_attrs.contains(attr_name) {
@@ -1837,8 +1858,7 @@ impl DiagnosticRun<'_> {
                                                 tagged
                                             };
                                         reshaped.to_string()
-                                    })
-                                }
+                                    }),
                                 // The shared whole-schema pass below validates identified
                                 // scalars with the owner-bound lookup. Doing it here as well
                                 // would execute native or bridged callbacks twice per edit.
@@ -1895,9 +1915,9 @@ impl DiagnosticRun<'_> {
                                                 | Value::Deferred(DeferredValue::Coalesce { .. })
                                         ) =>
                                 {
-                                    effective_attribute
-                                        .validate(value)
-                                        .err()
+                                    value_findings
+                                        .and_then(|findings| findings.local_error())
+                                        .cloned()
                                         .and_then(&mut diagnose_schema_error)
                                 }
 
@@ -1946,12 +1966,12 @@ impl DiagnosticRun<'_> {
                                 )
                             {
                                 let (nested_diagnostics, reported_duplicate) = self
-                                    .validate_container_value(
+                                    .render_container_findings(
                                         doc,
                                         rref,
                                         attr_name,
-                                        attr_value,
-                                        &effective_type,
+                                        value_findings
+                                            .map_or(&[], |findings| findings.local_findings()),
                                     );
                                 if reported_duplicate {
                                     reported_attribute_diagnostics
@@ -1962,29 +1982,10 @@ impl DiagnosticRun<'_> {
                         }
                     }
 
-                    // Run whole-resource validation, including top-level field groups.
-                    let mut resolved_attrs = semantic_resource_attributes
-                        .as_ref()
-                        .map(carina_core::resource::attrs_to_hashmap)
-                        .unwrap_or_else(|| rref.resolved_attributes());
-                    for value in resolved_attrs.values_mut() {
-                        if let Some(evaluated) =
-                            carina_core::parser::evaluate_static_value_for_validation(
-                                value,
-                                self.provider_context.catalog(),
-                            )
-                        {
-                            *value = evaluated;
-                        }
-                    }
-                    let is_string_literal =
-                        |attr: &str| resource_quoted_string_attrs.contains(attr);
-                    if let Err(errors) = validated_schema.validate_with_resolver(
-                        &resolved_attrs,
-                        &is_string_literal,
-                        self.provider_context.catalog().custom_type_resolver(),
-                    ) {
-                        for error in errors {
+                    // Render the report produced by the single owner-bound walk.
+                    {
+                        for (provider_finding, error) in value_validation.errors() {
+                            let error = error.clone();
                             if let carina_core::schema::TypeError::MissingRequired { name } = &error
                                 && pending_resource_sinks.iter().any(
                                     |(pending_resource, authored_name)| {
@@ -2024,17 +2025,20 @@ impl DiagnosticRun<'_> {
                             }
                             // Skip errors that are already reported with precise positions
                             // by the attribute-level checks above, including intrinsic secrets.
-                            if matches!(
-                                &error,
-                                carina_core::schema::TypeError::FieldGroupViolation { path, .. }
-                                    if !path.is_empty()
-                            ) {
+                            if !provider_finding
+                                && matches!(
+                                    &error,
+                                    carina_core::schema::TypeError::FieldGroupViolation { path, .. }
+                                        if !path.is_empty()
+                                )
+                            {
                                 continue;
                             }
                             // Statically evaluated expressions may first become known
                             // in this pass. Suppress list refinements only when
                             // the attribute pass emitted them.
-                            if is_duplicate_list_error(&error)
+                            if !provider_finding
+                                && is_duplicate_list_error(&error)
                                 && error.attribute_name().is_some_and(|attribute| {
                                     let canonical = bn_map
                                         .get(attribute)
@@ -2045,7 +2049,7 @@ impl DiagnosticRun<'_> {
                             {
                                 continue;
                             }
-                            if !is_duplicate_list_error(&error)
+                            if !provider_finding && !is_duplicate_list_error(&error)
                                 && matches!(
                                     &error,
                                     carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
@@ -2062,9 +2066,10 @@ impl DiagnosticRun<'_> {
                             {
                                 continue;
                             }
-                            if error
-                                .attribute_name()
-                                .is_some_and(|name| reported_attribute_diagnostics.contains(name))
+                            if !provider_finding
+                                && error.attribute_name().is_some_and(|name| {
+                                    reported_attribute_diagnostics.contains(name)
+                                })
                             {
                                 continue;
                             }
@@ -2468,15 +2473,13 @@ impl DiagnosticEngine {
 /// See #2309. The structured payload is consumed by
 /// [`crate::code_action::code_actions_for_diagnostic`].
 fn build_enum_diagnostic(
-    effective_attribute: &carina_core::schema::EffectiveAttribute<'_>,
-    attr_value: &Value,
+    error: Option<&TypeError>,
     attr_name: &str,
     is_quoted_literal: bool,
     doc: &Document,
     resource: &carina_core::parser::AnalysisResourceRef<'_>,
 ) -> Option<Diagnostic> {
-    let err = effective_attribute.validate(attr_value).err()?;
-    let tagged = err.with_attribute(attr_name);
+    let tagged = error?.clone().with_attribute(attr_name);
     // Reshape into the shape-mismatch diagnostic when the value came
     // from a quoted string literal — mirrors CLI behavior (#2094).
     let reshaped = if is_quoted_literal {
