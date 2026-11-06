@@ -3250,6 +3250,7 @@ fn rehydrate_desired_plan_file(
         &candidates.source,
         apply_target,
         candidates.provider_context(),
+        candidates.schemas(),
     )
 }
 
@@ -3260,6 +3261,7 @@ fn rehydrate_desired_plan_file_from_parts(
     source: &ResolvedPath,
     apply_target: ApplyTarget<'_>,
     provider_context: &carina_core::parser::LoadedProviderContext,
+    schemas: &carina_core::schema::SchemaRegistry,
 ) -> Result<ReloadedPlanFile, AppError> {
     crate::wiring::settle_type_checks(
         carina_core::validation::deferred_types::TypeCheckSession::run(
@@ -3380,16 +3382,21 @@ fn rehydrate_desired_plan_file_from_parts(
                     })
                     .collect::<Result<_, AppError>>()?;
 
-                Ok(plan_file.into_live(LivePlanFileValues {
-                    plan: rehydrated_plan,
-                    sorted_resources,
-                    unresolved_resources,
-                    compositions,
-                    data_sources,
-                    data_source_origins,
-                    provider_configs,
-                    upstream_snapshot,
-                }))
+                plan_file
+                    .into_live(
+                        LivePlanFileValues {
+                            plan: rehydrated_plan,
+                            sorted_resources,
+                            unresolved_resources,
+                            compositions,
+                            data_sources,
+                            data_source_origins,
+                            provider_configs,
+                            upstream_snapshot,
+                        },
+                        schemas,
+                    )
+                    .map_err(AppError::from)
             },
         ),
         AppError::Validation,

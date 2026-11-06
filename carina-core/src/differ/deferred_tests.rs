@@ -55,6 +55,62 @@ fn delete_effect_for_binding(binding: &str) -> Effect {
 }
 
 #[test]
+fn review5_4283_deferred_absorption_uses_the_recorded_generation_snapshot() {
+    let current = crate::effect::DeferredReplaceDelete {
+        generation: EffectGeneration::Current,
+        previous_attributes: HashMap::from([(
+            "name".into(),
+            crate::resource::SnapshotValue::Concrete(ConcreteValue::String("current-B".into())),
+        )]),
+        id: ResolvedResourceId::with_provider_identity(
+            "aws",
+            "route53.Record",
+            "validation_records[0]",
+            None,
+        ),
+        identifier: fixture_applied_identifier("current"),
+        directives: Default::default(),
+        binding: Some(absolute_binding("validation_records[0]")),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+    };
+    let mut deposed = current.clone();
+    deposed.generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+    deposed.identifier = fixture_applied_identifier("deposed");
+    deposed.previous_attributes.insert(
+        "name".into(),
+        crate::resource::SnapshotValue::Concrete(ConcreteValue::String("deposed-A".into())),
+    );
+    let mut plan = Plan::new();
+    plan.add_delete(current.clone());
+    plan.add_delete(deposed.clone());
+    add_deferred_create_effects(
+        &mut plan,
+        crate::test_support::resolved_targets(
+            DeferredCreateTargets::partition_for_expansion(
+                crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
+                    deferred_replace_test_target(),
+                ]),
+                |_| DeferredForExpansionChoice::Retain,
+            )
+            .1,
+        ),
+    );
+    let Effect::DeferredReplace(payload) = &plan.effects()[1] else {
+        panic!("current row should be absorbed while its deposed row stays independent");
+    };
+    assert_eq!(
+        payload.deletes[0].previous_attributes,
+        current.previous_attributes
+    );
+    assert_eq!(
+        plan.previous_delete_attributes(&deposed.instance_key()),
+        Some(deposed.previous_attributes)
+    );
+}
+
+#[test]
 fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace() {
     let target = deferred_replace_test_target();
     let mut plan = Plan::new();

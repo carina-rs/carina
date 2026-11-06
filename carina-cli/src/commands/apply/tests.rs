@@ -1925,6 +1925,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
             source_dir: tmp.path(),
         },
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     );
 
     let error = result.expect_err(
@@ -1951,6 +1952,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
             source_dir: tmp.path(),
         },
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        &SchemaRegistry::new(),
     )
     .expect_err("an unreadable live call source must fail with its typed identity error");
     let AppError::CompositionSourceIdentity(identity_error) = error else {

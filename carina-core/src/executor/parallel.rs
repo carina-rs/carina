@@ -37,38 +37,16 @@ use super::{
 #[cfg(test)]
 use super::{ExecutionInput, ProviderCheckInputs};
 
-pub(super) fn apply_deferred_gate_deps<S>(
-    effects: &[Effect<S>],
+pub(super) fn apply_deferred_gate_deps<S: Clone>(
+    admitted: &crate::replacement::AdmittedReplacementEffects<S>,
     deps_of: &mut HashMap<usize, HashSet<usize>>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) {
-    // A deferred gate may pair any old generation with a materialized child.
-    // Keep every candidate live until materialization and admission succeed.
-    for (delete_idx, effect) in effects.iter().enumerate() {
-        let Effect::Delete { id, binding, .. } = effect else {
-            continue;
-        };
-        if !deps_of.contains_key(&delete_idx) {
-            continue;
-        }
-        for (gate_idx, candidate) in effects.iter().enumerate() {
-            let template = match candidate {
-                Effect::DeferredCreate(payload) => payload.template.as_ref(),
-                Effect::DeferredReplace(payload) => payload.template.as_ref(),
-                _ => continue,
-            };
-            let bound_candidate = binding.as_ref().is_none_or(|binding| {
-                crate::differ::binding_matches_deferred_template(binding, template.target())
-            }) || matches!(candidate, Effect::DeferredReplace(payload) if payload.deletes.iter().any(|old| old.id == *id));
-            if (matches!(
-                template.target(),
-                crate::parser::DeferredForTarget::Unbound { .. }
-            ) || bound_candidate)
-                && template.template_resource_id().provider == id.provider
-                && template.template_resource_id().resource_type == id.resource_type
-                && template.template_resource_id().provider_instance == id.provider_instance
-            {
-                deps_of.entry(delete_idx).or_default().insert(gate_idx);
+    let effects = admitted.effects();
+    for gate in 0..effects.len() {
+        for delete in admitted.deferred_delete_candidates(gate) {
+            if let Some(dependencies) = deps_of.get_mut(&delete) {
+                dependencies.insert(gate);
             }
         }
     }
@@ -437,12 +415,8 @@ pub(super) async fn execute_effects_sequential<
                     &mut accumulated,
                     observer,
                     effect,
-                    EffectFailureKind::deferred(match error.required_by {
-                        Some(dependent) => super::DeferredCreateFailure::ReplacementRequired {
-                            dependent,
-                            error: error.cause,
-                        },
-                        None => super::DeferredCreateFailure::Replacement { error: error.cause },
+                    EffectFailureKind::deferred(super::DeferredCreateFailure::Replacement {
+                        error,
                     }),
                     FailureEventContext {
                         recovery: None,
@@ -675,9 +649,10 @@ pub(super) async fn execute_effects_sequential<
                 continue;
             }
 
-            let ordinary_old = effects
-                .iter()
-                .filter_map(|effect| match effect {
+            let ordinary_old = admitted
+                .deferred_delete_candidates(idx)
+                .into_iter()
+                .filter_map(|index| match &effects[index] {
                     Effect::Delete {
                         id,
                         identifier,
@@ -1457,6 +1432,58 @@ mod tests {
     }
 
     #[test]
+    fn review5_4283_bound_gate_recognizes_a_child_address_without_binding_metadata() {
+        let template = crate::parser::DeferredForExpression::new(
+            None,
+            0,
+            "for value in []".into(),
+            crate::parser::DeferredForTarget::bound(absolute("children")).unwrap(),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(Vec::new())),
+            crate::parser::ForBinding::Simple("value".into()),
+            crate::resource::Resource::<crate::resource::ModuleSource, crate::resource::LoopSlot>::with_provider(
+                "mock", "test.Child", "children", None,
+            ),
+        );
+        let delete = |identity| Effect::Delete {
+            id: crate::resource::ResolvedResourceId::with_provider_identity(
+                "mock",
+                "test.Child",
+                identity,
+                None,
+            ),
+            identifier: crate::effect::fixture_applied_identifier("old-child"),
+            generation: crate::effect::EffectGeneration::Current,
+            directives: Directives::default(),
+            binding: None,
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+        };
+        let effects = vec![
+            delete("children[0]"),
+            Effect::DeferredCreate(crate::test_support::compiled_loop(Box::new(template))),
+            delete("unrelated"),
+        ];
+        let admitted = crate::replacement::AdmittedReplacementEffects::resolve(
+            &effects,
+            &SchemaRegistry::new(),
+            |_| HashMap::new(),
+        )
+        .unwrap();
+        let mut deps_of = HashMap::from([
+            (0, HashSet::new()),
+            (1, HashSet::new()),
+            (2, HashSet::new()),
+        ]);
+        apply_deferred_gate_deps(&admitted, &mut deps_of, &[]);
+        assert_eq!(deps_of[&0], HashSet::from([1]));
+        assert!(
+            deps_of[&2].is_empty(),
+            "a bound gate cannot claim unrelated deletes with missing metadata"
+        );
+    }
+
+    #[test]
     fn anonymous_delete_waits_for_all_same_kind_unbound_deferred_gates() {
         let deleted_id = crate::resource::ResolvedResourceId::with_provider_identity(
             "mock",
@@ -1488,7 +1515,13 @@ mod tests {
             (2usize, HashSet::new()),
         ]);
 
-        apply_deferred_gate_deps(&effects, &mut deps_of, &[]);
+        let admitted = crate::replacement::AdmittedReplacementEffects::resolve(
+            &effects,
+            &SchemaRegistry::new(),
+            |_| HashMap::new(),
+        )
+        .unwrap();
+        apply_deferred_gate_deps(&admitted, &mut deps_of, &[]);
 
         assert_eq!(deps_of.get(&0), Some(&HashSet::from([1, 2])));
         assert_eq!(deps_of.get(&1), Some(&HashSet::new()));

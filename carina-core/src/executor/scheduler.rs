@@ -105,7 +105,7 @@ pub(super) fn build_scheduler_deps<'a, S: Clone>(
     };
     relax_update_update_edges(effects, &mut analysis);
     let mut deps_of = analysis.into_deps_of();
-    apply_deferred_gate_deps(effects, &mut deps_of, deferred_replace_delete_deps);
+    apply_deferred_gate_deps(admitted, &mut deps_of, deferred_replace_delete_deps);
     SchedulerDeps {
         deps_of,
         unresolved,

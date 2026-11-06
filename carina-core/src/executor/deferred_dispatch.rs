@@ -26,11 +26,7 @@ pub(super) struct DeferredIdentityInputs<'a> {
 #[derive(Debug)]
 pub enum DeferredCreateFailure {
     Replacement {
-        error: crate::plan::CreateBeforeDestroyError,
-    },
-    ReplacementRequired {
-        dependent: String,
-        error: crate::plan::CreateBeforeDestroyError,
+        error: crate::replacement::ReplacementAdmissionError,
     },
     /// Every candidate was complete, but a direct iterable reference was
     /// absent and there was no coalesce fallback.
@@ -165,16 +161,13 @@ impl DeferredAnonymousIdentityGuard {
 impl std::fmt::Display for DeferredCreateFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            DeferredCreateFailure::Replacement { error: _error } => {
-                formatter.write_str("replacement admission failed")
-            }
-            DeferredCreateFailure::ReplacementRequired {
-                dependent,
-                error: _error,
-            } => write!(
-                formatter,
-                "create_before_destroy required by dependent `{dependent}`"
-            ),
+            DeferredCreateFailure::Replacement { error } => match &error.required_by {
+                Some(dependent) => write!(
+                    formatter,
+                    "create_before_destroy required by dependent `{dependent}`"
+                ),
+                None => formatter.write_str("replacement admission failed"),
+            },
             DeferredCreateFailure::IterableAbsent {
                 file,
                 line,
@@ -265,11 +258,7 @@ fn source_location(file: Option<&str>, line: usize) -> String {
 impl std::error::Error for DeferredCreateFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Replacement { error }
-            | Self::ReplacementRequired {
-                error,
-                dependent: _,
-            } => Some(error),
+            Self::Replacement { error } => Some(error),
             Self::ValueAccess { error } => Some(error),
             Self::Directives { error } => Some(error),
             Self::ResolveResource { error } => Some(error),
@@ -492,13 +481,7 @@ fn admit_materialized<S: Clone>(
     }
     existing
         .with_materialized(children, replacements, schemas)
-        .map_err(|error| match error.required_by {
-            Some(dependent) => DeferredCreateFailure::ReplacementRequired {
-                dependent,
-                error: error.cause,
-            },
-            None => DeferredCreateFailure::Replacement { error: error.cause },
-        })
+        .map_err(|error| DeferredCreateFailure::Replacement { error })
 }
 
 /// Result of synchronously dispatching a deferred scheduler-meta effect.

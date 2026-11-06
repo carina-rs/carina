@@ -13237,6 +13237,135 @@ async fn review_4283_anonymous_delete_waits_for_forbidden_cbd_admission() {
 }
 
 #[tokio::test]
+async fn review5_4283_unbound_loop_after_read_does_not_block_unrelated_replacement() {
+    let (mut template, _, schemas, child) = anonymous_deferred_collision_fixture();
+    template.iterable = Value::root_resource_ref("lookup", "values", Vec::new());
+    let parent = Resource::with_provider("mock", "test.Child", "producer", None)
+        .with_root_binding("producer")
+        .with_attribute(
+            "identity_input",
+            Value::Concrete(ConcreteValue::String("static".into())),
+        );
+    let parent_id = parent.id.clone();
+    let mut data_source = DataSource::with_provider("mock", "test.Lookup", "lookup", None);
+    data_source.binding = Some(absolute_binding("lookup"));
+    data_source.attributes.insert(
+        "filter".into(),
+        Value::root_resource_ref("producer", "identity_input", Vec::new()),
+    );
+    let graph = crate::resolved_graph::resolve_expanded_graph(
+        crate::parser::ExpandedParsedFile {
+            resources: vec![parent.clone()],
+            data_sources: vec![data_source.clone()],
+            ..Default::default()
+        }
+        .into(),
+    )
+    .unwrap();
+    let (template, dependencies) = graph.compile_deferred_for(template).unwrap();
+    let mut plan = Plan::new();
+    plan.add_delete(DeferredReplaceDelete {
+        generation: EffectGeneration::Current,
+        previous_attributes: HashMap::new(),
+        id: ResolvedResourceId::new(parent_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("old-producer"),
+        directives: Default::default(),
+        binding: parent.binding.clone(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+    });
+    plan.add(Effect::Create(
+        graph.resolve_resource(parent, &schemas).unwrap(),
+    ));
+    plan.add(Effect::Read {
+        resource: graph.resolve_data_source(data_source.clone()).unwrap(),
+    });
+    plan.add(Effect::DeferredCreate(
+        crate::effect::DeferredCreatePayload::new(Box::new(template), dependencies),
+    ));
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(
+        crate::resource::State::<crate::resource::NoPlaceholder>::existing(
+            parent_id.clone(),
+            HashMap::from([(
+                "identity_input".into(),
+                Value::Concrete(ConcreteValue::String("static".into())),
+            )]),
+        )
+        .with_identifier("new-producer")
+        .to_snapshot(),
+    ));
+    provider.push_read(Ok(
+        crate::resource::State::<crate::resource::NoPlaceholder>::existing(
+            data_source.id.clone(),
+            HashMap::from([(
+                "values".into(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("stable".into()),
+                )])),
+            )]),
+        )
+        .with_identifier("lookup")
+        .to_snapshot(),
+    ));
+    provider.push_create(Ok(
+        State::existing(child.id.clone(), HashMap::new()).with_identifier("child")
+    ));
+    let input = ExecutionInput {
+        provider_context: crate::parser::LoadedProviderContext::empty_for_test()
+            .as_provider_context()
+            .clone(),
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::from([(
+            parent_id.clone(),
+            Current::from_snapshot(
+                State::existing(parent_id.clone(), HashMap::new()).with_identifier("old-producer"),
+            ),
+        )]),
+        data_source_values: executable_deferred_data_source_values(std::slice::from_ref(
+            &data_source,
+        )),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(2).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+    // wall-clock-ok: Bounds executor hangs while provider calls establish the actual operation order.
+    let result = completed_result(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            execute_plan(&provider, input, &observer, uncancelled_shutdown()),
+        )
+        .await
+        .expect("the read/deferred graph must finish"),
+    );
+    assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
+    assert_eq!(result.success_count, 4);
+    let calls = provider.calls();
+    assert!(
+        call_position(&calls, "delete", &parent_id.to_string())
+            < call_position(&calls, "create", &parent_id.to_string())
+    );
+    assert!(
+        call_position(&calls, "create", &parent_id.to_string())
+            < call_position(&calls, "read", &data_source.id.to_string())
+    );
+    assert!(
+        call_position(&calls, "read", &data_source.id.to_string())
+            < call_position(&calls, "create", &child.id.to_string())
+    );
+}
+
+#[tokio::test]
 async fn review4_4283_deposed_delete_waits_for_forbidden_deferred_admission() {
     deposed_deferred_admission(false, false, false).await;
 }

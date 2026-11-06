@@ -1061,7 +1061,9 @@ impl<S, V: PlanValueKind> Plan<S, V> {
         self.replacement_inputs.previous(instance)
     }
 
-    pub(crate) fn prepare_replacements(
+    /// Re-admit replacement requests after mapping plan values. This refreshes
+    /// prepared endpoints, scheduling, and display previews as one operation.
+    pub fn prepare_replacements(
         &mut self,
         schemas: &crate::schema::SchemaRegistry,
     ) -> Result<(), crate::replacement::ReplacementAdmissionError>

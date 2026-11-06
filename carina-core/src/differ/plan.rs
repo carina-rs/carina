@@ -191,7 +191,6 @@ pub struct PendingCascadePlan {
     plan: Plan,
     deferred: ResolvedDeferredCreateTargets,
     registry: SchemaRegistry,
-    prior_attributes: HashMap<ResourceId, HashMap<String, crate::resource::SnapshotValue>>,
 }
 
 impl PendingCascadePlan {
@@ -203,10 +202,9 @@ impl PendingCascadePlan {
             mut plan,
             deferred,
             registry,
-            prior_attributes,
         } = self;
         complete(&mut plan);
-        add_deferred_create_effects_with_priors(&mut plan, deferred, &registry, &prior_attributes);
+        add_deferred_create_effects_with_schemas(&mut plan, deferred, &registry);
         prepare_plan_replacements(&mut plan, &registry);
         plan
     }
@@ -1004,17 +1002,6 @@ pub fn create_plan_with_cascades(
         plan: build.plan,
         deferred: dependents.deferred,
         registry: registry.clone(),
-        prior_attributes: prior_states
-            .orphans()
-            .iter()
-            .filter_map(|(id, orphan)| {
-                if let Current::Present(present) = orphan.current() {
-                    Some((id.clone(), present.state().attributes.clone()))
-                } else {
-                    None
-                }
-            })
-            .collect(),
     })
 }
 
@@ -1024,13 +1011,12 @@ pub fn create_plan_with_cascades(
 /// with no matching deletes remain plain `DeferredCreate` effects.
 #[cfg(test)]
 fn add_deferred_create_effects(plan: &mut Plan, targets: ResolvedDeferredCreateTargets) {
-    add_deferred_create_effects_with_priors(plan, targets, &SchemaRegistry::new(), &HashMap::new());
+    add_deferred_create_effects_with_schemas(plan, targets, &SchemaRegistry::new());
 }
-fn add_deferred_create_effects_with_priors(
+fn add_deferred_create_effects_with_schemas(
     plan: &mut Plan,
     targets: ResolvedDeferredCreateTargets,
     registry: &SchemaRegistry,
-    prior_attributes: &HashMap<ResourceId, HashMap<String, crate::resource::SnapshotValue>>,
 ) {
     let mut deletes_to_absorb: HashSet<ResourceId> = HashSet::new();
     let mut deferred_effects = Vec::new();
@@ -1083,9 +1069,12 @@ fn add_deferred_create_effects_with_priors(
                 });
                 matches.then(|| DeferredReplaceDelete {
                     generation: crate::effect::EffectGeneration::Current,
-                    previous_attributes: prior_attributes
-                        .get(id.as_inner())
-                        .cloned()
+                    previous_attributes: plan
+                        .previous_delete_attributes(&crate::effect::DeletedInstanceKey::new(
+                            id.as_inner().clone(),
+                            EffectGeneration::Current,
+                            identifier.as_str(),
+                        ))
                         .unwrap_or_default(),
                     id: id.clone(),
                     identifier: identifier.clone(),

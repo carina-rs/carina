@@ -602,6 +602,96 @@ async fn review2_4283_legacy_unbound_runtime_writeback_retires_old_address() {
 }
 
 #[tokio::test]
+async fn review5_4283_saved_plan_conversion_readmits_delete_first_preview() {
+    Box::pin(saved_plan_conversion_preview(false, false)).await;
+}
+
+#[tokio::test]
+async fn review5_4283_saved_plan_conversion_readmits_create_first_preview() {
+    Box::pin(saved_plan_conversion_preview(true, false)).await;
+}
+
+#[tokio::test]
+async fn review5_4283_secret_plan_conversion_readmits_deferred_previews() {
+    for create_first in [false, true] {
+        Box::pin(saved_plan_conversion_preview(create_first, true)).await;
+    }
+}
+
+async fn saved_plan_conversion_preview(create_first: bool, secret: bool) {
+    let fixture = ApplyCancellationFixture::new().with_raw_config("");
+    let cloud = Cloud::default();
+    cloud.0.lock().unwrap().coexisting_child = create_first;
+    write_config(&fixture, "old");
+    apply(&fixture, &cloud).await;
+    write_config(&fixture, "new");
+    let path = fixture.config_path().join("main.crn");
+    let mut source_text = std::fs::read_to_string(&path).unwrap();
+    if create_first {
+        source_text = source_text.replace(
+            "name = opt.name",
+            "directives { create_before_destroy = true }\n    name = opt.name",
+        );
+    }
+    if secret {
+        source_text = source_text.replace("value = opt.value", "value = secret(opt.value)");
+    }
+    std::fs::write(path, source_text).unwrap();
+    let saved = plan(&fixture, &cloud).await;
+    let source = ResolvedPath::new(fixture.config_path()).unwrap();
+    let mut loaded = config(&fixture, &cloud);
+    let mut state = Some(fixture.read_state().await);
+    let prepared = prepare_plan_identity_and_provider_inputs(
+        &mut loaded,
+        &mut state,
+        &source,
+        fixture.provider_context(),
+        UpstreamMissingStatePolicy::Lenient,
+    )
+    .await
+    .unwrap();
+    let decoded: PlanFile = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+    let resolved = decoded
+        .reload_in_flight_from_locked_state(state.as_ref())
+        .unwrap()
+        .resolve_with_schemas(loaded.context().schemas())
+        .unwrap();
+    let expected = if create_first { "+/-" } else { "-/+" };
+    let live = if secret {
+        rehydrate_desired_plan_file_from_parts(
+            resolved,
+            loaded.resources().parsed(),
+            &prepared.provider_inputs,
+            &source,
+            ApplyTarget::SavedPlan {
+                plan_file: Path::new("p.plan"),
+                source_dir: fixture.config_path(),
+            },
+            loaded.context().provider_context(),
+            loaded.context().schemas(),
+        )
+        .unwrap()
+    } else {
+        resolved
+            .into_live_without_secrets(loaded.context().schemas())
+            .unwrap()
+    };
+    let glyph = live
+        .plan()
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            carina_core::effect::Effect::DeferredReplace(payload) => Some(payload.display_glyph()),
+            _ => None,
+        })
+        .expect("fixture has a deferred replacement");
+    assert_eq!(
+        glyph, expected,
+        "approval must show the admitted replacement order"
+    );
+}
+
+#[tokio::test]
 async fn review4_4283_attribute_child_with_deposed_name_live() {
     Box::pin(attribute_child_with_deposed_name(false)).await;
 }
