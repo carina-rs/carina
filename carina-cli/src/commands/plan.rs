@@ -714,6 +714,8 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 42 retains replacement history and create-first dependency
+    /// requirements for schema admission when loading saved plans.
     /// Plan format 41 encodes secret(...) only as a typed Secret node.
     /// Plan format 40 requires an absolute source locator and its planned
     /// canonical identity so a retargeted symlink requires replanning.
@@ -1138,7 +1140,8 @@ impl PlanFile {
 /// classification field is mandatory in the wire shape and is never
 /// defaulted. Format 40 requires the absolute source locator and canonical
 /// source identity captured at plan time. Format 41 removes the ordinary
-/// secret FunctionCall identity in favor of typed Secret nodes.
+/// secret FunctionCall identity in favor of typed Secret nodes. Format 42 adds
+/// replacement previous_attributes, required_by, and required_children.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
     version: u32,
@@ -2191,7 +2194,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 41;
+    pub const CURRENT_VERSION: u32 = 42;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -2750,7 +2753,7 @@ impl PlanFile {
     pub(crate) fn validate_replace_display(&self) -> Result<(), String> {
         let effects = self.plan.effects();
         let mut seen_replace_indices = HashSet::new();
-        for (metadata_idx, replacement) in self.plan.replace_display_info().enumerate() {
+        for (metadata_idx, replacement) in self.plan.replacement_intents().enumerate() {
             let create = effects.get(replacement.create_idx).ok_or_else(|| {
                 format!(
                     "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].create_idx {} is out of bounds for {} effects",
@@ -3853,7 +3856,7 @@ mod historical_display_tests {
         let (schemas, provider) =
             carina_core::provider::comparison_fixture_for_test(&schemas, std::iter::once(&id));
         let app = carina_tui::App::new(
-            &plan,
+            &plan.clone().admit(&schemas).unwrap(),
             &schemas,
             &historical,
             None,
@@ -3956,10 +3959,11 @@ pub(crate) struct UnresolvedReloadedPlanFile {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct ReloadedPlanFile<V: PlanValueKind = NoPlaceholder> {
+pub(crate) struct ReloadedPlanFile<V: PlanValueKind = NoPlaceholder, P = Plan<SavedModuleSource, V>>
+{
     refresh_rows: carina_state::RefreshRows,
     data_source_refresh_rows: carina_state::RefreshRows,
-    contents: PlanFileContents<SavedModuleSource, Plan<SavedModuleSource, V>, V>,
+    contents: PlanFileContents<SavedModuleSource, P, V>,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
     persisted_directive_changes: Vec<PersistedDirectiveChange>,
@@ -4100,7 +4104,78 @@ impl UnresolvedReloadedPlanFile {
     }
 }
 
-impl<V: PlanValueKind> ReloadedPlanFile<V> {
+impl<V: PlanValueKind, P> ReloadedPlanFile<V, P> {
+    pub(crate) fn try_map_plan<Q, E>(
+        self,
+        transform: impl FnOnce(P) -> Result<Q, E>,
+    ) -> Result<ReloadedPlanFile<V, Q>, E> {
+        let Self {
+            refresh_rows,
+            data_source_refresh_rows,
+            contents,
+            evidence,
+            current_states,
+            persisted_directive_changes,
+        } = self;
+        let PlanFileContents {
+            version,
+            carina_version,
+            timestamp,
+            source_path,
+            source_identity,
+            state_lineage,
+            state_serial,
+            provider_configs,
+            backend_config,
+            plan,
+            sorted_resources,
+            sorted_value_destroy_dependencies,
+            sorted_explicit_destroy_dependencies,
+            legacy_dependency_classification,
+            unresolved_resources,
+            compositions,
+            data_sources,
+            data_source_origins,
+            data_source_values,
+            current_states: saved_current_states,
+            upstream_snapshot,
+            upstream_sources,
+            wait_bindings,
+        } = contents;
+        Ok(ReloadedPlanFile {
+            refresh_rows,
+            data_source_refresh_rows,
+            evidence,
+            current_states,
+            persisted_directive_changes,
+            contents: PlanFileContents {
+                version,
+                carina_version,
+                timestamp,
+                source_path,
+                source_identity,
+                state_lineage,
+                state_serial,
+                provider_configs,
+                backend_config,
+                plan: transform(plan)?,
+                sorted_resources,
+                sorted_value_destroy_dependencies,
+                sorted_explicit_destroy_dependencies,
+                legacy_dependency_classification,
+                unresolved_resources,
+                compositions,
+                data_sources,
+                data_source_origins,
+                data_source_values,
+                current_states: saved_current_states,
+                upstream_snapshot,
+                upstream_sources,
+                wait_bindings,
+            },
+        })
+    }
+
     pub(crate) fn refresh_rows(&self) -> &carina_state::RefreshRows {
         &self.refresh_rows
     }
@@ -4121,11 +4196,11 @@ impl<V: PlanValueKind> ReloadedPlanFile<V> {
         &self.contents.provider_configs
     }
 
-    pub(crate) fn plan(&self) -> &Plan<SavedModuleSource, V> {
+    pub(crate) fn plan(&self) -> &P {
         &self.contents.plan
     }
 
-    pub(crate) fn plan_mut(&mut self) -> &mut Plan<SavedModuleSource, V> {
+    pub(crate) fn plan_mut(&mut self) -> &mut P {
         &mut self.contents.plan
     }
 
@@ -4209,6 +4284,8 @@ pub(crate) struct LivePlanFileValues {
 
 impl ReloadedPlanFile<SnapshotLeaf> {
     pub(crate) fn into_live(self, values: LivePlanFileValues) -> ReloadedPlanFile {
+        // Desired values are live, but historical names may still be redacted.
+        // Final admission after historical verification prepares replacements.
         let Self {
             refresh_rows,
             data_source_refresh_rows,
@@ -5008,7 +5085,7 @@ impl CurrentStateEntry {
 }
 
 #[derive(Debug)]
-enum PlanSaveError {
+pub(crate) enum PlanSaveError {
     Serialization(carina_core::value::SerializationError),
     CompositionSourceIdentity(carina_core::resource::CompositionSourceIdentityError),
     ProviderEvidence(ProviderEvidenceError),
@@ -5070,7 +5147,7 @@ fn build_plan_file<E>(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn build_plan_file_from_parts<E, R>(
+pub(crate) fn build_plan_file_from_parts<E, R>(
     path: &ResolvedPath,
     parsed: &carina_core::parser::ExpandedFile<E>,
     provider_configs: &ResolvedProviderConfigs,
@@ -5202,7 +5279,7 @@ fn build_plan_file_contents<E>(
         };
         Ok(redacted)
     };
-    let redacted_managed_states = ctx
+    let mut redacted_managed_states = ctx
         .managed_current
         .iter()
         .filter_map(|(id, current)| {
@@ -5216,6 +5293,19 @@ fn build_plan_file_contents<E>(
             state.map(|state| redact_current_state(id, state).map(|state| (id.clone(), state)))
         })
         .collect::<Result<HashMap<_, _>, carina_core::value::SerializationError>>()?;
+    for effect in ctx.plan.effects() {
+        if let Effect::DeferredReplace(payload) = effect {
+            for old in payload.deletes.iter() {
+                let state = SnapshotState::existing(
+                    old.id.as_inner().clone(),
+                    old.previous_attributes.clone(),
+                );
+                redacted_managed_states
+                    .entry(old.id.as_inner().clone())
+                    .or_insert(redact_current_state(old.id.as_inner(), &state)?);
+            }
+        }
+    }
     let redacted_managed_current = ctx
         .managed_current
         .iter()
@@ -5261,6 +5351,8 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#4283: bumped 41→42 — retain replacement history and dependency
+        // requirements; loading re-admits requests against the target schema.
         // carina#4275: bumped 40→41 — secret(...) has no ordinary FunctionCall
         // identity; older saved plans must be regenerated before decoding.
         // carina#4202: bumped 39→40 — require the absolute source locator and
@@ -6151,7 +6243,7 @@ pub(crate) async fn run_plan_using(
             file: image,
             inline: inline_image,
             input: PlanImageInput {
-                plan: &ctx.plan,
+                scheduled: &planned.schedule(&ctx.managed_current),
                 desired_resources: &ctx.sorted_resources,
                 unresolved_resources: &ctx.unresolved_resources,
                 compositions: &ctx.compositions,
@@ -8218,7 +8310,7 @@ mod run_plan_out_tests {
         let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: crate::test_support::creation_fixture::checked(plan),
+                plan: Box::new(crate::test_support::creation_fixture::checked(plan)),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -8498,7 +8590,8 @@ mod run_plan_out_tests {
                 file: Some(&image_target),
                 inline: None,
                 input: PlanImageInput {
-                    plan: &plan,
+                    scheduled: &crate::test_support::admit_fixture_plan(&plan, None)
+                        .schedule(&Default::default()),
                     desired_resources: &desired_resources,
                     unresolved_resources: &unresolved_resources,
                     compositions: &compositions,
@@ -8561,7 +8654,8 @@ mod run_plan_out_tests {
                         theme: Theme::Light,
                     }),
                     input: PlanImageInput {
-                        plan: &plan,
+                        scheduled: &crate::test_support::admit_fixture_plan(&plan, None)
+                            .schedule(&Default::default()),
                         desired_resources: &desired_resources,
                         unresolved_resources: &unresolved_resources,
                         compositions: &compositions,
@@ -8631,7 +8725,7 @@ mod run_plan_out_tests {
         let parsed = resolve_file_for_test(parsed, tmp.path());
         let ctx = crate::wiring::PlanContext {
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: crate::test_support::creation_fixture::checked(Plan::new()),
+                plan: Box::new(crate::test_support::creation_fixture::checked(Plan::new())),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -8732,7 +8826,7 @@ mod run_plan_out_tests {
         let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: crate::test_support::creation_fixture::checked(Plan::new()),
+                plan: Box::new(crate::test_support::creation_fixture::checked(Plan::new())),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -8805,7 +8899,7 @@ mod run_plan_out_tests {
             legacy_dependency_classification: None,
             migrated_legacy_state: None,
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: crate::test_support::creation_fixture::checked(Plan::new()),
+                plan: Box::new(crate::test_support::creation_fixture::checked(Plan::new())),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -8891,7 +8985,7 @@ mod run_plan_out_tests {
             legacy_dependency_classification: None,
             migrated_legacy_state: None,
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: crate::test_support::creation_fixture::checked(Plan::new()),
+                plan: Box::new(crate::test_support::creation_fixture::checked(Plan::new())),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),

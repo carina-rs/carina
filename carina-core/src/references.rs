@@ -791,7 +791,7 @@ impl ReferencePreparation {
             )
             .await?;
         Ok(PreparedComparison {
-            value: plan.plan().clone(),
+            value: plan.plan().clone().into_unadmitted(),
             references: display.references,
         })
     }

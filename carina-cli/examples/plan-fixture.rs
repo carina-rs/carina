@@ -170,6 +170,16 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    let plan = match fp.plan.clone().admit(&fp.schemas) {
+        Ok(plan) => plan,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                carina_cli::error::format_error_with_source_chain(&error)
+            );
+            return ExitCode::from(1);
+        }
+    };
     let historical_display =
         delete_instance_attributes_from_plan(&fp.plan, &fp.managed_current, fp.state_file.as_ref());
     let summary = build_fixture_plan_change_summary(&fp);
@@ -183,7 +193,7 @@ fn main() -> ExitCode {
             images.file(),
             images.inline(),
             PlanImageInput {
-                plan: &fp.plan,
+                scheduled: &plan.schedule(&fp.managed_current),
                 desired_resources: &fp.desired_resources,
                 unresolved_resources: &fp.unresolved_resources,
                 compositions: &fp.compositions,
@@ -248,7 +258,7 @@ fn main() -> ExitCode {
                 .map(|display| display.view())
                 .unwrap_or_else(|| {
                     carina_core::detail_rows::PlanDisplay::unprepared(
-                        &fp.plan,
+                        &plan,
                         &historical_display,
                         fp.references.for_display(),
                     )
@@ -267,7 +277,7 @@ fn main() -> ExitCode {
     if destroy {
         let output = match format_destroy_plan_with_delete_instances(
             color_mode,
-            &fp.plan,
+            &plan,
             detail,
             &historical_display,
             &provider,
@@ -299,7 +309,7 @@ fn main() -> ExitCode {
     } else {
         if let Err(error) = print_plan(
             color_mode,
-            &fp.plan,
+            &plan,
             &summary,
             detail,
             &historical_display,

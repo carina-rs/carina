@@ -6,7 +6,6 @@ use carina_core::executor::{
     EffectFailureKind, ExecutionCheckpointSink, ExecutionObserver, ExecutionResult,
     FailureEventContext, FailureReport, ProgressInfo,
 };
-use carina_core::plan::Plan;
 use carina_core::provider::{AppliedIdentifier, Provider, ReadRequest};
 use carina_core::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
@@ -76,7 +75,7 @@ fn record_import_failure<S: Clone>(
 /// so that finalize_apply can persist it.
 pub(crate) async fn execute_import_effects<S: Clone>(
     color_mode: crate::output_style::ColorMode,
-    plan: &Plan<S>,
+    plan: &carina_core::plan::AdmittedPlan<S>,
     provider: &dyn Provider,
     result: &mut ExecutionResult<S>,
     shutdown: &ShutdownToken,
@@ -269,7 +268,7 @@ fn format_state_only_effect_line<S>(
 /// state; this function only emits their user-facing output.
 pub(crate) fn execute_state_only_effects<S>(
     color_mode: crate::output_style::ColorMode,
-    plan: &Plan<S>,
+    plan: &carina_core::plan::AdmittedPlan<S>,
 ) -> usize {
     let mut completed = 0;
     for effect in plan.effects() {
@@ -471,7 +470,10 @@ mod tests {
         let mut result = empty_result();
         execute_import_effects(
             color_mode,
-            &plan,
+            &plan
+                .clone()
+                .admit(&carina_core::schema::SchemaRegistry::new())
+                .unwrap(),
             &recorder,
             &mut result,
             &ShutdownToken::running(),
@@ -533,7 +535,10 @@ mod tests {
         result.success_count = 2;
         execute_import_effects(
             color_mode,
-            &plan,
+            &plan
+                .clone()
+                .admit(&carina_core::schema::SchemaRegistry::new())
+                .unwrap(),
             &ReadRecorder::new(),
             &mut result,
             &ShutdownToken::running(),
@@ -560,7 +565,10 @@ mod tests {
         let mut result = empty_result();
         execute_import_effects(
             color_mode,
-            &plan,
+            &plan
+                .clone()
+                .admit(&carina_core::schema::SchemaRegistry::new())
+                .unwrap(),
             &recorder,
             &mut result,
             &ShutdownToken::running(),

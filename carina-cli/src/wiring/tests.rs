@@ -6093,7 +6093,7 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
 
 #[test]
 fn deposed_delete_waits_for_the_rows_in_flight_create() {
-    use carina_core::effect::{Effect, EffectGeneration};
+    use carina_core::effect::EffectGeneration;
     use carina_core::provider::Sent;
     use carina_state::state::{DeposedInstance, DeposedKey, ResourceState};
     use std::collections::HashMap;
@@ -6128,7 +6128,7 @@ fn deposed_delete_waits_for_the_rows_in_flight_create() {
 
     assert!(errors.is_empty());
     let [
-        Effect::Delete {
+        carina_core::effect::DeferredReplaceDelete {
             generation: EffectGeneration::Deposed(actual_key),
             blocked_by_updates,
             ..
@@ -15373,7 +15373,7 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                     .check_inputs(ctx.schemas(), &HashMap::new())
                     .expect("fixture inputs discharge");
                 let (create, cancellation) =
-                    carina_core::executor::dispatch_prepared_create(&provider, prepared);
+                    carina_core::executor::dispatch_create(&provider, prepared);
                 create.await.unwrap();
                 drop(cancellation);
                 let identifier = carina_core::provider::AppliedIdentifier::new("mock-id").unwrap();

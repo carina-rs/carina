@@ -2899,6 +2899,11 @@ pub(crate) fn unresolved_effect_contains_redacted_secret(
         }
         UnresolvedSavedEffect::DeferredReplace(payload) => {
             deferred_template_contains_redacted_secret(&payload.template)
+                || payload.deletes.iter().any(|old| {
+                    old.previous_attributes
+                        .values()
+                        .any(contains_redacted_secret)
+                })
         }
         UnresolvedSavedEffect::Delete { .. }
         | UnresolvedSavedEffect::Remove { .. }
@@ -2971,12 +2976,12 @@ pub(crate) fn effect_contains_redacted_secret<S, V: crate::resource::PlanValueKi
             deferred_template_contains_redacted_secret(&payload.template)
         }
         Effect::DeferredReplace(payload) => {
-            let crate::effect::DeferredReplacePayload {
-                deletes: _deletes,
-                dependency_template: _dependency_template,
-                template,
-            } = payload.as_ref();
-            deferred_template_contains_redacted_secret(template)
+            deferred_template_contains_redacted_secret(&payload.template)
+                || payload.deletes.iter().any(|old| {
+                    old.previous_attributes
+                        .values()
+                        .any(contains_redacted_secret)
+                })
         }
     }
 }
@@ -4506,12 +4511,44 @@ fn redact_deferred_template<S: Clone>(
 pub fn redact_secrets_in_effect<S: Clone>(
     effect: &crate::effect::Effect<S>,
 ) -> Result<crate::effect::Effect<S, SnapshotLeaf>, SerializationError> {
+    redact_secrets_in_effect_with_history(effect, &HashMap::new())
+}
+
+fn redact_historical_attributes<'a>(
+    attributes: &HashMap<String, SnapshotValue>,
+    mut guide: impl FnMut(&str) -> Option<&'a SnapshotValue>,
+) -> Result<HashMap<String, SnapshotValue>, SerializationError> {
+    redact_attrs_with_guide(attributes.iter(), |key, value| match guide(key) {
+        Some(shape) => redact_using_redacted_shape(value, shape),
+        None => redact_snapshot_secrets(value),
+    })
+}
+
+fn redact_secrets_in_effect_with_history<S: Clone>(
+    effect: &crate::effect::Effect<S>,
+    historical: &HashMap<crate::resource::ResourceId, crate::resource::SnapshotState>,
+) -> Result<crate::effect::Effect<S, SnapshotLeaf>, SerializationError> {
     let mut redacted = effect.try_map_value_stage(
         |_, _, value| redact_secrets_in_value(value),
         |_, value| redact_secrets_in_value(value),
         redact_deferred_template,
     )?;
     match &mut redacted {
+        crate::effect::Effect::DeferredReplace(payload) => {
+            for old in payload.unadmitted_request_mut().deletes.iter_mut() {
+                // Deposed snapshots carry their own persisted secret shape.
+                let historical = old
+                    .generation
+                    .is_current()
+                    .then(|| historical.get(old.id.as_inner()))
+                    .flatten();
+                old.previous_attributes =
+                    redact_historical_attributes(&old.previous_attributes, |key| {
+                        historical.and_then(|state| state.attributes.get(key))
+                    })?;
+            }
+        }
+
         crate::effect::Effect::Update { from, .. } => {
             **from = redact_secrets_in_state(from)?;
         }
@@ -4588,7 +4625,7 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
         .effects()
         .iter()
         .map(|effect| {
-            let mut effect = match effect {
+            let effect = match effect {
                 crate::effect::Effect::Create(resource) => {
                     match reusable_resource(&resource.id) {
                         Some(planned) => crate::effect::Effect::Create(resource.replace_inner(
@@ -4603,7 +4640,17 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
                     to,
                     changed_attributes,
                 } => crate::effect::Effect::Update {
-                    from: Box::new(redact_secrets_in_state(from)?),
+                    from: Box::new(crate::resource::SnapshotState {
+                        attributes: redact_historical_attributes(&from.attributes, |key| {
+                            match historical.get(&from.id) {
+                                Some(state) => state.attributes.get(key),
+                                None => planned_resources
+                                    .get(&from.id)
+                                    .and_then(|resource| resource.attributes.get(key)),
+                            }
+                        })?,
+                        ..from.as_ref().clone()
+                    }),
                     identifier: identifier.clone(),
                     to: match reusable_resource(&to.id) {
                         Some(planned) => {
@@ -4622,35 +4669,37 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
                 | crate::effect::Effect::ReleaseListKeys { .. }
                 | crate::effect::Effect::Wait { .. }
                 | crate::effect::Effect::DeferredCreate(_)
-                | crate::effect::Effect::DeferredReplace(_) => redact_secrets_in_effect(effect)?,
-            };
-            if let crate::effect::Effect::Update { from, .. } = &mut effect {
-                if let Some(state) = historical.get(&from.id) {
-                    for (key, value) in &mut from.attributes {
-                        let Some(shape) = state.attributes.get(key) else {
-                            continue;
-                        };
-                        *value = redact_using_redacted_shape(value, shape)?;
-                    }
-                } else if let Some(guide) = planned_resources.get(&from.id) {
-                    let attributes =
-                        redact_attrs_with_guide(from.attributes.iter(), |key, value| match guide
-                            .attributes
-                            .get(key)
-                        {
-                            Some(shape) => redact_using_redacted_shape(value, shape),
-                            None => redact_snapshot_secrets(value),
-                        })?;
-                    **from = crate::resource::State {
-                        attributes,
-                        ..from.as_ref().clone()
-                    };
+                | crate::effect::Effect::DeferredReplace(_) => {
+                    redact_secrets_in_effect_with_history(effect, historical)?
                 }
-            }
+            };
             Ok(effect)
         })
         .collect::<Result<_, SerializationError>>()?;
     let mut redacted = plan.clone().with_value_stage(redacted_effects);
+
+    for old in &mut redacted.replacement_inputs.old_instances {
+        // Only current-generation snapshots can use current-row evidence or
+        // the desired secret shape when historical evidence is absent.
+        // Deposed values already carry their own persisted secret shape.
+        let historical = old
+            .instance
+            .generation()
+            .is_current()
+            .then(|| historical.get(old.instance.id()))
+            .flatten();
+        let desired = old
+            .instance
+            .generation()
+            .is_current()
+            .then(|| planned_resources.get(old.instance.id()))
+            .flatten();
+        old.attributes = redact_historical_attributes(&old.attributes, |key| {
+            historical
+                .and_then(|state| state.attributes.get(key))
+                .or_else(|| desired.and_then(|resource| resource.attributes.get(key)))
+        })?;
+    }
 
     let create_ids = create_effect_ids(&redacted);
     for metadata in redacted.replace_display_mut() {
@@ -4924,6 +4973,28 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<
                     changed_attributes: changed_attributes.clone(),
                 })
             }
+            Effect::DeferredReplace(payload) => {
+                let mut payload = payload.clone();
+                for old in payload.unadmitted_request_mut().deletes.iter_mut() {
+                    // Current-row verification has no evidence for a deposed
+                    // generation. Preserve its own persisted secret hashes.
+                    if old.generation.is_current()
+                        && old
+                            .previous_attributes
+                            .values()
+                            .any(contains_redacted_secret)
+                    {
+                        let (redacted, verified) = state_evidence(old.id.as_inner())?;
+                        let saved = crate::resource::SnapshotState::existing(
+                            old.id.as_inner().clone(),
+                            old.previous_attributes.clone(),
+                        );
+                        old.previous_attributes =
+                            restore_state(&saved, redacted, verified)?.attributes;
+                    }
+                }
+                Ok(Effect::DeferredReplace(payload))
+            }
             Effect::Read { .. }
             | Effect::Create(_)
             | Effect::ResumeCreate { .. }
@@ -4934,11 +5005,23 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. }
             | Effect::Wait { .. }
-            | Effect::DeferredCreate(_)
-            | Effect::DeferredReplace(_) => Ok(effect.clone()),
+            | Effect::DeferredCreate(_) => Ok(effect.clone()),
         })
         .collect::<Result<Vec<_>, SecretRehydrationSiteError>>()?;
     *out.effects_mut() = effects;
+
+    for old in &mut out.replacement_inputs.old_instances {
+        if old.instance.generation().is_current()
+            && old.attributes.values().any(contains_redacted_secret)
+        {
+            let (redacted, verified) = state_evidence(old.instance.id())?;
+            let saved = crate::resource::SnapshotState::existing(
+                old.instance.id().clone(),
+                old.attributes.clone(),
+            );
+            old.attributes = restore_state(&saved, redacted, verified)?.attributes;
+        }
+    }
 
     let create_ids = create_effect_ids(&out);
     for metadata in out.replace_display_mut() {
@@ -15265,7 +15348,7 @@ mod tests {
         permanent_name_override: Option<crate::plan::PermanentNameOverride>,
     ) -> crate::plan::Plan {
         use crate::effect::ChangedCreateOnly;
-        use crate::plan::{ReplacementDelete, ReplacementGroup};
+        use crate::plan::ReplacementGroup;
         use crate::resource::{
             ExpandedDirectives as Directives, ExpandedResource as Resource, ResolvedResource,
             ResolvedResourceId, ResourceId,
@@ -15276,24 +15359,34 @@ mod tests {
 
         let mut plan = crate::plan::Plan::new();
         plan.add_replacement(ReplacementGroup {
-            create: ResolvedResource::new(create.with_dependency_phase(())),
-            delete: ReplacementDelete {
-                id: ResolvedResourceId::new(id.clone()),
-                identifier: crate::effect::fixture_applied_identifier("bucket-old"),
-                directives: Directives::default(),
-                binding: Some(absolute_binding("bucket")),
-                dependencies: Default::default(),
-                explicit_dependencies: Default::default(),
-            },
-            create_before_destroy: true,
             changed_create_only: ChangedCreateOnly::new(vec!["bucket_name".to_string()])
                 .expect("test replacement has a create-only attribute"),
             cascade_ref_hints: vec![("vpc_id".to_string(), "vpc.id".to_string())],
-            temporary_name: None,
-            permanent_name_override,
             consumer_updates: Default::default(),
-            previous_attributes: crate::test_support::snapshot_attributes(previous_attributes),
+            replacement: {
+                let mut old = crate::effect::DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
+                    blocked_by_updates: Default::default(),
+                    previous_attributes: Default::default(),
+                    id: ResolvedResourceId::new(id.clone()),
+                    identifier: crate::effect::fixture_applied_identifier("bucket-old"),
+                    directives: Directives::default(),
+                    binding: Some(absolute_binding("bucket")),
+                    dependencies: Default::default(),
+                    explicit_dependencies: Default::default(),
+                };
+                old.previous_attributes =
+                    crate::test_support::snapshot_attributes(previous_attributes);
+                crate::test_support::checked_replacement(
+                    ResolvedResource::new(create.with_dependency_phase(())),
+                    old,
+                    true,
+                )
+            },
         });
+        if let Some(override_) = permanent_name_override {
+            plan.permanent_name_overrides.push(override_);
+        }
         plan
     }
 
@@ -15370,6 +15463,67 @@ mod tests {
                 crate::resource::SnapshotLeaf::RedactedSecret { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn saved_plan_replacement_history_uses_desired_secret_shape_without_history() {
+        use crate::resource::ExpandedResource as Resource;
+
+        let previous = Value::Concrete(ConcreteValue::String("previous-private-token".into()));
+        let desired = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "desired-private-token".into(),
+            )))
+            .into(),
+        ));
+        let public = Value::Concrete(ConcreteValue::String("public-value".into()));
+        for (plaintext, secret_shape) in [
+            (previous.clone(), desired.clone()),
+            (
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("token".into(), previous.clone()),
+                    ("public".into(), public.clone()),
+                ]))),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("token".into(), desired.clone()),
+                    ("public".into(), public.clone()),
+                ]))),
+            ),
+            (
+                Value::Concrete(ConcreteValue::List(vec![previous, public.clone()])),
+                Value::Concrete(ConcreteValue::List(vec![desired, public.clone()])),
+            ),
+        ] {
+            let plan = replacement_plan_with_previous_attributes(
+                HashMap::from([
+                    ("settings".into(), plaintext),
+                    ("ordinary".into(), public.clone()),
+                ]),
+                None,
+            );
+            let guide = Resource::new("aws.s3.Bucket", "bucket")
+                .with_attribute("settings", secret_shape)
+                .to_snapshot();
+            let saved = redact_secrets_in_plan_with_desired_and_historical(
+                &plan,
+                &HashMap::from([(guide.id.clone(), guide)]),
+                &HashMap::new(),
+            )
+            .expect("desired secret shapes protect replacement history");
+
+            for rendered in [serde_json::to_string(&saved).unwrap(), format!("{saved:?}")] {
+                assert!(!rendered.contains("previous-private-token"), "{rendered}");
+                assert!(!rendered.contains("desired-private-token"), "{rendered}");
+            }
+            assert!(!saved.replacement_inputs.old_instances.is_empty());
+            for old in &saved.replacement_inputs.old_instances {
+                assert!(contains_redacted_secret(&old.attributes["settings"]));
+                assert_eq!(old.attributes["ordinary"], public.to_snapshot());
+            }
+            assert!(contains_redacted_secret(
+                &saved.replace_display[0].previous_attributes["settings"]
+            ));
+        }
     }
 }
 

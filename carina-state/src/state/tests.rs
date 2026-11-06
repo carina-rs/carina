@@ -112,7 +112,7 @@ fn create_attempt_for_test(id: ResourceId) -> carina_core::provider::CreateAttem
                 .check_inputs(&schemas, &HashMap::new())
                 .expect("fixture inputs discharge");
             let (create, _cancellation) =
-                carina_core::executor::dispatch_prepared_create(&provider, prepared);
+                carina_core::executor::dispatch_create(&provider, prepared);
             let mut create = std::pin::pin!(create);
             assert!(
                 create

@@ -1057,6 +1057,9 @@ pub enum AppError {
     #[error(transparent)]
     ResolvedResource(Box<carina_core::resource::ResolvedResourceError>),
 
+    #[error(transparent)]
+    ReplacementAdmission(Box<carina_core::replacement::ReplacementAdmissionError>),
+
     /// Persisted current state did not agree with the validated move source.
     #[error(transparent)]
     CurrentMoveRouting(#[from] carina_core::differ::CurrentMoveRoutingMismatch),
@@ -1577,6 +1580,12 @@ pub fn format_error_with_source_chain(error: &(dyn std::error::Error + 'static))
 impl From<carina_core::resource::ResolvedResourceError> for AppError {
     fn from(error: carina_core::resource::ResolvedResourceError) -> Self {
         Self::ResolvedResource(Box::new(error))
+    }
+}
+
+impl From<carina_core::replacement::ReplacementAdmissionError> for AppError {
+    fn from(error: carina_core::replacement::ReplacementAdmissionError) -> Self {
+        Self::ReplacementAdmission(Box::new(error))
     }
 }
 

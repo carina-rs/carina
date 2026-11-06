@@ -43,7 +43,7 @@ fn render_plan(fixture: &str, detail: DetailLevel) -> String {
         provider_router_for_plan(&runtime, &fp.plan).expect("fixture mock inputs must be valid");
     format_plan_with_delete_instances(
         ColorMode::Plain,
-        &fp.plan,
+        &fp.plan.clone().admit(&fp.schemas).unwrap(),
         &summary,
         detail,
         &delete_attributes,
@@ -67,7 +67,7 @@ fn render_destroy_plan(fixture: &str, detail: DetailLevel) -> String {
         provider_router_for_plan(&runtime, &fp.plan).expect("fixture mock inputs must be valid");
     format_destroy_plan_with_delete_instances(
         ColorMode::Plain,
-        &fp.plan,
+        &fp.plan.clone().admit(&fp.schemas).unwrap(),
         detail,
         &delete_attributes,
         &provider,

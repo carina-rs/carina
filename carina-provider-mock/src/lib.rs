@@ -2008,9 +2008,9 @@ mod tests {
 
     async fn dispatch_mock_create(
         provider: &MockProvider,
-        id: ResourceId,
         resource: Resource,
     ) -> Result<CreateOutcome, CreateFailure> {
+        let id = resource.id.clone();
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
         let schemas = carina_core::schema::SchemaRegistry::new();
@@ -2039,7 +2039,7 @@ mod tests {
                     .check_inputs(&schemas, &std::collections::HashMap::new())
                     .expect("fixture inputs discharge");
                 let (create, _cancellation) =
-                    carina_core::executor::dispatch_prepared_create(provider, prepared);
+                    carina_core::executor::dispatch_create(provider, prepared);
                 create.await
             },
         )
@@ -2130,11 +2130,10 @@ mod tests {
                     .build()
                     .unwrap();
                 barrier.wait();
-                let id = ResourceId::with_provider_identity("mock", "test.resource", "same", None);
                 let resource = Resource::with_provider("mock", "test.resource", "same", None)
                     .with_attribute("name", string_value("same"));
                 runtime
-                    .block_on(dispatch_mock_create(&provider, id, resource))
+                    .block_on(dispatch_mock_create(&provider, resource))
                     .map(CreateOutcome::into_kind)
                     .map_err(|error| Box::new(CreateFailure::into_kind(error)))
             })
@@ -2196,17 +2195,11 @@ mod tests {
                             "worker-{worker}-{item}"
                         ))
                         .unwrap();
-                        let id = ResourceId::with_provider_identity(
-                            "mock",
-                            "test.resource",
-                            identity.clone(),
-                            None,
-                        );
                         let resource =
                             Resource::with_provider("mock", "test.resource", identity, None)
                                 .with_attribute("name", string_value("transaction"));
                         runtime
-                            .block_on(dispatch_mock_create(&provider, id, resource))
+                            .block_on(dispatch_mock_create(&provider, resource))
                             .unwrap();
                     }
                 });
@@ -2278,13 +2271,6 @@ mod tests {
             )
             .create_provider();
             let identity = format!("create-{mode}");
-            let id = ResourceId::with_provider_identity(
-                "mock",
-                "test.resource",
-                carina_core::resource::ResourceIdentity::try_from(identity.clone())
-                    .expect("fixture identity is non-empty"),
-                None,
-            );
             let resource = Resource::with_provider(
                 "mock",
                 "test.resource",
@@ -2294,7 +2280,7 @@ mod tests {
             )
             .with_attribute("name", string_value(mode));
             let result = runtime
-                .block_on(dispatch_mock_create(&provider, id, resource))
+                .block_on(dispatch_mock_create(&provider, resource))
                 .map(CreateOutcome::into_kind)
                 .map_err(CreateFailure::into_kind);
             match (expected, result) {
@@ -2353,11 +2339,7 @@ mod tests {
         let resource = Resource::with_provider("mock", "test.resource", "resume-modes", None)
             .with_attribute("name", string_value("resume-modes"));
         let pending = match runtime
-            .block_on(dispatch_mock_create(
-                &provider,
-                id.clone(),
-                resource.clone(),
-            ))
+            .block_on(dispatch_mock_create(&provider, resource.clone()))
             .map(CreateOutcome::into_kind)
             .map_err(CreateFailure::into_kind)
         {
@@ -2691,7 +2673,7 @@ mod tests {
             .unwrap();
 
         runtime
-            .block_on(dispatch_mock_create(&provider, id.clone(), resource))
+            .block_on(dispatch_mock_create(&provider, resource))
             .expect("create should save mock v2 state");
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
@@ -2736,7 +2718,7 @@ mod tests {
             .unwrap();
 
         runtime
-            .block_on(dispatch_mock_create(&provider, id.clone(), resource))
+            .block_on(dispatch_mock_create(&provider, resource))
             .expect("create should persist the write-only request value");
         let state = runtime
             .block_on(provider.read(
@@ -2822,7 +2804,7 @@ mod tests {
             .unwrap();
 
         runtime
-            .block_on(dispatch_mock_create(&provider, id.clone(), resource))
+            .block_on(dispatch_mock_create(&provider, resource))
             .expect("create should save versioned mock state");
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
@@ -2880,7 +2862,7 @@ mod tests {
             .unwrap();
 
         let read = runtime.block_on(async {
-            dispatch_mock_create(&provider, id.clone(), resource)
+            dispatch_mock_create(&provider, resource)
                 .await
                 .expect("create succeeds");
             provider
@@ -2963,7 +2945,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            dispatch_mock_create(&provider, id.clone(), resource)
+            dispatch_mock_create(&provider, resource)
                 .await
                 .expect("create should succeed");
 
@@ -3014,13 +2996,9 @@ mod tests {
                         carina_core::differ::finalize_update_request(identifier.clone(), request)
                             .check_inputs(&schemas, &std::collections::HashMap::new())
                             .expect("fixture inputs discharge");
-                    carina_core::executor::dispatch_prepared_update(
-                        &provider,
-                        &identifier,
-                        prepared,
-                    )
-                    .await
-                    .expect("update should succeed");
+                    carina_core::executor::dispatch_update(&provider, prepared)
+                        .await
+                        .expect("update should succeed");
 
                     provider
                         .delete(&id, &identifier, delete_request_without_schema())
@@ -3064,7 +3042,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            dispatch_mock_create(&provider, id.clone(), resource)
+            dispatch_mock_create(&provider, resource)
                 .await
                 .expect("create should succeed");
             fs::write(&log_path, "").expect("clear create log");
@@ -3134,7 +3112,6 @@ mod tests {
             MockScope::file(state_file).unwrap(),
         )
         .create_provider();
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "blocked", None);
         let resource = Resource::with_provider("mock", "test.resource", "blocked", None)
             .with_attribute("name", string_value("blocked"));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3143,7 +3120,7 @@ mod tests {
             .unwrap();
 
         let err = runtime
-            .block_on(dispatch_mock_create(&provider, id, resource))
+            .block_on(dispatch_mock_create(&provider, resource))
             .expect_err("create should fail when CARINA_MOCK_CREATE_FAIL_FOR matches");
         assert_eq!(err.to_string(), "create failed and left no resource");
         let message = std::error::Error::source(&err)
@@ -3184,7 +3161,6 @@ mod tests {
             MockScope::file(tmp.path().join("mock-state.json")).unwrap(),
         )
         .create_provider();
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
         let resource = Resource::with_provider("mock", "test.resource", "slow", None)
             .with_attribute("name", string_value("slow"));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3195,7 +3171,7 @@ mod tests {
 
         let (initially_pending, ready_seen, still_pending, released, outcome) =
             runtime.block_on(async {
-                let create = dispatch_mock_create(&provider, id, resource);
+                let create = dispatch_mock_create(&provider, resource);
                 tokio::pin!(create);
                 let mut context = std::task::Context::from_waker(std::task::Waker::noop());
                 let first = create.as_mut().poll(&mut context);
@@ -3244,7 +3220,6 @@ mod tests {
             MockScope::file(tmp.path().join("mock-state.json")).unwrap(),
         )
         .create_provider();
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
         let resource = Resource::with_provider("mock", "test.resource", "slow", None)
             .with_attribute("name", string_value("slow"));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3255,7 +3230,7 @@ mod tests {
 
         let (outcome, elapsed) = runtime.block_on(async {
             let started = tokio::time::Instant::now();
-            let outcome = dispatch_mock_create(&provider, id, resource).await;
+            let outcome = dispatch_mock_create(&provider, resource).await;
             (outcome, started.elapsed())
         });
 

@@ -443,8 +443,7 @@ where
                 &std::collections::HashMap::new(),
             )
             .expect("fixture inputs discharge");
-        let (create, cancellation) =
-            carina_core::executor::dispatch_prepared_create(self, prepared);
+        let (create, cancellation) = carina_core::executor::dispatch_create(self, prepared);
         Box::pin(async move {
             let _cancellation = cancellation;
             create.await
@@ -467,9 +466,7 @@ trait DispatchUpdateForTest: Provider {
                 &std::collections::HashMap::new(),
             )
             .expect("fixture inputs discharge");
-        Box::pin(carina_core::executor::dispatch_prepared_update(
-            self, identifier, prepared,
-        ))
+        Box::pin(carina_core::executor::dispatch_update(self, prepared))
     }
 }
 

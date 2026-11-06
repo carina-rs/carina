@@ -108,7 +108,7 @@ impl App {
             plan.effects().iter().map(Effect::resource_id),
         );
         Self::new(
-            plan,
+            &plan.clone().admit(&schemas).unwrap(),
             &schemas,
             &historical_display,
             None,
@@ -121,7 +121,7 @@ impl App {
     }
 
     pub fn new(
-        plan: &Plan,
+        plan: &carina_core::plan::AdmittedPlan,
         schemas: &SchemaRegistry,
         historical_display: &HistoricalDisplayAttributes,
         prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,

@@ -143,10 +143,12 @@ impl<S: Clone, P: PlanValueKind> EffectWithSource<S, P> {
                 payload.dependency_template.clone(),
             )),
             Effect::DeferredReplace(payload) => {
+                let mapped = Box::new(template(&payload.template)?);
                 Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-                    deletes: payload.deletes.clone(),
+                    request: payload.request.clone().map_target(|_| mapped),
+                    preview: None,
+                    required_children: payload.required_children.clone(),
                     dependency_template: payload.dependency_template.clone(),
-                    template: Box::new(template(&payload.template)?),
                 }))
             }
         })

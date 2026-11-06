@@ -8867,7 +8867,7 @@ mod tests {
                     .check_inputs(&schemas, &std::collections::HashMap::new())
                     .expect("fixture inputs discharge");
                 let (create, _cancellation) =
-                    carina_core::executor::dispatch_prepared_create(&provider, prepared);
+                    carina_core::executor::dispatch_create(&provider, prepared);
                 let mut create = std::pin::pin!(create);
                 assert!(
                     create
@@ -8919,7 +8919,7 @@ mod tests {
                     captured_attempt: None,
                 };
                 let (create, _cancellation) =
-                    carina_core::executor::dispatch_prepared_create(&provider, prepared);
+                    carina_core::executor::dispatch_create(&provider, prepared);
                 let failure = create.await.expect_err("fixture create remains pending");
                 let pending = match failure.into_kind() {
                     CreateFailureKind::InFlight {

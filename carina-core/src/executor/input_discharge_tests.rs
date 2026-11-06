@@ -4,24 +4,30 @@ use crate::input_rules::FinalizedPlan;
 use crate::schema::{InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleScope};
 
 fn schemas(scope: InputRuleScope) -> SchemaRegistry {
+    schemas_with_order(scope, true)
+}
+
+fn schemas_with_order(scope: InputRuleScope, coexisting: bool) -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
-        PatternResourceSchema::new("test")
-            .attribute(
-                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
-            )
-            .attribute(
-                PatternAttributeSchema::optional("value", PatternAttributeType::string()).build(),
-            )
-            .input_rule(InputRule::value(
-                scope,
-                InputPath::new("name").unwrap(),
-                InputRuleCode::new("test.name.not_ipv4").unwrap(),
-                InputPredicate::NotIpv4,
-            ))
-            .validate()
-            .unwrap(),
+        (if coexisting {
+            PatternResourceSchema::new("test").with_coexisting_replacement()
+        } else {
+            PatternResourceSchema::new("test").with_conflicting_replacement()
+        })
+        .attribute(PatternAttributeSchema::optional("name", PatternAttributeType::string()).build())
+        .attribute(
+            PatternAttributeSchema::optional("value", PatternAttributeType::string()).build(),
+        )
+        .input_rule(InputRule::value(
+            scope,
+            InputPath::new("name").unwrap(),
+            InputRuleCode::new("test.name.not_ipv4").unwrap(),
+            InputPredicate::NotIpv4,
+        ))
+        .validate()
+        .unwrap(),
     );
     schemas
 }
@@ -132,24 +138,23 @@ fn replacement_with_delete_dependencies(
     cbd: bool,
     dependencies: crate::resource::PersistedDestroyDependencies,
 ) {
+    let old = DeferredReplaceDelete {
+        id: create.resolved_id(),
+        identifier: AppliedIdentifier::new("old-id").unwrap(),
+        generation: EffectGeneration::Current,
+        previous_attributes: HashMap::new(),
+        directives: Default::default(),
+        binding: create.binding.clone(),
+        dependencies,
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+    };
     plan.add_replacement(crate::plan::ReplacementGroup {
-        delete: crate::plan::ReplacementDelete {
-            id: create.resolved_id(),
-            identifier: AppliedIdentifier::new("old-id").unwrap(),
-            directives: Default::default(),
-            binding: create.binding.clone(),
-            dependencies,
-            explicit_dependencies: Default::default(),
-        },
-        create,
-        create_before_destroy: cbd,
+        replacement: crate::test_support::checked_replacement(create, old, cbd),
         changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["generation".into()])
             .unwrap(),
         cascade_ref_hints: vec![],
-        temporary_name: None,
-        permanent_name_override: None,
         consumer_updates: Default::default(),
-        previous_attributes: HashMap::new(),
     });
 }
 
@@ -367,19 +372,16 @@ async fn run_with_configs(
         UnresolvedResource::from_pre_resolve(source()),
     )]);
     for effect in checked.effects() {
-        if let Some(basic) = effect.as_basic() {
-            let resource = match basic {
-                crate::effect::BasicEffect::Create { resource, .. }
-                | crate::effect::BasicEffect::ResumeCreate { resource, .. } => Some(resource),
-                crate::effect::BasicEffect::Update { to, .. } => Some(to),
-                crate::effect::BasicEffect::Delete { .. } => None,
-            };
-            if let Some(resource) = resource {
-                origins.insert(
-                    resource.resolved_id(),
-                    UnresolvedResource::from_pre_resolve(resource.as_inner().clone()),
-                );
-            }
+        let resource = match effect {
+            Effect::Create(resource) | Effect::ResumeCreate { resource, .. } => Some(resource),
+            Effect::Update { to, .. } => Some(to),
+            _ => None,
+        };
+        if let Some(resource) = resource {
+            origins.insert(
+                resource.resolved_id(),
+                UnresolvedResource::from_pre_resolve(resource.as_inner().clone()),
+            );
         }
     }
     let observer = MockObserver::new();
@@ -543,10 +545,12 @@ async fn input_discharge_violation_does_not_pair_an_unrelated_delete_by_resource
     provider.push_delete(Ok(()));
     let mut plan = Plan::new();
     plan.add(Effect::Create(resources.remove(0)));
-    // The identical ResourceId does not make this a replacement. Only
-    // admitted replacement slot metadata can pair a delete with a create.
+    // The same display identity in a different resource type is an unrelated
+    // row. Only admitted slot/lineage associations may gate its deletion.
+    let mut unrelated_id = consumer().id;
+    unrelated_id.resource_type = "Unrelated".into();
     plan.add(Effect::Delete {
-        id: ResolvedResourceId::new(consumer().id),
+        id: ResolvedResourceId::new(unrelated_id.clone()),
         identifier: AppliedIdentifier::new("old-id").unwrap(),
         generation: EffectGeneration::Current,
         directives: Default::default(),
@@ -583,7 +587,7 @@ async fn input_discharge_violation_does_not_pair_an_unrelated_delete_by_resource
     assert!(
         provider
             .calls()
-            .contains(&("delete".into(), consumer().id.to_string()))
+            .contains(&("delete".into(), unrelated_id.to_string()))
     );
     assert_eq!(result.successfully_deleted.len(), 1);
 }
@@ -836,11 +840,13 @@ fn loop_effect(replace: bool) -> Effect {
     if !replace {
         return Effect::DeferredCreate(payload);
     }
-    Effect::DeferredReplace(Box::new(crate::effect::DeferredReplacePayload {
-        deletes: NonEmptyDeletes::try_new(
+    Effect::DeferredReplace(Box::new(crate::effect::DeferredReplacePayload::new(
+        NonEmptyDeletes::try_new(
             (0..2)
                 .map(|index| DeferredReplaceDelete {
                     id: test_resolved_id("test", &format!("children[{index}]")),
+                    generation: EffectGeneration::Current,
+                    previous_attributes: HashMap::new(),
                     identifier: AppliedIdentifier::new(format!("old-{index}")).unwrap(),
                     directives: Default::default(),
                     binding: Some(absolute_binding(&format!("children[{index}]"))),
@@ -851,9 +857,9 @@ fn loop_effect(replace: bool) -> Effect {
                 .collect(),
         )
         .unwrap(),
-        template: payload.template,
-        dependency_template: payload.dependency_template,
-    }))
+        payload.template,
+        payload.dependency_template,
+    )))
 }
 
 #[tokio::test]
@@ -1126,22 +1132,22 @@ async fn input_discharge_default_tags_are_checked_in_the_sent_projection() {
 #[tokio::test]
 async fn input_discharge_genuine_preparation_cycle_releases_no_delete() {
     let schemas = schemas(InputRuleScope::CreateOnly);
-    let mut parent = Resource::new("test", "parent").with_attribute("name", string("valid-parent"));
+    let mut parent = Resource::new("test", "parent")
+        .with_attribute("name", Value::root_resource_ref("child", "name", vec![]));
     parent.binding = Some(absolute_binding("parent"));
+    parent
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("child"));
     let mut child = Resource::new("test", "child")
         .with_attribute("name", Value::root_resource_ref("parent", "name", vec![]));
     child.binding = Some(absolute_binding("child"));
     let resources = resolved_fixture_resources(vec![parent, child]);
     let mut plan = Plan::new();
     replacement(&mut plan, resources[0].clone(), false);
-    replacement_with_delete_dependencies(
-        &mut plan,
-        resources[1].clone(),
-        false,
-        crate::resource::PersistedDestroyDependencies::from_test_dependencies([
-            resources[0].resolved_id()
-        ]),
-    );
+    // Main resolves historical replacement-order cycles at admission. Keep a
+    // genuine value/preparation cycle, which changing replacement order cannot break.
+    replacement(&mut plan, resources[1].clone(), false);
     let current: HashMap<_, _> = resources
         .iter()
         .map(|resource| {
@@ -1311,4 +1317,393 @@ async fn input_discharge_invalid_check_construction_aborts_all_dispatch() {
             .downcast_ref::<InputCheckConstructionError>(),
         Some(InputCheckConstructionError::DuplicateWrite { .. })
     ));
+}
+
+#[test]
+fn round1_rule_bearing_template_keeps_unrelated_delete_and_non_input_edges() {
+    let schemas = schemas(InputRuleScope::CreateOnly);
+    let mut plan = Plan::new();
+    plan.add(loop_effect(true));
+    let checked = FinalizedPlan::new(plan)
+        .check_inputs(&schemas, &HashMap::new())
+        .unwrap();
+    let scheduled = checked.schedule(&HashMap::new());
+    let (scheduled, _, sources) = scheduled.expand_deferred_replacements();
+    let mut effects = scheduled.effects().to_vec();
+    let checks = super::super::input_discharge::ExecutionInputChecks::new(
+        checked.execution_input_checks(),
+        &effects,
+        &sources,
+    )
+    .unwrap();
+    let template = effects
+        .iter()
+        .position(|effect| matches!(effect, Effect::DeferredReplace(_)))
+        .unwrap();
+    let own_deletes = checks.paired[&template].clone();
+    let nodes = super::super::scheduler::PreparationNodes::install(&mut effects, &checks);
+    // A distinct slot can even have the same routed ID as an absorbed delete.
+    // Neither its name nor Effect::Delete alone makes it part of the cycle.
+    let unrelated = effects.len();
+    let mut other = effects[own_deletes[0]].clone();
+    if let Effect::Delete { identifier, .. } = &mut other {
+        *identifier = AppliedIdentifier::new("unrelated-generation").unwrap();
+    }
+    effects.push(other);
+    let non_input = effects.len();
+    effects.push(Effect::Create(resolved(Resource::new(
+        "test",
+        "explicit-prerequisite",
+    ))));
+    let mut deps = HashMap::from([
+        (
+            template,
+            own_deletes
+                .iter()
+                .copied()
+                .chain([unrelated, non_input])
+                .collect(),
+        ),
+        (own_deletes[0], HashSet::from([template])),
+        (own_deletes[1], HashSet::from([template])),
+        (unrelated, HashSet::new()),
+        (non_input, HashSet::new()),
+    ]);
+    nodes.dependencies(&effects, &mut deps);
+    assert_eq!(deps[&template], HashSet::from([unrelated, non_input]));
+    assert!(deps[&own_deletes[0]].contains(&template));
+    assert!(deps[&own_deletes[1]].contains(&template));
+}
+
+#[tokio::test]
+async fn round1_unbound_rule_bearing_replacement_accepts_deleted_anonymous_child_identity() {
+    let (template, bindings, _, child) = anonymous_deferred_collision_fixture();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Child")
+            .with_conflicting_replacement()
+            .attribute(
+                PatternAttributeSchema::optional("identity_input", PatternAttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .input_rule(InputRule::value(
+                InputRuleScope::CreateOnly,
+                InputPath::new("identity_input").unwrap(),
+                InputRuleCode::new("child.not_ipv4").unwrap(),
+                InputPredicate::NotIpv4,
+            ))
+            .validate()
+            .unwrap(),
+    );
+    let payload = crate::test_support::compiled_loop(Box::new(template));
+    let old_absorbed = DeferredReplaceDelete {
+        id: ResolvedResourceId::with_provider_identity("mock", "test.Child", "removed-child", None),
+        identifier: AppliedIdentifier::new("removed-child-id").unwrap(),
+        generation: EffectGeneration::Current,
+        directives: Default::default(),
+        binding: None,
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: Default::default(),
+    };
+    let mut plan = Plan::new();
+    plan.add(Effect::DeferredReplace(Box::new(
+        crate::effect::DeferredReplacePayload::new(
+            NonEmptyDeletes::try_new(vec![old_absorbed.clone()]).unwrap(),
+            payload.template,
+            payload.dependency_template,
+        ),
+    )));
+    plan.add_delete(DeferredReplaceDelete {
+        id: ResolvedResourceId::new(child.id.clone()),
+        identifier: AppliedIdentifier::new("anonymous-old-id").unwrap(),
+        ..old_absorbed.clone()
+    });
+    let current = HashMap::from([
+        (
+            child.id.clone(),
+            Current::from_snapshot(ok_state(&child.id).with_identifier("anonymous-old-id")),
+        ),
+        (
+            old_absorbed.id.as_inner().clone(),
+            Current::from_snapshot(
+                ok_state(old_absorbed.id.as_inner()).with_identifier("removed-child-id"),
+            ),
+        ),
+    ]);
+    let checked = FinalizedPlan::new(plan)
+        .check_inputs(&schemas, &current)
+        .unwrap();
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(ok_state(&child.id)));
+    let input = ExecutionInput {
+        provider_context: crate::parser::LoadedProviderContext::empty_for_test()
+            .as_provider_context()
+            .clone(),
+        plan: &checked,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings,
+        managed_current: current,
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    assert_eq!(
+        (result.success_count, result.failure_count()),
+        (3, 0),
+        "{:?}",
+        observer.events()
+    );
+    let calls = provider.calls();
+    assert!(
+        call_position(&calls, "delete", &child.id.to_string())
+            < call_position(&calls, "create", &child.id.to_string()),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn input_discharge_conflicting_child_in_cbd_parent_window_keeps_old_on_rejection() {
+    for valid in [false, true] {
+        let mut schemas = schemas_with_order(InputRuleScope::CreateOnly, false);
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("Parent")
+                .with_coexisting_replacement()
+                .attribute(
+                    PatternAttributeSchema::provider_populated(
+                        "items",
+                        PatternAttributeType::list(PatternAttributeType::string()),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let parent =
+            Resource::new("Parent", "source").with_absolute_binding(absolute_binding("source"));
+        let parent = ResolvedResource::resolve_raw_fixture(parent.clone(), &schemas).unwrap();
+        let template = crate::parser::DeferredForExpression::new(
+            Some("main.crn".into()),
+            1,
+            "for item in source.items".into(),
+            crate::parser::DeferredForTarget::bound(absolute_binding("children")).unwrap(),
+            Value::root_resource_ref("source", "items", vec![]),
+            crate::parser::ForBinding::Simple("item".into()),
+            crate::resource::Resource::new("test", "children").with_attribute(
+                "name",
+                crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                    LoopSlot::Value,
+                )),
+            ),
+        );
+        let payload = crate::test_support::compiled_loop_with_producers(
+            Box::new(template),
+            vec![
+                parent
+                    .as_inner()
+                    .clone()
+                    .with_dependency_phase(Default::default()),
+            ],
+        );
+        let child_id = test_resolved_id("test", "children[0]");
+        let old = DeferredReplaceDelete {
+            id: child_id.clone(),
+            identifier: AppliedIdentifier::new("old-child").unwrap(),
+            generation: EffectGeneration::Current,
+            directives: Default::default(),
+            binding: Some(absolute_binding("children[0]")),
+            dependencies: crate::test_support::persisted([parent.resolved_id()]),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+            previous_attributes: Default::default(),
+        };
+        let mut plan = Plan::new();
+        replacement(&mut plan, parent.clone(), true);
+        plan.add(Effect::DeferredReplace(Box::new(
+            crate::effect::DeferredReplacePayload::new(
+                NonEmptyDeletes::try_new(vec![old]).unwrap(),
+                payload.template,
+                payload.dependency_template,
+            ),
+        )));
+        let current = HashMap::from([
+            (
+                parent.id.clone(),
+                Current::from_snapshot(ok_state(&parent.id).with_identifier("old-id")),
+            ),
+            (
+                child_id.as_inner().clone(),
+                Current::from_snapshot(ok_state(child_id.as_inner()).with_identifier("old-child")),
+            ),
+        ]);
+        let checked = FinalizedPlan::new(plan)
+            .check_inputs(&schemas, &current)
+            .unwrap();
+        let provider = MockProvider::new();
+        provider.push_create(Ok(State::existing(
+            parent.id.clone(),
+            crate::test_support::snapshot_attributes(HashMap::from([(
+                "items".into(),
+                Value::Concrete(ConcreteValue::List(vec![string(if valid {
+                    "valid-child"
+                } else {
+                    "192.168.123.234"
+                })])),
+            )])),
+        )
+        .with_identifier("new-parent")));
+        if valid {
+            provider.push_delete(Ok(()));
+            provider.push_delete(Ok(()));
+            provider.push_create(Ok(ok_state(child_id.as_inner())));
+        }
+        let observer = MockObserver::new();
+        let input = ExecutionInput {
+            provider_context: crate::parser::LoadedProviderContext::empty_for_test()
+                .as_provider_context()
+                .clone(),
+            plan: &checked,
+            provider_check_inputs: ProviderCheckInputs::Authored,
+            compositions: &[],
+            bindings: ResolvedBindings::default(),
+            managed_current: current,
+            data_source_values: ExecutableDataSourceValues::empty(),
+            normalizer: &NoopNormalizer,
+            provider_configs: &[],
+            factories: &[],
+            schemas: &schemas,
+            parallelism: NonZeroUsize::new(1).unwrap(),
+            precompleted_success_count: 0,
+            checkpoint_sink: ExecutionCheckpointSink::noop(),
+        };
+        let result = completed_result(
+            execute_plan(&provider, input, &observer, uncancelled_shutdown()).await,
+        );
+        let calls = provider.calls();
+        if valid {
+            assert_eq!(
+                (result.success_count, result.failure_count()),
+                (4, 0),
+                "{:?}",
+                observer.events()
+            );
+            let ordered = [
+                call_position(&calls, "create", &parent.id.to_string()),
+                call_position(&calls, "delete", &child_id.to_string()),
+                call_position(&calls, "create", &child_id.to_string()),
+                call_position(&calls, "delete", &parent.id.to_string()),
+            ];
+            assert!(
+                ordered.windows(2).all(|pair| pair[0] < pair[1]),
+                "{calls:?}"
+            );
+        } else {
+            assert_eq!(
+                (result.success_count, result.failure_count()),
+                (1, 1),
+                "{:?}",
+                observer.events()
+            );
+            assert!(matches!(
+                result.failures()[0].kind(),
+                EffectFailureKind::InputRule { .. }
+            ));
+            assert_eq!(calls, vec![("create".into(), parent.id.to_string())]);
+            assert!(result.successfully_deleted.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn input_discharge_identifierless_conflicting_resume_checks_before_old_delete() {
+    for valid in [false, true] {
+        let schemas = schemas_with_order(InputRuleScope::CreateOnly, false);
+        let mut resources = resolved_fixture_resources(vec![source(), consumer()]);
+        let target = resources.remove(1);
+        let pending = persisted_unissued_create_for_executor(&target.id);
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resources.remove(0)));
+        plan.add_resume_create(target.clone(), pending.started_at().clone());
+        plan.add_delete(DeferredReplaceDelete {
+            id: target.resolved_id(),
+            identifier: AppliedIdentifier::new("old-id").unwrap(),
+            generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
+            directives: Default::default(),
+            binding: target.binding.clone(),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+            previous_attributes: Default::default(),
+        });
+        let provider = MockProvider::new();
+        provider.push_create(Ok(State::existing(
+            source().id,
+            crate::test_support::snapshot_attributes(HashMap::from([(
+                "value".into(),
+                string(if valid {
+                    "valid-name"
+                } else {
+                    "192.168.123.234"
+                }),
+            )])),
+        )
+        .with_identifier("source-id")));
+        if valid {
+            provider.push_delete(Ok(()));
+            provider.push_resume(ResumeFixture::Resent);
+        }
+        let (result, events) = run(
+            &provider,
+            plan,
+            &schemas,
+            HashMap::from([(target.id.clone(), Current::CreateInFlight(pending))]),
+            Default::default(),
+            &NoopNormalizer,
+        )
+        .await;
+        let calls = provider.calls();
+        if valid {
+            assert_eq!(
+                (result.success_count, result.failure_count()),
+                (3, 0),
+                "{events:?}"
+            );
+            assert!(
+                call_position(&calls, "delete", &target.id.to_string())
+                    < call_position(&calls, "create", &target.id.to_string()),
+                "{calls:?}"
+            );
+            assert_eq!(
+                provider.captured_create_resources()[1].attributes["name"],
+                string("valid-name")
+            );
+        } else {
+            assert_eq!(
+                (result.success_count, result.failure_count()),
+                (1, 1),
+                "{events:?}"
+            );
+            assert!(matches!(
+                result.failures()[0].kind(),
+                EffectFailureKind::InputRule { .. }
+            ));
+            assert_eq!(calls, vec![("create".into(), source().id.to_string())]);
+            assert!(result.successfully_deleted.is_empty());
+        }
+    }
 }

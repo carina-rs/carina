@@ -67,7 +67,12 @@ impl PlanChangeSummary {
         )
     }
 
-    pub(crate) fn from_reloaded_plan(plan_file: &ReloadedPlanFile) -> Self {
+    pub(crate) fn from_reloaded_plan(
+        plan_file: &ReloadedPlanFile<
+            carina_core::resource::NoPlaceholder,
+            carina_core::plan::AdmittedPlan<carina_core::resource::SavedModuleSource>,
+        >,
+    ) -> Self {
         Self::from_parts(
             plan_file.plan(),
             &[],

@@ -4137,12 +4137,19 @@ impl ResumeFailure {
 /// use carina_core::provider::UpdateAttempt;
 /// let attempt = UpdateAttempt(());
 /// ```
-#[derive(Debug)]
-pub struct UpdateAttempt(());
+pub struct UpdateAttempt {
+    _permit: crate::replacement::UpdatePermit,
+}
+
+impl std::fmt::Debug for UpdateAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateAttempt").finish_non_exhaustive()
+    }
+}
 
 impl UpdateAttempt {
-    pub(crate) fn new() -> Self {
-        Self(())
+    pub(crate) fn new(permit: crate::replacement::UpdatePermit) -> Self {
+        Self { _permit: permit }
     }
 }
 
@@ -4405,6 +4412,68 @@ pub struct ResumeRoutingMismatch {
 pub struct ResumeCreateRequest {
     pending: InFlightCreate,
     request: CreateRequest,
+    authorization: ResumeAuthorization,
+}
+
+#[derive(Debug)]
+enum ResumeAuthorization {
+    Resend(crate::replacement::CreatePermit),
+    Poll(AppliedIdentifier),
+}
+
+/// Poll an already identified create. This request cannot produce an
+/// identifierless resume witness or send permission.
+///
+/// ```compile_fail,E0599
+/// use carina_core::provider::PollCreateRequest;
+/// fn resend(request: PollCreateRequest) {
+///     let (poll, _) = request.into_parts();
+///     poll.resend();
+/// }
+/// ```
+#[derive(Debug)]
+pub struct PollCreateRequest {
+    resumed: ResumedCreate,
+    request: CreateRequest,
+}
+
+impl PollCreateRequest {
+    pub(crate) fn new(
+        pending: InFlightCreate,
+        request: CreateRequest,
+    ) -> Result<Self, ProviderError> {
+        if pending.id() != &request.resource().id {
+            return Err(
+                ProviderError::internal("poll request belongs to another resource")
+                    .for_resource(pending.id().clone()),
+            );
+        }
+        let Some(identifier) = pending.identifier().cloned() else {
+            return Err(ProviderError::internal(
+                "poll-only continuation has no provider identifier",
+            )
+            .for_resource(pending.id().clone()));
+        };
+        Ok(Self {
+            resumed: ResumedCreate {
+                pending,
+                identifier,
+            },
+            request,
+        })
+    }
+
+    pub fn into_parts(self) -> (ResumedCreate, CreateRequest) {
+        (self.resumed, self.request)
+    }
+
+    pub(crate) fn into_resume_request(self) -> ResumeCreateRequest {
+        ResumeCreateRequest {
+            pending: self.resumed.pending,
+            request: self.request,
+            authorization: ResumeAuthorization::Poll(self.resumed.identifier),
+        }
+    }
 }
 
 /// Resume typestate selected from the persisted continuation.
@@ -4468,6 +4537,7 @@ impl Resume {
 #[derive(Debug)]
 pub struct ResumeAttempt {
     pending: InFlightCreate,
+    permit: crate::replacement::CreatePermit,
 }
 
 impl ResumeAttempt {
@@ -4490,6 +4560,7 @@ impl ResumeAttempt {
     pub fn repend(self, token: PendingToken) -> Resume {
         Resume::Unissued(Self {
             pending: self.pending.repend_preserving_identifier(token),
+            permit: self.permit,
         })
     }
 
@@ -4508,6 +4579,7 @@ impl ResumeAttempt {
     pub fn resend(self) -> ResentCreateAttempt {
         ResentCreateAttempt {
             previous: self.pending,
+            _permit: self.permit,
         }
     }
 }
@@ -4653,10 +4725,23 @@ fn identified_from_resume(
 }
 
 impl ResumeCreateRequest {
-    pub(crate) fn new(
+    /// A send-capable continuation needs the same admission permission as a
+    /// fresh create; a persisted token alone grants no resend authority.
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::provider::{CreateRequest, InFlightCreate, Resume, ResumeCreateRequest};
+    /// fn bypass(pending: InFlightCreate, request: CreateRequest) {
+    ///     let (resume, _) = ResumeCreateRequest::new(pending, request).unwrap().into_parts();
+    ///     if let Resume::Unissued(attempt) = resume {
+    ///         let _ = attempt.resend();
+    ///     }
+    /// }
+    /// ```
+    pub fn new(
         pending: InFlightCreate,
-        request: CreateRequest,
+        permit: crate::replacement::CreatePermit,
     ) -> Result<Self, ResumeRoutingMismatch> {
+        let request = permit.request().clone();
         let desired = request.resource().id.clone();
         if pending.id != desired {
             return Err(ResumeRoutingMismatch {
@@ -4664,7 +4749,11 @@ impl ResumeCreateRequest {
                 desired: Box::new(desired),
             });
         }
-        Ok(Self { pending, request })
+        Ok(Self {
+            pending,
+            request,
+            authorization: ResumeAuthorization::Resend(permit),
+        })
     }
 
     /// Construct a checked resume request in cross-crate tests.
@@ -4674,7 +4763,8 @@ impl ResumeCreateRequest {
         pending: InFlightCreate,
         request: CreateRequest,
     ) -> Result<Self, ResumeRoutingMismatch> {
-        Self::new(pending, request)
+        let permit = crate::replacement::create_permit_for_test(request);
+        Self::new(pending, permit)
     }
 
     pub fn id(&self) -> &ResourceId {
@@ -4690,14 +4780,21 @@ impl ResumeCreateRequest {
     }
 
     pub fn into_parts(self) -> (Resume, CreateRequest) {
-        let resume = match self.pending.identifier().cloned() {
-            Some(identifier) => Resume::Issued(ResumedCreate {
+        let resume = match self.authorization {
+            ResumeAuthorization::Poll(identifier) => Resume::Issued(ResumedCreate {
                 pending: self.pending,
                 identifier,
             }),
-            None => Resume::Unissued(ResumeAttempt {
-                pending: self.pending,
-            }),
+            ResumeAuthorization::Resend(permit) => match self.pending.identifier().cloned() {
+                Some(identifier) => Resume::Issued(ResumedCreate {
+                    pending: self.pending,
+                    identifier,
+                }),
+                None => Resume::Unissued(ResumeAttempt {
+                    pending: self.pending,
+                    permit,
+                }),
+            },
         };
         (resume, self.request)
     }
@@ -4711,6 +4808,7 @@ impl ResumeCreateRequest {
 #[derive(Debug)]
 pub struct ResentCreateAttempt {
     previous: InFlightCreate,
+    _permit: crate::replacement::CreatePermit,
 }
 
 impl ResentCreateAttempt {
@@ -11534,8 +11632,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         ))
         .check_inputs(&SchemaRegistry::new(), &HashMap::new())
         .expect("fixture inputs discharge");
-        let (create, _cancellation) =
-            crate::executor::dispatch_prepared_create(&provider, prepared);
+        let (create, _cancellation) = crate::executor::dispatch_create(&provider, prepared);
         let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
@@ -11607,7 +11704,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         ))
         .check_inputs(&SchemaRegistry::new(), &HashMap::new())
         .expect("fixture inputs discharge");
-        let (create, _cancellation) = crate::executor::dispatch_prepared_create(&router, prepared);
+        let (create, _cancellation) = crate::executor::dispatch_create(&router, prepared);
         let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
@@ -13009,7 +13106,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         let prepared = crate::differ::finalize_update_request(identifier.clone(), request)
             .check_inputs(&SchemaRegistry::new(), &HashMap::new())
             .expect("fixture inputs discharge");
-        let state = crate::executor::dispatch_prepared_update(&router, &identifier, prepared)
+        let state = crate::executor::dispatch_update(&router, prepared)
             .await
             .unwrap()
             .into_state_for_writeback();

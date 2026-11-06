@@ -12,6 +12,7 @@ pub(crate) mod value_stage;
 
 #[cfg(test)]
 use crate::resource::Resource;
+use std::collections::HashMap;
 use std::{
     collections::{BTreeSet, HashSet},
     ops::Deref,
@@ -148,7 +149,7 @@ impl EffectInstanceKey {
 /// Unlike [`EffectInstanceKey`], this carries the full [`ResourceId`] so result
 /// accounting cannot conflate resources whose identity strings collide across
 /// providers, types, or provider instances.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DeletedInstanceKey {
     id: ResourceId,
     generation: EffectGeneration,
@@ -203,11 +204,16 @@ pub struct TemporaryName {
 
 /// Delete payload absorbed into [`Effect::DeferredReplace`].
 ///
-/// This carries the current-generation delete fields from [`Effect::Delete`].
+/// This carries old-generation delete fields from [`Effect::Delete`].
 /// Keeping the delete half in a named struct lets the deletes slot grow new
 /// fields later without re-shaping `DeferredReplace` itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeferredReplaceDelete {
+    #[serde(default, skip_serializing_if = "EffectGeneration::is_current")]
+    pub generation: EffectGeneration,
+    /// Prior snapshot retained for replacement naming and recovery.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub previous_attributes: HashMap<String, crate::resource::SnapshotValue>,
     pub id: ResolvedResourceId,
     pub identifier: AppliedIdentifier,
     #[serde(default)]
@@ -248,15 +254,24 @@ impl PriorInstanceDestroyDependencies {
 }
 
 impl DeferredReplaceDelete {
+    /// Identity of the exact current or deposed instance described by this Delete.
+    pub fn instance_key(&self) -> DeletedInstanceKey {
+        DeletedInstanceKey::new(
+            self.id.as_inner().clone(),
+            self.generation.clone(),
+            self.identifier.as_str(),
+        )
+    }
+
     pub fn prior_instance_destroy_dependencies(&self) -> PriorInstanceDestroyDependencies {
         PriorInstanceDestroyDependencies(self.dependencies.clone())
     }
 
-    pub fn to_delete_effect<S>(&self) -> Effect<S> {
+    pub fn to_delete_effect<S, P: crate::resource::PlanValueKind>(&self) -> Effect<S, P> {
         Effect::Delete {
             id: self.id.clone(),
             identifier: self.identifier.clone(),
-            generation: EffectGeneration::Current,
+            generation: self.generation.clone(),
             directives: self.directives.clone(),
             binding: self.binding.clone(),
             dependencies: self.dependencies.clone(),
@@ -291,6 +306,9 @@ impl std::error::Error for EmptyDeletes {}
 pub struct NonEmptyDeletes(NonEmptyVec<DeferredReplaceDelete>);
 
 impl NonEmptyDeletes {
+    pub(crate) fn iter_mut(&mut self) -> std::slice::IterMut<'_, DeferredReplaceDelete> {
+        self.0.as_mut_slice().iter_mut()
+    }
     /// Construct a non-empty absorbed delete list.
     pub fn try_new(deletes: Vec<DeferredReplaceDelete>) -> Result<Self, EmptyDeletes> {
         NonEmptyVec::from_vec(deletes).map(Self).ok_or(EmptyDeletes)
@@ -396,19 +414,222 @@ impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
     }
 }
 
-/// Payload for [`Effect::DeferredReplace`].
-#[derive(Debug, Clone, PartialEq)]
+/// Payload for [`Effect::DeferredReplace`]. Requests remain unadmitted until
+/// individual children have materialized. The preview is display-only evidence.
+/// The request cannot be changed while retaining its admitted preview.
+///
+/// ```compile_fail,E0616
+/// use carina_core::effect::DeferredReplacePayload;
+/// fn change(payload: &mut DeferredReplacePayload) {
+///     payload.request = payload.request.clone();
+/// }
+/// ```
+///
+/// The read-only request view cannot be used to replace its target either:
+///
+/// ```compile_fail,E0594
+/// use carina_core::effect::DeferredReplacePayload;
+/// fn change(payload: &mut DeferredReplacePayload) {
+///     payload.template = payload.template.clone();
+/// }
+/// ```
+#[derive(Debug, Clone)]
 pub struct DeferredReplacePayload<S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
-    pub dependency_template: crate::resource::DeferredDependencyTemplate,
-    /// Pre-apply iterations being destroyed.
-    pub deletes: NonEmptyDeletes,
-    /// The for-expression body, replayed against the upstream state.
-    pub template: Box<DeferredForExpression<S, V, V::Template>>,
+    dependency_template: crate::resource::DeferredDependencyTemplate,
+    request: crate::replacement::ReplacementRequest<Box<DeferredForExpression<S, V, V::Template>>>,
+    preview: Option<crate::replacement::ReplacementOrder>,
+    required_children: Vec<(ResolvedResourceId, String)>,
 }
-
+impl<S: PartialEq, V: PlanValueKind> PartialEq for DeferredReplacePayload<S, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.request == other.request
+            && self.dependency_template == other.dependency_template
+            && self.required_children == other.required_children
+    }
+}
 impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
+    pub fn new(
+        deletes: NonEmptyDeletes,
+        template: Box<DeferredForExpression<S, V, V::Template>>,
+        dependency_template: crate::resource::DeferredDependencyTemplate,
+    ) -> Self
+    where
+        S: Clone,
+    {
+        let mut payload = Self {
+            dependency_template,
+            request: crate::replacement::ReplacementRequest::new(template, deletes),
+            preview: None,
+            required_children: Vec::new(),
+        };
+        // A schema-free default can admit delete-first; a CBD request remains
+        // unchosen until the caller supplies its provider registry.
+        let _ = payload.preflight(&crate::schema::SchemaRegistry::new());
+        payload
+    }
     pub fn id(&self) -> &ResolvedResourceId {
         self.template.deferred_effect_id()
+    }
+    pub fn dependency_template(&self) -> &crate::resource::DeferredDependencyTemplate {
+        &self.dependency_template
+    }
+    pub(crate) fn required_children(&self) -> &[(ResolvedResourceId, String)] {
+        &self.required_children
+    }
+    pub(crate) fn unadmitted_request_mut(
+        &mut self,
+    ) -> &mut crate::replacement::ReplacementRequest<Box<DeferredForExpression<S, V, V::Template>>>
+    {
+        self.preview = None;
+        &mut self.request
+    }
+    pub(crate) fn require_create_first_with_lineage(
+        &mut self,
+        requirements: &HashMap<ResolvedResourceId, String>,
+        lineage: &crate::replacement::ReplacementLineage,
+    ) {
+        self.preview = None;
+        if let Some(dependent) = lineage.required_by(self.id(), requirements) {
+            self.request
+                .require_create_first_in_place(dependent.to_owned());
+        }
+        for old in self.request.deletes.iter() {
+            let target = self.projected_target_id(&old.id);
+            if let Some(dependent) = lineage.required_by(&target, requirements) {
+                if let Some((_, previous)) = self
+                    .required_children
+                    .iter_mut()
+                    .find(|(id, _)| crate::replacement::same_state_row(id, &target))
+                {
+                    *previous = dependent.to_owned();
+                } else {
+                    self.required_children.push((target, dependent.to_owned()));
+                }
+            }
+        }
+    }
+    pub(crate) fn required_by_child(&self, id: &ResolvedResourceId) -> Option<&str> {
+        self.request.required_by().or_else(|| {
+            self.required_children
+                .iter()
+                .find(|(child, _)| crate::replacement::same_state_row(child, id))
+                .map(|(_, dependent)| dependent.as_str())
+        })
+    }
+
+    fn projected_target_id(&self, old: &ResolvedResourceId) -> ResolvedResourceId {
+        let template = self.template.template_resource_id();
+        ResolvedResourceId::with_provider_identity(
+            template.provider.clone(),
+            template.resource_type.clone(),
+            old.identity().clone(),
+            template.provider_instance.clone(),
+        )
+    }
+    pub fn preflight(
+        &mut self,
+        registry: &crate::schema::SchemaRegistry,
+    ) -> Result<(), crate::plan::CreateBeforeDestroyError>
+    where
+        S: Clone,
+    {
+        let per_element = matches!(
+            self.template
+                .template_resource()
+                .directives()
+                .create_before_destroy,
+            crate::resource::LoopDirective::PerElement(_)
+        );
+        self.preview = None;
+        for request in self.preflight_requests() {
+            if per_element && request.required_by().is_none() {
+                continue;
+            }
+            let checked =
+                crate::replacement::resolve_replacement(request, registry)?.into_scheduling();
+            if self
+                .preview
+                .as_ref()
+                .is_none_or(|preview| !preview.is_create_first())
+            {
+                self.preview = Some(checked);
+            }
+        }
+        Ok(())
+    }
+
+    /// Value-free targets for admission of the known replacement graph.
+    /// Their declared dependencies survive even before the iterable expands.
+    pub(crate) fn preflight_requests(
+        &self,
+    ) -> Vec<crate::replacement::ReplacementRequest<crate::resource::ResolvedResource<S, V>>>
+    where
+        S: Clone,
+    {
+        let requested = match self
+            .template
+            .template_resource()
+            .directives()
+            .create_before_destroy
+        {
+            crate::resource::LoopDirective::Resolved(requested) => requested,
+            crate::resource::LoopDirective::PerElement(_) => false,
+        };
+        let mut requests: Vec<
+            crate::replacement::ReplacementRequest<crate::resource::ResolvedResource<S, V>>,
+        > = Vec::new();
+        for old in self.request.deletes.iter() {
+            let target_id = self.projected_target_id(&old.id);
+            let required_by = self.required_by_child(&target_id);
+            if let Some(request) = requests
+                .iter_mut()
+                .find(|request| request.target().resolved_id() == target_id)
+            {
+                let mut deletes = request.deletes.to_vec();
+                deletes.push(old.clone());
+                request.deletes = NonEmptyDeletes::try_new(deletes).expect("existing old instance");
+                continue;
+            }
+            let template = self.template.template_resource().as_resource();
+            let mut directives = crate::resource::Directives::default();
+            directives.create_before_destroy = requested;
+            directives.ignore_changes = template.directives.ignore_changes.clone();
+            let mut resource = template
+                .clone()
+                .with_value_stage(Default::default(), directives)
+                .with_dependency_phase(());
+            resource.id = target_id.into_inner();
+            resource.binding = old.binding.clone();
+            let target = crate::resource::ResolvedResource::from_resolved_parts(
+                resource,
+                self.dependency_template.dependencies(),
+                Default::default(),
+            );
+            let mut request = crate::replacement::ReplacementRequest::new(
+                target,
+                NonEmptyDeletes::try_new(vec![old.clone()]).expect("one old instance"),
+            );
+            if let Some(dependent) = required_by {
+                request = request.require_create_first(dependent);
+            }
+            requests.push(request);
+        }
+        requests
+    }
+    pub fn display_glyph(&self) -> &'static str {
+        match &self.preview {
+            Some(checked) => {
+                Effect::<ModuleSource>::replace_display_glyph(checked.is_create_first())
+            }
+            None => "~",
+        }
+    }
+}
+impl<S, V: PlanValueKind> std::ops::Deref for DeferredReplacePayload<S, V> {
+    type Target =
+        crate::replacement::ReplacementRequest<Box<DeferredForExpression<S, V, V::Template>>>;
+    fn deref(&self) -> &Self::Target {
+        &self.request
     }
 }
 
@@ -417,8 +638,18 @@ impl<S: Serialize + Clone, V: PlanValueKind> Serialize for DeferredReplacePayloa
     where
         Ser: serde::Serializer,
     {
-        let mut state = serializer.serialize_struct("DeferredReplacePayload", 4)?;
+        let mut state = serializer.serialize_struct(
+            "DeferredReplacePayload",
+            4 + usize::from(self.request.required_by().is_some())
+                + usize::from(!self.required_children.is_empty()),
+        )?;
         state.serialize_field("deletes", &self.deletes)?;
+        if !self.required_children.is_empty() {
+            state.serialize_field("required_children", &self.required_children)?;
+        }
+        if let Some(dependent) = self.request.required_by() {
+            state.serialize_field("required_by", dependent)?;
+        }
         state.serialize_field("id", &self.template.deferred_effect_wire_id())?;
         state.serialize_field("template", &self.template)?;
         state.serialize_field("dependency_template", &self.dependency_template)?;
@@ -437,6 +668,10 @@ impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
         #[serde(bound(deserialize = "S: serde::de::DeserializeOwned, V: PlanValueKind"))]
         struct Wire<S, V: PlanValueKind> {
             deletes: NonEmptyDeletes,
+            #[serde(default)]
+            required_by: Option<String>,
+            #[serde(default)]
+            required_children: Vec<(ResolvedResourceId, String)>,
             id: ResolvedResourceId,
             template: Box<DeferredForExpression<S, V, V::Template>>,
             dependency_template: crate::resource::DeferredDependencyTemplate,
@@ -444,15 +679,22 @@ impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
 
         let Wire {
             deletes,
+            required_by,
+            required_children,
             id,
             template,
             dependency_template,
         } = Wire::deserialize(deserializer)?;
         validate_deferred_effect_id::<De::Error, S, V>(&id, &template)?;
+        let mut request = crate::replacement::ReplacementRequest::new(template, deletes);
+        if let Some(dependent) = required_by {
+            request = request.require_create_first(dependent);
+        }
         Ok(Self {
-            deletes,
-            template,
+            request,
             dependency_template,
+            required_children,
+            preview: None,
         })
     }
 }
@@ -1168,7 +1410,7 @@ pub enum EffectWithSource<S, V: PlanValueKind = NoPlaceholder> {
     /// Stop treating omitted keys of a keyed partial-update list as authored.
     ///
     /// This effect is applied only to locked local state. It is deliberately
-    /// excluded from [`BasicEffect`] so it cannot enter a provider call path.
+    /// excluded from scheduled basic effects so it cannot enter a provider call path.
     ReleaseListKeys {
         id: ResolvedResourceId,
         attribute: String,
@@ -1529,7 +1771,14 @@ impl UnresolvedSavedEffect {
                 Effect::DeferredCreate(payload)
             }
             Self::DeferredReplace(mut payload) => {
-                payload.template.resolve_template_ignore_changes(schemas)?;
+                payload.preview = None;
+                payload
+                    .request
+                    .template
+                    .resolve_template_ignore_changes(schemas)?;
+                payload
+                    .preflight(schemas)
+                    .map_err(crate::resource::ResolvedResourceError::Replacement)?;
                 Effect::DeferredReplace(payload)
             }
         })
@@ -1617,14 +1866,16 @@ impl<V: PlanValueKind> From<Effect<ModuleSource, V>> for Effect<SavedModuleSourc
             }),
             Effect::DeferredReplace(payload) => {
                 let DeferredReplacePayload {
-                    deletes,
-                    template,
+                    request,
                     dependency_template,
+                    preview: _,
+                    required_children,
                 } = *payload;
                 Self::DeferredReplace(Box::new(DeferredReplacePayload {
-                    deletes,
+                    request: request.map_target(|template| Box::new((*template).into())),
                     dependency_template,
-                    template: Box::new((*template).into()),
+                    preview: None,
+                    required_children,
                 }))
             }
         }
@@ -1637,59 +1888,11 @@ impl<S, V: PlanValueKind> AsRef<EffectWithSource<S, V>> for EffectWithSource<S, 
     }
 }
 
-/// A type-level narrowing of [`Effect`] to the variants the basic
-/// executor (`execute_basic_effect`) actually handles: `Create`,
-/// `Update`, and `Delete`.
-///
-/// The basic executor was previously typed on `&Effect` and used a
-/// `_ => unreachable!("execute_basic_effect called with non-basic
-/// effect")` arm to reject `Read`/`Import`/`Remove`/`Move`/
-/// `ReleaseListKeys`/`Wait`. Callers' filters were the *only* thing keeping non-basic
-/// effects out; a single missed filter (#3164) panicked apply at
-/// runtime and left the state lock acquired.
-///
-/// `BasicEffect` makes that contract live in the type system instead.
-/// The only way to obtain one is [`Effect::as_basic`], which returns
-/// `None` for every non-basic variant. `execute_basic_effect` takes
-/// `BasicEffect<'a>` directly and exhaustively matches its three arms —
-/// no `unreachable!()` is needed, and adding a new `Effect` variant
-/// won't compile until the call sites decide whether the variant is
-/// "basic" or routed elsewhere.
-///
-/// Variants borrow from the source `&'a Effect` so the basic executor
-/// can still forward the original effect into `ExecutionEvent::*`
-/// observer calls.
-#[derive(Debug)]
-pub enum BasicEffect<'a, S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
-    Create {
-        effect: &'a EffectWithSource<S, V>,
-        resource: &'a ResolvedResource<S, V>,
-    },
-    ResumeCreate {
-        effect: &'a EffectWithSource<S, V>,
-        resource: &'a ResolvedResource<S, V>,
-    },
-    Update {
-        effect: &'a EffectWithSource<S, V>,
-        from: &'a crate::resource::SnapshotState,
-        identifier: &'a AppliedIdentifier,
-        to: &'a ResolvedResource<S, V>,
-        changed_attributes: &'a [String],
-    },
-    Delete {
-        effect: &'a EffectWithSource<S, V>,
-        id: &'a ResourceId,
-        identifier: &'a AppliedIdentifier,
-        generation: &'a EffectGeneration,
-        directives: &'a Directives,
-    },
-}
-
 /// Type-level capability for applying a keyed-list release to locked state.
 ///
 /// The fields are private and this value can only be minted by
 /// [`Effect::as_release_list_keys`]. State writeback accepts this type rather
-/// than `&Effect`, while provider executors accept [`BasicEffect`]; the two
+/// than `&Effect`, while provider executors accept scheduled basic effects; the two
 /// paths are disjoint by construction.
 #[derive(Debug, Clone, Copy)]
 pub struct ReleaseListKeysEffect<'a> {
@@ -1714,21 +1917,6 @@ impl<'a> ReleaseListKeysEffect<'a> {
 
     pub fn key_field(self) -> &'a FieldName {
         self.key_field
-    }
-}
-
-impl<'a, S, V: PlanValueKind> BasicEffect<'a, S, V> {
-    /// Returns the source `&Effect` this `BasicEffect` was narrowed
-    /// from. Used by `execute_basic_effect` to forward the original
-    /// effect to `ExecutionEvent::*` observer calls without storing it
-    /// twice.
-    pub fn as_effect(&self) -> &'a EffectWithSource<S, V> {
-        match *self {
-            BasicEffect::Create { effect, .. }
-            | BasicEffect::ResumeCreate { effect, .. }
-            | BasicEffect::Update { effect, .. }
-            | BasicEffect::Delete { effect, .. } => effect,
-        }
     }
 }
 
@@ -1986,6 +2174,8 @@ impl EffectWithSource<ModuleSource> {
             (
                 Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
                     NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                        generation: crate::effect::EffectGeneration::Current,
+                        previous_attributes: Default::default(),
                         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                             "route53.Record",
                             "validation_records[0]"
@@ -2025,82 +2215,7 @@ impl<S, V: PlanValueKind> EffectWithSource<S, V> {
             Effect::ReleaseListKeys { .. } => "!",
             Effect::Wait { .. } => ">",
             Effect::DeferredCreate(_) => "+",
-            Effect::DeferredReplace(_) => "+/-",
-        }
-    }
-
-    /// Narrow this effect to a [`BasicEffect`] if it is one of the
-    /// variants the basic executor handles (`Create`, `Update`,
-    /// `Delete`). Returns `None` for `Read`, `Import`,
-    /// `Remove`, `Move`, `ReleaseListKeys`, and `Wait` — those route through other
-    /// executor paths or are state-only (applied by the CLI's
-    /// `execute_state_only_effects` step).
-    ///
-    /// This is the *only* way to construct a `BasicEffect`, so the
-    /// basic executor's "this is a Create/Update/Delete" contract
-    /// lives in the type system rather than in caller-side filters.
-    /// See [`BasicEffect`] for the rationale (#3164).
-    ///
-    /// Guard: `BasicEffect` has no `From<&Effect>` or other public
-    /// constructor — callers must route through `as_basic()` and
-    /// handle the `None` case. A bare `&Effect` does not coerce to
-    /// `BasicEffect`:
-    ///
-    /// ```compile_fail,E0277
-    /// use carina_core::effect::{BasicEffect, Effect};
-    /// use carina_core::resource::{ResolvedResource, Resource};
-    /// let effect: Effect = Effect::Create(ResolvedResource::new(Resource::new("test", "x").into_value_snapshot()));
-    /// // Was: a missed filter could pass a non-basic `&Effect` straight
-    /// // into `execute_basic_effect` and trip `unreachable!()` at apply
-    /// // time (carina#3164). The conversion no longer exists.
-    /// let _: BasicEffect = (&effect).into();
-    /// ```
-    pub fn as_basic(&self) -> Option<BasicEffect<'_, S, V>> {
-        match self {
-            Effect::Create(resource) => Some(BasicEffect::Create {
-                effect: self,
-                resource,
-            }),
-            Effect::ResumeCreate {
-                resource,
-                started_at: _started_at,
-            } => Some(BasicEffect::ResumeCreate {
-                effect: self,
-                resource,
-            }),
-            Effect::Update {
-                from,
-                identifier,
-                to,
-                changed_attributes,
-            } => Some(BasicEffect::Update {
-                effect: self,
-                from,
-                identifier,
-                to,
-                changed_attributes,
-            }),
-            Effect::Delete {
-                id,
-                identifier,
-                generation,
-                directives,
-                ..
-            } => Some(BasicEffect::Delete {
-                effect: self,
-                id,
-                identifier,
-                generation,
-                directives,
-            }),
-            Effect::Read { .. }
-            | Effect::Import { .. }
-            | Effect::Remove { .. }
-            | Effect::Move { .. }
-            | Effect::ReleaseListKeys { .. }
-            | Effect::Wait { .. }
-            | Effect::DeferredCreate(_)
-            | Effect::DeferredReplace(_) => None,
+            Effect::DeferredReplace(payload) => payload.display_glyph(),
         }
     }
 
@@ -2206,6 +2321,41 @@ impl<S, V: PlanValueKind> EffectWithSource<S, V> {
             Effect::DeferredCreate(payload) => payload.id(),
             Effect::DeferredReplace(payload) => payload.id(),
         }
+    }
+
+    /// Capture a delete endpoint with the history of that exact generation.
+    pub(crate) fn to_delete_payload(
+        &self,
+        previous: impl FnOnce(&DeletedInstanceKey) -> HashMap<String, SnapshotValue>,
+    ) -> Option<DeferredReplaceDelete> {
+        let Self::Delete {
+            id,
+            identifier,
+            generation,
+            directives,
+            binding,
+            dependencies,
+            explicit_dependencies,
+            blocked_by_updates,
+        } = self
+        else {
+            return None;
+        };
+        Some(DeferredReplaceDelete {
+            id: id.clone(),
+            identifier: identifier.clone(),
+            generation: generation.clone(),
+            directives: directives.clone(),
+            binding: binding.clone(),
+            dependencies: dependencies.clone(),
+            explicit_dependencies: explicit_dependencies.clone(),
+            blocked_by_updates: blocked_by_updates.clone(),
+            previous_attributes: previous(&DeletedInstanceKey::new(
+                id.as_inner().clone(),
+                generation.clone(),
+                identifier.as_str(),
+            )),
+        })
     }
 
     /// Returns the effect's resource identity, not its typed scheduling key.
@@ -2375,13 +2525,7 @@ impl<S, V: PlanValueKind> EffectWithSource<S, V> {
             Effect::DeferredReplace(payload) => payload
                 .deletes
                 .iter()
-                .map(|delete| {
-                    DeletedInstanceKey::new(
-                        delete.id.clone().into_inner(),
-                        EffectGeneration::Current,
-                        delete.identifier.to_string(),
-                    )
-                })
+                .map(DeferredReplaceDelete::instance_key)
                 .collect(),
         }
     }
@@ -2499,11 +2643,13 @@ impl<S, V: PlanValueKind> EffectWithSource<S, V> {
         match self {
             Effect::Delete {
                 dependencies,
+                explicit_dependencies,
                 blocked_by_updates,
                 ..
             } => {
                 let mut edges: Vec<ScheduleEdge> = dependencies
                     .iter()
+                    .chain(explicit_dependencies.iter())
                     .cloned()
                     .map(ScheduleEdge::BlockedByIfDelete)
                     .collect();
@@ -2786,8 +2932,10 @@ mod tests {
 
     fn deferred_replace_effect() -> Effect {
         let payload = compiled_deferred_for_template(deferred_for_template_at(None, 0));
-        Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-            deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+        Effect::DeferredReplace(Box::new(DeferredReplacePayload::new(
+            NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: crate::effect::EffectGeneration::Current,
+                previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
                     "validation_records[0]",
@@ -2802,9 +2950,9 @@ mod tests {
                 blocked_by_updates: Default::default(),
             }])
             .expect("test fixture has one delete"),
-            template: payload.template,
-            dependency_template: payload.dependency_template,
-        }))
+            payload.template,
+            payload.dependency_template,
+        )))
     }
 
     #[test]
@@ -3108,6 +3256,8 @@ mod tests {
         let template = deferred_for_template_at(None, 0);
         let effect = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: crate::effect::EffectGeneration::Current,
+                previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
                     "validation_records[0]",
@@ -3133,6 +3283,8 @@ mod tests {
         let template = deferred_for_template_at(None, 0);
         let effect = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: crate::effect::EffectGeneration::Current,
+                previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
                     "validation_records[0]",
@@ -3154,7 +3306,14 @@ mod tests {
     #[test]
     fn deferred_create_as_basic_returns_none() {
         let effect = deferred_create_effect();
-        assert!(effect.as_basic().is_none());
+        let mut plan = crate::plan::Plan::new();
+        plan.add(effect);
+        let plan = plan.admit(&crate::schema::SchemaRegistry::new()).unwrap();
+        let scheduled = plan.schedule(&Default::default());
+        assert!(
+            crate::executor::scheduler::release_basic_for_test(&scheduled, 0, &Default::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -3189,6 +3348,87 @@ mod tests {
             }
             other => panic!("expected DeferredCreate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn review3_4283_changed_deferred_request_cannot_retain_create_first_preview() {
+        let Effect::DeferredReplace(mut payload) = deferred_replace_effect() else {
+            unreachable!();
+        };
+        payload
+            .unadmitted_request_mut()
+            .template
+            .template_directives_mut()
+            .create_before_destroy = crate::resource::LoopDirective::Resolved(true);
+        let mut schemas = crate::schema::SchemaRegistry::new();
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("route53.Record")
+                .with_coexisting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("test.Conflicting")
+                .with_conflicting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        payload.preflight(&schemas).unwrap();
+        assert_eq!(payload.display_glyph(), "+/-");
+        let mut decoded: DeferredReplacePayload<SavedModuleSource> =
+            serde_json::from_value(serde_json::to_value(&payload).unwrap()).unwrap();
+        assert_eq!(decoded.display_glyph(), "~");
+        decoded.preflight(&schemas).unwrap();
+        assert_eq!(decoded.display_glyph(), "+/-");
+
+        let mut changed =
+            compiled_deferred_for_template(crate::parser::DeferredForExpression::new(
+                None,
+                0,
+                "for opt in cert.domain_validation_options".to_owned(),
+                crate::parser::DeferredForTarget::bound(absolute_binding("validation_records"))
+                    .unwrap(),
+                Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
+                crate::parser::ForBinding::Simple("opt".to_owned()),
+                Resource::new("test.Conflicting", "validation_records"),
+            ));
+        changed
+            .template
+            .template_directives_mut()
+            .create_before_destroy = crate::resource::LoopDirective::Resolved(true);
+        // Public requests are read-only; internal edits discard their preview.
+        payload.unadmitted_request_mut().template = changed.template;
+        assert_eq!(
+            payload.display_glyph(),
+            "~",
+            "a changed request requires fresh admission"
+        );
+        assert!(payload.preflight(&schemas).is_err());
+    }
+
+    #[test]
+    fn review3_4283_deferred_requirements_invalidate_preview() {
+        let Effect::DeferredReplace(mut payload) = deferred_replace_effect() else {
+            unreachable!();
+        };
+        assert_eq!(payload.display_glyph(), "-/+");
+        payload.require_create_first_with_lineage(
+            &HashMap::from([(payload.deletes[0].id.clone(), "dependent".to_owned())]),
+            &crate::replacement::ReplacementLineage::default(),
+        );
+        assert_eq!(payload.display_glyph(), "~");
+        let mut schemas = crate::schema::SchemaRegistry::new();
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("route53.Record")
+                .with_conflicting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        assert!(payload.preflight(&schemas).is_err());
+        assert_eq!(payload.display_glyph(), "~");
     }
 
     #[test]
@@ -3718,7 +3958,7 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
-    /// `as_basic()` must return `Some` for the three variants the
+    /// Scheduled `as_basic()` must return `Some` for the three variants the
     /// basic executor handles, and `None` for every other variant.
     /// This is the carina#3164 type-level contract: filters used to
     /// be caller-side, and a missed filter (Move slipping into the
@@ -3727,6 +3967,17 @@ mod tests {
     fn as_basic_narrows_to_create_update_and_delete_only() {
         use crate::resource::State as ResState;
 
+        use crate::replacement::ScheduledBasicEffect;
+        let schedule = |effect| {
+            let mut plan = crate::plan::Plan::new();
+            plan.add(effect);
+            let plan = plan.admit(&crate::schema::SchemaRegistry::new()).unwrap();
+            crate::executor::scheduler::release_basic_for_test(
+                &plan.schedule(&Default::default()),
+                0,
+                &Default::default(),
+            )
+        };
         let rid = ResourceId::with_identity("test", "x");
 
         // Basic variants must narrow.
@@ -3734,8 +3985,8 @@ mod tests {
             Resource::new("test", "x").into_value_snapshot(),
         ));
         assert!(matches!(
-            create.as_basic(),
-            Some(BasicEffect::Create { .. })
+            schedule(create),
+            Some(ScheduledBasicEffect::Create { .. })
         ));
 
         let update: Effect = Effect::Update {
@@ -3747,8 +3998,8 @@ mod tests {
             changed_attributes: vec![],
         };
         assert!(matches!(
-            update.as_basic(),
-            Some(BasicEffect::Update { .. })
+            schedule(update),
+            Some(ScheduledBasicEffect::Update { .. })
         ));
 
         let delete: Effect = Effect::Delete {
@@ -3762,8 +4013,8 @@ mod tests {
             blocked_by_updates: Default::default(),
         };
         assert!(matches!(
-            delete.as_basic(),
-            Some(BasicEffect::Delete { .. })
+            schedule(delete),
+            Some(ScheduledBasicEffect::Delete { .. })
         ));
 
         // Non-basic variants must not. If a new variant is added and
@@ -3812,8 +4063,8 @@ mod tests {
             ("Wait", wait),
         ] {
             assert!(
-                e.as_basic().is_none(),
-                "{label} must not narrow to BasicEffect"
+                schedule(e).is_none(),
+                "{label} must not narrow to ScheduledBasicEffect"
             );
         }
     }

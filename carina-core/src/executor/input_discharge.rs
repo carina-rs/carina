@@ -103,7 +103,7 @@ impl FinalizedWrite<CreateRequest> {
         self,
         schemas: &SchemaRegistry,
         current: &HashMap<ResourceId, Current>,
-    ) -> Result<PreparedWrite<CreateRequest>, WriteInputError> {
+    ) -> Result<crate::replacement::CreatePermit, WriteInputError> {
         let checked = self
             .plan
             .check_inputs(schemas, current)
@@ -122,6 +122,9 @@ impl FinalizedWrite<CreateRequest> {
         checks
             .take_write(0)
             .and_then(|check| check.prepare_create(self.request, writeback, schemas))
+            .and_then(|write| {
+                super::scheduler::authorize_finalized_create(&checked, current, write)
+            })
             .map_err(WriteInputError::Discharge)
     }
 }
@@ -131,7 +134,7 @@ impl FinalizedWrite<UpdateRequest> {
         self,
         schemas: &SchemaRegistry,
         current: &HashMap<ResourceId, Current>,
-    ) -> Result<PreparedWrite<UpdateRequest>, WriteInputError> {
+    ) -> Result<crate::replacement::UpdatePermit, WriteInputError> {
         let checked = self
             .plan
             .check_inputs(schemas, current)
@@ -145,7 +148,35 @@ impl FinalizedWrite<UpdateRequest> {
         checks
             .take_write(0)
             .and_then(|check| check.prepare_update(&id, self.request, writeback, schemas))
+            .and_then(|write| {
+                super::scheduler::authorize_finalized_update(&checked, current, write)
+            })
             .map_err(WriteInputError::Discharge)
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+pub(super) fn prepared_create_for_test(request: CreateRequest) -> PreparedWrite<CreateRequest> {
+    let attributes = request
+        .resource()
+        .attributes
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    PreparedWrite {
+        resource_id: request.resource().id.clone(),
+        request: Arc::new(request),
+        writeback: SecretPreservingAttributes::from_provider_values(&attributes, &attributes),
+        receipt: Arc::new(PreparationReceipt {
+            slot: EffectSlot {
+                run: Arc::new(()),
+                index: 0,
+                child: None,
+            },
+            _children: Vec::new(),
+            deletes: Vec::new(),
+            _create_request: None,
+        }),
     }
 }
 
@@ -161,8 +192,8 @@ struct PreparationReceipt {
     _create_request: Option<Arc<CreateRequest>>,
 }
 
-/// Release authority for one exact delete slot in one execution. It cannot be
-/// copied, forged, deserialized, or rebound using a resource's display name.
+/// Release authority for one exact delete slot in one execution. The scheduler
+/// and input discharge jointly mint this owner of the immutable delete target.
 ///
 /// ```compile_fail
 /// use carina_core::executor::DeletePermit;
@@ -177,15 +208,13 @@ struct PreparationReceipt {
 /// let permit = DeletePermit { delete: todo!(), prepared: todo!() };
 /// ```
 pub struct DeletePermit {
-    delete: EffectSlot,
-    prepared: Arc<PreparationReceipt>,
+    _receipts: Vec<DeleteDischargeReceipt>,
+    target: Box<DeleteTarget>,
 }
 
-pub(super) struct DeleteAuthorization {
-    // Keep the receipt alive through the provider Delete, even if its create
-    // has already completed (DeferredReplace's existing CBD order).
-    _permit: Option<DeletePermit>,
-    target: Box<DeleteTarget>,
+pub(super) struct DeleteDischargeReceipt {
+    delete: EffectSlot,
+    prepared: Arc<PreparationReceipt>,
 }
 
 /// The exact delete operation captured from its immutable scheduler slot.
@@ -223,7 +252,7 @@ impl DeleteTarget {
     }
 }
 
-impl DeleteAuthorization {
+impl DeletePermit {
     pub(super) async fn dispatch(
         self,
         provider: &dyn Provider,
@@ -264,55 +293,62 @@ pub(super) struct WriteCheck {
 }
 
 pub(super) struct PreparedCohort<S> {
-    children: Vec<Effect<S>>,
-    requests: Vec<PreparedBasicRequest>,
-    permits: Vec<DeletePermit>,
+    children: crate::replacement::AdmittedReplacementEffects<S>,
+    requests: Vec<(usize, PreparedBasicRequest)>,
+    receipts: Vec<DeleteDischargeReceipt>,
 }
 
 impl<S> PreparedCohort<S> {
+    pub(super) fn take_receipts(&mut self) -> Vec<DeleteDischargeReceipt> {
+        std::mem::take(&mut self.receipts)
+    }
+
     pub(super) fn into_parts(
         self,
-    ) -> (Vec<Effect<S>>, Vec<PreparedBasicRequest>, Vec<DeletePermit>) {
-        (self.children, self.requests, self.permits)
+    ) -> (
+        crate::replacement::AdmittedReplacementEffects<S>,
+        Vec<(usize, PreparedBasicRequest)>,
+        Vec<DeleteDischargeReceipt>,
+    ) {
+        (self.children, self.requests, self.receipts)
     }
 }
 
 pub(super) async fn prepare_cohort<S: Clone>(
     check: WriteCheck,
-    children: Vec<Effect<S>>,
+    children: crate::replacement::AdmittedReplacementEffects<S>,
+    child_offset: usize,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<PreparedCohort<S>, EffectFailureKind> {
-    let mut requests = Vec::with_capacity(children.len());
-    for (ordinal, child) in children.iter().enumerate() {
+    let mut requests = Vec::new();
+    for (index, child) in children.effects().iter().enumerate().skip(child_offset) {
         let Effect::Create(resource) = child else {
-            return Err(EffectFailureKind::message(
-                "materialized cohort contains a non-create effect",
-            ));
+            continue;
         };
         let (ready, writeback) = super::basic::resolve_resource(
             Ok(CheckInput::Authored(resource.as_inner().clone())),
             context,
         )
         .await?;
-        let write = check.child(ordinal).prepare_create(
+        let write = check.child(requests.len()).prepare_create(
             CreateRequest::checked(ready),
             writeback,
             context.schemas(),
         )?;
-        requests.push(PreparedBasicRequest::Create(write));
+        requests.push((index, PreparedBasicRequest::Create(write)));
     }
     let writes: Vec<_> = requests
         .iter()
-        .map(|request| match request {
+        .map(|(_, request)| match request {
             PreparedBasicRequest::Create(write) => write,
             _ => unreachable!("materialized create request"),
         })
         .collect();
-    let permits = check.cohort_permits(&writes);
+    let receipts = check.cohort_receipts(&writes);
     Ok(PreparedCohort {
         children,
         requests,
-        permits,
+        receipts,
     })
 }
 
@@ -409,7 +445,10 @@ impl WriteCheck {
         })
     }
 
-    pub(super) fn cohort_permits<R>(&self, writes: &[&PreparedWrite<R>]) -> Vec<DeletePermit> {
+    pub(super) fn cohort_receipts<R>(
+        &self,
+        writes: &[&PreparedWrite<R>],
+    ) -> Vec<DeleteDischargeReceipt> {
         for (index, write) in writes.iter().enumerate() {
             assert_eq!(
                 write.receipt.slot,
@@ -428,7 +467,7 @@ impl WriteCheck {
         });
         self.deletes
             .iter()
-            .map(|delete| DeletePermit {
+            .map(|delete| DeleteDischargeReceipt {
                 delete: delete.clone(),
                 prepared: Arc::clone(&receipt),
             })
@@ -457,11 +496,11 @@ impl<R> PreparedWrite<R> {
         } = self;
         (Arc::unwrap_or_clone(request), writeback)
     }
-    pub(super) fn delete_permits(&self) -> Vec<DeletePermit> {
+    pub(super) fn delete_receipts(&self) -> Vec<DeleteDischargeReceipt> {
         self.receipt
             .deletes
             .iter()
-            .map(|delete| DeletePermit {
+            .map(|delete| DeleteDischargeReceipt {
                 delete: delete.clone(),
                 prepared: Arc::clone(&self.receipt),
             })
@@ -494,8 +533,9 @@ pub(super) struct ExecutionInputChecks {
     run: Arc<()>,
     pub(super) checks: HashMap<usize, PendingInputObligation>,
     pub(super) paired: HashMap<usize, Vec<usize>>,
-    required_deletes: HashMap<usize, usize>,
-    permits: HashMap<usize, DeletePermit>,
+    pub(super) absorbed: HashMap<usize, HashSet<usize>>,
+    required_deletes: HashMap<usize, HashSet<usize>>,
+    receipts: HashMap<(usize, usize), DeleteDischargeReceipt>,
     consumed: HashSet<usize>,
     delete_targets: HashMap<usize, DeleteTarget>,
 }
@@ -519,8 +559,9 @@ impl ExecutionInputChecks {
             run: Arc::new(()),
             checks: HashMap::new(),
             paired: HashMap::new(),
+            absorbed: HashMap::new(),
             required_deletes: HashMap::new(),
-            permits: HashMap::new(),
+            receipts: HashMap::new(),
             consumed: HashSet::new(),
             delete_targets: effects
                 .iter()
@@ -577,7 +618,14 @@ impl ExecutionInputChecks {
                     },
                 )?;
                 result.paired.entry(write).or_default().push(delete_idx);
-                if result.required_deletes.insert(delete_idx, write).is_some() {
+                if delete.absorbed_index().is_some() {
+                    result.absorbed.entry(write).or_default().insert(delete_idx);
+                }
+                if result
+                    .required_deletes
+                    .insert(delete_idx, HashSet::from([write]))
+                    .is_some()
+                {
                     return Err(InputCheckConstructionError::DuplicateDelete { index: delete_idx });
                 }
             }
@@ -621,23 +669,29 @@ impl ExecutionInputChecks {
         assert!(self.consumed.insert(index));
     }
 
-    pub(super) fn publish_permits(
+    pub(super) fn publish_receipts(
         &mut self,
-        permits: Vec<DeletePermit>,
+        receipts: Vec<DeleteDischargeReceipt>,
     ) -> Result<(), EffectFailureKind> {
-        for permit in permits {
+        for permit in receipts {
             let index = permit.delete.index;
             if !Arc::ptr_eq(&self.run, &permit.delete.run)
                 || !Arc::ptr_eq(&self.run, &permit.prepared.slot.run)
                 || permit.prepared.slot.child.is_some()
-                || self.required_deletes.get(&index) != Some(&permit.prepared.slot.index)
-                || self.permits.contains_key(&index)
+                || !self
+                    .required_deletes
+                    .get(&index)
+                    .is_some_and(|writes| writes.contains(&permit.prepared.slot.index))
+                || self
+                    .receipts
+                    .contains_key(&(index, permit.prepared.slot.index))
             {
                 return Err(EffectFailureKind::message(
                     "paired delete input permit slot mismatch",
                 ));
             }
-            self.permits.insert(index, permit);
+            self.receipts
+                .insert((index, permit.prepared.slot.index), permit);
         }
         Ok(())
     }
@@ -645,27 +699,58 @@ impl ExecutionInputChecks {
     pub(super) fn authorize_delete(
         &mut self,
         index: usize,
-    ) -> Result<DeleteAuthorization, EffectFailureKind> {
-        let permit = if self.required_deletes.contains_key(&index) {
-            let permit = self.permits.remove(&index).ok_or_else(|| {
+        ready: &super::scheduler::ReadyDelete,
+    ) -> Result<DeletePermit, EffectFailureKind> {
+        let mut receipts = Vec::new();
+        for &write in self.required_deletes.get(&index).into_iter().flatten() {
+            let receipt = self.receipts.remove(&(index, write)).ok_or_else(|| {
                 EffectFailureKind::message("paired delete has no prepared input permit")
             })?;
-            if permit.delete != self.slot(index) {
+            if receipt.delete != self.slot(index) {
                 return Err(EffectFailureKind::message(
                     "paired delete input permit slot mismatch",
                 ));
             }
-            Some(permit)
-        } else {
-            None
-        };
+            receipts.push(receipt);
+        }
         let target = self.delete_targets.remove(&index).ok_or_else(|| {
             EffectFailureKind::message("delete dispatch target missing for effect slot")
         })?;
-        Ok(DeleteAuthorization {
-            _permit: permit,
+        if ready.instance()
+            != &DeletedInstanceKey::new(
+                target.id.clone(),
+                target.generation.clone(),
+                target.identifier.as_str(),
+            )
+        {
+            return Err(EffectFailureKind::message(
+                "paired delete input permit slot mismatch",
+            ));
+        }
+        Ok(DeletePermit {
+            _receipts: receipts,
             target: Box::new(target),
         })
+    }
+
+    pub(super) fn bind_materialized_deletes(
+        &mut self,
+        write: usize,
+        deletes: impl IntoIterator<Item = usize>,
+    ) {
+        // Only the resolver's confirmed child/old-generation associations enter
+        // discharge. Same-kind anonymous gate candidates are graph barriers,
+        // not necessarily members of this cohort's replacement.
+        for delete in deletes {
+            let paired = self.paired.entry(write).or_default();
+            if !paired.contains(&delete) {
+                paired.push(delete);
+            }
+            self.required_deletes
+                .entry(delete)
+                .or_default()
+                .insert(write);
+        }
     }
 }
 
@@ -702,24 +787,23 @@ mod tests {
         )
         .unwrap();
         let mut plan = Plan::new();
+        let old = crate::effect::DeferredReplaceDelete {
+            id: resource.resolved_id(),
+            identifier: AppliedIdentifier::new("old").unwrap(),
+            generation: EffectGeneration::Current,
+            previous_attributes: HashMap::new(),
+            directives: Default::default(),
+            binding: None,
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+        };
         plan.add_replacement(crate::plan::ReplacementGroup {
-            delete: crate::plan::ReplacementDelete {
-                id: resource.resolved_id(),
-                identifier: AppliedIdentifier::new("old").unwrap(),
-                directives: Default::default(),
-                binding: None,
-                dependencies: Default::default(),
-                explicit_dependencies: Default::default(),
-            },
-            create: resource,
-            create_before_destroy: false,
+            replacement: crate::test_support::checked_replacement(resource, old, false),
             changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["generation".into()])
                 .unwrap(),
             cascade_ref_hints: vec![],
-            temporary_name: None,
-            permanent_name_override: None,
             consumer_updates: Default::default(),
-            previous_attributes: Default::default(),
         });
         let checked = FinalizedPlan::new(plan)
             .check_inputs(&schemas, &HashMap::new())
@@ -854,23 +938,30 @@ mod tests {
         let mut checks = ExecutionInputChecks::new(Vec::new(), &effects, &[]).unwrap();
         // No names enter this authorization test: each delete has a distinct
         // effect slot even if their resource and generation were identical.
-        checks.required_deletes.extend([(1, 0), (2, 3)]);
+        checks
+            .required_deletes
+            .extend([(1, HashSet::from([0])), (2, HashSet::from([3]))]);
         let target = DeleteTarget {
             id: ResourceId::with_identity("test", "same-instance"),
             identifier: AppliedIdentifier::new("old-id").unwrap(),
             generation: EffectGeneration::Current,
             directives: Default::default(),
         };
+        let ready = super::super::scheduler::ReadyDelete::for_test(DeletedInstanceKey::new(
+            target.id.clone(),
+            target.generation.clone(),
+            target.identifier.as_str(),
+        ));
         checks.delete_targets.insert(1, target.clone());
         checks.delete_targets.insert(2, target);
         checks.paired.insert(0, vec![1]);
         let cohort = checks.take_write(0).unwrap();
         checks
-            .publish_permits(cohort.cohort_permits::<CreateRequest>(&[]))
+            .publish_receipts(cohort.cohort_receipts::<CreateRequest>(&[]))
             .unwrap();
-        assert!(checks.authorize_delete(2).is_err());
-        assert!(checks.authorize_delete(1).is_ok());
-        assert!(checks.authorize_delete(1).is_err());
+        assert!(checks.authorize_delete(2, &ready).is_err());
+        assert!(checks.authorize_delete(1, &ready).is_ok());
+        assert!(checks.authorize_delete(1, &ready).is_err());
         assert!(checks.take_write(0).is_err());
     }
 
@@ -880,11 +971,16 @@ mod tests {
         let mut first = ExecutionInputChecks::new(Vec::new(), &effects, &[]).unwrap();
         first.paired.insert(0, vec![1]);
         let cohort = first.take_write(0).unwrap();
-        let permit = cohort.cohort_permits::<CreateRequest>(&[]).pop().unwrap();
+        let permit = cohort.cohort_receipts::<CreateRequest>(&[]).pop().unwrap();
         let mut second = ExecutionInputChecks::new(Vec::new(), &effects, &[]).unwrap();
-        second.required_deletes.insert(1, 0);
+        second.required_deletes.insert(1, HashSet::from([0]));
         // Deliberately corrupt the private store to exercise its final check.
-        second.permits.insert(1, permit);
-        assert!(second.authorize_delete(1).is_err());
+        second.receipts.insert((1, 0), permit);
+        let ready = super::super::scheduler::ReadyDelete::for_test(DeletedInstanceKey::new(
+            ResourceId::with_identity("test", "same-instance"),
+            EffectGeneration::Current,
+            "old-id",
+        ));
+        assert!(second.authorize_delete(1, &ready).is_err());
     }
 }

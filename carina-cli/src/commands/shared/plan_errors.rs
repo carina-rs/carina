@@ -66,6 +66,7 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
             PlanErrorKind::SchemaNotRegistered(_)
             | PlanErrorKind::InputRule { .. }
             | PlanErrorKind::ReplacementCannotCoexist(_)
+            | PlanErrorKind::InvalidPreparedReplacementName(_)
             | PlanErrorKind::CreateBeforeDestroyRequiredByDependent { .. }
             | PlanErrorKind::MissingProviderIdentifier
             | PlanErrorKind::InvalidImportProviderIdentifier

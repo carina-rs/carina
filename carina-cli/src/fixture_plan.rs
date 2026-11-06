@@ -802,7 +802,7 @@ where
             }
             let (checked, references) = match plan {
                 crate::wiring::PlannedPlan::Unrendered { plan, references } => {
-                    (plan, FixtureReferences(references))
+                    (*plan, FixtureReferences(references))
                 }
                 crate::wiring::PlannedPlan::Rendered {
                     display,
@@ -812,7 +812,7 @@ where
                     FixtureReferences(references),
                 ),
             };
-            let plan = checked.plan().clone();
+            let plan = checked.plan().clone().into_unadmitted();
             let moved_hints =
                 detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
                     .expect("fixture moved-hint comparisons must resolve");

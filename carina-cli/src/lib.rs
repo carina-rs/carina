@@ -482,7 +482,7 @@ fn dispatch_fixture_create(
                 .check_inputs(&schemas, &std::collections::HashMap::new())
                 .expect("fixture inputs discharge");
             let (create, _cancellation) =
-                carina_core::executor::dispatch_prepared_create(&provider, prepared);
+                carina_core::executor::dispatch_create(&provider, prepared);
             block_on_ready(create).expect_err("fixture create returns a classified failure")
         },
     )

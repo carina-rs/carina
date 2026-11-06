@@ -228,7 +228,7 @@ async fn prepare_bootstrap_creation(
     resource: Resource,
     context: &BootstrapCreateContext<'_>,
     session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<carina_core::executor::PreparedWrite<carina_core::provider::CreateRequest>, AppError> {
+) -> Result<carina_core::replacement::CreatePermit, AppError> {
     let bindings = bootstrap_resolved_bindings(context.parsed);
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(
         &context.parsed.compositions,
@@ -296,7 +296,7 @@ async fn create_checked_bootstrap_resource(
                 let schema = Some(owner_schema.schema().as_schema());
                 let accepted_request = AcceptedRequest::from_create_request(request);
                 let (create, create_cancellation) =
-                    carina_core::executor::dispatch_prepared_create(operation_provider, prepared);
+                    carina_core::executor::dispatch_create(operation_provider, prepared);
                 let outcome = create.await;
                 // Bootstrap creates are not part of the parallel executor, but they still
                 // retain the reporter until the guest call has settled.
@@ -2727,7 +2727,7 @@ async fn run_apply_locked_owned(
             let state_save_inputs = Arc::new(
                 ApplyStateSaveInputs::new(
                     resolved_resources.clone(),
-                    plan.clone(),
+                    plan.clone().into_unadmitted(),
                     ctx.schemas().clone(),
                     None,
                     provider.as_ref(),
@@ -3520,7 +3520,9 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 40
+    // Validate version compatibility before decoding the payload. Format 42
+    // retains replacement history and create-first dependency requirements;
+    // format 41 uses typed Secret nodes exclusively. Format 40
     // requires an absolute source locator and its planned canonical identity.
     // Format 39 stores resolved dependency addresses and legacy migration
     // classifications.
@@ -4305,7 +4307,7 @@ async fn run_apply_from_plan_locked_owned(
             let provider = Arc::new(provider);
             let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
                 resolved_sorted_resources.clone(),
-                plan.plan().clone(),
+                plan.plan().clone().into_unadmitted(),
                 wiring.schemas().clone(),
                 Some(rehydrated_plan_file.planned_secret_hashes().clone()),
                 provider.as_ref(),

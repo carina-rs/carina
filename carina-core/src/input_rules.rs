@@ -283,17 +283,15 @@ fn classify_write_site<'a, S>(
                 Effect::Create(resource) => {
                     let replacement = plan.replacement_creates.get(&index);
                     let deletes = replacement
-                        .as_ref()
-                        .filter(|info| !info.create_before_destroy)
-                        .map(|info| {
-                            vec![PairedInputDelete {
-                                plan: plan.identity.clone(),
-                                effect_index: info.delete_index,
-                                absorbed_index: None,
-                                instance: plan.plan.effects()[info.delete_index].instance_key(),
-                            }]
+                        .into_iter()
+                        .flat_map(|info| &info.delete_indices)
+                        .map(|&delete_index| PairedInputDelete {
+                            plan: plan.identity.clone(),
+                            effect_index: delete_index,
+                            absorbed_index: None,
+                            instance: plan.plan.effects()[delete_index].instance_key(),
                         })
-                        .unwrap_or_default();
+                        .collect();
                     (
                         &resource.id,
                         Some(Cow::Borrowed(&resource.attributes)),
@@ -336,7 +334,17 @@ fn classify_write_site<'a, S>(
                         &resource.id,
                         Some(Cow::Borrowed(&resource.attributes)),
                         InputWriteContext::ResumeCreate,
-                        Vec::new(),
+                        plan.replacement_creates
+                            .get(&index)
+                            .into_iter()
+                            .flat_map(|info| &info.delete_indices)
+                            .map(|&delete_index| PairedInputDelete {
+                                plan: plan.identity.clone(),
+                                effect_index: delete_index,
+                                absorbed_index: None,
+                                instance: plan.plan.effects()[delete_index].instance_key(),
+                            })
+                            .collect(),
                     )
                 }
                 Effect::DeferredCreate(payload) => (
@@ -521,7 +529,7 @@ pub struct FinalizedPlan<S = ModuleSource> {
 
 #[derive(Debug)]
 struct ReplacementWrite {
-    delete_index: usize,
+    delete_indices: Vec<usize>,
     create_before_destroy: bool,
 }
 
@@ -576,7 +584,7 @@ impl<S> FinalizedPlan<S> {
                 (
                     info.create_idx,
                     ReplacementWrite {
-                        delete_index: info.delete_idx,
+                        delete_indices: vec![info.delete_idx],
                         create_before_destroy: info.create_before_destroy,
                     },
                 )
@@ -617,7 +625,10 @@ impl<S> FinalizedPlan<S> {
         self,
         schemas: &SchemaRegistry,
         current: &HashMap<ResourceId, Current>,
-    ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>> {
+    ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>>
+    where
+        S: Clone,
+    {
         self.check_inputs_with_types(schemas, current, &InputTypeContext::empty())
     }
 
@@ -627,7 +638,39 @@ impl<S> FinalizedPlan<S> {
         schemas: &SchemaRegistry,
         current: &HashMap<ResourceId, Current>,
         types: &InputTypeContext<S>,
-    ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>> {
+    ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>>
+    where
+        S: Clone,
+    {
+        // Replacement admission may install prepared temporary names. Classify
+        // the resulting exact effects, never the draft that preceded that seam.
+        let admitted = match self.plan.clone().admit(schemas) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let error = error.into_plan_error();
+                if !self.plan.errors().contains(&error) {
+                    self.plan.add_error(error);
+                }
+                return Err(InputAdmissionFailure {
+                    plan: Box::new(self.plan),
+                });
+            }
+        };
+        self = Self::new(admitted.clone().into_unadmitted());
+        self.replacement_creates = admitted
+            .admitted_effects()
+            .input_replacement_sites()
+            .into_iter()
+            .map(|(index, delete_indices, create_before_destroy)| {
+                (
+                    index,
+                    ReplacementWrite {
+                        delete_indices,
+                        create_before_destroy,
+                    },
+                )
+            })
+            .collect();
         let mut diagnostics = Vec::new();
         let mut pending = Vec::new();
         let mut write_checks = Vec::new();
@@ -725,7 +768,7 @@ impl<S> FinalizedPlan<S> {
             })
         } else {
             Ok(InputCheckedPlan {
-                plan: self.plan,
+                plan: admitted,
                 obligations: Box::new(InputObligations {
                     pending,
                     write_checks,
@@ -1020,7 +1063,7 @@ fn project_known_value<P: crate::resource::ValueKind, B: crate::resource::Bindin
 /// ```
 #[derive(Debug, Clone)]
 pub struct InputCheckedPlan<S = ModuleSource> {
-    plan: Plan<S>,
+    plan: crate::plan::AdmittedPlan<S>,
     obligations: Box<InputObligations>,
 }
 
@@ -1031,7 +1074,7 @@ struct InputObligations {
 }
 
 impl<S> Deref for InputCheckedPlan<S> {
-    type Target = Plan<S>;
+    type Target = crate::plan::AdmittedPlan<S>;
     fn deref(&self) -> &Self::Target {
         &self.plan
     }
@@ -1041,7 +1084,7 @@ impl<S> InputCheckedPlan<S> {
     pub(crate) fn execution_input_checks(&self) -> Vec<PendingInputObligation> {
         self.obligations.write_checks.clone()
     }
-    pub fn plan(&self) -> &Plan<S> {
+    pub fn plan(&self) -> &crate::plan::AdmittedPlan<S> {
         &self.plan
     }
     pub fn pending_inputs(&self) -> &[PendingInputObligation] {
@@ -1067,6 +1110,17 @@ impl<S> InputCheckedPlan<S> {
                 crate::detail_rows::DetailRow::PendingInput { path, codes }
             })
             .collect()
+    }
+}
+
+impl<S: Clone> crate::plan::AdmittedPlan<S> {
+    /// Check the admitted, prepared effects and retain both witnesses for execution.
+    pub fn check_inputs(
+        self,
+        schemas: &SchemaRegistry,
+        current: &HashMap<ResourceId, Current>,
+    ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>> {
+        FinalizedPlan::new(self.into_unadmitted()).check_inputs(schemas, current)
     }
 }
 

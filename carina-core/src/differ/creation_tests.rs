@@ -1,4 +1,5 @@
 use super::*;
+use crate::effect::TemporaryName;
 use crate::input_rules::{InputCheckedPlan, InputWriteContext};
 use crate::provider::{AppliedIdentifier, CreateAttempt, InFlightCreate, PendingToken, Sent};
 use crate::resource::{DeferredValue, LoopSlot};
@@ -9,6 +10,7 @@ fn schemas() -> SchemaRegistry {
     registry.insert(
         "mock",
         crate::schema::ResourceSchema::new("Bucket")
+            .with_coexisting_replacement()
             .attribute(
                 AttributeSchema::optional("name", crate::schema::AttributeType::string()).build(),
             )
@@ -52,6 +54,7 @@ fn checked(
     current: &HashMap<ResourceId, Current>,
 ) -> Result<InputCheckedPlan, crate::input_rules::InputAdmissionFailure> {
     PendingCascadePlan {
+        registry: schemas(),
         plan,
         deferred: ResolvedDeferredCreateTargets::default(),
     }
@@ -59,8 +62,11 @@ fn checked(
     .check_inputs(&schemas(), current)
 }
 
-fn delete(resource: &ResolvedResource) -> ReplacementDelete {
-    ReplacementDelete {
+fn delete(resource: &ResolvedResource) -> DeferredReplaceDelete {
+    DeferredReplaceDelete {
+        generation: EffectGeneration::Current,
+        previous_attributes: HashMap::new(),
+        blocked_by_updates: Default::default(),
         id: resource.resolved_id().clone(),
         identifier: AppliedIdentifier::new("old-id").unwrap(),
         directives: Default::default(),
@@ -78,15 +84,14 @@ fn replacement(create_before_destroy: bool, create: ResolvedResource) -> Plan {
 
 fn add_replacement(plan: &mut Plan, create_before_destroy: bool, create: ResolvedResource) {
     plan.add_replacement(ReplacementGroup {
-        delete: delete(&create),
-        create,
-        create_before_destroy,
+        replacement: crate::test_support::checked_replacement(
+            create.clone(),
+            delete(&create),
+            create_before_destroy,
+        ),
         changed_create_only: ChangedCreateOnly::new(vec!["generation".into()]).unwrap(),
         cascade_ref_hints: Vec::new(),
-        temporary_name: None,
-        permanent_name_override: None,
         consumer_updates: Default::default(),
-        previous_attributes: HashMap::new(),
     });
 }
 
@@ -313,6 +318,8 @@ fn creation_admission_deferred_replace_retains_all_absorbed_delete_slots() {
     } = deferred_payload();
     let mut plan = Plan::new();
     let deletes = ["old-a", "old-b"].map(|identity| DeferredReplaceDelete {
+        generation: EffectGeneration::Current,
+        previous_attributes: HashMap::new(),
         id: ResolvedResourceId::with_provider_identity("mock", "Bucket", identity, None),
         identifier: AppliedIdentifier::new(identity).unwrap(),
         directives: Default::default(),
@@ -321,11 +328,13 @@ fn creation_admission_deferred_replace_retains_all_absorbed_delete_slots() {
         explicit_dependencies: Default::default(),
         blocked_by_updates: Default::default(),
     });
-    plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-        template,
-        dependency_template,
-        deletes: NonEmptyDeletes::try_new(deletes.into()).unwrap(),
-    })));
+    plan.add(Effect::DeferredReplace(Box::new(
+        DeferredReplacePayload::new(
+            NonEmptyDeletes::try_new(deletes.into()).unwrap(),
+            template,
+            dependency_template,
+        ),
+    )));
     let checked = checked(plan, &HashMap::new()).unwrap();
     assert_eq!(checked.pending_inputs().len(), 1);
     let obligation = &checked.pending_inputs()[0];
@@ -384,6 +393,7 @@ fn creation_admission_required_absence_stays_pending() {
     let mut plan = Plan::new();
     plan.add(Effect::Create(resource(None)));
     let plan = PendingCascadePlan {
+        registry: schemas.clone(),
         plan,
         deferred: ResolvedDeferredCreateTargets::default(),
     }
@@ -468,6 +478,7 @@ fn creation_admission_collects_all_diagnostics_in_stable_resource_path_code_orde
             plan.add(Effect::Create(resource));
         }
         PendingCascadePlan {
+            registry: schemas.clone(),
             plan,
             deferred: Default::default(),
         }
@@ -518,6 +529,7 @@ fn creation_admission_nested_absence_unknown_and_secret_values_remain_distinct()
             ResolvedResource::resolve_raw_fixture(resource, &schemas).unwrap(),
         ));
         PendingCascadePlan {
+            registry: schemas.clone(),
             plan,
             deferred: Default::default(),
         }
@@ -708,10 +720,10 @@ fn input_scope_classification_table_covers_every_effect_variant() {
         ),
         (
             "deferred replace",
-            Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-                template,
-                dependency_template,
-                deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+            Effect::DeferredReplace(Box::new(DeferredReplacePayload::new(
+                NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                    generation: EffectGeneration::Current,
+                    previous_attributes: HashMap::new(),
                     id: resource.resolved_id().clone(),
                     identifier: AppliedIdentifier::new("old").unwrap(),
                     directives: Default::default(),
@@ -721,7 +733,9 @@ fn input_scope_classification_table_covers_every_effect_variant() {
                     blocked_by_updates: Default::default(),
                 }])
                 .unwrap(),
-            })),
+                template,
+                dependency_template,
+            ))),
             None,
             1,
             1,
@@ -768,6 +782,7 @@ fn input_scope_classification_table_covers_every_effect_variant() {
                 .map(|prior| HashMap::from([(resource.id.clone(), prior)]))
                 .unwrap_or_default();
             let finalized = PendingCascadePlan {
+                registry: schemas.clone(),
                 plan,
                 deferred: Default::default(),
             }
@@ -784,6 +799,7 @@ fn input_scope_classification_table_covers_every_effect_variant() {
         }
         for cbd in [false, true] {
             let finalized = PendingCascadePlan {
+                registry: schemas.clone(),
                 plan: replacement(cbd, resource.clone()),
                 deferred: Default::default(),
             }
@@ -850,31 +866,27 @@ fn issue_3900_actual_generated_temporary_name_exceeding_length_rejects_plan() {
         ]),
     )
     .with_identifier("old");
-    let temporary = generate_temporary_name(
-        &desired,
-        &from,
-        schemas
-            .get("mock", "Bucket", crate::schema::SchemaKind::Resource)
-            .unwrap()
-            .as_schema(),
+    let resolved = ResolvedResource::resolve_raw_fixture(desired, &schemas).unwrap();
+    let mut old = delete(&resolved);
+    old.previous_attributes = from.attributes;
+    let mut requested = resolved.as_inner().clone();
+    requested.directives.create_before_destroy = true;
+    let checked = crate::replacement::resolve_replacement(
+        crate::replacement::ReplacementRequest::new(
+            resolved.replace_inner(requested),
+            NonEmptyDeletes::try_new(vec![old]).unwrap(),
+        ),
+        &schemas,
     )
-    .unwrap()
     .unwrap();
+    let temporary = checked.temporary_name().unwrap().clone();
     assert_eq!(temporary.temporary_value.len(), 33);
     assert!(original.len() <= 32);
-    let resolved = ResolvedResource::resolve_raw_fixture(desired, &schemas).unwrap();
-    let (raw, value_deps, explicit_deps, persisted_deps, persisted_explicit, reads) =
-        resolved.into_parts();
-    let resolved = ResolvedResource::from_resolved_parts_with_reads(
-        apply_temporary_name(raw, Some(&temporary)),
-        value_deps,
-        explicit_deps,
-        reads,
-    )
-    .with_persisted_destroy_dependencies(persisted_deps, persisted_explicit);
+    let resolved = checked.target().clone();
     let mut plan = replacement(true, resolved);
     plan.replace_display_mut()[0].temporary_name = Some(temporary.clone());
     let rejected = PendingCascadePlan {
+        registry: schemas.clone(),
         plan,
         deferred: Default::default(),
     }
@@ -885,4 +897,37 @@ fn issue_3900_actual_generated_temporary_name_exceeding_length_rejects_plan() {
         matches!(&rejected.errors()[0].kind, PlanErrorKind::InputRule { path, code, .. } if path == "name" && code == "name.max_length")
     );
     assert!(!format!("{:?}", rejected.errors()).contains(&temporary.temporary_value));
+}
+
+#[test]
+fn creation_admission_does_not_duplicate_existing_replacement_error() {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "mock",
+        crate::schema::ResourceSchema::new("Bucket")
+            .with_conflicting_replacement()
+            .attribute(
+                AttributeSchema::optional("name", crate::schema::AttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let mut raw = resource(Some(string("valid-name"))).as_inner().clone();
+    raw.directives.create_before_destroy = true;
+    let create = ResolvedResource::resolve_with_schemas(raw, &registry).unwrap();
+    let mut plan = Plan::new();
+    plan.add_delete(delete(&create));
+    plan.add(Effect::Create(create));
+    let finalized = PendingCascadePlan {
+        plan,
+        deferred: Default::default(),
+        registry: registry.clone(),
+    }
+    .finish(std::iter::empty(), |_| {});
+    assert_eq!(finalized.errors().len(), 1);
+    let diagnostic = finalized.errors()[0].clone();
+    let rejected = finalized
+        .check_inputs(&registry, &HashMap::new())
+        .unwrap_err();
+    assert_eq!(rejected.errors(), &[diagnostic]);
 }

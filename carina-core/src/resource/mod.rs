@@ -1156,6 +1156,7 @@ impl PendingResourceIdentityError {
 /// A resource could not enter the schema-resolved planning boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResolvedResourceError {
+    Replacement(crate::plan::CreateBeforeDestroyError),
     PendingIdentity(PendingResourceIdentityError),
     MissingSchema {
         id: ResourceId,
@@ -1170,6 +1171,7 @@ impl Display for ResolvedResourceError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::PendingIdentity(error) => Display::fmt(error, formatter),
+            Self::Replacement(error) => Display::fmt(error, formatter),
             Self::MissingSchema { id } => write!(
                 formatter,
                 "resource '{id}' has ignore_changes paths but no managed resource schema"
@@ -1192,6 +1194,7 @@ impl std::error::Error for ResolvedResourceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::PendingIdentity(error) => Some(error),
+            Self::Replacement(error) => Some(error),
             Self::MissingSchema { .. } | Self::InvalidIgnoreChanges { .. } => None,
         }
     }
