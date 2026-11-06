@@ -605,7 +605,9 @@ A struct type represents a nested object with typed fields.
   Declared descendant modes are preserved; whole-schema validation applies
   provider-populated ancestry after the graph is reconstructed. Schema
   defaults use the JSON-compatible projection (`StringList` normalizes to
-  `List`) and reject deferred/core-only values and non-finite floats. SDK
+  `List`) and reject deferred/core-only values. Non-finite floats cannot be
+  represented at all: value floats and float range bounds are `FiniteF64`,
+  admitted only through its checked constructor (carina#4257). SDK
   guests derive custom-type dispatch from the identity/callback pairs in the
   same validated resource/config witnesses they serialize; providers do not
   implement an optional success-default hook. The guest builds a callback
