@@ -15369,9 +15369,7 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                 let request = carina_core::executor::prepare_create_request(resource, &preparation)
                     .await
                     .unwrap();
-                let prepared = carina_core::differ::finalize_bootstrap_create(request)
-                    .check_inputs(ctx.schemas(), &HashMap::new())
-                    .expect("fixture inputs discharge");
+                let prepared = carina_core::replacement::create_permit_for_test(request);
                 let (create, cancellation) =
                     carina_core::executor::dispatch_create(&provider, prepared);
                 create.await.unwrap();

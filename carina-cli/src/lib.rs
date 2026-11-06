@@ -478,9 +478,7 @@ fn dispatch_fixture_create(
             let provider = FixtureCreateProvider {
                 result: std::sync::Mutex::new(Some(result)),
             };
-            let prepared = carina_core::differ::finalize_bootstrap_create(request)
-                .check_inputs(&schemas, &std::collections::HashMap::new())
-                .expect("fixture inputs discharge");
+            let prepared = carina_core::replacement::create_permit_for_test(request);
             let (create, _cancellation) =
                 carina_core::executor::dispatch_create(&provider, prepared);
             block_on_ready(create).expect_err("fixture create returns a classified failure")

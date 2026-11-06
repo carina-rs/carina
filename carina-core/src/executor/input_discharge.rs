@@ -12,11 +12,9 @@ use super::provider_ready::{CheckInput, ProviderPreparationContext};
 use crate::{
     binding_index::SecretPreservingAttributes,
     effect::{DeletedInstanceKey, Effect, EffectGeneration},
-    input_rules::{FinalizedPlan, InputAdmissionFailure},
     input_rules::{InputVerdict, PendingInputObligation, executor_write_site},
-    plan::Plan,
     provider::{AppliedIdentifier, CreateRequest, DeleteRequest, Provider, UpdateRequest},
-    resource::{Current, Directives, ProviderModuleSource, ResourceId, Value},
+    resource::{Directives, ResourceId, Value},
     schema::{SchemaKind, SchemaRegistry},
 };
 
@@ -71,113 +69,6 @@ pub struct PreparedWrite<R> {
     resource_id: ResourceId,
     writeback: SecretPreservingAttributes,
     receipt: Arc<PreparationReceipt>,
-}
-
-/// A single finalized request, retained unchanged through admission and discharge.
-/// Only the request-specific finalizers can construct this owner.
-pub struct FinalizedWrite<R> {
-    request: R,
-    plan: FinalizedPlan<ProviderModuleSource>,
-}
-
-/// Admission diagnostics or a failure to discharge the exact provider request.
-#[derive(Debug, thiserror::Error)]
-pub enum WriteInputError {
-    #[error("input admission rejected the request")]
-    Admission(InputAdmissionFailure<ProviderModuleSource>),
-    #[error("{0}")]
-    Discharge(EffectFailureKind),
-}
-
-impl<R> FinalizedWrite<R> {
-    pub(crate) fn new(request: R, plan: Plan<ProviderModuleSource>) -> Self {
-        Self {
-            request,
-            plan: FinalizedPlan::new(plan),
-        }
-    }
-}
-
-impl FinalizedWrite<CreateRequest> {
-    pub fn check_inputs(
-        self,
-        schemas: &SchemaRegistry,
-        current: &HashMap<ResourceId, Current>,
-    ) -> Result<crate::replacement::CreatePermit, WriteInputError> {
-        let checked = self
-            .plan
-            .check_inputs(schemas, current)
-            .map_err(WriteInputError::Admission)?;
-        let mut checks =
-            ExecutionInputChecks::new(checked.execution_input_checks(), checked.effects(), &[0])
-                .map_err(|error| WriteInputError::Discharge(EffectFailureKind::execution(error)))?;
-        let attributes = self
-            .request
-            .resource()
-            .attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect();
-        let writeback = SecretPreservingAttributes::from_provider_values(&attributes, &attributes);
-        checks
-            .take_write(0)
-            .and_then(|check| check.prepare_create(self.request, writeback, schemas))
-            .and_then(|write| {
-                super::scheduler::authorize_finalized_create(&checked, current, write)
-            })
-            .map_err(WriteInputError::Discharge)
-    }
-}
-
-impl FinalizedWrite<UpdateRequest> {
-    pub fn check_inputs(
-        self,
-        schemas: &SchemaRegistry,
-        current: &HashMap<ResourceId, Current>,
-    ) -> Result<crate::replacement::UpdatePermit, WriteInputError> {
-        let checked = self
-            .plan
-            .check_inputs(schemas, current)
-            .map_err(WriteInputError::Admission)?;
-        let mut checks =
-            ExecutionInputChecks::new(checked.execution_input_checks(), checked.effects(), &[0])
-                .map_err(|error| WriteInputError::Discharge(EffectFailureKind::execution(error)))?;
-        let attributes = self.request.patch().sent_projection().into_iter().collect();
-        let writeback = SecretPreservingAttributes::from_provider_values(&attributes, &attributes);
-        let id = self.request.from().id.clone();
-        checks
-            .take_write(0)
-            .and_then(|check| check.prepare_update(&id, self.request, writeback, schemas))
-            .and_then(|write| {
-                super::scheduler::authorize_finalized_update(&checked, current, write)
-            })
-            .map_err(WriteInputError::Discharge)
-    }
-}
-
-#[cfg(any(test, feature = "test-utils"))]
-pub(super) fn prepared_create_for_test(request: CreateRequest) -> PreparedWrite<CreateRequest> {
-    let attributes = request
-        .resource()
-        .attributes
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    PreparedWrite {
-        resource_id: request.resource().id.clone(),
-        request: Arc::new(request),
-        writeback: SecretPreservingAttributes::from_provider_values(&attributes, &attributes),
-        receipt: Arc::new(PreparationReceipt {
-            slot: EffectSlot {
-                run: Arc::new(()),
-                index: 0,
-                child: None,
-            },
-            _children: Vec::new(),
-            deletes: Vec::new(),
-            _create_request: None,
-        }),
-    }
 }
 
 // A receipt is shared by the prepared request and every permit it authorizes.
@@ -757,6 +648,8 @@ impl ExecutionInputChecks {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input_rules::FinalizedPlan;
+    use crate::plan::Plan;
 
     #[test]
     fn input_discharge_invalid_plan_mapping_returns_error_without_panicking() {
@@ -831,7 +724,7 @@ mod tests {
     }
 
     #[test]
-    fn input_discharge_finalized_requests_check_create_and_update_scopes() {
+    fn input_discharge_scheduled_requests_check_create_and_update_scopes() {
         use crate::schema::{
             InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleScope,
             PatternAttributeSchema, PatternAttributeType, PatternResourceSchema,
@@ -877,22 +770,58 @@ mod tests {
                             super::super::prepare_create_request(resource.clone(), &context),
                         )
                         .unwrap();
-                        let finalized = crate::differ::finalize_bootstrap_create(create);
-                        match finalized.check_inputs(&schemas, &HashMap::new()) {
-                            Ok(prepared) => {
+                        let admit = |effect: Effect<crate::resource::ProviderModuleSource>| {
+                            let mut plan = Plan::default();
+                            plan.add(effect);
+                            let checked = crate::input_rules::FinalizedPlan::new(plan)
+                                .check_inputs(&schemas, &HashMap::new())?;
+                            let scheduled = checked.schedule(&HashMap::new());
+                            let ready = super::super::scheduler::release_basic_for_test(
+                                &scheduled,
+                                0,
+                                &HashSet::new(),
+                            )
+                            .expect("fixture write is initially ready");
+                            let check = ExecutionInputChecks::new(
+                                checked.execution_input_checks(),
+                                scheduled.effects(),
+                                &[0],
+                            )
+                            .unwrap()
+                            .take_write(0)
+                            .unwrap();
+                            Ok::<_, crate::input_rules::InputAdmissionFailure<_>>((ready, check))
+                        };
+                        match admit(Effect::Create(create.resource().as_inner().clone())) {
+                            Ok((ready, check)) => {
+                                let attributes =
+                                    create.resource().as_resource().resolved_attributes();
+                                let writeback = SecretPreservingAttributes::from_provider_values(
+                                    &attributes,
+                                    &attributes,
+                                );
+                                let write =
+                                    check.prepare_create(create, writeback, &schemas).unwrap();
+                                let super::super::scheduler::ScheduledBasicEffect::Create {
+                                    create,
+                                    ..
+                                } = ready
+                                else {
+                                    panic!("expected fixture create")
+                                };
+                                let prepared = create.authorize(write);
                                 assert_eq!(value, "valid-name");
                                 assert_eq!(
                                     prepared.request().resource().attributes["name"],
                                     string(value)
                                 );
                             }
-                            Err(WriteInputError::Admission(plan)) => {
+                            Err(plan) => {
                                 assert_eq!(value, "192.168.1.1");
                                 assert!(
                                     matches!(&plan.errors()[0].kind, crate::plan::PlanErrorKind::InputRule { code, .. } if code == "test.name.not_ipv4")
                                 );
                             }
-                            Err(error) => panic!("unexpected discharge failure: {error}"),
                         }
                         let from = crate::resource::SnapshotState::not_found(resource.id.clone());
                         let update =
@@ -903,12 +832,33 @@ mod tests {
                                 &context,
                             ))
                             .unwrap();
-                        let finalized = crate::differ::finalize_update_request(
-                            AppliedIdentifier::new("old-id").unwrap(),
-                            update,
-                        );
-                        match finalized.check_inputs(&schemas, &HashMap::new()) {
-                            Ok(prepared) => {
+                        let id = update.from().id.clone();
+                        let mut desired = crate::resource::Resource::from_id(id.clone());
+                        desired.attributes = update.patch().sent_projection();
+                        match admit(Effect::Update {
+                            from: Box::new(update.from().clone()),
+                            identifier: AppliedIdentifier::new("old-id").unwrap(),
+                            to: crate::resource::ResolvedResource::new(desired.into()),
+                            changed_attributes: vec!["name".into()],
+                        }) {
+                            Ok((ready, check)) => {
+                                let attributes =
+                                    update.patch().sent_projection().into_iter().collect();
+                                let writeback = SecretPreservingAttributes::from_provider_values(
+                                    &attributes,
+                                    &attributes,
+                                );
+                                let write = check
+                                    .prepare_update(&id, update, writeback, &schemas)
+                                    .unwrap();
+                                let super::super::scheduler::ScheduledBasicEffect::Update {
+                                    update,
+                                    ..
+                                } = ready
+                                else {
+                                    panic!("expected fixture update")
+                                };
+                                let prepared = update.authorize(write);
                                 assert!(
                                     value == "valid-name" || scope == InputRuleScope::CreateOnly
                                 );
@@ -917,14 +867,13 @@ mod tests {
                                     Some(&string(value))
                                 );
                             }
-                            Err(WriteInputError::Admission(plan)) => {
+                            Err(plan) => {
                                 assert_eq!(scope, InputRuleScope::EveryWrite);
                                 assert_eq!(value, "192.168.1.1");
                                 assert!(
                                     matches!(&plan.errors()[0].kind, crate::plan::PlanErrorKind::InputRule { code, .. } if code == "test.name.not_ipv4")
                                 );
                             }
-                            Err(error) => panic!("unexpected discharge failure: {error}"),
                         }
                     }
                 },

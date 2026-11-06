@@ -70,7 +70,7 @@ pub struct InputTypeContext<S = ModuleSource> {
 
 impl<S> InputTypeContext<S> {
     /// An empty catalog preserves fail-closed admission for callers that have
-    /// no retained source expressions (including bootstrap provider requests).
+    /// no retained source expressions.
     pub fn empty() -> Self {
         Self {
             facts: TypeFacts::default(),

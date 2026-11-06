@@ -1120,7 +1120,17 @@ impl<S: Clone> crate::plan::AdmittedPlan<S> {
         schemas: &SchemaRegistry,
         current: &HashMap<ResourceId, Current>,
     ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>> {
-        FinalizedPlan::new(self.into_unadmitted()).check_inputs(schemas, current)
+        self.check_inputs_with_types(schemas, current, &InputTypeContext::empty())
+    }
+
+    /// Finalize the admitted effects and check them against retained declarations.
+    pub fn check_inputs_with_types(
+        self,
+        schemas: &SchemaRegistry,
+        current: &HashMap<ResourceId, Current>,
+        types: &InputTypeContext<S>,
+    ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>> {
+        FinalizedPlan::new(self.into_unadmitted()).check_inputs_with_types(schemas, current, types)
     }
 }
 

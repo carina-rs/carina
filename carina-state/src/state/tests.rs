@@ -108,9 +108,7 @@ fn create_attempt_for_test(id: ResourceId) -> carina_core::provider::CreateAttem
                 &preparation,
             ))
             .expect("fixture passes provider preparation");
-            let prepared = carina_core::differ::finalize_bootstrap_create(request)
-                .check_inputs(&schemas, &HashMap::new())
-                .expect("fixture inputs discharge");
+            let prepared = carina_core::replacement::create_permit_for_test(request);
             let (create, _cancellation) =
                 carina_core::executor::dispatch_create(&provider, prepared);
             let mut create = std::pin::pin!(create);

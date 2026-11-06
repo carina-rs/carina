@@ -484,7 +484,7 @@ impl std::fmt::Display for ResourceProviderPreparationError {
             "[{}.{}] {}",
             self.resource.resource_type,
             self.resource.identity_display(),
-            self.source,
+            format_error_with_source_chain(self.source.as_ref()),
         )
     }
 }
@@ -509,7 +509,7 @@ impl std::fmt::Display for StateBucketPreparationError {
         write!(
             f,
             "Failed to prepare state bucket before create: {}",
-            self.source
+            format_error_with_source_chain(self.source.as_ref())
         )
     }
 }
@@ -985,8 +985,6 @@ impl std::error::Error for AwsCredentialStartupError {}
 /// Typed error enum for carina-cli operations
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
-    #[error(transparent)]
-    BootstrapInputDischarge(#[from] carina_core::executor::WriteInputError),
     #[error(transparent)]
     CommandInput(#[from] std::sync::Arc<CommandInputError>),
 
@@ -1789,6 +1787,33 @@ mod tests {
             },
         )
         .await
+    }
+
+    #[test]
+    fn round2_input_discharge_cli_wrappers_render_diagnostics_once() {
+        for state_bucket in [false, true] {
+            let preparation = carina_core::executor::ProviderPreparationError::InputDischarge(
+                carina_core::executor::EffectFailureKind::UnresolvedInputRule {
+                    path: carina_core::schema::InputPath::new("name").unwrap(),
+                    code: carina_core::schema::InputRuleCode::new("test.name.not_ipv4").unwrap(),
+                },
+            );
+            let error = if state_bucket {
+                AppError::from_state_bucket_preparation(preparation)
+            } else {
+                AppError::from_resource_preparation(
+                    ResourceId::with_identity("test", "example"),
+                    preparation,
+                )
+            };
+            let rendered = format_error_with_source_chain(&error);
+            assert_eq!(
+                rendered.matches("test.name.not_ipv4").count(),
+                1,
+                "{rendered}"
+            );
+            assert!(rendered.contains("could not be discharged"), "{rendered}");
+        }
     }
 
     fn dependency_analysis_failure() -> carina_core::effect::deps::DependencyAnalysisFailure {

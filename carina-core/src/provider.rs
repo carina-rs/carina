@@ -11627,11 +11627,9 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     async fn mock_provider_create_returns_existing() {
         let provider = MockProvider;
         let resource = Resource::new("test", "example");
-        let prepared = crate::differ::finalize_bootstrap_create(CreateRequest::checked(
+        let prepared = crate::replacement::create_permit_for_test(CreateRequest::checked(
             resolved_for_test(resource),
-        ))
-        .check_inputs(&SchemaRegistry::new(), &HashMap::new())
-        .expect("fixture inputs discharge");
+        ));
         let (create, _cancellation) = crate::executor::dispatch_create(&provider, prepared);
         let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
@@ -11699,11 +11697,9 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let resource = Resource::with_provider("mock", "test", "example", None);
-        let prepared = crate::differ::finalize_bootstrap_create(CreateRequest::checked(
+        let prepared = crate::replacement::create_permit_for_test(CreateRequest::checked(
             resolved_for_test(resource),
-        ))
-        .check_inputs(&SchemaRegistry::new(), &HashMap::new())
-        .expect("fixture inputs discharge");
+        ));
         let (create, _cancellation) = crate::executor::dispatch_create(&router, prepared);
         let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
@@ -13103,9 +13099,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             .expect("fixture has no ignored write-only paths");
         let identifier =
             AppliedIdentifier::new("mock-id-123").expect("fixture identifier is non-empty");
-        let prepared = crate::differ::finalize_update_request(identifier.clone(), request)
-            .check_inputs(&SchemaRegistry::new(), &HashMap::new())
-            .expect("fixture inputs discharge");
+        let prepared = crate::replacement::update_permit_for_test(identifier.clone(), request);
         let state = crate::executor::dispatch_update(&router, prepared)
             .await
             .unwrap()

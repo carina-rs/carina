@@ -437,12 +437,7 @@ where
         request: CreateRequest,
     ) -> BoxFuture<'a, Result<CreateOutcome, CreateFailure>> {
         assert_eq!(&request.resource().id, id);
-        let prepared = carina_core::differ::finalize_bootstrap_create(request)
-            .check_inputs(
-                &carina_core::schema::SchemaRegistry::new(),
-                &std::collections::HashMap::new(),
-            )
-            .expect("fixture inputs discharge");
+        let prepared = carina_core::replacement::create_permit_for_test(request);
         let (create, cancellation) = carina_core::executor::dispatch_create(self, prepared);
         Box::pin(async move {
             let _cancellation = cancellation;
@@ -460,12 +455,8 @@ trait DispatchUpdateForTest: Provider {
     ) -> BoxFuture<'a, carina_core::provider::ProviderResult<carina_core::provider::UpdateOutcome>>
     {
         assert_eq!(&request.from().id, id);
-        let prepared = carina_core::differ::finalize_update_request(identifier.clone(), request)
-            .check_inputs(
-                &carina_core::schema::SchemaRegistry::new(),
-                &std::collections::HashMap::new(),
-            )
-            .expect("fixture inputs discharge");
+        let prepared =
+            carina_core::replacement::update_permit_for_test(identifier.clone(), request);
         Box::pin(carina_core::executor::dispatch_update(self, prepared))
     }
 }

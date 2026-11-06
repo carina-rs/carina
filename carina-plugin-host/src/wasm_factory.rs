@@ -8863,9 +8863,7 @@ mod tests {
                     panic!("fixture preparation must complete synchronously");
                 };
                 let request = request.expect("fixture passes provider preparation");
-                let prepared = carina_core::differ::finalize_bootstrap_create(request)
-                    .check_inputs(&schemas, &std::collections::HashMap::new())
-                    .expect("fixture inputs discharge");
+                let prepared = carina_core::replacement::create_permit_for_test(request);
                 let (create, _cancellation) =
                     carina_core::executor::dispatch_create(&provider, prepared);
                 let mut create = std::pin::pin!(create);
@@ -8912,9 +8910,7 @@ mod tests {
                 let request =
                     carina_core::executor::prepare_create_request(resource, &preparation).await;
                 let request = request.expect("fixture resource passes provider preparation");
-                let prepared = carina_core::differ::finalize_bootstrap_create(request)
-                    .check_inputs(&schemas, &std::collections::HashMap::new())
-                    .expect("fixture inputs discharge");
+                let prepared = carina_core::replacement::create_permit_for_test(request);
                 let provider = PendingFixtureProvider {
                     captured_attempt: None,
                 };

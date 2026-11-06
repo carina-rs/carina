@@ -48,11 +48,96 @@ impl CreatePermit {
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub fn create_permit_for_test(request: crate::provider::CreateRequest) -> CreatePermit {
-    // The explicit test-only bypass retains main's fixture API. Production
-    // callers must combine scheduler readiness and schema-aware discharge.
-    CreatePermit {
-        request: Box::new(super::input_discharge::prepared_create_for_test(request)),
-    }
+    let (ready, check) =
+        fixture_write_authority(Effect::Create(request.resource().as_inner().clone()));
+    let attributes = request.resource().as_resource().resolved_attributes();
+    let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
+        &attributes,
+        &attributes,
+    );
+    let write = check
+        .prepare_create(request, writeback, &crate::schema::SchemaRegistry::new())
+        .expect("fixture input discharge");
+    let ScheduledBasicEffect::Create { create, .. } = ready else {
+        unreachable!("fixture create slot")
+    };
+    create.authorize(write)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn update_permit_for_test(
+    identifier: crate::provider::AppliedIdentifier,
+    request: crate::provider::UpdateRequest,
+) -> UpdatePermit {
+    let id = request.from().id.clone();
+    let mut desired = crate::resource::Resource::from_id(id.clone());
+    desired.attributes = request.patch().sent_projection();
+    let (ready, check) = fixture_write_authority(Effect::Update {
+        from: Box::new(request.from().clone()),
+        identifier,
+        to: crate::resource::ResolvedResource::new(desired.into()),
+        changed_attributes: request
+            .patch()
+            .ops
+            .iter()
+            .map(|op| op.key().to_owned())
+            .collect(),
+    });
+    let attributes = request.patch().sent_projection().into_iter().collect();
+    let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
+        &attributes,
+        &attributes,
+    );
+    let write = check
+        .prepare_update(
+            &id,
+            request,
+            writeback,
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .expect("fixture input discharge");
+    let ScheduledBasicEffect::Update { update, .. } = ready else {
+        unreachable!("fixture update slot")
+    };
+    update.authorize(write)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn fixture_write_authority(
+    effect: Effect<crate::resource::ProviderModuleSource>,
+) -> (
+    ScheduledBasicEffect<crate::resource::ProviderModuleSource>,
+    super::input_discharge::WriteCheck,
+) {
+    let mut plan = crate::plan::Plan::default();
+    plan.add(effect);
+    let checked = crate::input_rules::FinalizedPlan::new(plan)
+        .check_inputs(&crate::schema::SchemaRegistry::new(), &HashMap::new())
+        .expect("fixture plan admission");
+    let scheduled = checked.schedule(&HashMap::new());
+    let dependencies = build_scheduler_deps(&scheduled, std::iter::empty());
+    assert!(dependencies.unresolved.is_empty());
+    let ready = release_ready_effect(
+        &scheduled,
+        0,
+        &dependencies.deps_of,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .expect("fixture slot is dependency ready")
+    .expect("fixture has no failed dependencies")
+    .into_basic()
+    .expect("fixture provider write");
+    let check = super::input_discharge::ExecutionInputChecks::new(
+        checked.execution_input_checks(),
+        scheduled.effects(),
+        &[0],
+    )
+    .expect("fixture input checks")
+    .take_write(0)
+    .expect("unconsumed fixture slot");
+    (ready, check)
 }
 
 pub(crate) struct ReadyDelete {
@@ -101,58 +186,6 @@ impl ReadyUpdate {
 impl UpdatePermit {
     pub fn request(&self) -> &crate::provider::UpdateRequest {
         self.write.request()
-    }
-}
-
-pub(super) fn authorize_finalized_create(
-    checked: &crate::input_rules::InputCheckedPlan<crate::resource::ProviderModuleSource>,
-    current: &HashMap<crate::resource::ResourceId, crate::resource::Current>,
-    write: super::PreparedWrite<crate::provider::CreateRequest>,
-) -> Result<CreatePermit, super::EffectFailureKind> {
-    let scheduled = checked.schedule(current);
-    let deps = build_scheduler_deps(&scheduled, std::iter::empty());
-    let ready = release_ready_effect(
-        &scheduled,
-        0,
-        &deps.deps_of,
-        &HashSet::new(),
-        &HashSet::new(),
-    )
-    .and_then(Result::ok)
-    .and_then(ReadyEffect::into_basic);
-    match ready {
-        Some(ScheduledBasicEffect::Create { create, .. }) if deps.unresolved.is_empty() => {
-            Ok(create.authorize(write))
-        }
-        _ => Err(super::EffectFailureKind::message(
-            "prepared request missing for consumed write slot",
-        )),
-    }
-}
-
-pub(super) fn authorize_finalized_update(
-    checked: &crate::input_rules::InputCheckedPlan<crate::resource::ProviderModuleSource>,
-    current: &HashMap<crate::resource::ResourceId, crate::resource::Current>,
-    write: super::PreparedWrite<crate::provider::UpdateRequest>,
-) -> Result<UpdatePermit, super::EffectFailureKind> {
-    let scheduled = checked.schedule(current);
-    let deps = build_scheduler_deps(&scheduled, std::iter::empty());
-    let ready = release_ready_effect(
-        &scheduled,
-        0,
-        &deps.deps_of,
-        &HashSet::new(),
-        &HashSet::new(),
-    )
-    .and_then(Result::ok)
-    .and_then(ReadyEffect::into_basic);
-    match ready {
-        Some(ScheduledBasicEffect::Update { update, .. }) if deps.unresolved.is_empty() => {
-            Ok(update.authorize(write))
-        }
-        _ => Err(super::EffectFailureKind::message(
-            "prepared request missing for consumed write slot",
-        )),
     }
 }
 
@@ -399,12 +432,34 @@ pub(super) fn release_ready_effect_mapped<S: Clone>(
 /// Prepare an initially ready create without starting a full apply, for
 /// bootstrap callers. This uses the executor's release and the sealed target;
 /// an endpoint with pending prerequisites yields no permission.
+/// A schedule without input admission cannot authorize bootstrap dispatch:
+///
+/// ```compile_fail
+/// use carina_core::{
+///     executor::{prepare_initial_create, ProviderPreparationContext},
+///     replacement::ScheduledPlan, resolved_graph::ExpandedBindingIndex,
+/// };
+/// async fn bypass(
+///     scheduled: &ScheduledPlan<'_>, graph: &ExpandedBindingIndex,
+///     context: &ProviderPreparationContext<'_>,
+/// ) {
+///     let _ = prepare_initial_create(scheduled, graph, context).await;
+/// }
+/// ```
 pub async fn prepare_initial_create(
-    scheduled: &crate::replacement::ScheduledPlan<'_>,
+    scheduled: &crate::replacement::InputCheckedScheduledPlan<'_>,
     graph: &crate::resolved_graph::ExpandedBindingIndex,
     context: &super::ProviderPreparationContext<'_>,
 ) -> Result<Option<CreatePermit>, super::ProviderPreparationError> {
-    let (scheduled, _, _) = scheduled.clone().expand_deferred_replacements();
+    let obligations = scheduled.execution_input_checks();
+    let (scheduled, _, sources) = scheduled.clone().expand_deferred_replacements();
+    let input_error = super::ProviderPreparationError::InputDischarge;
+    let mut checks = super::input_discharge::ExecutionInputChecks::new(
+        obligations,
+        scheduled.effects(),
+        &sources,
+    )
+    .map_err(|error| input_error(super::EffectFailureKind::execution(error)))?;
     let dependencies = build_scheduler_deps(&scheduled, graph.scheduler_target_ids());
     let completed = HashSet::new();
     for index in 0..scheduled.effects().len() {
@@ -431,10 +486,16 @@ pub async fn prepare_initial_create(
             )
             .await?;
             let request = crate::provider::CreateRequest::checked(resource);
-            let write = crate::differ::finalize_bootstrap_create(request)
-                .check_inputs(context.schemas(), &HashMap::new())
-                .map_err(|error| super::ProviderPreparationError::Input(Box::new(error)))?;
-            return Ok(Some(create.authorize(*write.request)));
+            let attributes = request.resource().as_resource().resolved_attributes();
+            let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
+                &create.resource.resolved_attributes(),
+                &attributes,
+            );
+            let write = checks
+                .take_write(index)
+                .and_then(|check| check.prepare_create(request, writeback, context.schemas()))
+                .map_err(input_error)?;
+            return Ok(Some(create.authorize(write)));
         }
     }
     Ok(None)

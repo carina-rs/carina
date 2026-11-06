@@ -12322,6 +12322,56 @@ async fn auto_create_backend_bucket_is_outside_provider_input_admission() {
 pub(super) mod issue_4283;
 
 #[tokio::test]
+async fn round2_bootstrap_rejects_unknown_dependency_before_dispatch() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::Success,
+    };
+    let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".into())),
+    );
+    resource
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("missing"));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        PatternResourceSchema::new("s3.Bucket")
+            .attribute(
+                PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let provider_configs = empty_resolved_provider_configs();
+    let (_temp, backend) = bootstrap_test_backend();
+    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
+    let result = create_checked_bootstrap_resource_for_test(
+        crate::output_style::ColorMode::Plain,
+        &provider,
+        resource,
+        BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            backend: backend.as_ref(),
+            parsed: &parsed,
+            provider_configs: &provider_configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "bootstrap must resolve authored dependency operands"
+    );
+    assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
+    assert!(backend.read_state().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn bootstrap_unresolved_reference_returns_typed_preparation_error() {
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),

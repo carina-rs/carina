@@ -2035,9 +2035,7 @@ mod tests {
                     carina_core::executor::prepare_create_request(resource, &preparation).await;
                 let request = request.expect("mock test resource should pass create preparation");
                 assert_eq!(request.resource().id, id);
-                let prepared = carina_core::differ::finalize_bootstrap_create(request)
-                    .check_inputs(&schemas, &std::collections::HashMap::new())
-                    .expect("fixture inputs discharge");
+                let prepared = carina_core::replacement::create_permit_for_test(request);
                 let (create, _cancellation) =
                     carina_core::executor::dispatch_create(provider, prepared);
                 create.await
@@ -2992,10 +2990,10 @@ mod tests {
                     let request = request.expect("update request should pass checked preparation");
                     let identifier = AppliedIdentifier::new("mock-id")
                         .expect("the mock identifier is non-empty");
-                    let prepared =
-                        carina_core::differ::finalize_update_request(identifier.clone(), request)
-                            .check_inputs(&schemas, &std::collections::HashMap::new())
-                            .expect("fixture inputs discharge");
+                    let prepared = carina_core::replacement::update_permit_for_test(
+                        identifier.clone(),
+                        request,
+                    );
                     carina_core::executor::dispatch_update(&provider, prepared)
                         .await
                         .expect("update should succeed");

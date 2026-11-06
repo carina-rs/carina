@@ -229,6 +229,55 @@ async fn prepare_bootstrap_creation(
     context: &BootstrapCreateContext<'_>,
     session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<carina_core::replacement::CreatePermit, AppError> {
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(context.parsed.clone().into())?;
+    let target = graph.resolve_resource(resource.clone(), context.schemas)?;
+    let mut bootstrap_plan = carina_core::plan::Plan::new();
+    bootstrap_plan.add(carina_core::effect::Effect::Create(target));
+    let bootstrap_plan = bootstrap_plan.admit(context.schemas)?;
+    let mut input_sources = context
+        .parsed
+        .resources
+        .iter()
+        .cloned()
+        .map(UnresolvedResource::from_pre_resolve)
+        .collect::<Vec<_>>();
+    if !input_sources
+        .iter()
+        .any(|source| source.as_resource().id == resource.id)
+    {
+        input_sources.push(UnresolvedResource::from_pre_resolve(resource));
+    }
+    let wait_aliases = context
+        .parsed
+        .wait_bindings
+        .iter()
+        .map(WaitAliasSpec::from)
+        .collect::<Vec<_>>();
+    let input_types = carina_core::input_rules::InputTypeContext::from_compositions(
+        &input_sources,
+        &context.parsed.data_sources,
+        carina_core::input_rules::InputCompositions::Live(&context.parsed.compositions),
+        &wait_aliases,
+        context.schemas,
+    );
+    let checked = match bootstrap_plan.check_inputs_with_types(
+        context.schemas,
+        &HashMap::new(),
+        &input_types,
+    ) {
+        Ok(checked) => checked,
+        Err(plan) => {
+            return Err(
+                crate::commands::shared::plan_errors::render_plan_errors_and_abort(
+                    color_mode,
+                    &plan,
+                    Path::new("."),
+                )
+                .expect_err("bootstrap input rejection has diagnostics"),
+            );
+        }
+    };
+    let scheduled = checked.schedule(&HashMap::new());
     let bindings = bootstrap_resolved_bindings(context.parsed);
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(
         &context.parsed.compositions,
@@ -242,23 +291,14 @@ async fn prepare_bootstrap_creation(
         context.schemas,
         session,
     );
-    let request = carina_core::executor::prepare_create_request(resource, &preparation)
+    carina_core::executor::prepare_initial_create(&scheduled, &graph, &preparation)
         .await
-        .map_err(AppError::from_state_bucket_preparation)?;
-    match carina_core::differ::finalize_bootstrap_create(request)
-        .check_inputs(context.schemas, &HashMap::new())
-    {
-        Ok(prepared) => Ok(prepared),
-        Err(carina_core::executor::WriteInputError::Admission(plan)) => Err(
-            crate::commands::shared::plan_errors::render_plan_errors_and_abort(
-                color_mode,
-                &plan,
-                Path::new("."),
+        .map_err(AppError::from_state_bucket_preparation)?
+        .ok_or_else(|| {
+            AppError::from_state_bucket_preparation(
+                carina_core::executor::ProviderPreparationError::InitialCreateNotReady,
             )
-            .expect_err("bootstrap input rejection has diagnostics"),
-        ),
-        Err(error) => Err(error.into()),
-    }
+        })
 }
 
 async fn create_auto_bootstrap_bucket(backend: &dyn StateBackend) -> Result<(), AppError> {

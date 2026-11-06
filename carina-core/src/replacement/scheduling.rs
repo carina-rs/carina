@@ -191,6 +191,50 @@ impl<S: Clone> crate::plan::AdmittedPlan<S> {
     }
 }
 
+/// A schedule retaining the input obligations of its exact source plan.
+/// Only scheduling an [`crate::input_rules::InputCheckedPlan`] constructs it.
+#[derive(Debug, Clone)]
+pub struct InputCheckedScheduledPlan<'plan, S = crate::resource::ModuleSource> {
+    checked: &'plan crate::input_rules::InputCheckedPlan<S>,
+    scheduled: ScheduledPlan<'plan, S>,
+}
+
+impl<'plan, S> Deref for InputCheckedScheduledPlan<'plan, S> {
+    type Target = ScheduledPlan<'plan, S>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.scheduled
+    }
+}
+
+impl<'plan, S: Clone> InputCheckedScheduledPlan<'plan, S> {
+    pub(crate) fn execution_input_checks(&self) -> Vec<crate::input_rules::PendingInputObligation> {
+        self.checked.execution_input_checks()
+    }
+
+    pub(crate) fn expand_deferred_replacements(
+        self,
+    ) -> (
+        ScheduledPlan<'plan, S>,
+        std::collections::HashSet<usize>,
+        Vec<usize>,
+    ) {
+        self.scheduled.expand_deferred_replacements()
+    }
+}
+
+impl<S: Clone> crate::input_rules::InputCheckedPlan<S> {
+    pub fn schedule(
+        &self,
+        current: &HashMap<ResourceId, Current>,
+    ) -> InputCheckedScheduledPlan<'_, S> {
+        InputCheckedScheduledPlan {
+            checked: self,
+            scheduled: self.plan().schedule(current),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,7 +484,11 @@ mod tests {
                     )),
                 )]),
             });
-            let admitted = draft.admit(&schemas).unwrap();
+            let admitted = draft
+                .admit(&schemas)
+                .unwrap()
+                .check_inputs(&schemas, &HashMap::new())
+                .unwrap();
             let scheduled = admitted.schedule(&Default::default());
             let mut configuration = crate::parser::ExpandedInferredFile::default();
             configuration.resources.push(

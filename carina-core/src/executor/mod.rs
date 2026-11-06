@@ -26,7 +26,7 @@ pub(super) mod scheduler;
 pub(crate) mod wait;
 
 pub use deferred_dispatch::{AnonymousIdentityCollisionSource, DeferredCreateFailure};
-pub use input_discharge::{DeletePermit, FinalizedWrite, PreparedWrite, WriteInputError};
+pub use input_discharge::{DeletePermit, PreparedWrite};
 pub use parallel::classify_stalled_effects;
 pub use scheduler::prepare_initial_create;
 pub use wait::StartMarker;
@@ -184,6 +184,21 @@ pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 ///     let _ = dispatch_create(provider, discharged);
 /// }
 /// ```
+///
+/// Preparing and checking a raw request cannot manufacture scheduler readiness:
+///
+/// ```compile_fail
+/// use carina_core::{
+///     executor::{prepare_create_request, ProviderPreparationContext},
+///     replacement::CreatePermit, resource::Resource, schema::SchemaRegistry,
+/// };
+/// async fn bypass(raw: Resource, context: &ProviderPreparationContext<'_>) -> CreatePermit {
+///     let request = prepare_create_request(raw, context).await.unwrap();
+///     carina_core::differ::finalize_bootstrap_create(request)
+///         .check_inputs(&SchemaRegistry::new(), &std::collections::HashMap::new())
+///         .unwrap()
+/// }
+/// ```
 pub fn dispatch_create<'a, P: Provider + ?Sized>(
     provider: &'a P,
     permit: crate::replacement::CreatePermit,
@@ -204,6 +219,20 @@ pub fn dispatch_create<'a, P: Provider + ?Sized>(
 /// use carina_core::{executor::dispatch_update, provider::{Provider, AppliedIdentifier, UpdateRequest}};
 /// fn bypass(provider: &dyn Provider, id: &AppliedIdentifier, raw: UpdateRequest) {
 ///     let _ = dispatch_update(provider, raw);
+/// }
+/// ```
+///
+/// A raw update request cannot obtain a permit by checking a synthetic plan:
+///
+/// ```compile_fail
+/// use carina_core::{
+///     provider::{AppliedIdentifier, UpdateRequest},
+///     replacement::UpdatePermit, schema::SchemaRegistry,
+/// };
+/// fn bypass(identifier: AppliedIdentifier, raw: UpdateRequest) -> UpdatePermit {
+///     carina_core::differ::finalize_update_request(identifier, raw)
+///         .check_inputs(&SchemaRegistry::new(), &std::collections::HashMap::new())
+///         .unwrap()
 /// }
 /// ```
 pub async fn dispatch_update<P: Provider + ?Sized>(
@@ -1402,6 +1431,12 @@ impl std::fmt::Display for EffectFailureKind {
             }
             Self::ModuleConstraint { failure } => failure.fmt(formatter),
         }
+    }
+}
+
+impl std::error::Error for EffectFailureKind {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.reported_error()
     }
 }
 

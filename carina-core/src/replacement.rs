@@ -22,11 +22,11 @@ mod plan_scheduling_tests;
 #[path = "replacement/scheduling.rs"]
 mod scheduling;
 pub(crate) use crate::executor::scheduler::ScheduledBasicEffect;
+pub use crate::executor::scheduler::{CreatePermit, UpdatePermit};
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
-pub use crate::executor::scheduler::create_permit_for_test;
-pub use crate::executor::scheduler::{CreatePermit, UpdatePermit};
-pub use scheduling::{ScheduledEffect, ScheduledEffects, ScheduledPlan};
+pub use crate::executor::scheduler::{create_permit_for_test, update_permit_for_test};
+pub use scheduling::{InputCheckedScheduledPlan, ScheduledEffect, ScheduledEffects, ScheduledPlan};
 
 /// State rows own all their provider generations. Routing aliases belong to
 /// the generations, not to the row's identity.

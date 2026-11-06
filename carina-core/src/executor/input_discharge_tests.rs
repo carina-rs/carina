@@ -163,6 +163,105 @@ struct ChangingNormalizer {
     first: &'static str,
 }
 
+async fn round2_initial_create_after_normalization(
+    retain_runtime_rule: bool,
+) -> Result<Option<crate::replacement::CreatePermit>, ProviderPreparationError> {
+    let admission_schemas = schemas(InputRuleScope::CreateOnly);
+    let resource = resolved_fixture_resources(vec![
+        Resource::new("test", "consumer").with_attribute("name", string("valid-name")),
+    ])
+    .remove(0);
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resource));
+    let checked = FinalizedPlan::new(plan)
+        .check_inputs(&admission_schemas, &HashMap::new())
+        .unwrap();
+    let scheduled = checked.schedule(&HashMap::new());
+    let graph = crate::resolved_graph::resolve_expanded_graph(
+        crate::parser::ExpandedInferredFile::default().into(),
+    )
+    .unwrap();
+    let mut runtime_schemas = admission_schemas;
+    if !retain_runtime_rule {
+        // Discharge must retain the admitted declarations, even when the
+        // provider-preparation catalog has no input rules for this resource.
+        runtime_schemas.insert(
+            "",
+            PatternResourceSchema::new("test")
+                .attribute(
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+    }
+    let bindings = ResolvedBindings::default();
+    let gate = ModuleConstraintGate::from_live_compositions(&[]);
+    let normalizer = ChangingNormalizer {
+        calls: AtomicUsize::new(0),
+        first: "192.168.1.1",
+    };
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |session| {
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                &normalizer,
+                &[],
+                &runtime_schemas,
+                session,
+            );
+            prepare_initial_create(&scheduled, &graph, &context).await
+        },
+    )
+    .await
+}
+
+#[tokio::test]
+async fn round2_initial_create_discharges_the_original_plan_obligations() {
+    let result = round2_initial_create_after_normalization(false).await;
+    assert!(
+        result.is_err(),
+        "the original admitted rule must reject the normalized request"
+    );
+}
+
+#[tokio::test]
+async fn round2_initial_create_discharge_exposes_its_error_source() {
+    let error = round2_initial_create_after_normalization(true)
+        .await
+        .unwrap_err();
+    let source = std::error::Error::source(&error)
+        .expect("provider preparation must expose its input failure source");
+    assert!(matches!(
+        source.downcast_ref::<EffectFailureKind>(),
+        Some(EffectFailureKind::InputRule { .. })
+    ));
+    assert!(
+        source.to_string().contains("test.name.not_ipv4"),
+        "{source}"
+    );
+}
+
+#[tokio::test]
+async fn round2_initial_create_discharge_renders_diagnostics_on_the_generic_error_path() {
+    let error = round2_initial_create_after_normalization(true)
+        .await
+        .unwrap_err();
+    let mut rendered = error.to_string();
+    let mut source = std::error::Error::source(&error);
+    while let Some(error) = source {
+        rendered.push_str(&format!("\n{error}"));
+        source = error.source();
+    }
+    assert!(rendered.contains("test.name.not_ipv4"), "{rendered}");
+    assert!(rendered.contains("name"), "{rendered}");
+    assert!(!rendered.contains("192.168.1.1"), "{rendered}");
+}
+
 impl crate::provider::ProviderNormalizer for ChangingNormalizer {
     fn normalize_desired<'a>(
         &'a self,
