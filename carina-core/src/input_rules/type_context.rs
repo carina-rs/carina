@@ -69,6 +69,22 @@ pub struct InputTypeContext<S = ModuleSource> {
 }
 
 impl<S> InputTypeContext<S> {
+    /// Build the complete input context shared by live, saved, and bootstrap
+    /// admission, including declarations and host-merged default tag keys.
+    pub fn for_plan<'a, D>(
+        resources: &[UnresolvedResource<S>],
+        data_sources: &[DataSource<S, crate::resource::NoPlaceholder, AbsoluteBindingAddress, D>],
+        compositions: InputCompositions<'_>,
+        wait_aliases: &[WaitAliasSpec],
+        configs: &[crate::parser::ExpandedProviderConfig],
+        schemas: &SchemaRegistry,
+        write_ids: impl IntoIterator<Item = &'a ResourceId>,
+    ) -> crate::provider::ProviderResult<Self> {
+        Self::from_compositions(resources, &[], compositions, wait_aliases, schemas)
+            .with_data_sources(data_sources, schemas)
+            .with_default_tags(configs, schemas, write_ids)
+    }
+
     /// An empty catalog preserves fail-closed admission for callers that have
     /// no retained source expressions.
     pub fn empty() -> Self {

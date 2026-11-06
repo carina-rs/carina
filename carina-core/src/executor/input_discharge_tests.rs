@@ -167,20 +167,18 @@ async fn round2_initial_create_after_normalization(
     retain_runtime_rule: bool,
 ) -> Result<Option<crate::replacement::CreatePermit>, ProviderPreparationError> {
     let admission_schemas = schemas(InputRuleScope::CreateOnly);
-    let resource = resolved_fixture_resources(vec![
-        Resource::new("test", "consumer").with_attribute("name", string("valid-name")),
-    ])
-    .remove(0);
-    let mut plan = Plan::new();
-    plan.add(Effect::Create(resource));
-    let checked = FinalizedPlan::new(plan)
-        .check_inputs(&admission_schemas, &HashMap::new())
+    let resource = Resource::new("test", "consumer").with_attribute("name", string("valid-name"));
+    let mut parsed = crate::parser::ExpandedInferredFile::default();
+    parsed.resources.push(resource.clone()); // allow: direct — fixture test inspection
+    let graph = crate::resolved_graph::resolve_expanded_graph(parsed.into()).unwrap();
+    let checked = graph
+        .initial_create_plan(resource, &admission_schemas)
+        .unwrap()
+        .check_inputs_with_types(
+            &admission_schemas,
+            &crate::input_rules::InputTypeContext::empty(),
+        )
         .unwrap();
-    let scheduled = checked.schedule(&HashMap::new());
-    let graph = crate::resolved_graph::resolve_expanded_graph(
-        crate::parser::ExpandedInferredFile::default().into(),
-    )
-    .unwrap();
     let mut runtime_schemas = admission_schemas;
     if !retain_runtime_rule {
         // Discharge must retain the admitted declarations, even when the
@@ -214,7 +212,7 @@ async fn round2_initial_create_after_normalization(
                 &runtime_schemas,
                 session,
             );
-            prepare_initial_create(&scheduled, &graph, &context).await
+            prepare_initial_create(&checked, &context).await
         },
     )
     .await
@@ -224,8 +222,8 @@ async fn round2_initial_create_after_normalization(
 async fn round2_initial_create_discharges_the_original_plan_obligations() {
     let result = round2_initial_create_after_normalization(false).await;
     assert!(
-        result.is_err(),
-        "the original admitted rule must reject the normalized request"
+        matches!(result, Err(ProviderPreparationError::InputDischarge(EffectFailureKind::InputRule { ref violation, .. })) if violation.code().as_str() == "test.name.not_ipv4"),
+        "the original admitted rule must reject the normalized request: {result:?}"
     );
 }
 

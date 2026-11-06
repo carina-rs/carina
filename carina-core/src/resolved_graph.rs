@@ -264,6 +264,48 @@ pub struct ExpandedBindingIndex {
     upstream_bindings: HashSet<AbsoluteBindingAddress>,
 }
 
+/// A bootstrap plan produced by resolving its create against its own graph.
+/// The graph remains private through input admission and scheduling.
+#[derive(Debug)]
+pub struct ResolvedInitialCreatePlan {
+    graph: ExpandedBindingIndex,
+    plan: crate::input_rules::FinalizedPlan,
+}
+
+/// Input-checked bootstrap intent retaining the graph that resolved its target.
+///
+/// The readiness graph cannot be replaced after admission:
+///
+/// ```compile_fail,E0616
+/// use carina_core::resolved_graph::{InputCheckedInitialCreatePlan, ExpandedBindingIndex};
+/// fn swap_graph(plan: &mut InputCheckedInitialCreatePlan, other: ExpandedBindingIndex) {
+///     plan.graph = other;
+/// }
+/// ```
+#[derive(Debug)]
+pub struct InputCheckedInitialCreatePlan {
+    pub(crate) graph: ExpandedBindingIndex,
+    pub(crate) checked: crate::input_rules::InputCheckedPlan,
+}
+
+impl ResolvedInitialCreatePlan {
+    /// Admit the resolved effects and retain their input obligations together
+    /// with the graph that will judge readiness at dispatch.
+    pub fn check_inputs_with_types(
+        self,
+        schemas: &SchemaRegistry,
+        types: &crate::input_rules::InputTypeContext,
+    ) -> Result<InputCheckedInitialCreatePlan, crate::input_rules::InputAdmissionFailure> {
+        let checked = self
+            .plan
+            .check_inputs_with_types(schemas, &HashMap::new(), types)?;
+        Ok(InputCheckedInitialCreatePlan {
+            graph: self.graph,
+            checked,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedHandleTarget {
     id: ResolvedResourceId,
@@ -431,6 +473,23 @@ fn rewrite_handle_output_refs<P: PlaceholderKind>(
 }
 
 impl ExpandedBindingIndex {
+    /// Resolve and finalize one bootstrap create, retaining this exact graph
+    /// for the executor's dependency-ready release. No resolved plan can be
+    /// attached by the caller after this transition.
+    pub fn initial_create_plan(
+        &self,
+        resource: Resource,
+        schemas: &SchemaRegistry,
+    ) -> Result<ResolvedInitialCreatePlan, ExpandedGraphResolutionError> {
+        let target = self.resolve_resource(resource, schemas)?;
+        let mut plan = crate::plan::Plan::new();
+        plan.add(crate::effect::Effect::Create(target));
+        Ok(ResolvedInitialCreatePlan {
+            graph: self.clone(),
+            plan: crate::input_rules::FinalizedPlan::new(plan),
+        })
+    }
+
     /// Declared inputs outside a subset plan remain known graph targets. This
     /// catalog never removes edges to endpoints present in that plan.
     pub(crate) fn scheduler_target_ids(&self) -> impl Iterator<Item = &ResolvedResourceId> {

@@ -108,6 +108,7 @@ fn create_attempt_for_test(id: ResourceId) -> carina_core::provider::CreateAttem
                 &preparation,
             ))
             .expect("fixture passes provider preparation");
+            // This fixture only captures dispatch provenance; its schema has no input rules.
             let prepared = carina_core::replacement::create_permit_for_test(request);
             let (create, _cancellation) =
                 carina_core::executor::dispatch_create(&provider, prepared);

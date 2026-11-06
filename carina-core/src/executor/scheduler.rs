@@ -48,15 +48,26 @@ impl CreatePermit {
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub fn create_permit_for_test(request: crate::provider::CreateRequest) -> CreatePermit {
-    let (ready, check) =
-        fixture_write_authority(Effect::Create(request.resource().as_inner().clone()));
+    create_permit_with_schemas_for_test(request, &crate::schema::SchemaRegistry::new())
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn create_permit_with_schemas_for_test(
+    request: crate::provider::CreateRequest,
+    schemas: &crate::schema::SchemaRegistry,
+) -> CreatePermit {
+    let (ready, check) = fixture_write_authority(
+        Effect::Create(request.resource().as_inner().clone()),
+        schemas,
+    );
     let attributes = request.resource().as_resource().resolved_attributes();
     let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
         &attributes,
         &attributes,
     );
     let write = check
-        .prepare_create(request, writeback, &crate::schema::SchemaRegistry::new())
+        .prepare_create(request, writeback, schemas)
         .expect("fixture input discharge");
     let ScheduledBasicEffect::Create { create, .. } = ready else {
         unreachable!("fixture create slot")
@@ -70,32 +81,40 @@ pub fn update_permit_for_test(
     identifier: crate::provider::AppliedIdentifier,
     request: crate::provider::UpdateRequest,
 ) -> UpdatePermit {
+    update_permit_with_schemas_for_test(identifier, request, &crate::schema::SchemaRegistry::new())
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn update_permit_with_schemas_for_test(
+    identifier: crate::provider::AppliedIdentifier,
+    request: crate::provider::UpdateRequest,
+    schemas: &crate::schema::SchemaRegistry,
+) -> UpdatePermit {
     let id = request.from().id.clone();
     let mut desired = crate::resource::Resource::from_id(id.clone());
     desired.attributes = request.patch().sent_projection();
-    let (ready, check) = fixture_write_authority(Effect::Update {
-        from: Box::new(request.from().clone()),
-        identifier,
-        to: crate::resource::ResolvedResource::new(desired.into()),
-        changed_attributes: request
-            .patch()
-            .ops
-            .iter()
-            .map(|op| op.key().to_owned())
-            .collect(),
-    });
+    let (ready, check) = fixture_write_authority(
+        Effect::Update {
+            from: Box::new(request.from().clone()),
+            identifier,
+            to: crate::resource::ResolvedResource::new(desired.into()),
+            changed_attributes: request
+                .patch()
+                .ops
+                .iter()
+                .map(|op| op.key().to_owned())
+                .collect(),
+        },
+        schemas,
+    );
     let attributes = request.patch().sent_projection().into_iter().collect();
     let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
         &attributes,
         &attributes,
     );
     let write = check
-        .prepare_update(
-            &id,
-            request,
-            writeback,
-            &crate::schema::SchemaRegistry::new(),
-        )
+        .prepare_update(&id, request, writeback, schemas)
         .expect("fixture input discharge");
     let ScheduledBasicEffect::Update { update, .. } = ready else {
         unreachable!("fixture update slot")
@@ -106,6 +125,7 @@ pub fn update_permit_for_test(
 #[cfg(any(test, feature = "test-utils"))]
 fn fixture_write_authority(
     effect: Effect<crate::resource::ProviderModuleSource>,
+    schemas: &crate::schema::SchemaRegistry,
 ) -> (
     ScheduledBasicEffect<crate::resource::ProviderModuleSource>,
     super::input_discharge::WriteCheck,
@@ -113,7 +133,7 @@ fn fixture_write_authority(
     let mut plan = crate::plan::Plan::default();
     plan.add(effect);
     let checked = crate::input_rules::FinalizedPlan::new(plan)
-        .check_inputs(&crate::schema::SchemaRegistry::new(), &HashMap::new())
+        .check_inputs(schemas, &HashMap::new())
         .expect("fixture plan admission");
     let scheduled = checked.schedule(&HashMap::new());
     let dependencies = build_scheduler_deps(&scheduled, std::iter::empty());
@@ -437,20 +457,35 @@ pub(super) fn release_ready_effect_mapped<S: Clone>(
 /// ```compile_fail
 /// use carina_core::{
 ///     executor::{prepare_initial_create, ProviderPreparationContext},
-///     replacement::ScheduledPlan, resolved_graph::ExpandedBindingIndex,
+///     replacement::ScheduledPlan,
 /// };
 /// async fn bypass(
-///     scheduled: &ScheduledPlan<'_>, graph: &ExpandedBindingIndex,
+///     scheduled: &ScheduledPlan<'_>,
+///     context: &ProviderPreparationContext<'_>,
+/// ) {
+///     let _ = prepare_initial_create(scheduled, context).await;
+/// }
+/// ```
+///
+/// Input admission cannot be paired with a caller-chosen readiness graph:
+///
+/// ```compile_fail
+/// use carina_core::{
+///     executor::{prepare_initial_create, ProviderPreparationContext},
+///     replacement::InputCheckedScheduledPlan, resolved_graph::ExpandedBindingIndex,
+/// };
+/// async fn swap_graph(
+///     scheduled: &InputCheckedScheduledPlan<'_>, graph: &ExpandedBindingIndex,
 ///     context: &ProviderPreparationContext<'_>,
 /// ) {
 ///     let _ = prepare_initial_create(scheduled, graph, context).await;
 /// }
 /// ```
 pub async fn prepare_initial_create(
-    scheduled: &crate::replacement::InputCheckedScheduledPlan<'_>,
-    graph: &crate::resolved_graph::ExpandedBindingIndex,
+    plan: &crate::resolved_graph::InputCheckedInitialCreatePlan,
     context: &super::ProviderPreparationContext<'_>,
 ) -> Result<Option<CreatePermit>, super::ProviderPreparationError> {
+    let scheduled = plan.checked.schedule(&HashMap::new());
     let obligations = scheduled.execution_input_checks();
     let (scheduled, _, sources) = scheduled.clone().expand_deferred_replacements();
     let input_error = super::ProviderPreparationError::InputDischarge;
@@ -460,7 +495,7 @@ pub async fn prepare_initial_create(
         &sources,
     )
     .map_err(|error| input_error(super::EffectFailureKind::execution(error)))?;
-    let dependencies = build_scheduler_deps(&scheduled, graph.scheduler_target_ids());
+    let dependencies = build_scheduler_deps(&scheduled, plan.graph.scheduler_target_ids());
     let completed = HashSet::new();
     for index in 0..scheduled.effects().len() {
         if dependencies

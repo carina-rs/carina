@@ -390,10 +390,19 @@ fn redacted_secret_and_legacy_marker(plaintext: &str) -> (SnapshotValue, String)
     (SnapshotValue::redacted(hash), format!("_secret:{digest}"))
 }
 
+fn fixture_schemas() -> carina_core::schema::SchemaRegistry {
+    let mut schemas = carina_core::schema::SchemaRegistry::new();
+    for schema in carina_provider_mock::builtin_schemas() {
+        schemas.insert("", schema.clone());
+        schemas.insert("mock", schema);
+    }
+    schemas
+}
+
 async fn create_request_for_test(resource: Resource) -> CreateRequest {
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::schema::SchemaRegistry::new();
+    let schemas = fixture_schemas();
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
         schemas.clone(),
@@ -437,7 +446,10 @@ where
         request: CreateRequest,
     ) -> BoxFuture<'a, Result<CreateOutcome, CreateFailure>> {
         assert_eq!(&request.resource().id, id);
-        let prepared = carina_core::replacement::create_permit_for_test(request);
+        let prepared = carina_core::replacement::create_permit_with_schemas_for_test(
+            request,
+            &fixture_schemas(),
+        );
         let (create, cancellation) = carina_core::executor::dispatch_create(self, prepared);
         Box::pin(async move {
             let _cancellation = cancellation;
@@ -455,8 +467,11 @@ trait DispatchUpdateForTest: Provider {
     ) -> BoxFuture<'a, carina_core::provider::ProviderResult<carina_core::provider::UpdateOutcome>>
     {
         assert_eq!(&request.from().id, id);
-        let prepared =
-            carina_core::replacement::update_permit_for_test(identifier.clone(), request);
+        let prepared = carina_core::replacement::update_permit_with_schemas_for_test(
+            identifier.clone(),
+            request,
+            &fixture_schemas(),
+        );
         Box::pin(carina_core::executor::dispatch_update(self, prepared))
     }
 }

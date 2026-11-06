@@ -8863,6 +8863,7 @@ mod tests {
                     panic!("fixture preparation must complete synchronously");
                 };
                 let request = request.expect("fixture passes provider preparation");
+                // Pure dispatch fixture with no schema input rules.
                 let prepared = carina_core::replacement::create_permit_for_test(request);
                 let (create, _cancellation) =
                     carina_core::executor::dispatch_create(&provider, prepared);
@@ -8910,6 +8911,7 @@ mod tests {
                 let request =
                     carina_core::executor::prepare_create_request(resource, &preparation).await;
                 let request = request.expect("fixture resource passes provider preparation");
+                // Pure dispatch fixture with no schema input rules.
                 let prepared = carina_core::replacement::create_permit_for_test(request);
                 let provider = PendingFixtureProvider {
                     captured_attempt: None,

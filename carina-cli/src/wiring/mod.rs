@@ -7103,13 +7103,11 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     .cloned()
                     .map(UnresolvedResource::from_pre_resolve)
                     .collect::<Vec<_>>();
-                let input_types = carina_core::input_rules::InputTypeContext::from_compositions(
+                let input_types = carina_core::input_rules::InputTypeContext::for_plan(
                     &input_sources,
                     &data_sources_for_plan,
                     carina_core::input_rules::InputCompositions::Live(&compositions),
                     &wait_aliases,
-                    context.schemas(),
-                ).with_default_tags(
                     provider_configs,
                     context.schemas(),
                     plan.effects().iter().map(|effect| effect.resource_id()),

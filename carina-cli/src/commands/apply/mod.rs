@@ -230,10 +230,7 @@ async fn prepare_bootstrap_creation(
     session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<carina_core::replacement::CreatePermit, AppError> {
     let graph = carina_core::resolved_graph::resolve_expanded_graph(context.parsed.clone().into())?;
-    let target = graph.resolve_resource(resource.clone(), context.schemas)?;
-    let mut bootstrap_plan = carina_core::plan::Plan::new();
-    bootstrap_plan.add(carina_core::effect::Effect::Create(target));
-    let bootstrap_plan = bootstrap_plan.admit(context.schemas)?;
+    let bootstrap_plan = graph.initial_create_plan(resource.clone(), context.schemas)?;
     let mut input_sources = context
         .parsed
         .resources
@@ -245,7 +242,7 @@ async fn prepare_bootstrap_creation(
         .iter()
         .any(|source| source.as_resource().id == resource.id)
     {
-        input_sources.push(UnresolvedResource::from_pre_resolve(resource));
+        input_sources.push(UnresolvedResource::from_pre_resolve(resource.clone()));
     }
     let wait_aliases = context
         .parsed
@@ -253,18 +250,16 @@ async fn prepare_bootstrap_creation(
         .iter()
         .map(WaitAliasSpec::from)
         .collect::<Vec<_>>();
-    let input_types = carina_core::input_rules::InputTypeContext::from_compositions(
+    let input_types = carina_core::input_rules::InputTypeContext::for_plan(
         &input_sources,
         &context.parsed.data_sources,
         carina_core::input_rules::InputCompositions::Live(&context.parsed.compositions),
         &wait_aliases,
+        context.provider_configs.as_provider_configs(),
         context.schemas,
-    );
-    let checked = match bootstrap_plan.check_inputs_with_types(
-        context.schemas,
-        &HashMap::new(),
-        &input_types,
-    ) {
+        [&resource.id],
+    )?;
+    let checked = match bootstrap_plan.check_inputs_with_types(context.schemas, &input_types) {
         Ok(checked) => checked,
         Err(plan) => {
             return Err(
@@ -277,7 +272,6 @@ async fn prepare_bootstrap_creation(
             );
         }
     };
-    let scheduled = checked.schedule(&HashMap::new());
     let bindings = bootstrap_resolved_bindings(context.parsed);
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(
         &context.parsed.compositions,
@@ -291,7 +285,14 @@ async fn prepare_bootstrap_creation(
         context.schemas,
         session,
     );
-    carina_core::executor::prepare_initial_create(&scheduled, &graph, &preparation)
+    prepare_bootstrap_permit(&checked, &preparation).await
+}
+
+async fn prepare_bootstrap_permit(
+    checked: &carina_core::resolved_graph::InputCheckedInitialCreatePlan,
+    preparation: &carina_core::executor::ProviderPreparationContext<'_>,
+) -> Result<carina_core::replacement::CreatePermit, AppError> {
+    carina_core::executor::prepare_initial_create(checked, preparation)
         .await
         .map_err(AppError::from_state_bucket_preparation)?
         .ok_or_else(|| {
@@ -4143,16 +4144,11 @@ async fn run_apply_from_plan_locked_owned(
                     unresolved_resources[&ResolvedResourceId::new(resource.id.clone())].clone()
                 })
                 .collect::<Vec<_>>();
-            let input_types = carina_core::input_rules::InputTypeContext::from_compositions(
+            let input_types = carina_core::input_rules::InputTypeContext::for_plan(
                 &input_sources,
-                &[],
+                plan_data_source_origins,
                 carina_core::input_rules::InputCompositions::Saved(plan_compositions),
                 &wait_aliases,
-                wiring.schemas(),
-            ).with_data_sources(
-                plan_data_source_origins,
-                wiring.schemas(),
-            ).with_default_tags(
                 raw_provider_configs,
                 wiring.schemas(),
                 rehydrated_plan_file.plan().effects().iter().map(|effect| effect.resource_id()),

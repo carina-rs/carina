@@ -2006,6 +2006,15 @@ mod tests {
         Value::Concrete(ConcreteValue::String(value.clone().into()))
     }
 
+    fn fixture_schemas() -> carina_core::schema::SchemaRegistry {
+        let mut schemas = carina_core::schema::SchemaRegistry::new();
+        for schema in builtin_schemas() {
+            schemas.insert("", schema.clone());
+            schemas.insert("mock", schema);
+        }
+        schemas
+    }
+
     async fn dispatch_mock_create(
         provider: &MockProvider,
         resource: Resource,
@@ -2013,7 +2022,7 @@ mod tests {
         let id = resource.id.clone();
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = carina_core::schema::SchemaRegistry::new();
+        let schemas = fixture_schemas();
         let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
             std::sync::Arc::new(Vec::new()),
             schemas.clone(),
@@ -2035,13 +2044,30 @@ mod tests {
                     carina_core::executor::prepare_create_request(resource, &preparation).await;
                 let request = request.expect("mock test resource should pass create preparation");
                 assert_eq!(request.resource().id, id);
-                let prepared = carina_core::replacement::create_permit_for_test(request);
+                let prepared = carina_core::replacement::create_permit_with_schemas_for_test(
+                    request, &schemas,
+                );
                 let (create, _cancellation) =
                     carina_core::executor::dispatch_create(provider, prepared);
                 create.await
             },
         )
         .await
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "fixture plan admission")]
+    async fn round3_mock_create_fixture_rejects_declared_input_rule_violation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior::default(),
+            MockScope::file(tmp.path().join("mock-state.json")).unwrap(),
+        )
+        .create_provider();
+        let resource =
+            Resource::with_provider("mock", "test.creation_constrained", "invalid", None)
+                .with_attribute("name", string_value("192.168.1.1"));
+        dispatch_mock_create(&provider, resource).await.unwrap();
     }
 
     fn persist_pending_for_resume(pending: &InFlightCreate) -> InFlightCreate {
@@ -2956,13 +2982,7 @@ mod tests {
             let bindings = carina_core::binding_index::ResolvedBindings::default();
             let module_gate =
                 carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-            let mut schemas = carina_core::schema::SchemaRegistry::new();
-            schemas.insert(
-                "mock",
-                carina_core::schema::ResourceSchema::new("test.resource")
-                    .validate()
-                    .expect("test schema must be valid"),
-            );
+            let schemas = fixture_schemas();
             let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
                 std::sync::Arc::new(Vec::new()),
                 schemas.clone(),
@@ -2990,9 +3010,10 @@ mod tests {
                     let request = request.expect("update request should pass checked preparation");
                     let identifier = AppliedIdentifier::new("mock-id")
                         .expect("the mock identifier is non-empty");
-                    let prepared = carina_core::replacement::update_permit_for_test(
+                    let prepared = carina_core::replacement::update_permit_with_schemas_for_test(
                         identifier.clone(),
                         request,
+                        &schemas,
                     );
                     carina_core::executor::dispatch_update(&provider, prepared)
                         .await

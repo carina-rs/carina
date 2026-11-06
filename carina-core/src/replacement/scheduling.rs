@@ -489,7 +489,6 @@ mod tests {
                 .unwrap()
                 .check_inputs(&schemas, &HashMap::new())
                 .unwrap();
-            let scheduled = admitted.schedule(&Default::default());
             let mut configuration = crate::parser::ExpandedInferredFile::default();
             configuration.resources.push(
                 target
@@ -499,6 +498,13 @@ mod tests {
             );
             let graph =
                 crate::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
+            // Exercise a replacement cohort through the same scheduler release;
+            // public bootstrap construction only produces a single create.
+            let checked = crate::resolved_graph::InputCheckedInitialCreatePlan {
+                graph: graph.into_parts().1,
+                checked: admitted,
+            };
+            let scheduled = checked.checked.schedule(&Default::default());
             let bindings = crate::binding_index::ResolvedBindings::default();
             let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
             crate::validation::deferred_types::with_session_for_test_async(
@@ -513,10 +519,9 @@ mod tests {
                         &schemas,
                         type_checks,
                     );
-                    let permit =
-                        crate::executor::prepare_initial_create(&scheduled, &graph, &context)
-                            .await
-                            .unwrap();
+                    let permit = crate::executor::prepare_initial_create(&checked, &context)
+                        .await
+                        .unwrap();
                     if create_first {
                         let permit =
                             permit.expect("a checked create-first endpoint is initially ready");
