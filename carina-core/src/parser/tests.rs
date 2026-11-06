@@ -12471,6 +12471,38 @@ fn schema_custom_type_validation_accepts_a_loaded_context_witness() {
 }
 
 #[test]
+fn schema_custom_type_validation_preserves_bridge_decode_error_chain() {
+    let owned = crate::parser::OwnedTypeIdentity::provider(
+        "test",
+        TypeIdentity::bare("Count"),
+        crate::schema::RefinedScalarKind::Int,
+    )
+    .unbounded_witness_for_test();
+    let config = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            HashSet::from([(*owned).clone()]),
+            Box::new(|_, _| Ok(())),
+        ),
+        ..ProviderContext::new(crate::EnvironmentSnapshot::empty())
+    };
+    let value = ExpandedValue::Concrete(ExpandedConcreteValue::EnumIdentifier(
+        crate::resource::RawEnumIdentifier::parse("not_an_integer"),
+    ));
+
+    let error = super::functions::validate_schema_custom_type_with_context(&owned, &value, &config)
+        .expect_err("invalid integer bridge text must fail decoding");
+    let message = error.to_string();
+    assert!(
+        message.contains("invalid integer bridge value"),
+        "{message}"
+    );
+    assert!(
+        message.contains("invalid digit found in string"),
+        "{message}"
+    );
+}
+
+#[test]
 fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
     let identity = TypeIdentity::from_dotted("test.Widget.SecretId");
     let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {

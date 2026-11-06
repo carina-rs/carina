@@ -4707,8 +4707,7 @@ impl ResourceState {
     /// protected/name override metadata and existing deposed generations are
     /// preserved by the row-write path.
     ///
-    /// Returns an error if any provider attribute value cannot be converted to
-    /// JSON, such as non-finite float values.
+    /// Returns an error if any provider attribute value cannot be converted to JSON.
     pub fn from_provider_state_for_resource_and_schema<
         S: Clone,
         R: ReferenceEquality,

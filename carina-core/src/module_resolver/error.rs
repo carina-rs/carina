@@ -635,7 +635,7 @@ fn display_parse_error_relative_to(error: &ParseError, root: &Path) -> String {
             display_source_path_relative_to(path, root),
             display_parse_error_relative_to(error, root),
         ),
-        _ => error.to_string(),
+        _ => crate::executor::render_error_chain(error),
     }
 }
 
