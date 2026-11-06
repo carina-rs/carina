@@ -308,6 +308,7 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
     plan.add(Effect::DeferredReplace(Box::new(
         DeferredReplacePayload::new(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: carina_core::effect::EffectGeneration::Current,
                 previous_attributes: Default::default(),
                 id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
                 identifier: AppliedIdentifier::new("old-validation-id")

@@ -7,6 +7,9 @@ use crate::wiring::{LoadedProviderFactory, RowRequest};
 struct Cloud(Arc<Mutex<CloudRecords>>);
 #[derive(Default)]
 struct CloudRecords {
+    coexisting_child: bool,
+    fail_child_delete: bool,
+    child_generation: usize,
     live: HashMap<String, HashMap<String, Value>>,
     operations: Vec<String>,
 }
@@ -88,22 +91,29 @@ impl ProviderFactory for Factory {
                 .with_coexisting_replacement()
                 .validate()
                 .unwrap(),
-            ResourceSchema::new("test.Child")
-                .attribute(
-                    AttributeSchema::required("name", AttributeType::string())
-                        .create_only()
-                        .build(),
-                )
-                .attribute(
-                    AttributeSchema::required("value", AttributeType::string())
-                        .create_only()
-                        .build(),
-                )
-                .with_conflicting_replacement()
-                .validate()
-                .unwrap(),
+            child_schema(self.0.0.lock().unwrap().coexisting_child),
         ]
     }
+}
+fn child_schema(coexisting: bool) -> carina_core::schema::ValidatedResourceSchema {
+    let schema = ResourceSchema::new("test.Child")
+        .attribute(
+            AttributeSchema::required("name", AttributeType::string())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::required("value", AttributeType::string())
+                .create_only()
+                .build(),
+        );
+    if coexisting {
+        schema.with_coexisting_replacement()
+    } else {
+        schema.with_conflicting_replacement()
+    }
+    .validate()
+    .unwrap()
 }
 impl Provider for Mock {
     fn name(&self) -> &str {
@@ -164,7 +174,14 @@ impl Provider for Mock {
             )
         } else {
             // Equivalent child generations overwrite one record, just like Route53 UPSERT.
-            ("dns:_validation.example".to_string(), HashMap::new())
+            let mut cloud = self.0.0.lock().unwrap();
+            let key = if cloud.coexisting_child {
+                cloud.child_generation += 1;
+                format!("dns:{}", cloud.child_generation)
+            } else {
+                "dns:_validation.example".to_string()
+            };
+            (key, HashMap::new())
         };
         attrs.extend(outputs.clone());
         let mut cloud = self.0.0.lock().unwrap();
@@ -196,6 +213,13 @@ impl Provider for Mock {
     ) -> BoxFuture<'_, ProviderResult<()>> {
         let mut cloud = self.0.0.lock().unwrap();
         cloud.operations.push(format!("delete:{identifier}"));
+        if cloud.fail_child_delete && identifier.as_str().starts_with("dns:") {
+            return Box::pin(async {
+                Err(ProviderError::api_error(
+                    "injected old-child delete failure",
+                ))
+            });
+        }
         cloud.live.remove(identifier.as_str());
         Box::pin(async { Ok(()) })
     }
@@ -344,11 +368,20 @@ async fn destroy(fixture: &ApplyCancellationFixture, cloud: &Cloud) {
     .unwrap();
 }
 async fn convergence(saved: bool) {
+    Box::pin(convergence_with_binding(saved, true)).await;
+}
+async fn convergence_with_binding(saved: bool, bound: bool) {
     let fixture = ApplyCancellationFixture::new().with_raw_config("");
     let cloud = Cloud::default();
     write_config(&fixture, "old");
+    if !bound {
+        unbind_config(&fixture);
+    }
     apply(&fixture, &cloud).await;
     write_config(&fixture, "new");
+    if !bound {
+        unbind_config(&fixture);
+    }
     let saved_plan = plan(&fixture, &cloud).await;
     if saved {
         // Exercise actual wire decoding and schema resolution, not a clone of a live plan.
@@ -447,4 +480,114 @@ async fn issue_4283_live_apply_preserves_conflicting_child() {
 #[tokio::test]
 async fn issue_4283_saved_plan_apply_preserves_conflicting_child() {
     convergence(true).await;
+}
+
+#[tokio::test]
+async fn review2_4283_unbound_runtime_replacement_writeback_live() {
+    Box::pin(convergence_with_binding(false, false)).await;
+}
+#[tokio::test]
+async fn review2_4283_unbound_runtime_replacement_writeback_saved() {
+    Box::pin(convergence_with_binding(true, false)).await;
+}
+
+fn unbind_config(fixture: &ApplyCancellationFixture) {
+    let path = fixture.config_path().join("main.crn");
+    let source = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace("let records = for", "for");
+    std::fs::write(path, source).unwrap();
+}
+
+#[tokio::test]
+async fn review2_4283_unbound_create_first_delete_failure_preserves_old() {
+    let fixture = ApplyCancellationFixture::new().with_raw_config("");
+    let cloud = Cloud::default();
+    cloud.0.lock().unwrap().coexisting_child = true;
+    write_config(&fixture, "old");
+    unbind_config(&fixture);
+    apply(&fixture, &cloud).await;
+    write_config(&fixture, "new");
+    unbind_config(&fixture);
+    let path = fixture.config_path().join("main.crn");
+    let source = std::fs::read_to_string(&path).unwrap().replace(
+        "name = opt.name",
+        "directives { create_before_destroy = true }\n    name = opt.name",
+    );
+    std::fs::write(path, source).unwrap();
+    cloud.0.lock().unwrap().fail_child_delete = true;
+    let outcome = run_apply_locked(
+        config(&fixture, &cloud),
+        true,
+        fixture.backend_handle(),
+        StateLock::disabled_for_test(),
+        fixture.config_path(),
+        fixture.provider_context(),
+        fixture.cancel_token(),
+        &fixture.observer_factory(),
+        NonZeroUsize::new(2).unwrap(),
+        false,
+    )
+    .await;
+    assert!(outcome.is_err(), "injected deletion must fail");
+    let state = fixture.read_state().await;
+    let child = state
+        .resources()
+        .iter()
+        .find(|row| row.resource_type == "test.Child")
+        .unwrap();
+    assert_eq!(
+        child.identifier().map(AppliedIdentifier::as_str),
+        Some("dns:2")
+    );
+    assert_eq!(
+        child.deposed.len(),
+        1,
+        "checkpoint/final writeback lost the still-live old instance: {child:?}"
+    );
+    assert!(cloud.0.lock().unwrap().live.contains_key("dns:1"));
+}
+
+#[tokio::test]
+async fn review2_4283_legacy_unbound_runtime_writeback_retires_old_address() {
+    let fixture = ApplyCancellationFixture::new().with_raw_config("");
+    let cloud = Cloud::default();
+    write_config(&fixture, "old");
+    unbind_config(&fixture);
+    apply(&fixture, &cloud).await;
+    let mut state = fixture.read_state().await;
+    let mut child = state
+        .resources()
+        .iter()
+        .find(|row| row.resource_type == "test.Child")
+        .unwrap()
+        .clone();
+    state.remove_resource(
+        &child.provider,
+        &child.resource_type,
+        child.identity.as_str(),
+    );
+    child.identity =
+        carina_core::resource::ResourceIdentity::try_from("_opts[0]".to_owned()).unwrap();
+    child.binding = Some(carina_core::resource::absolute_binding_address_for_test(
+        "_opts[0]",
+    ));
+    state.upsert_resource(child).unwrap();
+    fixture.write_state(&state);
+    write_config(&fixture, "new");
+    unbind_config(&fixture);
+    apply(&fixture, &cloud).await;
+    let state = fixture.read_state().await;
+    let children: Vec<_> = state
+        .resources()
+        .iter()
+        .filter(|row| row.resource_type == "test.Child")
+        .collect();
+    assert_eq!(
+        children.len(),
+        1,
+        "successful replacement must retire its distinct legacy address: {children:?}"
+    );
+    assert_ne!(children[0].identity.as_str(), "_opts[0]");
+    assert!(plan(&fixture, &cloud).await.plan.effects().is_empty());
 }

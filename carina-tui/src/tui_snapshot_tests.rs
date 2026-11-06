@@ -341,6 +341,7 @@ fn build_deferred_replace_plan() -> Plan {
     plan.add(Effect::DeferredReplace(Box::new(
         crate::compiled_replace_fixture(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: carina_core::effect::EffectGeneration::Current,
                 previous_attributes: Default::default(),
                 id: carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",

@@ -204,11 +204,13 @@ pub struct TemporaryName {
 
 /// Delete payload absorbed into [`Effect::DeferredReplace`].
 ///
-/// This carries the current-generation delete fields from [`Effect::Delete`].
+/// This carries old-generation delete fields from [`Effect::Delete`].
 /// Keeping the delete half in a named struct lets the deletes slot grow new
 /// fields later without re-shaping `DeferredReplace` itself.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeferredReplaceDelete {
+    #[serde(default, skip_serializing_if = "EffectGeneration::is_current")]
+    pub generation: EffectGeneration,
     /// Prior snapshot retained for replacement naming and recovery.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub previous_attributes: HashMap<String, crate::resource::SnapshotValue>,
@@ -260,7 +262,7 @@ impl DeferredReplaceDelete {
         Effect::Delete {
             id: self.id.clone(),
             identifier: self.identifier.clone(),
-            generation: EffectGeneration::Current,
+            generation: self.generation.clone(),
             directives: self.directives.clone(),
             binding: self.binding.clone(),
             dependencies: self.dependencies.clone(),
@@ -2139,6 +2141,7 @@ impl EffectWithSource<ModuleSource> {
             (
                 Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
                     NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                        generation: crate::effect::EffectGeneration::Current,
                         previous_attributes: Default::default(),
                         id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                             "route53.Record",
@@ -2917,6 +2920,7 @@ mod tests {
         let payload = compiled_deferred_for_template(deferred_for_template_at(None, 0));
         Effect::DeferredReplace(Box::new(DeferredReplacePayload::new(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: crate::effect::EffectGeneration::Current,
                 previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
@@ -3238,6 +3242,7 @@ mod tests {
         let template = deferred_for_template_at(None, 0);
         let effect = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: crate::effect::EffectGeneration::Current,
                 previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",
@@ -3264,6 +3269,7 @@ mod tests {
         let template = deferred_for_template_at(None, 0);
         let effect = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: crate::effect::EffectGeneration::Current,
                 previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.Record",

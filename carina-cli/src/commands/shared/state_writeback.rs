@@ -381,6 +381,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
             &self.comparisons,
             self.references.as_ref(),
             &result.permanent_name_overrides,
+            &result.replacement_writeback,
         )
     }
 }
@@ -1086,8 +1087,6 @@ struct ReplacementDeleteInput<'a> {
     previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
 }
 
-static CURRENT_GENERATION: EffectGeneration = EffectGeneration::Current;
-
 fn delete_succeeded(
     successfully_deleted: &HashSet<DeletedInstanceKey>,
     id: &ResolvedResourceId,
@@ -1306,7 +1305,7 @@ fn delete_input_from_deferred(delete: &DeferredReplaceDelete) -> ReplacementDele
         id: &delete.id,
         identifier: delete.identifier.as_str(),
         provider_instance: delete.id.as_inner().provider_instance.clone(),
-        generation: &CURRENT_GENERATION,
+        generation: &delete.generation,
         previous_attributes: None,
         prior_dependencies: delete.prior_instance_destroy_dependencies(),
     }
@@ -1448,12 +1447,13 @@ struct DecomposeInput<'a, 's, S = ModuleSource> {
 #[cfg(test)]
 fn decompose<'a, S>(input: DecomposeInput<'a, '_, S>) -> Result<WritebackPlan<'a, S>, AppError> {
     let moved_origins = MovedOrigins::from_plan(input.plan);
-    decompose_with_moved_origins(input, &moved_origins)
+    decompose_with_moved_origins(input, &moved_origins, &[])
 }
 
 fn decompose_with_moved_origins<'a, S>(
     input: DecomposeInput<'a, '_, S>,
     moved_origins: &MovedOrigins,
+    runtime_replacements: &'a [carina_core::replacement::ReplacementWriteback],
 ) -> Result<WritebackPlan<'a, S>, AppError> {
     let state_file = input.state_file;
     let sorted_resources = input.sorted_resources;
@@ -1527,6 +1527,31 @@ fn decompose_with_moved_origins<'a, S>(
         }
     }
 
+    let runtime_by_delete: HashMap<_, _> = runtime_replacements
+        .iter()
+        .flat_map(|replacement| {
+            replacement
+                .old_instances()
+                .iter()
+                .enumerate()
+                .filter(|(_, old)| old.generation.is_current())
+                .map(move |(index, old)| {
+                    (
+                        DeletedInstanceKey::new(
+                            old.id.as_inner().clone(),
+                            old.generation.clone(),
+                            old.identifier.as_str().to_owned(),
+                        ),
+                        (
+                            replacement.target(),
+                            old,
+                            replacement.previous_attributes_for_state_writeback(index),
+                        ),
+                    )
+                })
+        })
+        .collect();
+
     let replacement_by_delete_idx: HashMap<usize, ReplaceDisplayInfo<'_>> = plan
         .replace_display_info()
         .map(|replacement| (replacement.delete_idx, replacement))
@@ -1552,11 +1577,50 @@ fn decompose_with_moved_origins<'a, S>(
             continue;
         }
 
+        if let Effect::Delete {
+            id,
+            identifier,
+            generation,
+            ..
+        } = effect
+        {
+            let key = DeletedInstanceKey::new(
+                id.as_inner().clone(),
+                generation.clone(),
+                identifier.as_str().to_owned(),
+            );
+            if let Some((target, old, previous)) = runtime_by_delete.get(&key) {
+                let mut delete = delete_input_from_deferred(old);
+                delete.previous_attributes = Some(*previous);
+                let outcome = classify_replacement_outcome(
+                    delete,
+                    replacement_create_result(target.as_inner(), &wb.upserts, applied_states),
+                    state_file,
+                    managed_current,
+                    moved_origins,
+                    successfully_deleted,
+                    schemas,
+                )?;
+                wb.apply_replacement_outcome(outcome)?;
+                continue;
+            }
+        }
+
         if let Effect::DeferredReplace(payload) = effect {
             for delete in &payload.deletes {
-                let delete = delete_input_from_deferred(delete);
-                let create_result =
-                    replacement_create_result(delete.id.as_inner(), &wb.upserts, applied_states);
+                let key = DeletedInstanceKey::new(
+                    delete.id.as_inner().clone(),
+                    delete.generation.clone(),
+                    delete.identifier.as_str().to_owned(),
+                );
+                let mut delete = delete_input_from_deferred(delete);
+                let target = if let Some((target, _old, previous)) = runtime_by_delete.get(&key) {
+                    delete.previous_attributes = Some(*previous);
+                    target.as_inner()
+                } else {
+                    delete.id.as_inner()
+                };
+                let create_result = replacement_create_result(target, &wb.upserts, applied_states);
                 let outcome = classify_replacement_outcome(
                     delete,
                     create_result,
@@ -1644,6 +1708,7 @@ pub(crate) fn build_state_after_apply<S: Clone>(
         &comparisons,
         None,
         &HashMap::new(),
+        &[],
     )
 }
 
@@ -1656,6 +1721,7 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
         ResourceId,
         HashMap<String, carina_core::name_override::NameOverride>,
     >,
+    runtime_replacements: &[carina_core::replacement::ReplacementWriteback],
 ) -> Result<StateFile, AppError> {
     let ApplyStateSave {
         state_file,
@@ -1684,6 +1750,7 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
             schemas,
         },
         &moved_origins,
+        runtime_replacements,
     )?;
     let mut permanent_name_overrides = plan.permanent_name_overrides_for_state();
     for (id, overrides) in runtime_name_overrides {
@@ -5353,6 +5420,7 @@ mod apply_state_save_tests {
 
     fn deferred_replace_delete(id: &ResourceId) -> DeferredReplaceDelete {
         DeferredReplaceDelete {
+            generation: carina_core::effect::EffectGeneration::Current,
             previous_attributes: Default::default(),
             id: carina_core::resource::ResolvedResourceId::new(id.clone()),
             identifier: crate::fixture_applied_identifier("old-record-id"),
@@ -5916,8 +5984,11 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let snapshot_plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
-            .expect("replacement metadata should deserialize");
+        let snapshot_plan =
+            serde_json::from_value::<carina_core::plan::UnresolvedSavedPlan>(plan_json)
+                .expect("replacement metadata should deserialize")
+                .resolve_with_schemas(&SchemaRegistry::new())
+                .expect("replacement metadata should admit");
         let plan = carina_core::value::rehydrate_plan_desired_secrets(
             &snapshot_plan,
             &HashMap::new(),
@@ -6098,8 +6169,11 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let snapshot_plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
-            .expect("replacement metadata should deserialize");
+        let snapshot_plan =
+            serde_json::from_value::<carina_core::plan::UnresolvedSavedPlan>(plan_json)
+                .expect("replacement metadata should deserialize")
+                .resolve_with_schemas(&SchemaRegistry::new())
+                .expect("replacement metadata should admit");
         let plan = carina_core::value::rehydrate_plan_desired_secrets(
             &snapshot_plan,
             &HashMap::new(),
@@ -6229,8 +6303,11 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let snapshot_plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
-            .expect("replacement metadata should deserialize");
+        let snapshot_plan =
+            serde_json::from_value::<carina_core::plan::UnresolvedSavedPlan>(plan_json)
+                .expect("replacement metadata should deserialize")
+                .resolve_with_schemas(&SchemaRegistry::new())
+                .expect("replacement metadata should admit");
         let plan = carina_core::value::rehydrate_plan_desired_secrets(
             &snapshot_plan,
             &HashMap::new(),

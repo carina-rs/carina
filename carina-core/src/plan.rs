@@ -91,7 +91,16 @@ pub struct ReplacementCannotCoexistError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
+#[error("prepared replacement name for '{resource_type}.{attribute}' does not match the target")]
+pub struct InvalidPreparedReplacementNameError {
+    pub resource_type: String,
+    pub attribute: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error, Serialize, Deserialize)]
 pub enum CreateBeforeDestroyError {
+    #[error(transparent)]
+    InvalidPreparedReplacementName(#[from] InvalidPreparedReplacementNameError),
     #[error(transparent)]
     SchemaNotRegistered(#[from] SchemaNotRegisteredError),
     #[error(transparent)]
@@ -106,6 +115,7 @@ pub enum PlanErrorKind {
     },
     SchemaNotRegistered(SchemaNotRegisteredError),
     ReplacementCannotCoexist(ReplacementCannotCoexistError),
+    InvalidPreparedReplacementName(InvalidPreparedReplacementNameError),
     /// A referenced producer cannot coexist with its old generation, but a
     /// managed or deferred dependent requires its replacement first.
     CreateBeforeDestroyRequiredByDependent {
@@ -253,6 +263,9 @@ impl PlanError {
 impl From<CreateBeforeDestroyError> for PlanErrorKind {
     fn from(err: CreateBeforeDestroyError) -> Self {
         match err {
+            CreateBeforeDestroyError::InvalidPreparedReplacementName(err) => {
+                Self::InvalidPreparedReplacementName(err)
+            }
             CreateBeforeDestroyError::SchemaNotRegistered(err) => Self::SchemaNotRegistered(err),
             CreateBeforeDestroyError::ReplacementCannotCoexist(err) => {
                 Self::ReplacementCannotCoexist(err)
@@ -359,6 +372,7 @@ impl PlanErrorKind {
             },
             Self::SchemaNotRegistered(err) => write!(f, "{err}"),
             Self::ReplacementCannotCoexist(err) => write!(f, "{err}"),
+            Self::InvalidPreparedReplacementName(err) => write!(f, "{err}"),
             Self::CreateBeforeDestroyRequiredByDependent { dependent, cause } => {
                 write!(f, "{cause}; create_before_destroy required by dependent `{dependent}`")
             }
@@ -480,6 +494,7 @@ impl PlanError {
             kind @ (PlanErrorKind::PreventDestroy { .. }
             | PlanErrorKind::SchemaNotRegistered(_)
             | PlanErrorKind::ReplacementCannotCoexist(_)
+            | PlanErrorKind::InvalidPreparedReplacementName(_)
             | PlanErrorKind::CreateBeforeDestroyRequiredByDependent { .. }
             | PlanErrorKind::MissingProviderIdentifier
             | PlanErrorKind::CreateInFlightOrphan
@@ -675,12 +690,15 @@ impl IgnoredChangeSummary {
     }
 }
 
-/// Plan containing Effects to be executed
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(bound(
-    serialize = "S: Serialize + Clone, V: PlanValueKind",
-    deserialize = "S: serde::de::DeserializeOwned, V: PlanValueKind"
-))]
+/// Plan containing admitted replacement metadata and effects to be executed.
+/// Decode [`UnresolvedSavedPlan`] and resolve it with schemas to load a plan.
+///
+/// ```compile_fail,E0277
+/// use carina_core::plan::SavedPlan;
+/// let unchecked: SavedPlan = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, Clone, Serialize)]
+#[serde(bound(serialize = "S: Serialize + Clone, V: PlanValueKind"))]
 pub struct Plan<S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
     effects: Vec<EffectWithSource<S, V>>,
     #[serde(skip)]
@@ -780,6 +798,12 @@ impl From<SavedPlan> for UnresolvedSavedPlan {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ReplacementIntentEndpoints {
+    pub create_idx: usize,
+    pub delete_idx: usize,
+}
+
 impl UnresolvedSavedPlan {
     pub fn add(&mut self, effect: UnresolvedSavedEffect) {
         self.effects.push(effect);
@@ -812,10 +836,14 @@ impl UnresolvedSavedPlan {
             })
     }
 
-    pub fn replace_display_info(&self) -> impl Iterator<Item = ReplaceDisplayInfo<'_>> {
+    /// Endpoint indices are wire intents, without admitted display order.
+    pub fn replacement_intents(&self) -> impl Iterator<Item = ReplacementIntentEndpoints> + '_ {
         self.replace_display
             .iter()
-            .map(ReplaceDisplayInfo::from_metadata)
+            .map(|metadata| ReplacementIntentEndpoints {
+                create_idx: metadata.create_idx,
+                delete_idx: metadata.delete_idx,
+            })
     }
 
     pub fn abandoned_deposed_generations(
@@ -1076,7 +1104,19 @@ impl<S, V: PlanValueKind> Plan<S, V> {
                 }
             }
         }
-        crate::replacement::AdmittedReplacementEffects::resolve_with_associations(
+        let prepared_names = self
+            .replace_display
+            .iter()
+            .filter_map(|entry| {
+                let name = entry.temporary_name.as_ref()?;
+                let target = self.effects.get(entry.create_idx)?;
+                Some((
+                    ResolvedResourceId::new(target.resource_id().clone()),
+                    name.clone(),
+                ))
+            })
+            .collect();
+        crate::replacement::AdmittedReplacementEffects::resolve_with_prepared_names(
             &effects,
             registry,
             |id| {
@@ -1091,6 +1131,7 @@ impl<S, V: PlanValueKind> Plan<S, V> {
                     .unwrap_or_default()
             },
             &associations,
+            &prepared_names,
         )
     }
 
@@ -1686,11 +1727,30 @@ mod tests {
     }
 
     fn deserialize_plan(json: &str) -> SavedPlan {
-        serde_json::from_str::<SavedPlan>(json).unwrap()
+        deserialize_plan_value(serde_json::from_str(json).unwrap())
     }
 
     fn deserialize_plan_value(value: serde_json::Value) -> SavedPlan {
-        serde_json::from_value::<SavedPlan>(value).unwrap()
+        let mut registry = crate::schema::SchemaRegistry::new();
+        registry.insert(
+            "",
+            crate::schema::PatternResourceSchema::new("ec2.Vpc")
+                .attribute(
+                    crate::schema::PatternAttributeSchema::optional(
+                        "name",
+                        crate::schema::PatternAttributeType::string(),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .with_unique_name_attribute("name")
+                .validate()
+                .unwrap(),
+        );
+        serde_json::from_value::<UnresolvedSavedPlan>(value)
+            .unwrap()
+            .resolve_with_schemas(&registry)
+            .unwrap()
     }
 
     fn changed_create_only() -> ChangedCreateOnly {
@@ -1725,6 +1785,7 @@ mod tests {
                     None,
                 );
                 let old = crate::effect::DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
                     id: ResolvedResourceId::with_identity("ec2.Vpc", "vpc-old"),
                     identifier: crate::effect::fixture_applied_identifier("vpc-123"),
                     directives: Directives::default(),
@@ -1958,6 +2019,7 @@ mod tests {
         );
         let deletes = (0..3)
             .map(|idx| DeferredReplaceDelete {
+                generation: crate::effect::EffectGeneration::Current,
                 previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "route53.RecordSet",

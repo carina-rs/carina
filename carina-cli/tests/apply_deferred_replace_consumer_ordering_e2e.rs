@@ -373,6 +373,7 @@ fn deferred_replace_consumer_ordering_plan_file(project: &Path, state: &StateFil
     plan.add(Effect::DeferredReplace(Box::new(
         DeferredReplacePayload::new(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: carina_core::effect::EffectGeneration::Current,
                 previous_attributes: Default::default(),
                 id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
                 identifier: AppliedIdentifier::new("old-validation-id")

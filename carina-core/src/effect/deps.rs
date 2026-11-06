@@ -716,11 +716,15 @@ where
             }
         }
         for (create_idx, effect) in effects.iter().enumerate() {
-            let Effect::Create(target) = effect.as_ref() else {
-                continue;
+            let target = match effect.as_ref() {
+                Effect::Create(target)
+                | Effect::ResumeCreate {
+                    resource: target, ..
+                } => target,
+                _ => continue,
             };
             for (delete_idx, old) in effects.iter().enumerate() {
-                if matches!(old.as_ref(), Effect::Delete { id, generation: crate::effect::EffectGeneration::Current, .. } if target.id == **id)
+                if matches!(old.as_ref(), Effect::Delete { id, .. } if target.id == **id)
                     && !admitted_pairs.contains(&(create_idx, delete_idx))
                 {
                     // An empty capability cannot admit raw replacement endpoints.

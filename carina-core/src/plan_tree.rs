@@ -980,6 +980,7 @@ mod tests {
             consumer_updates: Default::default(),
             replacement: {
                 let mut old = crate::effect::DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
                     blocked_by_updates: Default::default(),
                     previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
@@ -1134,6 +1135,7 @@ mod tests {
         plan.add(Effect::DeferredReplace(Box::new(
             crate::test_support::compiled_replace(
                 NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
                     previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "route53.Record",
@@ -1208,6 +1210,7 @@ mod tests {
         plan.add(Effect::DeferredReplace(Box::new(
             crate::test_support::compiled_replace(
                 NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
                     previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "route53.Record",

@@ -117,6 +117,7 @@ impl DeferredAnonymousIdentityGuard {
         &mut self,
         template: &DeferredForExpression<S>,
         admitted: &crate::replacement::AdmittedReplacementEffects<S>,
+        child_offset: usize,
     ) -> Result<(), DeferredCreateFailure> {
         if !matches!(
             template.target(),
@@ -128,7 +129,7 @@ impl DeferredAnonymousIdentityGuard {
         }
 
         let mut batch = HashSet::new();
-        for child in admitted.effects() {
+        for child in &admitted.effects()[child_offset..] {
             let Effect::Create(resource) = child else {
                 continue;
             };
@@ -417,19 +418,15 @@ pub(super) fn materialize_deferred_create<
         .collect()
 }
 
-pub(super) struct DeferredMaterialization<S> {
-    pub(super) admitted: crate::replacement::AdmittedReplacementEffects<S>,
-}
-
 fn admit_materialized<S: Clone>(
     effect: &Effect<S>,
-    mut children: Vec<Effect<S>>,
+    children: Vec<Effect<S>>,
     schemas: &crate::schema::SchemaRegistry,
     ordinary_old: &[crate::effect::DeferredReplaceDelete],
     requirements: &HashMap<crate::resource::ResolvedResourceId, String>,
-) -> Result<DeferredMaterialization<S>, DeferredCreateFailure> {
+    existing: &crate::replacement::AdmittedReplacementEffects<S>,
+) -> Result<crate::replacement::AdmittedReplacementEffects<S>, DeferredCreateFailure> {
     let mut replacements = Vec::new();
-    let child_requirements = crate::replacement::create_first_requirements(&children);
     let (old_instances, is_unbound) = match effect {
         Effect::DeferredReplace(payload) => (
             &payload.deletes[..],
@@ -441,7 +438,7 @@ fn admit_materialized<S: Clone>(
         ),
         _ => unreachable!("only deferred gates materialize children"),
     };
-    for child in &mut children {
+    for child in &children {
         let Effect::Create(resource) = child else {
             continue;
         };
@@ -483,47 +480,35 @@ fn admit_materialized<S: Clone>(
         .or_else(|| {
             old.iter()
                 .find_map(|old| requirements.get(&old.id).map(String::as_str))
-        })
-        .or_else(|| {
-            child_requirements
-                .get(&resource.resolved_id())
-                .map(String::as_str)
         });
         let mut request = crate::replacement::ReplacementRequest::new(resource.clone(), old);
         if let Some(dependent) = required_by {
             request = request.require_create_first(dependent);
         }
-        let checked =
-            crate::replacement::resolve_replacement(request, schemas).map_err(|error| {
-                match required_by {
-                    Some(dependent) => DeferredCreateFailure::ReplacementRequired {
-                        dependent: dependent.to_string(),
-                        error,
-                    },
-                    None => DeferredCreateFailure::Replacement { error },
-                }
-            })?;
-        replacements.push(checked);
+        replacements.push(request);
     }
-    Ok(DeferredMaterialization {
-        admitted: crate::replacement::AdmittedReplacementEffects::from_materialized(
-            children,
-            replacements,
-        ),
-    })
+    existing
+        .with_materialized(children, replacements, schemas)
+        .map_err(|error| match error.required_by {
+            Some(dependent) => DeferredCreateFailure::ReplacementRequired {
+                dependent,
+                error: error.cause,
+            },
+            None => DeferredCreateFailure::Replacement { error: error.cause },
+        })
 }
 
 /// Result of synchronously dispatching a deferred scheduler-meta effect.
 pub(super) enum DeferredDispatchResult<S> {
-    /// DeferredCreate or DeferredReplace create children were materialized and
-    /// should be appended to the scheduler queue.
-    Materialized(DeferredMaterialization<S>),
+    /// Existing effects and materialized children admitted as one graph.
+    Materialized(crate::replacement::AdmittedReplacementEffects<S>),
     /// Deferred-for materialization failed before any child effects existed.
     MaterializeFailed(DeferredCreateFailure),
 }
 
 /// Shared inputs required to materialize deferred scheduler-meta effects.
-pub(super) struct PureMetaCtx<'a> {
+pub(super) struct PureMetaCtx<'a, S> {
+    pub(super) existing: &'a crate::replacement::AdmittedReplacementEffects<S>,
     pub(super) identity_inputs: DeferredIdentityInputs<'a>,
     pub(super) ordinary_old: &'a [crate::effect::DeferredReplaceDelete],
     pub(super) requirements: &'a HashMap<crate::resource::ResolvedResourceId, String>,
@@ -538,7 +523,7 @@ pub(super) fn dispatch_deferred_create<
     template: &DeferredForExpression<S>,
     dependencies: &crate::resource::DeferredDependencyTemplate,
     bindings: &ResolvedBindings,
-    ctx: &PureMetaCtx<'_>,
+    ctx: &PureMetaCtx<'_, S>,
 ) -> DeferredDispatchResult<S> {
     match materialize_deferred_create(template, dependencies, bindings, &ctx.identity_inputs) {
         Ok(children) => match admit_materialized(
@@ -547,6 +532,7 @@ pub(super) fn dispatch_deferred_create<
             ctx.identity_inputs.schemas,
             ctx.ordinary_old,
             ctx.requirements,
+            ctx.existing,
         ) {
             Ok(materialized) => DeferredDispatchResult::Materialized(materialized),
             Err(error) => DeferredDispatchResult::MaterializeFailed(error),

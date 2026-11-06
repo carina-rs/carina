@@ -1376,6 +1376,7 @@ mod process_basic_result_tests {
             interrupted_count: 0,
             applied_states: HashMap::new(),
             runtime_synthesized_resources: Vec::new(),
+            replacement_writeback: Vec::new(),
             successfully_deleted: HashSet::new(),
             permanent_name_overrides: HashMap::new(),
             managed_current: HashMap::new(),

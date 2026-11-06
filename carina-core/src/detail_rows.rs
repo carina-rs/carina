@@ -4514,7 +4514,10 @@ mod tests {
         // default-tag provenance survives serialization without being copied
         // into ReplaceDisplayMetadata.
         let plan =
-            serde_json::from_str::<SavedPlan>(&serde_json::to_string(&plan).unwrap()).unwrap();
+            serde_json::from_str::<UnresolvedSavedPlan>(&serde_json::to_string(&plan).unwrap())
+                .unwrap()
+                .resolve_with_schemas(&SchemaRegistry::new())
+                .unwrap();
         let Effect::Create(saved_to) = &plan.effects()[0] else {
             panic!("replacement create effect must survive saved-plan round trip");
         };

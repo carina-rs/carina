@@ -2734,7 +2734,7 @@ impl PlanFile {
     pub(crate) fn validate_replace_display(&self) -> Result<(), String> {
         let effects = self.plan.effects();
         let mut seen_replace_indices = HashSet::new();
-        for (metadata_idx, replacement) in self.plan.replace_display_info().enumerate() {
+        for (metadata_idx, replacement) in self.plan.replacement_intents().enumerate() {
             let create = effects.get(replacement.create_idx).ok_or_else(|| {
                 format!(
                     "Invalid saved plan replacement metadata: replace_display[{metadata_idx}].create_idx {} is out of bounds for {} effects",

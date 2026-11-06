@@ -1738,6 +1738,7 @@ fn create_before_destroy_with_missing_schema_reports_schema_not_registered() {
     let mut resource = resource;
     resource.directives.create_before_destroy = true;
     let old = crate::effect::DeferredReplaceDelete {
+        generation: crate::effect::EffectGeneration::Current,
         id: ResolvedResourceId::new(from.id.clone()),
         identifier: crate::effect::fixture_applied_identifier("old"),
         directives: Default::default(),

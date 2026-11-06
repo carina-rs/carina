@@ -464,6 +464,7 @@ pub(super) async fn execute_effects_sequential<
         interrupted_count: 0,
         applied_states: HashMap::new(),
         runtime_synthesized_resources: Vec::new(),
+        replacement_writeback: Vec::new(),
         successfully_deleted: HashSet::new(),
         permanent_name_overrides: HashMap::new(),
         managed_current: std::mem::take(&mut input.managed_current),
@@ -514,21 +515,7 @@ pub(super) async fn execute_effects_sequential<
             return (accumulated.finish(&input.checkpoint_sink), false);
         }
     };
-    for (id, name) in admitted.temporary_names() {
-        accumulated.mutate(|result| {
-            result
-                .permanent_name_overrides
-                .entry(id.clone())
-                .or_default()
-                .insert(
-                    name.attribute.clone(),
-                    crate::name_override::NameOverride {
-                        temp_value: name.temporary_value.clone(),
-                        original_value: Some(name.original_value.clone()),
-                    },
-                );
-        });
-    }
+    accumulated.record_replacement_metadata(&admitted);
     let (mut admitted, deferred_replace_delete_deps, _) = admitted.expand_deferred_replacements();
     let mut effects = admitted.effects();
     let mut materialization_requirements = crate::replacement::create_first_requirements(effects);
@@ -759,6 +746,7 @@ pub(super) async fn execute_effects_sequential<
                         explicit_dependencies,
                         blocked_by_updates,
                     } => Some(crate::effect::DeferredReplaceDelete {
+                        generation: crate::effect::EffectGeneration::Current,
                         id: id.clone(),
                         identifier: identifier.clone(),
                         directives: directives.clone(),
@@ -782,6 +770,7 @@ pub(super) async fn execute_effects_sequential<
                 })
                 .collect::<Vec<_>>();
             let dispatch_ctx = PureMetaCtx {
+                existing: &admitted,
                 ordinary_old: &ordinary_old,
                 requirements: &materialization_requirements,
                 identity_inputs: super::deferred_dispatch::DeferredIdentityInputs {
@@ -813,15 +802,16 @@ pub(super) async fn execute_effects_sequential<
                     completed_synchronous_dispatch = true;
                     break;
                 }
-                PureMetaOutcome::Materialized(
-                    super::deferred_dispatch::DeferredMaterialization { admitted: children },
-                ) => {
+                PureMetaOutcome::Materialized(combined) => {
+                    let child_offset = effects.len();
                     let template = match &effect {
                         Effect::DeferredCreate(payload) => payload.template.as_ref(),
                         Effect::DeferredReplace(payload) => payload.template.as_ref(),
                         _ => unreachable!("pure meta materialization has a deferred template"),
                     };
-                    if let Err(error) = anonymous_identity_guard.admit(template, &children) {
+                    if let Err(error) =
+                        anonymous_identity_guard.admit(template, &combined, child_offset)
+                    {
                         record_effect_failure(
                             &mut accumulated,
                             observer,
@@ -841,24 +831,11 @@ pub(super) async fn execute_effects_sequential<
                         completed_synchronous_dispatch = true;
                         break;
                     }
-                    for (id, name) in children.temporary_names() {
-                        accumulated.mutate(|result| {
-                            result
-                                .permanent_name_overrides
-                                .entry(id.clone())
-                                .or_default()
-                                .insert(
-                                    name.attribute.clone(),
-                                    crate::name_override::NameOverride {
-                                        temp_value: name.temporary_value.clone(),
-                                        original_value: Some(name.original_value.clone()),
-                                    },
-                                );
-                        });
-                    }
-                    if !children.effects().is_empty() {
-                        total += count_actionable_effects(children.effects());
-                        for (offset, child) in children.effects().iter().enumerate() {
+                    accumulated.record_replacement_metadata(&combined);
+                    if combined.effects().len() > child_offset {
+                        total += count_actionable_effects(&combined.effects()[child_offset..]);
+                        for (offset, child) in combined.effects()[child_offset..].iter().enumerate()
+                        {
                             let child_idx = effects.len() + offset;
                             if let Effect::Create(resource) = child {
                                 runtime_authored_resource_ids.insert(resource.id.clone());
@@ -871,7 +848,7 @@ pub(super) async fn execute_effects_sequential<
                             }
                             actionable_indices.push(child_idx);
                         }
-                        admitted.append(children);
+                        admitted = combined;
                         effects = admitted.effects();
                         materialization_requirements =
                             crate::replacement::create_first_requirements(effects);

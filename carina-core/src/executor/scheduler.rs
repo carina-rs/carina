@@ -5,7 +5,6 @@ use crate::effect::{Effect, SchedulerKey};
 use crate::parser::CompiledDeferredForExpression as DeferredForExpression;
 use crate::resource::ResolvedResourceId;
 
-use super::UnresolvedResource;
 use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
 use super::parallel::apply_deferred_gate_deps;
 use crate::effect::deps::{
@@ -53,14 +52,14 @@ impl<'a, S> PureMetaStep<'a, S> {
 
 pub(super) enum PureMetaOutcome<S> {
     NotPureMeta,
-    Materialized(super::deferred_dispatch::DeferredMaterialization<S>),
+    Materialized(crate::replacement::AdmittedReplacementEffects<S>),
     Failed(super::DeferredCreateFailure),
 }
 
 pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdentityModuleSource>(
     effect: &Effect<S>,
     bindings: &ResolvedBindings,
-    ctx: &PureMetaCtx<'_>,
+    ctx: &PureMetaCtx<'_, S>,
 ) -> PureMetaOutcome<S> {
     let Some(step) = PureMetaStep::from_effect(effect) else {
         return PureMetaOutcome::NotPureMeta;
@@ -97,26 +96,14 @@ pub(super) fn failure_display_name<S>(effect: &Effect<S>) -> Option<String> {
     }
 }
 
-pub(super) fn build_scheduler_deps<S: Clone>(
+pub(super) fn build_scheduler_deps<'a, S: Clone>(
     admitted: &crate::replacement::AdmittedReplacementEffects<S>,
-    unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
+    unresolved_resources: impl IntoIterator<Item = &'a ResolvedResourceId>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) -> SchedulerDeps {
     finish_scheduler_deps(
         admitted.effects(),
-        admitted.dependency_analysis(unresolved_resources.keys()),
-        deferred_replace_delete_deps,
-    )
-}
-
-pub(super) fn build_scheduler_deps_from_resources(
-    admitted: &crate::replacement::AdmittedReplacementEffects,
-    unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
-    deferred_replace_delete_deps: &[(usize, usize)],
-) -> SchedulerDeps {
-    finish_scheduler_deps(
-        admitted.effects(),
-        admitted.dependency_analysis(unresolved_resources.keys()),
+        admitted.dependency_analysis(unresolved_resources),
         deferred_replace_delete_deps,
     )
 }

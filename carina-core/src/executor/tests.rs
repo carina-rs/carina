@@ -456,6 +456,7 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
             create_effect(cert.clone()),
             Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
                 NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
                     previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "test",
@@ -1495,6 +1496,7 @@ fn empty_execution_result() -> ExecutionResult {
         interrupted_count: 0,
         applied_states: Default::default(),
         runtime_synthesized_resources: Vec::new(),
+        replacement_writeback: Vec::new(),
         successfully_deleted: HashSet::new(),
         permanent_name_overrides: HashMap::new(),
         managed_current: HashMap::new(),
@@ -11266,6 +11268,7 @@ fn legacy_unbound_deferred_replace(
 ) -> Effect {
     Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
         NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+            generation: crate::effect::EffectGeneration::Current,
             previous_attributes: Default::default(),
             id: crate::resource::ResolvedResourceId::new(legacy_id.clone()),
             identifier: crate::effect::fixture_applied_identifier("existing"),
@@ -11584,6 +11587,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
         crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![
                 DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
                     previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "test",
@@ -11597,6 +11601,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
                     blocked_by_updates: Default::default(),
                 },
                 DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
                     previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "test",
@@ -11696,6 +11701,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
     plan.add(Effect::DeferredReplace(Box::new(
         crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: crate::effect::EffectGeneration::Current,
                 previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "test",
@@ -11957,6 +11963,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     plan.add(Effect::DeferredReplace(Box::new(
         crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: crate::effect::EffectGeneration::Current,
                 previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "test",
@@ -12851,6 +12858,7 @@ async fn conflicting_deferred_case(
         crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![
                 DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
                     previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "test",
@@ -12864,6 +12872,7 @@ async fn conflicting_deferred_case(
                     blocked_by_updates: Default::default(),
                 },
                 DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
                     previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "test",
@@ -13005,6 +13014,7 @@ async fn issue_4283_conflicting_map_child_is_delete_first() {
 #[test]
 fn issue_4283_deferred_prior_snapshot_redacts_secrets() {
     let old = DeferredReplaceDelete {
+        generation: crate::effect::EffectGeneration::Current,
         id: test_resolved_id("test", "validation_records[0]"),
         identifier: crate::effect::fixture_applied_identifier("old-child"),
         directives: Default::default(),
@@ -13056,6 +13066,7 @@ fn issue_4283_deferred_prior_snapshot_uses_persisted_secret_shape() {
     ))
     .unwrap();
     let old = DeferredReplaceDelete {
+        generation: crate::effect::EffectGeneration::Current,
         id: id.clone(),
         identifier: crate::effect::fixture_applied_identifier("old-child"),
         directives: Default::default(),
@@ -13190,6 +13201,7 @@ fn review_4283_deferred_requirements_apply_to_one_concrete_sibling() {
         crate::binding_index::BindingCompleteness::Complete,
     );
     let old = |index: usize| DeferredReplaceDelete {
+        generation: crate::effect::EffectGeneration::Current,
         id: test_resolved_id("test", &format!("validation_records[{index}]")),
         identifier: crate::effect::fixture_applied_identifier(format!("old-{index}")),
         directives: Default::default(),
@@ -13233,7 +13245,17 @@ fn review_4283_deferred_requirements_apply_to_one_concrete_sibling() {
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         |session| {
+            let saved_effects: Vec<Effect<crate::resource::SavedModuleSource>> =
+                admitted.effects().iter().cloned().map(Into::into).collect();
+            let (existing, _, _) = crate::replacement::AdmittedReplacementEffects::resolve(
+                &saved_effects,
+                &COEXISTING_TEST_SCHEMAS,
+                |_| HashMap::new(),
+            )
+            .unwrap()
+            .expand_deferred_replacements();
             let ctx = deferred_dispatch::PureMetaCtx {
+                existing: &existing,
                 ordinary_old: &[],
                 requirements: &HashMap::new(),
                 identity_inputs: deferred_dispatch::DeferredIdentityInputs {
@@ -13252,7 +13274,7 @@ fn review_4283_deferred_requirements_apply_to_one_concrete_sibling() {
                 else {
                     panic!("children must materialize");
                 };
-                let children = materialized.admitted.effects();
+                let children = &materialized.effects()[existing.effects().len()..];
                 assert_eq!(children.len(), 2);
                 assert!(
                     matches!(&children[0], Effect::Create(child) if child.directives.create_before_destroy)
@@ -13269,6 +13291,7 @@ fn review_4283_deferred_requirements_apply_to_one_concrete_sibling() {
 #[test]
 fn review_4283_redacted_deferred_debug_drops_preview_snapshots() {
     let old = DeferredReplaceDelete {
+        generation: crate::effect::EffectGeneration::Current,
         id: test_resolved_id("test", "validation_records[0]"),
         identifier: crate::effect::fixture_applied_identifier("old-child"),
         directives: Default::default(),
@@ -13417,10 +13440,250 @@ async fn review_4283_runtime_attribute_name_override_reaches_checkpoints() {
         checkpoint.permanent_name_overrides[&child_id]["identity_input"],
         *override_
     );
+    for saved in [&result, checkpoint] {
+        let replacement = saved
+            .replacement_writeback
+            .iter()
+            .find(|replacement| replacement.target().as_inner() == &child_id)
+            .expect("checkpoint and final result retain the admitted association");
+        assert_eq!(replacement.old_instances()[0].id.as_inner(), &child_id);
+        assert_eq!(
+            replacement.old_instances()[0].identifier.as_str(),
+            "old-child"
+        );
+    }
+
     let calls = provider.calls();
     assert!(
         call_position(&calls, "create", &child_id.to_string())
             < call_position(&calls, "delete", &child_id.to_string()),
         "prepared Attribute replacement should be create-first: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn review2_4283_deferred_reversed_history_resolves_combined_graph() {
+    deferred_reversed_history(true).await;
+}
+
+#[tokio::test]
+async fn review2_4283_deferred_reversed_history_rejects_conflicting_combined_graph() {
+    deferred_reversed_history(false).await;
+}
+
+async fn deferred_reversed_history(coexisting_child: bool) {
+    let provider = MockProvider::new();
+    let mut parent = Resource::new("test", "cert").with_root_binding("cert");
+    parent.directives.create_before_destroy = true;
+    let parent_id = parent.id.clone();
+    let child_id = test_resolved_id("test.Child", "validation_records[0]");
+    provider.push_create(Ok(cert_state_for_deferred_replace_deadlock(&parent_id)));
+    provider.push_create(Ok(State::existing(
+        child_id.as_inner().clone(),
+        HashMap::new(),
+    )
+    .with_identifier("new-child")));
+    provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
+    let mut schemas = COEXISTING_TEST_SCHEMAS.clone();
+    let schema = PatternResourceSchema::new("test.Child");
+    schemas.insert(
+        "",
+        if coexisting_child {
+            schema.with_coexisting_replacement()
+        } else {
+            schema.with_conflicting_replacement()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let mut resource =
+        crate::resource::Resource::<ModuleSource, LoopSlot, AbsoluteBindingAddress>::new(
+            "test.Child",
+            "validation_records",
+        );
+    resource.binding = Some(absolute_binding("validation_records"));
+    resource
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("cert"));
+    resource.set_attr("name", for_value_access(&["resource_record", "name"]));
+    resource.set_attr("value", for_value_access(&["resource_record", "value"]));
+    let template = crate::parser::DeferredForExpression::new(
+        None,
+        1,
+        "for opt in cert.domain_validation_options".into(),
+        crate::parser::DeferredForTarget::bound(absolute_binding("validation_records")).unwrap(),
+        Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
+        crate::parser::ForBinding::Simple("opt".into()),
+        resource,
+    );
+    let gate = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
+        NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+            generation: crate::effect::EffectGeneration::Current,
+            id: child_id.clone(),
+            identifier: crate::effect::fixture_applied_identifier("old-child"),
+            directives: Default::default(),
+            binding: Some(absolute_binding("validation_records[0]")),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+            previous_attributes: Default::default(),
+        }])
+        .unwrap(),
+        Box::new(template),
+    )));
+    let mut plan = Plan::new();
+    plan.add(create_effect(parent));
+    plan.add(Effect::Delete {
+        id: ResolvedResourceId::new(parent_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("old-parent"),
+        generation: EffectGeneration::Current,
+        directives: Default::default(),
+        binding: Some(absolute_binding("cert")),
+        dependencies: crate::test_support::persisted([child_id.clone()]),
+        explicit_dependencies: std::iter::once(child_id.clone()).collect(),
+        blocked_by_updates: std::iter::once(ResolvedResourceId::new(gate.resource_id().clone()))
+            .collect(),
+    });
+    plan.add(gate);
+    let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: Default::default(),
+        managed_current: Default::default(),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    if !coexisting_child {
+        assert_eq!(result.failure_count(), 1, "events: {:?}", observer.events());
+        assert_eq!(
+            provider.calls(),
+            vec![("create".into(), parent_id.to_string())],
+            "rejection must precede either child endpoint"
+        );
+        assert!(result.successfully_deleted.is_empty());
+        assert!(
+            observer
+                .events()
+                .iter()
+                .any(|event| event.contains("cannot coexist"))
+        );
+        return;
+    }
+    assert_eq!(
+        result.failure_count(),
+        0,
+        "combined admission must promote the child: {:?}",
+        observer.events()
+    );
+    assert_eq!(result.success_count, 4);
+    let calls = provider.calls();
+    assert!(
+        call_position(&calls, "create", &child_id.to_string())
+            < call_position(&calls, "delete", &child_id.to_string()),
+        "historical inversion requires child coexistence: {calls:?}"
+    );
+}
+
+#[test]
+fn review2_4283_secret_wrapped_deferred_history_uses_shared_hashes() {
+    use crate::resource::{SnapshotLeaf, SnapshotValue};
+    let id = test_resolved_id("test", "validation_records[0]");
+    let previous = HashMap::from([(
+        "secret".into(),
+        SnapshotValue::Deferred(crate::resource::DeferredValue::Secret(Box::new(
+            SnapshotValue::Concrete(crate::resource::ConcreteValue::String("old-secret".into())),
+        ))),
+    )]);
+    let verified = State::existing(id.as_inner().clone(), previous.clone());
+    let guide = crate::value::redact_secrets_in_state(&verified).unwrap();
+    let mut plan = Plan::new();
+    plan.add(Effect::DeferredReplace(Box::new(
+        crate::test_support::compiled_replace(
+            NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: crate::effect::EffectGeneration::Current,
+                id: id.clone(),
+                identifier: crate::effect::fixture_applied_identifier("old-child"),
+                directives: Default::default(),
+                binding: Some(absolute_binding("validation_records[0]")),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
+                previous_attributes: previous,
+            }])
+            .unwrap(),
+            Box::new(validation_deferred_for_expression()),
+        ),
+    )));
+    let redacted = crate::value::redact_secrets_in_plan_with_desired_and_historical(
+        &plan,
+        &HashMap::<ResourceId, crate::resource::Resource<ModuleSource, SnapshotLeaf>>::new(),
+        &HashMap::from([(id.as_inner().clone(), guide.clone())]),
+    )
+    .unwrap();
+    let restored = crate::value::rehydrate_plan_historical_secrets_from_verified_states(
+        &redacted,
+        &HashMap::from([(id.as_inner().clone(), guide)]),
+        &HashMap::from([(id.as_inner().clone(), verified)]),
+    );
+    assert!(
+        restored.is_ok(),
+        "historical rehydration must use the shared salt: {restored:?}"
+    );
+}
+
+#[test]
+fn review2_4283_secret_wrapped_update_history_uses_shared_hashes() {
+    let id = ResourceId::with_identity("test", "updated");
+    let old = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "secret".into(),
+            crate::resource::SnapshotValue::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(crate::resource::SnapshotValue::Concrete(
+                    crate::resource::ConcreteValue::String("historical-secret".into()),
+                )),
+            )),
+        )]),
+    );
+    let guide = crate::value::redact_secrets_in_state(&old).unwrap();
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(old.clone()),
+        identifier: crate::effect::fixture_applied_identifier("existing"),
+        to: resolved(Resource::new("test", "updated")),
+        changed_attributes: vec!["secret".into()],
+    });
+    let redacted = crate::value::redact_secrets_in_plan_with_desired_and_historical(
+        &plan,
+        &HashMap::<
+            ResourceId,
+            crate::resource::Resource<ModuleSource, crate::resource::SnapshotLeaf>,
+        >::new(),
+        &HashMap::from([(id.clone(), guide.clone())]),
+    )
+    .unwrap();
+    let restored = crate::value::rehydrate_plan_historical_secrets_from_verified_states(
+        &redacted,
+        &HashMap::from([(id.clone(), guide)]),
+        &HashMap::from([(id, old)]),
+    );
+    assert!(
+        restored.is_ok(),
+        "shared historical guide was applied after hashing: {restored:?}"
     );
 }

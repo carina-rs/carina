@@ -1122,6 +1122,7 @@ fn deferred_replace_validation_records_effect() -> Effect {
 
     Effect::DeferredReplace(Box::new(DeferredReplacePayload::new(
         NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+            generation: carina_core::effect::EffectGeneration::Current,
             previous_attributes: Default::default(),
             id: delete_id,
             identifier,

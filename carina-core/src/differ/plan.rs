@@ -1079,6 +1079,7 @@ fn add_deferred_create_effects_with_priors(
                     super::binding_matches_deferred_template(binding, template.target())
                 });
                 matches.then(|| DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
                     previous_attributes: prior_attributes
                         .get(id.as_inner())
                         .cloned()
@@ -1696,6 +1697,7 @@ fn pending_replace_from_parts(
     registry: &SchemaRegistry,
 ) -> Result<PendingReplace, CreateBeforeDestroyError> {
     let old = DeferredReplaceDelete {
+        generation: crate::effect::EffectGeneration::Current,
         id: ResolvedResourceId::new(from.id.clone()),
         identifier,
         directives,

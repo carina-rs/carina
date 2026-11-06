@@ -72,9 +72,9 @@ pub fn build_plan_scheduler_dependency_edges(
         .iter()
         .map(|(_, delete_idx)| *delete_idx)
         .collect();
-    let scheduler::SchedulerDeps { deps_of, .. } = scheduler::build_scheduler_deps_from_resources(
+    let scheduler::SchedulerDeps { deps_of, .. } = scheduler::build_scheduler_deps(
         &admitted,
-        unresolved_resources,
+        unresolved_resources.keys(),
         &deferred_replace_delete_deps,
     );
 
@@ -544,7 +544,7 @@ impl RuntimeCompositions<'_> {
         let _ = self;
         scheduler::build_scheduler_deps(
             admitted,
-            unresolved_resources,
+            unresolved_resources.keys(),
             deferred_replace_delete_deps,
         )
     }
@@ -1456,6 +1456,7 @@ pub struct ExecutionResult<S = ModuleSource> {
     pub interrupted_count: usize,
     pub applied_states: std::collections::HashMap<ResourceId, Applied>,
     pub runtime_synthesized_resources: Vec<ResolvedResource<S>>,
+    pub replacement_writeback: Vec<crate::replacement::ReplacementWriteback>,
     pub successfully_deleted: HashSet<DeletedInstanceKey>,
     pub permanent_name_overrides:
         HashMap<ResourceId, HashMap<String, crate::name_override::NameOverride>>,
@@ -1476,6 +1477,7 @@ impl<S> ExecutionResult<S> {
             interrupted_count: 0,
             applied_states: HashMap::new(),
             runtime_synthesized_resources: Vec::new(),
+            replacement_writeback: Vec::new(),
             successfully_deleted: HashSet::new(),
             permanent_name_overrides: HashMap::new(),
             managed_current: HashMap::new(),
@@ -1512,6 +1514,7 @@ pub(super) struct ExecutionResultFields<S = ModuleSource> {
     pub(super) skip_count: usize,
     pub(super) interrupted_count: usize,
     pub(super) runtime_synthesized_resources: Vec<ResolvedResource<S>>,
+    pub(super) replacement_writeback: Vec<crate::replacement::ReplacementWriteback>,
     pub(super) successfully_deleted: HashSet<DeletedInstanceKey>,
     pub(super) permanent_name_overrides:
         HashMap<ResourceId, HashMap<String, crate::name_override::NameOverride>>,
@@ -1538,6 +1541,7 @@ impl<S> ExecutionResultFields<S> {
             skip_count,
             interrupted_count,
             runtime_synthesized_resources,
+            replacement_writeback,
             successfully_deleted,
             permanent_name_overrides,
             managed_current,
@@ -1554,6 +1558,7 @@ impl<S> ExecutionResultFields<S> {
             interrupted_count,
             applied_states,
             runtime_synthesized_resources,
+            replacement_writeback,
             successfully_deleted,
             permanent_name_overrides,
             managed_current,
@@ -1584,6 +1589,7 @@ impl<S: Clone> ExecutionAccumulator<S> {
             interrupted_count,
             applied_states,
             runtime_synthesized_resources,
+            replacement_writeback,
             successfully_deleted,
             permanent_name_overrides,
             managed_current,
@@ -1605,6 +1611,7 @@ impl<S: Clone> ExecutionAccumulator<S> {
                 skip_count,
                 interrupted_count,
                 runtime_synthesized_resources,
+                replacement_writeback,
                 successfully_deleted,
                 permanent_name_overrides,
                 managed_current,
@@ -1634,6 +1641,28 @@ impl<S: Clone> ExecutionAccumulator<S> {
     ) -> T {
         self.dirty = true;
         mutation(&mut self.fields)
+    }
+
+    pub(super) fn record_replacement_metadata(
+        &mut self,
+        admitted: &crate::replacement::AdmittedReplacementEffects<S>,
+    ) {
+        self.mutate(|result| {
+            result.replacement_writeback = admitted.writeback().to_vec();
+            for (id, name) in admitted.temporary_names() {
+                result
+                    .permanent_name_overrides
+                    .entry(id.clone())
+                    .or_default()
+                    .insert(
+                        name.attribute.clone(),
+                        crate::name_override::NameOverride {
+                            temp_value: name.temporary_value.clone(),
+                            original_value: Some(name.original_value.clone()),
+                        },
+                    );
+            }
+        });
     }
 
     pub(super) fn insert_published(&mut self, id: ResourceId, applied: Applied, state: &State) {

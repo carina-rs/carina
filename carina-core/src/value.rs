@@ -4403,6 +4403,23 @@ fn redact_deferred_template<S: Clone>(
 pub fn redact_secrets_in_effect<S: Clone>(
     effect: &crate::effect::Effect<S>,
 ) -> Result<crate::effect::Effect<S, SnapshotLeaf>, SerializationError> {
+    redact_secrets_in_effect_with_history(effect, &HashMap::new())
+}
+
+fn redact_historical_attributes<'a>(
+    attributes: &HashMap<String, SnapshotValue>,
+    mut guide: impl FnMut(&str) -> Option<&'a SnapshotValue>,
+) -> Result<HashMap<String, SnapshotValue>, SerializationError> {
+    redact_attrs_with_guide(attributes.iter(), |key, value| match guide(key) {
+        Some(shape) => redact_using_redacted_shape(value, shape),
+        None => redact_snapshot_secrets(value),
+    })
+}
+
+fn redact_secrets_in_effect_with_history<S: Clone>(
+    effect: &crate::effect::Effect<S>,
+    historical: &HashMap<crate::resource::ResourceId, crate::resource::SnapshotState>,
+) -> Result<crate::effect::Effect<S, SnapshotLeaf>, SerializationError> {
     let mut redacted = effect.try_map_value_stage(
         |_, _, value| redact_secrets_in_value(value),
         |_, value| redact_secrets_in_value(value),
@@ -4411,18 +4428,21 @@ pub fn redact_secrets_in_effect<S: Clone>(
     match &mut redacted {
         crate::effect::Effect::DeferredReplace(payload) => {
             for old in payload.deletes.iter_mut() {
-                old.previous_attributes = old
-                    .previous_attributes
-                    .iter()
-                    .map(|(key, value)| {
-                        redact_snapshot_secrets(value).map(|value| (key.clone(), value))
-                    })
-                    .collect::<Result<_, _>>()?;
+                old.previous_attributes =
+                    redact_historical_attributes(&old.previous_attributes, |key| {
+                        historical
+                            .get(old.id.as_inner())
+                            .and_then(|state| state.attributes.get(key))
+                    })?;
             }
         }
 
         crate::effect::Effect::Update { from, .. } => {
-            **from = redact_secrets_in_state(from)?;
+            from.attributes = redact_historical_attributes(&from.attributes, |key| {
+                historical
+                    .get(&from.id)
+                    .and_then(|state| state.attributes.get(key))
+            })?;
         }
         crate::effect::Effect::ReleaseListKeys { keys, .. } => {
             *keys = crate::effect::ReleasedListKeys::try_new(
@@ -4497,7 +4517,7 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
         .effects()
         .iter()
         .map(|effect| {
-            let mut effect = match effect {
+            let effect = match effect {
                 crate::effect::Effect::Create(resource) => {
                     match reusable_resource(&resource.id) {
                         Some(planned) => crate::effect::Effect::Create(resource.replace_inner(
@@ -4512,7 +4532,17 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
                     to,
                     changed_attributes,
                 } => crate::effect::Effect::Update {
-                    from: Box::new(redact_secrets_in_state(from)?),
+                    from: Box::new(crate::resource::SnapshotState {
+                        attributes: redact_historical_attributes(&from.attributes, |key| {
+                            match historical.get(&from.id) {
+                                Some(state) => state.attributes.get(key),
+                                None => planned_resources
+                                    .get(&from.id)
+                                    .and_then(|resource| resource.attributes.get(key)),
+                            }
+                        })?,
+                        ..from.as_ref().clone()
+                    }),
                     identifier: identifier.clone(),
                     to: match reusable_resource(&to.id) {
                         Some(planned) => {
@@ -4531,42 +4561,10 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
                 | crate::effect::Effect::ReleaseListKeys { .. }
                 | crate::effect::Effect::Wait { .. }
                 | crate::effect::Effect::DeferredCreate(_)
-                | crate::effect::Effect::DeferredReplace(_) => redact_secrets_in_effect(effect)?,
+                | crate::effect::Effect::DeferredReplace(_) => {
+                    redact_secrets_in_effect_with_history(effect, historical)?
+                }
             };
-            if let crate::effect::Effect::Update { from, .. } = &mut effect {
-                if let Some(state) = historical.get(&from.id) {
-                    for (key, value) in &mut from.attributes {
-                        let Some(shape) = state.attributes.get(key) else {
-                            continue;
-                        };
-                        *value = redact_using_redacted_shape(value, shape)?;
-                    }
-                } else if let Some(guide) = planned_resources.get(&from.id) {
-                    let attributes =
-                        redact_attrs_with_guide(from.attributes.iter(), |key, value| match guide
-                            .attributes
-                            .get(key)
-                        {
-                            Some(shape) => redact_using_redacted_shape(value, shape),
-                            None => redact_snapshot_secrets(value),
-                        })?;
-                    **from = crate::resource::State {
-                        attributes,
-                        ..from.as_ref().clone()
-                    };
-                }
-            }
-            if let crate::effect::Effect::DeferredReplace(payload) = &mut effect {
-                for old in payload.deletes.iter_mut() {
-                    if let Some(guide) = historical.get(old.id.as_inner()) {
-                        for (key, value) in &mut old.previous_attributes {
-                            if let Some(shape) = guide.attributes.get(key) {
-                                *value = redact_using_redacted_shape(value, shape)?;
-                            }
-                        }
-                    }
-                }
-            }
             Ok(effect)
         })
         .collect::<Result<_, SerializationError>>()?;
@@ -15170,6 +15168,7 @@ mod tests {
             consumer_updates: Default::default(),
             replacement: {
                 let mut old = crate::effect::DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
                     blocked_by_updates: Default::default(),
                     previous_attributes: Default::default(),
                     id: ResolvedResourceId::new(id.clone()),

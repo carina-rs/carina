@@ -5,9 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::effect::{
-    DeferredReplaceDelete, Effect, EffectGeneration, NonEmptyDeletes, TemporaryName,
-};
+use crate::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes, TemporaryName};
 use crate::plan::{
     CreateBeforeDestroyError, ReplacementCannotCoexistError, SchemaNotRegisteredError,
 };
@@ -24,6 +22,8 @@ pub struct ReplacementRequest<T> {
     pub deletes: NonEmptyDeletes,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     required_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    prepared_name: Option<TemporaryName>,
 }
 impl<T> ReplacementRequest<T> {
     pub fn new(target: T, old_instances: NonEmptyDeletes) -> Self {
@@ -31,6 +31,7 @@ impl<T> ReplacementRequest<T> {
             template: target,
             deletes: old_instances,
             required_by: None,
+            prepared_name: None,
         }
     }
     pub fn target(&self) -> &T {
@@ -54,7 +55,12 @@ impl<T> ReplacementRequest<T> {
             template: map(self.template),
             deletes: self.deletes,
             required_by: self.required_by,
+            prepared_name: self.prepared_name,
         }
+    }
+    pub(crate) fn with_prepared_name(mut self, name: Option<TemporaryName>) -> Self {
+        self.prepared_name = name;
+        self
     }
 }
 
@@ -121,14 +127,15 @@ impl<T> CheckedReplacement<T> {
         }
     }
     pub fn into_request(self) -> ReplacementRequest<T> {
-        let target = match self.admitted {
-            Admitted::DeleteFirst(target) => target,
-            Admitted::CreateFirst(witness) => witness.target,
+        let (target, prepared_name) = match self.admitted {
+            Admitted::DeleteFirst(target) => (target, None),
+            Admitted::CreateFirst(witness) => (witness.target, witness.temporary_name),
         };
         ReplacementRequest {
             template: target,
             deletes: self.old_instances,
             required_by: self.required_by,
+            prepared_name,
         }
     }
     pub(crate) fn project_prior_explicit(
@@ -153,7 +160,13 @@ impl<S, P: PlanValueKind> CheckedReplacement<ResolvedResource<S, P>> {
             old_instances: self
                 .old_instances
                 .iter()
-                .map(|old| old.id.clone())
+                .map(|old| {
+                    crate::effect::DeletedInstanceKey::new(
+                        old.id.as_inner().clone(),
+                        old.generation.clone(),
+                        old.identifier.as_str().to_owned(),
+                    )
+                })
                 .collect(),
             create_first: self.is_create_first(),
         }
@@ -198,6 +211,7 @@ pub fn resolve_replacement<S: Clone, P: PlanValueKind>(
         template: target,
         deletes: old_instances,
         required_by,
+        prepared_name,
     } = request;
     let admitted = if target.directives.create_before_destroy || required_by.is_some() {
         let schema = registry
@@ -214,7 +228,12 @@ pub fn resolve_replacement<S: Clone, P: PlanValueKind>(
                     .map(ToString::to_string)
                     .unwrap_or_else(|| target.id.identity_display().to_string()),
             })?;
-        let temporary_name = prepare_name(&target, &old_instances, schema.as_schema())?;
+        let temporary_name = prepare_name(
+            &target,
+            &old_instances,
+            schema.as_schema(),
+            prepared_name.as_ref(),
+        )?;
         let mut resource = target.as_resource().clone();
         resource.directives.create_before_destroy = true;
         if let Some(name) = &temporary_name {
@@ -241,6 +260,7 @@ fn prepare_name<S, P: PlanValueKind>(
     target: &ResolvedResource<S, P>,
     old: &NonEmptyDeletes,
     schema: &crate::schema::CompiledResourceSchema,
+    prepared: Option<&TemporaryName>,
 ) -> Result<Option<TemporaryName>, CreateBeforeDestroyError> {
     let attribute = match &schema.unique_name {
         UniqueNameSpec::Coexisting => return Ok(None),
@@ -257,6 +277,26 @@ fn prepare_name<S, P: PlanValueKind>(
         }
         UniqueNameSpec::Attribute(attribute) => attribute,
     };
+    if let Some(prepared) = prepared {
+        if prepared.attribute != *attribute
+            || target.prefixes.contains_key(attribute)
+            || prepared.original_value == prepared.temporary_value
+            || old.iter().any(|old| matches!(old.previous_attributes.get(attribute), Some(Value::Concrete(ConcreteValue::String(previous))) if previous.expose_plaintext() == prepared.temporary_value))
+            || !matches!(target.get_attr(attribute), Some(Value::Concrete(ConcreteValue::String(value))) if value.expose_plaintext() == prepared.temporary_value)
+        {
+            return Err(crate::plan::InvalidPreparedReplacementNameError {
+                resource_type: target.id.display_type(),
+                attribute: attribute.clone(),
+            }.into());
+        }
+        return Ok(Some(TemporaryName {
+            can_rename: schema
+                .attributes
+                .get(attribute)
+                .is_some_and(|attr| !attr.create_only),
+            ..prepared.clone()
+        }));
+    }
     if target.prefixes.contains_key(attribute) {
         return Ok(None);
     }
@@ -284,12 +324,13 @@ fn prepare_name<S, P: PlanValueKind>(
 pub(crate) fn create_first_requirements<S, P: PlanValueKind>(
     effects: &[Effect<S, P>],
 ) -> HashMap<ResolvedResourceId, String> {
-    replacement_requirements(effects, &HashMap::new())
+    replacement_requirements(effects, &HashMap::new(), &HashMap::new())
 }
 
 fn replacement_requirements<S, P: PlanValueKind>(
     effects: &[Effect<S, P>],
     associations: &HashMap<ResolvedResourceId, HashSet<ResolvedResourceId>>,
+    required: &HashMap<ResolvedResourceId, String>,
 ) -> HashMap<ResolvedResourceId, String> {
     let new_dependencies: Vec<crate::resource::ResolvedDependencies> = effects
         .iter()
@@ -309,7 +350,7 @@ fn replacement_requirements<S, P: PlanValueKind>(
             | Effect::ReleaseListKeys { .. } => Default::default(),
         })
         .collect();
-    let mut requirements = HashMap::new();
+    let mut requirements = required.clone();
     for (effect, dependencies) in effects.iter().zip(&new_dependencies) {
         for dependency in dependencies.iter() {
             if dependency.as_inner() != effect.resource_id() {
@@ -323,19 +364,17 @@ fn replacement_requirements<S, P: PlanValueKind>(
         .iter()
         .enumerate()
         .filter_map(|(index, effect)| match effect {
-            Effect::Create(resource) => Some((resource.resolved_id(), index)),
+            Effect::Create(resource) | Effect::ResumeCreate { resource, .. } => {
+                Some((resource.resolved_id(), index))
+            }
             _ => None,
         })
         .collect();
-    let deletes: HashMap<_, _> = effects
+    let deletes: Vec<_> = effects
         .iter()
         .enumerate()
         .filter_map(|(index, effect)| match effect {
-            Effect::Delete {
-                id,
-                generation: EffectGeneration::Current,
-                ..
-            } => Some((id.clone(), index)),
+            Effect::Delete { id, .. } => Some((id.clone(), index)),
             _ => None,
         })
         .collect();
@@ -345,17 +384,17 @@ fn replacement_requirements<S, P: PlanValueKind>(
             deletes
                 .iter()
                 .filter(move |(old, _)| {
-                    *old == target
+                    old == target
                         || associations
                             .get(target)
-                            .is_some_and(|ids| ids.contains(*old))
+                            .is_some_and(|ids| ids.contains(old))
                 })
-                .map(move |(_, &delete)| (target.clone(), create, delete))
+                .map(move |(_, delete)| (target.clone(), create, *delete))
         })
         .collect();
     loop {
         let create_first = |target: &ResolvedResourceId, index: usize| {
-            matches!(&effects[index], Effect::Create(resource) if resource.directives.create_before_destroy)
+            matches!(&effects[index], Effect::Create(resource) | Effect::ResumeCreate { resource, .. } if resource.directives.create_before_destroy)
                 || requirements.contains_key(target)
         };
         let mut edges: HashMap<usize, HashSet<usize>> = HashMap::new();
@@ -366,7 +405,7 @@ fn replacement_requirements<S, P: PlanValueKind>(
                 }
             }
         }
-        for &delete in deletes.values() {
+        for &(_, delete) in &deletes {
             if let Effect::Delete {
                 dependencies,
                 explicit_dependencies,
@@ -377,8 +416,10 @@ fn replacement_requirements<S, P: PlanValueKind>(
                 let mut old_dependencies = dependencies.to_resolved_dependencies();
                 old_dependencies.extend(explicit_dependencies.iter().cloned());
                 for old_dependency in old_dependencies {
-                    if let Some(&upstream_delete) = deletes.get(&old_dependency) {
-                        edges.entry(upstream_delete).or_default().insert(delete);
+                    for (_, upstream_delete) in
+                        deletes.iter().filter(|(id, _)| id == &old_dependency)
+                    {
+                        edges.entry(*upstream_delete).or_default().insert(delete);
                     }
                 }
                 for consumer in blocked_by_updates.iter() {
@@ -500,6 +541,7 @@ pub struct AdmittedReplacementEffects<
     effects: Vec<Effect<S, P>>,
     scheduling: ReplacementScheduling,
     temporary_names: PreparedReplacementNames,
+    writeback: Vec<ReplacementWriteback>,
 }
 pub(crate) type PreparedReplacementNames = Vec<(crate::resource::ResourceId, TemporaryName)>;
 
@@ -517,10 +559,43 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
         previous: impl Fn(&ResolvedResourceId) -> HashMap<String, SnapshotValue>,
         associations: &HashMap<ResolvedResourceId, HashSet<ResolvedResourceId>>,
     ) -> Result<Self, ReplacementAdmissionError> {
+        Self::resolve_with_prepared_names(
+            effects,
+            registry,
+            previous,
+            associations,
+            &HashMap::new(),
+        )
+    }
+    pub(crate) fn resolve_with_prepared_names(
+        effects: &[Effect<S, P>],
+        registry: &SchemaRegistry,
+        previous: impl Fn(&ResolvedResourceId) -> HashMap<String, SnapshotValue>,
+        associations: &HashMap<ResolvedResourceId, HashSet<ResolvedResourceId>>,
+        prepared_names: &HashMap<ResolvedResourceId, TemporaryName>,
+    ) -> Result<Self, ReplacementAdmissionError> {
+        Self::resolve_with_context(
+            effects,
+            registry,
+            previous,
+            associations,
+            prepared_names,
+            &HashMap::new(),
+        )
+    }
+    fn resolve_with_context(
+        effects: &[Effect<S, P>],
+        registry: &SchemaRegistry,
+        previous: impl Fn(&ResolvedResourceId) -> HashMap<String, SnapshotValue>,
+        associations: &HashMap<ResolvedResourceId, HashSet<ResolvedResourceId>>,
+        prepared_names: &HashMap<ResolvedResourceId, TemporaryName>,
+        required: &HashMap<ResolvedResourceId, String>,
+    ) -> Result<Self, ReplacementAdmissionError> {
         let mut effects = effects.to_vec();
-        let requirements = replacement_requirements(&effects, associations);
+        let requirements = replacement_requirements(&effects, associations, required);
         let mut scheduling = ReplacementScheduling::default();
         let mut temporary_names = Vec::new();
+        let mut writeback = Vec::new();
         for index in 0..effects.len() {
             if let Effect::DeferredReplace(payload) = &mut effects[index] {
                 payload.require_create_first_for_dependencies(&requirements);
@@ -539,8 +614,12 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                         cause,
                     })?;
             }
-            let Effect::Create(target) = &effects[index] else {
-                continue;
+            let target = match &effects[index] {
+                Effect::Create(target)
+                | Effect::ResumeCreate {
+                    resource: target, ..
+                } => target,
+                _ => continue,
             };
             let old: Vec<_> = effects
                 .iter()
@@ -548,7 +627,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                     Effect::Delete {
                         id,
                         identifier,
-                        generation: EffectGeneration::Current,
+                        generation,
                         directives,
                         binding,
                         dependencies,
@@ -560,6 +639,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                             .is_some_and(|old| old.contains(id)) =>
                     {
                         Some(DeferredReplaceDelete {
+                            generation: generation.clone(),
                             id: id.clone(),
                             identifier: identifier.clone(),
                             directives: directives.clone(),
@@ -574,7 +654,8 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                 })
                 .collect();
             if let Ok(old) = NonEmptyDeletes::try_new(old) {
-                let mut request = ReplacementRequest::new(target.clone(), old);
+                let mut request = ReplacementRequest::new(target.clone(), old)
+                    .with_prepared_name(prepared_names.get(&target.resolved_id()).cloned());
                 if let Some(dependent) = requirements.get(&target.resolved_id()) {
                     request = request.require_create_first(dependent);
                 }
@@ -590,7 +671,14 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                 if let Some(name) = checked.temporary_name() {
                     temporary_names.push((checked.target().id.clone(), name.clone()));
                 }
-                effects[index] = Effect::Create(checked.target().clone());
+                writeback.push(ReplacementWriteback::from_checked(&checked));
+                match &mut effects[index] {
+                    Effect::Create(target)
+                    | Effect::ResumeCreate {
+                        resource: target, ..
+                    } => *target = checked.target().clone(),
+                    _ => unreachable!(),
+                }
                 scheduling.insert(checked.into_scheduling(), &effects, index);
             }
         }
@@ -598,6 +686,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
             effects,
             scheduling,
             temporary_names,
+            writeback,
         })
     }
     pub fn effects(&self) -> &[Effect<S, P>] {
@@ -612,21 +701,64 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
             effects,
             scheduling,
             temporary_names,
+            writeback: Vec::new(),
         }
     }
     pub(crate) fn temporary_names(&self) -> &PreparedReplacementNames {
         &self.temporary_names
     }
-    pub(crate) fn append(&mut self, other: Self) {
-        let offset = self.effects.len();
-        self.effects.extend(other.effects);
-        for mut replacement in other.scheduling.replacements {
-            replacement.create += offset;
-            replacement.deletes =
-                ReplacementScheduling::delete_slots(&replacement.order, &self.effects);
-            self.scheduling.replacements.push(replacement);
+    pub(crate) fn with_materialized(
+        &self,
+        children: Vec<Effect<S, P>>,
+        requests: Vec<ReplacementRequest<ResolvedResource<S, P>>>,
+        registry: &SchemaRegistry,
+    ) -> Result<Self, ReplacementAdmissionError> {
+        let mut effects = self.effects.clone();
+        effects.extend(children);
+        let mut associations: HashMap<ResolvedResourceId, HashSet<ResolvedResourceId>> =
+            HashMap::new();
+        let mut previous = HashMap::new();
+        let mut required = HashMap::new();
+        for replacement in &self.writeback {
+            associations
+                .entry(replacement.target.clone())
+                .or_default()
+                .extend(replacement.deletes.iter().map(|old| old.id.clone()));
+            previous.insert(
+                replacement.target.clone(),
+                replacement.deletes[0].previous_attributes.clone(),
+            );
         }
-        self.temporary_names.extend(other.temporary_names);
+        for request in requests {
+            let target = request.target().resolved_id();
+            associations
+                .entry(target.clone())
+                .or_default()
+                .extend(request.deletes.iter().map(|old| old.id.clone()));
+            previous.insert(
+                target.clone(),
+                request.deletes[0].previous_attributes.clone(),
+            );
+            if let Some(dependent) = request.required_by() {
+                required.insert(target, dependent.to_owned());
+            }
+        }
+        let names = self
+            .temporary_names
+            .iter()
+            .map(|(id, name)| (ResolvedResourceId::new(id.clone()), name.clone()))
+            .collect();
+        Self::resolve_with_context(
+            &effects,
+            registry,
+            |id| previous.get(id).cloned().unwrap_or_default(),
+            &associations,
+            &names,
+            &required,
+        )
+    }
+    pub(crate) fn writeback(&self) -> &[ReplacementWriteback] {
+        &self.writeback
     }
     pub(crate) fn replaces_current(&self, id: &crate::resource::ResourceId) -> bool {
         self.scheduling.replacements.iter().any(|replacement| {
@@ -634,7 +766,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                 .order
                 .old_instances
                 .iter()
-                .any(|old| old.as_inner() == id)
+                .any(|old| old.id() == id && old.generation().is_current())
         })
     }
     pub(super) fn into_parts(
@@ -677,30 +809,42 @@ impl<S: Clone> AdmittedReplacementEffects<S> {
                 effects: expanded.effects,
                 scheduling,
                 temporary_names: self.temporary_names,
+                writeback: self.writeback,
             },
             expanded.deferred_replace_delete_deps,
             expanded.source_effect_indices,
         )
     }
-    pub(crate) fn from_materialized(
-        mut children: Vec<Effect<S>>,
-        replacements: Vec<CheckedReplacement<ResolvedResource<S>>>,
+}
+
+/// Checked association used by checkpoint and final state writeback.
+/// It is minted only from the owner of admitted replacement endpoints.
+#[derive(Debug, Clone)]
+pub struct ReplacementWriteback {
+    target: ResolvedResourceId,
+    deletes: NonEmptyDeletes,
+}
+impl ReplacementWriteback {
+    fn from_checked<S, P: PlanValueKind>(
+        checked: &CheckedReplacement<ResolvedResource<S, P>>,
     ) -> Self {
-        let mut scheduling = ReplacementScheduling::default();
-        let mut temporary_names = Vec::new();
-        for checked in replacements {
-            let create = children.iter().position(|child| matches!(child, Effect::Create(resource) if resource.resolved_id() == checked.target().resolved_id()))
-                .expect("materialized admission retains its target");
-            children[create] = Effect::Create(checked.target().clone());
-            if let Some(name) = checked.temporary_name() {
-                temporary_names.push((checked.target().id.clone(), name.clone()));
-            }
-            scheduling.insert(checked.into_scheduling(), &children, create);
-        }
         Self {
-            effects: children,
-            scheduling,
-            temporary_names,
+            target: checked.target().resolved_id(),
+            deletes: checked.old_instances().clone(),
+        }
+    }
+    pub fn target(&self) -> &ResolvedResourceId {
+        &self.target
+    }
+    pub fn old_instances(&self) -> &NonEmptyDeletes {
+        &self.deletes
+    }
+    pub fn previous_attributes_for_state_writeback(
+        &self,
+        index: usize,
+    ) -> crate::plan::ReplacementPreviousAttributesForStateWriteback<'_> {
+        crate::plan::ReplacementPreviousAttributesForStateWriteback {
+            attributes: &self.deletes[index].previous_attributes,
         }
     }
 }
@@ -710,7 +854,7 @@ impl<S: Clone> AdmittedReplacementEffects<S> {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ReplacementOrder {
     target: ResolvedResourceId,
-    old_instances: Vec<ResolvedResourceId>,
+    old_instances: Vec<crate::effect::DeletedInstanceKey>,
     create_first: bool,
 }
 impl ReplacementOrder {
@@ -746,9 +890,19 @@ impl ReplacementScheduling {
             .filter_map(|(index, effect)| match effect {
                 Effect::Delete {
                     id,
-                    generation: EffectGeneration::Current,
+                    identifier,
+                    generation,
                     ..
-                } if order.old_instances.contains(id) => Some(index),
+                } if order
+                    .old_instances
+                    .contains(&crate::effect::DeletedInstanceKey::new(
+                        id.as_inner().clone(),
+                        generation.clone(),
+                        identifier.as_str().to_owned(),
+                    )) =>
+                {
+                    Some(index)
+                }
                 _ => None,
             })
             .collect()
@@ -845,6 +999,7 @@ impl ReplacementScheduling {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effect::EffectGeneration;
     use crate::effect::deps::{ScheduleInputs, build_effect_dependency_analysis};
     use crate::resource::{Resource, RootScope};
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
@@ -861,6 +1016,7 @@ mod tests {
             .unwrap()
             .remove(0);
         let old = DeferredReplaceDelete {
+            generation: crate::effect::EffectGeneration::Current,
             id: target.resolved_id(),
             identifier: crate::effect::fixture_applied_identifier("stable-physical-key"),
             directives: Default::default(),
@@ -1375,5 +1531,227 @@ mod tests {
             !format!("{redacted:?}").contains("REVIEW_STATIC_SECRET_PLAINTEXT"),
             "redacted plan Debug retained a plaintext scheduling snapshot"
         );
+    }
+    #[test]
+    fn review2_4283_readmission_preserves_prepared_name_without_prior_name() {
+        let schemas = registry(UniqueNameSpec::Attribute("name".into()));
+        for redacted in [false, true] {
+            let mut request = fixture(true);
+            request
+                .deletes
+                .iter_mut()
+                .next()
+                .unwrap()
+                .previous_attributes
+                .clear();
+            if redacted {
+                let secret: SnapshotValue = Value::Deferred(
+                    crate::resource::DeferredValue::Secret(Box::new(string("stable"))),
+                );
+                let state = crate::resource::State::existing(
+                    request.target().id.clone(),
+                    HashMap::from([("name".into(), secret)]),
+                );
+                let value = crate::value::redact_secrets_in_state(&state)
+                    .unwrap()
+                    .attributes
+                    .remove("name")
+                    .unwrap();
+                request
+                    .deletes
+                    .iter_mut()
+                    .next()
+                    .unwrap()
+                    .previous_attributes
+                    .insert("name".into(), value);
+            }
+            let checked = resolve_replacement(request, &schemas).unwrap();
+            let expected_name = checked.temporary_name().unwrap().clone();
+            let checked = resolve_replacement(checked.into_request(), &schemas).unwrap();
+            assert_eq!(
+                checked.temporary_name(),
+                Some(&expected_name),
+                "re-admission must retain the original DSL name and prepared suffix"
+            );
+            let mut plan = crate::plan::Plan::new();
+            plan.add_replacement(crate::plan::ReplacementGroup {
+                replacement: checked,
+                changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".into()])
+                    .unwrap(),
+                cascade_ref_hints: Vec::new(),
+                permanent_name_override: None,
+                consumer_updates: Default::default(),
+            });
+            plan.prepare_replacements(&schemas).unwrap();
+            let wire: crate::plan::UnresolvedSavedPlan =
+                serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+            let loaded = wire.resolve_with_schemas(&schemas).unwrap();
+            let prepared = loaded.admit_replacement_effects(&schemas).unwrap();
+            assert_eq!(prepared.temporary_names()[0].1, expected_name);
+            assert_eq!(
+                loaded.replace_display_info().next().unwrap().temporary_name,
+                Some(&expected_name)
+            );
+            assert_eq!(
+                loaded.permanent_name_overrides[0].original_value.as_deref(),
+                Some("stable")
+            );
+        }
+    }
+
+    #[test]
+    fn review2_4283_deposed_create_cannot_bypass_admission() {
+        let request = fixture(true);
+        let mut delete = request.deletes[0].to_delete_effect();
+        if let Effect::Delete { generation, .. } = &mut delete {
+            *generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+        }
+        let effects = vec![Effect::Create(request.target().clone()), delete];
+        assert!(
+            AdmittedReplacementEffects::resolve(
+                &effects,
+                &registry(UniqueNameSpec::Conflicting),
+                |_| HashMap::new()
+            )
+            .is_err(),
+            "a recovery generation still requires the target's coexistence admission"
+        );
+    }
+
+    #[test]
+    fn review2_4283_resume_create_cannot_bypass_admission() {
+        for deposed in [false, true] {
+            let request = fixture(true);
+            let mut delete = request.deletes[0].to_delete_effect();
+            if deposed && let Effect::Delete { generation, .. } = &mut delete {
+                *generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+            }
+            let effects = vec![
+                Effect::ResumeCreate {
+                    resource: request.target().clone(),
+                    started_at: crate::provider::Timestamp::now(),
+                },
+                delete,
+            ];
+            assert!(
+                AdmittedReplacementEffects::resolve(
+                    &effects,
+                    &registry(UniqueNameSpec::Conflicting),
+                    |_| HashMap::new()
+                )
+                .is_err(),
+                "a continuation still requires replacement admission"
+            );
+        }
+    }
+
+    #[test]
+    fn review2_4283_direct_deserialization_cannot_mint_displayable_plan() {
+        let checked =
+            resolve_replacement(fixture(true), &registry(UniqueNameSpec::Coexisting)).unwrap();
+        let mut plan = crate::plan::Plan::new();
+        plan.add_replacement(crate::plan::ReplacementGroup {
+            replacement: checked,
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".into()])
+                .unwrap(),
+            cascade_ref_hints: Vec::new(),
+            permanent_name_override: None,
+            consumer_updates: Default::default(),
+        });
+        let json = serde_json::to_value(&plan).unwrap();
+        let wire: crate::plan::UnresolvedSavedPlan = serde_json::from_value(json).unwrap();
+        assert!(
+            wire.resolve_with_schemas(&registry(UniqueNameSpec::Conflicting))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn review2_4283_prepared_name_is_revalidated_against_target_and_class() {
+        let schemas = registry(UniqueNameSpec::Attribute("name".into()));
+        let checked = resolve_replacement(fixture(true), &schemas).unwrap();
+        assert!(
+            resolve_replacement(
+                checked.clone().into_request(),
+                &registry(UniqueNameSpec::Conflicting)
+            )
+            .is_err()
+        );
+        let mut colliding = checked.clone().into_request();
+        colliding
+            .deletes
+            .iter_mut()
+            .next()
+            .unwrap()
+            .previous_attributes
+            .insert(
+                "name".into(),
+                string(&checked.temporary_name().unwrap().temporary_value),
+            );
+        assert!(matches!(
+            resolve_replacement(colliding, &schemas),
+            Err(CreateBeforeDestroyError::InvalidPreparedReplacementName(_))
+        ));
+        let tampered = checked.into_request().map_target(|target| {
+            let mut resource = target.as_resource().clone();
+            resource.set_attr("name", string("changed-after-preparation"));
+            target.replace_inner(resource)
+        });
+        assert!(matches!(
+            resolve_replacement(tampered, &schemas),
+            Err(CreateBeforeDestroyError::InvalidPreparedReplacementName(_))
+        ));
+    }
+
+    #[test]
+    fn review2_4283_recovery_pairs_admit_every_generation_and_continuation() {
+        for resume in [false, true] {
+            for create_first in [false, true] {
+                let request = fixture(create_first);
+                let target = if resume {
+                    Effect::ResumeCreate {
+                        resource: request.target().clone(),
+                        started_at: crate::provider::Timestamp::now(),
+                    }
+                } else {
+                    Effect::Create(request.target().clone())
+                };
+                let mut first = request.deletes[0].to_delete_effect();
+                let mut second = first.clone();
+                if let Effect::Delete { generation, .. } = &mut first {
+                    *generation =
+                        EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+                }
+                if let Effect::Delete { generation, .. } = &mut second {
+                    *generation =
+                        EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+                }
+                let effects = vec![first, target, second, request.deletes[0].to_delete_effect()];
+                assert!(
+                    build_effect_dependency_analysis(
+                        &effects,
+                        std::iter::empty(),
+                        ScheduleInputs::Apply
+                    )
+                    .is_err()
+                );
+                let admitted = AdmittedReplacementEffects::resolve(
+                    &effects,
+                    &registry(UniqueNameSpec::Coexisting),
+                    |_| HashMap::new(),
+                )
+                .unwrap();
+                let graph = admitted.dependency_analysis(std::iter::empty()).unwrap();
+                for delete in [0, 2, 3] {
+                    let (after, before) = if create_first {
+                        (delete, 1)
+                    } else {
+                        (1, delete)
+                    };
+                    assert!(graph.deps_of(after).unwrap().contains(&before));
+                    assert!(!graph.deps_of(before).unwrap().contains(&after));
+                }
+            }
+        }
     }
 }
