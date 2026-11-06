@@ -13726,13 +13726,29 @@ fn review_4283_deferred_requirements_apply_to_one_concrete_sibling() {
                 };
                 let children = &materialized.effects()[existing.effects().len()..];
                 assert_eq!(children.len(), 2);
-                assert!(
-                    matches!(&children[0], Effect::Create(child) if child.directives.create_before_destroy)
-                );
-                assert!(
-                    matches!(&children[1], Effect::Create(child) if !child.directives.create_before_destroy),
-                    "a requirement on iteration 0 promoted iteration 1"
-                );
+                let graph = materialized
+                    .dependency_analysis(std::iter::empty())
+                    .unwrap();
+                for (index, effect) in children.iter().enumerate() {
+                    let Effect::Create(child) = effect else {
+                        panic!("expected a materialized child Create");
+                    };
+                    assert!(!child.directives.create_before_destroy);
+                    let create = existing.effects().len() + index;
+                    let delete = materialized.effects().iter().position(|effect| {
+                        matches!(effect, Effect::Delete { id, .. } if **id == child.id)
+                    }).unwrap();
+                    let (after, before) = if index == 0 {
+                        (delete, create)
+                    } else {
+                        (create, delete)
+                    };
+                    assert!(
+                        graph.deps_of(after).unwrap().contains(&before),
+                        "only iteration 0 must be promoted to create-first"
+                    );
+                    assert!(!graph.deps_of(before).unwrap().contains(&after));
+                }
             }
         },
     );

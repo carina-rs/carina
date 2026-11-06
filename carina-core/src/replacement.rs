@@ -254,8 +254,9 @@ pub fn resolve_replacement<S: Clone, P: PlanValueKind>(
             prepared_name.as_ref(),
             naming,
         )?;
+        // The target supplies authored directives to writeback. Promotion
+        // belongs to this checked owner's admitted order.
         let mut resource = target.as_resource().clone();
-        resource.directives.create_before_destroy = true;
         if let Some(name) = &temporary_name {
             resource.set_attr(
                 name.attribute.clone(),
@@ -1318,6 +1319,31 @@ mod tests {
             previous_attributes: HashMap::from([("name".into(), string("stable"))]),
         };
         ReplacementRequest::new(target, NonEmptyDeletes::try_new(vec![old]).unwrap())
+    }
+
+    #[test]
+    fn review10_4283_dependency_promotion_preserves_authored_directive() {
+        for class in [
+            UniqueNameSpec::Coexisting,
+            UniqueNameSpec::Attribute("name".into()),
+        ] {
+            for authored in [false, true] {
+                let schemas = registry(class.clone());
+                let checked = resolve_replacement(
+                    fixture(authored).require_create_first("consumer"),
+                    &schemas,
+                )
+                .unwrap();
+                assert!(checked.is_create_first());
+                assert_eq!(checked.target().directives.create_before_destroy, authored);
+                let readmitted = resolve_replacement(checked.into_request(), &schemas).unwrap();
+                assert!(readmitted.is_create_first());
+                assert_eq!(
+                    readmitted.target().directives.create_before_destroy,
+                    authored
+                );
+            }
+        }
     }
     fn registry(class: UniqueNameSpec) -> SchemaRegistry {
         let schema = PatternResourceSchema::new("test.Record").attribute(

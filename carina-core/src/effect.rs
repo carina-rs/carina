@@ -254,7 +254,8 @@ impl PriorInstanceDestroyDependencies {
 }
 
 impl DeferredReplaceDelete {
-    pub(crate) fn instance_key(&self) -> DeletedInstanceKey {
+    /// Identity of the exact current or deposed instance described by this Delete.
+    pub fn instance_key(&self) -> DeletedInstanceKey {
         DeletedInstanceKey::new(
             self.id.as_inner().clone(),
             self.generation.clone(),
@@ -2657,13 +2658,7 @@ impl<S, V: PlanValueKind> EffectWithSource<S, V> {
             Effect::DeferredReplace(payload) => payload
                 .deletes
                 .iter()
-                .map(|delete| {
-                    DeletedInstanceKey::new(
-                        delete.id.clone().into_inner(),
-                        EffectGeneration::Current,
-                        delete.identifier.to_string(),
-                    )
-                })
+                .map(DeferredReplaceDelete::instance_key)
                 .collect(),
         }
     }

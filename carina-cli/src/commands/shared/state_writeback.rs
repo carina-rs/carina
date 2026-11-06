@@ -932,6 +932,7 @@ enum ReplacementOutcome {
     CurrentRowRetireOldAddress(ResolvedResourceId),
     CreateAppliedDeposeOld(PlannedDepose),
     DeleteSucceededCreateAbsent(ResolvedResourceId),
+    DeposedDeleteSucceeded(PlannedRemoveDeposed),
     KeepOld,
 }
 
@@ -1064,6 +1065,10 @@ impl<'a, S> WritebackPlan<'a, S> {
                 self.upserts.shift_remove(id.as_inner());
                 self.add_cleanup(id)
             }
+            ReplacementOutcome::DeposedDeleteSucceeded(remove) => {
+                self.add_remove_deposed(remove.id, remove.key);
+                Ok(())
+            }
         }
     }
 
@@ -1125,6 +1130,26 @@ fn classify_replacement_outcome<S>(
     successfully_deleted: &HashSet<DeletedInstanceKey>,
     schemas: &SchemaRegistry,
 ) -> Result<ReplacementOutcome, AppError> {
+    match delete.generation {
+        EffectGeneration::Current => {}
+        EffectGeneration::Deposed(key) => {
+            return Ok(
+                if delete_succeeded(
+                    successfully_deleted,
+                    delete.id,
+                    delete.generation,
+                    delete.identifier,
+                ) {
+                    ReplacementOutcome::DeposedDeleteSucceeded(PlannedRemoveDeposed {
+                        id: delete.id.clone(),
+                        key: key.clone(),
+                    })
+                } else {
+                    ReplacementOutcome::KeepOld
+                },
+            );
+        }
+    }
     let create_upsert = match create_result {
         ReplacementCreateResult::Upsert(upsert) => Some(upsert),
         ReplacementCreateResult::Ended => return Ok(ReplacementOutcome::CurrentRowOnly),
@@ -1553,11 +1578,7 @@ fn decompose_with_moved_origins<'a, S>(
                 .filter(|(_, old)| old.generation.is_current())
                 .map(move |(index, old)| {
                     (
-                        DeletedInstanceKey::new(
-                            old.id.as_inner().clone(),
-                            old.generation.clone(),
-                            old.identifier.as_str().to_owned(),
-                        ),
+                        old.instance_key(),
                         (
                             replacement.target(),
                             old,
@@ -1624,11 +1645,7 @@ fn decompose_with_moved_origins<'a, S>(
 
         if let Effect::DeferredReplace(payload) = effect {
             for delete in &payload.deletes {
-                let key = DeletedInstanceKey::new(
-                    delete.id.as_inner().clone(),
-                    delete.generation.clone(),
-                    delete.identifier.as_str().to_owned(),
-                );
+                let key = delete.instance_key();
                 let mut delete = delete_input_from_deferred(delete);
                 let target = if let Some((target, _old, previous)) = runtime_by_delete.get(&key) {
                     delete.previous_attributes = Some(*previous);
@@ -7498,6 +7515,91 @@ mod apply_state_save_tests {
 
         assert!(wb.upserts.is_empty());
         assert_eq!(wb.cleanups, HashSet::from([ResolvedResourceId::new(id)]));
+    }
+
+    #[test]
+    fn review10_4283_absorbed_deposed_delete_retires_only_its_generation() {
+        for current_deleted in [false, true] {
+            let id = ResourceId::with_provider_identity(
+                "aws",
+                "route53.Record",
+                "validation_records[0]",
+                None,
+            );
+            let retained_key = DeposedKey::new_unique();
+            let deleted_key = DeposedKey::new_unique();
+            let mut row = ResourceState::try_applied(
+                "route53.Record",
+                "validation_records[0]",
+                "aws",
+                "old-record-id",
+            )
+            .unwrap();
+            for (key, identifier) in [(&retained_key, "retained-id"), (&deleted_key, "deleted-id")]
+            {
+                row.deposed.push(DeposedInstance::from_persisted_json(
+                    key.clone(),
+                    identifier.into(),
+                    None,
+                    HashMap::new(),
+                    Default::default(),
+                ));
+            }
+            let mut initial = StateFile::new();
+            initial.upsert_resource(row).unwrap();
+            let Effect::DeferredReplace(payload) = deferred_replace_effect(&id) else {
+                unreachable!()
+            };
+            let current = payload.deletes[0].clone();
+            let mut deletes = vec![current.clone()];
+            for (key, identifier) in [(&retained_key, "retained-id"), (&deleted_key, "deleted-id")]
+            {
+                let mut old = current.clone();
+                old.generation = EffectGeneration::Deposed(key.clone());
+                old.identifier = crate::fixture_applied_identifier(identifier);
+                deletes.push(old);
+            }
+            let payload = Box::new(carina_core::effect::DeferredReplacePayload::new(
+                NonEmptyDeletes::try_new(deletes).unwrap(),
+                payload.template.clone(),
+                payload.dependency_template().clone(),
+            ));
+            let mut plan = Plan::new();
+            plan.add(Effect::DeferredReplace(payload));
+            let mut deleted = HashSet::from([DeletedInstanceKey::new(
+                id.clone(),
+                EffectGeneration::Deposed(deleted_key),
+                "deleted-id",
+            )]);
+            if current_deleted {
+                deleted.insert(DeletedInstanceKey::current(id.clone(), "old-record-id"));
+            }
+            let state = build_state_after_apply(
+                ApplyStateSave {
+                    state_file: initial,
+                    sorted_resources: &[],
+                    runtime_synthesized_resources: &[],
+                    managed_current: &HashMap::new(),
+                    applied_states: &HashMap::new(),
+                    plan: &plan,
+                    successfully_deleted: &deleted,
+                    failed_refreshes: &HashSet::new(),
+                    schemas: &SchemaRegistry::new(),
+                },
+                None,
+            )
+            .unwrap();
+            let saved = state
+                .find_resource("aws", "route53.Record", "validation_records[0]")
+                .expect("undeleted deposed generation must retain its row");
+            assert_eq!(
+                saved.identifier().map(|identifier| identifier.as_str()),
+                (!current_deleted).then_some("old-record-id")
+            );
+            assert_eq!(saved.deposed.len(), 1);
+            assert_eq!(saved.deposed[0].key, retained_key);
+            assert_eq!(saved.deposed[0].identifier, "retained-id");
+        }
     }
 
     #[test]

@@ -495,6 +495,36 @@ fn deferred_replace_consumer_ordering_updates_consumer_between_create_and_delete
     );
 }
 
+#[test]
+fn review10_4283_promoted_deferred_child_keeps_authored_directives() {
+    let scenario = Scenario::new();
+    scenario.write_config();
+    scenario.init();
+    let state = scenario.seed_state();
+    scenario.seed_mock_provider_state();
+    let plan_path = scenario.write_plan(&state);
+    assert_success("carina apply plan", &scenario.apply_plan(&plan_path));
+
+    let state = carina_state::check_and_migrate(&fs::read_to_string(&scenario.state_path).unwrap())
+        .unwrap()
+        .into_state();
+    let child = state
+        .find_resource("mock", "test.resource", "validation_records[0]")
+        .unwrap();
+    assert!(
+        !child.directives.create_before_destroy,
+        "dependency promotion must not persist as an authored directive"
+    );
+    assert!(
+        child
+            .directives
+            .field_changes_to(&Default::default())
+            .is_empty(),
+        "an unchanged desired directive must not produce a replan change: {:?}",
+        child.directives
+    );
+}
+
 fn op_position(op_log: &[String], expected: &str, label: &str) -> usize {
     op_log
         .iter()

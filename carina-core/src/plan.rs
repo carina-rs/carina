@@ -1551,24 +1551,7 @@ impl<S, V: PlanValueKind> Plan<S, V> {
         let old_instances: HashSet<_> = self
             .effects
             .iter()
-            .flat_map(|effect| match effect {
-                Effect::Delete {
-                    id,
-                    identifier,
-                    generation,
-                    ..
-                } => vec![DeletedInstanceKey::new(
-                    id.as_inner().clone(),
-                    generation.clone(),
-                    identifier.as_str(),
-                )],
-                Effect::DeferredReplace(payload) => payload
-                    .deletes
-                    .iter()
-                    .map(DeferredReplaceDelete::instance_key)
-                    .collect(),
-                _ => Vec::new(),
-            })
+            .flat_map(Effect::deleted_resource_attribute_keys)
             .collect();
         self.replacement_inputs
             .old_instances
