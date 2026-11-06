@@ -386,9 +386,21 @@ pub(super) async fn execute_effects_sequential<
     let module_gate = input.compositions.module_constraint_gate();
     let type_checks = input.type_checks;
 
+    let continuations = accumulated
+        .result()
+        .managed_current
+        .iter()
+        .filter_map(|(id, current)| match current {
+            crate::resource::Current::CreateInFlight(pending) => {
+                Some((id.clone(), pending.clone()))
+            }
+            _ => None,
+        })
+        .collect();
     let admitted = input.plan.admitted_effects();
     accumulated.record_replacement_metadata(&admitted);
-    let (mut admitted, _, _) = admitted.expand_deferred_replacements();
+    let (admitted, _, _) = admitted.expand_deferred_replacements();
+    let mut admitted = admitted.schedule(&continuations);
     let mut effects = admitted.effects();
     let mut materialization_requirements = crate::replacement::create_first_requirements(effects);
     let mut total = count_runtime_effects(effects, &input.data_source_values);
@@ -710,7 +722,7 @@ pub(super) async fn execute_effects_sequential<
                             }
                             actionable_indices.push(child_idx);
                         }
-                        admitted = combined;
+                        admitted = combined.schedule(&continuations);
                         effects = admitted.effects();
                         materialization_requirements =
                             crate::replacement::create_first_requirements(effects);
@@ -759,30 +771,7 @@ pub(super) async fn execute_effects_sequential<
             let provider_configs = input.provider_configs;
             let factories = input.factories;
             let schemas = input.schemas;
-            let resume_create = match &effect {
-                Effect::ResumeCreate { resource, .. } => accumulated
-                    .result()
-                    .managed_current
-                    .get(&resource.id)
-                    .and_then(|current| match current {
-                        crate::resource::Current::CreateInFlight(pending) => Some(pending.clone()),
-                        crate::resource::Current::Absent(_)
-                        | crate::resource::Current::Present(_)
-                        | crate::resource::Current::CreateOutcomeUnknown(_)
-                        | crate::resource::Current::MissingIdentifier(_) => None,
-                    }),
-                Effect::Read { .. }
-                | Effect::Create(_)
-                | Effect::Update { .. }
-                | Effect::Delete { .. }
-                | Effect::Import { .. }
-                | Effect::Remove { .. }
-                | Effect::Move { .. }
-                | Effect::ReleaseListKeys { .. }
-                | Effect::Wait { .. }
-                | Effect::DeferredCreate(_)
-                | Effect::DeferredReplace(_) => None,
-            };
+            let scheduled_effect = admitted.effect(idx);
             let completed_ref = &completed;
             let effect_for_future = effect.clone();
             let make_future = move |wait_cancel_rx: Option<
@@ -798,14 +787,9 @@ pub(super) async fn execute_effects_sequential<
                     schemas,
                     type_checks,
                 );
-                let result = match effect_for_future.as_basic() {
-                    // `BasicEffect` is the type-level contract for
-                    // `execute_basic_effect`: any Create/Update/Delete
-                    // narrows here, and any non-basic variant falls
-                    // through to the `None` arm so it can't accidentally
-                    // be dispatched (carina#3164). The compiler enforces
-                    // exhaustiveness on the outer `match effect { ... }`
-                    // below.
+                let result = match scheduled_effect.as_basic() {
+                    // Only the admitted schedule can supply the create,
+                    // resend, poll-only and Delete execution capabilities.
                     Some(basic) => SingleEffectResult::Basic(Box::new(
                         execute_basic_effect(
                             basic,
@@ -815,7 +799,6 @@ pub(super) async fn execute_effects_sequential<
                                 provider_check_inputs,
                                 runtime_authored,
                                 preparation: &preparation,
-                                resume_create,
                                 completed: completed_ref,
                                 total,
                             },

@@ -2970,6 +2970,48 @@ async fn identifierless_conflicting_resume_deletes_old_generation_before_resend(
 }
 
 #[tokio::test]
+async fn identifierless_resume_delete_failure_blocks_resend() {
+    let provider = MockProvider::new();
+    provider.push_delete(Err(ProviderError::api_error(
+        "old generation is still live",
+    )));
+    let target = resolved(make_resource("source", &[]));
+    let id = target.id.clone();
+    let pending = persisted_unissued_create_for_executor(&id);
+    let mut plan = Plan::new();
+    plan.add_resume_create(target.clone(), pending.started_at().clone());
+    plan.add(Effect::Delete {
+        id: target.resolved_id(),
+        identifier: AppliedIdentifier::new("old-id").unwrap(),
+        generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
+        directives: Default::default(),
+        binding: target.binding.clone(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: [target.resolved_id()].into_iter().collect(),
+    });
+    let result = execute_lifecycle_fixture(
+        &provider,
+        &plan,
+        HashMap::from([(id.clone(), Current::CreateInFlight(pending))]),
+    )
+    .await;
+    assert_eq!(
+        (
+            result.success_count,
+            result.failure_count(),
+            result.skip_count
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(provider.calls(), vec![("delete".into(), id.to_string())]);
+    assert!(matches!(
+        result.managed_current.get(&id),
+        Some(Current::CreateInFlight(_))
+    ));
+}
+
+#[tokio::test]
 async fn resumed_partial_success_reports_once_and_preserves_partial_binding() {
     let provider = MockProvider::new();
     let source = make_resource("source", &[]);
@@ -3074,7 +3116,8 @@ async fn resume_dispatch_validates_resent_sent_against_checked_request() {
             let request = crate::executor::prepare_create_request(resource, &preparation)
                 .await
                 .expect("fixture request passes provider preparation");
-            let request = crate::provider::ResumeCreateRequest::new(pending, request)
+            let permit = crate::replacement::create_permit_for_test(&id);
+            let request = crate::provider::ResumeCreateRequest::new(pending, request, permit)
                 .expect("fixture continuation and request share a route");
 
             let failure = crate::executor::dispatch_resume_create(&provider, request)

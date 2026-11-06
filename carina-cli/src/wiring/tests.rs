@@ -15368,8 +15368,11 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                 let request = carina_core::executor::prepare_create_request(resource, &preparation)
                     .await
                     .unwrap();
-                let (create, cancellation) =
-                    carina_core::executor::dispatch_create(&provider, &id, request);
+                let (create, cancellation) = carina_core::executor::dispatch_create(
+                    &provider,
+                    carina_core::replacement::create_permit_for_test(&id),
+                    request,
+                );
                 create.await.unwrap();
                 drop(cancellation);
                 let identifier = carina_core::provider::AppliedIdentifier::new("mock-id").unwrap();

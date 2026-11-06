@@ -243,6 +243,17 @@ async fn create_checked_bootstrap_resource(
                     schemas,
                 } = context;
                 let id = resource.id.clone();
+                let graph =
+                    carina_core::resolved_graph::resolve_expanded_graph(parsed.clone().into())?;
+                let target = graph.resolve_resource(resource.clone(), schemas)?;
+                let mut bootstrap_plan = carina_core::plan::Plan::new();
+                bootstrap_plan.add(carina_core::effect::Effect::Create(target));
+                let permit = bootstrap_plan
+                    .admit(schemas)?
+                    .schedule(&HashMap::new())
+                    .effect(0)
+                    .into_create_permit()
+                    .expect("bootstrap plan contains one create");
                 let bindings = bootstrap_resolved_bindings(parsed);
                 let module_gate =
                     carina_core::executor::ModuleConstraintGate::from_live_compositions(
@@ -267,7 +278,7 @@ async fn create_checked_bootstrap_resource(
                 let schema = Some(owner_schema.schema().as_schema());
                 let accepted_request = AcceptedRequest::from_create_request(&request);
                 let (create, create_cancellation) =
-                    carina_core::executor::dispatch_create(operation_provider, &id, request);
+                    carina_core::executor::dispatch_create(operation_provider, permit, request);
                 let outcome = create.await;
                 // Bootstrap creates are not part of the parallel executor, but they still
                 // retain the reporter until the guest call has settled.

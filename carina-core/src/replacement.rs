@@ -16,6 +16,69 @@ use crate::resource::{
 };
 use crate::schema::{SchemaKind, SchemaRegistry, UniqueNameSpec};
 
+#[path = "replacement/scheduling.rs"]
+mod scheduling;
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub use scheduling::create_permit_for_test;
+pub use scheduling::{CreatePermit, ScheduledEffect, ScheduledEffects};
+pub(crate) use scheduling::{ScheduledBasicEffect, ScheduledResume};
+
+/// State rows own all their provider generations. Routing aliases belong to
+/// the generations, not to the row's identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StateRowLineage(crate::resource::ResourceId);
+
+impl StateRowLineage {
+    fn of(id: &ResolvedResourceId) -> Self {
+        let mut row = id.as_inner().clone();
+        row.provider_instance = None;
+        Self(row)
+    }
+}
+
+pub(crate) fn same_state_row(left: &ResolvedResourceId, right: &ResolvedResourceId) -> bool {
+    StateRowLineage::of(left) == StateRowLineage::of(right)
+}
+
+fn row_on_route(
+    id: &ResolvedResourceId,
+    route: &crate::resource::ResourceId,
+) -> ResolvedResourceId {
+    let mut row = id.as_inner().clone();
+    row.provider_instance = route.provider_instance.clone();
+    ResolvedResourceId::new(row)
+}
+
+#[derive(Default)]
+struct ReplacementLineage {
+    sources: HashMap<StateRowLineage, HashSet<StateRowLineage>>,
+}
+
+impl ReplacementLineage {
+    fn associate(&mut self, target: &ResolvedResourceId, old: &ResolvedResourceId) {
+        self.sources
+            .entry(StateRowLineage::of(target))
+            .or_default()
+            .insert(StateRowLineage::of(old));
+    }
+
+    fn owns(&self, target: &ResolvedResourceId, old: &ResolvedResourceId) -> bool {
+        let old = StateRowLineage::of(old);
+        let mut pending = vec![StateRowLineage::of(target)];
+        let mut seen = HashSet::new();
+        while let Some(row) = pending.pop() {
+            if row == old {
+                return true;
+            }
+            if seen.insert(row.clone()) {
+                pending.extend(self.sources.get(&row).into_iter().flatten().cloned());
+            }
+        }
+        false
+    }
+}
+
 /// Unadmitted intent. Changing a request never grants create-first permission.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReplacementRequest<T> {
@@ -30,13 +93,13 @@ pub struct ReplacementRequest<T> {
     naming: ReplacementNaming,
 }
 
-/// A continuation already has a provider-issued name. Admission still checks
-/// coexistence, but must not prepare another name for that operation.
+/// A continuation retains its original request name. Admission still checks
+/// permission to resend, but must not prepare another name for that operation.
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 enum ReplacementNaming {
     #[default]
     Prepare,
-    Issued,
+    Continuation,
 }
 impl<T> ReplacementRequest<T> {
     pub fn new(target: T, old_instances: NonEmptyDeletes) -> Self {
@@ -89,9 +152,6 @@ struct CreateFirst<T> {
 enum Admitted<T> {
     DeleteFirst(T),
     CreateFirst(CreateFirst<T>),
-    /// Continue an already issued create before cleaning up its old rows.
-    /// This grants no permission to issue a new create-first replacement.
-    Resume(T),
 }
 
 /// An admitted replacement owns the exact target and old instances it checked.
@@ -129,7 +189,7 @@ pub struct CheckedReplacement<T> {
 impl<T> CheckedReplacement<T> {
     pub fn target(&self) -> &T {
         match &self.admitted {
-            Admitted::DeleteFirst(target) | Admitted::Resume(target) => target,
+            Admitted::DeleteFirst(target) => target,
             Admitted::CreateFirst(witness) => &witness.target,
         }
     }
@@ -141,13 +201,13 @@ impl<T> CheckedReplacement<T> {
     }
     pub fn temporary_name(&self) -> Option<&TemporaryName> {
         match &self.admitted {
-            Admitted::DeleteFirst(_) | Admitted::Resume(_) => None,
+            Admitted::DeleteFirst(_) => None,
             Admitted::CreateFirst(witness) => witness.temporary_name.as_ref(),
         }
     }
     pub fn into_request(self) -> ReplacementRequest<T> {
         let (target, prepared_name) = match self.admitted {
-            Admitted::DeleteFirst(target) | Admitted::Resume(target) => (target, None),
+            Admitted::DeleteFirst(target) => (target, None),
             Admitted::CreateFirst(witness) => (witness.target, witness.temporary_name),
         };
         ReplacementRequest {
@@ -185,8 +245,9 @@ impl<S, P: PlanValueKind> CheckedReplacement<ResolvedResource<S, P>> {
             kind: match self.admitted {
                 Admitted::DeleteFirst(_) => ReplacementOrderKind::DeleteFirst,
                 Admitted::CreateFirst(_) => ReplacementOrderKind::CreateFirst,
-                Admitted::Resume(_) => ReplacementOrderKind::ResumeBeforeCleanup,
             },
+            continuation: (self.naming == ReplacementNaming::Continuation)
+                .then_some(ContinuationOrder::Resend),
         }
     }
 }
@@ -263,16 +324,10 @@ pub fn resolve_replacement<S: Clone, P: PlanValueKind>(
                 Value::Concrete(ConcreteValue::String(name.temporary_value.clone().into())),
             );
         }
-        if naming == ReplacementNaming::Issued {
-            Admitted::Resume(target.replace_inner(resource))
-        } else {
-            Admitted::CreateFirst(CreateFirst {
-                target: target.replace_inner(resource),
-                temporary_name,
-            })
-        }
-    } else if naming == ReplacementNaming::Issued {
-        Admitted::Resume(target)
+        Admitted::CreateFirst(CreateFirst {
+            target: target.replace_inner(resource),
+            temporary_name,
+        })
     } else {
         Admitted::DeleteFirst(target)
     };
@@ -306,7 +361,7 @@ fn prepare_name<S, P: PlanValueKind>(
         }
         UniqueNameSpec::Attribute(attribute) => attribute,
     };
-    if naming == ReplacementNaming::Issued {
+    if naming == ReplacementNaming::Continuation {
         return Ok(None);
     }
     if let Some(prepared) = prepared {
@@ -396,7 +451,7 @@ fn new_dependencies<S, P: PlanValueKind>(
 /// this graph before deciding that any rejected candidate is mandatory.
 fn cycle_promotions<S, P: PlanValueKind>(
     effects: &[Effect<S, P>],
-    associations: &HashMap<ResolvedResourceId, HashSet<ResolvedResourceId>>,
+    lineage: &ReplacementLineage,
     requirements: &HashMap<ResolvedResourceId, String>,
 ) -> Vec<(ResolvedResourceId, String)> {
     let new_dependencies = new_dependencies(effects);
@@ -423,19 +478,13 @@ fn cycle_promotions<S, P: PlanValueKind>(
         .flat_map(|(target, &create)| {
             deletes
                 .iter()
-                .filter(move |(old, _)| {
-                    old == target
-                        || associations
-                            .get(target)
-                            .is_some_and(|ids| ids.contains(old))
-                })
+                .filter(move |(old, _)| lineage.owns(target, old))
                 .map(move |(_, delete)| (target.clone(), create, *delete))
         })
         .collect();
     pairs.sort_by_key(|(_, create, delete)| (*create, *delete));
     let runs_before_cleanup = |target: &ResolvedResourceId, index: usize| {
-        matches!(&effects[index], Effect::ResumeCreate { .. })
-            || matches!(&effects[index], Effect::Create(resource) if resource.directives.create_before_destroy)
+        matches!(&effects[index], Effect::Create(resource) | Effect::ResumeCreate { resource, .. } if resource.directives.create_before_destroy)
             || requirements.contains_key(target)
     };
     let mut edges: HashMap<usize, HashSet<usize>> = HashMap::new();
@@ -463,6 +512,12 @@ fn cycle_promotions<S, P: PlanValueKind>(
             }
             for consumer in blocked_by_updates.iter() {
                 if let Some(&consumer) = creates.get(consumer) {
+                    if pairs
+                        .iter()
+                        .any(|(_, create, old)| *create == consumer && *old == delete)
+                    {
+                        continue;
+                    }
                     edges.entry(delete).or_default().insert(consumer);
                 }
             }
@@ -666,15 +721,17 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
         required: &HashMap<ResolvedResourceId, String>,
     ) -> Result<Self, ReplacementAdmissionError> {
         let mut effects = effects.to_vec();
-        let mut associations = associations.clone();
+        let mut lineage = ReplacementLineage::default();
+        for (target, sources) in associations {
+            for source in sources {
+                lineage.associate(target, source);
+            }
+        }
         // A move transfers ownership of all source generations, but each
         // provider delete must retain the route that issued that generation.
         for effect in &effects {
             if let Effect::Move { from, to, .. } = effect {
-                associations
-                    .entry(to.clone())
-                    .or_default()
-                    .insert(from.clone());
+                lineage.associate(to, from);
             }
         }
         let mut requirements = create_first_requirements(&effects);
@@ -704,10 +761,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                 .iter()
                 .filter(|effect| {
                     matches!(effect,
-                        Effect::Delete { id, .. } if target.id == **id
-                            || associations
-                                .get(&target.resolved_id())
-                                .is_some_and(|old| old.contains(id))
+                        Effect::Delete { id, .. } if lineage.owns(&target.resolved_id(), id)
                     )
                 })
                 .filter_map(|effect| effect.to_delete_payload(&previous))
@@ -716,7 +770,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                 let mut request = ReplacementRequest::new(target.clone(), old)
                     .with_prepared_name(prepared_names.get(&target.resolved_id()).cloned());
                 if matches!(&effects[index], Effect::ResumeCreate { .. }) {
-                    request.naming = ReplacementNaming::Issued;
+                    request.naming = ReplacementNaming::Continuation;
                 }
                 if let Some(dependent) = requirements.get(&target.resolved_id()) {
                     request = request.require_create_first(dependent);
@@ -769,7 +823,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
         // Each successful iteration permanently promotes one distinct pair.
         // Rejected candidates never change the graph or consume a retry.
         for _ in 0..checked_replacements.len() {
-            let promotions = cycle_promotions(&known_effects, &associations, &requirements);
+            let promotions = cycle_promotions(&known_effects, &lineage, &requirements);
             if promotions.is_empty() {
                 break;
             }
@@ -959,13 +1013,15 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                     // Only confirmed members may reject the plan here.
                     .filter(|&index| match &self.effects[index] {
                         Effect::Delete { id, binding, .. } => {
-                            payload.template.contains_managed_member(id)
-                                || binding.as_ref().is_some_and(|binding| {
-                                    crate::differ::binding_matches_deferred_template(
-                                        binding,
-                                        payload.template.target(),
-                                    )
-                                })
+                            payload.template.contains_managed_member(&row_on_route(
+                                id,
+                                payload.template.template_resource_id(),
+                            )) || binding.as_ref().is_some_and(|binding| {
+                                crate::differ::binding_matches_deferred_template(
+                                    binding,
+                                    payload.template.target(),
+                                )
+                            })
                         }
                         _ => false,
                     })
@@ -1022,13 +1078,11 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                     return None;
                 }
                 let kind = template.template_resource_id();
-                if kind.provider != id.provider
-                    || kind.resource_type != id.resource_type
-                    || kind.provider_instance != id.provider_instance
-                {
+                if kind.provider != id.provider || kind.resource_type != id.resource_type {
                     return None;
                 }
-                let candidate = template.contains_managed_member(id)
+                let candidate = template
+                    .contains_managed_member(&row_on_route(id, template.template_resource_id()))
                     || match binding {
                         Some(binding) => crate::differ::binding_matches_deferred_template(
                             binding,
@@ -1134,13 +1188,22 @@ pub(crate) struct ReplacementOrder {
     target: ResolvedResourceId,
     old_instances: Vec<crate::effect::DeletedInstanceKey>,
     kind: ReplacementOrderKind,
+    /// Admission checks the resend order. Scheduling can select the separate
+    /// poll-only branch only with an identified persisted continuation.
+    continuation: Option<ContinuationOrder>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 enum ReplacementOrderKind {
     DeleteFirst,
     CreateFirst,
-    ResumeBeforeCleanup,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum ContinuationOrder {
+    Resend,
+    Poll,
+    Blocked,
 }
 impl ReplacementOrder {
     pub(crate) fn is_create_first(&self) -> bool {
@@ -1148,9 +1211,15 @@ impl ReplacementOrder {
     }
 
     fn runs_before_cleanup(&self) -> bool {
+        if matches!(
+            self.continuation,
+            Some(ContinuationOrder::Poll | ContinuationOrder::Blocked)
+        ) {
+            return true;
+        }
         match self.kind {
             ReplacementOrderKind::DeleteFirst => false,
-            ReplacementOrderKind::CreateFirst | ReplacementOrderKind::ResumeBeforeCleanup => true,
+            ReplacementOrderKind::CreateFirst => true,
         }
     }
 }
@@ -2752,7 +2821,11 @@ mod tests {
             let schemas = registry(UniqueNameSpec::Conflicting);
             let admitted =
                 AdmittedReplacementEffects::resolve(&effects, &schemas, |_| HashMap::new())
-                    .expect("resuming an issued create must retain its cleanup barrier");
+                    .expect("resuming an issued create must retain its cleanup barrier")
+                    .schedule(&HashMap::from([(
+                        request.target().id.clone(),
+                        persisted_identified_create(request.target()),
+                    )]));
             assert_eq!(admitted.effects()[0], effects[0]);
             assert_eq!(admitted.writeback()[0].old_instances().len(), 1);
             let graph = admitted.dependency_analysis(std::iter::empty()).unwrap();
@@ -2940,7 +3013,15 @@ mod tests {
                     &registry(UniqueNameSpec::Coexisting),
                     |_| HashMap::new(),
                 )
-                .unwrap();
+                .unwrap()
+                .schedule(&if resume {
+                    HashMap::from([(
+                        request.target().id.clone(),
+                        persisted_identified_create(request.target()),
+                    )])
+                } else {
+                    HashMap::new()
+                });
                 let graph = admitted.dependency_analysis(std::iter::empty()).unwrap();
                 for delete in [0, 2, 3] {
                     // An issued create resumes before cleanup regardless of
@@ -2955,5 +3036,16 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn persisted_identified_create(target: &ResolvedResource) -> crate::provider::InFlightCreate {
+        let (attempt, _cancellation) = crate::provider::CreateAttempt::new(target.id.clone());
+        attempt
+            .issued(
+                crate::provider::AppliedIdentifier::new("new-identifier").unwrap(),
+                crate::provider::Sent::AllRequestAttributes,
+            )
+            .pending(crate::provider::PendingToken::new("continuation"), 1)
+            .persist(Default::default(), Default::default())
     }
 }

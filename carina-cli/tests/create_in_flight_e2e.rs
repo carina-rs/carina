@@ -409,12 +409,8 @@ fn state_commands_report_create_in_flight_instead_of_empty_current_state() {
 
 #[test]
 fn wasm_bound_anonymous_moved_and_deposed_rows_resume_without_duplicate_create() {
-    let Some(wasm_path) = wasm_mock_path() else {
-        eprintln!(
-            "skipping real-WASM CLI recovery test: build carina-provider-mock for wasm32-wasip2 first"
-        );
-        return;
-    };
+    let wasm_path = wasm_mock_path()
+        .expect("build carina-provider-mock for wasm32-wasip2 before running CLI recovery tests");
     let provider_block = format!(
         "provider mock {{\n  source = \"file://{}\"\n}}",
         wasm_path.display()

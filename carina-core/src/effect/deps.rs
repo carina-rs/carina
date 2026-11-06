@@ -749,12 +749,14 @@ where
         let effect = effect.as_ref();
         match inputs {
             ScheduleInputs::Apply => {
-                analyzer.collect_from_schedule_edges(
-                    effects,
-                    effect.apply_edges(),
-                    &mut analysis,
-                    idx,
-                );
+                // A replacement's own cleanup barrier is selected by its
+                // admitted order, including the resend/poll distinction.
+                let edges = effect.apply_edges().into_iter().filter(|edge| {
+                    !matches!(edge, crate::effect::ScheduleEdge::RequiredDependsOn(target)
+                        if admitted_pairs.iter().any(|(create, delete)|
+                            *delete == idx && effects[*create].as_ref().resource_id() == target.as_inner()))
+                }).collect();
+                analyzer.collect_from_schedule_edges(effects, edges, &mut analysis, idx);
             }
             ScheduleInputs::Destroy { .. } => {
                 analyzer.collect_from_schedule_edges(

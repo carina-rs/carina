@@ -1943,8 +1943,11 @@ mod tests {
                 let request =
                     carina_core::executor::prepare_create_request(resource, &preparation).await;
                 let request = request.expect("mock test resource should pass create preparation");
-                let (create, _cancellation) =
-                    carina_core::executor::dispatch_create(provider, &id, request);
+                let (create, _cancellation) = carina_core::executor::dispatch_create(
+                    provider,
+                    carina_core::replacement::create_permit_for_test(&id),
+                    request,
+                );
                 create.await
             },
         )

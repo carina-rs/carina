@@ -129,27 +129,43 @@ pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 /// core. The supervising caller must retain the receiver until the returned
 /// future settles. Executor-owned abandonment paths drain it before saving
 /// the cancellation classification.
+///
+/// Raw resource IDs cannot authorize a create, including a replacement:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::dispatch_create, provider::{CreateRequest, Provider}, resource::ResourceId};
+/// fn bypass(provider: &dyn Provider, target: &ResourceId, request: CreateRequest) {
+///     let _ = dispatch_create(provider, target, request);
+/// }
+/// ```
 pub fn dispatch_create<'a, P: Provider + ?Sized>(
     provider: &'a P,
-    id: &'a ResourceId,
+    permit: crate::replacement::CreatePermit,
     request: CreateRequest,
 ) -> (
     impl std::future::Future<Output = Result<CreateOutcome, CreateFailure>> + 'a,
     crate::provider::CreateCallCancellationReceiver,
 ) {
-    let (attempt, cancellation) = crate::provider::CreateAttempt::new(id.clone());
+    let (attempt, cancellation) = crate::provider::CreateAttempt::new(permit.target().clone());
     (
-        dispatch_create_with_attempt(provider, id, request, attempt),
+        dispatch_create_with_attempt(provider, permit, request, attempt),
         cancellation,
     )
 }
 
 async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
     provider: &P,
-    id: &ResourceId,
+    permit: crate::replacement::CreatePermit,
     request: CreateRequest,
     attempt: crate::provider::CreateAttempt,
 ) -> Result<CreateOutcome, CreateFailure> {
+    let id = permit.target();
+    if &request.resource().id != id {
+        return Err(CreateFailure::not_created_at_dispatch(
+            ProviderError::internal("create request does not match its admitted target")
+                .for_resource(id.clone()),
+        ));
+    }
     let request_attributes: BTreeSet<_> = request
         .resource()
         .as_resource()
@@ -268,6 +284,15 @@ pub async fn dispatch_resume_create<P: Provider + ?Sized>(
             }
         },
     }
+}
+
+/// Dispatch a continuation whose request can only yield an identified poll
+/// witness. This path cannot issue a new create or obtain a resend attempt.
+pub async fn dispatch_poll_create<P: Provider + ?Sized>(
+    provider: &P,
+    request: crate::provider::PollCreateRequest,
+) -> Result<ResumeOutcome, ResumeFailure> {
+    dispatch_resume_create(provider, request.into_resume_request()).await
 }
 
 /// The accepted provider request whose result produced a complete state.

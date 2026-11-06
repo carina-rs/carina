@@ -437,11 +437,10 @@ fn admit_materialized<S: Clone>(
             .chain(ordinary_old)
             .filter(|old| seen.insert(old.instance_key()))
             .filter(|old| {
-                resource.id == *old.id
+                crate::replacement::same_state_row(&resource.resolved_id(), &old.id)
                     || (is_unbound
                         && resource.id.provider == old.id.provider
                         && resource.id.resource_type == old.id.resource_type
-                        && resource.id.provider_instance == old.id.provider_instance
                         && resource.id.identity().is_some_and(|identity| {
                             resource
                                 .loop_provenance
