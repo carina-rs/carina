@@ -1589,12 +1589,13 @@ fn resolve_directive_dependencies(
         })
     })?;
     let mut origins = Vec::new();
-    for path in dependencies.reference_origins() {
-        let value = resolve_plain_module_value(
-            &Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
-            resolver,
-        )?;
-        value.visit_resource_refs(&mut |path| origins.push(path.clone()));
+    for origin in dependencies.reference_origins() {
+        origins.extend(origin.resolve(|path| {
+            resolve_plain_module_value(
+                &Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
+                resolver,
+            )
+        })?);
     }
     resolved.set_reference_origins(origins);
     let mut binding_origins = Vec::new();
@@ -2247,7 +2248,7 @@ fn select_deferred_module_ifs(
                     condition,
                     deferred.condition().source_file().to_path_buf(),
                     deferred.condition().source_line(),
-                    deferred.condition().source_expression().to_string(),
+                    deferred.condition().source_expression.clone(),
                 );
                 let then_branch =
                     expand_forwarded_if_body(deferred.then_branch(), module_call, resolver)?;
@@ -2863,6 +2864,9 @@ enum ExpandedIfDependency {
     Runtime,
 }
 
+impl crate::resource::SealedSecretReadResult for ExpandedIfDependency {}
+impl crate::resource::SecretReadResult for ExpandedIfDependency {}
+
 impl ExpandedIfDependency {
     fn combine(self, other: Self) -> Self {
         match (self, other) {
@@ -2928,7 +2932,7 @@ fn expanded_if_dependency(value: &ModuleResolvedValue) -> ExpandedIfDependency {
                 InterpolationPart::Expr(value) => dependency.combine(expanded_if_dependency(value)),
             },
         ),
-        Value::Deferred(DeferredValue::Secret(inner)) => expanded_if_dependency(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(expanded_if_dependency),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             expanded_if_dependency(value).combine(expanded_if_dependency(default))
         }
@@ -3021,7 +3025,7 @@ fn select_expanded_module_ifs(
                         condition,
                         deferred.condition().source_file().to_path_buf(),
                         deferred.condition().source_line(),
-                        deferred.condition().source_expression().to_string(),
+                        deferred.condition().source_expression.clone(),
                     ),
                     select_expanded_module_ifs(deferred.then_value())?,
                     select_expanded_module_ifs(deferred.else_value())?,
@@ -3127,7 +3131,7 @@ fn select_expanded_module_ifs(
                 parse_error: None,
             })?,
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            Box::new(select_expanded_module_ifs(inner)?),
+            inner.try_map(select_expanded_module_ifs)?,
         )),
         Value::Concrete(
             ConcreteValue::String(_)
@@ -3166,7 +3170,7 @@ fn evaluate_expanded_module_functions(
                     evaluate_expanded_module_functions(deferred.condition().value(), config)?,
                     deferred.condition().source_file().to_path_buf(),
                     deferred.condition().source_line(),
-                    deferred.condition().source_expression().to_string(),
+                    deferred.condition().source_expression.clone(),
                 ),
                 evaluate_expanded_module_functions(deferred.then_value(), config)?,
                 evaluate_expanded_module_functions(deferred.else_value(), config)?,
@@ -3313,7 +3317,7 @@ fn evaluate_expanded_module_functions(
                 parse_error: None,
             })?,
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            Box::new(evaluate_expanded_module_functions(inner, config)?),
+            inner.try_map(|value| evaluate_expanded_module_functions(value, config))?,
         )),
         Value::Concrete(
             ConcreteValue::String(_)
@@ -3356,7 +3360,7 @@ fn module_value_origin<B: BindingAddress, C: BindingAddress>(
     arguments: &HashMap<String, ResolvedArgument<C>>,
 ) -> crate::resource::ArgumentValueOrigin {
     let mut names = BTreeSet::new();
-    value.visit_placeholders(&mut |placeholder| {
+    value.visit_placeholders(&mut |placeholder, _| {
         if let Some(name) = placeholder.module_argument_name()
             && !names.contains(name)
         {
@@ -3412,22 +3416,24 @@ fn resolve_module_directives(
 {
     directives.try_map_expressions(|_, expression| {
         let mut sources = Vec::new();
-        expression.value().visit_placeholders(&mut |placeholder| {
-            if let ParserPlaceholder::ModuleArgument { name, .. } = placeholder
-                && let Some(argument) = resolver.arguments.arguments.get(name)
-                && let ArgumentOrigin::Authored { .. } = argument.origin
-            {
-                let location = resolver
-                    .call_path
-                    .immediate()
-                    .id
-                    .argument_value_location(name)
-                    .expect("authored argument provenance");
-                sources.push(crate::resource::DiagnosticSourceSpan::from_declaration(
-                    location.clone(),
-                ));
-            }
-        });
+        expression
+            .value()
+            .visit_placeholders(&mut |placeholder, _| {
+                if let ParserPlaceholder::ModuleArgument { name, .. } = placeholder
+                    && let Some(argument) = resolver.arguments.arguments.get(name)
+                    && let ArgumentOrigin::Authored { .. } = argument.origin
+                {
+                    let location = resolver
+                        .call_path
+                        .immediate()
+                        .id
+                        .argument_value_location(name)
+                        .expect("authored argument provenance");
+                    sources.push(crate::resource::DiagnosticSourceSpan::from_declaration(
+                        location.clone(),
+                    ));
+                }
+            });
         // Substitution and loop expansion may erase the original argument
         // slots. Every instantiated expression retains its caller anchors.
         for call in resolver.call_path.calls() {
@@ -4172,6 +4178,10 @@ fn expand_parsed_deferred_for_expression(
 
 #[derive(Debug)]
 pub(super) enum ArgumentSubstitutionError {
+    InsideSecret {
+        source_file: Option<std::path::PathBuf>,
+        line: usize,
+    },
     Evaluation {
         source_file: Option<std::path::PathBuf>,
         line: usize,
@@ -4189,6 +4199,24 @@ struct ArgumentSubstitutionDetails {
     parse_error: Option<Box<ParseError>>,
 }
 
+impl crate::resource::InsideSecret for ArgumentSubstitutionError {
+    fn inside_secret(self) -> Self {
+        match self {
+            Self::Evaluation {
+                source_file, line, ..
+            } => Self::InsideSecret { source_file, line },
+            Self::Authored(finding) => {
+                let (location, error) = finding.into_parts();
+                Self::Authored(crate::parser::Located::new(
+                    location,
+                    Box::new((*error).inside_secret()),
+                ))
+            }
+            error @ Self::InsideSecret { .. } => error,
+        }
+    }
+}
+
 impl ArgumentSubstitutionError {
     // Evaluation errors become analysis diagnostics after their owning syntax
     // is known. An operand's authored location takes precedence over an
@@ -4198,6 +4226,15 @@ impl ArgumentSubstitutionError {
         owner: &crate::parser::DeclarationLocation,
     ) -> crate::parser::Located<ArgumentSubstitutionDetails> {
         match self {
+            Self::InsideSecret { source_file, line } => crate::parser::Located::new(
+                owner.clone(),
+                ArgumentSubstitutionDetails {
+                    source_file,
+                    line,
+                    message: crate::resource::INSIDE_SECRET_MESSAGE.into(),
+                    parse_error: None,
+                },
+            ),
             Self::Evaluation {
                 source_file,
                 line,
@@ -4228,6 +4265,10 @@ impl ArgumentSubstitutionError {
 
     fn with_source_file(self, file: &std::path::Path) -> Self {
         match self {
+            Self::InsideSecret { source_file, line } => Self::InsideSecret {
+                source_file: source_file.or_else(|| Some(file.to_path_buf())),
+                line,
+            },
             Self::Evaluation {
                 source_file,
                 line,
@@ -4340,7 +4381,7 @@ fn select_authored_module_ifs_for_test(
                 .collect::<Result<_, ArgumentSubstitutionError>>()?,
         )),
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            Box::new(select_authored_module_ifs_for_test(inner, config)?),
+            inner.try_map(|value| select_authored_module_ifs_for_test(value, config))?,
         )),
         Value::Concrete(
             ConcreteValue::String(_)
@@ -4443,172 +4484,6 @@ fn substitute_function_argument<B: BindingAddress>(
     })
 }
 
-fn substitute_module_if_paths_in_secret<B: BindingAddress>(
-    value: &crate::resource::Value<ParserPlaceholder, B>,
-    arguments: ArgumentSubstitutions<'_, B>,
-    position: ArgumentSubstitutionPosition,
-) -> Result<crate::resource::Value<ParserPlaceholder, B>, ArgumentSubstitutionError> {
-    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
-
-    if !super::deferred_if::value_contains_module_if(value) {
-        return Ok(value.clone());
-    }
-    if matches!(value, Value::Deferred(DeferredValue::ModuleIf(_))) {
-        return substitute_arguments_with_position(value, arguments, position);
-    }
-
-    Ok(match value {
-        Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
-            values
-                .iter()
-                .map(|value| substitute_module_if_paths_in_secret(value, arguments, position))
-                .collect::<Result<_, _>>()?,
-        )),
-        Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
-            values
-                .iter()
-                .map(|(name, value)| {
-                    Ok((
-                        name.clone(),
-                        substitute_module_if_paths_in_secret(value, arguments, position)?,
-                    ))
-                })
-                .collect::<Result<_, ArgumentSubstitutionError>>()?,
-        )),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            Value::Deferred(DeferredValue::Interpolation(
-                parts
-                    .iter()
-                    .map(|part| match part {
-                        InterpolationPart::Literal(literal) => {
-                            Ok(InterpolationPart::Literal(literal.clone()))
-                        }
-                        InterpolationPart::Expr(value) => Ok(InterpolationPart::Expr(
-                            substitute_module_if_paths_in_secret(value, arguments, position)?,
-                        )),
-                    })
-                    .collect::<Result<_, ArgumentSubstitutionError>>()?,
-            ))
-        }
-        Value::Deferred(DeferredValue::FunctionCall {
-            name,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::FunctionCall {
-            name: *name,
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument.try_map_value(|value| {
-                        substitute_module_if_paths_in_secret(value, arguments, position)
-                    })
-                })
-                .collect::<Result<_, _>>()?,
-            source_line: *source_line,
-        }),
-        Value::Deferred(DeferredValue::Unavailable {
-            name,
-            args,
-            reason,
-            source_line,
-        }) => Value::Deferred(DeferredValue::Unavailable {
-            name: *name,
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument.try_map_value(|value| {
-                        substitute_module_if_paths_in_secret(value, arguments, position)
-                    })
-                })
-                .collect::<Result<_, _>>()?,
-            reason: reason.clone(),
-            source_line: *source_line,
-        }),
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function: function.clone(),
-            functions: functions.clone(),
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument.try_map_value(|value| {
-                        substitute_module_if_paths_in_secret(value, arguments, position)
-                    })
-                })
-                .collect::<Result<_, _>>()?,
-            source_line: *source_line,
-        }),
-        Value::Deferred(DeferredValue::Access(access)) => access
-            .rebuild_with_base(
-                substitute_module_if_paths_in_secret(access.base(), arguments, position)?,
-                AccessMissPolicy::Error,
-            )
-            .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                source_file: None,
-                line: access.source_line(),
-                message: error.to_string(),
-                parse_error: None,
-            })?,
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            Value::Deferred(DeferredValue::Secret(Box::new(
-                substitute_module_if_paths_in_secret(inner, arguments, position)?,
-            )))
-        }
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(substitute_module_if_paths_in_secret(
-                    value, arguments, position,
-                )?),
-                default: Box::new(substitute_module_if_paths_in_secret(
-                    default, arguments, position,
-                )?),
-            })
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => expression
-            .evaluate_with_operands(
-                substitute_module_if_paths_in_secret(expression.lhs(), arguments, position)?,
-                substitute_module_if_paths_in_secret(expression.rhs(), arguments, position)?,
-            )
-            .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                source_file: None,
-                line: expression
-                    .operator_span()
-                    .line()
-                    .unwrap_or(arguments.default_line),
-                message: error.to_string(),
-                parse_error: None,
-            })?,
-        Value::Deferred(DeferredValue::ModuleIf(_)) => {
-            unreachable!("module-if values return before container traversal")
-        }
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(
-            DeferredValue::ResourceRef { path: _ } | DeferredValue::BindingRef { binding: _ },
-        ) => value.clone(),
-        Value::Deferred(DeferredValue::Unknown(reason)) => {
-            let _dependency = expanded_unknown_dependency(reason);
-            value.clone()
-        }
-        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
-            let _dependency = expanded_placeholder_dependency(placeholder);
-            value.clone()
-        }
-    })
-}
-
 fn substitute_arguments_with_position<B: BindingAddress>(
     value: &crate::resource::Value<ParserPlaceholder, B>,
     arguments: ArgumentSubstitutions<'_, B>,
@@ -4629,7 +4504,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                     condition,
                     deferred.condition().source_file().to_path_buf(),
                     deferred.condition().source_line(),
-                    deferred.condition().source_expression().to_string(),
+                    deferred.condition().source_expression.clone(),
                 ),
                 substitute_arguments_with_position(deferred.then_value(), arguments, position)?,
                 substitute_arguments_with_position(deferred.else_value(), arguments, position)?,
@@ -4912,13 +4787,15 @@ fn substitute_arguments_with_position<B: BindingAddress>(
             let _dependency = expanded_unknown_dependency(reason);
             value.clone()
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            Box::new(substitute_module_if_paths_in_secret(
-                inner,
-                arguments,
-                ArgumentSubstitutionPosition::Value,
-            )?),
-        )),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            Value::Deferred(DeferredValue::Secret(inner.try_map(|value| {
+                substitute_arguments_with_position(
+                    value,
+                    arguments,
+                    ArgumentSubstitutionPosition::Value,
+                )
+            })?))
+        }
     };
 
     if let Some(binding_index) = arguments.binding_index
@@ -5308,6 +5185,37 @@ fn rewrite_binding_prefix(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_origin_4275_module_walkers_normalize_secret_depth() {
+        use crate::resource::{DeferredValue, Value};
+        let value: ModuleResolvedValue =
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(crate::resource::Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(
+                        "private-depth".into(),
+                    )))
+                    .into(),
+                )))
+                .into(),
+            ));
+        let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for result in [
+            select_expanded_module_ifs(&value).unwrap(),
+            crate::validation::deferred_types::with_session_for_test(&config, |session| {
+                evaluate_expanded_module_functions(&value, session)
+            })
+            .unwrap(),
+        ] {
+            let Value::Deferred(DeferredValue::Secret(inner)) = result else {
+                panic!("expected secret")
+            };
+            assert!(matches!(
+                inner.expose_plaintext(),
+                Value::Concrete(ConcreteValue::String(_))
+            ));
+        }
+    }
 
     #[test]
     fn composition_substitution_checks_deferred_interpolation() {

@@ -129,9 +129,9 @@ fn value_contains_module_if_inner<P: ModuleIfAuditPlaceholder, B: BindingAddress
         Value::Deferred(DeferredValue::Access(access)) => {
             value_contains_module_if_inner(access.base(), functions, function_scopes)
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            value_contains_module_if_inner(inner, functions, function_scopes)
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(|secret_value| {
+            value_contains_module_if_inner(secret_value, functions, function_scopes)
+        }),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             value_contains_module_if_inner(value, functions, function_scopes)
                 || value_contains_module_if_inner(default, functions, function_scopes)

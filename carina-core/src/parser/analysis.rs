@@ -437,6 +437,8 @@ pub struct AnalysisTreeError {
 /// construct an error or mint a scoped diagnostic.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AnalysisTreeErrorKind {
+    #[error("{}", crate::resource::INSIDE_SECRET_MESSAGE)]
+    InsideSecret,
     #[error("missing parser syntax provenance for {element}")]
     MissingSyntaxProvenance { element: String },
     #[error("missing declaration provenance for {kind:?} {id}")]
@@ -451,6 +453,12 @@ pub enum AnalysisTreeErrorKind {
         declaration: DeclarationLocation,
         element: String,
     },
+}
+
+impl crate::resource::InsideSecret for AnalysisTreeError {
+    fn inside_secret(self) -> Self {
+        Self::new(AnalysisTreeErrorKind::InsideSecret)
+    }
 }
 
 pub enum AnalysisTreeDiagnostic<'a> {
@@ -525,10 +533,24 @@ enum AnalysisIterableRef<'a, P: ValueKind, B: BindingAddress> {
 }
 
 /// A reference whose occurrence and prefix provenance were validated at the boundary.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AnalysisReference<B: BindingAddress = RelativeBindingName> {
     path: crate::resource::AccessPath<B>,
     locations: Arc<super::ReferenceLocations>,
+    diagnostic_scope: crate::resource::DiagnosticScope,
+}
+
+impl<B: BindingAddress> std::fmt::Debug for AnalysisReference<B> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.diagnostic_scope.is_secret() {
+            return formatter.write_str("(secret reference)");
+        }
+        formatter
+            .debug_struct("AnalysisReference")
+            .field("path", &self.path)
+            .field("locations", &self.locations)
+            .finish()
+    }
 }
 
 /// An authored reference occurrence in a value, with its consumer context.
@@ -617,26 +639,26 @@ fn collect_value_references<P: ValueKind, B: BindingAddress>(
 ) -> Result<(), AnalysisTreeError> {
     require_integer_operator_provenance(value, context)?;
     let mut result = Ok(());
-    value.visit_resource_refs_with_usage(
-        &mut |path, usage| match path.reference_locations_shared() {
-            Some(locations) => references.push(AnalysisValueReference {
-                reference: AnalysisReference {
-                    path: path.clone(),
-                    locations: locations.clone(),
+    value.visit_resource_refs_for_diagnostics(&mut |reference, usage| match reference
+        .analysis_reference()
+    {
+        Some(reference) => references.push(AnalysisValueReference {
+            reference,
+            context: context.to_string(),
+            usage,
+            scope,
+        }),
+        None => {
+            result = Err(AnalysisTreeError::new(
+                AnalysisTreeErrorKind::MissingSyntaxProvenance {
+                    element: format!(
+                        "{context} reference {}",
+                        reference.diagnostic_path().to_dot_string()
+                    ),
                 },
-                context: context.to_string(),
-                usage,
-                scope,
-            }),
-            None => {
-                result = Err(AnalysisTreeError::new(
-                    AnalysisTreeErrorKind::MissingSyntaxProvenance {
-                        element: format!("{context} reference {path}"),
-                    },
-                ))
-            }
-        },
-    );
+            ))
+        }
+    });
     result
 }
 
@@ -691,7 +713,7 @@ fn require_integer_operator_provenance<P: ValueKind, B: BindingAddress>(
                 check(argument.walker_value())?;
             }
         }
-        Value::Deferred(DeferredValue::Secret(value)) => check(value)?,
+        Value::Deferred(DeferredValue::Secret(value)) => value.try_inspect(check)?,
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             check(value)?;
             check(default)?;
@@ -734,7 +756,13 @@ where
             collect_iterable_result_references(expression.rhs(), context, references)?;
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            collect_iterable_result_references(inner, context, references)?
+            let first = references.len();
+            inner.try_inspect(|secret_value| {
+                collect_iterable_result_references(secret_value, context, references)
+            })?;
+            for reference in &mut references[first..] {
+                reference.reference.diagnostic_scope = crate::resource::DiagnosticScope::Secret;
+            }
         }
         // References inside a function argument constrain that argument,
         // not the function result used as the iterable.
@@ -754,14 +782,89 @@ where
 }
 
 impl<B: BindingAddress> AnalysisReference<B> {
-    pub fn path(&self) -> &crate::resource::AccessPath<B> {
-        &self.path
+    pub(crate) fn from_scoped(
+        path: &crate::resource::AccessPath<B>,
+        diagnostic_scope: crate::resource::DiagnosticScope,
+    ) -> Option<Self> {
+        Some(Self {
+            path: path.clone(),
+            locations: path.reference_locations_shared()?.clone(),
+            diagnostic_scope,
+        })
+    }
+
+    /// Protect a finding before any frontend formats or stores its payload.
+    pub fn diagnostic<E>(&self, error: E) -> crate::resource::SecretDiagnosticError<E> {
+        self.diagnostic_scope.protect(error)
+    }
+
+    /// Reference lookup errors cross their enclosing intrinsic boundary here.
+    pub fn attribute_error(
+        &self,
+        bindings: &crate::binding_index::BindingIndex<'_, B>,
+        usage: crate::resource::ResourceRefUsage,
+    ) -> Option<crate::resource::SecretDiagnosticError<crate::binding_index::RefTypeError>> {
+        match bindings.ref_type(&self.path) {
+            crate::binding_index::RefType::UnknownAttribute(error)
+                if !crate::validation::suppress_coalesce_existence_error(&error, usage) =>
+            {
+                Some(self.diagnostic(error))
+            }
+            _ => None,
+        }
+    }
+
+    /// Diagnostic callers receive only the scoped spelling.
+    pub fn diagnostic_path(&self) -> crate::resource::DiagnosticPath<B> {
+        self.diagnostic_scope
+            .path(crate::resource::ReferencePath::Access(self.path.clone()))
+    }
+
+    /// Identity comparisons do not expose the matched binding.
+    pub fn binding_matches(
+        &self,
+        matches: impl FnOnce(crate::resource::DependencyKey<B>) -> bool,
+    ) -> bool {
+        matches(crate::resource::DependencyKey::new(
+            self.path.binding_address().clone(),
+        ))
+    }
+
+    pub fn render<T>(
+        &self,
+        render: impl FnOnce(&crate::resource::AccessPath<B>) -> T,
+    ) -> crate::resource::SecretDiagnosticError<T> {
+        if self.diagnostic_scope.is_secret() {
+            crate::resource::SecretDiagnosticError::InsideSecret
+        } else {
+            crate::resource::SecretDiagnosticError::Public(render(&self.path))
+        }
+    }
+
+    /// Check lookup identity and protect each finding before it leaves this boundary.
+    pub(crate) fn collect_diagnostics<E: crate::resource::InsideSecret>(
+        &self,
+        check: impl FnOnce(&crate::resource::AccessPath<B>, &mut Vec<super::Located<E>>),
+    ) -> Vec<super::Located<E>> {
+        let mut findings = Vec::new();
+        check(&self.path, &mut findings);
+        findings
+            .into_iter()
+            .map(|finding| {
+                let (location, error) = finding.into_parts();
+                super::Located::new(location, self.diagnostic_scope.protect_error(error))
+            })
+            .collect()
     }
     pub fn location(&self) -> &DeclarationLocation {
         self.locations.occurrence()
     }
     pub fn prefix_location(&self) -> &DeclarationLocation {
         self.locations.prefix()
+    }
+    pub fn own_attribute_location(&self) -> &DeclarationLocation {
+        self.locations
+            .attribute_location(self.path.binding(), self.path.attribute())
     }
     pub fn attribute_location(&self, binding: &str, attribute: &str) -> &DeclarationLocation {
         self.locations.attribute_location(binding, attribute)
@@ -800,21 +903,25 @@ fn append_reference_origins<B: BindingAddress>(
     dependencies: &super::UnexpandedDependencies<B>,
     declaration: &DeclarationLocation,
 ) -> Result<(), AnalysisTreeError> {
-    for path in dependencies.reference_origins() {
-        let locations = path.reference_locations_shared().ok_or_else(|| {
+    for origin in dependencies.reference_origins() {
+        let scoped = origin.as_ref();
+        let reference = scoped.analysis_reference().ok_or_else(|| {
             AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
                 declaration: declaration.clone(),
-                element: format!("reference edge {path}"),
+                element: format!(
+                    "reference edge {}",
+                    scoped.diagnostic_path().to_dot_string()
+                ),
             })
         })?;
-        if !references
-            .iter()
-            .any(|existing| existing.path == *path && existing.location() == locations.occurrence())
-        {
-            references.push(AnalysisReference {
-                path: path.clone(),
-                locations: locations.clone(),
-            });
+        if let Some(existing) = references.iter_mut().find(|existing| {
+            existing.path == reference.path && existing.location() == reference.location()
+        }) {
+            if scoped.is_secret() {
+                existing.diagnostic_scope = crate::resource::DiagnosticScope::Secret;
+            }
+        } else {
+            references.push(reference);
         }
     }
     Ok(())
@@ -874,16 +981,18 @@ fn attribute_provenance<'a, P: ValueKind, B: BindingAddress>(
         }
         keys.insert(key.clone(), key_location);
         let mut result = Ok(());
-        value.visit_resource_refs(&mut |path| match path.reference_locations_shared() {
-            Some(locations) => references.push(AnalysisReference {
-                path: path.clone(),
-                locations: locations.clone(),
-            }),
+        value.visit_resource_refs_for_diagnostics(&mut |reference, _| match reference
+            .analysis_reference()
+        {
+            Some(reference) => references.push(reference),
             None => {
                 result = Err(AnalysisTreeError::new(
                     AnalysisTreeErrorKind::MissingElementProvenance {
                         declaration: location.clone(),
-                        element: format!("reference {path}"),
+                        element: format!(
+                            "reference {}",
+                            reference.diagnostic_path().to_dot_string()
+                        ),
                     },
                 ))
             }
@@ -926,7 +1035,7 @@ where
             )
         } else if let Some(reference) = references
             .iter()
-            .find(|reference| reference.path().binding_address() == &binding)
+            .find(|reference| reference.path.binding_address() == &binding)
         {
             (DependencyEdgeOrigin::ValueReference, reference.location())
         } else if let Some(origin) = managed
@@ -942,15 +1051,17 @@ where
             // deferred call's bare handle dependencies. Keep
             // the authored reference that performed that inline.
             file.iter_top_level_resources()
-                .find(|source| source.binding_address() == Some(reference.path().binding_address()))
+                .find(|source| source.binding_address() == Some(reference.path.binding_address()))
                 .is_some_and(|source| {
                     source.dependency_bindings().contains(&binding)
                         || source
                             .attributes()
-                            .get(reference.path().attribute())
+                            .get(reference.path.attribute())
                             .is_some_and(|value| {
                                 let mut found = false;
-                                value.visit_binding_refs(&mut |target| found |= target == &binding);
+                                value.visit_binding_refs(&mut |target| {
+                                    found |= target.matches(&binding)
+                                });
                                 found
                             })
                 })
@@ -974,7 +1085,7 @@ where
                         }
                         super::BareBindingSource::Value { value, .. } => {
                             let mut found = false;
-                            value.visit_binding_refs(&mut |name| found |= name == &binding);
+                            value.visit_binding_refs(&mut |name| found |= name.matches(&binding));
                             found
                         }
                     };
@@ -2372,6 +2483,33 @@ where
             )
         })
     }
+    /// Resolve an occurrence without weakening the scope carried by its visitor.
+    pub fn reference_for_scoped(
+        &self,
+        reference: crate::resource::ScopedResourceRef<'_, B>,
+    ) -> AnalysisReference<B> {
+        let identity = reference.identity();
+        let matched = self
+            .value_references
+            .iter()
+            .map(|value| value.reference())
+            .chain(
+                self.resources
+                    .iter()
+                    .flat_map(|resource| resource.references()),
+            )
+            .find(|candidate| identity.matches_occurrence(&candidate.path))
+            .expect("reference validated at the analysis boundary");
+        AnalysisReference {
+            path: matched.path.clone(),
+            locations: matched.locations.clone(),
+            diagnostic_scope: if reference.is_secret() {
+                crate::resource::DiagnosticScope::Secret
+            } else {
+                matched.diagnostic_scope
+            },
+        }
+    }
     pub fn reference_for_path(
         &self,
         path: &crate::resource::AccessPath<B>,
@@ -2385,8 +2523,8 @@ where
                     .flat_map(|resource| resource.references()),
             )
             .find(|reference| {
-                reference.path() == path
-                    && reference.path().reference_locations_shared()
+                &reference.path == path
+                    && reference.path.reference_locations_shared()
                         == path.reference_locations_shared()
             })
             .expect("reference validated at the analysis boundary")
@@ -2572,6 +2710,33 @@ where
 #[cfg(test)]
 mod location_tests {
     use super::*;
+
+    #[test]
+    fn secret_origin_4275_round2_iterable_provenance_masks_secret_path() {
+        use crate::resource::{DeferredValue, ExpandedValue};
+        let reference =
+            ExpandedValue::root_resource_ref("private_producer", "private_attr", vec![]);
+        let mut references = Vec::new();
+        let public_error =
+            collect_iterable_result_references(&reference, "iterable", &mut references)
+                .unwrap_err();
+        assert!(
+            public_error
+                .to_string()
+                .contains("private_producer.private_attr")
+        );
+        let secret = ExpandedValue::Deferred(DeferredValue::Secret(Box::new(reference).into()));
+        let error =
+            collect_iterable_result_references(&secret, "iterable", &mut references).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains(crate::resource::INSIDE_SECRET_MESSAGE)
+        );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("private_"), "{rendered}");
+        }
+    }
 
     #[test]
     fn integer_operator_without_parser_provenance_fails_at_seal() {

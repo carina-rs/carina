@@ -100,7 +100,7 @@ impl LegacyLoopAddress {
 struct LoopAuthoring {
     file: crate::parser::SourceFileId,
     span: SourceSpan,
-    source_text: Arc<str>,
+    source_text: Option<Arc<str>>,
     binding_scope: Arc<BTreeSet<String>>,
 }
 
@@ -142,7 +142,7 @@ impl LoopSource {
     pub(crate) fn authored(
         source_file: &Path,
         span: SourceSpan,
-        source_text: impl Into<Arc<str>>,
+        source_text: impl Into<crate::parser::retained::DiagnosticSourceText>,
         kind: LoopKind,
     ) -> Self {
         let display_file = source_file.display().to_string();
@@ -162,7 +162,7 @@ impl LoopSource {
             authoring: Some(LoopAuthoring {
                 file: crate::parser::SourceFileId::new(source_file.to_path_buf()),
                 span,
-                source_text: source_text.into(),
+                source_text: source_text.into().into_text(),
                 binding_scope: Arc::new(BTreeSet::new()),
             }),
         }
@@ -219,7 +219,7 @@ impl LoopSource {
     pub(crate) fn source_text(&self) -> Option<&str> {
         self.authoring
             .as_ref()
-            .map(|authoring| authoring.source_text.as_ref())
+            .and_then(|authoring| authoring.source_text.as_deref())
     }
 
     pub(crate) fn source_span(&self) -> Option<SourceSpan> {

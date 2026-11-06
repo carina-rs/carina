@@ -120,6 +120,161 @@ pub async fn apply_desired_normalization<S: Clone, D: Clone + Default>(
     Ok(NormalizedResource(resource))
 }
 
+/// Dispatch gives normalizers main's plaintext input shape, then restores only
+/// input annotations while host checks run. Newly introduced provider secrets
+/// retain their original wire semantics.
+pub(super) async fn apply_dispatch_desired_normalization<S: Clone, D: Clone + Default>(
+    resource: Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    provider_configs: &[ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
+    normalizer: &dyn ProviderNormalizer,
+    schemas: &SchemaRegistry,
+) -> ProviderResult<(NormalizedResource<S, D>, RestoredSecrets)> {
+    let mut resources = [resource];
+    let mut restored = [RestoredSecrets::default()];
+    apply_desired_normalization_slice_inner(
+        &mut resources,
+        provider_configs,
+        normalizer,
+        schemas,
+        Some(&mut restored),
+    )
+    .await?;
+    let [resource] = resources;
+    let [restored] = restored;
+    Ok((NormalizedResource(resource), restored))
+}
+
+#[derive(Clone)]
+enum SecretSlot {
+    Key(String),
+    Index(usize),
+}
+
+#[derive(Default)]
+pub(super) struct RestoredSecrets {
+    paths: Vec<Vec<SecretSlot>>,
+}
+
+impl RestoredSecrets {
+    fn restore(&mut self, source: &Value, target: &mut Value, path: &mut Vec<SecretSlot>) {
+        match (source, target) {
+            (Value::Deferred(DeferredValue::Secret(_)), target)
+                if !matches!(target, Value::Deferred(DeferredValue::Secret(_))) =>
+            {
+                *target = target.clone().into_secret();
+                self.paths.push(path.clone());
+            }
+            (
+                Value::Concrete(ConcreteValue::Map(source)),
+                Value::Concrete(ConcreteValue::Map(target)),
+            ) => {
+                for (key, source) in source {
+                    if let Some(target) = target.get_mut(key) {
+                        path.push(SecretSlot::Key(key.clone()));
+                        self.restore(source, target, path);
+                        path.pop();
+                    }
+                }
+            }
+            (
+                Value::Concrete(ConcreteValue::List(source)),
+                Value::Concrete(ConcreteValue::List(target)),
+            ) => {
+                for (index, (source, target)) in source.iter().zip(target).enumerate() {
+                    path.push(SecretSlot::Index(index));
+                    self.restore(source, target, path);
+                    path.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn remove(&self, attributes: &mut indexmap::IndexMap<String, Value>) {
+        self.apply(attributes, false);
+    }
+
+    fn rewrap(&self, attributes: &mut indexmap::IndexMap<String, Value>) {
+        self.apply(attributes, true);
+    }
+
+    fn apply(&self, attributes: &mut indexmap::IndexMap<String, Value>, wrap: bool) {
+        fn apply_at(value: &mut Value, path: &[SecretSlot], wrap: bool) {
+            match path.split_first() {
+                None => {
+                    if wrap {
+                        *value = value.clone().into_secret();
+                    } else if let Value::Deferred(DeferredValue::Secret(payload)) = value {
+                        *value = payload.expose_plaintext().clone();
+                    }
+                }
+                Some((SecretSlot::Key(key), rest)) => {
+                    if let Value::Concrete(ConcreteValue::Map(values)) = value
+                        && let Some(value) = values.get_mut(key)
+                    {
+                        apply_at(value, rest, wrap);
+                    }
+                }
+                Some((SecretSlot::Index(index), rest)) => {
+                    if let Value::Concrete(ConcreteValue::List(values)) = value
+                        && let Some(value) = values.get_mut(*index)
+                    {
+                        apply_at(value, rest, wrap);
+                    }
+                }
+            }
+        }
+        for path in &self.paths {
+            if let Some((SecretSlot::Key(key), rest)) = path.split_first()
+                && let Some(value) = attributes.get_mut(key)
+            {
+                apply_at(value, rest, wrap);
+            }
+        }
+    }
+}
+
+/// Main's dispatch projection, applied only after protected host checks.
+pub(super) fn unwrap_secret(value: Value) -> Value {
+    match value {
+        Value::Deferred(DeferredValue::Secret(payload)) => {
+            unwrap_secret(payload.expose_plaintext().clone())
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(unwrap_secret(*value)),
+                default: Box::new(unwrap_secret(*default)),
+            })
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            let lhs = unwrap_secret(expression.lhs().clone());
+            let rhs = unwrap_secret(expression.rhs().clone());
+            let original = Value::Deferred(DeferredValue::IntegerArithmetic(expression.clone()));
+            expression
+                .evaluate_with_operands(lhs, rhs)
+                .unwrap_or(original)
+        }
+        Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
+            values.into_iter().map(unwrap_secret).collect(),
+        )),
+        Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
+            values
+                .into_iter()
+                .map(|(key, value)| (key, unwrap_secret(value)))
+                .collect(),
+        )),
+        value => value,
+    }
+}
+
 /// Apply the full desired-side pipeline to a resource slice in place.
 ///
 /// Stages run in order:
@@ -145,15 +300,56 @@ pub async fn apply_desired_normalization_slice<S: Clone, D: Clone + Default>(
     normalizer: &dyn ProviderNormalizer,
     schemas: &SchemaRegistry,
 ) -> ProviderResult<()> {
+    apply_desired_normalization_slice_inner(resources, provider_configs, normalizer, schemas, None)
+        .await
+}
+
+async fn apply_desired_normalization_slice_inner<S: Clone, D: Clone + Default>(
+    resources: &mut [Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >],
+    provider_configs: &[ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
+    normalizer: &dyn ProviderNormalizer,
+    schemas: &SchemaRegistry,
+    mut restored: Option<&mut [RestoredSecrets]>,
+) -> ProviderResult<()> {
     crate::value::canonicalize_resources_with_schemas(resources, schemas)?;
     let mut provider_resources = resources
         .iter()
         .cloned()
         .map(Resource::into_provider_resource)
         .collect::<Vec<_>>();
+    let protected_inputs = restored.as_ref().map(|_| {
+        provider_resources
+            .iter_mut()
+            .map(|resource| {
+                let protected = resource.attributes.clone();
+                for value in resource.attributes.values_mut() {
+                    *value = unwrap_secret(value.clone());
+                }
+                protected
+            })
+            .collect::<Vec<_>>()
+    });
     normalizer
         .normalize_desired(&mut provider_resources)
         .await?;
+    if let (Some(restored), Some(inputs)) = (restored.as_deref_mut(), protected_inputs) {
+        for ((resource, input), restored) in provider_resources.iter_mut().zip(inputs).zip(restored)
+        {
+            for (key, source) in input {
+                if let Some(target) = resource.attributes.get_mut(&key) {
+                    restored.restore(&source, target, &mut vec![SecretSlot::Key(key)]);
+                }
+            }
+        }
+    }
     for (resource, provider_resource) in resources.iter_mut().zip(provider_resources) {
         if resource.id != provider_resource.id {
             return Err(crate::provider::ProviderError::invalid_input(format!(
@@ -165,8 +361,21 @@ pub async fn apply_desired_normalization_slice<S: Clone, D: Clone + Default>(
     }
     reject_provider_boundary_block_aliases(resources, schemas)?;
     crate::value::canonicalize_normalized_resources_with_schemas(resources, schemas)?;
+    // Default-tag merging only inspects map shape and diagnoses config values.
+    // Give it main's shape, then restore the diagnostic annotations for the
+    // fully-resolved, ignore-path and wire gates that follow normalization.
+    if let Some(restored) = restored.as_deref() {
+        for (resource, restored) in resources.iter_mut().zip(restored) {
+            restored.remove(&mut resource.attributes);
+        }
+    }
     for config in provider_configs {
         merge_default_tags(config, resources, schemas)?;
+    }
+    if let Some(restored) = restored.as_deref() {
+        for (resource, restored) in resources.iter_mut().zip(restored) {
+            restored.rewrap(&mut resource.attributes);
+        }
     }
     Ok(())
 }
@@ -239,7 +448,7 @@ pub fn is_value_fully_concrete_for_expansion(value: &Value) -> bool {
             DeferredValue::Unavailable { .. } => false,
             DeferredValue::ResolvedFunctionCall { .. } => false,
             DeferredValue::Access(_) => false,
-            DeferredValue::Secret(inner) => is_value_fully_concrete_for_expansion(inner),
+            DeferredValue::Secret(inner) => inner.visit(is_value_fully_concrete_for_expansion),
 
             DeferredValue::Unknown(_) => false,
             DeferredValue::Placeholder(never) => match *never {},

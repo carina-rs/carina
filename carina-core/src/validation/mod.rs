@@ -1,5 +1,6 @@
 //! Validation utilities for resources and modules
 
+use crate::resource::{DiagnosticPath, DiagnosticScope, InsideSecret, SecretDiagnosticError};
 pub mod deferred_populate;
 pub mod deferred_types;
 pub mod depends_on;
@@ -459,6 +460,7 @@ pub struct BindingReferenceTypeError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ModuleCallDiagnosticPath {
+    Protected,
     Authored(ReferencePath<RelativeBindingName>),
     Expanded(ReferencePath<AbsoluteBindingAddress>),
 }
@@ -466,6 +468,7 @@ enum ModuleCallDiagnosticPath {
 impl ModuleCallDiagnosticPath {
     fn to_dot_string(&self) -> String {
         match self {
+            Self::Protected => crate::schema::SECRET_VALUE_MASK.into(),
             Self::Authored(path) => path.to_dot_string(),
             Self::Expanded(path) => path.to_dot_string(),
         }
@@ -479,12 +482,27 @@ impl ModuleCallDiagnosticPath {
         kind: &ModuleCallRefErrorKind,
     ) -> std::fmt::Result {
         match self {
-            Self::Authored(path) => {
-                format_module_call_ref_error(formatter, call_label, argument, path, kind)
-            }
-            Self::Expanded(path) => {
-                format_module_call_ref_error(formatter, call_label, argument, path, kind)
-            }
+            Self::Protected => format_module_call_ref_error_with_path(
+                formatter,
+                call_label,
+                argument,
+                crate::schema::SECRET_VALUE_MASK,
+                kind,
+            ),
+            Self::Authored(path) => format_module_call_ref_error_with_path(
+                formatter,
+                call_label,
+                argument,
+                &path.to_dot_string(),
+                kind,
+            ),
+            Self::Expanded(path) => format_module_call_ref_error_with_path(
+                formatter,
+                call_label,
+                argument,
+                &path.to_dot_string(),
+                kind,
+            ),
         }
     }
 }
@@ -2074,68 +2092,77 @@ fn unique_union_map_member<'a>(
 /// sink says nothing sound about its input positions. Secrets preserve their
 /// enclosing sink. Interpolation operands must be scalars that can be
 /// rendered to text, independently of the completed string's sink.
-pub(crate) fn visit_refs_with_sink<'a, P: PlaceholderKind, B: BindingAddress>(
-    value: &GenericValue<P, B>,
-    sink: Option<RefSink<'a>>,
-    f: &mut impl FnMut(
-        ReferencePathRef<'_, B>,
-        Option<RefSink<'a>>,
-        crate::resource::ResourceRefUsage,
-        Option<&GenericValue<P, B>>,
-    ),
-) {
-    visit_refs_with_sink_inner(value, sink, crate::resource::ResourceRefUsage::Required, f);
-}
-
 fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
     value: &GenericValue<P, B>,
     sink: Option<RefSink<'a>>,
     usage: crate::resource::ResourceRefUsage,
+    scope: DiagnosticScope,
     f: &mut impl FnMut(
         ReferencePathRef<'_, B>,
         Option<RefSink<'a>>,
         crate::resource::ResourceRefUsage,
         Option<&GenericValue<P, B>>,
+        DiagnosticScope,
     ),
 ) {
     match value {
         GenericValue::Deferred(crate::resource::DeferredValue::ModuleIf(deferred)) => {
             let [condition, then_value, else_value] = deferred.values();
-            visit_refs_with_sink_inner(condition, None, usage, f);
+            visit_refs_with_sink_inner(condition, None, usage, scope, f);
             for branch in [then_value, else_value] {
-                visit_refs_with_sink_inner(branch, sink, usage, f);
+                visit_refs_with_sink_inner(branch, sink, usage, scope, f);
             }
         }
-        GenericValue::Deferred(crate::resource::DeferredValue::ResourceRef { path }) => {
-            f(ReferencePathRef::<B>::Access(path), sink, usage, None)
-        }
-        GenericValue::Deferred(crate::resource::DeferredValue::BindingRef { binding }) => {
-            f(ReferencePathRef::<B>::Binding(binding), sink, usage, None)
-        }
+        GenericValue::Deferred(crate::resource::DeferredValue::ResourceRef { path }) => f(
+            ReferencePathRef::<B>::Access(path),
+            sink,
+            usage,
+            None,
+            scope,
+        ),
+        GenericValue::Deferred(crate::resource::DeferredValue::BindingRef { binding }) => f(
+            ReferencePathRef::<B>::Binding(binding),
+            sink,
+            usage,
+            None,
+            scope,
+        ),
         GenericValue::Deferred(crate::resource::DeferredValue::Placeholder(placeholder)) => {
             if let Some(name) = placeholder.module_argument_name()
                 && let Some(binding) =
                     crate::resource::module_argument_placeholder::<B>(name.to_string())
             {
-                f(ReferencePathRef::<B>::Binding(&binding), sink, usage, None);
+                f(
+                    ReferencePathRef::<B>::Binding(&binding),
+                    sink,
+                    usage,
+                    None,
+                    scope,
+                );
             }
         }
         GenericValue::Concrete(crate::resource::ConcreteValue::List(items)) => {
             let child_sink = sink.and_then(RefSink::list_element);
             for item in items {
-                visit_refs_with_sink_inner(item, child_sink, usage, f);
+                visit_refs_with_sink_inner(item, child_sink, usage, scope, f);
             }
         }
         GenericValue::Concrete(crate::resource::ConcreteValue::Map(entries)) => {
             for (key, value) in entries {
                 let child_sink = sink.and_then(|sink| sink.map_entry(key));
-                visit_refs_with_sink_inner(value, child_sink, usage, f);
+                visit_refs_with_sink_inner(value, child_sink, usage, scope, f);
             }
         }
         GenericValue::Deferred(crate::resource::DeferredValue::Interpolation(parts)) => {
             for part in parts {
                 if let crate::resource::InterpolationPart::Expr(value) = part {
-                    visit_refs_with_sink_inner(value, Some(RefSink::Interpolation), usage, f);
+                    visit_refs_with_sink_inner(
+                        value,
+                        Some(RefSink::Interpolation),
+                        usage,
+                        scope,
+                        f,
+                    );
                 }
             }
         }
@@ -2148,7 +2175,7 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
             // inputs. Function parameter sites are walked separately with
             // BindingIndex's signature authority.
             for argument in args {
-                visit_refs_with_sink_inner(argument.walker_value(), None, usage, f);
+                visit_refs_with_sink_inner(argument.walker_value(), None, usage, scope, f);
             }
         }
         GenericValue::Deferred(crate::resource::DeferredValue::Access(access)) => {
@@ -2157,17 +2184,18 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
                 // structural references. Project their postfix chain through
                 // BindingIndex so `cfg.field` receives the same narrowing and
                 // diagnostic origin as an ordinary path.
-                f(reference.as_ref(), sink, usage, None);
+                f(reference.as_ref(), sink, usage, None, scope);
             } else {
                 // Other Access values have computed operands. References
                 // nested inside the computation do not inherit its result
                 // sink.
-                visit_refs_with_sink_inner(access.base(), None, usage, f);
+                visit_refs_with_sink_inner(access.base(), None, usage, scope, f);
             }
         }
-        GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
-            visit_refs_with_sink_inner(inner, sink, usage, f)
-        }
+        GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => inner
+            .visit_plaintext_reference_inventory(|value, scope| {
+                visit_refs_with_sink_inner(value, sink, usage, scope, f)
+            }),
         GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) => {
             let value_usage = if value.is_coalesce_optional_operand() {
                 crate::resource::ResourceRefUsage::CoalesceValue
@@ -2181,13 +2209,13 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
             } else {
                 crate::resource::ResourceRefUsage::Required
             };
-            visit_refs_with_sink_inner(value, sink, value_usage, f);
-            visit_refs_with_sink_inner(default, sink, default_usage, f);
+            visit_refs_with_sink_inner(value, sink, value_usage, scope, f);
+            visit_refs_with_sink_inner(default, sink, default_usage, scope, f);
         }
         GenericValue::Deferred(crate::resource::DeferredValue::IntegerArithmetic(expression)) => {
             let operand_sink = Some(RefSink::TypeExpr(&TypeExpr::Int));
-            visit_refs_with_sink_inner(expression.lhs(), operand_sink, usage, f);
-            visit_refs_with_sink_inner(expression.rhs(), operand_sink, usage, f);
+            visit_refs_with_sink_inner(expression.lhs(), operand_sink, usage, scope, f);
+            visit_refs_with_sink_inner(expression.rhs(), operand_sink, usage, scope, f);
         }
         GenericValue::Concrete(crate::resource::ConcreteValue::String(_))
         | GenericValue::Concrete(crate::resource::ConcreteValue::EnumIdentifier(_))
@@ -2206,95 +2234,263 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
 /// canonical ResourceRef with path segments also needs inference so a known
 /// scalar cannot be indexed merely because BindingIndex reserves shape
 /// diagnostics for upstream references.
-fn visit_computed_accesses_with_sink<'a, B: BindingAddress>(
+fn collect_ref_diagnostics_with_sink<'a, P: PlaceholderKind, B: BindingAddress, E: InsideSecret>(
+    value: &GenericValue<P, B>,
+    sink: Option<RefSink<'a>>,
+    f: &mut impl FnMut(
+        ReferencePathRef<'_, B>,
+        Option<RefSink<'a>>,
+        crate::resource::ResourceRefUsage,
+        Option<&GenericValue<P, B>>,
+        &mut Vec<E>,
+    ),
+) -> Vec<E> {
+    let mut findings = Vec::new();
+    visit_refs_with_sink_inner(
+        value,
+        sink,
+        crate::resource::ResourceRefUsage::Required,
+        DiagnosticScope::Public,
+        &mut |path, sink, usage, candidate, scope| {
+            let mut local = Vec::new();
+            f(path, sink, usage, candidate, &mut local);
+            findings.extend(local.into_iter().map(|finding| {
+                if scope.is_secret() {
+                    finding.inside_secret()
+                } else {
+                    finding
+                }
+            }));
+        },
+    );
+    findings
+}
+
+type ReferenceDiagnosticMessage = SecretDiagnosticError<String>;
+
+#[derive(Debug, Clone)]
+enum ReferenceFindingLocation {
+    Resource { location: String, attribute: String },
+    Attribute(String),
+    Export(String),
+}
+
+#[derive(Debug)]
+enum ReferenceFindingKind {
+    UnknownAttribute(ReferenceDiagnosticMessage),
+    UnknownBinding(ReferenceDiagnosticMessage),
+    InvalidValue(ReferenceDiagnosticMessage),
+    TypeMismatch {
+        types: MismatchTypeNames,
+        path: ReferenceDiagnosticMessage,
+        origin: Option<ReferenceDiagnosticMessage>,
+    },
+}
+
+#[derive(Debug)]
+struct ReferenceFinding {
+    location: ReferenceFindingLocation,
+    kind: ReferenceFindingKind,
+}
+
+impl ReferenceFinding {
+    fn new(location: &ReferenceFindingLocation, kind: ReferenceFindingKind) -> Self {
+        Self {
+            location: location.clone(),
+            kind,
+        }
+    }
+}
+
+impl InsideSecret for ReferenceFinding {
+    fn inside_secret(self) -> Self {
+        let kind = match self.kind {
+            ReferenceFindingKind::UnknownAttribute(message) => {
+                ReferenceFindingKind::UnknownAttribute(message.inside_secret())
+            }
+            ReferenceFindingKind::UnknownBinding(message) => {
+                ReferenceFindingKind::UnknownBinding(message.inside_secret())
+            }
+            ReferenceFindingKind::InvalidValue(message) => {
+                ReferenceFindingKind::InvalidValue(message.inside_secret())
+            }
+            ReferenceFindingKind::TypeMismatch {
+                types,
+                path,
+                origin,
+            } => ReferenceFindingKind::TypeMismatch {
+                types,
+                path: path.inside_secret(),
+                origin: origin.map(InsideSecret::inside_secret),
+            },
+        };
+        Self { kind, ..self }
+    }
+}
+
+impl std::fmt::Display for ReferenceFinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use ReferenceFindingKind::*;
+        match &self.location {
+            ReferenceFindingLocation::Resource {
+                location,
+                attribute,
+            } => {
+                write!(f, "{location}: ")?;
+                if matches!(
+                    self.kind,
+                    UnknownAttribute(SecretDiagnosticError::InsideSecret)
+                        | UnknownBinding(SecretDiagnosticError::InsideSecret)
+                        | InvalidValue(SecretDiagnosticError::InsideSecret)
+                ) {
+                    write!(f, "attribute '{attribute}': ")?;
+                }
+            }
+            ReferenceFindingLocation::Attribute(name) => write!(f, "attribute '{name}': ")?,
+            ReferenceFindingLocation::Export(name) => write!(f, "export '{name}': ")?,
+        }
+        match &self.kind {
+            UnknownAttribute(message @ SecretDiagnosticError::InsideSecret) => {
+                write!(f, "unknown attribute: {message}")
+            }
+            UnknownBinding(message @ SecretDiagnosticError::InsideSecret) => {
+                write!(f, "unknown binding: {message}")
+            }
+            UnknownAttribute(message) | UnknownBinding(message) | InvalidValue(message) => {
+                message.fmt(f)
+            }
+            TypeMismatch {
+                types,
+                path,
+                origin,
+            } => {
+                match &self.location {
+                    ReferenceFindingLocation::Resource { attribute, .. } => write!(
+                        f,
+                        "cannot assign {} to '{attribute}': {types}",
+                        types.actual()
+                    )?,
+                    ReferenceFindingLocation::Attribute(_) => write!(f, "type mismatch: {types}")?,
+                    ReferenceFindingLocation::Export(_) => {
+                        write!(f, "type mismatch for '{path}': {types}")?
+                    }
+                }
+                if let Some(origin) = origin {
+                    write!(f, " ({origin})")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+fn visit_computed_accesses_with_sink<'a, B: BindingAddress, E: InsideSecret>(
     value: &GenericValue<ParserPlaceholder, B>,
     sink: Option<RefSink<'a>>,
-    f: &mut impl FnMut(&GenericValue<ParserPlaceholder, B>, Option<RefSink<'a>>),
-) {
+    f: &mut impl FnMut(&GenericValue<ParserPlaceholder, B>, Option<RefSink<'a>>) -> Vec<E>,
+) -> Vec<E> {
+    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart};
+    let mut findings = Vec::new();
     match value {
-        GenericValue::Deferred(crate::resource::DeferredValue::ModuleIf(deferred)) => {
+        GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
             let [condition, then_value, else_value] = deferred.values();
-            visit_computed_accesses_with_sink(condition, None, f);
+            findings.extend(visit_computed_accesses_with_sink(condition, None, f));
             for branch in [then_value, else_value] {
-                visit_computed_accesses_with_sink(branch, sink, f);
+                findings.extend(visit_computed_accesses_with_sink(branch, sink, f));
             }
         }
-        GenericValue::Deferred(crate::resource::DeferredValue::Access(access)) => {
+        GenericValue::Deferred(DeferredValue::Access(access)) => {
             if crate::resource::module_argument_reference_path(value).is_none() {
-                f(value, sink);
-                visit_computed_accesses_with_sink(access.base(), None, f);
+                findings.extend(f(value, sink));
+                findings.extend(visit_computed_accesses_with_sink(access.base(), None, f));
             }
         }
-        GenericValue::Deferred(crate::resource::DeferredValue::ResourceRef { path })
+        GenericValue::Deferred(DeferredValue::ResourceRef { path })
             if !path.segments().is_empty() =>
         {
-            f(value, sink);
+            findings.extend(f(value, sink))
         }
-        GenericValue::Concrete(crate::resource::ConcreteValue::List(items)) => {
+        GenericValue::Concrete(ConcreteValue::List(items)) => {
             let child_sink = sink.and_then(RefSink::list_element);
             for item in items {
-                visit_computed_accesses_with_sink(item, child_sink, f);
+                findings.extend(visit_computed_accesses_with_sink(item, child_sink, f));
             }
         }
-        GenericValue::Concrete(crate::resource::ConcreteValue::Map(entries)) => {
+        GenericValue::Concrete(ConcreteValue::Map(entries)) => {
             for (key, value) in entries {
-                visit_computed_accesses_with_sink(
+                findings.extend(visit_computed_accesses_with_sink(
                     value,
                     sink.and_then(|sink| sink.map_entry(key)),
                     f,
-                );
+                ));
             }
         }
-        GenericValue::Deferred(crate::resource::DeferredValue::Interpolation(parts)) => {
+        GenericValue::Deferred(DeferredValue::Interpolation(parts)) => {
             for part in parts {
-                if let crate::resource::InterpolationPart::Expr(value) = part {
-                    visit_computed_accesses_with_sink(value, Some(RefSink::Interpolation), f);
+                if let InterpolationPart::Expr(value) = part {
+                    findings.extend(visit_computed_accesses_with_sink(
+                        value,
+                        Some(RefSink::Interpolation),
+                        f,
+                    ));
                 }
             }
         }
         GenericValue::Deferred(
-            crate::resource::DeferredValue::FunctionCall { args, .. }
-            | crate::resource::DeferredValue::Unavailable { args, .. }
-            | crate::resource::DeferredValue::ResolvedFunctionCall { args, .. },
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for argument in args {
-                visit_computed_accesses_with_sink(argument.walker_value(), None, f);
+                findings.extend(visit_computed_accesses_with_sink(
+                    argument.walker_value(),
+                    None,
+                    f,
+                ));
             }
         }
-        GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
-            visit_computed_accesses_with_sink(inner, sink, f)
+        GenericValue::Deferred(DeferredValue::Secret(inner)) => {
+            findings.extend(
+                inner
+                    .try_inspect(|value| {
+                        Err::<(), _>(visit_computed_accesses_with_sink(value, sink, f))
+                    })
+                    .err()
+                    .into_iter()
+                    .flatten(),
+            );
         }
-        GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) => {
-            visit_computed_accesses_with_sink(value, sink, f);
-            visit_computed_accesses_with_sink(default, sink, f);
+        GenericValue::Deferred(DeferredValue::Coalesce { value, default }) => {
+            findings.extend(visit_computed_accesses_with_sink(value, sink, f));
+            findings.extend(visit_computed_accesses_with_sink(default, sink, f));
         }
-        GenericValue::Deferred(crate::resource::DeferredValue::IntegerArithmetic(expression)) => {
-            // Interpolation renders the final concrete Int to text; it does
-            // not turn the arithmetic node into a String expression. Keep an
-            // Int result sink at that boundary while still honoring ordinary
-            // resource/module sinks everywhere else.
+        GenericValue::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
             let result_sink = match sink {
                 Some(RefSink::Interpolation) => Some(RefSink::TypeExpr(&INT_REF_SINK)),
                 other => other,
             };
-            f(value, result_sink);
+            findings.extend(f(value, result_sink));
             let operand_sink = Some(RefSink::TypeExpr(&INT_REF_SINK));
-            visit_computed_accesses_with_sink(expression.lhs(), operand_sink, f);
-            visit_computed_accesses_with_sink(expression.rhs(), operand_sink, f);
+            findings.extend(visit_computed_accesses_with_sink(
+                expression.lhs(),
+                operand_sink,
+                f,
+            ));
+            findings.extend(visit_computed_accesses_with_sink(
+                expression.rhs(),
+                operand_sink,
+                f,
+            ));
         }
-        GenericValue::Deferred(crate::resource::DeferredValue::ResourceRef { .. })
-        | GenericValue::Deferred(crate::resource::DeferredValue::BindingRef { .. })
-        | GenericValue::Concrete(crate::resource::ConcreteValue::String(_))
-        | GenericValue::Concrete(crate::resource::ConcreteValue::EnumIdentifier(_))
-        | GenericValue::Concrete(crate::resource::ConcreteValue::CanonicalEnum(_))
-        | GenericValue::Concrete(crate::resource::ConcreteValue::Int(_))
-        | GenericValue::Concrete(crate::resource::ConcreteValue::Float(_))
-        | GenericValue::Concrete(crate::resource::ConcreteValue::Bool(_))
-        | GenericValue::Concrete(crate::resource::ConcreteValue::Duration(_))
-        | GenericValue::Concrete(crate::resource::ConcreteValue::StringList(_))
-        | GenericValue::Deferred(crate::resource::DeferredValue::Unknown(_))
-        | GenericValue::Deferred(crate::resource::DeferredValue::Placeholder(_)) => {}
+        GenericValue::Concrete(_)
+        | GenericValue::Deferred(
+            DeferredValue::ResourceRef { .. }
+            | DeferredValue::BindingRef { .. }
+            | DeferredValue::Unknown(_)
+            | DeferredValue::Placeholder(_),
+        ) => {}
     }
+    findings
 }
 
 /// A statically-known postfix access error shared by CLI validation and LSP
@@ -2316,6 +2512,20 @@ impl std::fmt::Display for DeferredAccessTypeError {
         match self {
             Self::InvalidAccess { error } => error.fmt(f),
             Self::TypeMismatch { types, origin } => write!(f, "Type mismatch: {types} ({origin})"),
+        }
+    }
+}
+
+impl InsideSecret for DeferredAccessTypeError {
+    fn inside_secret(self) -> Self {
+        match self {
+            Self::InvalidAccess { error } => Self::InvalidAccess {
+                error: error.inside_secret(),
+            },
+            Self::TypeMismatch { types, .. } => Self::TypeMismatch {
+                types,
+                origin: format!("from {}", crate::schema::SECRET_VALUE_MASK),
+            },
         }
     }
 }
@@ -2355,6 +2565,70 @@ pub struct IntegerArithmeticTypeFinding {
 impl IntegerArithmeticTypeFinding {
     pub fn error(&self) -> &DeferredAccessTypeError {
         &self.error
+    }
+}
+
+impl InsideSecret for crate::parser::Located<IntegerArithmeticTypeFinding> {
+    fn inside_secret(self) -> Self {
+        let (location, finding) = self.into_parts();
+        crate::parser::Located::new(
+            location,
+            IntegerArithmeticTypeFinding {
+                error: finding.error.inside_secret(),
+            },
+        )
+    }
+}
+
+#[derive(Debug)]
+enum ComputedAccessDiagnostic {
+    MissingEvidence(crate::parser::retained::MissingEvidence),
+    Protected,
+    Assignment {
+        location: String,
+        attribute: String,
+        error: DeferredAccessTypeError,
+    },
+}
+
+impl InsideSecret for ComputedAccessDiagnostic {
+    fn inside_secret(self) -> Self {
+        match self {
+            Self::MissingEvidence(_) => Self::Protected,
+            protected @ Self::Protected => protected,
+            Self::Assignment {
+                location,
+                attribute,
+                error,
+            } => Self::Assignment {
+                location,
+                attribute,
+                error: error.inside_secret(),
+            },
+        }
+    }
+}
+
+impl std::fmt::Display for ComputedAccessDiagnostic {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MissingEvidence(error) => error.fmt(formatter),
+            Self::Protected => inference::InferenceError::InsideSecret {}.fmt(formatter),
+            Self::Assignment {
+                location,
+                error: DeferredAccessTypeError::InvalidAccess { error },
+                ..
+            } => write!(formatter, "{location}: {error}"),
+            Self::Assignment {
+                location,
+                attribute,
+                error: DeferredAccessTypeError::TypeMismatch { types, origin },
+            } => write!(
+                formatter,
+                "{location}: cannot assign {} to '{attribute}': {types} ({origin})",
+                types.actual()
+            ),
+        }
     }
 }
 
@@ -2466,7 +2740,9 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
             });
         }
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
+            error @ (inference::InferenceError::InsideSecret { .. }
+            | inference::InferenceError::SecretAssignmentMismatch { .. }
+            | inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
             | inference::InferenceError::HeterogeneousCollection { .. }
             | inference::InferenceError::UnknownType { .. }),
         )) => return Err(DeferredAccessTypeError::InvalidAccess { error }),
@@ -2552,7 +2828,11 @@ fn prove_integer_operand<B: BindingAddress>(
             crate::resource::ApplyTimeUnknown::UpstreamExport { path },
         )) => Some(binding_index.postfix_ref_type(path)),
         GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
-            return prove_integer_operand(inner, expression, side, report, binding_index);
+            return {
+                inner.try_inspect(|secret_value| {
+                    prove_integer_operand(secret_value, expression, side, report, binding_index)
+                })
+            };
         }
         GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) => {
             prove_integer_operand(value, expression, side, report, binding_index)?;
@@ -2720,53 +3000,57 @@ fn check_integer_arithmetic_types_with_sink<'a, B: BindingAddress>(
     report: &crate::parser::retained::ExpressionReport<B>,
     binding_index: &BindingIndex<'_, B>,
 ) -> Vec<crate::parser::Located<IntegerArithmeticTypeFinding>> {
-    let mut findings = Vec::new();
-    visit_computed_accesses_with_sink(value, sink, &mut |candidate, candidate_sink| {
-        let GenericValue::Deferred(crate::resource::DeferredValue::IntegerArithmetic(expression)) =
-            candidate
-        else {
-            return;
-        };
-        let result = prove_integer_operand(
-            expression.lhs(),
-            expression,
-            crate::integer_arithmetic::IntegerOperandSide::Left,
-            report,
-            binding_index,
-        )
-        .and_then(|()| {
-            prove_integer_operand(
-                expression.rhs(),
+    let findings =
+        visit_computed_accesses_with_sink(value, sink, &mut |candidate, candidate_sink| {
+            let GenericValue::Deferred(crate::resource::DeferredValue::IntegerArithmetic(
                 expression,
-                crate::integer_arithmetic::IntegerOperandSide::Right,
+            )) = candidate
+            else {
+                return Vec::new();
+            };
+            let result = prove_integer_operand(
+                expression.lhs(),
+                expression,
+                crate::integer_arithmetic::IntegerOperandSide::Left,
                 report,
                 binding_index,
             )
-        })
-        .and_then(|()| check_integer_result_sink(candidate, candidate_sink, binding_index));
-        let Err(error) = result else {
-            return;
-        };
-        let operator_span = error
-            .integer_operator_span()
-            .unwrap_or_else(|| expression.operator_span());
-        let duplicate = findings.iter().any(
-            |finding: &crate::parser::Located<IntegerArithmeticTypeFinding>| {
-                finding.detail().to_string() == error.to_string()
-                    && Some(finding.location()) == operator_span.location()
-            },
-        );
-        if !duplicate {
-            findings.push(crate::parser::Located::new(
+            .and_then(|()| {
+                prove_integer_operand(
+                    expression.rhs(),
+                    expression,
+                    crate::integer_arithmetic::IntegerOperandSide::Right,
+                    report,
+                    binding_index,
+                )
+            })
+            .and_then(|()| check_integer_result_sink(candidate, candidate_sink, binding_index));
+            let Err(error) = result else {
+                return Vec::new();
+            };
+            let operator_span = error
+                .integer_operator_span()
+                .unwrap_or_else(|| expression.operator_span());
+            vec![crate::parser::Located::new(
                 operator_span
                     .location()
                     .expect("integer operator validated at the analysis boundary")
                     .clone(),
                 IntegerArithmeticTypeFinding { error },
-            ));
+            )]
+        });
+    let mut unique = Vec::new();
+    for finding in findings {
+        if !unique.iter().any(
+            |previous: &crate::parser::Located<IntegerArithmeticTypeFinding>| {
+                previous.location() == finding.location()
+                    && previous.detail().to_string() == finding.detail().to_string()
+            },
+        ) {
+            unique.push(finding);
         }
-    });
-    findings
+    }
+    unique
 }
 
 impl<D, B: BindingAddress, E>
@@ -2963,37 +3247,96 @@ pub fn check_file_integer_arithmetic_values<
     findings
 }
 
-fn resolve_resource_reference<B: BindingAddress>(
-    resource_id: &crate::resource::ResourceId,
+struct ResourceReferenceContext<'a, 'schema, B: BindingAddress> {
+    location: ReferenceFindingLocation,
+    bindings: &'a BindingIndex<'schema, B>,
+    declared_source: Option<&'a crate::binding_index::DeclaredValueSource>,
+    interpolation_sink: &'a LiftedType,
+}
+
+fn check_resource_reference<B: BindingAddress>(
+    context: &ResourceReferenceContext<'_, '_, B>,
     reference: ReferencePathRef<'_, B>,
-    bindings: &BindingIndex<'_, B>,
+    sink: Option<RefSink<'_>>,
     usage: crate::resource::ResourceRefUsage,
-    all_errors: &mut Vec<String>,
-) -> Option<ResolvedRefType> {
-    match bindings.ref_type(reference) {
-        RefType::Typed(resolved) => Some(resolved),
-        RefType::Unchecked => None,
+) -> Option<ReferenceFinding> {
+    let finding = |kind| ReferenceFinding::new(&context.location, kind);
+    let source = match context.bindings.ref_type(reference) {
+        RefType::Typed(source) => source,
+        RefType::Unchecked => return None,
         RefType::UnknownBinding { .. } => {
-            all_errors.push(format!(
-                "{}: unknown binding '{}' in reference {}",
-                resource_id,
-                reference.binding(),
-                reference.to_dot_string(),
-            ));
-            None
+            return Some(finding(ReferenceFindingKind::UnknownBinding(
+                SecretDiagnosticError::Public(format!(
+                    "unknown binding '{}' in reference {}",
+                    reference.binding(),
+                    reference.to_dot_string()
+                )),
+            )));
         }
         RefType::UnknownAttribute(error) if suppress_coalesce_existence_error(&error, usage) => {
-            None
+            return None;
         }
         RefType::UnknownAttribute(error) => {
-            all_errors.push(format!("{}: {}", resource_id, error));
-            None
+            return Some(finding(ReferenceFindingKind::UnknownAttribute(
+                SecretDiagnosticError::Public(error.to_string()),
+            )));
         }
+    };
+    if sink.is_some() && source.resource_handle_type().is_some() {
+        return Some(finding(ReferenceFindingKind::InvalidValue(
+            SecretDiagnosticError::Public(format!(
+                "'{}' is a resource handle, not a value",
+                reference.to_dot_string()
+            )),
+        )));
+    }
+    if matches!(reference, ReferencePathRef::Access(path) if !path.segments().is_empty()) {
+        return None; // computed postfix checking owns narrowing and sink compatibility
+    }
+    let sink_type = match sink {
+        Some(RefSink::EffectiveType {
+            attr_type,
+            defs,
+            owner,
+            ..
+        }) => attr_type.in_schema(defs).with_authority(
+            &context.bindings.provider_context().custom_types,
+            crate::schema::SinkAuthority::Owner(owner),
+        ),
+        Some(RefSink::Interpolation) => context
+            .interpolation_sink
+            .assignment_sink(&context.bindings.provider_context().custom_types),
+        Some(RefSink::TypeExpr(_)) | None => return None,
+    };
+    let checked = match context.declared_source {
+        Some(declared) => declared.assignment_to_sink(sink_type, context.bindings),
+        None => crate::binding_index::DeclaredValueAssignment::from_result(
+            source.is_assignable_to_sink(sink_type, context.bindings),
+        ),
+    };
+    match checked {
+        crate::binding_index::DeclaredValueAssignment::Assignable
+        | crate::binding_index::DeclaredValueAssignment::IncomingBoundaryMismatch => None,
+        crate::binding_index::DeclaredValueAssignment::Rejected(
+            RefTypeAssignabilityError::Mismatch(mismatch),
+        ) => Some(finding(ReferenceFindingKind::TypeMismatch {
+            types: mismatch.type_names().clone(),
+            path: SecretDiagnosticError::Public(reference.to_dot_string()),
+            origin: Some(SecretDiagnosticError::Public(
+                mismatch.origin_description(reference),
+            )),
+        })),
+        crate::binding_index::DeclaredValueAssignment::Rejected(
+            RefTypeAssignabilityError::Unchecked(reason),
+        ) => Some(finding(ReferenceFindingKind::InvalidValue(
+            SecretDiagnosticError::Public(reason.to_string()),
+        ))),
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ModuleCallRefErrorKind {
+    InsideSecret {},
     TypeMismatch {
         types: MismatchTypeNames,
         declared: Option<String>,
@@ -3003,6 +3346,42 @@ pub enum ModuleCallRefErrorKind {
     ProviderSchemaUnavailable {
         reason: String,
     },
+}
+
+impl InsideSecret for ModuleCallRefErrorKind {
+    fn inside_secret(self) -> Self {
+        match self {
+            Self::TypeMismatch { types, .. } => Self::TypeMismatch {
+                types,
+                declared: None,
+            },
+            _ => Self::InsideSecret {},
+        }
+    }
+}
+
+impl InsideSecret for ModuleCallRefError {
+    fn inside_secret(mut self) -> Self {
+        self.identity.kind = self.identity.kind.inside_secret();
+        self.identity.path = ModuleCallDiagnosticPath::Protected;
+        self
+    }
+}
+
+impl InsideSecret for CompositionRefError {
+    fn inside_secret(mut self) -> Self {
+        match &mut self {
+            Self::ModuleCall(error) => {
+                error.path = crate::resource::DiagnosticScope::Secret.path(None);
+                error.kind = error.kind.clone().inside_secret();
+            }
+            Self::Attribute(error) => {
+                error.error.path = crate::resource::DiagnosticScope::Secret.path(None);
+                error.error.kind = error.error.kind.clone().inside_secret();
+            }
+        }
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -3124,7 +3503,7 @@ fn format_module_call_ref_error<B: BindingAddress>(
     f: &mut std::fmt::Formatter<'_>,
     call_label: &str,
     argument: &str,
-    path: &ReferencePath<B>,
+    path: &DiagnosticPath<B>,
     kind: &ModuleCallRefErrorKind,
 ) -> std::fmt::Result {
     format_module_call_ref_error_with_path(f, call_label, argument, &path.to_dot_string(), kind)
@@ -3138,6 +3517,11 @@ fn format_module_call_ref_error_with_path(
     kind: &ModuleCallRefErrorKind,
 ) -> std::fmt::Result {
     match kind {
+        ModuleCallRefErrorKind::InsideSecret { .. } => write!(
+            f,
+            "module call '{call_label}': argument '{argument}': {}",
+            crate::resource::INSIDE_SECRET_MESSAGE
+        ),
         ModuleCallRefErrorKind::TypeMismatch { types, declared } => write!(
             f,
             "module call '{}': argument '{}': cannot assign {} to '{}': {} ({})",
@@ -3244,10 +3628,10 @@ fn validate_module_call_argument_ref_types_inner(
                 .map_or(value.walker_value(), |expression| {
                     expression.assignment_value(value.walker_value())
                 });
-            visit_refs_with_sink(
+            let reference_diagnostics = collect_ref_diagnostics_with_sink(
                 value,
                 declared_sink.map(RefSink::TypeExpr),
-                &mut |path, sink, usage, _candidate| {
+                &mut |path, sink, usage, _candidate, reference_findings| {
                     let current_position = reference_position;
                     reference_position += 1;
                     let Some(kind) =
@@ -3255,7 +3639,7 @@ fn validate_module_call_argument_ref_types_inner(
                     else {
                         return;
                     };
-                    errors.push(ModuleCallRefError {
+                    reference_findings.push(ModuleCallRefError {
                         call_label: call_name.to_string(),
                         identity: ModuleCallReferenceIdentity {
                             call: call.id().clone(),
@@ -3269,6 +3653,7 @@ fn validate_module_call_argument_ref_types_inner(
                     });
                 },
             );
+            errors.extend(reference_diagnostics);
         }
     }
 
@@ -3278,13 +3663,19 @@ fn validate_module_call_argument_ref_types_inner(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttributeParamRefError<B: BindingAddress = RelativeBindingName> {
     pub attribute: String,
-    pub path: ReferencePath<B>,
+    pub path: DiagnosticPath<B>,
     pub kind: ModuleCallRefErrorKind,
 }
 
 impl<B: BindingAddress> std::fmt::Display for AttributeParamRefError<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.kind {
+            ModuleCallRefErrorKind::InsideSecret { .. } => write!(
+                f,
+                "attribute '{}': {}",
+                self.attribute,
+                crate::resource::INSIDE_SECRET_MESSAGE
+            ),
             ModuleCallRefErrorKind::TypeMismatch { types, declared } => write!(
                 f,
                 "attribute '{}': type mismatch: {} ({})",
@@ -3324,7 +3715,7 @@ pub enum CompositionRefError {
 pub struct CompositionModuleCallRefError {
     pub argument: String,
     pub origin: Box<crate::parser::ArgumentOrigin>,
-    pub path: ReferencePath<AbsoluteBindingAddress>,
+    pub path: DiagnosticPath<AbsoluteBindingAddress>,
     pub kind: ModuleCallRefErrorKind,
     pub call_path: CompositionCallPath,
     reference_position: usize,
@@ -3400,6 +3791,7 @@ impl std::error::Error for CompositionRefError {}
 /// while expanded bindings differ for every module instance.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CompositionRefErrorKindKey {
+    InsideSecret,
     DeclarationResolution(StaticTypeResolutionError),
     ProviderSchemaUnavailable {
         reason: String,
@@ -3431,6 +3823,7 @@ enum CompositionRefErrorKindKey {
 impl From<&ModuleCallRefErrorKind> for CompositionRefErrorKindKey {
     fn from(kind: &ModuleCallRefErrorKind) -> Self {
         match kind {
+            ModuleCallRefErrorKind::InsideSecret { .. } => Self::InsideSecret,
             ModuleCallRefErrorKind::DeclarationResolution(error) => {
                 Self::DeclarationResolution(error.clone())
             }
@@ -3609,12 +4002,19 @@ pub fn validate_user_function_ref_types_with_bindings<
 mod user_function_refs {
     use super::*;
     pub(super) enum FunctionRefFinding {
+        InsideSecret,
         Reference(crate::resource::AccessPath<RelativeBindingName>, String),
         Boundary(String),
+    }
+    impl InsideSecret for FunctionRefFinding {
+        fn inside_secret(self) -> Self {
+            Self::InsideSecret
+        }
     }
     impl FunctionRefFinding {
         pub(super) fn into_message(self) -> String {
             match self {
+                Self::InsideSecret => crate::resource::INSIDE_SECRET_MESSAGE.into(),
                 Self::Reference(_, message) | Self::Boundary(message) => message,
             }
         }
@@ -3627,43 +4027,54 @@ mod user_function_refs {
         unknown_policy: UnknownReferencePolicy,
         errors: &mut Vec<FunctionRefFinding>,
     ) {
-        visit_refs_with_sink(value, sink, &mut |path, sink, usage, _candidate| {
-            let Some(sink) = sink else {
-                return;
-            };
-            let Some(kind) =
-                composition_ref_error_kind(path, Some(sink), bindings, unknown_policy, usage)
-            else {
-                return;
-            };
-            let message = match kind {
-                ModuleCallRefErrorKind::TypeMismatch { types, declared } => format!(
-                    "{context}: reference {}: {types} ({})",
-                    path.to_dot_string(),
-                    declared.map_or_else(
-                        || format!("from {}", path.to_dot_string()),
-                        |declared| format!("from {}, declared {declared}", path.to_dot_string()),
-                    )
-                ),
-                ModuleCallRefErrorKind::UnknownAttribute(error) => {
-                    format!("{context}: {error}")
-                }
-                ModuleCallRefErrorKind::DeclarationResolution(error) => {
-                    format!("{context}: {error}")
-                }
-                ModuleCallRefErrorKind::ProviderSchemaUnavailable { reason } => {
-                    format!("{context}: {reason}")
-                }
-            };
-            errors.push(match path {
-                ReferencePathRef::Access(path) => {
-                    FunctionRefFinding::Reference(path.clone(), message)
-                }
-                ReferencePathRef::Binding(_) | ReferencePathRef::BindingAccess { .. } => {
-                    FunctionRefFinding::Boundary(message)
-                }
-            });
-        });
+        let reference_diagnostics = collect_ref_diagnostics_with_sink(
+            value,
+            sink,
+            &mut |path, sink, usage, _candidate, reference_findings| {
+                let Some(sink) = sink else {
+                    return;
+                };
+                let Some(kind) =
+                    composition_ref_error_kind(path, Some(sink), bindings, unknown_policy, usage)
+                else {
+                    return;
+                };
+                let message = match kind {
+                    ModuleCallRefErrorKind::InsideSecret { .. } => {
+                        crate::resource::INSIDE_SECRET_MESSAGE.into()
+                    }
+                    ModuleCallRefErrorKind::TypeMismatch { types, declared } => format!(
+                        "{context}: reference {}: {types} ({})",
+                        path.to_dot_string(),
+                        declared.map_or_else(
+                            || format!("from {}", path.to_dot_string()),
+                            |declared| format!(
+                                "from {}, declared {declared}",
+                                path.to_dot_string()
+                            ),
+                        )
+                    ),
+                    ModuleCallRefErrorKind::UnknownAttribute(error) => {
+                        format!("{context}: {error}")
+                    }
+                    ModuleCallRefErrorKind::DeclarationResolution(error) => {
+                        format!("{context}: {error}")
+                    }
+                    ModuleCallRefErrorKind::ProviderSchemaUnavailable { reason } => {
+                        format!("{context}: {reason}")
+                    }
+                };
+                reference_findings.push(match path {
+                    ReferencePathRef::Access(path) => {
+                        FunctionRefFinding::Reference(path.clone(), message)
+                    }
+                    ReferencePathRef::Binding(_) | ReferencePathRef::BindingAccess { .. } => {
+                        FunctionRefFinding::Boundary(message)
+                    }
+                });
+            },
+        );
+        errors.extend(reference_diagnostics);
     }
 
     fn declared_result_mismatch(
@@ -3887,14 +4298,19 @@ mod user_function_refs {
                 }
             }
             crate::resource::Value::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
-                check_function_calls(
-                    inner,
-                    result_sink,
-                    context,
-                    bindings,
-                    unknown_policy,
-                    errors,
-                )
+                let result = inner.try_inspect(|value| {
+                    let mut local = Vec::new();
+                    check_function_calls(
+                        value,
+                        result_sink,
+                        context,
+                        bindings,
+                        unknown_policy,
+                        &mut local,
+                    );
+                    Err::<(), _>(local)
+                });
+                errors.extend(result.err().into_iter().flatten());
             }
             crate::resource::Value::Deferred(crate::resource::DeferredValue::Access(access)) => {
                 check_function_calls(
@@ -4010,6 +4426,10 @@ pub fn user_function_reference_diagnostics(
                     (tree.reference_for_path(&path).location().clone(), message)
                 }
                 FunctionRefFinding::Boundary(message) => (input.location().clone(), message),
+                FunctionRefFinding::InsideSecret => (
+                    input.location().clone(),
+                    crate::resource::INSIDE_SECRET_MESSAGE.into(),
+                ),
             };
             diagnostics.push(crate::parser::Located::new(location, message));
         }
@@ -4201,10 +4621,10 @@ pub fn validate_composition_ref_types_with_bindings<P: PlaceholderKind>(
             }
             let mut reference_position = 0;
             let declared_sink = declared_type.known().map(RefSink::TypeExpr);
-            visit_refs_with_sink(
+            let reference_diagnostics = collect_ref_diagnostics_with_sink(
                 argument.value(),
                 declared_sink,
-                &mut |path, sink, usage, _candidate| {
+                &mut |path, sink, usage, _candidate, reference_findings| {
                     let current_position = reference_position;
                     reference_position += 1;
                     let Some(kind) = composition_ref_error_kind(
@@ -4216,11 +4636,11 @@ pub fn validate_composition_ref_types_with_bindings<P: PlaceholderKind>(
                     ) else {
                         return;
                     };
-                    errors.push(CompositionRefError::ModuleCall(
+                    reference_findings.push(CompositionRefError::ModuleCall(
                         CompositionModuleCallRefError {
                             argument: argument_name.clone(),
                             origin: Box::new(origin),
-                            path: path.to_owned(),
+                            path: crate::resource::DiagnosticScope::Public.path(path.to_owned()),
                             kind,
                             call_path: call_path.clone(),
                             reference_position: current_position,
@@ -4228,6 +4648,7 @@ pub fn validate_composition_ref_types_with_bindings<P: PlaceholderKind>(
                     ));
                 },
             );
+            errors.extend(reference_diagnostics);
         }
 
         for (attribute_name, attribute) in &composition.signature.attributes {
@@ -4246,10 +4667,10 @@ pub fn validate_composition_ref_types_with_bindings<P: PlaceholderKind>(
                 .declared_type()
                 .and_then(|static_type| static_type.known())
                 .map(RefSink::TypeExpr);
-            visit_refs_with_sink(
+            let reference_diagnostics = collect_ref_diagnostics_with_sink(
                 &value,
                 declared_sink,
-                &mut |path, sink, usage, _candidate| {
+                &mut |path, sink, usage, _candidate, reference_findings| {
                     let current_position = reference_position;
                     reference_position += 1;
                     let Some(kind) = composition_ref_error_kind(
@@ -4261,11 +4682,12 @@ pub fn validate_composition_ref_types_with_bindings<P: PlaceholderKind>(
                     ) else {
                         return;
                     };
-                    errors.push(CompositionRefError::Attribute(
+                    reference_findings.push(CompositionRefError::Attribute(
                         CompositionAttributeRefError {
                             error: AttributeParamRefError {
                                 attribute: attribute_name.clone(),
-                                path: path.to_owned(),
+                                path: crate::resource::DiagnosticScope::Public
+                                    .path(path.to_owned()),
                                 kind,
                             },
                             module_name: call.module_name.clone(),
@@ -4277,6 +4699,7 @@ pub fn validate_composition_ref_types_with_bindings<P: PlaceholderKind>(
                     ));
                 },
             );
+            errors.extend(reference_diagnostics);
         }
     }
 
@@ -4777,111 +5200,55 @@ fn validate_resource_ref_types_inner<
                 });
                 let interpolation_sink = lift_type_expr(&INTERPOLATION_REF_SINK)
                     .expect("built-in interpolation operand types lift");
-                visit_refs_with_sink(
+                let reference_diagnostics = collect_ref_diagnostics_with_sink(
                     assignment_value,
                     sink,
-                    &mut |reference, sink, usage, _candidate_value| {
-                        let Some(source) = resolve_resource_reference(
-                            resource_id,
-                            reference,
+                    &mut |reference, sink, usage, _candidate_value, reference_findings| {
+                        let context = ResourceReferenceContext {
+                            location: ReferenceFindingLocation::Resource {
+                                location: resource_location.clone(),
+                                attribute: attr_name.clone(),
+                            },
                             bindings,
-                            usage,
-                            &mut all_errors,
-                        ) else {
-                            return;
+                            declared_source: declared_source.as_ref().map(|(_, source)| source),
+                            interpolation_sink: &interpolation_sink,
                         };
-                        if sink.is_some() && source.resource_handle_type().is_some() {
-                            // A handle used directly in a provider attribute is a
-                            // value-boundary error. Function arguments deliberately
-                            // arrive here without the enclosing result sink: the
-                            // user-function pass below owns their parameter type,
-                            // including matching and mismatched handle sinks.
-                            all_errors.push(format!(
-                                "{}: '{}' is a resource handle, not a value",
-                                resource_location,
-                                reference.to_dot_string(),
-                            ));
-                            return;
-                        }
+                        reference_findings
+                            .extend(check_resource_reference(&context, reference, sink, usage));
+                    },
+                );
+                all_errors.extend(
+                    reference_diagnostics
+                        .into_iter()
+                        .map(|finding| finding.to_string()),
+                );
+                let access_diagnostics = visit_computed_accesses_with_sink(
+                    assignment_value,
+                    sink,
+                    &mut |access, sink| {
                         if matches!(
-                            reference,
-                            ReferencePathRef::Access(path) if !path.segments().is_empty()
+                            access,
+                            GenericValue::Deferred(
+                                crate::resource::DeferredValue::IntegerArithmetic(_)
+                            )
                         ) {
-                            // The shared postfix authority below owns both narrowing
-                            // and sink compatibility for a segmented ResourceRef.
-                            return;
+                            return Vec::new();
                         }
-                        let Some(sink_type) = (match sink {
+                        let sink_type = match sink {
                             Some(RefSink::EffectiveType {
                                 attr_type,
                                 defs,
                                 ancestry: _,
                                 owner,
-                            }) => Some(attr_type.in_schema(defs).with_authority(
+                            }) => attr_type.in_schema(defs).with_authority(
                                 &bindings.provider_context().custom_types,
                                 crate::schema::SinkAuthority::Owner(owner),
-                            )),
-                            Some(RefSink::Interpolation) => Some(
-                                interpolation_sink
-                                    .assignment_sink(&bindings.provider_context().custom_types),
                             ),
-                            Some(RefSink::TypeExpr(_)) | None => None,
-                        }) else {
-                            return;
+                            Some(RefSink::Interpolation) => interpolation_sink
+                                .assignment_sink(&bindings.provider_context().custom_types),
+                            Some(RefSink::TypeExpr(_)) | None => return Vec::new(),
                         };
                         let checked = match declared_source.as_ref() {
-                            Some((_name, declared)) => {
-                                declared.assignment_to_sink(sink_type, bindings)
-                            }
-                            None => crate::binding_index::DeclaredValueAssignment::from_result(
-                                source.is_assignable_to_sink(sink_type, bindings),
-                            ),
-                        };
-                        let mismatch = match checked {
-                            crate::binding_index::DeclaredValueAssignment::Assignable
-                            | crate::binding_index::DeclaredValueAssignment::IncomingBoundaryMismatch => return,
-                            crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
-                            crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Unchecked(reason)) => {
-                                all_errors.push(format!("{resource_location}: {reason}"));
-                                return;
-                            }
-                        };
-                        let source_name = mismatch.actual_type_name();
-                        let origin = mismatch.origin_description(reference);
-                        all_errors.push(format!(
-                            "{}: cannot assign {} to '{}': {} ({})",
-                            resource_location,
-                            source_name,
-                            attr_name,
-                            mismatch.type_names(),
-                            origin,
-                        ));
-                    },
-                );
-                visit_computed_accesses_with_sink(assignment_value, sink, &mut |access, sink| {
-                    if matches!(
-                        access,
-                        GenericValue::Deferred(crate::resource::DeferredValue::IntegerArithmetic(
-                            _
-                        ))
-                    ) {
-                        return;
-                    }
-                    let sink_type = match sink {
-                        Some(RefSink::EffectiveType {
-                            attr_type,
-                            defs,
-                            ancestry: _,
-                            owner,
-                        }) => attr_type.in_schema(defs).with_authority(
-                            &bindings.provider_context().custom_types,
-                            crate::schema::SinkAuthority::Owner(owner),
-                        ),
-                        Some(RefSink::Interpolation) => interpolation_sink
-                            .assignment_sink(&bindings.provider_context().custom_types),
-                        Some(RefSink::TypeExpr(_)) | None => return,
-                    };
-                    let checked = match declared_source.as_ref() {
                         Some((name, declared)) => match declared.assignment_to_sink(sink_type, bindings) {
                             crate::binding_index::DeclaredValueAssignment::Assignable
                             | crate::binding_index::DeclaredValueAssignment::IncomingBoundaryMismatch => Ok(()),
@@ -4899,25 +5266,25 @@ fn validate_resource_ref_types_inner<
                                 // The caller's projected access belongs to another instance.
                                 expression
                             } else {
-                                match access { GenericValue::Deferred(crate::resource::DeferredValue::Access(access)) => match report.access(access) { Ok(evidence) => evidence, Err(error) => { all_errors.push(error.to_string()); return; } }, _ => expression }
+                                match access { GenericValue::Deferred(crate::resource::DeferredValue::Access(access)) => match report.access(access) { Ok(evidence) => evidence, Err(error) => { return vec![ComputedAccessDiagnostic::MissingEvidence(error)]; } }, _ => expression }
                             }, registry, bindings),
                     };
-                    match checked {
-                        Ok(()) => {}
-                        Err(DeferredAccessTypeError::InvalidAccess { error }) => {
-                            all_errors.push(format!("{}: {}", resource_location, error))
-                        }
-                        Err(DeferredAccessTypeError::TypeMismatch { types, origin }) => all_errors
-                            .push(format!(
-                                "{}: cannot assign {} to '{}': {} ({})",
-                                resource_location,
-                                types.actual(),
-                                attr_name,
-                                types,
-                                origin,
-                            )),
-                    }
-                });
+                        checked
+                            .err()
+                            .into_iter()
+                            .map(|error| ComputedAccessDiagnostic::Assignment {
+                                location: resource_location.to_string(),
+                                attribute: attr_name.clone(),
+                                error,
+                            })
+                            .collect()
+                    },
+                );
+                all_errors.extend(
+                    access_diagnostics
+                        .into_iter()
+                        .map(|diagnostic| diagnostic.to_string()),
+                );
                 if let Some(effective_sink) = effective_sink {
                     for finding in check_integer_arithmetic_types(
                         attr_value,
@@ -5188,14 +5555,31 @@ where
         .iter()
         .filter(|deferred| deferred.checks_scope())
     {
-        for root in deferred.iterable().root_bindings() {
-            if tree.binding_names().contains(root.as_str()) {
+        let mut roots = std::collections::BTreeMap::new();
+        let mut record = |key, path: crate::resource::DiagnosticPath<B>| {
+            let existing = roots.entry(key).or_insert_with(|| path.clone());
+            if path.is_secret() {
+                *existing = path;
+            }
+        };
+        deferred
+            .iterable()
+            .visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                record(reference.identity().binding_key(), reference.binding_path());
+            });
+        deferred
+            .iterable()
+            .visit_binding_refs_for_diagnostics(&mut |reference| {
+                record(reference.identity(), reference.diagnostic_path());
+            });
+        for (root, diagnostic_path) in roots {
+            if root.is_in_names(tree.binding_names()) {
                 continue;
             }
             let occurrences: Vec<_> = deferred
                 .references()
                 .iter()
-                .filter(|reference| reference.path().binding_address() == &root)
+                .filter(|reference| reference.binding_matches(|binding| binding == root))
                 .map(|reference| reference.prefix_location())
                 .collect();
             let locations = if occurrences.is_empty() {
@@ -5207,7 +5591,7 @@ where
                 findings.push(crate::parser::Located::new(
                     location.clone(),
                     crate::parser::ParseError::undefined_identifier(
-                        root.to_string(),
+                        diagnostic_path.to_dot_string(),
                         location.span().start_line(),
                         in_scope.clone(),
                     ),
@@ -5258,7 +5642,9 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
     let inferred = match deferred_iterable_shape_for_phase(context.judged) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
-            error @ (inference::InferenceError::MissingEvidence(_)
+            error @ (inference::InferenceError::InsideSecret { .. }
+            | inference::InferenceError::SecretAssignmentMismatch { .. }
+            | inference::InferenceError::MissingEvidence(_)
             | inference::InferenceError::IncompatibleCoalesceTypes { .. }
             | inference::InferenceError::HeterogeneousCollection { .. }),
         )) => {
@@ -5418,10 +5804,10 @@ fn check_attribute_param_refs<P: PlaceholderKind, B: BindingAddress>(
         return;
     };
     let value = expression.map_or(value, |expression| expression.assignment_value(value));
-    visit_refs_with_sink(
+    let reference_diagnostics = collect_ref_diagnostics_with_sink(
         value,
         expected_type.map(RefSink::TypeExpr),
-        &mut |path, sink, usage, _candidate| {
+        &mut |path, sink, usage, _candidate, reference_findings| {
             check_attribute_param_ref(
                 param_name,
                 sink.and_then(RefSink::as_type_expr),
@@ -5429,9 +5815,14 @@ fn check_attribute_param_refs<P: PlaceholderKind, B: BindingAddress>(
                 bindings,
                 unknown_policy,
                 usage,
-                errors,
+                reference_findings,
             );
         },
+    );
+    errors.extend(
+        reference_diagnostics
+            .into_iter()
+            .map(|finding| finding.to_string()),
     );
 }
 
@@ -5442,8 +5833,10 @@ fn check_attribute_param_ref<B: BindingAddress>(
     bindings: &BindingIndex<'_, B>,
     unknown_policy: UnknownReferencePolicy,
     usage: crate::resource::ResourceRefUsage,
-    errors: &mut Vec<String>,
+    errors: &mut Vec<ReferenceFinding>,
 ) {
+    let location = ReferenceFindingLocation::Attribute(param_name.into());
+    let finding = |kind| ReferenceFinding::new(&location, kind);
     match bindings.ref_type(path) {
         RefType::Typed(source) => {
             let Some(type_expr) = expected_type else {
@@ -5452,16 +5845,18 @@ fn check_attribute_param_ref<B: BindingAddress>(
             let resolved = match bindings.resolve_declared_type(type_expr) {
                 Ok(resolved) => resolved,
                 Err(error) => {
-                    errors.push(format!("attribute '{param_name}': {error}"));
+                    errors.push(finding(ReferenceFindingKind::InvalidValue(
+                        SecretDiagnosticError::Public(error.to_string()),
+                    )));
                     return;
                 }
             };
             if let TypeExpr::Ref(expected) = &resolved {
-                errors.push(format!(
-                    "attribute '{}': {}",
-                    param_name,
-                    HandleSinkError::reference_for_handle(expected, &source),
-                ));
+                errors.push(finding(ReferenceFindingKind::InvalidValue(
+                    SecretDiagnosticError::Public(
+                        HandleSinkError::reference_for_handle(expected, &source).to_string(),
+                    ),
+                )));
                 return;
             }
             let Some(sink) = lift_type_expr(&resolved) else {
@@ -5472,24 +5867,30 @@ fn check_attribute_param_ref<B: BindingAddress>(
                 Ok(()) => return,
                 Err(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
                 Err(RefTypeAssignabilityError::Unchecked(reason)) => {
-                    errors.push(format!("attribute '{param_name}': {reason}"));
+                    errors.push(finding(ReferenceFindingKind::InvalidValue(
+                        SecretDiagnosticError::Public(reason.to_string()),
+                    )));
                     return;
                 }
             };
-            errors.push(format!(
-                "attribute '{}': type mismatch: {} ({})",
-                param_name,
-                mismatch.type_names(),
+            let origin = Some(SecretDiagnosticError::Public(
                 mismatch.origin_description(path),
             ));
+            errors.push(finding(ReferenceFindingKind::TypeMismatch {
+                types: mismatch.type_names().clone(),
+                path: SecretDiagnosticError::Public(path.to_dot_string()),
+                origin,
+            }));
         }
         RefType::UnknownAttribute(error) if suppress_coalesce_existence_error(&error, usage) => {}
-        RefType::UnknownAttribute(error) => {
-            if matches!(unknown_policy, UnknownReferencePolicy::Report) {
-                errors.push(format!("attribute '{}': {}", param_name, error));
-            }
+        RefType::UnknownAttribute(error)
+            if matches!(unknown_policy, UnknownReferencePolicy::Report) =>
+        {
+            errors.push(finding(ReferenceFindingKind::UnknownAttribute(
+                SecretDiagnosticError::Public(error.to_string()),
+            )));
         }
-        RefType::Unchecked | RefType::UnknownBinding { .. } => {}
+        RefType::UnknownAttribute(_) | RefType::Unchecked | RefType::UnknownBinding { .. } => {}
     }
 }
 
@@ -5699,17 +6100,26 @@ fn collect_export_param_ref_type_errors<
         .judgement()
         .ok()
         .map_or(value, |expression| expression.assignment_value(value));
-    visit_refs_with_sink(value, sink, &mut |path, sink, usage, _candidate| {
-        check_export_ref(
-            param.name(),
-            sink.and_then(RefSink::as_type_expr),
-            path,
-            bindings,
-            unknown_policy,
-            usage,
-            &mut errors,
-        );
-    });
+    let reference_diagnostics = collect_ref_diagnostics_with_sink(
+        value,
+        sink,
+        &mut |path, sink, usage, _candidate, reference_findings| {
+            check_export_ref(
+                param.name(),
+                sink.and_then(RefSink::as_type_expr),
+                path,
+                bindings,
+                unknown_policy,
+                usage,
+                reference_findings,
+            );
+        },
+    );
+    errors.extend(
+        reference_diagnostics
+            .into_iter()
+            .map(|finding| finding.to_string()),
+    );
     errors
 }
 
@@ -5720,8 +6130,10 @@ fn check_export_ref<B: BindingAddress>(
     bindings: &BindingIndex<'_, B>,
     unknown_policy: UnknownReferencePolicy,
     usage: crate::resource::ResourceRefUsage,
-    errors: &mut Vec<String>,
+    errors: &mut Vec<ReferenceFinding>,
 ) {
+    let location = ReferenceFindingLocation::Export(param_name.into());
+    let finding = |kind| ReferenceFinding::new(&location, kind);
     match bindings.ref_type(path) {
         RefType::Typed(source) => {
             let Some(type_expr) = expected_type else {
@@ -5730,7 +6142,9 @@ fn check_export_ref<B: BindingAddress>(
             let resolved = match bindings.resolve_declared_type(type_expr) {
                 Ok(resolved) => resolved,
                 Err(error) => {
-                    errors.push(format!("export '{param_name}': {error}"));
+                    errors.push(finding(ReferenceFindingKind::InvalidValue(
+                        SecretDiagnosticError::Public(error.to_string()),
+                    )));
                     return;
                 }
             };
@@ -5742,28 +6156,30 @@ fn check_export_ref<B: BindingAddress>(
                 Ok(()) => return,
                 Err(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
                 Err(RefTypeAssignabilityError::Unchecked(reason)) => {
-                    errors.push(format!("export '{param_name}': {reason}"));
+                    errors.push(finding(ReferenceFindingKind::InvalidValue(
+                        SecretDiagnosticError::Public(reason.to_string()),
+                    )));
                     return;
                 }
             };
-            let inferred_origin = mismatch
+            let origin = mismatch
                 .declared_type_name()
-                .map(|_| format!(" ({})", mismatch.origin_description(path)));
-            errors.push(format!(
-                "export '{}': type mismatch for '{}': {}{}",
-                param_name,
-                path.to_dot_string(),
-                mismatch.type_names(),
-                inferred_origin.as_deref().unwrap_or_default(),
-            ));
+                .map(|_| SecretDiagnosticError::Public(mismatch.origin_description(path)));
+            errors.push(finding(ReferenceFindingKind::TypeMismatch {
+                types: mismatch.type_names().clone(),
+                path: SecretDiagnosticError::Public(path.to_dot_string()),
+                origin,
+            }));
         }
         RefType::UnknownAttribute(error) if suppress_coalesce_existence_error(&error, usage) => {}
-        RefType::UnknownAttribute(error) => {
-            if matches!(unknown_policy, UnknownReferencePolicy::Report) {
-                errors.push(format!("export '{}': {}", param_name, error));
-            }
+        RefType::UnknownAttribute(error)
+            if matches!(unknown_policy, UnknownReferencePolicy::Report) =>
+        {
+            errors.push(finding(ReferenceFindingKind::UnknownAttribute(
+                SecretDiagnosticError::Public(error.to_string()),
+            )));
         }
-        RefType::Unchecked | RefType::UnknownBinding { .. } => {}
+        RefType::UnknownAttribute(_) | RefType::Unchecked | RefType::UnknownBinding { .. } => {}
     }
 }
 
@@ -7054,7 +7470,7 @@ pub fn value_contains_unresolved_ref<P: PlaceholderKind>(value: &GenericValue<P>
         | GenericValue::Deferred(crate::resource::DeferredValue::Unknown(_))
         | GenericValue::Deferred(crate::resource::DeferredValue::Placeholder(_)) => true,
         GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
-            value_contains_unresolved_ref(inner)
+            inner.visit(|secret_value| value_contains_unresolved_ref(secret_value))
         }
         GenericValue::Concrete(crate::resource::ConcreteValue::List(items)) => {
             items.iter().any(value_contains_unresolved_ref)
@@ -8652,13 +9068,16 @@ impl ModuleCallChecker<'_> {
                 CompositionRefError::ModuleCall(error) => {
                     let root = error.call_path.root();
                     let immediate = error.call_path.immediate();
-                    let display_path = ModuleCallDiagnosticPath::Expanded(error.path.clone());
+                    let display_path = error.path.render(
+                        |path| ModuleCallDiagnosticPath::Expanded(path.clone()),
+                        || ModuleCallDiagnosticPath::Protected,
+                    );
                     self.push_finding(ModuleCallFinding::reference_type_with_display_path(
                         &immediate.display_label(),
                         ModuleCallReferenceIdentity {
                             call: immediate.id.clone(),
                             argument: error.argument,
-                            path: ModuleCallDiagnosticPath::Expanded(error.path),
+                            path: display_path.clone(),
                             reference_position: Some(error.reference_position),
                             binding_use: None,
                             kind: error.kind,
@@ -8898,7 +9317,7 @@ fn module_call_value_is_context_free(value: &Value) -> bool {
             })
         }
         crate::resource::Value::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
-            module_call_value_is_context_free(inner)
+            inner.visit(module_call_value_is_context_free)
         }
         crate::resource::Value::Deferred(crate::resource::DeferredValue::Coalesce {
             value,
@@ -9165,9 +9584,9 @@ where
         let mut resolved_param = param.clone();
         if let Some(value) = param.value() {
             let mut references_removed_secret = false;
-            value.visit_resource_refs_with_usage(&mut |path, usage| {
+            value.visit_resource_refs(&mut |path, usage| {
                 if usage == crate::resource::ResourceRefUsage::Required
-                    && bindings.removed_attribute_was_sensitive(path.binding(), path.attribute())
+                    && path.removed_attribute_was_sensitive(bindings)
                 {
                     references_removed_secret = true;
                 }
@@ -9781,3 +10200,6 @@ pub mod inference;
 mod named_annotation_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod secret_tests;

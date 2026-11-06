@@ -3790,9 +3790,9 @@ mod tests {
 
     #[test]
     fn saved_plan_projection_keeps_hash_evidence_and_propagates_verification_errors() {
-        let live: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("private".into()),
-        ))));
+        let live: Value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("private".into()))).into(),
+        ));
         let hash = crate::value::redact_secrets_in_value(&live).unwrap();
         let authored = SnapshotValue::Concrete(ConcreteValue::Map(IndexMap::from([
             (
@@ -3854,10 +3854,12 @@ mod tests {
                 authored
             ])))
         );
-        let unavailable =
-            SnapshotValue::Deferred(DeferredValue::Secret(Box::new(SnapshotValue::Concrete(
-                ConcreteValue::Map(IndexMap::from([("opaque".into(), hash.clone())])),
-            ))));
+        let unavailable = SnapshotValue::Deferred(DeferredValue::Secret(
+            Box::new(SnapshotValue::Concrete(ConcreteValue::Map(IndexMap::from(
+                [("opaque".into(), hash.clone())],
+            ))))
+            .into(),
+        ));
         let result = schema.with_observation(|comparison| {
             crate::differ::type_aware_equal(
                 &unavailable,
@@ -3868,8 +3870,14 @@ mod tests {
             )
         });
         assert!(
-            matches!(result, Err(crate::differ::ComparisonError::Secret(crate::value::SerializationError::UnavailableSecret(error))) if error.path() == "comparison.secret.opaque")
+            matches!(&result, Err(crate::differ::ComparisonError::Secret(crate::value::SerializationError::UnavailableSecret(error))) if error.path() == "(secret)")
         );
+        for rendered in [
+            result.as_ref().unwrap_err().to_string(),
+            format!("{result:?}"),
+        ] {
+            assert!(!rendered.contains("opaque"), "{rendered}");
+        }
     }
 
     #[test]

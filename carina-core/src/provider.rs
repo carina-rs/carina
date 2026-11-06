@@ -1968,7 +1968,7 @@ fn hash_provider_view_as_secret(
     let plaintext = provider_value
         .decode_value()
         .ok_or(SerializationError::NullProviderSecret)?;
-    crate::value::persist_secret_json(&plaintext.to_value_at("provider secret")?, previous)
+    crate::value::persist_secret_json(&plaintext, previous)
 }
 
 /// Saved attributes decoded from persisted state but not yet reconciled
@@ -5667,7 +5667,8 @@ pub fn merge_default_tags<S, D>(
                 source @ (SerializationError::NullProviderSecret
                 | SerializationError::UnresolvedEnumIdentifier { .. }
                 | SerializationError::UnexpandedModuleIf { .. }
-                | SerializationError::UnavailableSecret(_)),
+                | SerializationError::UnavailableSecret(_)
+                | SerializationError::InsideSecret { .. }),
             ) => {
                 return Err(ProviderError::invalid_input_caused_by(
                     "failed to encode default tag",
@@ -9995,9 +9996,12 @@ mod tests {
             ),
             ("$enum".to_string(), enum_shaped_user_map),
         ])));
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("guest-secret".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "guest-secret".into(),
+            )))
+            .into(),
+        ));
 
         let persisted = PersistedAttributes::from_persisted_values(HashMap::from([
             (
@@ -10110,9 +10114,12 @@ mod tests {
 
     #[test]
     fn saved_plan_hash_inventory_ignores_non_placeholder_siblings() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("SAVED_PLAN_SECRET".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "SAVED_PLAN_SECRET".into(),
+            )))
+            .into(),
+        ));
         let placeholder =
             crate::value::redact_secrets_in_value(&secret).expect("redact saved-plan secret");
         let attributes = HashMap::from([
@@ -10169,9 +10176,12 @@ mod tests {
 
     #[test]
     fn persistence_merges_propagate_typed_unavailable_secret() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("previous secret".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "previous secret".into(),
+            )))
+            .into(),
+        ));
         let previous = PersistedValue::encode_desired_value(&secret, None).unwrap();
         let opaque = previous.decode().unwrap();
         let provider = PersistedValue::encode_provider_value(
@@ -10184,8 +10194,11 @@ mod tests {
         let error = hash_provider_json_as_secret(&provider, Some(&previous)).unwrap_err();
         assert!(
             matches!(error, SerializationError::UnavailableSecret(ref error)
-            if error.path() == "provider secret.token")
+            if error.path() == "(secret)")
         );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("token"), "{rendered}");
+        }
         let map = |value: &PersistedValue| {
             PersistedValue::from_serialized_json(serde_json::json!({"protected": value.as_json()}))
                 .unwrap()
@@ -10203,8 +10216,11 @@ mod tests {
                     .expect_err("an unavailable provider secret must not retain stale evidence");
             assert!(
                 matches!(error, SerializationError::UnavailableSecret(ref error)
-                if error.path().ends_with(".token"))
+                if error.path() == "(secret)")
             );
+            for rendered in [error.to_string(), format!("{error:?}")] {
+                assert!(!rendered.contains("token"), "{rendered}");
+            }
         }
     }
 
@@ -12115,9 +12131,9 @@ mod tests {
                     ),
                     (
                         "client_secret".to_string(),
-                        Value::Deferred(DeferredValue::Secret(Box::new(patch_test_value(
-                            "client-secret",
-                        )))),
+                        Value::Deferred(DeferredValue::Secret(
+                            Box::new(patch_test_value("client-secret")).into(),
+                        )),
                     ),
                 ]))),
             )])),
@@ -12172,9 +12188,9 @@ mod tests {
                 ),
                 (
                     "client_secret".to_string(),
-                    Value::Deferred(DeferredValue::Secret(Box::new(patch_test_value(
-                        "client-secret",
-                    )))),
+                    Value::Deferred(DeferredValue::Secret(
+                        Box::new(patch_test_value("client-secret")).into(),
+                    )),
                 ),
             ]))),
         )])));

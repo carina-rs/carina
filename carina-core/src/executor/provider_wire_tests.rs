@@ -488,9 +488,12 @@ async fn checked_projection_preserves_native_scalars_and_late_secret_provenance(
                         Value::Concrete(ConcreteValue::CanonicalEnum(mode)),
                     ])),
                 );
-            let configs = [config(Value::Deferred(DeferredValue::Secret(Box::new(
-                Value::Concrete(ConcreteValue::String("private-late-tag".into())),
-            ))))];
+            let configs = [config(Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "private-late-tag".into(),
+                )))
+                .into(),
+            )))];
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
             let schemas = schemas();
@@ -571,4 +574,163 @@ async fn nested_wire_failures_retain_list_indices_and_never_values() {
         },
     )
     .await
+}
+
+#[tokio::test]
+async fn review2_f4_dispatch_and_native_normalizer_receive_main_plaintext_shapes() {
+    use crate::provider::ProviderNormalizer;
+    use crate::resource::DeferredValue;
+    struct MainShapes;
+    impl ProviderNormalizer for MainShapes {
+        fn normalize_desired<'a>(
+            &'a self,
+            resources: &'a mut [crate::resource::ProviderResource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            Box::pin(async move {
+                assert!(
+                    matches!(resources[0].get_attr("text"), Some(Value::Concrete(ConcreteValue::String(value))) if value == "t")
+                );
+                assert!(matches!(
+                    resources[0].get_attr("list"),
+                    Some(Value::Concrete(ConcreteValue::StringList(_)))
+                ));
+                assert!(matches!(
+                    resources[0].get_attr("map"),
+                    Some(Value::Concrete(ConcreteValue::Map(_)))
+                ));
+                Ok(())
+            })
+        }
+        fn normalize_state<'a>(
+            &'a self,
+            _: &'a mut crate::provider::StateTransformMap,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            crate::provider::ready_noop()
+        }
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _: &'a mut crate::provider::StateTransformMap,
+            _: &'a crate::provider::SavedAttrs,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            crate::provider::ready_noop()
+        }
+    }
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+            let secret =
+                |value: Value| Value::Deferred(DeferredValue::Secret(Box::new(value).into()));
+            let resource = Resource::with_provider("test", "thing", "secret-inputs", None)
+                .with_attribute(
+                    "text",
+                    secret(Value::Concrete(ConcreteValue::String("t".into()))),
+                )
+                .with_attribute(
+                    "list",
+                    secret(Value::Concrete(ConcreteValue::StringList(vec![
+                        "a".into(),
+                        "b".into(),
+                    ]))),
+                )
+                .with_attribute(
+                    "map",
+                    secret(Value::Concrete(ConcreteValue::Map(
+                        indexmap::IndexMap::from([(
+                            "key".into(),
+                            Value::Concrete(ConcreteValue::String("value".into())),
+                        )]),
+                    ))),
+                );
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            let schemas = SchemaRegistry::new();
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                &MainShapes,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let request = prepare_create_request(resource, &context).await.unwrap();
+            assert!(matches!(
+                request.resource().get_attr("text"),
+                Some(Value::Concrete(ConcreteValue::String(_)))
+            ));
+            for key in ["text", "list", "map"] {
+                assert!(
+                    !request
+                        .resource()
+                        .wire_attributes()
+                        .get(key)
+                        .unwrap()
+                        .is_secret()
+                );
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn review2_f4_secret_tag_maps_receive_main_default_tags() {
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+            let value = Value::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::Map(
+                    indexmap::IndexMap::from([(
+                        "authored".into(),
+                        Value::Concrete(ConcreteValue::String("x".into())),
+                    )]),
+                )))
+                .into(),
+            ));
+            let resource = Resource::with_provider("test", "sqs.Queue", "queue", None)
+                .with_attribute("tags", value);
+            let configs = [config(Value::Concrete(ConcreteValue::String(
+                "default".into(),
+            )))];
+            let bindings = ResolvedBindings::default();
+            let gate = ModuleConstraintGate::from_live_compositions(&[]);
+            let schemas = schemas();
+            let context = ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &configs,
+                &NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let request = prepare_create_request(resource, &context).await.unwrap();
+            assert_eq!(
+                request
+                    .resource()
+                    .wire_attributes()
+                    .get("tags")
+                    .unwrap()
+                    .value(),
+                &carina_provider_protocol::types::Value::Map(BTreeMap::from([
+                    (
+                        "authored".into(),
+                        carina_provider_protocol::types::Value::String("x".into())
+                    ),
+                    (
+                        "unrelated".into(),
+                        carina_provider_protocol::types::Value::String("default".into())
+                    )
+                ]))
+            );
+            assert!(
+                request
+                    .resource()
+                    .as_resource()
+                    .default_tag_keys
+                    .contains("unrelated")
+            );
+        },
+    )
+    .await;
 }

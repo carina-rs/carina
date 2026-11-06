@@ -1,3 +1,4 @@
+use crate::resource::InsideSecret;
 static TEST_OWNER: std::sync::LazyLock<crate::parser::SchemaTypeOwner> =
     std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
 
@@ -1086,7 +1087,7 @@ fn unique_list_skips_whole_secrets_and_diagnostic_sensitive_elements() {
         Value::Concrete(ConcreteValue::String("private-claim".into())),
         Value::Concrete(ConcreteValue::String("private-claim".into())),
     ]));
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(duplicate)));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(duplicate).into()));
     assert!(list.validate(&secret).is_ok());
     assert!(Schema::flat(list).validate_collect(&secret).is_empty());
 
@@ -1158,9 +1159,9 @@ fn unique_list_whole_secret_still_checks_length_and_element_types() {
         vec![string_value("private"); 3],
         vec![Value::Concrete(ConcreteValue::Int(1)); 2],
     ] {
-        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::List(items),
-        ))));
+        let value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::List(items))).into(),
+        ));
         assert!(list.validate(&value).is_err());
         let collected = Schema::flat(list.clone()).validate_collect(&value);
         assert!(!collected.is_empty());
@@ -1262,7 +1263,7 @@ fn unique_list_constraints_collect_length_and_element_errors_together() {
 fn assert_mixed_sensitive_list_is_not_comparable(secret: bool, sensitive_first: bool) {
     let plain = Value::Concrete(ConcreteValue::String("private-mixed-claim".into()));
     let sensitive = if secret {
-        Value::Deferred(DeferredValue::Secret(Box::new(plain.clone())))
+        Value::Deferred(DeferredValue::Secret(Box::new(plain.clone()).into()))
     } else {
         Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
             "private-mixed-claim",
@@ -1305,7 +1306,7 @@ fn unique_list_skips_plain_before_diagnostic_sensitive() {
 
 #[test]
 fn unique_list_skips_two_secrets() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string_value("x"))));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string_value("x")).into()));
     let value = Value::Concrete(ConcreteValue::List(vec![secret.clone(), secret]));
     let list = unique_list_from_protocol(AttributeType::string(), true);
     assert!(list.validate(&value).is_ok());
@@ -1322,9 +1323,9 @@ fn unique_list_skips_nested_secret_struct_elements() {
         true,
     );
     let object = |a| Value::Concrete(ConcreteValue::Map(IndexMap::from([("a".into(), a)])));
-    let secret = object(Value::Deferred(DeferredValue::Secret(Box::new(
-        string_value("x"),
-    ))));
+    let secret = object(Value::Deferred(DeferredValue::Secret(
+        Box::new(string_value("x")).into(),
+    )));
     let plain = object(string_value("x"));
     let value = Value::Concrete(ConcreteValue::List(vec![secret.clone(), plain, secret]));
     assert!(list.validate(&value).is_ok());
@@ -1413,15 +1414,16 @@ fn unique_list_inside_whole_secret_struct_does_not_report_equality() {
             StructField::required("enabled", AttributeType::bool()).build(),
         ],
     ));
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::Map(IndexMap::from([
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "items".into(),
                 Value::Concrete(ConcreteValue::List(vec![string_value("private"); 2])),
             ),
             ("enabled".into(), string_value("invalid")),
-        ])),
-    ))));
+        ]))))
+        .into(),
+    ));
     let error = schema.validate(&value).unwrap_err();
     let collected = schema.validate_collect(&value);
     assert_eq!(collected.len(), 1, "{collected:?}");
@@ -1983,7 +1985,9 @@ fn write_only_secret_group_errors_never_render_values() {
         vec![FieldGroup::at_most_one(["access_token", "password"]).unwrap()],
     );
     let plaintext = "must-never-appear-in-group-errors";
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string_value(plaintext))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(string_value(plaintext)).into(),
+    ));
     let both_secret = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         ("access_token".to_string(), secret.clone()),
         ("password".to_string(), secret),
@@ -2001,12 +2005,13 @@ fn write_only_secret_group_errors_never_render_values() {
 
 #[test]
 fn secret_map_of_grouped_structs_masks_the_map_key_in_group_errors() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::Map(IndexMap::from([(
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "leaky-key".to_string(),
             Value::Concrete(ConcreteValue::Map(IndexMap::new())),
-        )])),
-    ))));
+        )]))))
+        .into(),
+    ));
     let error = RootlessType::new(AttributeType::map(choice_struct(
         FieldGroupKind::ExactlyOne,
     )))
@@ -2022,12 +2027,13 @@ fn secret_map_of_grouped_structs_masks_the_map_key_in_group_errors() {
 
 #[test]
 fn secret_struct_masks_nested_struct_paths_in_group_errors() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::Map(IndexMap::from([(
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "leaky_field".to_string(),
             Value::Concrete(ConcreteValue::Map(IndexMap::new())),
-        )])),
-    ))));
+        )]))))
+        .into(),
+    ));
     let envelope = AttributeType::struct_(
         "SecretEnvelope",
         vec![
@@ -2217,7 +2223,7 @@ fn secret_masking_preserves_custom_type_attribute_position() {
         attribute: Some("secret_value".to_string()),
     };
 
-    let masked = error.masked_for_secret();
+    let masked = error.inside_secret();
     assert_eq!(masked.attribute_name(), Some("secret_value"));
     assert!(matches!(
         masked,
@@ -6765,9 +6771,12 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
         .validate()
         .expect("secret validation schema must be valid");
     let secret = |value: &str| {
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String(value.to_string().into()),
-        ))))
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                value.to_string().into(),
+            )))
+            .into(),
+        ))
     };
     let mut map = IndexMap::new();
     map.insert("key".to_string(), secret("map-plaintext"));
@@ -6781,9 +6790,12 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
         ("length".to_string(), secret("length-plaintext")),
         (
             "enum_value".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::enum_identifier("enum-plaintext"),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::enum_identifier(
+                    "enum-plaintext",
+                )))
+                .into(),
+            )),
         ),
         ("custom".to_string(), secret("schema-custom-plaintext")),
         ("lookup".to_string(), secret("lookup-plaintext")),
@@ -6896,9 +6908,12 @@ fn secret_enum_literal_masks_typed_value_and_validator_message() {
         .validate()
         .expect("secret enum schema must be valid");
     let secret = |plaintext: &str| {
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String(plaintext.to_string().into()),
-        ))))
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                plaintext.to_string().into(),
+            )))
+            .into(),
+        ))
     };
     let attributes = HashMap::from([
         ("enumerated".to_string(), secret(enumerated_plaintext)),
@@ -6983,9 +6998,12 @@ fn secret_wrapped_containers_mask_user_derived_error_paths() {
     use indexmap::IndexMap;
 
     fn secret_map(entries: impl IntoIterator<Item = (String, Value)>) -> Value {
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::Map(entries.into_iter().collect::<IndexMap<_, _>>()),
-        ))))
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Map(
+                entries.into_iter().collect::<IndexMap<_, _>>(),
+            )))
+            .into(),
+        ))
     }
 
     let constrained = || {
@@ -7081,9 +7099,12 @@ fn secret_wrapped_containers_mask_user_derived_error_paths() {
 #[test]
 fn secret_length_out_of_range_is_masked_without_pattern_error() {
     let plaintext = "short";
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(plaintext.to_string().into()),
-    ))));
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            plaintext.to_string().into(),
+        )))
+        .into(),
+    ));
     let error = AttributeType::refined_string(None, None, Some((Some(8), None)), None)
         .validate(&value)
         .expect_err("short secret must fail the length constraint");
@@ -7104,9 +7125,12 @@ fn secret_length_out_of_range_is_masked_without_pattern_error() {
 #[test]
 fn secret_pattern_mismatch_is_masked_without_literal_quotes() {
     let plaintext = "wrong";
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(plaintext.to_string().into()),
-    ))));
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            plaintext.to_string().into(),
+        )))
+        .into(),
+    ));
     let error = AttributeType::refined_string(
         None,
         Some(crate::schema::CompiledPattern::try_new("^allowed$").unwrap()),
@@ -7152,9 +7176,12 @@ fn secret_structured_string_enum_error_is_masked_without_literal_quotes() {
         }),
         None,
     );
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(plaintext.to_string().into()),
-    ))));
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            plaintext.to_string().into(),
+        )))
+        .into(),
+    ));
     let error = attr
         .validate(&value)
         .expect_err("secret must fail the structured enum validator");
@@ -14694,9 +14721,9 @@ fn unique_best_union_failure_remains_verbatim() {
 #[test]
 fn secret_scalar_union_masks_every_tied_failure() {
     let plaintext = "z14grhdcwa56qt";
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(plaintext.into()),
-    ))));
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+    ));
 
     for (path, error) in union_errors_from_public_paths(&hosted_zone_id_union(true), &value) {
         let TypeError::UnionAlternativesMismatch { failures } = &error else {

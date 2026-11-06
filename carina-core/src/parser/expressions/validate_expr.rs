@@ -122,10 +122,17 @@ pub(crate) fn parse_validate_expr(
             parse_validate_expr(inner, ctx)
         }
         Rule::validate_function_call => {
+            let line = pair.line_col().0;
             let mut inner = pair.into_inner();
             let name = next_pair(&mut inner, "function name", "validate_function_call")?
                 .as_str()
                 .to_string();
+            if matches!(
+                crate::builtins::Builtin::from_name(&name),
+                Some(crate::builtins::Builtin::Secret)
+            ) {
+                return Err(ParseError::SecretInConstraint { line });
+            }
             let mut args = Vec::new();
             for arg_pair in inner {
                 args.push(parse_validate_expr(arg_pair, ctx)?);

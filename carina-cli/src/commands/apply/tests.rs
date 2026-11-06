@@ -1282,7 +1282,9 @@ async fn run_saved_plan_schema_fingerprint_case(
     if secret_bearing {
         resource.set_attr(
             "name",
-            Value::Deferred(DeferredValue::Secret(Box::new(string_value(identity)))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(string_value(identity)).into(),
+            )),
         );
     }
     let resource_id = resource.id.clone();
@@ -1832,7 +1834,9 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     let current_source = tmp.path().join("current.crn");
     std::fs::write(&saved_source, "saved fixture").unwrap();
     std::fs::write(&current_source, "current fixture").unwrap();
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string_value("public"))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(string_value("public")).into(),
+    ));
     let mut saved = saved_module_composition(secret.clone(), "rejected");
     saved.id = carina_core::resource::ResolvedResourceId::new(ResourceId::with_identity(
         "_virtual",
@@ -10607,7 +10611,7 @@ mod apply_deferred_for_parity {
 mod saved_plan_version_tests {
 
     //! Saved plan formats have no backward-compatibility path: re-running
-    //! `carina plan` is the supported migration. Version 40 pins the absolute source
+    //! `carina plan` is the supported migration. Version 41 requires typed Secret nodes. Version 40 pins the absolute source
     //! locator to its canonical identity. Version 39 stores typed dependency
     //! handles. Version 38 retains authored
     //! directives and default origins. Version 37 requires deferred
@@ -10638,6 +10642,39 @@ mod saved_plan_version_tests {
     };
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn secret_origin_4275_v40_secret_calls_fail_by_version_before_decode() {
+        let runtime = crate::test_support::TestCommandRuntime::new();
+        let dir = TempDir::new().unwrap();
+        let plan_path = dir.path().join("v40.plan.json");
+        std::fs::write(&plan_path, r#"{"version":40,"timestamp":"x","value":{"FunctionCall":{"name":"secret","args":[{"String":"private-plan"}]}}}"#).unwrap();
+        let error = crate::commands::apply::run_apply_from_plan(
+            &runtime,
+            &carina_core::paths::ResolvedPath::new(&plan_path).unwrap(),
+            &plan_path,
+            true,
+            false,
+            std::num::NonZeroUsize::new(8).unwrap(),
+            false,
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            carina_core::shutdown::ShutdownToken::running(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                crate::error::AppError::UnsupportedPlanVersion {
+                    found: 40,
+                    expected: 41,
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains("private-plan"));
+    }
+
     #[tokio::test]
     async fn saved_plan_rejects_repointed_source_symlink_with_display_path() {
         let runtime = crate::test_support::TestCommandRuntime::new();
@@ -10686,8 +10723,8 @@ mod saved_plan_version_tests {
     }
 
     #[test]
-    fn source_identity_requires_plan_format_40() {
-        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 40);
+    fn typed_secret_nodes_require_plan_format_41() {
+        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 41);
     }
 
     #[tokio::test]
@@ -10743,7 +10780,7 @@ mod saved_plan_version_tests {
             rejected_saved_plan_message(&plan_path, &json, "format 38 must require replanning")
                 .await;
         assert!(
-            message.contains("Unsupported plan file version: 38 (expected 40)"),
+            message.contains("Unsupported plan file version: 38 (expected 41)"),
             "{message}"
         );
         assert!(!message.contains("corrupted"), "{message}");
@@ -10833,7 +10870,7 @@ mod saved_plan_version_tests {
         );
     }
 
-    /// Main's v39 and older lack the canonical source identity; reject their
+    /// Format 40 and older predate typed-only secret nodes; reject their
     /// headers before attempting to decode any format-specific payload.
     #[tokio::test]
     async fn previous_emitted_and_older_plan_versions_are_rejected_before_payload_decoding() {
@@ -10841,12 +10878,12 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            40,
-            "carina#4202 requires format 40 for source identity on top of carina#3803 format 39",
+            41,
+            "carina#4275 requires format 41 for typed secret nodes on top of carina#4202 format 40",
         );
-        let previous = 39;
+        let previous = 40;
 
-        for older_version in [previous, 38, 37, 36, 35, 34, 33, 32] {
+        for older_version in [previous, 39, 38, 37, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,

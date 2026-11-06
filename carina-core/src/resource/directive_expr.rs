@@ -491,7 +491,7 @@ fn resolve_bool<P: PlaceholderKind, B: BindingAddress>(
                 Value::Deferred(_) => {
                     let mut module_arguments = false;
                     let mut loop_slots = false;
-                    value.visit_placeholders(&mut |placeholder| {
+                    value.visit_placeholders(&mut |placeholder, _| {
                         module_arguments |= placeholder.module_argument_name().is_some();
                         loop_slots |= placeholder.loop_slot().is_some();
                     });
@@ -528,6 +528,9 @@ fn loop_expression_is_local<P: PlaceholderKind, B: BindingAddress>(value: &Value
             placeholder.loop_slot().is_some()
         }
         Value::Deferred(DeferredValue::Access(access)) => loop_expression_is_local(access.base()),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            inner.visit(|secret_value| loop_expression_is_local(secret_value))
+        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             parts.iter().all(|part| match part {
                 InterpolationPart::Literal(_) => true,
@@ -549,8 +552,7 @@ fn loop_expression_is_local<P: PlaceholderKind, B: BindingAddress>(value: &Value
             | DeferredValue::Unknown(_)
             | DeferredValue::Coalesce { .. }
             | DeferredValue::ModuleIf(_)
-            | DeferredValue::Unavailable { .. }
-            | DeferredValue::Secret(_),
+            | DeferredValue::Unavailable { .. },
         ) => false,
     }
 }
@@ -1577,7 +1579,7 @@ mod tests {
         let mut references = Vec::new();
         expression
             .value
-            .visit_resource_refs(&mut |reference| references.push(reference.binding().to_string()));
+            .visit_resource_refs(&mut |reference, _usage| references.push(reference.binding_key()));
         assert!(references.is_empty());
     }
 

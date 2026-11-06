@@ -610,6 +610,10 @@ fn evaluate_pending_constraint_views<'a>(
                             error,
                         });
                     }
+                    Err(error @ crate::resolver::ResolutionError::InsideSecret { .. }) => {
+                        resolution_errors.insert(name.clone(), error.to_string());
+                        resolved_arguments.insert(name.clone(), argument.clone());
+                    }
                     Err(crate::resolver::ResolutionError::Message(message)) => {
                         resolution_errors.insert(name.clone(), message);
                         resolved_arguments.insert(name.clone(), argument.clone());
@@ -700,6 +704,10 @@ fn resolve_bound_constraint_values(
         match crate::resolver::resolve_ref_value(value, bindings, session) {
             Ok(value) => Ok(value),
             Err(crate::resolver::ResolutionError::UnavailableSecret(error)) => Err(error),
+            Err(error @ crate::resolver::ResolutionError::InsideSecret { .. }) => {
+                errors.insert(argument.to_string(), error.to_string());
+                Ok(value.clone())
+            }
             Err(crate::resolver::ResolutionError::Message(message)) => {
                 errors.insert(argument.to_string(), message);
                 Ok(value.clone())
@@ -859,7 +867,9 @@ fn is_recursively_concrete<P: PlaceholderKind, B: BindingAddress>(value: &Value<
     match value {
         Value::Concrete(ConcreteValue::List(items)) => items.iter().all(is_recursively_concrete),
         Value::Concrete(ConcreteValue::Map(map)) => map.values().all(is_recursively_concrete),
-        Value::Deferred(DeferredValue::Secret(inner)) => is_recursively_concrete(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            inner.visit(|secret_value| is_recursively_concrete(secret_value))
+        }
         Value::Concrete(_) => true,
         Value::Deferred(_) => false,
     }
@@ -911,10 +921,22 @@ impl<P: PlaceholderKind, B: BindingAddress> EvalValue<P, B> {
     fn bool(self, context: &str) -> Result<bool, String> {
         match self {
             Self::Value(Value::Concrete(ConcreteValue::Bool(value))) => Ok(value),
+            Self::Value(Value::Deferred(DeferredValue::Secret(payload))) => {
+                payload.try_inspect(|value| EvalValue::Value(value.clone()).bool(context))
+            }
             other => Err(format!(
                 "{context} must be boolean, got {}",
                 other.kind_name()
             )),
+        }
+    }
+    fn require_int(&self, context: &str) -> Result<(), String> {
+        match self {
+            Self::Value(Value::Concrete(ConcreteValue::Int(_))) => Ok(()),
+            Self::Value(Value::Deferred(DeferredValue::Secret(payload))) => {
+                payload.try_inspect(|value| EvalValue::Value(value.clone()).require_int(context))
+            }
+            other => Err(format!("{context} must be int, got {}", other.kind_name())),
         }
     }
 }
@@ -942,30 +964,21 @@ fn eval_expr<P: PlaceholderKind, B: BindingAddress>(
             apply_constraint_path(base, path).map(|value| value_for_evaluation(&value))
         }
         ValidateExpr::BoundArgument { value, .. } => Ok(value_for_evaluation(value)),
-        ValidateExpr::IntegerArithmetic { lhs, op, rhs, .. } => {
+        ValidateExpr::IntegerArithmetic {
+            lhs,
+            op,
+            rhs,
+            operator_span,
+        } => {
             let lhs = eval_expr(lhs, arguments)?;
             let rhs = eval_expr(rhs, arguments)?;
-            let lhs = match lhs {
-                EvalValue::Value(Value::Concrete(ConcreteValue::Int(value))) => value,
-                other => {
-                    return Err(format!(
-                        "left operand of {op} must be int, got {}",
-                        other.kind_name()
-                    ));
-                }
+            lhs.require_int(&format!("left operand of {op}"))?;
+            rhs.require_int(&format!("right operand of {op}"))?;
+            let (EvalValue::Value(lhs), EvalValue::Value(rhs)) = (lhs, rhs) else {
+                unreachable!("validated integer values")
             };
-            let rhs = match rhs {
-                EvalValue::Value(Value::Concrete(ConcreteValue::Int(value))) => value,
-                other => {
-                    return Err(format!(
-                        "right operand of {op} must be int, got {}",
-                        other.kind_name()
-                    ));
-                }
-            };
-            crate::integer_arithmetic::evaluate_checked_integer(lhs, *op, rhs)
-                .map(ConcreteValue::Int)
-                .map(value_from)
+            crate::integer_arithmetic::evaluate_integer_values(lhs, *op, rhs, operator_span.clone())
+                .map(EvalValue::Value)
                 .map_err(|error| error.to_string())
         }
         ValidateExpr::Compare { lhs, op, rhs } => {
@@ -1058,10 +1071,7 @@ fn value_from<P: PlaceholderKind, B: BindingAddress>(
 fn value_for_evaluation<P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
 ) -> EvalValue<P, B> {
-    match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => value_for_evaluation(inner),
-        other => EvalValue::Value(other.clone()),
-    }
+    EvalValue::Value(value.clone())
 }
 
 fn compare_values<P: PlaceholderKind, B: BindingAddress>(
@@ -1080,6 +1090,24 @@ fn compare_values<P: PlaceholderKind, B: BindingAddress>(
     let (EvalValue::Value(left), EvalValue::Value(right)) = (left, right) else {
         unreachable!("null values returned above");
     };
+    if let Value::Deferred(DeferredValue::Secret(payload)) = left {
+        return payload.try_inspect(|value| {
+            compare_values(
+                &EvalValue::Value(value.clone()),
+                op,
+                &EvalValue::Value(right.clone()),
+            )
+        });
+    }
+    if let Value::Deferred(DeferredValue::Secret(payload)) = right {
+        return payload.try_inspect(|value| {
+            compare_values(
+                &EvalValue::Value(left.clone()),
+                op,
+                &EvalValue::Value(value.clone()),
+            )
+        });
+    }
     if let (Value::Concrete(left), Value::Concrete(right)) = (left, right)
         && let Some(pair) = NumericPair::new(left, right)
     {
@@ -1153,27 +1181,44 @@ fn eval_function<P: PlaceholderKind, B: BindingAddress>(
                 return Err(format!("{}() expects 1 argument, got {}", name, args.len()));
             }
             let value = eval_expr(&args[0], arguments)?;
-            let length = match value {
-                EvalValue::Value(Value::Concrete(ConcreteValue::String(value))) => {
-                    value.expose_plaintext().len()
-                }
-                EvalValue::Value(Value::Concrete(ConcreteValue::List(value))) => value.len(),
-                EvalValue::Value(Value::Concrete(ConcreteValue::StringList(value))) => value.len(),
-                EvalValue::Value(Value::Concrete(ConcreteValue::Map(value))) => value.len(),
-                other => {
-                    return Err(format!(
-                        "{}() argument must be a string, list, or map, got {}",
-                        name,
-                        other.kind_name()
-                    ));
-                }
-            };
-            Ok(value_from(ConcreteValue::Int(length as i64)))
+            match value {
+                EvalValue::Value(value) => constraint_length(&value, name).map(EvalValue::Value),
+                other => Err(format!(
+                    "{}() argument must be a string, list, or map, got {}",
+                    name,
+                    other.kind_name()
+                )),
+            }
         }
         _ => Err(format!(
             "unknown function '{name}' in constraint expression"
         )),
     }
+}
+
+fn constraint_length<P: PlaceholderKind, B: BindingAddress>(
+    value: &Value<P, B>,
+    name: &str,
+) -> Result<Value<P, B>, String> {
+    let length = match value {
+        Value::Deferred(DeferredValue::Secret(payload)) => {
+            return payload
+                .try_map(|value| constraint_length(value, name))
+                .map(|payload| Value::Deferred(DeferredValue::Secret(payload)));
+        }
+        Value::Concrete(ConcreteValue::String(value)) => value.expose_plaintext().len(),
+        Value::Concrete(ConcreteValue::List(values)) => values.len(),
+        Value::Concrete(ConcreteValue::StringList(values)) => values.len(),
+        Value::Concrete(ConcreteValue::Map(values)) => values.len(),
+        other => {
+            return Err(format!(
+                "{}() argument must be a string, list, or map, got {}",
+                name,
+                EvalValue::Value(other.clone()).kind_name()
+            ));
+        }
+    };
+    Ok(Value::Concrete(ConcreteValue::Int(length as i64)))
 }
 
 #[cfg(test)]
@@ -1183,6 +1228,20 @@ mod tests {
     use super::*;
 
     type ValidateExpr = crate::parser::ValidateExpr<crate::resource::NoPlaceholder>;
+
+    #[test]
+    fn secret_origin_4275_constraint_reads_keep_string_taint() {
+        let secret: Value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "private-constraint-input".into(),
+            )))
+            .into(),
+        ));
+        let EvalValue::Value(value) = value_for_evaluation(&secret) else {
+            panic!("expected value")
+        };
+        assert!(!format!("{value:?}").contains("private-constraint-input"));
+    }
 
     #[test]
     fn require_exact_numeric_and_duration_ordering() {
@@ -1248,9 +1307,12 @@ mod tests {
     }
 
     fn secret_value() -> Value {
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("validation-test".into()),
-        ))))
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "validation-test".into(),
+            )))
+            .into(),
+        ))
     }
 
     fn length_at_least(variable: &str, minimum: i64) -> ValidateExpr {
@@ -1438,9 +1500,9 @@ mod tests {
         };
         let arguments = HashMap::from([(
             "password".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("plaintext".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("plaintext".into()))).into(),
+            )),
         )]);
 
         let result = evaluate_constraint(&expression, &arguments, "password is invalid");

@@ -25,10 +25,10 @@ use crate::parser::{AnalysisReference, AnalysisTree, Located, TypeExpr, Upstream
 #[cfg(test)]
 use crate::parser::{LoadedProviderContext, ProviderContext};
 use crate::resource::{
-    AbsoluteBindingAddress, BindingAddress, ParserPlaceholder, RelativeBindingName, Subscript,
-    Value,
+    AbsoluteBindingAddress, BindingAddress, DiagnosticScope, InsideSecret, ParserPlaceholder,
+    RelativeBindingName, SecretDiagnosticError, Subscript, Value,
 };
-use crate::schema::suggest_similar_name;
+use crate::schema::{SECRET_VALUE_MASK, suggest_similar_name};
 use crate::static_type::ConsumerExportStaticType;
 #[cfg(test)]
 use crate::static_type::StaticType;
@@ -117,6 +117,67 @@ impl<D: UpstreamRefDiagnostic> UpstreamRefDiagnostic for Located<D> {
         self.detail().diagnostic_message()
     }
 }
+
+/// An upstream finding whose entire payload is discarded at a secret boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamDiagnostic<D> {
+    detail: SecretDiagnosticError<D>,
+}
+
+impl<D> UpstreamDiagnostic<D> {
+    /// Structured details are available only for public findings.
+    pub fn public_detail(&self) -> Option<&D> {
+        match &self.detail {
+            SecretDiagnosticError::Public(detail) => Some(detail),
+            SecretDiagnosticError::InsideSecret => None,
+        }
+    }
+}
+
+impl<D> From<D> for UpstreamDiagnostic<D> {
+    fn from(detail: D) -> Self {
+        Self {
+            detail: DiagnosticScope::Public.protect(detail),
+        }
+    }
+}
+
+impl<D> InsideSecret for UpstreamDiagnostic<D> {
+    fn inside_secret(self) -> Self {
+        Self {
+            detail: self.detail.inside_secret(),
+        }
+    }
+}
+
+impl<D: UpstreamRefDiagnostic> UpstreamRefDiagnostic for UpstreamDiagnostic<D> {
+    fn location(&self) -> &str {
+        self.public_detail().map_or(SECRET_VALUE_MASK, D::location)
+    }
+
+    fn binding(&self) -> &str {
+        self.public_detail().map_or(SECRET_VALUE_MASK, D::binding)
+    }
+
+    fn field(&self) -> &str {
+        self.public_detail().map_or(SECRET_VALUE_MASK, D::field)
+    }
+
+    fn diagnostic_message(&self) -> String {
+        self.public_detail().map_or_else(
+            || crate::resource::INSIDE_SECRET_MESSAGE.into(),
+            D::diagnostic_message,
+        )
+    }
+}
+
+impl<D: UpstreamRefDiagnostic> std::fmt::Display for UpstreamDiagnostic<D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.location(), self.diagnostic_message())
+    }
+}
+
+impl<D: UpstreamRefDiagnostic + std::fmt::Debug> std::error::Error for UpstreamDiagnostic<D> {}
 
 /// An `upstream_state` binding whose source directory exists but couldn't
 /// be parsed. Downstream field-reference checks against this binding are
@@ -559,7 +620,7 @@ pub fn check_upstream_state_field_references<
 >(
     parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
-) -> Vec<Located<UpstreamFieldError>> {
+) -> Vec<Located<UpstreamDiagnostic<UpstreamFieldError>>> {
     check_upstream_state_field_references_inner(parsed, exports, true)
 }
 
@@ -575,7 +636,7 @@ pub fn check_upstream_state_untyped_field_references<
 >(
     parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
-) -> Vec<Located<UpstreamFieldError>> {
+) -> Vec<Located<UpstreamDiagnostic<UpstreamFieldError>>> {
     check_upstream_state_field_references_inner(parsed, exports, false)
 }
 
@@ -587,8 +648,8 @@ fn check_upstream_state_field_references_inner<
     parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
     include_typed_consumers: bool,
-) -> Vec<Located<UpstreamFieldError>> {
-    let mut errors: Vec<Located<UpstreamFieldError>> = Vec::new();
+) -> Vec<Located<UpstreamDiagnostic<UpstreamFieldError>>> {
+    let mut errors: Vec<Located<UpstreamDiagnostic<UpstreamFieldError>>> = Vec::new();
 
     // One &str slice per binding so a project with many bad refs doesn't
     // re-materialize the same Vec for every error.
@@ -601,28 +662,29 @@ fn check_upstream_state_field_references_inner<
         if usage == crate::resource::ResourceRefUsage::CoalesceValue {
             return;
         }
-        let path = reference.path();
-        let binding = path.binding_address();
-        let field = path.attribute();
-        let Some(keys) = exports.get(binding) else {
-            return;
-        };
-        if keys.contains_key(field) {
-            return;
-        }
-        let known = known_by_binding
-            .get(binding.as_str())
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        errors.push(Located::new(
-            reference.prefix_location().clone(),
-            UpstreamFieldError {
-                location: context.to_string(),
-                binding: binding.to_string(),
-                field: field.to_string(),
-                suggestion: suggest_similar_name(field, known),
-            },
-        ));
+        errors.extend(reference.collect_diagnostics(|path, errors| {
+            let binding = path.binding_address();
+            let field = path.attribute();
+            let Some(keys) = exports.get(binding) else {
+                return;
+            };
+            if keys.contains_key(field) {
+                return;
+            }
+            let known = known_by_binding
+                .get(binding.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            errors.push(Located::new(
+                reference.prefix_location().clone(),
+                UpstreamDiagnostic::from(UpstreamFieldError {
+                    location: context.to_string(),
+                    binding: binding.to_string(),
+                    field: field.to_string(),
+                    suggestion: suggest_similar_name(field, known),
+                }),
+            ));
+        }));
     };
     for occurrence in parsed.upstream_field_references() {
         if include_typed_consumers || !occurrence.typed_consumer() {
@@ -645,16 +707,11 @@ fn check_upstream_state_field_references_inner<
     // final error list so CLI output and any snapshot-style assertions
     // stay stable across runs.
     errors.sort_by(|a, b| {
-        (
-            a.detail().location.as_str(),
-            a.binding.as_str(),
-            a.field.as_str(),
-        )
-            .cmp(&(
-                b.detail().location.as_str(),
-                b.binding.as_str(),
-                b.field.as_str(),
-            ))
+        (a.detail().location(), a.binding(), a.field()).cmp(&(
+            b.detail().location(),
+            b.binding(),
+            b.field(),
+        ))
     });
     errors
 }
@@ -794,70 +851,66 @@ impl UpstreamRefDiagnostic for UpstreamForIterableShapeError {
 pub fn check_upstream_state_for_iterable_shapes<D, B, E>(
     parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
-) -> Vec<Located<UpstreamForIterableShapeError>>
+) -> Vec<Located<UpstreamDiagnostic<UpstreamForIterableShapeError>>>
 where
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 {
-    let mut errors: Vec<Located<UpstreamForIterableShapeError>> = Vec::new();
+    let mut errors: Vec<Located<UpstreamDiagnostic<UpstreamForIterableShapeError>>> = Vec::new();
     for deferred in parsed.for_iterables() {
         let binding_kind = ForIterableBindingKind::from_for_binding(deferred.binding());
         for reference in deferred.result_references() {
-            let path = reference.path();
-            let Some(fields) = exports.get(path.binding_address()) else {
-                continue;
-            };
-            let Some(entry) = fields.get(path.attribute()) else {
-                continue;
-            };
-            let Some(export_type) = entry.static_type.declared_known() else {
-                continue;
-            };
-            let export_kind = match export_type {
-                TypeExpr::List(_) => Some(ForIterableBindingKind::List),
-                TypeExpr::Map(_) => Some(ForIterableBindingKind::Map),
-                TypeExpr::String
-                | TypeExpr::Bool
-                | TypeExpr::Int
-                | TypeExpr::Float
-                | TypeExpr::Duration
-                | TypeExpr::Simple(_)
-                | TypeExpr::UnloadedSchemaType(_)
-                | TypeExpr::Ref(_)
-                | TypeExpr::DottedUnresolved(_)
-                | TypeExpr::SchemaType { .. }
-                | TypeExpr::Struct { .. }
-                | TypeExpr::StringLiteral(_)
-                | TypeExpr::Union(_) => None,
-            };
-            // Scalars feeding a `for` are a different kind of bug; the
-            // shape-check fires on them too because no kind matches.
-            if export_kind == Some(binding_kind) {
-                continue;
-            }
-            errors.push(Located::new(
-                reference.prefix_location().clone(),
-                UpstreamForIterableShapeError {
-                    location: format!("for-expression `{}`", deferred.header()),
-                    binding: path.binding().to_string(),
-                    field: path.attribute().to_string(),
-                    export_type: export_type.clone(),
-                    binding_kind,
-                },
-            ));
+            errors.extend(reference.collect_diagnostics(|path, errors| {
+                let Some(fields) = exports.get(path.binding_address()) else {
+                    return;
+                };
+                let Some(entry) = fields.get(path.attribute()) else {
+                    return;
+                };
+                let Some(export_type) = entry.static_type.declared_known() else {
+                    return;
+                };
+                let export_kind = match export_type {
+                    TypeExpr::List(_) => Some(ForIterableBindingKind::List),
+                    TypeExpr::Map(_) => Some(ForIterableBindingKind::Map),
+                    TypeExpr::String
+                    | TypeExpr::Bool
+                    | TypeExpr::Int
+                    | TypeExpr::Float
+                    | TypeExpr::Duration
+                    | TypeExpr::Simple(_)
+                    | TypeExpr::UnloadedSchemaType(_)
+                    | TypeExpr::Ref(_)
+                    | TypeExpr::DottedUnresolved(_)
+                    | TypeExpr::SchemaType { .. }
+                    | TypeExpr::Struct { .. }
+                    | TypeExpr::StringLiteral(_)
+                    | TypeExpr::Union(_) => None,
+                };
+                // Scalars feeding a `for` are a different kind of bug; the
+                // shape-check fires on them too because no kind matches.
+                if export_kind == Some(binding_kind) {
+                    return;
+                }
+                errors.push(Located::new(
+                    reference.prefix_location().clone(),
+                    UpstreamDiagnostic::from(UpstreamForIterableShapeError {
+                        location: format!("for-expression `{}`", deferred.header()),
+                        binding: path.binding().to_string(),
+                        field: path.attribute().to_string(),
+                        export_type: export_type.clone(),
+                        binding_kind,
+                    }),
+                ));
+            }));
         }
     }
     errors.sort_by(|a, b| {
-        (
-            a.detail().location.as_str(),
-            a.binding.as_str(),
-            a.field.as_str(),
-        )
-            .cmp(&(
-                b.detail().location.as_str(),
-                b.binding.as_str(),
-                b.field.as_str(),
-            ))
+        (a.detail().location(), a.binding(), a.field()).cmp(&(
+            b.detail().location(),
+            b.binding(),
+            b.field(),
+        ))
     });
     errors
 }
@@ -991,7 +1044,7 @@ pub fn check_upstream_state_attribute_access_shapes<
 >(
     parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
-) -> Vec<Located<UpstreamAttributeAccessShapeError>> {
+) -> Vec<Located<UpstreamDiagnostic<UpstreamAttributeAccessShapeError>>> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, true)
 }
 
@@ -1009,7 +1062,7 @@ pub fn check_upstream_state_attribute_access_shape_fallbacks<
 >(
     parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
-) -> Vec<Located<UpstreamAttributeAccessShapeError>> {
+) -> Vec<Located<UpstreamDiagnostic<UpstreamAttributeAccessShapeError>>> {
     check_upstream_state_attribute_access_shapes_inner(parsed, exports, false)
 }
 
@@ -1021,8 +1074,9 @@ fn check_upstream_state_attribute_access_shapes_inner<
     parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
     include_resolver_struct_errors: bool,
-) -> Vec<Located<UpstreamAttributeAccessShapeError>> {
-    let mut errors: Vec<Located<UpstreamAttributeAccessShapeError>> = Vec::new();
+) -> Vec<Located<UpstreamDiagnostic<UpstreamAttributeAccessShapeError>>> {
+    let mut errors: Vec<Located<UpstreamDiagnostic<UpstreamAttributeAccessShapeError>>> =
+        Vec::new();
     for occurrence in parsed.project_value_references() {
         visit_attribute_access(
             occurrence.reference(),
@@ -1044,16 +1098,11 @@ fn check_upstream_state_attribute_access_shapes_inner<
         }
     }
     errors.sort_by(|a, b| {
-        (
-            a.detail().location.as_str(),
-            a.binding.as_str(),
-            a.field.as_str(),
-        )
-            .cmp(&(
-                b.detail().location.as_str(),
-                b.binding.as_str(),
-                b.field.as_str(),
-            ))
+        (a.detail().location(), a.binding(), a.field()).cmp(&(
+            b.detail().location(),
+            b.binding(),
+            b.field(),
+        ))
     });
     errors
 }
@@ -1066,43 +1115,44 @@ fn visit_attribute_access<B: BindingAddress>(
     exports: &UpstreamExports<B>,
     location: &str,
     include_resolver_struct_errors: bool,
-    errors: &mut Vec<Located<UpstreamAttributeAccessShapeError>>,
+    errors: &mut Vec<Located<UpstreamDiagnostic<UpstreamAttributeAccessShapeError>>>,
 ) {
-    let path = reference.path();
-    let leading: Vec<String> = path.leading_field_path();
-    if leading.is_empty() {
-        return;
-    }
-    let binding = path.binding_address();
-    let attribute = path.attribute();
-    let Some(fields) = exports.get(binding) else {
-        return;
-    };
-    let Some(entry) = fields.get(attribute) else {
-        return;
-    };
-    let Some(export_type) = entry.static_type.declared_known() else {
-        return;
-    };
-    let walk_result = walk_type_expr_fields(export_type, &leading);
-    if let Err((mismatched_at, bad_segment)) = walk_result {
-        if !include_resolver_struct_errors && matches!(mismatched_at, TypeExpr::Struct { .. }) {
+    errors.extend(reference.collect_diagnostics(|path, errors| {
+        let leading: Vec<String> = path.leading_field_path();
+        if leading.is_empty() {
             return;
         }
-        let mismatched_at = mismatched_at.clone();
-        let bad_segment = bad_segment.to_string();
-        errors.push(Located::new(
-            reference.prefix_location().clone(),
-            UpstreamAttributeAccessShapeError {
-                location: location.to_string(),
-                binding: binding.to_string(),
-                field: attribute.to_string(),
-                field_path: leading,
-                mismatched_at,
-                bad_segment,
-            },
-        ));
-    }
+        let binding = path.binding_address();
+        let attribute = path.attribute();
+        let Some(fields) = exports.get(binding) else {
+            return;
+        };
+        let Some(entry) = fields.get(attribute) else {
+            return;
+        };
+        let Some(export_type) = entry.static_type.declared_known() else {
+            return;
+        };
+        let walk_result = walk_type_expr_fields(export_type, &leading);
+        if let Err((mismatched_at, bad_segment)) = walk_result {
+            if !include_resolver_struct_errors && matches!(mismatched_at, TypeExpr::Struct { .. }) {
+                return;
+            }
+            let mismatched_at = mismatched_at.clone();
+            let bad_segment = bad_segment.to_string();
+            errors.push(Located::new(
+                reference.prefix_location().clone(),
+                UpstreamDiagnostic::from(UpstreamAttributeAccessShapeError {
+                    location: location.to_string(),
+                    binding: binding.to_string(),
+                    field: attribute.to_string(),
+                    field_path: leading,
+                    mismatched_at,
+                    bad_segment,
+                }),
+            ));
+        }
+    }));
 }
 
 /// A `[index]` subscript reads an `upstream_state` export at a depth
@@ -1214,8 +1264,8 @@ pub fn check_upstream_state_subscript_shapes<
 >(
     parsed: &UpstreamAnalysis<'_, D, B, E>,
     exports: &UpstreamExports<B>,
-) -> Vec<Located<UpstreamSubscriptShapeError>> {
-    let mut errors: Vec<Located<UpstreamSubscriptShapeError>> = Vec::new();
+) -> Vec<Located<UpstreamDiagnostic<UpstreamSubscriptShapeError>>> {
+    let mut errors: Vec<Located<UpstreamDiagnostic<UpstreamSubscriptShapeError>>> = Vec::new();
     for occurrence in parsed.project_value_references() {
         visit_subscript_access(
             occurrence.reference(),
@@ -1235,16 +1285,11 @@ pub fn check_upstream_state_subscript_shapes<
         }
     }
     errors.sort_by(|a, b| {
-        (
-            a.detail().location.as_str(),
-            a.binding.as_str(),
-            a.field.as_str(),
-        )
-            .cmp(&(
-                b.detail().location.as_str(),
-                b.binding.as_str(),
-                b.field.as_str(),
-            ))
+        (a.detail().location(), a.binding(), a.field()).cmp(&(
+            b.detail().location(),
+            b.binding(),
+            b.field(),
+        ))
     });
     errors
 }
@@ -1256,82 +1301,83 @@ fn visit_subscript_access<B: BindingAddress>(
     reference: &AnalysisReference<B>,
     exports: &UpstreamExports<B>,
     location: &str,
-    errors: &mut Vec<Located<UpstreamSubscriptShapeError>>,
+    errors: &mut Vec<Located<UpstreamDiagnostic<UpstreamSubscriptShapeError>>>,
 ) {
-    let path = reference.path();
-    // Chained access (`cert.foo[0].bar`) is not yet exercised by
-    // this checker — see #3025 for the planned segments-driven
-    // walker. Skip the path here; the resolver still surfaces
-    // typos at apply time and the simple-shape paths remain
-    // covered.
-    if !path.is_simple_shape() {
-        return;
-    }
-    let subscripts = path.trailing_subscripts();
-    if subscripts.is_empty() {
-        return;
-    }
-    let binding = path.binding_address();
-    let attribute = path.attribute();
-    let Some(fields) = exports.get(binding) else {
-        return;
-    };
-    let Some(entry) = fields.get(attribute) else {
-        return;
-    };
-    let Some(export_type) = entry.static_type.declared_known() else {
-        return;
-    };
-    // If the field path itself doesn't resolve, the
-    // attribute-access check will already report it. Skip here so
-    // we don't double-fire.
-    let field_path: Vec<String> = path.leading_field_path();
-    let Ok(at_field_end) = walk_type_expr_fields(export_type, &field_path) else {
-        return;
-    };
-    // Step through each subscript, descending into the element
-    // type when it fits and emitting at the first kind mismatch.
-    let mut current = at_field_end;
-    for sub in &subscripts {
-        let next = match current {
-            TypeExpr::List(inner) => match sub {
-                Subscript::Int { .. } => Some(inner.as_ref()),
-                Subscript::Str { .. } => None,
-            },
-            TypeExpr::Map(inner) => match sub {
-                Subscript::Int { .. } => None,
-                Subscript::Str { .. } => Some(inner.as_ref()),
-            },
-            TypeExpr::String
-            | TypeExpr::Bool
-            | TypeExpr::Int
-            | TypeExpr::Float
-            | TypeExpr::Duration
-            | TypeExpr::Simple(_)
-            | TypeExpr::UnloadedSchemaType(_)
-            | TypeExpr::Ref(_)
-            | TypeExpr::DottedUnresolved(_)
-            | TypeExpr::SchemaType { .. }
-            | TypeExpr::Struct { .. }
-            | TypeExpr::StringLiteral(_)
-            | TypeExpr::Union(_) => None,
-        };
-        let Some(next) = next else {
-            errors.push(Located::new(
-                reference.prefix_location().clone(),
-                UpstreamSubscriptShapeError {
-                    location: location.to_string(),
-                    binding: binding.to_string(),
-                    field: attribute.to_string(),
-                    field_path: field_path.clone(),
-                    mismatched_at: current.clone(),
-                    bad_subscript: sub.clone(),
-                },
-            ));
+    errors.extend(reference.collect_diagnostics(|path, errors| {
+        // Chained access (`cert.foo[0].bar`) is not yet exercised by
+        // this checker — see #3025 for the planned segments-driven
+        // walker. Skip the path here; the resolver still surfaces
+        // typos at apply time and the simple-shape paths remain
+        // covered.
+        if !path.is_simple_shape() {
+            return;
+        }
+        let subscripts = path.trailing_subscripts();
+        if subscripts.is_empty() {
+            return;
+        }
+        let binding = path.binding_address();
+        let attribute = path.attribute();
+        let Some(fields) = exports.get(binding) else {
             return;
         };
-        current = next;
-    }
+        let Some(entry) = fields.get(attribute) else {
+            return;
+        };
+        let Some(export_type) = entry.static_type.declared_known() else {
+            return;
+        };
+        // If the field path itself doesn't resolve, the
+        // attribute-access check will already report it. Skip here so
+        // we don't double-fire.
+        let field_path: Vec<String> = path.leading_field_path();
+        let Ok(at_field_end) = walk_type_expr_fields(export_type, &field_path) else {
+            return;
+        };
+        // Step through each subscript, descending into the element
+        // type when it fits and emitting at the first kind mismatch.
+        let mut current = at_field_end;
+        for sub in &subscripts {
+            let next = match current {
+                TypeExpr::List(inner) => match sub {
+                    Subscript::Int { .. } => Some(inner.as_ref()),
+                    Subscript::Str { .. } => None,
+                },
+                TypeExpr::Map(inner) => match sub {
+                    Subscript::Int { .. } => None,
+                    Subscript::Str { .. } => Some(inner.as_ref()),
+                },
+                TypeExpr::String
+                | TypeExpr::Bool
+                | TypeExpr::Int
+                | TypeExpr::Float
+                | TypeExpr::Duration
+                | TypeExpr::Simple(_)
+                | TypeExpr::UnloadedSchemaType(_)
+                | TypeExpr::Ref(_)
+                | TypeExpr::DottedUnresolved(_)
+                | TypeExpr::SchemaType { .. }
+                | TypeExpr::Struct { .. }
+                | TypeExpr::StringLiteral(_)
+                | TypeExpr::Union(_) => None,
+            };
+            let Some(next) = next else {
+                errors.push(Located::new(
+                    reference.prefix_location().clone(),
+                    UpstreamDiagnostic::from(UpstreamSubscriptShapeError {
+                        location: location.to_string(),
+                        binding: binding.to_string(),
+                        field: attribute.to_string(),
+                        field_path: field_path.clone(),
+                        mismatched_at: current.clone(),
+                        bad_subscript: sub.clone(),
+                    }),
+                ));
+                return;
+            };
+            current = next;
+        }
+    }));
 }
 
 #[cfg(test)]
@@ -1465,6 +1511,116 @@ mod tests {
                 type_expr,
             ))),
             value: None,
+        }
+    }
+
+    fn public<D>(diagnostic: &Located<UpstreamDiagnostic<D>>) -> &D {
+        diagnostic.public_detail().expect("public diagnostic")
+    }
+
+    fn diagnostic_fixtures(
+        binding: &str,
+    ) -> (
+        UpstreamFieldError,
+        UpstreamForIterableShapeError,
+        UpstreamAttributeAccessShapeError,
+        UpstreamSubscriptShapeError,
+    ) {
+        (
+            UpstreamFieldError {
+                location: "private_location".into(),
+                binding: binding.into(),
+                field: "private_field".into(),
+                suggestion: Some("private_suggestion".into()),
+            },
+            UpstreamForIterableShapeError {
+                location: "private_location".into(),
+                binding: binding.into(),
+                field: "private_field".into(),
+                export_type: TypeExpr::StringLiteral("private_type".into()),
+                binding_kind: ForIterableBindingKind::List,
+            },
+            UpstreamAttributeAccessShapeError {
+                location: "private_location".into(),
+                binding: binding.into(),
+                field: "private_field".into(),
+                field_path: vec!["private_path".into()],
+                mismatched_at: TypeExpr::StringLiteral("private_type".into()),
+                bad_segment: "private_segment".into(),
+            },
+            UpstreamSubscriptShapeError {
+                location: "private_location".into(),
+                binding: binding.into(),
+                field: "private_field".into(),
+                field_path: vec!["private_path".into()],
+                mismatched_at: TypeExpr::StringLiteral("private_type".into()),
+                bad_subscript: Subscript::Str {
+                    key: "private_key".into(),
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn public_upstream_diagnostics_do_not_infer_scope_from_mask_text() {
+        let (field, iterable, attribute, subscript) = diagnostic_fixtures("(secret)");
+        let diagnostics: [&dyn UpstreamRefDiagnostic; 4] =
+            [&field, &iterable, &attribute, &subscript];
+        for error in diagnostics {
+            assert_eq!(error.binding(), "(secret)");
+            assert_eq!(error.field(), "private_field");
+            assert_eq!(error.location(), "private_location");
+            let message = error.diagnostic_message();
+            assert!(message.starts_with("upstream_state `(secret)"), "{message}");
+            assert!(message.contains("private_field"), "{message}");
+        }
+    }
+
+    #[test]
+    fn protected_upstream_diagnostics_discard_all_private_details() {
+        use crate::resource::InsideSecret;
+
+        fn check(error: impl UpstreamRefDiagnostic + std::fmt::Debug) {
+            let error = UpstreamDiagnostic::from(error)
+                .inside_secret()
+                .inside_secret();
+            assert!(error.public_detail().is_none());
+            assert_eq!(error.location(), "(secret)");
+            assert_eq!(error.binding(), "(secret)");
+            assert_eq!(error.field(), "(secret)");
+            assert_eq!(
+                error.diagnostic_message(),
+                crate::resource::INSIDE_SECRET_MESSAGE
+            );
+            assert_eq!(
+                error.to_string(),
+                "(secret): invalid value inside secret(...)"
+            );
+            assert!(!format!("{error:?}").contains("private_"), "{error:?}");
+        }
+
+        let (field, iterable, attribute, subscript) = diagnostic_fixtures("private_binding");
+        check(field);
+        check(iterable);
+        check(attribute);
+        check(subscript);
+    }
+
+    #[test]
+    fn review3_secret_upstream_lookup_protects_findings() {
+        let parsed = parse_project(
+            r#"
+            let private_orgs = upstream_state { source = "../organizations" }
+            test.resource { name = secret(private_orgs.private_field) }
+        "#,
+        );
+        let exports = mk_exports(&[("private_orgs", &[])]);
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let errors = check_upstream_state_field_references(&tree, &exports);
+        assert_eq!(errors.len(), 1);
+        for text in [errors[0].to_string(), format!("{:?}", errors[0])] {
+            assert!(!text.contains("private_orgs"), "{text}");
+            assert!(!text.contains("private_field"), "{text}");
         }
     }
 
@@ -2007,9 +2163,9 @@ mod tests {
         let errs =
             check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1, "got: {errs:?}");
-        assert_eq!(errs[0].binding, "orgs");
-        assert_eq!(errs[0].field, "account");
-        assert_eq!(errs[0].suggestion.as_deref(), Some("accounts"));
+        assert_eq!(public(&errs[0]).binding, "orgs");
+        assert_eq!(public(&errs[0]).field, "account");
+        assert_eq!(public(&errs[0]).suggestion.as_deref(), Some("accounts"));
         assert!(errs[0].detail().to_string().contains("exports.bad"));
         assert!(
             errs[0]
@@ -2054,7 +2210,7 @@ mod tests {
         let errs =
             check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1, "got: {errs:?}");
-        assert_eq!(errs[0].field, "required");
+        assert_eq!(public(&errs[0]).field, "required");
         Ok(())
     }
 
@@ -2078,7 +2234,7 @@ mod tests {
             check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         let fields = errs
             .iter()
-            .map(|error| error.field.as_str())
+            .map(|error| public(error).field.as_str())
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
             fields,
@@ -2132,7 +2288,7 @@ mod tests {
             &exports,
         );
         assert_eq!(errs.len(), 1, "got: {errs:?}");
-        assert_eq!(errs[0].field, "fallback");
+        assert_eq!(public(&errs[0]).field, "fallback");
         Ok(())
     }
 
@@ -2163,7 +2319,7 @@ mod tests {
             &exports,
         );
         assert_eq!(errs.len(), 1, "got: {errs:?}");
-        assert_eq!(errs[0].bad_segment, "missing");
+        assert_eq!(public(&errs[0]).bad_segment, "missing");
         Ok(())
     }
 
@@ -2185,8 +2341,8 @@ mod tests {
         let errs =
             check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].field, "anything");
-        assert!(errs[0].suggestion.is_none());
+        assert_eq!(public(&errs[0]).field, "anything");
+        assert!(public(&errs[0]).suggestion.is_none());
         Ok(())
     }
 
@@ -2228,8 +2384,8 @@ mod tests {
         let errs =
             check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1, "got: {errs:?}");
-        assert_eq!(errs[0].field, "acc");
-        assert!(errs[0].location.contains("let"));
+        assert_eq!(public(&errs[0]).field, "acc");
+        assert!(public(&errs[0]).location.contains("let"));
         Ok(())
     }
 
@@ -2309,7 +2465,7 @@ mod tests {
         let errs =
             check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert!(
-            errs.iter().any(|e| e.field == "NONEXISTENT"),
+            errs.iter().any(|e| public(e).field == "NONEXISTENT"),
             "for-body ref to non-exported field must be flagged, got: {errs:?}"
         );
         Ok(())
@@ -2333,7 +2489,10 @@ mod tests {
         let exports = mk_exports(&[("orgs", &["accounts"])]);
         let errs =
             check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
-        let missing: Vec<_> = errs.iter().filter(|e| e.field == "missing").collect();
+        let missing: Vec<_> = errs
+            .iter()
+            .filter(|e| public(e).field == "missing")
+            .collect();
         assert_eq!(missing.len(), 1, "must not double-report, got: {missing:?}");
         Ok(())
     }
@@ -2359,10 +2518,10 @@ mod tests {
         let errs =
             check_upstream_state_field_references(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1);
-        assert_eq!(errs[0].binding, "orgs");
-        assert_eq!(errs[0].field, "account");
-        assert_eq!(errs[0].suggestion.as_deref(), Some("accounts"));
-        assert!(errs[0].location.contains("for"));
+        assert_eq!(public(&errs[0]).binding, "orgs");
+        assert_eq!(public(&errs[0]).field, "account");
+        assert_eq!(public(&errs[0]).suggestion.as_deref(), Some("accounts"));
+        assert!(public(&errs[0]).location.contains("for"));
         Ok(())
     }
 
@@ -2404,12 +2563,12 @@ mod tests {
             let contexts = if field_error {
                 check_upstream_state_field_references(&tree, &exports)
                     .into_iter()
-                    .map(|finding| finding.detail().location.clone())
+                    .map(|finding| finding.detail().location().to_string())
                     .collect::<Vec<_>>()
             } else {
                 check_upstream_state_subscript_shapes(&tree, &exports)
                     .into_iter()
-                    .map(|finding| finding.detail().location.clone())
+                    .map(|finding| finding.detail().location().to_string())
                     .collect::<Vec<_>>()
             };
             assert_eq!(contexts.len(), 2, "{expression}: {contexts:?}");
@@ -3433,9 +3592,9 @@ mod tests {
             1,
             "map export + simple binding must fail, got: {errs:?}"
         );
-        assert_eq!(errs[0].binding, "orgs");
-        assert_eq!(errs[0].field, "accounts");
-        assert_eq!(errs[0].binding_kind, ForIterableBindingKind::List);
+        assert_eq!(public(&errs[0]).binding, "orgs");
+        assert_eq!(public(&errs[0]).field, "accounts");
+        assert_eq!(public(&errs[0]).binding_kind, ForIterableBindingKind::List);
         let msg = errs[0].diagnostic_message();
         assert!(
             msg.contains("map(AwsAccountId)") && msg.contains("requires a list"),
@@ -3483,8 +3642,8 @@ mod tests {
             1,
             "list export + map binding must fail, got: {errs:?}"
         );
-        assert_eq!(errs[0].field, "accounts");
-        assert_eq!(errs[0].binding_kind, ForIterableBindingKind::Map);
+        assert_eq!(public(&errs[0]).field, "accounts");
+        assert_eq!(public(&errs[0]).binding_kind, ForIterableBindingKind::Map);
         let msg = errs[0].diagnostic_message();
         assert!(
             msg.contains("list(AwsAccountId)") && msg.contains("requires a map"),
@@ -3622,8 +3781,8 @@ mod tests {
             1,
             "expected one shape mismatch from list↔map upstream change, got: {errs:?}"
         );
-        assert_eq!(errs[0].field, "accounts");
-        assert_eq!(errs[0].binding_kind, ForIterableBindingKind::List);
+        assert_eq!(public(&errs[0]).field, "accounts");
+        assert_eq!(public(&errs[0]).binding_kind, ForIterableBindingKind::List);
         Ok(())
     }
 
@@ -3727,7 +3886,7 @@ mod tests {
             1,
             "indexed binding + map export must fail, got: {errs:?}"
         );
-        assert_eq!(errs[0].binding_kind, ForIterableBindingKind::List);
+        assert_eq!(public(&errs[0]).binding_kind, ForIterableBindingKind::List);
         Ok(())
     }
 
@@ -3776,8 +3935,8 @@ mod tests {
             &exports,
         );
         assert_eq!(errs.len(), 2, "expected two errors, got: {errs:?}");
-        assert_eq!(errs[0].field, "alpha_accounts");
-        assert_eq!(errs[1].field, "beta_accounts");
+        assert_eq!(public(&errs[0]).field, "alpha_accounts");
+        assert_eq!(public(&errs[1]).field, "beta_accounts");
         Ok(())
     }
 
@@ -3934,9 +4093,9 @@ mod tests {
             1,
             "unknown struct field must fail, got: {errs:?}"
         );
-        assert_eq!(errs[0].binding, "orgs");
-        assert_eq!(errs[0].field, "account");
-        assert_eq!(errs[0].field_path, vec!["region".to_string()]);
+        assert_eq!(public(&errs[0]).binding, "orgs");
+        assert_eq!(public(&errs[0]).field, "account");
+        assert_eq!(public(&errs[0]).field_path, vec!["region".to_string()]);
         let msg = errs[0].diagnostic_message();
         assert!(
             msg.contains("region"),
@@ -4225,10 +4384,10 @@ mod tests {
             "nested unknown field must fail, got: {errs:?}"
         );
         assert_eq!(
-            errs[0].field_path,
+            public(&errs[0]).field_path,
             vec!["network".to_string(), "bad_field".to_string()]
         );
-        assert_eq!(errs[0].bad_segment, "bad_field");
+        assert_eq!(public(&errs[0]).bad_segment, "bad_field");
         let msg = errs[0].diagnostic_message();
         assert!(
             msg.contains("bad_field"),
@@ -4265,11 +4424,11 @@ mod tests {
             &exports,
         );
         assert_eq!(errs.len(), 1, "list-at-depth must flag, got: {errs:?}");
-        assert_eq!(errs[0].bad_segment, "foo");
+        assert_eq!(public(&errs[0]).bad_segment, "foo");
         assert!(
-            matches!(errs[0].mismatched_at, TypeExpr::List(_)),
+            matches!(public(&errs[0]).mismatched_at, TypeExpr::List(_)),
             "mismatched_at must be the inner list, got: {:?}",
-            errs[0].mismatched_at
+            public(&errs[0]).mismatched_at
         );
         let msg = errs[0].diagnostic_message();
         assert!(
@@ -4342,9 +4501,9 @@ mod tests {
             1,
             "expected one shape mismatch from list export + .field access, got: {errs:?}"
         );
-        assert_eq!(errs[0].field, "accounts");
-        assert_eq!(errs[0].bad_segment, "foo");
-        assert!(matches!(errs[0].mismatched_at, TypeExpr::List(_)));
+        assert_eq!(public(&errs[0]).field, "accounts");
+        assert_eq!(public(&errs[0]).bad_segment, "foo");
+        assert!(matches!(public(&errs[0]).mismatched_at, TypeExpr::List(_)));
         Ok(())
     }
 
@@ -4423,9 +4582,12 @@ mod tests {
         let errs =
             check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1, "[int] on map must fail, got: {errs:?}");
-        assert_eq!(errs[0].binding, "orgs");
-        assert_eq!(errs[0].field, "accounts");
-        assert!(matches!(errs[0].bad_subscript, Subscript::Int { index: 0 }));
+        assert_eq!(public(&errs[0]).binding, "orgs");
+        assert_eq!(public(&errs[0]).field, "accounts");
+        assert!(matches!(
+            public(&errs[0]).bad_subscript,
+            Subscript::Int { index: 0 }
+        ));
         let msg = errs[0].diagnostic_message();
         assert!(msg.contains("map"), "message must mention map shape: {msg}");
         assert!(
@@ -4456,7 +4618,10 @@ mod tests {
         let errs =
             check_upstream_state_subscript_shapes(&AnalysisTree::try_from_file(&parsed)?, &exports);
         assert_eq!(errs.len(), 1, "[\"k\"] on list must fail, got: {errs:?}");
-        assert!(matches!(errs[0].bad_subscript, Subscript::Str { .. }));
+        assert!(matches!(
+            public(&errs[0]).bad_subscript,
+            Subscript::Str { .. }
+        ));
         let msg = errs[0].diagnostic_message();
         assert!(
             msg.contains("list"),
@@ -4492,9 +4657,12 @@ mod tests {
             1,
             "the valid integer postfix access should pass and the string alias access should fail: {errs:?}"
         );
-        assert!(matches!(errs[0].bad_subscript, Subscript::Str { .. }));
-        assert_eq!(errs[0].binding, "orgs");
-        assert_eq!(errs[0].field, "accounts");
+        assert!(matches!(
+            public(&errs[0]).bad_subscript,
+            Subscript::Str { .. }
+        ));
+        assert_eq!(public(&errs[0]).binding, "orgs");
+        assert_eq!(public(&errs[0]).field, "accounts");
         Ok(())
     }
 
@@ -4724,7 +4892,10 @@ mod tests {
             1,
             "second subscript mismatch must fire, got: {errs:?}"
         );
-        assert!(matches!(errs[0].bad_subscript, Subscript::Str { .. }));
+        assert!(matches!(
+            public(&errs[0]).bad_subscript,
+            Subscript::Str { .. }
+        ));
         Ok(())
     }
 

@@ -1012,7 +1012,7 @@ async fn round8_unused_secret_values_are_never_requested_or_rejected_by_enumerat
             false,
         );
         let value = if wrapped {
-            Value::Deferred(DeferredValue::Secret(Box::new(string(SECRET))))
+            Value::Deferred(DeferredValue::Secret(Box::new(string(SECRET)).into()))
         } else {
             Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
                 SECRET,
@@ -1041,7 +1041,7 @@ async fn round8_compared_secret_reference_list_leaves_keep_typed_paths_and_redac
     for ordered in [true, false] {
         for wrapped in [true, false] {
             let secret = if wrapped {
-                Value::Deferred(DeferredValue::Secret(Box::new(string(SECRET))))
+                Value::Deferred(DeferredValue::Secret(Box::new(string(SECRET)).into()))
             } else {
                 Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
                     SECRET,
@@ -2543,7 +2543,7 @@ async fn round2_secret_reference_is_rejected_before_any_guest_call() {
         for equal in [true, false] {
             for wrapped in [true, false] {
                 let secret = if wrapped {
-                    Value::Deferred(DeferredValue::Secret(Box::new(string(SECRET))))
+                    Value::Deferred(DeferredValue::Secret(Box::new(string(SECRET)).into()))
                 } else {
                     Value::Concrete(ConcreteValue::String(
                         crate::resource::ValueString::diagnostic_sensitive(SECRET),

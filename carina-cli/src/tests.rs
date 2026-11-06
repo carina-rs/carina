@@ -94,8 +94,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_40_for_pinned_source_identity_and_resolved_dependencies() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 40);
+fn saved_plan_version_is_41_for_typed_secrets_and_pinned_source_identity() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 41);
 }
 
 #[test]
@@ -2212,9 +2212,12 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
 #[tokio::test]
 async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file() {
     let color_mode = crate::output_style::ColorMode::Plain;
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("secret-value".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "secret-value".into(),
+        )))
+        .into(),
+    ));
     let persisted_secret = PersistedValue::encode_desired_value(&secret, None)
         .expect("secret is persistable")
         .as_json()
@@ -3921,14 +3924,17 @@ fn plan_file_serialization_redacts_secrets() {
     };
 
     // Build a plan with secrets in resources, states, and effects
-    let secret_password = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("super-secret-pw".into()),
-    ))));
+    let secret_password = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "super-secret-pw".into(),
+        )))
+        .into(),
+    ));
     let secret_arithmetic = Value::Deferred(DeferredValue::IntegerArithmetic(
         carina_core::integer_arithmetic::ValidatedIntegerExpr::new(
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::Int(42),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::Int(42))).into(),
+            )),
             carina_core::integer_arithmetic::IntegerOp::Add,
             Value::Concrete(ConcreteValue::Int(1)),
             carina_core::integer_arithmetic::IntegerOperatorSpan::synthetic(),
@@ -5656,9 +5662,9 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
         resource_id.clone(),
         HashMap::from([(
             "name".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("created".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("created".into()))).into(),
+            )),
         )]),
     )
     .with_identifier("created-id");

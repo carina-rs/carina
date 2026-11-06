@@ -1945,6 +1945,13 @@ impl PartialReadBack {
         self.missing_attributes.contains(attribute)
     }
 
+    pub(crate) fn attribute_key_is_missing(
+        &self,
+        key: &crate::resource::DependencyKey<String>,
+    ) -> bool {
+        key.is_in(&self.missing_attributes)
+    }
+
     pub(crate) fn end(&self) -> crate::provider::ReadBackEnd {
         self.end
     }
@@ -2035,6 +2042,19 @@ impl<P: PlaceholderKind, B: BindingAddress> ResolvedBinding<P, B> {
     /// snapshot: nested provider-filled fields can still be unpublished.
     fn attribute_snapshot_is_known(&self, attribute: &str) -> bool {
         !self.changed_attributes.contains(attribute) && self.completeness.attribute_known(attribute)
+    }
+    fn attribute_key_snapshot_is_known(
+        &self,
+        key: &crate::resource::DependencyKey<String>,
+    ) -> bool {
+        !key.is_in(&self.changed_attributes)
+            && match &self.completeness {
+                BindingCompleteness::Complete => true,
+                BindingCompleteness::Incomplete => false,
+                BindingCompleteness::PartialReadBack(partial) => {
+                    !partial.attribute_key_is_missing(key)
+                }
+            }
     }
 }
 
@@ -2997,14 +3017,20 @@ impl ResolvedBindings {
 
     pub fn access_miss_policy_for_value(&self, value: &Value) -> crate::resource::AccessMissPolicy {
         let mut definitive = true;
-        value.visit_resource_refs(&mut |path| {
-            definitive &= self.by_name.get(path.binding()).is_some_and(|binding| {
-                binding.attribute_snapshot_is_known(path.attribute())
-                    && !binding.refreshable_attributes.contains(path.attribute())
-            });
+        value.visit_resource_refs(&mut |path, _usage| {
+            definitive &= path
+                .binding_key()
+                .lookup_by_name(&self.by_name)
+                .is_some_and(|binding| {
+                    binding.attribute_key_snapshot_is_known(&path.attribute_key())
+                        && !path.attribute_key().is_in(&binding.refreshable_attributes)
+                });
         });
         value.visit_binding_refs(&mut |name| {
-            definitive &= self.binding_is_fully_definitive(name.as_str());
+            definitive &= name.lookup_by_name(&self.by_name).is_some_and(|binding| {
+                binding.completeness.all_attributes_known()
+                    && binding.refreshable_attributes.is_empty()
+            });
         });
         if definitive {
             crate::resource::AccessMissPolicy::Error
@@ -5233,9 +5259,9 @@ mod resolved_bindings_tests {
         let plaintext = Value::Concrete(ConcreteValue::String("sensitive".into()));
         let resource_attrs = HashMap::from([(
             "comment".to_string(),
-            Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(
-                plaintext.clone(),
-            ))),
+            Value::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(plaintext.clone()).into(),
+            )),
         )]);
         let state = State {
             id: ResourceId::with_identity("test.resource", "secret"),
@@ -5258,8 +5284,10 @@ mod resolved_bindings_tests {
                 .get("secret")
                 .and_then(|attrs| attrs.get("comment")),
             Some(
-                &(Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(plaintext))))
-                    .to_snapshot()
+                &(Value::Deferred(crate::resource::DeferredValue::Secret(
+                    Box::new(plaintext).into()
+                )))
+                .to_snapshot()
             )
         );
     }

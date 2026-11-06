@@ -477,6 +477,8 @@ impl ResidualModuleResolutionError {
                 }
                 | ParseError::RecursiveFunction(_)
                 | ParseError::CyclicLetBinding { chain: _ }
+                | ParseError::InsideSecret { .. }
+                | ParseError::SecretInConstraint { .. }
                 | ParseError::UserFunctionError(_) => false,
             },
             ModuleError::ParseInFile { path, error } => {

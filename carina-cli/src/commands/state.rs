@@ -91,15 +91,7 @@ fn format_deferred_state_refresh_warning(
 ) -> String {
     let mut refs = unresolved
         .iter()
-        .flat_map(|input| {
-            let paths = input.paths.iter().map(|path| path.to_dot_string());
-            let bindings = input.bindings.iter().map(ToString::to_string);
-            let unknowns = input
-                .unknowns
-                .iter()
-                .map(|reason| format!("unknown({reason})"));
-            paths.chain(bindings).chain(unknowns)
-        })
+        .flat_map(UnresolvedDataSourceInput::diagnostic_references)
         .collect::<Vec<_>>();
     if refs.is_empty() {
         refs.extend(
@@ -6147,9 +6139,9 @@ mod tests {
         );
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
             "password",
-            Value::Deferred(DeferredValue::Secret(Box::new(string_value(
-                "plain-secret",
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(string_value("plain-secret")).into(),
+            )),
         );
 
         refresh_deposed_generations_until_cancelled(
@@ -7665,9 +7657,9 @@ mod tests {
             Resource::with_provider("awscc", "db.Instance", "main", Some("east".to_string()))
                 .with_attribute(
                     "password",
-                    Value::Deferred(DeferredValue::Secret(Box::new(string_value(
-                        "plain-secret",
-                    )))),
+                    Value::Deferred(DeferredValue::Secret(
+                        Box::new(string_value("plain-secret")).into(),
+                    )),
                 );
         let right_instance =
             Resource::with_provider("awscc", "db.Instance", "main", Some("west".to_string()));
@@ -7914,15 +7906,14 @@ mod tests {
         let resource: DataSource = DataSource::with_provider("mock", "iam.Roles", "roles", None);
         let warning = format_deferred_state_refresh_warning(
             &resource,
-            &[UnresolvedDataSourceInput {
-                attribute: "name_regex".to_string(),
-                paths: vec![
-                    carina_core::resource::AccessPath::new("target_role", "role_name")
+            &[UnresolvedDataSourceInput::collect(
+                "name_regex",
+                &Value::Deferred(carina_core::resource::DeferredValue::ResourceRef {
+                    path: carina_core::resource::AccessPath::new("target_role", "role_name")
                         .resolve_root_for_test(),
-                ],
-                bindings: Vec::new(),
-                unknowns: Vec::new(),
-            }],
+                }),
+            )
+            .unwrap()],
         );
 
         assert!(warning.contains("mock.iam.Roles.roles"));

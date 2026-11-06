@@ -23,6 +23,9 @@ pub(crate) enum IfConditionDependency {
     Runtime,
 }
 
+impl crate::resource::SealedSecretReadResult for IfConditionDependency {}
+impl crate::resource::SecretReadResult for IfConditionDependency {}
+
 impl IfConditionDependency {
     fn combine(self, other: Self) -> Self {
         match (self, other) {
@@ -127,7 +130,9 @@ fn classify_non_static_if_condition(
                 }
             },
         ),
-        Value::Deferred(DeferredValue::Secret(inner)) => classify(inner, visiting_functions),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            inner.visit(|value| classify(value, visiting_functions))
+        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             classify(value, visiting_functions).combine(classify(default, visiting_functions))
         }
@@ -254,7 +259,9 @@ pub(crate) fn is_static_value<B: BindingAddress>(
         | GenericValue::Deferred(GenericDeferredValue::Unavailable { .. })
         | GenericValue::Deferred(GenericDeferredValue::Unknown(_))
         | GenericValue::Deferred(GenericDeferredValue::Placeholder(_)) => false,
-        GenericValue::Deferred(GenericDeferredValue::Secret(inner)) => is_static_value(inner),
+        GenericValue::Deferred(GenericDeferredValue::Secret(inner)) => {
+            inner.visit(|secret_value| is_static_value(secret_value))
+        }
     }
 }
 
@@ -294,9 +301,11 @@ pub(crate) fn evaluate_static_value(
             }
             Ok(Value::Concrete(ConcreteValue::Map(evaluated)))
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => Ok(Value::Deferred(
-            DeferredValue::Secret(Box::new(evaluate_static_value(*inner, config)?)),
-        )),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            Ok(Value::Deferred(DeferredValue::Secret(inner.try_map(
+                |value| evaluate_static_value(value.clone(), config),
+            )?)))
+        }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             let evaluated = parts
                 .into_iter()

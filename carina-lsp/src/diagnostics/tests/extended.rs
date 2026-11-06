@@ -4,6 +4,45 @@ use carina_core::parser::TypeExpr;
 use carina_core::resource::AuthoredValue as Value;
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 
+#[path = "../../../../carina-core/tests/support/secret_origin.rs"]
+mod secret_origin_fixture;
+
+#[test]
+fn secret_origin_4275_directory_diagnostics_are_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    secret_origin_fixture::write_directory(dir.path());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", secret_origin_fixture::schema());
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let diagnostics =
+        analyze_with_buffer(&engine, dir.path(), "main.crn", secret_origin_fixture::MAIN);
+    let mismatch = diagnostics
+        .iter()
+        .find(|d| d.message.contains("expected Int"))
+        .unwrap_or_else(|| panic!("the mismatch must survive redaction: {diagnostics:?}"));
+    assert_eq!(
+        mismatch.message,
+        "Type mismatch: expected Int, got String (from (secret))"
+    );
+    assert_eq!(mismatch.range.start.line, 0);
+    assert!(
+        !serde_json::to_string(&diagnostics)
+            .unwrap()
+            .contains("private-"),
+        "{diagnostics:?}"
+    );
+    assert!(
+        analyze_with_buffer(
+            &engine,
+            dir.path(),
+            "producer.crn",
+            "let producer = mock.test.Secret {}\n"
+        )
+        .iter()
+        .all(|d| !d.message.contains("expected Int"))
+    );
+}
+
 const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is derived from \
 mutable attributes for multiple 'mock.test.resource' declarations using provider instance \
 '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
@@ -17629,5 +17668,49 @@ fn resource_child_failure_has_one_error_across_files() {
     assert!(
         errors[0].message.contains("no_such_attr"),
         "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn secret_origin_4275_lsp_nested_failure_is_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    secret_origin_fixture::write_directory(dir.path());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", secret_origin_fixture::schema());
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let diagnostics = analyze_with_buffer(
+        &engine,
+        dir.path(),
+        "main.crn",
+        "mock.test.Secret { params = secret(cidr_subnet(\"private-invalid-cidr\", 1, 1)) }\n",
+    );
+    assert!(!diagnostics.is_empty());
+    assert!(
+        !serde_json::to_string(&diagnostics)
+            .unwrap()
+            .contains("private-"),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn secret_origin_4275_lsp_reference_errors_are_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    secret_origin_fixture::write_directory(dir.path());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", secret_origin_fixture::reference_schema());
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let diagnostics = analyze_with_buffer(
+        &engine,
+        dir.path(),
+        "main.crn",
+        "mock.test.Secret { params = secret(producer.config.private_field) }\n",
+    );
+    assert!(!diagnostics.is_empty());
+    assert!(
+        !serde_json::to_string(&diagnostics)
+            .unwrap()
+            .contains("private_field"),
+        "{diagnostics:?}"
     );
 }

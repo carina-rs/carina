@@ -121,10 +121,11 @@ use crate::provider::{
     ResumeFailureKind, ResumeOutcome, SentAttributes, SentDesiredAttributes, UnknownCreateOutcome,
     UpdateRequest,
 };
+#[cfg(test)]
+use crate::resource::ApplyTimeUnknown;
 use crate::resource::{
-    ApplyTimeUnknown, ConcreteValue, Current, DataSource, DeferredValue, InterpolationPart,
-    ModuleSource, ResolvedResource, Resource, ResourceId, ResourceIdentity, SavedModuleSource,
-    SnapshotState as State, Value,
+    Current, DataSource, ModuleSource, ResolvedResource, Resource, ResourceId, ResourceIdentity,
+    SavedModuleSource, SnapshotState as State,
 };
 use crate::wait::WaitObservation;
 
@@ -758,58 +759,6 @@ impl<S: Clone> ProviderCheckInputs<'_, S> {
     }
 }
 
-fn visit_unknowns(value: &Value, f: &mut impl FnMut(&ApplyTimeUnknown)) {
-    match value {
-        Value::Deferred(DeferredValue::Unknown(reason)) => f(reason),
-        Value::Concrete(ConcreteValue::List(items)) => {
-            for item in items {
-                visit_unknowns(item, f);
-            }
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            for item in map.values() {
-                visit_unknowns(item, f);
-            }
-        }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            for part in parts {
-                if let InterpolationPart::Expr(value) = part {
-                    visit_unknowns(value, f);
-                }
-            }
-        }
-        Value::Deferred(
-            DeferredValue::FunctionCall { args, .. }
-            | DeferredValue::Unavailable { args, .. }
-            | DeferredValue::ResolvedFunctionCall { args, .. },
-        ) => {
-            for arg in args {
-                visit_unknowns(arg.walker_value(), f);
-            }
-        }
-        Value::Deferred(DeferredValue::Access(access)) => visit_unknowns(access.base(), f),
-        Value::Deferred(DeferredValue::Secret(inner)) => visit_unknowns(inner, f),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            visit_unknowns(value, f);
-            visit_unknowns(default, f);
-        }
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            deferred
-                .values()
-                .into_iter()
-                .for_each(|value| visit_unknowns(value, f));
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            visit_unknowns(expression.lhs(), f);
-            visit_unknowns(expression.rhs(), f);
-        }
-        Value::Concrete(_)
-        | Value::Deferred(DeferredValue::ResourceRef { .. })
-        | Value::Deferred(DeferredValue::BindingRef { .. }) => {}
-        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
-    }
-}
-
 pub fn unresolved_data_source_inputs<S, D>(
     resource: &DataSource<
         S,
@@ -821,22 +770,7 @@ pub fn unresolved_data_source_inputs<S, D>(
     resource
         .attributes
         .iter()
-        .filter_map(|(attribute, value)| {
-            let mut paths = Vec::new();
-            let mut bindings = Vec::new();
-            let mut unknowns = Vec::new();
-            value.visit_resource_refs(&mut |path| paths.push(path.clone()));
-            value.visit_binding_refs(&mut |binding| bindings.push(binding.clone()));
-            visit_unknowns(value, &mut |reason| unknowns.push(reason.clone()));
-            (!paths.is_empty() || !bindings.is_empty() || !unknowns.is_empty()).then(|| {
-                UnresolvedDataSourceInput {
-                    attribute: attribute.clone(),
-                    paths,
-                    bindings,
-                    unknowns,
-                }
-            })
-        })
+        .filter_map(|(attribute, value)| UnresolvedDataSourceInput::collect(attribute, value))
         .collect()
 }
 
@@ -912,6 +846,24 @@ impl<S> std::fmt::Debug for ExecutionCheckpointSink<S> {
     }
 }
 
+/// Public reporting context constructed from labels owned by the executor.
+#[derive(Debug, Clone)]
+pub enum PublicReportContext {
+    SecretAttribute { attribute: String },
+}
+
+impl std::fmt::Display for PublicReportContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::SecretAttribute { attribute } => format!(
+                "Attribute '{attribute}': {}",
+                crate::resource::INSIDE_SECRET_MESSAGE
+            ),
+        };
+        crate::provider_text::ProviderText::new(message).fmt(f)
+    }
+}
+
 /// Cloneable ownership wrapper for a typed execution error.
 #[derive(Clone)]
 pub struct ReportedError {
@@ -939,14 +891,52 @@ impl ReportedError {
     }
 
     pub fn with_context(self, context: impl Into<String>) -> Self {
-        Self::new(ContextError {
+        Self::new(UntrustedContextError {
             context: crate::provider_text::ProviderText::new(context),
+            source: self,
+        })
+    }
+
+    pub fn with_public_context(self, context: PublicReportContext) -> Self {
+        Self::new(ContextError {
+            context,
             source: self,
         })
     }
 
     pub fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
         self.inner.as_ref()
+    }
+}
+
+impl crate::resource::InsideSecret for ReportedError {
+    fn inside_secret(self) -> Self {
+        if let Some(error) = self.as_error().downcast_ref::<ContextError>() {
+            return error
+                .source
+                .clone()
+                .inside_secret()
+                .with_public_context(error.context.clone());
+        }
+        if let Some(error) = self.as_error().downcast_ref::<UntrustedContextError>() {
+            return error.source.clone().inside_secret();
+        }
+        // Preserve typed, safe context through reporting wrappers. Each source
+        // error owns its protection policy, including public upstream reasons.
+        let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(self.as_error());
+        while let Some(error) = cause {
+            if let Some(error) = error.downcast_ref::<crate::value::SerializationError>() {
+                return Self::new(crate::resource::InsideSecret::inside_secret(error.clone()));
+            }
+            if let Some(error) = error.downcast_ref::<crate::resolver::ResolutionError>() {
+                return Self::new(crate::resource::InsideSecret::inside_secret(error.clone()));
+            }
+            if let Some(error) = error.downcast_ref::<crate::resource::UnavailableSecretError>() {
+                return Self::new(crate::resource::InsideSecret::inside_secret(error.clone()));
+            }
+            cause = error.source();
+        }
+        Self::message(crate::resource::INSIDE_SECRET_MESSAGE)
     }
 }
 
@@ -990,17 +980,35 @@ impl std::error::Error for MessageError {}
 
 #[derive(Debug)]
 struct ContextError {
-    context: crate::provider_text::ProviderText,
+    context: PublicReportContext,
     source: ReportedError,
 }
 
 impl std::fmt::Display for ContextError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.context)
+        self.context.fmt(formatter)
     }
 }
 
 impl std::error::Error for ContextError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_error())
+    }
+}
+
+/// Arbitrary context remains useful outside secrets; it has no public-label
+/// authority and is discarded when the cause crosses a secret boundary.
+#[derive(Debug)]
+struct UntrustedContextError {
+    context: crate::provider_text::ProviderText,
+    source: ReportedError,
+}
+impl std::fmt::Display for UntrustedContextError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.context.fmt(f)
+    }
+}
+impl std::error::Error for UntrustedContextError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.source.as_error())
     }

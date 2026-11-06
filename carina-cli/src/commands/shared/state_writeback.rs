@@ -2671,9 +2671,12 @@ mod apply_state_save_tests {
     }
 
     fn secret_string(value: &str) -> Value {
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String(value.to_string().into()),
-        ))))
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                value.to_string().into(),
+            )))
+            .into(),
+        ))
     }
 
     fn identified_create(
@@ -6886,9 +6889,12 @@ mod apply_state_save_tests {
                 .with_test_binding("validation_records[0]")
                 .with_attribute(
                     "password",
-                    Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                        ConcreteValue::String("plain-secret".into()),
-                    )))),
+                    Value::Deferred(DeferredValue::Secret(
+                        Box::new(Value::Concrete(ConcreteValue::String(
+                            "plain-secret".into(),
+                        )))
+                        .into(),
+                    )),
                 );
         let applied_state =
             State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
@@ -7573,9 +7579,12 @@ mod apply_state_save_tests {
 
         let persisted_secret = PersistedValue::encode_provider_value(
             &Value::<carina_core::resource::NoPlaceholder>::Deferred(
-                carina_core::resource::DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("previously-secret".into()),
-                ))),
+                carina_core::resource::DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(
+                        "previously-secret".into(),
+                    )))
+                    .into(),
+                ),
             ),
             None,
         )
@@ -8185,9 +8194,9 @@ mod stage4_unknown_err_tests {
     /// backstop.
     #[test]
     fn secret_returns_an_error() {
-        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("password".into()),
-        ))));
+        let v = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("password".into()))).into(),
+        ));
         let error = PersistedExportValue::encode(&v).expect_err("secret export must be rejected");
         assert!(
             matches!(

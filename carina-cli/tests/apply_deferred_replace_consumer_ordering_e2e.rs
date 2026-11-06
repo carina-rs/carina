@@ -29,12 +29,7 @@ fn resolved(resource: Resource) -> ResolvedResource {
         let mut configuration = carina_core::parser::ExpandedParsedFile::default();
         let mut dependencies = resource.dependencies.value_bindings.clone();
         for value in resource.attributes.values() {
-            value.visit_resource_refs(&mut |path| {
-                dependencies.insert(path.binding_address().clone());
-            });
-            value.visit_binding_refs(&mut |binding| {
-                dependencies.insert(binding.clone());
-            });
+            dependencies.extend(value.root_bindings());
         }
         configuration.resources = dependencies
             .into_iter()

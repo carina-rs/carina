@@ -27,7 +27,7 @@ fn string(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.into()))
 }
 fn secret(value: &str) -> Value {
-    Value::Deferred(DeferredValue::Secret(Box::new(string(value))))
+    Value::Deferred(DeferredValue::Secret(Box::new(string(value)).into()))
 }
 fn reference() -> Value {
     Value::Deferred(DeferredValue::ResourceRef {
@@ -124,7 +124,7 @@ fn assert_structure(left: &Value, right: &Value) {
         (
             Value::Deferred(DeferredValue::Secret(left)),
             Value::Deferred(DeferredValue::Secret(right)),
-        ) => assert_structure(left, right),
+        ) => assert_structure(left.plaintext_for_test(), right.plaintext_for_test()),
         (
             Value::Deferred(DeferredValue::Unknown(left)),
             Value::Deferred(DeferredValue::Unknown(right)),

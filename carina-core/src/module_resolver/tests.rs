@@ -442,7 +442,8 @@ let consumer = mock.test.resource {
     else {
         panic!("comment must remain a secret expression")
     };
-    let ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }) = inner.as_ref()
+    let ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }) =
+        inner.expose_plaintext()
     else {
         panic!("secret must retain the inner resource reference")
     };
@@ -2425,7 +2426,7 @@ fn test_substitute_arguments_nested() {
 }
 
 #[test]
-fn substitute_arguments_enters_secret_only_along_module_if_paths() {
+fn substitute_arguments_enters_secret_and_selects_module_if() {
     let module_argument = |name: &str| {
         Value::Deferred(DeferredValue::Placeholder(
             ParserPlaceholder::ModuleArgument {
@@ -2439,9 +2440,13 @@ fn substitute_arguments_enters_secret_only_along_module_if_paths() {
         Value::Concrete(ConcreteValue::String("yes".into())),
         Value::Concrete(ConcreteValue::String("no".into())),
     ))));
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::List(vec![module_argument("plain"), conditional]),
-    ))));
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::List(vec![
+            module_argument("plain"),
+            conditional,
+        ])))
+        .into(),
+    ));
     let inputs = HashMap::from([
         (
             "flag".to_string(),
@@ -2449,7 +2454,7 @@ fn substitute_arguments_enters_secret_only_along_module_if_paths() {
         ),
         (
             "plain".to_string(),
-            Value::Concrete(ConcreteValue::String("must-stay-deferred".into())),
+            Value::Concrete(ConcreteValue::String("substituted".into())),
         ),
     ]);
 
@@ -2457,13 +2462,13 @@ fn substitute_arguments_enters_secret_only_along_module_if_paths() {
     let Value::Deferred(DeferredValue::Secret(inner)) = substituted else {
         panic!("secret wrapper was not preserved")
     };
-    let Value::Concrete(ConcreteValue::List(items)) = inner.as_ref() else {
+    let Value::Concrete(ConcreteValue::List(items)) = inner.expose_plaintext() else {
         panic!("secret list was not preserved")
     };
     assert_eq!(
         items[0],
-        module_argument("plain"),
-        "ordinary argument substitution inside Secret is outside #4149's behavior change",
+        Value::Concrete(ConcreteValue::String("substituted".into())),
+        "early intrinsic wrappers must not block ordinary module argument substitution",
     );
     assert_eq!(
         items[1],
@@ -10163,9 +10168,12 @@ fn argument_type_mismatch_error_shows_int_literal_value() {
 #[test]
 fn argument_type_mismatch_error_redacts_secret_value() {
     let secret = "issue-3804-secret-plaintext";
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(secret.to_string().into()),
-    ))));
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            secret.to_string().into(),
+        )))
+        .into(),
+    ));
 
     let msg = module_argument_type_error("environment", TypeExpr::Int, value);
 
@@ -10325,9 +10333,12 @@ fn directory_module_loader_preserves_parameter_diagnostic_sources() {
 fn argument_type_mismatch_error_redacts_secret_list_element() {
     let secret = "issue-3804-nested-secret-plaintext";
     let value = Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
-        DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String(
-            secret.to_string().into(),
-        )))),
+        DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                secret.to_string().into(),
+            )))
+            .into(),
+        ),
     )]));
 
     let msg = module_argument_type_error("counts", TypeExpr::List(Box::new(TypeExpr::Int)), value);

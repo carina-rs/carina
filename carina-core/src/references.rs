@@ -80,6 +80,42 @@ pub struct ReferencePlanError {
     pub source: ReferenceFailure,
 }
 
+impl crate::resource::InsideSecret for ReferencePlanError {
+    fn inside_secret(self) -> Self {
+        fn redact(error: Arc<ProviderError>) -> Arc<ProviderError> {
+            use crate::provider::ProviderErrorKind;
+            let message = crate::resource::INSIDE_SECRET_MESSAGE;
+            Arc::new(match error.kind() {
+                ProviderErrorKind::InvalidInput => ProviderError::invalid_input(message),
+                ProviderErrorKind::ApiError => ProviderError::api_error(message),
+                ProviderErrorKind::NotFound => ProviderError::not_found(message),
+                ProviderErrorKind::Timeout => ProviderError::timeout(message),
+                ProviderErrorKind::Internal => ProviderError::internal(message),
+            })
+        }
+        let source = match self.source {
+            ReferenceFailure::DesiredNotFound(error) => {
+                ReferenceFailure::DesiredNotFound(redact(error))
+            }
+            ReferenceFailure::Call(error) => ReferenceFailure::Call(redact(error)),
+            ReferenceFailure::Resolution(error) => ReferenceFailure::Resolution(match error {
+                ReferenceError::AccessDenied(error) => ReferenceError::AccessDenied(redact(error)),
+                ReferenceError::Transient(error) => ReferenceError::Transient(redact(error)),
+                ReferenceError::InvalidReference(error) => {
+                    ReferenceError::InvalidReference(redact(error))
+                }
+            }),
+            source => source,
+        };
+        Self {
+            path: self.path.inside_secret(),
+            raw: ValueString::diagnostic_sensitive(crate::schema::SECRET_VALUE_MASK),
+            source,
+            ..self
+        }
+    }
+}
+
 impl From<Box<ReferencePlanError>> for ProviderError {
     fn from(error: Box<ReferencePlanError>) -> Self {
         ProviderError::invalid_input_caused_by("Failed to prepare reference comparison", error)
@@ -1317,7 +1353,12 @@ impl ReferenceValidation<'_> {
             }));
         }
         if let Value::Deferred(crate::resource::DeferredValue::Secret(inner)) = value {
-            return self.walk(inner, ty, path, true, depth + 1, visit);
+            return inner
+                .try_inspect(|value| self.walk(value, ty, path, true, depth + 1, visit))
+                .map_err(|mut error| {
+                    error.path = path.to_string();
+                    error
+                });
         }
         match ty.shape() {
             Shape::Reference { identity, .. } => visit(value, identity, path, secret)?,

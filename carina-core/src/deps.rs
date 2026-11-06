@@ -99,11 +99,11 @@ pub(crate) fn collect_dependencies<P: crate::resource::ValueKind, B: BindingAddr
     value: &Value<P, B>,
     deps: &mut HashSet<B>,
 ) {
-    value.visit_resource_refs(&mut |path| {
-        deps.insert(path.binding_address().clone());
+    value.visit_resource_refs(&mut |path, _usage| {
+        path.binding_key().record_graph_key(deps);
     });
     value.visit_binding_refs(&mut |binding| {
-        deps.insert(binding.clone());
+        binding.record_graph_key(deps);
     });
 }
 
@@ -383,11 +383,9 @@ mod tests {
     fn collect_dependencies_recurses_into_secret_inner_value() {
         // `Deferred(Secret(_))` is reachable after resolution wraps a value
         // (for example in parser/resolve.rs), so pin this walker arm directly.
-        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
-            "role",
-            "arn",
-            vec![],
-        ))));
+        let value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref("role", "arn", vec![])).into(),
+        ));
         let mut deps = HashSet::new();
 
         collect_dependencies(&value, &mut deps);

@@ -4,6 +4,7 @@
 
 use super::{Rule, SourceSpan};
 use crate::eval_value::EvalValueError;
+use crate::resource::InsideSecret;
 use std::path::{Path, PathBuf};
 
 pub const SINGLE_QUOTED_INTERPOLATION_WARNING_MESSAGE: &str = "single-quoted string contains '${...}' which is not interpolated; use double quotes (\"...\") for interpolation, or keep single quotes if the literal text is intended";
@@ -131,6 +132,18 @@ pub(crate) fn parse_float_literal(text: &str, line: usize) -> Result<crate::Fini
 /// ```
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
+    /// Failures crossing an intrinsic secret boundary retain only their location.
+    #[error(
+        "Invalid expression at line {line}: {}",
+        crate::resource::INSIDE_SECRET_MESSAGE
+    )]
+    InsideSecret { line: usize },
+
+    #[error(
+        "Invalid constraint at line {line}: secret(...) is not allowed in constraint expressions"
+    )]
+    SecretInConstraint { line: usize },
+
     /// A runtime function selected historical evidence without its plaintext.
     #[error(transparent)]
     UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
@@ -302,7 +315,9 @@ pub enum ParseError {
     RecursiveFunction(String),
 
     #[error("{}", format_cyclic_let_binding(chain))]
-    CyclicLetBinding { chain: Vec<String> },
+    CyclicLetBinding {
+        chain: Vec<crate::resource::DiagnosticPath<crate::resource::RelativeBindingName>>,
+    },
 
     #[error("User-defined function error: {0}")]
     UserFunctionError(String),
@@ -314,8 +329,14 @@ impl From<pest::error::Error<Rule>> for ParseError {
     }
 }
 
-fn format_cyclic_let_binding(chain: &[String]) -> String {
-    let rendered = chain.join(" -> ");
+fn format_cyclic_let_binding(
+    chain: &[crate::resource::DiagnosticPath<crate::resource::RelativeBindingName>],
+) -> String {
+    let rendered = chain
+        .iter()
+        .map(crate::resource::DiagnosticPath::to_dot_string)
+        .collect::<Vec<_>>()
+        .join(" -> ");
     if chain.len() == 2 && chain[0] == chain[1] {
         format!(
             "Cyclic let binding detected: {rendered}; a `let` binding cannot reference itself; \
@@ -417,6 +438,37 @@ pub struct ParseWarning {
 }
 
 impl ParseError {
+    pub(crate) fn inside_secret_at(self, fallback_line: usize) -> Self {
+        match self {
+            Self::Located { path, error } => Self::Located {
+                path,
+                error: Box::new(error.inside_secret_at(fallback_line)),
+            },
+            Self::AtElement(finding) => {
+                let (location, error) = (*finding).into_parts();
+                Self::AtElement(Box::new(super::Located::new(
+                    location,
+                    error.inside_secret_at(fallback_line),
+                )))
+            }
+            Self::UnavailableSecret(error) => Self::UnavailableSecret(error.inside_secret()),
+            Self::InsideSecret { line } => Self::InsideSecret { line },
+            error => {
+                let line = match error {
+                    Self::InvalidExpression { line, .. }
+                    | Self::IntegerArithmetic { line, .. }
+                    | Self::SecretInConstraint { line }
+                    | Self::UnknownFunction { line, .. }
+                    | Self::UndefinedIdentifier { line, .. }
+                    | Self::DuplicateBinding { line, .. }
+                    | Self::UnresolvedDeclarationType { line, .. } => line,
+                    _ => fallback_line,
+                };
+                Self::InsideSecret { line }
+            }
+        }
+    }
+
     pub(crate) fn in_file(self, path: impl Into<PathBuf>) -> Self {
         if matches!(self, Self::Located { .. } | Self::AtElement(_)) {
             self
@@ -545,4 +597,10 @@ pub(super) fn undefined_identifier_error(
     line: usize,
 ) -> ParseError {
     ParseError::undefined_identifier(name, line, known.iter().map(|s| s.to_string()).collect())
+}
+
+impl crate::resource::InsideSecret for ParseError {
+    fn inside_secret(self) -> Self {
+        self.inside_secret_at(0)
+    }
 }

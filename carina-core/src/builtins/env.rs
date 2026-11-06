@@ -1,9 +1,7 @@
 //! `env(name)` built-in function
 
 use crate::EnvironmentSnapshot;
-use crate::resource::{
-    BindingAddress, ConcreteValue, DeferredValue, NoPlaceholder, Value, ValueString,
-};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value, ValueString};
 
 use super::value_type_name;
 
@@ -22,28 +20,24 @@ pub(crate) fn builtin_env<B: BindingAddress>(
     args: &[Value<NoPlaceholder, B>],
     environment: &EnvironmentSnapshot,
 ) -> Result<Value<NoPlaceholder, B>, String> {
-    let (name, secret) = parse_env_args(args)?;
+    let name = parse_env_args(args)?;
     let value = environment
         .get(name.expose_plaintext())
         .and_then(|value| value.to_str())
         .map(|s| Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(s))))
         .ok_or_else(|| {
-            let literal = name.diagnostic_literal().filter(|_name| !secret);
+            let literal = name.diagnostic_literal();
             match literal {
                 Some(name) => format!("environment variable '{name}' is not set"),
                 None => "environment variable named by a sensitive value is not set".to_string(),
             }
         })?;
-    Ok(if secret {
-        Value::Deferred(DeferredValue::Secret(Box::new(value)))
-    } else {
-        value
-    })
+    Ok(value)
 }
 
 fn parse_env_args<B: BindingAddress>(
     args: &[Value<NoPlaceholder, B>],
-) -> Result<(&ValueString, bool), String> {
+) -> Result<&ValueString, String> {
     if args.len() != 1 {
         return Err(format!(
             "env() expects 1 argument (variable name), got {}",
@@ -51,16 +45,8 @@ fn parse_env_args<B: BindingAddress>(
         ));
     }
 
-    // Preserve the historical env(secret(name)) result and diagnostic masking
-    // without routing environment lookups through the transforming builtins.
-    let mut argument = &args[0];
-    let mut secret = false;
-    while let Value::Deferred(DeferredValue::Secret(inner)) = argument {
-        argument = inner;
-        secret = true;
-    }
-    match argument {
-        Value::Concrete(ConcreteValue::String(name)) => Ok((name, secret)),
+    match &args[0] {
+        Value::Concrete(ConcreteValue::String(name)) => Ok(name),
         other => Err(format!(
             "env() argument must be a string, got {}",
             value_type_name(other)
@@ -190,10 +176,10 @@ mod tests {
             "SECRET_NAME".to_string(),
             "captured".into(),
         )]));
-        let secret = |value| {
-            Value::Deferred(crate::resource::ExpandedDeferredValue::Secret(Box::new(
-                value,
-            )))
+        let secret = |value: Value| {
+            Value::Deferred(crate::resource::ExpandedDeferredValue::Secret(
+                Box::new(value).into(),
+            ))
         };
         let name = Value::Concrete(ConcreteValue::String("SECRET_NAME".into()));
         let expected = secret(Value::Concrete(ConcreteValue::String("captured".into())));
@@ -208,19 +194,21 @@ mod tests {
         )));
         assert_eq!(
             evaluate_builtin("env", &[missing], &config).unwrap_err(),
-            "environment variable named by a sensitive value is not set",
+            crate::resource::INSIDE_SECRET_MESSAGE,
         );
         for (value, kind) in [
             (Value::Concrete(ConcreteValue::Int(42)), "Int"),
             (Value::Concrete(ConcreteValue::Bool(true)), "Bool"),
             (Value::Concrete(ConcreteValue::List(Vec::new())), "List"),
         ] {
-            for argument in [value.clone(), secret(value)] {
-                assert_eq!(
-                    evaluate_builtin("env", &[argument], &config).unwrap_err(),
-                    format!("env() argument must be a string, got {kind}"),
-                );
-            }
+            assert_eq!(
+                evaluate_builtin("env", std::slice::from_ref(&value), &config).unwrap_err(),
+                format!("env() argument must be a string, got {kind}"),
+            );
+            assert_eq!(
+                evaluate_builtin("env", &[secret(value)], &config).unwrap_err(),
+                crate::resource::INSIDE_SECRET_MESSAGE,
+            );
         }
     }
 

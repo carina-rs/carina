@@ -1079,9 +1079,9 @@ fn create_only_nested_write_only_fixture<R: crate::schema::PatternForm>(
         ),
         (
             "password".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(password.into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(password.into()))).into(),
+            )),
         ),
     ])));
     let desired =

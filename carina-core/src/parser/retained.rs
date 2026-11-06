@@ -6,6 +6,8 @@
 //! be turned back into an authored expression.
 
 use super::{DeclarationLocation, Located, PreprocessedFile, Rule, TypeExpr};
+use crate::resource::DiagnosticScope;
+use crate::resource::InsideSecret;
 use crate::resource::{
     BindingAddress, ParserPlaceholder, PathSegment, RelativeBindingName, Value, ValueKind,
 };
@@ -89,11 +91,24 @@ enum Projection<P: ValueKind, B: BindingAddress> {
     Value(Value<P, B>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 struct AuthoredExpr<P: ValueKind, B: BindingAddress> {
     location: ExpressionLocation,
     kind: ExprKind<B>,
     children: Vec<ExprValue<P, B>>,
+}
+
+impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for AuthoredExpr<P, B> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = formatter.debug_struct("AuthoredExpr");
+        debug
+            .field("location", &self.location)
+            .field("kind", &self.kind);
+        if !matches!(self.kind, ExprKind::Secret) {
+            debug.field("children", &self.children);
+        }
+        debug.finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -119,6 +134,7 @@ enum ExprKind<B: BindingAddress> {
     },
     EmptyInterpolation,
     Coalesce,
+    Secret,
     Call(String),
     Function {
         name: String,
@@ -205,6 +221,7 @@ impl<P: ValueKind, B: BindingAddress> ExprValue<P, B> {
             }
             ExprKind::EmptyInterpolation => ExprKind::EmptyInterpolation,
             ExprKind::Coalesce => ExprKind::Coalesce,
+            ExprKind::Secret => ExprKind::Secret,
             ExprKind::Call(name) => ExprKind::Call(name),
             ExprKind::Function { name, signature } => ExprKind::Function { name, signature },
             ExprKind::Sequence => ExprKind::Sequence,
@@ -644,6 +661,41 @@ fn compile(
     compile_form(pair, file, source, scope)
 }
 
+/// Authored diagnostic source is retained only when its parsed graph contains
+/// no intrinsic secrets. A protected graph cannot contribute any raw source.
+#[derive(Debug, Clone)]
+pub(crate) struct DiagnosticSourceText(Option<Arc<str>>);
+
+impl DiagnosticSourceText {
+    pub(crate) fn into_text(self) -> Option<Arc<str>> {
+        self.0
+    }
+}
+
+#[cfg(test)]
+impl From<&'static str> for DiagnosticSourceText {
+    fn from(text: &'static str) -> Self {
+        Self(Some(text.into()))
+    }
+}
+
+pub(super) fn diagnostic_source_text(
+    pair: Pair<'_, Rule>,
+    file: &PreprocessedFile,
+    source_file: &Path,
+) -> DiagnosticSourceText {
+    fn contains_secret(expression: &ExprValue) -> bool {
+        matches!(expression.authored.kind, ExprKind::Secret)
+            || expression.authored.children.iter().any(contains_secret)
+    }
+    let expression = compile(pair.clone(), file, source_file, &HashMap::new());
+    if contains_secret(&expression) {
+        return DiagnosticSourceText(None);
+    }
+    let range = super::SourceSpan::preprocessed_range(&pair);
+    DiagnosticSourceText(Some(file.original_slice(range).trim_end().into()))
+}
+
 fn reference_form(pair: Pair<'_, Rule>) -> Option<Pair<'_, Rule>> {
     match pair.as_rule() {
         Rule::variable_ref | Rule::namespaced_id => Some(pair),
@@ -772,6 +824,13 @@ fn compile_form(
             for function in parts {
                 let mut call = compile(function, file, source, scope);
                 let authored = Arc::make_mut(&mut call.authored);
+                if matches!(authored.kind, ExprKind::Secret) {
+                    // The piped input is part of the intrinsic's protected subtree.
+                    authored.location = ExpressionLocation::new(
+                        ExpressionInstance::Root,
+                        &DeclarationLocation::expression_node(&pair, file, source),
+                    );
+                }
                 authored.children.push(value);
                 value = call;
             }
@@ -1150,7 +1209,10 @@ fn compile_form(
             let name = parts.next().expect("function name").as_str().to_string();
             node(
                 &pair,
-                ExprKind::Call(name),
+                match crate::builtins::Builtin::from_name(&name) {
+                    Some(crate::builtins::Builtin::Secret) => ExprKind::Secret,
+                    _ => ExprKind::Call(name),
+                },
                 parts
                     .map(|child| compile(child, file, source, scope))
                     .collect(),
@@ -1626,8 +1688,9 @@ mod judgement {
     pub struct JudgedExpr(Arc<JudgedExprData>);
 
     #[doc(hidden)]
-    #[derive(Debug, Clone)]
+    #[derive(Clone)]
     pub struct JudgedExprData {
+        diagnostic_scope: DiagnosticScope,
         origin: Option<ExpressionLocation>,
         boundary_owner: Option<Arc<DeclarationLocation>>,
         judgement: ExprJudgement,
@@ -1639,9 +1702,30 @@ mod judgement {
         fields: Arc<IndexMap<String, JudgedExpr>>,
     }
 
+    impl std::fmt::Debug for JudgedExprData {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if self.diagnostic_scope.is_secret() {
+                return formatter.write_str(crate::schema::SECRET_VALUE_MASK);
+            }
+            formatter
+                .debug_struct("JudgedExprData")
+                .field("origin", &self.origin)
+                .field("boundary_owner", &self.boundary_owner)
+                .field("judgement", &self.judgement)
+                .field("authority", &self.authority)
+                .field("coalesce", &self.coalesce)
+                .field("alternatives", &self.alternatives)
+                .field("member", &self.member)
+                .field("elements", &self.elements)
+                .field("fields", &self.fields)
+                .finish()
+        }
+    }
+
     impl PartialEq for JudgedExprData {
         fn eq(&self, other: &Self) -> bool {
-            self.origin == other.origin
+            self.diagnostic_scope == other.diagnostic_scope
+                && self.origin == other.origin
                 && self.boundary_owner == other.boundary_owner
                 && self.judgement == other.judgement
                 && match (&self.authority, &other.authority) {
@@ -2159,6 +2243,13 @@ mod judgement {
         if kind == Some(&InferredKind::StringConstruction(Knowledge::Deferred)) {
             return if sink.is_string_shaped() || matches!(sink, TypeExpr::Ref(_)) {
                 Ok(DeferredInterpolation)
+            } else if expression.diagnostic_scope.is_secret() {
+                Err(InferenceError::SecretAssignmentMismatch {
+                    types: crate::schema::MismatchTypeNames::for_type_exprs(
+                        sink,
+                        &TypeExpr::String,
+                    ),
+                })
             } else {
                 Err(InferenceError::UnknownType {
                     reason: format!(
@@ -2629,6 +2720,7 @@ mod judgement {
             schemas,
             config,
             memo: HashMap::new(),
+            scope: DiagnosticScope::Public,
             by_location: HashMap::new(),
             visiting: Vec::new(),
             findings: Vec::new(),
@@ -2699,7 +2791,8 @@ mod judgement {
         functions: HashMap<(ExpressionInstance, String), Arc<FunctionSignature>>,
         schemas: &'a crate::schema::SchemaRegistry,
         config: &'a super::super::ProviderContext,
-        memo: HashMap<usize, JudgedExpr>,
+        memo: HashMap<(usize, DiagnosticScope), JudgedExpr>,
+        scope: DiagnosticScope,
         by_location: HashMap<ExpressionLocation, JudgedExpr>,
         visiting: Vec<usize>,
         findings: Vec<Located<InferenceError>>,
@@ -2721,7 +2814,12 @@ mod judgement {
         fn judge(&mut self, expression: &ExprValue<ParserPlaceholder, B>) -> JudgedExpr {
             let root = &expression.authored;
             let id = Arc::as_ptr(root) as usize;
-            if let Some(judged) = self.memo.get(&id) {
+            let scope = if self.scope.is_secret() || matches!(root.kind, ExprKind::Secret) {
+                DiagnosticScope::Secret
+            } else {
+                DiagnosticScope::Public
+            };
+            if let Some(judged) = self.memo.get(&(id, scope)) {
                 return judged.clone();
             }
             if self.visiting.contains(&id) {
@@ -2735,6 +2833,8 @@ mod judgement {
                 failure.report_at(FailureOwner::BindingIndex);
                 return failure;
             }
+            let outer_scope = self.scope;
+            self.scope = scope;
             self.visiting.push(id);
             // Always visit every child, even for length(), selected access,
             // interpolation, and a coalesce whose left payload is concrete.
@@ -2821,8 +2921,26 @@ mod judgement {
                 self.push_finding(location, error.clone());
                 result.report_at(FailureOwner::Reported);
             }
+            if scope.is_secret() {
+                fn protect(judgement: &mut ExprJudgement) {
+                    match judgement {
+                        ExprJudgement::Failed { error, .. } => {
+                            *error = error.clone().inside_secret()
+                        }
+                        ExprJudgement::Rejected { source, error, .. } => {
+                            protect(source);
+                            *error = error.clone().inside_secret();
+                        }
+                        _ => {}
+                    }
+                }
+                let data = result.data_mut();
+                data.diagnostic_scope = DiagnosticScope::Secret;
+                protect(&mut data.judgement);
+            }
             self.visiting.pop();
-            self.memo.insert(id, result.clone());
+            self.scope = outer_scope;
+            self.memo.insert((id, scope), result.clone());
             self.by_location
                 .insert(root.location.clone(), result.clone());
             result
@@ -2880,6 +2998,12 @@ mod judgement {
                     reason: format!("{context}: {error}"),
                 },
             );
+            let finding = if self.scope.is_secret() {
+                let (location, error) = finding.into_parts();
+                Located::new(location, error.inside_secret())
+            } else {
+                finding
+            };
             if expression.kind() == Some(InferredKind::StringConstruction(Knowledge::Deferred))
                 && !self.function_errors.contains(&finding)
             {
@@ -2902,6 +3026,11 @@ mod judgement {
         }
 
         fn push_finding(&mut self, location: DeclarationLocation, error: InferenceError) {
+            let error = if self.scope.is_secret() {
+                error.inside_secret()
+            } else {
+                error
+            };
             if !self
                 .findings
                 .iter()
@@ -3323,6 +3452,7 @@ mod judgement {
                     declaration()
                 }
                 ExprKind::Sequence => authored_child(children.last()),
+                ExprKind::Secret => authored_child(children.first()),
                 ExprKind::Call(name) => {
                     let mut argument_failure = None;
                     let signature = self
@@ -3684,7 +3814,7 @@ mod judgement {
                                 self.by_location
                                     .insert(value.authored.location.clone(), rejected.clone());
                                 self.memo.insert(
-                                    Arc::as_ptr(&value.authored) as usize,
+                                    (Arc::as_ptr(&value.authored) as usize, self.scope),
                                     rejected.clone(),
                                 );
                                 failure.get_or_insert(rejected);
@@ -3849,6 +3979,7 @@ mod judgement {
             },
         };
         JudgedExpr(Arc::new(JudgedExprData {
+            diagnostic_scope: DiagnosticScope::Public,
             origin: None,
             boundary_owner: None,
             judgement,

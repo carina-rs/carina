@@ -43,6 +43,30 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::shutdown::ShutdownToken;
+
+#[test]
+fn secret_origin_4275_round2_reported_error_keeps_safe_outer_context() {
+    use crate::resource::InsideSecret;
+    let error = ReportedError::new(SerializationError::UnresolvedResourceRef {
+        path: "private_producer.private_attr".into(),
+        context: crate::value::SerializationContext::WasmBoundary,
+    })
+    .with_public_context(PublicReportContext::SecretAttribute {
+        attribute: "password".into(),
+    })
+    .inside_secret();
+    let rendered = render_error_chain(error.as_error());
+    assert!(
+        rendered.contains("Attribute 'password': invalid value inside secret(...)"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(crate::resource::INSIDE_SECRET_MESSAGE),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("private_"), "{rendered}");
+    assert!(!format!("{error:?}").contains("private_"));
+}
 use crate::shutdown::testing::{TestShutdownTrigger as ShutdownTrigger, shutdown_channel};
 
 fn uncancelled_shutdown() -> ShutdownToken {
@@ -1069,11 +1093,12 @@ fn resolved_resource_constructor_rejects_nested_deferred() {
     let mut map = indexmap::IndexMap::new();
     map.insert(
         "secret".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-            DeferredValue::ResourceRef {
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::ResourceRef {
                 path: AccessPath::root("cert", "domain_validation_options"),
-            },
-        )))),
+            }))
+            .into(),
+        )),
     );
     let nested = Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
         ConcreteValue::Map(map),
@@ -1083,9 +1108,21 @@ fn resolved_resource_constructor_rejects_nested_deferred() {
         .expect_err("nested deferred values must not construct a ResolvedResource");
 
     assert!(
-        matches!(err, SerializationError::UnresolvedResourceRef { .. }),
-        "expected UnresolvedResourceRef, got {err:?}"
+        matches!(
+            err,
+            SerializationError::InsideSecret {
+                kind: crate::value::SecretSerializationErrorKind::UnresolvedResourceRef,
+            }
+        ),
+        "expected protected UnresolvedResourceRef, got {err:?}"
     );
+    for rendered in [err.to_string(), format!("{err:?}")] {
+        assert!(!rendered.contains("cert"), "{rendered}");
+        assert!(
+            !rendered.contains("domain_validation_options"),
+            "{rendered}"
+        );
+    }
 }
 
 // -----------------------------------------------------------------------
@@ -3506,9 +3543,12 @@ async fn invalid_secret_create_value_is_masked_and_never_reaches_provider() {
         "secret-source",
         HashMap::from([(
             "value".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(plaintext.to_string().into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    plaintext.to_string().into(),
+                )))
+                .into(),
+            )),
         )]),
         BindingValueSource::Local,
     );
@@ -5666,7 +5706,7 @@ fn module_constraint_resolution_keeps_unavailable_secret_typed() {
     use crate::parser::ValidateExpr;
 
     let hash = crate::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
-        Box::new(Value::Concrete(ConcreteValue::String("private".into()))),
+        Box::new(Value::Concrete(ConcreteValue::String("private".into()))).into(),
     )))
     .unwrap();
     let mut bindings = ResolvedBindings::default();
@@ -7548,9 +7588,9 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
     to_resource.binding = Some(absolute_binding("a"));
     let rid = to_resource.id.clone();
 
-    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".into()),
-    ))));
+    let secret_value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+    ));
     to_resource.set_attr("master_password", secret_value.clone());
 
     let hash_json = crate::value::value_to_json(&secret_value).expect("secret hash must serialize");
@@ -7608,9 +7648,9 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
     to_resource.binding = Some(absolute_binding("a"));
     let rid = to_resource.id.clone();
 
-    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".into()),
-    ))));
+    let secret_value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+    ));
     to_resource.set_attr(
         "master_password",
         Value::Concrete(ConcreteValue::List(vec![
@@ -12748,4 +12788,18 @@ async fn deferred_create_reports_iterable_reference_when_binding_missing() {
         "events: {:?}",
         observer.events(),
     );
+}
+
+#[test]
+fn review2_context_error_drops_untyped_secret_context() {
+    use crate::resource::InsideSecret;
+    let error = ReportedError::context(
+        "private-context-value",
+        SerializationError::UnresolvedResourceRef {
+            path: "private-path".into(),
+            context: crate::value::SerializationContext::WasmBoundary,
+        },
+    )
+    .inside_secret();
+    assert!(!render_error_chain(error.as_error()).contains("private-"));
 }

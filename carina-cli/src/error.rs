@@ -1633,7 +1633,8 @@ mod tests {
             carina_core::resource::Value::Deferred(carina_core::resource::DeferredValue::Secret(
                 Box::new(carina_core::resource::Value::Concrete(
                     carina_core::resource::ConcreteValue::String("private".into()),
-                )),
+                ))
+                .into(),
             ));
         let snapshot = carina_core::value::redact_secrets_in_value(&secret).unwrap();
         let unavailable = snapshot.to_value_at(&raw).unwrap_err();
@@ -1694,9 +1695,9 @@ mod tests {
     #[test]
     fn deferred_loop_expansion_preserves_unavailable_secret_error() {
         use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-        let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("private".into()),
-        ))));
+        let secret: Value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("private".into()))).into(),
+        ));
         let snapshot = carina_core::value::redact_secrets_in_value(&secret).unwrap();
         let unavailable = snapshot.to_value_at("loop.items").unwrap_err();
         let error = AppError::from(

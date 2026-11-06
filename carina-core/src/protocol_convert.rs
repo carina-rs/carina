@@ -302,6 +302,20 @@ impl Error for ProtocolConvertError {
     }
 }
 
+impl crate::resource::InsideSecret for ProtocolConvertError {
+    fn inside_secret(self) -> Self {
+        let leaf = match self.into_leaf_error() {
+            error @ (Self::DurationOutOfRange
+            | Self::InvalidRedactedSecretDigest
+            | Self::NonWireValue { .. }
+            | Self::NonWireAttributeType { .. }
+            | Self::ValidatorWithoutIdentity { .. }) => error,
+            _ => Self::NonWireValue { variant: "Secret" },
+        };
+        leaf.at_value_path(WirePathSegment::Secret)
+    }
+}
+
 impl ProtocolConvertError {
     /// Structured container path, in outermost-to-innermost order.
     pub fn value_path(&self) -> Vec<WirePathSegment> {
@@ -3837,9 +3851,9 @@ mod tests {
                 source_line: (0).into(),
             }),
             access,
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("secret".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("secret".into()))).into(),
+            )),
             Value::Deferred(DeferredValue::Unknown(
                 crate::resource::ApplyTimeUnknown::UpstreamAllExports {
                     binding: absolute_binding("upstream"),

@@ -707,6 +707,7 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 41 encodes secret(...) only as a typed Secret node.
     /// Plan format 40 requires an absolute source locator and its planned
     /// canonical identity so a retargeted symlink requires replanning.
     /// Plan format 39 stores complete dependency addresses and legacy migration
@@ -1129,7 +1130,8 @@ impl PlanFile {
 /// fields introduced by format 35 remain mandatory. Format 39's optional
 /// classification field is mandatory in the wire shape and is never
 /// defaulted. Format 40 requires the absolute source locator and canonical
-/// source identity captured at plan time.
+/// source identity captured at plan time. Format 41 removes the ordinary
+/// secret FunctionCall identity in favor of typed Secret nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
     version: u32,
@@ -2175,7 +2177,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 40;
+    pub const CURRENT_VERSION: u32 = 41;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -3805,9 +3807,9 @@ mod historical_display_tests {
         let to = resolved(
             Resource::new("mock.test.resource", "masked-update").with_attribute(
                 "comment",
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("rotated".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("rotated".into()))).into(),
+                )),
             ),
         );
 
@@ -5245,6 +5247,8 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#4275: bumped 40→41 — secret(...) has no ordinary FunctionCall
+        // identity; older saved plans must be regenerated before decoding.
         // carina#4202: bumped 39→40 — require the absolute source locator and
         // canonical identity separately, rejecting retargeted source symlinks.
         // Format 39 already records typed dependency handles (carina#3803).
@@ -6546,6 +6550,7 @@ pub(crate) async fn load_and_resolve_provider_configs<E>(
 struct ProviderAttributeRequirement {
     provider: String,
     attribute: String,
+    diagnostic_path: Option<carina_core::resource::DiagnosticPath>,
 }
 
 #[derive(Clone, Debug)]
@@ -6580,7 +6585,17 @@ async fn load_provider_referenced_upstream_states<E>(
         .map_err(|error| AppError::ProviderReferencedUpstream {
             provider: required_by.provider,
             attribute: required_by.attribute,
-            error: Box::new(error),
+            error: Box::new(
+                if required_by
+                    .diagnostic_path
+                    .as_ref()
+                    .is_some_and(carina_core::resource::DiagnosticPath::is_secret)
+                {
+                    AppError::Config(carina_core::resource::INSIDE_SECRET_MESSAGE.into())
+                } else {
+                    error
+                },
+            ),
         })?;
         remote_bindings.extend(loaded);
     }
@@ -6598,24 +6613,45 @@ async fn load_provider_referenced_upstream_states<E>(
 fn provider_referenced_upstream_states<E>(
     parsed: &carina_core::parser::ExpandedFile<E>,
 ) -> Vec<ProviderReferencedUpstream> {
+    type ProviderReference = (
+        carina_core::resource::DependencyKey<AbsoluteBindingAddress>,
+        Option<carina_core::resource::DependencyKey<String>>,
+        ProviderAttributeRequirement,
+    );
     fn enqueue_value(
         value: &Value,
         required_by: &ProviderAttributeRequirement,
-        pending: &mut VecDeque<(
-            AbsoluteBindingAddress,
-            Option<String>,
-            ProviderAttributeRequirement,
-        )>,
+        pending: &mut VecDeque<ProviderReference>,
     ) {
-        value.visit_resource_refs(&mut |path| {
+        let scoped_requirement = |path: carina_core::resource::DiagnosticPath| {
+            let mut requirement = required_by.clone();
+            requirement.diagnostic_path = Some(
+                if requirement
+                    .diagnostic_path
+                    .as_ref()
+                    .is_some_and(carina_core::resource::DiagnosticPath::is_secret)
+                {
+                    carina_core::resource::DiagnosticScope::Secret.path(None)
+                } else {
+                    path
+                },
+            );
+            requirement
+        };
+        value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+            let identity = reference.identity();
             pending.push_back((
-                path.binding_address().clone(),
-                Some(path.attribute().to_string()),
-                required_by.clone(),
+                identity.binding_key(),
+                Some(identity.attribute_key()),
+                scoped_requirement(reference.diagnostic_path()),
             ));
         });
-        value.visit_binding_refs(&mut |binding| {
-            pending.push_back((binding.clone(), None, required_by.clone()));
+        value.visit_binding_refs_for_diagnostics(&mut |reference| {
+            pending.push_back((
+                reference.identity(),
+                None,
+                scoped_requirement(reference.diagnostic_path()),
+            ));
         });
     }
 
@@ -6632,6 +6668,7 @@ fn provider_referenced_upstream_states<E>(
                 &ProviderAttributeRequirement {
                     provider: provider.name.clone(),
                     attribute: attribute.clone(),
+                    diagnostic_path: None,
                 },
                 &mut pending,
             );
@@ -6641,18 +6678,38 @@ fn provider_referenced_upstream_states<E>(
     let mut visited = HashSet::new();
     let mut referenced_upstreams = HashMap::new();
     while let Some((binding, attribute, required_by)) = pending.pop_front() {
-        if !visited.insert((binding.clone(), attribute.clone())) {
+        if !visited.insert((
+            binding.clone(),
+            attribute.clone(),
+            required_by
+                .diagnostic_path
+                .as_ref()
+                .is_some_and(carina_core::resource::DiagnosticPath::is_secret),
+        )) {
             continue;
         }
-        if upstream_bindings.contains(&binding) {
-            referenced_upstreams.entry(binding).or_insert(required_by);
+        if upstream_bindings.iter().any(|key| binding.matches(key)) {
+            referenced_upstreams
+                .entry(binding)
+                .and_modify(|previous: &mut ProviderAttributeRequirement| {
+                    if required_by
+                        .diagnostic_path
+                        .as_ref()
+                        .is_some_and(carina_core::resource::DiagnosticPath::is_secret)
+                    {
+                        previous.diagnostic_path =
+                            Some(carina_core::resource::DiagnosticScope::Secret.path(None));
+                    }
+                })
+                .or_insert(required_by);
             continue;
         }
 
-        let Some(resource) = parsed
-            .iter_top_level_resources()
-            .find(|resource| resource.binding_address() == Some(&binding))
-        else {
+        let Some(resource) = parsed.iter_top_level_resources().find(|resource| {
+            resource
+                .binding_address()
+                .is_some_and(|key| binding.matches(key))
+        }) else {
             continue;
         };
         let attributes = match resource {
@@ -6676,7 +6733,7 @@ fn provider_referenced_upstream_states<E>(
             }
         };
         if let Some(attribute) = attribute {
-            if let Some(value) = attributes.get(&attribute) {
+            if let Some(value) = attribute.lookup_indexmap(&attributes) {
                 enqueue_value(value, &required_by, &mut pending);
             }
         } else {
@@ -6691,7 +6748,9 @@ fn provider_referenced_upstream_states<E>(
         .iter()
         .filter_map(|upstream| {
             referenced_upstreams
-                .get(&upstream.binding)
+                .get(&carina_core::resource::DependencyKey::new(
+                    upstream.binding.clone(),
+                ))
                 .cloned()
                 .map(|required_by| ProviderReferencedUpstream {
                     upstream: upstream.clone(),
@@ -6930,6 +6989,44 @@ mod load_upstream_states_tests {
     use super::*;
     #[cfg(test)]
     use std::fs;
+
+    #[tokio::test]
+    async fn review2_f8_provider_upstream_inventory_masks_secret_reference_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+        parsed.upstream_states.push(UpstreamState {
+            binding: absolute_binding("private_upstream"),
+            source: PathBuf::from("private_source"),
+        });
+        parsed.providers.push(ProviderConfig {
+            name: "test".into(),
+            attributes: indexmap::IndexMap::from([(
+                "region".into(),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(root_resource_ref("private_upstream", "value")).into(),
+                )),
+            )]),
+            default_tags: Default::default(),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: Default::default(),
+            binding: None,
+        });
+        let error = load_provider_referenced_upstream_states(
+            &crate::test_support::TestCommandRuntime::new(),
+            &parsed,
+            &ResolvedPath::new(dir.path()).unwrap(),
+            &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            &mut HashSet::new(),
+            UpstreamMissingStatePolicy::Strict,
+        )
+        .await
+        .unwrap_err();
+        let rendered = format!("{error} {error:?}");
+        assert!(!rendered.contains("private_"), "{rendered}");
+        assert!(rendered.contains("region"), "{rendered}");
+    }
 
     fn write_state(dir: &Path, exports: &[(&str, serde_json::Value)]) {
         let mut state = StateFile::new();
@@ -7943,9 +8040,12 @@ mod run_plan_out_tests {
         )
         .with_attribute(
             "comment",
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(plaintext.to_string().into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    plaintext.to_string().into(),
+                )))
+                .into(),
+            )),
         )
     }
 
@@ -8679,9 +8779,12 @@ mod run_plan_out_tests {
         let path = tmp.path().join("main.crn");
         fs::write(&path, "provider mock {}\n").unwrap();
         let parsed = carina_core::parser::ExpandedParsedFile::default();
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            carina_core::resource::ConcreteValue::String("upstream-secret".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(
+                carina_core::resource::ConcreteValue::String("upstream-secret".into()),
+            ))
+            .into(),
+        ));
         let ctx = crate::wiring::PlanContext {
             legacy_dependency_classification: None,
             migrated_legacy_state: None,
@@ -8983,9 +9086,12 @@ mod export_diff_tests {
             .with_absolute_binding(absolute_binding("vpc"))
             .with_attribute(
                 "password",
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("topsecretXYZ".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(
+                        "topsecretXYZ".into(),
+                    )))
+                    .into(),
+                )),
             );
         let bindings = carina_core::binding_index::ResolvedBindings::pre_apply_live(
             carina_core::binding_index::LivePreApplyInputs {
@@ -9032,20 +9138,46 @@ mod plan_serialization_error_tests {
     }
 
     #[test]
+    fn secret_origin_4275_unknown_secret_keeps_upstream_guidance() {
+        use carina_core::resource::InsideSecret;
+        let error = PersistedValue::encode_provider_value(&upstream_unknown(), None)
+            .unwrap_err()
+            .inside_secret();
+        assert!(
+            matches!(&error, SerializationError::UnknownNotAllowed { reason, .. }
+            if matches!(reason.as_ref(), ApplyTimeUnknown::UpstreamExport { .. })),
+            "{error:?}"
+        );
+        let error = super::map_plan_save_error(error.into(), "--out");
+        let message = error.to_string();
+        assert!(
+            message.contains("Apply the upstream module(s) first"),
+            "{message}"
+        );
+        assert!(message.contains("network.vpc.vpc_id"), "{message}");
+    }
+
+    #[test]
     fn plan_save_serialization_preserves_unavailable_secret_at_cli_boundary() {
         use crate::error::AppError;
         use carina_core::resource::SnapshotValue;
         use carina_core::value::{redact_plaintext_using_secret_shape, redact_secrets_in_value};
 
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("private-token".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "private-token".into(),
+            )))
+            .into(),
+        ));
         let historical = SnapshotValue::Concrete(carina_core::resource::ConcreteValue::Map(
             indexmap::IndexMap::from([("token".into(), redact_secrets_in_value(&secret).unwrap())]),
         ));
-        let whole_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::Map(indexmap::IndexMap::from([("token".into(), secret)])),
-        ))));
+        let whole_secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Map(
+                indexmap::IndexMap::from([("token".into(), secret)]),
+            )))
+            .into(),
+        ));
         for flag in [None, Some("--out"), Some("--json")] {
             let error = redact_plaintext_using_secret_shape(&historical, &whole_secret)
                 .expect_err("whole-container redaction cannot recover a nested historical hash");
@@ -9053,7 +9185,10 @@ mod plan_serialization_error_tests {
                 SerializationError::UnavailableSecret(error) => error.clone(),
                 other => panic!("expected typed unavailable-secret error, got {other:?}"),
             };
-            assert_eq!(expected.path(), "state.token");
+            assert_eq!(expected.path(), "(secret)");
+            for rendered in [error.to_string(), format!("{error:?}")] {
+                assert!(!rendered.contains("token"), "{rendered}");
+            }
             let error = match flag {
                 Some(flag) => super::map_plan_save_error(error.into(), flag),
                 None => AppError::from(error),

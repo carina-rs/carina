@@ -148,6 +148,17 @@ pub(crate) struct ParseContext<'cfg, Source = AuthoredDiagnosticSource> {
 }
 
 impl<'cfg> ParseContext<'cfg, AuthoredDiagnosticSource> {
+    pub(super) fn diagnostic_source_text(
+        &self,
+        pair: pest::iterators::Pair<'_, Rule>,
+    ) -> super::retained::DiagnosticSourceText {
+        super::retained::diagnostic_source_text(
+            pair,
+            &self.diagnostic_source.file,
+            &self.diagnostic_source.path,
+        )
+    }
+
     pub(super) fn new(
         config: &'cfg ProviderContext,
         source_file: &std::path::Path,

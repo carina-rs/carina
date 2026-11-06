@@ -109,12 +109,16 @@ mod tests {
         Value::Concrete(ConcreteValue::String(value.into()))
     }
     fn fixture() -> Vec<Resource> {
-        let nested = Value::Deferred(DeferredValue::Secret(Box::new(string("private-nested"))));
+        let nested = Value::Deferred(DeferredValue::Secret(
+            Box::new(string("private-nested")).into(),
+        ));
         vec![
             Resource::new("test", "example")
                 .with_attribute(
                     "top",
-                    Value::Deferred(DeferredValue::Secret(Box::new(string("private-top")))),
+                    Value::Deferred(DeferredValue::Secret(
+                        Box::new(string("private-top")).into(),
+                    )),
                 )
                 .with_attribute(
                     "rules",
@@ -225,7 +229,7 @@ mod tests {
                 .with_attribute("known", string("before"))
                 .with_attribute(
                     "secret",
-                    Value::Deferred(DeferredValue::Secret(Box::new(string("private")))),
+                    Value::Deferred(DeferredValue::Secret(Box::new(string("private")).into())),
                 );
         let dependencies = resource.dependencies.clone();
         normalize(&mut resource);

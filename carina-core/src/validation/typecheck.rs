@@ -600,6 +600,40 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
     provider_custom_types: ProviderCustomTypeValidation,
 ) -> TypeExprValueCheck<'s> {
     use TypeExprValueCheck::{Assignable, Mismatch};
+    if let Value::Deferred(DeferredValue::Secret(inner)) = value {
+        let checked = inner.try_project_plaintext(|value| {
+            match check_type_expr_value_inner_with_mode(
+                expected,
+                value,
+                config,
+                inference,
+                provider_custom_types,
+            ) {
+                Mismatch(_) => Err(()),
+                checked => Ok(checked),
+            }
+        });
+        return match checked {
+            Err(()) => Mismatch(mismatch(expected, value)),
+            Ok(TypeExprValueCheck::Deferred(mut deferred)) => {
+                fn protect<P: PlaceholderKind, B: BindingAddress>(
+                    deferred: &mut TypeExprValueDeferral<'_>,
+                    secret: &Value<P, B>,
+                ) {
+                    deferred.path.clear();
+                    *deferred.actual = ValueDescription::of(secret);
+                    for child in &mut deferred.additional {
+                        protect(child, secret);
+                    }
+                }
+                protect(&mut deferred, value);
+                TypeExprValueCheck::Deferred(deferred)
+            }
+            Ok(Assignable) => Assignable,
+            Ok(Mismatch(_)) => unreachable!("mismatches cross the protected error channel"),
+        };
+    }
+
     let ValueCheckEvidence::Authored(expression) = inference else {
         return check_constraint_value(expected, value, config, inference, provider_custom_types);
     };
@@ -735,7 +769,9 @@ fn check_constraint_value<'s, P: PlaceholderKind, B: BindingAddress>(
                         | ConcreteValue::CanonicalEnum(_),
                     ) => deferred_provider_check(expected, value),
                     Value::Concrete(_) => Mismatch(mismatch(expected, value)),
-                    Value::Deferred(DeferredValue::Secret(inner)) => check(expected, inner),
+                    Value::Deferred(DeferredValue::Secret(_)) => {
+                        unreachable!("secret values are checked at the boundary")
+                    }
                     Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
                         TypeExprValueCheck::all(deferred.values()[1..].iter().enumerate().map(
                             |(index, value)| {
@@ -809,11 +845,8 @@ fn check_constraint_value<'s, P: PlaceholderKind, B: BindingAddress>(
                     }),
             );
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            return match check(expected, inner) {
-                Mismatch(_) => Mismatch(mismatch(expected, value)),
-                result => result,
-            };
+        Value::Deferred(DeferredValue::Secret(_)) => {
+            unreachable!("secret values are checked at the boundary")
         }
         Value::Concrete(_) => {}
     }
@@ -1447,9 +1480,9 @@ mod tests {
                 "id".into(),
                 string("account"),
             )]))),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::Bool(true),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::Bool(true))).into(),
+            )),
         ] {
             assert!(
                 matches!(
@@ -2529,7 +2562,7 @@ mod tests {
     #[test]
     fn secret_checks_inner_value_without_leaking_validator_text() {
         let plaintext = "secret-invalid-ip-address";
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(string(plaintext))));
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(string(plaintext)).into()));
         let error = check(
             &crate::parser::bare_type_for_test("ipv4_address".to_string()),
             &secret,
@@ -2563,12 +2596,13 @@ mod tests {
 
     #[test]
     fn secret_errors_stop_at_the_secret_boundary() {
-        let secret_map = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::Map(IndexMap::from([(
+        let secret_map = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "private_key".to_string(),
                 string("not-a-bool"),
-            )])),
-        ))));
+            )]))))
+            .into(),
+        ));
         let error = check(&TypeExpr::Map(Box::new(TypeExpr::Bool)), &secret_map).unwrap_err();
         assert!(matches!(
             &error,
@@ -2582,9 +2616,9 @@ mod tests {
         ));
         assert!(!error.to_string().contains("private_key"));
 
-        let secret_struct = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::Map(IndexMap::new()),
-        ))));
+        let secret_struct = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::new()))).into(),
+        ));
         assert!(matches!(
             check(
                 &TypeExpr::Struct {

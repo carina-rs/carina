@@ -2458,7 +2458,7 @@ mod tests {
         assert!(matches!(
             loaded.parsed.variables.get("token"),
             Some(Value::Deferred(DeferredValue::Secret(inner)))
-                if matches!(inner.as_ref(), Value::Deferred(DeferredValue::Unavailable { .. }))
+                if matches!(inner.expose_plaintext(), Value::Deferred(DeferredValue::Unavailable { .. }))
         ));
         cleanup(&dir);
     }

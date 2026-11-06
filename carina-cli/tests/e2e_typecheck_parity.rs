@@ -524,6 +524,13 @@ fn authored_expression_coalesce_cli_lsp_directory_parity() {
                 cli[0].contains("String") && cli[0].contains("Int"),
                 "{cli:#?}"
             );
+            if expression.starts_with("secret(") {
+                assert!(
+                    cli[0].lines().last()
+                        == Some("coalesce default type `Int` does not match left type `String`"),
+                    "{cli:#?}"
+                );
+            }
             let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
             assert_eq!(
                 lsp_error_multiset(&lsp),

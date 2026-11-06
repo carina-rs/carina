@@ -144,6 +144,12 @@ pub enum NotInferableReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum InferenceError {
+    #[error("{}", crate::resource::INSIDE_SECRET_MESSAGE)]
+    InsideSecret {},
+    #[error("Type mismatch: {types} (from {})", crate::schema::SECRET_VALUE_MASK)]
+    SecretAssignmentMismatch {
+        types: crate::schema::MismatchTypeNames,
+    },
     #[error(transparent)]
     MissingEvidence(#[from] crate::parser::retained::MissingEvidence),
     #[error("{reason}", reason = crate::provider_text::ProviderText::new(reason))]
@@ -174,6 +180,20 @@ pub enum InferenceError {
     },
     #[error("cyclic composition binding chain: {}", crate::provider_text::ProviderText::new(cycle.join(" -> ")))]
     CyclicVirtualBinding { cycle: Vec<String> },
+}
+
+/// Keep public type context and remove names, paths and value payloads.
+impl crate::resource::InsideSecret for InferenceError {
+    fn inside_secret(self) -> Self {
+        match self {
+            error @ (Self::InsideSecret {}
+            | Self::SecretAssignmentMismatch { .. }
+            | Self::HeterogeneousCollection { .. }
+            | Self::IncompatibleCoalesceTypes { .. }
+            | Self::InvalidIntegerArithmeticOperand { .. }) => error,
+            _ => Self::InsideSecret {},
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -285,6 +305,17 @@ impl ConsumerExportStaticType {
             Self::Inferred(StaticType::Unchecked(
                 ConsumerInferredUncheckedReason::UnnameableInConsumer(_reason),
             )) => None,
+        }
+    }
+}
+
+impl crate::resource::InsideSecret for InferenceIssue {
+    fn inside_secret(self) -> Self {
+        match self {
+            Self::Failed(error) => {
+                Self::Failed(crate::resource::InsideSecret::inside_secret(error))
+            }
+            Self::NotInferable(_) => Self::Failed(InferenceError::InsideSecret {}),
         }
     }
 }

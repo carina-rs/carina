@@ -33,7 +33,7 @@
 //! after a multi-minute apply.
 
 use crate::parser::{AnalysisTree, DeclarationLocation, Located};
-use crate::resource::{AccessPath, BindingAddress, ParserPlaceholder, PathSegment};
+use crate::resource::{BindingAddress, ParserPlaceholder, PathSegment};
 use crate::schema::{EffectiveAttribute, SchemaKind, SchemaRegistry, Shape};
 use std::collections::{HashMap, HashSet};
 
@@ -80,9 +80,9 @@ where
     for resource in tree.resources() {
         for attribute in resource.located_attributes() {
             let (key, value) = attribute.detail();
-            value.visit_resource_refs(&mut |path| {
+            value.visit_resource_refs_for_diagnostics(&mut |reference, _usage| {
                 check_ref(
-                    path,
+                    reference,
                     key,
                     attribute.location(),
                     &by_binding,
@@ -97,7 +97,7 @@ where
 }
 
 fn check_ref<B: BindingAddress>(
-    path: &AccessPath<B>,
+    reference: crate::resource::ScopedResourceRef<'_, B>,
     key: &str,
     location: &DeclarationLocation,
     bindings: &HashMap<B, (&String, &String)>,
@@ -105,25 +105,30 @@ fn check_ref<B: BindingAddress>(
     schemas: &SchemaRegistry,
     out: &mut Vec<Located<DeferredPopulateDiagnostic>>,
 ) {
+    let _: Result<(), std::convert::Infallible> = reference.check(|path| {
     let target = path.binding_address();
     if synchronized.contains(target) {
-        return;
+        return Ok(());
     }
     let Some((provider, resource_type)) = bindings.get(target) else {
-        return;
+        return Ok(());
     };
     let Some(schema) = schemas.get(provider, resource_type, SchemaKind::Resource) else {
-        return;
+        return Ok(());
     };
     let Some(attribute) = schema.effective_attribute_by_authored_name(path.attribute()) else {
-        return;
+        return Ok(());
     };
     if path_traverses_deferred(attribute, path.segments()) {
+        let diagnostic_path = reference.diagnostic_path().to_dot_string();
+        let target = reference.binding_path().to_dot_string();
         out.push(Located::new(location.clone(), DeferredPopulateDiagnostic {
-            message: format!("attribute `{key}` references `{}`, which is populated asynchronously by the provider after Create. Add a `wait {target} {{ until = ... }}` block in this directory before downstream resources read this attribute.", path.to_dot_string()),
-            attribute_key: key.to_string(), unresolved_path: path.to_dot_string(), target_binding: target.to_string(),
+            message: format!("attribute `{key}` references `{}`, which is populated asynchronously by the provider after Create. Add a `wait {target} {{ until = ... }}` block in this directory before downstream resources read this attribute.", diagnostic_path.clone()),
+            attribute_key: key.to_string(), unresolved_path: diagnostic_path.clone(), target_binding: target.to_string(),
         }));
     }
+        Ok(())
+    });
 }
 
 /// Walk `(top_attr, segments)` over the schema graph; return true if
@@ -194,6 +199,22 @@ fn path_traverses_deferred(top_attr: EffectiveAttribute<'_>, segments: &[PathSeg
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review3_secret_deferred_populate_warning_masks_reference() {
+        let parsed = fixture(
+            "let private_cert = aws.acm.Certificate {}\nlet record = aws.route53.RecordSet { resource_records = [secret(private_cert.domain_validation_options[0].resource_record_value)] }\n",
+        );
+        let diags = validate_deferred_populate_refs(
+            &AnalysisTree::try_from_file(&parsed).unwrap(),
+            &registry_for_acm(),
+        );
+        assert_eq!(diags.len(), 1);
+        for text in [diags[0].to_string(), format!("{:?}", diags[0])] {
+            assert!(!text.contains("private_cert"), "{text}");
+            assert!(!text.contains("domain_validation_options"), "{text}");
+        }
+    }
+
     use crate::schema::{
         PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
     };

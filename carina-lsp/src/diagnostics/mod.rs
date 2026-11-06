@@ -1937,10 +1937,11 @@ impl DiagnosticRun<'_> {
                                         carina_core::schema::Shape::List { .. },
                                         Value::Concrete(
                                             ConcreteValue::List(_) | ConcreteValue::StringList(_)
-                                        )
+                                        ) | Value::Deferred(DeferredValue::Secret(_))
                                     ) | (
                                         carina_core::schema::Shape::Map { .. },
                                         Value::Concrete(ConcreteValue::Map(_))
+                                            | Value::Deferred(DeferredValue::Secret(_))
                                     )
                                 )
                             {
@@ -2022,10 +2023,7 @@ impl DiagnosticRun<'_> {
                                 continue;
                             }
                             // Skip errors that are already reported with precise positions
-                            // by the attribute-level checks above. Static `secret(...)`
-                            // calls are materialized only for this shared schema pass,
-                            // so retain their masked nested errors: the authored AST
-                            // seen by the attribute pass was still a FunctionCall.
+                            // by the attribute-level checks above, including intrinsic secrets.
                             if matches!(
                                 &error,
                                 carina_core::schema::TypeError::FieldGroupViolation { path, .. }
@@ -2033,7 +2031,6 @@ impl DiagnosticRun<'_> {
                             ) {
                                 continue;
                             }
-                            let is_masked_secret_error = error.to_string().contains("(secret)");
                             // Statically evaluated expressions may first become known
                             // in this pass. Suppress list refinements only when
                             // the attribute pass emitted them.
@@ -2048,8 +2045,7 @@ impl DiagnosticRun<'_> {
                             {
                                 continue;
                             }
-                            if !is_masked_secret_error
-                                && !is_duplicate_list_error(&error)
+                            if !is_duplicate_list_error(&error)
                                 && matches!(
                                     &error,
                                     carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
@@ -2066,10 +2062,9 @@ impl DiagnosticRun<'_> {
                             {
                                 continue;
                             }
-                            if !is_masked_secret_error
-                                && error.attribute_name().is_some_and(|name| {
-                                    reported_attribute_diagnostics.contains(name)
-                                })
+                            if error
+                                .attribute_name()
+                                .is_some_and(|name| reported_attribute_diagnostics.contains(name))
                             {
                                 continue;
                             }
