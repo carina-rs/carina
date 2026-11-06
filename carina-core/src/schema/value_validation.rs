@@ -380,44 +380,23 @@ pub(crate) fn validate_custom_type_leaf<'a, R>(
     Ok(validated(proof))
 }
 
-/// Annotation values use state-text enum spelling, including string values
-/// from module and function arguments. Resolve that spelling in the validation
-/// owner before entering the same leaf walk and proof construction. Numeric
-/// bridge text is decoded before local range checks and provider dispatch.
+/// Annotation declarations check the original scalar before canonicalization.
+/// In particular, enumerated strings and numeric enum identifiers must retain
+/// their local shape errors instead of being decoded as provider bridge text.
 pub(crate) fn validate_custom_type_annotation_leaf<'a, R>(
     declaration: crate::parser::IdentifiedCustomTypeDeclaration<'a>,
     value: &Value,
     validated: impl FnOnce(Option<LocallyValidatedCustomType<'a>>) -> R,
 ) -> Result<R, TypeError> {
-    let normalized = match (declaration.declared_type().raw_shape(), value) {
-        (RawShape::Enum { .. }, Value::Concrete(ConcreteValue::String(text))) => {
-            Some(Value::Concrete(ConcreteValue::CanonicalEnum(
-                crate::resource::EnumValueResolver::new(declaration.declared_type())
-                    .resolve_state_text(text.expose_plaintext())
-                    .map_err(|error| {
-                        crate::provider::CustomTypeCanonicalizationError::EnumResolution {
-                            identity: declaration.identity().clone(),
-                            error: Box::new(error),
-                        }
-                        .into_type_error()
-                    })?,
-            )))
-        }
-        (
-            RawShape::Int { .. } | RawShape::Float { .. },
-            Value::Concrete(ConcreteValue::EnumIdentifier(raw)),
-        ) => Some(
-            crate::provider::bridge_text_to_typed_value(
-                declaration.scalar_kind(),
-                raw.as_str().into(),
-            )
-            .map_err(|error| TypeError::ValidationFailed {
-                message: crate::executor::render_error_chain(&error).into(),
-            })?,
-        ),
-        _ => None,
+    declaration.declared_type().validate_leaf_value(value)?;
+    let validator = ValueValidator {
+        defs: empty_defs_for_schema_walks(),
+        lookup: None,
     };
-    validate_custom_type_leaf(declaration, normalized.as_ref().unwrap_or(value), validated)
+    let proof = validator
+        .canonical_leaf(declaration.declared_type(), value, None)
+        .map_err(|failure| *failure.error)?;
+    Ok(validated(proof))
 }
 
 struct CanonicalLeafError<'a> {
@@ -622,14 +601,17 @@ impl<'a> ValueValidator<'a> {
                 },
                 ConcreteValueRef::StringList(items),
             ) => {
-                // Defaults are not injected here, and provider normalization
-                // runs after authored validation. Supplied items share the
-                // same local guards and dispatch as ordinary List elements.
                 let items = items
                     .iter()
                     .map(|item| Value::Concrete(ConcreteValue::String(item.clone())))
                     .collect::<Vec<Value<P, B>>>();
-                self.list(
+                // The provider walk visits ordinary Lists only. State and
+                // provider StringLists retain their local element checks.
+                ValueValidator {
+                    defs: self.defs,
+                    lookup: None,
+                }
+                .list(
                     attr,
                     element_type,
                     *constraints,
@@ -2006,31 +1988,68 @@ mod rootless_tests {
                 0,
                 "omitted defaults are not injected"
             );
-            let values: [Value; 2] = [
-                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::String("bad".into()),
-                )])),
-                Value::Concrete(ConcreteValue::StringList(vec!["bad".into()])),
+            let values: [(Value, _); 2] = [
+                (
+                    Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                        ConcreteValue::String("bad".into()),
+                    )])),
+                    Err(vec![
+                        "Resource validation failed: VpcId rejects bad".to_string(),
+                    ]),
+                ),
+                (
+                    Value::Concrete(ConcreteValue::StringList(vec!["bad".into()])),
+                    Ok(()),
+                ),
             ];
-            for value in values {
-                let errors = schema
+            for (value, expected) in values {
+                let result = schema
                     .validate_with_origins_and_lookup(
                         &HashMap::from([("params".into(), value)]),
                         &|_| false,
                         &lookup,
                     )
-                    .unwrap_err();
-                assert_eq!(
-                    errors.iter().map(ToString::to_string).collect::<Vec<_>>(),
-                    vec!["Resource validation failed: VpcId rejects bad"]
-                );
+                    .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>());
+                assert_eq!(result, expected);
             }
             assert_eq!(
                 calls.load(Ordering::SeqCst),
-                2,
-                "present List and StringList elements share dispatch"
+                1,
+                "only ordinary List elements reach provider dispatch"
             );
         }
+    }
+
+    #[test]
+    fn issue_4276_round5_string_list_keeps_local_guards_and_native_callbacks() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let ty = CompiledAttributeType::list(CompiledAttributeType::refined_string_with_validator(
+            TypeIdentity::bare("Short"),
+            None,
+            Some((None, Some(3))),
+            validator(move |_| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+            None,
+        ));
+        let lookup = |_: &CompiledAttributeType, _: &Value| {
+            panic!("StringList items must not reach provider dispatch")
+        };
+        for (input, valid) in [("ok", true), ("long", false)] {
+            let value: Value = Value::Concrete(ConcreteValue::StringList(vec![input.into()]));
+            let findings = validate_value_with_lookup(
+                &ty,
+                &value,
+                &BTreeMap::new(),
+                FieldAncestry::WRITABLE,
+                &lookup,
+            );
+            assert_eq!(findings.local_error.is_none(), valid);
+            assert!(findings.provider.is_empty());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

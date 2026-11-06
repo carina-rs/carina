@@ -1396,6 +1396,172 @@ mod provider_config_tests {
         seen_values: Option<Arc<Mutex<Vec<String>>>>,
     }
 
+    fn assert_round5_annotation_error(
+        declaration: crate::schema::AttributeType,
+        identity: TypeIdentity,
+        kind: crate::schema::RefinedScalarKind,
+        value: Value,
+        expected: TypeError,
+    ) {
+        use crate::parser::{
+            CustomTypeValidationError, CustomTypeValidationTarget, OwnedTypeIdentity,
+        };
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factories: Arc<Vec<Box<dyn ProviderFactory>>> =
+            Arc::new(vec![Box::new(RoutingFactory {
+                name: "owner",
+                declaration,
+                sibling_declaration: None,
+                accepted: None,
+                validate_calls: Arc::clone(&calls),
+                seen_values: None,
+            })]);
+        let snapshot = crate::provider::loaded_provider_snapshot_from_factories(
+            Arc::clone(&factories),
+            SchemaRegistry::new(),
+            crate::EnvironmentSnapshot::empty(),
+        );
+        let owned = OwnedTypeIdentity::provider("owner", identity.clone(), kind);
+        let resolver = test_schema_path_resolver(&factories);
+        for result in [
+            crate::parser::validate_custom_type_value(
+                &resolver,
+                CustomTypeValidationTarget::Annotation(&owned),
+                &value,
+            ),
+            crate::parser::validate_schema_custom_type(&owned, &value, snapshot.provider_context()),
+        ] {
+            assert_eq!(
+                result,
+                Err(CustomTypeValidationError::InvalidDeclarationValue {
+                    owner: "owner".into(),
+                    identity: identity.clone(),
+                    error: Box::new(expected.clone()),
+                })
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn assert_round5_enum_annotation_error(input: &str) {
+        let identity = TypeIdentity::from_dotted("shared.Mode");
+        assert_round5_annotation_error(
+            PatternAttributeType::enum_(
+                identity.clone(),
+                Some(vec!["COMMON".into()]),
+                Vec::new(),
+                None,
+                None,
+            ),
+            identity.clone(),
+            crate::schema::RefinedScalarKind::String,
+            Value::Concrete(ConcreteValue::String(input.into())),
+            TypeError::StringLiteralExpectedEnum {
+                user_typed: input.into(),
+                attribute: None,
+                type_name: "Mode".into(),
+                expected: vec![crate::schema::ExpectedEnumVariant::from_identity(
+                    &identity, "COMMON", false,
+                )],
+                extra_message: None,
+            },
+        );
+    }
+
+    #[test]
+    fn issue_4276_round5_annotation_rejects_matching_enum_string() {
+        assert_round5_enum_annotation_error("COMMON");
+    }
+
+    #[test]
+    fn issue_4276_round5_annotation_rejects_unknown_enum_string() {
+        assert_round5_enum_annotation_error("bogus");
+    }
+
+    #[test]
+    fn issue_4276_round5_numeric_annotation_rejects_enum_identifier() {
+        let identity = TypeIdentity::from_dotted("shared.Count");
+        for (declaration, kind) in [
+            (
+                PatternAttributeType::refined_int(Some(identity.clone()), None),
+                crate::schema::RefinedScalarKind::Int,
+            ),
+            (
+                PatternAttributeType::refined_float(Some(identity.clone()), None),
+                crate::schema::RefinedScalarKind::Float,
+            ),
+        ] {
+            assert_round5_annotation_error(
+                declaration,
+                identity.clone(),
+                kind,
+                Value::Concrete(ConcreteValue::enum_identifier("5")),
+                TypeError::value_type_mismatch("shared.Count".into(), "EnumIdentifier".into()),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_4276_round5_apply_resolved_state_string_list_skips_provider_validation() {
+        let stored = crate::protocol_convert::protocol_to_core_persisted_value(
+            &carina_provider_protocol::types::PersistedValue::StringList(vec!["bad".into()]),
+        )
+        .unwrap();
+        let value = stored.to_value_at("producer.value").unwrap();
+        assert!(matches!(
+            value,
+            Value::Concrete(ConcreteValue::StringList(_))
+        ));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(RoutingFactory {
+            name: "owner",
+            declaration: PatternAttributeType::list(PatternAttributeType::refined_string(
+                Some(TypeIdentity::bare("VpcId")),
+                None,
+                None,
+                None,
+            )),
+            sibling_declaration: None,
+            accepted: Some("vpc-good"),
+            validate_calls: Arc::clone(&calls),
+            seen_values: None,
+        })];
+        let schemas = test_schema_registry(&factories);
+        let bindings = ResolvedBindings::default();
+        let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |type_checks| {
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &factories,
+                    &schemas,
+                    type_checks,
+                );
+                let resource = Resource::with_provider("owner", "test.owner", "example", None)
+                    .with_attribute("value", value.clone());
+                let input = ResolvedCheckInput::plan_normalized(
+                    resource,
+                    HashMap::from([("value".into(), value.clone())]),
+                    HashSet::from(["value".into()]),
+                );
+                let ready = prepare_provider_ready_resource_after_resolution(input, &context)
+                    .await
+                    .expect("state StringList items receive only local validation at apply");
+                assert_eq!(
+                    ready.as_resource().resolved_attributes().get("value"),
+                    Some(&value)
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+            },
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn issue_4276_round2_d_provider_normalized_string_list_is_not_revalidated() {
         struct DefaultingNormalizer;
