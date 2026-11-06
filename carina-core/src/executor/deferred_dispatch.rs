@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::binding_index::ResolvedBindings;
 use crate::effect::Effect;
@@ -113,10 +113,10 @@ impl DeferredAnonymousIdentityGuard {
         }
     }
 
-    pub(super) fn admit<S>(
+    pub(super) fn admit<S: Clone>(
         &mut self,
         template: &DeferredForExpression<S>,
-        children: &[Effect<S>],
+        admitted: &crate::replacement::AdmittedReplacementEffects<S>,
     ) -> Result<(), DeferredCreateFailure> {
         if !matches!(
             template.target(),
@@ -128,14 +128,17 @@ impl DeferredAnonymousIdentityGuard {
         }
 
         let mut batch = HashSet::new();
-        for child in children {
+        for child in admitted.effects() {
             let Effect::Create(resource) = child else {
                 continue;
             };
             let id = &resource.id;
             let occupied_by = if self.desired.contains(id) {
                 Some(AnonymousIdentityCollisionSource::DesiredPlan)
-            } else if self.current.contains(id) && !self.absorbed_current.contains(id) {
+            } else if self.current.contains(id)
+                && !self.absorbed_current.contains(id)
+                && !admitted.replaces_current(id)
+            {
                 Some(AnonymousIdentityCollisionSource::CurrentState)
             } else if self.materialized.contains(id) || !batch.insert(id.clone()) {
                 Some(AnonymousIdentityCollisionSource::DeferredChild)
@@ -415,9 +418,7 @@ pub(super) fn materialize_deferred_create<
 }
 
 pub(super) struct DeferredMaterialization<S> {
-    pub(super) children: Vec<Effect<S>>,
-    pub(super) replacements:
-        Vec<crate::replacement::CheckedReplacement<crate::resource::ResolvedResource<S>>>,
+    pub(super) admitted: crate::replacement::AdmittedReplacementEffects<S>,
 }
 
 fn admit_materialized<S: Clone>(
@@ -425,17 +426,17 @@ fn admit_materialized<S: Clone>(
     mut children: Vec<Effect<S>>,
     schemas: &crate::schema::SchemaRegistry,
     ordinary_old: &[crate::effect::DeferredReplaceDelete],
+    requirements: &HashMap<crate::resource::ResolvedResourceId, String>,
 ) -> Result<DeferredMaterialization<S>, DeferredCreateFailure> {
     let mut replacements = Vec::new();
-    let (old_instances, required_by, is_unbound) = match effect {
+    let child_requirements = crate::replacement::create_first_requirements(&children);
+    let (old_instances, is_unbound) = match effect {
         Effect::DeferredReplace(payload) => (
             &payload.deletes[..],
-            payload.request.required_by(),
             matches!(payload.template.target(), DeferredForTarget::Unbound { .. }),
         ),
         Effect::DeferredCreate(payload) => (
             ordinary_old,
-            None,
             matches!(payload.template.target(), DeferredForTarget::Unbound { .. }),
         ),
         _ => unreachable!("only deferred gates materialize children"),
@@ -465,6 +466,29 @@ fn admit_materialized<S: Clone>(
         let Ok(old) = crate::effect::NonEmptyDeletes::try_new(old) else {
             continue;
         };
+        let required_by = match effect {
+            Effect::DeferredReplace(payload) => payload
+                .required_by_child(&resource.resolved_id())
+                .or_else(|| {
+                    old.iter()
+                        .find_map(|old| payload.required_by_child(&old.id))
+                }),
+            _ => None,
+        }
+        .or_else(|| {
+            requirements
+                .get(&resource.resolved_id())
+                .map(String::as_str)
+        })
+        .or_else(|| {
+            old.iter()
+                .find_map(|old| requirements.get(&old.id).map(String::as_str))
+        })
+        .or_else(|| {
+            child_requirements
+                .get(&resource.resolved_id())
+                .map(String::as_str)
+        });
         let mut request = crate::replacement::ReplacementRequest::new(resource.clone(), old);
         if let Some(dependent) = required_by {
             request = request.require_create_first(dependent);
@@ -479,12 +503,13 @@ fn admit_materialized<S: Clone>(
                     None => DeferredCreateFailure::Replacement { error },
                 }
             })?;
-        *resource = checked.target().clone();
         replacements.push(checked);
     }
     Ok(DeferredMaterialization {
-        children,
-        replacements,
+        admitted: crate::replacement::AdmittedReplacementEffects::from_materialized(
+            children,
+            replacements,
+        ),
     })
 }
 
@@ -501,6 +526,7 @@ pub(super) enum DeferredDispatchResult<S> {
 pub(super) struct PureMetaCtx<'a> {
     pub(super) identity_inputs: DeferredIdentityInputs<'a>,
     pub(super) ordinary_old: &'a [crate::effect::DeferredReplaceDelete],
+    pub(super) requirements: &'a HashMap<crate::resource::ResolvedResourceId, String>,
 }
 
 /// Dispatch a DeferredCreate meta-effect by materializing its runtime
@@ -520,6 +546,7 @@ pub(super) fn dispatch_deferred_create<
             children,
             ctx.identity_inputs.schemas,
             ctx.ordinary_old,
+            ctx.requirements,
         ) {
             Ok(materialized) => DeferredDispatchResult::Materialized(materialized),
             Err(error) => DeferredDispatchResult::MaterializeFailed(error),

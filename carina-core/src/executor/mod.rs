@@ -16,7 +16,7 @@ mod deferred_dispatch;
 pub mod normalized;
 #[cfg(test)]
 mod normalized_tests;
-mod parallel;
+pub(crate) mod parallel;
 pub mod provider_ready;
 #[cfg(test)]
 mod provider_wire_tests;
@@ -63,24 +63,19 @@ pub struct PlanSchedulerEndpoint {
 /// Dependency-analysis failures retain their partial edge graph, matching the
 /// scheduler's behavior for unaffected effects.
 pub fn build_plan_scheduler_dependency_edges(
-    plan_effects: &[Effect],
+    plan: &crate::plan::Plan,
     unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
-    replacements: &crate::replacement::ReplacementScheduling,
 ) -> BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)> {
-    let parallel::ExpandedEffects {
-        effects,
-        deferred_replace_delete_deps,
-        source_effect_indices,
-    } = parallel::expand_deferred_replace_effects(plan_effects);
+    let (admitted, deferred_replace_delete_deps, source_effect_indices) =
+        plan.scheduling_effects().expand_deferred_replacements();
     let deferred_replace_teardowns: HashSet<_> = deferred_replace_delete_deps
         .iter()
         .map(|(_, delete_idx)| *delete_idx)
         .collect();
     let scheduler::SchedulerDeps { deps_of, .. } = scheduler::build_scheduler_deps_from_resources(
-        &effects,
+        &admitted,
         unresolved_resources,
         &deferred_replace_delete_deps,
-        replacements,
     );
 
     deps_of
@@ -540,19 +535,17 @@ impl RuntimeCompositions<'_> {
         }
     }
 
-    fn scheduler_dependencies<S>(
+    fn scheduler_dependencies<S: Clone>(
         self,
-        effects: &[Effect<S>],
+        admitted: &crate::replacement::AdmittedReplacementEffects<S>,
         unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
         deferred_replace_delete_deps: &[(usize, usize)],
-        replacements: &crate::replacement::ReplacementScheduling,
     ) -> scheduler::SchedulerDeps {
         let _ = self;
         scheduler::build_scheduler_deps(
-            effects,
+            admitted,
             unresolved_resources,
             deferred_replace_delete_deps,
-            replacements,
         )
     }
 }
@@ -1464,7 +1457,8 @@ pub struct ExecutionResult<S = ModuleSource> {
     pub applied_states: std::collections::HashMap<ResourceId, Applied>,
     pub runtime_synthesized_resources: Vec<ResolvedResource<S>>,
     pub successfully_deleted: HashSet<DeletedInstanceKey>,
-    pub permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
+    pub permanent_name_overrides:
+        HashMap<ResourceId, HashMap<String, crate::name_override::NameOverride>>,
     pub managed_current: HashMap<ResourceId, Current>,
     pub data_source_states: HashMap<ResourceId, State>,
     pub bindings: ResolvedBindings,
@@ -1519,7 +1513,8 @@ pub(super) struct ExecutionResultFields<S = ModuleSource> {
     pub(super) interrupted_count: usize,
     pub(super) runtime_synthesized_resources: Vec<ResolvedResource<S>>,
     pub(super) successfully_deleted: HashSet<DeletedInstanceKey>,
-    pub(super) permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
+    pub(super) permanent_name_overrides:
+        HashMap<ResourceId, HashMap<String, crate::name_override::NameOverride>>,
     pub(super) managed_current: HashMap<ResourceId, Current>,
     pub(super) data_source_states: HashMap<ResourceId, State>,
     pub(super) bindings: ResolvedBindings,

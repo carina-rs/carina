@@ -7077,11 +7077,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                 });
                 state_block_result?;
 
-                let analysis = carina_core::effect::deps::build_effect_dependency_analysis(
-                    plan.effects(),
-                    resolved_desired_ids.ids.iter(),
-                    carina_core::effect::deps::ScheduleInputs::Apply(plan.replacement_scheduling()),
-                );
+                let analysis = plan.dependency_analysis(resolved_desired_ids.ids.iter());
                 let analysis = match analysis {
                     Ok(analysis) => analysis,
                     Err(failure) => failure.into_parts().0,

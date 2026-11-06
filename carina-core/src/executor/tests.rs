@@ -14,9 +14,6 @@ macro_rules! unexpected_resume_create {
     };
 }
 use crate::data_source_value::{DataSourceValue, DataSourceValues, ExecutableDataSourceValues};
-use crate::effect::deps::{
-    ScheduleInputs, build_effect_dependency_analysis as build_dependency_analysis,
-};
 use crate::effect::{
     DeferredReplaceDelete, DeletedInstanceKey, EffectGeneration, NonEmptyDeletes, ReleasedListKey,
     ReleasedListKeys,
@@ -373,20 +370,12 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
             .iter()
             .map(|(id, resource)| (id.clone(), resource))
             .collect();
-        let mut schemas = SchemaRegistry::new();
-        schemas.insert(
-            "",
-            PatternResourceSchema::new("test")
-                .with_coexisting_replacement()
-                .validate()
-                .unwrap(),
-        );
-        let replacements =
-            crate::replacement::ReplacementScheduling::resolve(&effects, &schemas, |_| {
-                HashMap::new()
-            })
-            .unwrap();
-        let actual = build_plan_scheduler_dependency_edges(&effects, &borrowed, &replacements);
+        let mut plan = Plan::new();
+        for effect in effects {
+            plan.add(effect);
+        }
+        plan.prepare_replacements(&COEXISTING_TEST_SCHEMAS).unwrap();
+        let actual = build_plan_scheduler_dependency_edges(&plan, &borrowed);
 
         assert_eq!(actual, expected, "scheduler-edge export drifted for {case}");
         actual
@@ -9284,13 +9273,10 @@ fn test_build_dependency_levels_consistent_with_dependency_map() {
     let plan = create_plan_from_fixture_resources(vec![a, b, c, d]);
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new());
-    let dep_map = build_dependency_analysis(
-        plan.effects(),
-        std::iter::empty(),
-        ScheduleInputs::Apply(plan.replacement_scheduling()),
-    )
-    .expect("dependency analysis must resolve")
-    .into_deps_of();
+    let dep_map = plan
+        .dependency_analysis(std::iter::empty())
+        .expect("dependency analysis must resolve")
+        .into_deps_of();
 
     // Verify levels are consistent with the dependency map:
     // For every effect, its level must be greater than all its dependencies' levels.
@@ -9476,13 +9462,10 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         blocked_by_updates: Default::default(),
     });
 
-    let deps = build_dependency_analysis(
-        plan.effects(),
-        std::iter::empty(),
-        ScheduleInputs::Apply(plan.replacement_scheduling()),
-    )
-    .expect("dependency analysis must resolve")
-    .into_deps_of();
+    let deps = plan
+        .dependency_analysis(std::iter::empty())
+        .expect("dependency analysis must resolve")
+        .into_deps_of();
 
     // vpc delete (idx 0) must depend on subnet delete (idx 1)
     // because subnet must be deleted before vpc (reverse dependency)
@@ -9998,13 +9981,10 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     .finish(|_| {});
     assert_eq!(plan.replace_display_info().count(), 2);
 
-    let deps = build_dependency_analysis(
-        plan.effects(),
-        unresolved_resources.keys(),
-        ScheduleInputs::Apply(plan.replacement_scheduling()),
-    )
-    .expect("dependency analysis must resolve")
-    .into_deps_of();
+    let deps = plan
+        .dependency_analysis(unresolved_resources.keys())
+        .expect("dependency analysis must resolve")
+        .into_deps_of();
     let vpc_create_idx = plan
         .effects()
         .iter()
@@ -13124,5 +13104,323 @@ fn issue_4283_deferred_prior_snapshot_uses_persisted_secret_shape() {
         !serde_json::to_string(&redacted)
             .unwrap()
             .contains("OLD_CHILD_SECRET_PLAINTEXT")
+    );
+}
+
+#[tokio::test]
+async fn review_4283_anonymous_delete_waits_for_forbidden_cbd_admission() {
+    let (mut template, bindings, schemas, child) = anonymous_deferred_collision_fixture();
+    template.template_directives_mut().create_before_destroy =
+        crate::resource::LoopDirective::Resolved(true);
+    let child_id = child.id.clone();
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    let mut plan = Plan::new();
+    plan.add(Effect::Delete {
+        id: ResolvedResourceId::new(child_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("existing"),
+        generation: EffectGeneration::Current,
+        directives: Directives::default(),
+        binding: None,
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+    });
+    plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+        Box::new(template),
+    )));
+    let current = Current::from_snapshot(
+        State::existing(child_id.clone(), HashMap::new()).with_identifier("existing"),
+    );
+    let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings,
+        managed_current: HashMap::from([(child_id.clone(), current)]),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    assert_eq!(result.failure_count(), 1, "events: {:?}", observer.events());
+    assert!(
+        provider.calls().is_empty(),
+        "admission failed after destroying the old child: {:?}",
+        provider.calls()
+    );
+    assert!(result.managed_current.contains_key(&child_id));
+}
+
+#[test]
+fn review_4283_deferred_requirements_apply_to_one_concrete_sibling() {
+    let mut bindings = ResolvedBindings::default();
+    let option = |name: &str| {
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "resource_record".into(),
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                (
+                    "name".into(),
+                    Value::Concrete(ConcreteValue::String(name.into())),
+                ),
+                (
+                    "value".into(),
+                    Value::Concrete(ConcreteValue::String("value".into())),
+                ),
+            ]))),
+        )])))
+    };
+    bindings.set_with_completeness(
+        "cert",
+        HashMap::from([(
+            "domain_validation_options".into(),
+            Value::Concrete(ConcreteValue::List(vec![option("first"), option("second")])),
+        )]),
+        crate::binding_index::BindingValueSource::Upstream,
+        crate::binding_index::BindingCompleteness::Complete,
+    );
+    let old = |index: usize| DeferredReplaceDelete {
+        id: test_resolved_id("test", &format!("validation_records[{index}]")),
+        identifier: crate::effect::fixture_applied_identifier(format!("old-{index}")),
+        directives: Default::default(),
+        binding: Some(absolute_binding(&format!("validation_records[{index}]"))),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: Default::default(),
+    };
+    let first = old(0).id;
+    let configuration = crate::parser::ExpandedParsedFile {
+        upstream_states: vec![crate::parser::UpstreamState {
+            binding: absolute_binding("cert"),
+            source: std::path::PathBuf::from("../cert"),
+        }],
+        ..Default::default()
+    };
+    let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
+    let (template, dependencies) = graph
+        .compile_deferred_for(validation_deferred_for_expression())
+        .unwrap();
+    let deferred = Effect::DeferredReplace(Box::new(crate::effect::DeferredReplacePayload::new(
+        NonEmptyDeletes::try_new(vec![old(0), old(1)]).unwrap(),
+        Box::new(template),
+        dependencies,
+    )));
+    let consumer = ResolvedResource::from_resolved_parts(
+        Resource::new("test", "consumer")
+            .with_root_binding("consumer")
+            .with_dependency_phase(()),
+        std::iter::once(first).collect(),
+        Default::default(),
+    );
+    let admitted = crate::replacement::AdmittedReplacementEffects::resolve(
+        &[deferred, Effect::Create(consumer)],
+        &COEXISTING_TEST_SCHEMAS,
+        |_| HashMap::new(),
+    )
+    .unwrap();
+    let effects = admitted.effects();
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            let ctx = deferred_dispatch::PureMetaCtx {
+                ordinary_old: &[],
+                requirements: &HashMap::new(),
+                identity_inputs: deferred_dispatch::DeferredIdentityInputs {
+                    provider_configs: &[],
+                    type_checks: session,
+                    factories: &[],
+                    schemas: &COEXISTING_TEST_SCHEMAS,
+                },
+            };
+            let saved: Effect<crate::resource::SavedModuleSource> = effects[0].clone().into();
+            let decoded: Effect<crate::resource::SavedModuleSource> =
+                serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+            for gate in [&saved, &decoded] {
+                let scheduler::PureMetaOutcome::Materialized(materialized) =
+                    scheduler::try_dispatch_pure_meta(gate, &bindings, &ctx)
+                else {
+                    panic!("children must materialize");
+                };
+                let children = materialized.admitted.effects();
+                assert_eq!(children.len(), 2);
+                assert!(
+                    matches!(&children[0], Effect::Create(child) if child.directives.create_before_destroy)
+                );
+                assert!(
+                    matches!(&children[1], Effect::Create(child) if !child.directives.create_before_destroy),
+                    "a requirement on iteration 0 promoted iteration 1"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+fn review_4283_redacted_deferred_debug_drops_preview_snapshots() {
+    let old = DeferredReplaceDelete {
+        id: test_resolved_id("test", "validation_records[0]"),
+        identifier: crate::effect::fixture_applied_identifier("old-child"),
+        directives: Default::default(),
+        binding: Some(absolute_binding("validation_records[0]")),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: HashMap::from([(
+            "secret".into(),
+            crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::String(
+                "REVIEW_DEFERRED_SECRET_PLAINTEXT".into(),
+            )),
+        )]),
+    };
+    let id = old.id.as_inner().clone();
+    let guide = crate::value::redact_secrets_in_state(&State::existing(
+        id.clone(),
+        HashMap::from([(
+            "secret".into(),
+            crate::resource::SnapshotValue::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(crate::resource::SnapshotValue::Concrete(
+                    crate::resource::ConcreteValue::String(
+                        "REVIEW_DEFERRED_SECRET_PLAINTEXT".into(),
+                    ),
+                )),
+            )),
+        )]),
+    ))
+    .unwrap();
+    let effect = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
+        NonEmptyDeletes::try_new(vec![old]).unwrap(),
+        Box::new(validation_deferred_for_expression()),
+    )));
+    let mut plan = Plan::new();
+    plan.add(effect);
+    let redacted = crate::value::redact_secrets_in_plan_with_desired_and_historical(
+        &plan,
+        &HashMap::<
+            ResourceId,
+            crate::resource::Resource<ModuleSource, crate::resource::SnapshotLeaf>,
+        >::new(),
+        &HashMap::from([(id, guide)]),
+    )
+    .unwrap();
+    assert!(
+        !serde_json::to_string(&redacted)
+            .unwrap()
+            .contains("REVIEW_DEFERRED_SECRET_PLAINTEXT")
+    );
+    assert!(
+        !format!("{redacted:?}").contains("REVIEW_DEFERRED_SECRET_PLAINTEXT"),
+        "redacted deferred Debug retained a plaintext preview snapshot"
+    );
+}
+
+#[tokio::test]
+async fn review_4283_runtime_attribute_name_override_reaches_checkpoints() {
+    let (mut template, bindings, _, child) = anonymous_deferred_collision_fixture();
+    template.template_directives_mut().create_before_destroy =
+        crate::resource::LoopDirective::Resolved(true);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Child")
+            .attribute(
+                PatternAttributeSchema::optional("identity_input", PatternAttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("identity_input")
+            .validate()
+            .unwrap(),
+    );
+    let child_id = child.id.clone();
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(
+        State::existing(child_id.clone(), HashMap::new()).with_identifier("new-child")
+    ));
+    let mut plan = Plan::new();
+    plan.add(Effect::Delete {
+        id: ResolvedResourceId::new(child_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("old-child"),
+        generation: EffectGeneration::Current,
+        directives: Directives::default(),
+        binding: None,
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+    });
+    plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+        Box::new(template),
+    )));
+    let snapshots = Arc::new(Mutex::new(Vec::new()));
+    let published = Arc::clone(&snapshots);
+    let old = State::existing(
+        child_id.clone(),
+        HashMap::from([(
+            "identity_input".into(),
+            crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::String(
+                "stable".into(),
+            )),
+        )]),
+    )
+    .with_identifier("old-child");
+    let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings,
+        managed_current: HashMap::from([(child_id.clone(), Current::from_snapshot(old))]),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::new(move |result| {
+            published.lock().unwrap().push(result)
+        }),
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
+    let override_ = &result.permanent_name_overrides[&child_id]["identity_input"];
+    assert_eq!(override_.original_value.as_deref(), Some("stable"));
+    assert_ne!(override_.temp_value, "stable");
+    let creates = provider.captured_create_resources();
+    assert_eq!(
+        creates[0].get_attr("identity_input"),
+        Some(&crate::resource::Value::Concrete(
+            crate::resource::ConcreteValue::String(override_.temp_value.clone().into())
+        ))
+    );
+    let snapshots = snapshots.lock().unwrap();
+    let checkpoint = snapshots
+        .iter()
+        .find(|snapshot| snapshot.applied_states.contains_key(&child_id))
+        .expect("created child must be checkpointed");
+    assert_eq!(
+        checkpoint.permanent_name_overrides[&child_id]["identity_input"],
+        *override_
+    );
+    let calls = provider.calls();
+    assert!(
+        call_position(&calls, "create", &child_id.to_string())
+            < call_position(&calls, "delete", &child_id.to_string()),
+        "prepared Attribute replacement should be create-first: {calls:?}"
     );
 }

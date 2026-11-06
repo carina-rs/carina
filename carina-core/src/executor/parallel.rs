@@ -37,13 +37,13 @@ use super::{
 #[cfg(test)]
 use super::{ExecutionInput, ProviderCheckInputs};
 
-pub(super) struct ExpandedEffects<S> {
-    pub(super) effects: Vec<Effect<S>>,
-    pub(super) deferred_replace_delete_deps: Vec<(usize, usize)>,
-    pub(super) source_effect_indices: Vec<usize>,
+pub(crate) struct ExpandedEffects<S> {
+    pub(crate) effects: Vec<Effect<S>>,
+    pub(crate) deferred_replace_delete_deps: Vec<(usize, usize)>,
+    pub(crate) source_effect_indices: Vec<usize>,
 }
 
-pub(super) fn expand_deferred_replace_effects<S: Clone>(
+pub(crate) fn expand_deferred_replace_effects<S: Clone>(
     plan_effects: &[Effect<S>],
 ) -> ExpandedEffects<S> {
     let mut effects = Vec::with_capacity(plan_effects.len());
@@ -85,10 +85,9 @@ pub(super) fn apply_deferred_gate_deps<S>(
     deps_of: &mut HashMap<usize, HashSet<usize>>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) {
-    // An unrelated anonymous state row remains a normal Delete rather than
-    // being claimed by one arbitrary unbound loop. Every same-kind unbound
-    // runtime gate must nevertheless wait for that row to be removed, because
-    // any gate may materialize a child with the persisted generated address.
+    // Every same-kind unbound gate may materialize a replacement for an
+    // anonymous row. Keep those candidate rows live until all such gates
+    // materialize and admit their children successfully.
     for (delete_idx, effect) in effects.iter().enumerate() {
         let Effect::Delete {
             id,
@@ -115,7 +114,7 @@ pub(super) fn apply_deferred_gate_deps<S>(
                 && template.template_resource_id().resource_type == id.resource_type
                 && template.template_resource_id().provider_instance == id.provider_instance
             {
-                deps_of.entry(gate_idx).or_default().insert(delete_idx);
+                deps_of.entry(delete_idx).or_default().insert(gate_idx);
             }
         }
     }
@@ -212,7 +211,7 @@ pub(super) fn build_dependency_levels(
     let deps_of = crate::effect::deps::build_effect_dependency_analysis(
         effects,
         unresolved_resources.keys(),
-        crate::effect::deps::ScheduleInputs::Apply(&Default::default()),
+        crate::effect::deps::ScheduleInputs::Apply,
     )
     .expect("dependency analysis must resolve")
     .into_deps_of();
@@ -488,15 +487,19 @@ pub(super) async fn execute_effects_sequential<
                 .plan
                 .effects()
                 .iter()
-                .find(|effect| matches!(effect, Effect::Create(_) | Effect::DeferredReplace(_)))
-                .expect("replacement admission errors have replacement endpoints");
+                .find(|effect| effect.resource_id() == error.resource_id.as_ref())
+                .expect("replacement admission errors identify their endpoint");
             {
                 record_effect_failure(
                     &mut accumulated,
                     observer,
                     effect,
-                    EffectFailureKind::deferred(super::DeferredCreateFailure::Replacement {
-                        error,
+                    EffectFailureKind::deferred(match error.required_by {
+                        Some(dependent) => super::DeferredCreateFailure::ReplacementRequired {
+                            dependent,
+                            error: error.cause,
+                        },
+                        None => super::DeferredCreateFailure::Replacement { error: error.cause },
                     }),
                     FailureEventContext {
                         recovery: None,
@@ -511,22 +514,25 @@ pub(super) async fn execute_effects_sequential<
             return (accumulated.finish(&input.checkpoint_sink), false);
         }
     };
-    let (admitted_effects, mut replacements, temporary_names) = admitted.into_parts();
-    for (id, name) in temporary_names {
+    for (id, name) in admitted.temporary_names() {
         accumulated.mutate(|result| {
             result
                 .permanent_name_overrides
-                .entry(id)
+                .entry(id.clone())
                 .or_default()
-                .insert(name.attribute, name.temporary_value);
+                .insert(
+                    name.attribute.clone(),
+                    crate::name_override::NameOverride {
+                        temp_value: name.temporary_value.clone(),
+                        original_value: Some(name.original_value.clone()),
+                    },
+                );
         });
     }
-    let ExpandedEffects {
-        mut effects,
-        deferred_replace_delete_deps,
-        source_effect_indices: _,
-    } = expand_deferred_replace_effects(&admitted_effects);
-    let mut total = count_runtime_effects(&effects, &input.data_source_values);
+    let (mut admitted, deferred_replace_delete_deps, _) = admitted.expand_deferred_replacements();
+    let mut effects = admitted.effects();
+    let mut materialization_requirements = crate::replacement::create_first_requirements(effects);
+    let mut total = count_runtime_effects(effects, &input.data_source_values);
     let completed = AtomicUsize::new(0);
 
     let empty_resource_origins = HashMap::new();
@@ -538,7 +544,7 @@ pub(super) async fn execute_effects_sequential<
         .keys()
         .map(|id| id.as_inner().clone())
         .collect::<HashSet<_>>();
-    for effect in &effects {
+    for effect in effects {
         if matches!(
             effect,
             Effect::Read { .. }
@@ -580,10 +586,9 @@ pub(super) async fn execute_effects_sequential<
         mut deps_of,
         unresolved: scheduler_dependency_errors,
     } = input.compositions.scheduler_dependencies(
-        &effects,
+        &admitted,
         resource_origins,
         &deferred_replace_delete_deps,
-        &replacements,
     );
 
     // Build effect index -> binding name mapping for resolving dependency names
@@ -714,7 +719,7 @@ pub(super) async fn execute_effects_sequential<
             dispatched.insert(idx);
             let effect = effects[idx].clone();
 
-            let failure_view = FailureView::new(&effects, &deps_of, &failed_indices);
+            let failure_view = FailureView::new(effects, &deps_of, &failed_indices);
             if let Some(failed_dep) = failure_view.find_failed_dependency(idx) {
                 let c = if effect.is_scheduler_meta() {
                     completed.load(Ordering::Relaxed)
@@ -761,13 +766,24 @@ pub(super) async fn execute_effects_sequential<
                         dependencies: dependencies.clone(),
                         explicit_dependencies: explicit_dependencies.clone(),
                         blocked_by_updates: blocked_by_updates.clone(),
-                        previous_attributes: Default::default(),
+                        previous_attributes: accumulated
+                            .result()
+                            .managed_current
+                            .get(id.as_inner())
+                            .and_then(|current| match current {
+                                crate::resource::Current::Present(present) => {
+                                    Some(present.state().to_snapshot().attributes)
+                                }
+                                _ => None,
+                            })
+                            .unwrap_or_default(),
                     }),
                     _ => None,
                 })
                 .collect::<Vec<_>>();
             let dispatch_ctx = PureMetaCtx {
                 ordinary_old: &ordinary_old,
+                requirements: &materialization_requirements,
                 identity_inputs: super::deferred_dispatch::DeferredIdentityInputs {
                     provider_configs: input.provider_configs,
                     factories: input.factories,
@@ -798,10 +814,7 @@ pub(super) async fn execute_effects_sequential<
                     break;
                 }
                 PureMetaOutcome::Materialized(
-                    super::deferred_dispatch::DeferredMaterialization {
-                        children,
-                        replacements: admitted,
-                    },
+                    super::deferred_dispatch::DeferredMaterialization { admitted: children },
                 ) => {
                     let template = match &effect {
                         Effect::DeferredCreate(payload) => payload.template.as_ref(),
@@ -828,39 +841,44 @@ pub(super) async fn execute_effects_sequential<
                         completed_synchronous_dispatch = true;
                         break;
                     }
-                    for checked in admitted {
-                        if let Some(name) = checked.temporary_name() {
-                            accumulated.mutate(|result| {
-                                result
-                                    .permanent_name_overrides
-                                    .entry(checked.target().id.clone())
-                                    .or_default()
-                                    .insert(name.attribute.clone(), name.temporary_value.clone());
-                            });
-                        }
-                        replacements.insert(checked);
+                    for (id, name) in children.temporary_names() {
+                        accumulated.mutate(|result| {
+                            result
+                                .permanent_name_overrides
+                                .entry(id.clone())
+                                .or_default()
+                                .insert(
+                                    name.attribute.clone(),
+                                    crate::name_override::NameOverride {
+                                        temp_value: name.temporary_value.clone(),
+                                        original_value: Some(name.original_value.clone()),
+                                    },
+                                );
+                        });
                     }
-                    if !children.is_empty() {
-                        total += count_actionable_effects(&children);
-                        for child in children {
-                            let child_idx = effects.len();
-                            if let Effect::Create(resource) = &child {
+                    if !children.effects().is_empty() {
+                        total += count_actionable_effects(children.effects());
+                        for (offset, child) in children.effects().iter().enumerate() {
+                            let child_idx = effects.len() + offset;
+                            if let Effect::Create(resource) = child {
                                 runtime_authored_resource_ids.insert(resource.id.clone());
                                 accumulated.mutate(|result| {
                                     result.runtime_synthesized_resources.push(resource.clone());
                                 });
                             }
-                            if let Some(binding) = failure_display_name(&child) {
+                            if let Some(binding) = failure_display_name(child) {
                                 idx_to_binding.insert(child_idx, binding);
                             }
-                            effects.push(child);
                             actionable_indices.push(child_idx);
                         }
+                        admitted.append(children);
+                        effects = admitted.effects();
+                        materialization_requirements =
+                            crate::replacement::create_first_requirements(effects);
                         let rebuilt = input.compositions.scheduler_dependencies(
-                            &effects,
+                            &admitted,
                             resource_origins,
                             &deferred_replace_delete_deps,
-                            &replacements,
                         );
                         deps_of = rebuilt.deps_of;
                         for dependency in rebuilt.unresolved {
@@ -1147,7 +1165,7 @@ pub(super) async fn execute_effects_sequential<
         }
 
         let count_undispatched = |dispatched: &HashSet<usize>, failed_indices: &HashSet<usize>| {
-            let failure_view = FailureView::new(&effects, &deps_of, failed_indices);
+            let failure_view = FailureView::new(effects, &deps_of, failed_indices);
             count_effectively_undispatched(&actionable_indices, dispatched, &failure_view)
         };
         in_flight
@@ -1187,7 +1205,7 @@ pub(super) async fn execute_effects_sequential<
                     .copied()
                     .collect::<HashSet<_>>();
                 for (idx, kind) in classify_stalled_effects(
-                    &effects,
+                    effects,
                     &deps_of,
                     &remaining_indices,
                     &completed_indices,
@@ -1808,12 +1826,9 @@ mod tests {
                 _ => None,
             })
             .collect();
-        let mut analysis = build_dependency_analysis(
-            &effects,
-            unresolved.keys(),
-            ScheduleInputs::Apply(&Default::default()),
-        )
-        .expect("dependency analysis must resolve");
+        let mut analysis =
+            build_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         analysis.into_deps_of().remove(&1).unwrap()
     }
@@ -2014,7 +2029,7 @@ mod tests {
                 let deps = build_dependency_analysis(
                     plan.effects(),
                     unresolved.keys(),
-                    ScheduleInputs::Apply(&Default::default()),
+                    ScheduleInputs::Apply,
                 )
                 .expect("dependency analysis must resolve")
                 .into_deps_of();
@@ -2211,12 +2226,9 @@ mod tests {
             ),
         ]);
 
-        let analysis = build_dependency_analysis(
-            &effects,
-            unresolved.keys(),
-            ScheduleInputs::Apply(&Default::default()),
-        )
-        .expect("dependency analysis must resolve");
+        let analysis =
+            build_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve");
         assert!(
             analysis
                 .reads_for_edge(1, 0)
@@ -2323,12 +2335,9 @@ mod tests {
                 _ => unreachable!(),
             }),
         )]);
-        let mut analysis = build_dependency_analysis(
-            &effects,
-            unresolved.keys(),
-            ScheduleInputs::Apply(&Default::default()),
-        )
-        .expect("dependency analysis must resolve");
+        let mut analysis =
+            build_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         let deps_of = analysis.into_deps_of();
 
@@ -2341,12 +2350,9 @@ mod tests {
     #[test]
     fn relax_update_update_edges_handles_empty_plan() {
         let effects: Vec<Effect> = Vec::new();
-        let mut analysis = build_dependency_analysis(
-            &effects,
-            std::iter::empty(),
-            ScheduleInputs::Apply(&Default::default()),
-        )
-        .expect("dependency analysis must resolve");
+        let mut analysis =
+            build_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of().is_empty());
     }
@@ -2355,12 +2361,9 @@ mod tests {
     fn relax_update_update_edges_handles_single_update_without_parent() {
         let effect = update_effect("only", &[], &["tags"]);
         let effects = vec![effect];
-        let mut analysis = build_dependency_analysis(
-            &effects,
-            std::iter::empty(),
-            ScheduleInputs::Apply(&Default::default()),
-        )
-        .expect("dependency analysis must resolve");
+        let mut analysis =
+            build_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of()[&0].is_empty());
     }
@@ -2372,12 +2375,9 @@ mod tests {
             update_effect("parent", &[], &["tags"]),
             Effect::Create(resolved(child)),
         ];
-        let mut analysis = build_dependency_analysis(
-            &effects,
-            std::iter::empty(),
-            ScheduleInputs::Apply(&Default::default()),
-        )
-        .expect("dependency analysis must resolve");
+        let mut analysis =
+            build_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
+                .expect("dependency analysis must resolve");
         relax_update_update_edges(&effects, &mut analysis);
         assert!(analysis.into_deps_of()[&0].is_empty());
     }
@@ -2460,13 +2460,9 @@ mod tests {
             UnresolvedResource::from_pre_resolve(role_policy),
         );
 
-        let deps_of = build_dependency_analysis(
-            &effects,
-            unresolved.keys(),
-            ScheduleInputs::Apply(&Default::default()),
-        )
-        .expect("dependency analysis must resolve")
-        .into_deps_of();
+        let deps_of = build_dependency_analysis(&effects, unresolved.keys(), ScheduleInputs::Apply)
+            .expect("dependency analysis must resolve")
+            .into_deps_of();
 
         assert!(
             deps_of[&1].contains(&0),

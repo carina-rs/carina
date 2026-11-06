@@ -1014,12 +1014,10 @@ fn binding_spelling_collision_does_not_link_apply_dag_to_anonymous_replace() {
             )
         })
         .collect();
-    let analysis = crate::effect::deps::build_effect_dependency_analysis(
-        fixture.plan.effects(),
-        unresolved.keys(),
-        crate::effect::deps::ScheduleInputs::Apply(fixture.plan.replacement_scheduling()),
-    )
-    .expect("fixture dependency graph is valid");
+    let analysis = fixture
+        .plan
+        .dependency_analysis(unresolved.keys())
+        .expect("fixture dependency graph is valid");
 
     assert!(
         !analysis
@@ -1032,9 +1030,6 @@ fn binding_spelling_collision_does_not_link_apply_dag_to_anonymous_replace() {
 
 #[test]
 fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
-    use crate::effect::deps::{
-        ScheduleInputs, build_effect_dependency_analysis as build_dependency_analysis,
-    };
     use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
     use crate::resource::{LoopSlot, ModuleSource, ResolvedResource};
 
@@ -1150,13 +1145,10 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
         ResolvedResourceId::new(vpc_id),
         crate::executor::UnresolvedResource::from_pre_resolve(unresolved_vpc),
     )]);
-    let deps = build_dependency_analysis(
-        plan.effects(),
-        unresolved_resources.keys(),
-        ScheduleInputs::Apply(plan.replacement_scheduling()),
-    )
-    .expect("all scheduler dependencies must resolve")
-    .into_deps_of();
+    let deps = plan
+        .dependency_analysis(unresolved_resources.keys())
+        .expect("all scheduler dependencies must resolve")
+        .into_deps_of();
     let mut remaining = deps;
     let mut completed = HashSet::new();
     loop {
@@ -1379,7 +1371,6 @@ fn planning_uses_retained_targets_for_both_cbd_and_deferred_effects() {
 }
 
 fn assert_deferred_create_cbd_is_acyclic(plan: &Plan, producer: &ResourceId) {
-    use crate::effect::deps::{ScheduleInputs, build_effect_dependency_analysis};
     assert!(!plan.has_errors(), "{:?}", plan.errors());
     assert!(replacement_metadata(plan, producer).create_before_destroy);
     assert!(
@@ -1393,13 +1384,10 @@ fn assert_deferred_create_cbd_is_acyclic(plan: &Plan, producer: &ResourceId) {
             .iter()
             .any(|effect| matches!(effect, Effect::DeferredReplace(_)))
     );
-    let deps = build_effect_dependency_analysis(
-        plan.effects(),
-        std::iter::empty::<&ResolvedResourceId>(),
-        ScheduleInputs::Apply(plan.replacement_scheduling()),
-    )
-    .unwrap()
-    .into_deps_of();
+    let deps = plan
+        .dependency_analysis(std::iter::empty::<&ResolvedResourceId>())
+        .unwrap()
+        .into_deps_of();
     let mut completed = HashSet::new();
     loop {
         let ready = deps
@@ -1917,5 +1905,71 @@ fn issue_4283_conflicting_cascaded_child_rejects_own_cbd_or_grandchild_requireme
             "errors: {:?}",
             plan.errors()
         );
+    }
+}
+
+#[test]
+fn review_4283_reversed_dependencies_are_resolved_during_planning() {
+    for conflicting in [false, true] {
+        let a = Resource::new("test.Parent", "a")
+            .with_root_binding("a")
+            .with_attribute("version", string("new"));
+        let b = Resource::new("test.Record", "b")
+            .with_root_binding("b")
+            .with_attribute("version", string("new"));
+        let a_id = ResolvedResourceId::new(a.id.clone());
+        let b_id = ResolvedResourceId::new(b.id.clone());
+        let old_a = state(&a.id, &[("version", string("old"))], "old-a")
+            .with_dependency_bindings(crate::test_support::persisted([b_id.clone()]));
+        let old_b = state(&b.id, &[("version", string("old"))], "old-b");
+        let a = ResolvedResource::new(a.with_dependency_phase(()));
+        let b = ResolvedResource::from_resolved_parts(
+            b.with_dependency_phase(()),
+            Default::default(),
+            std::iter::once(a_id.clone()).collect(),
+        );
+        let schema = |kind: &str| {
+            PatternResourceSchema::new(kind).attribute(
+                PatternAttributeSchema::required("version", PatternAttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+        };
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            schema("test.Parent")
+                .with_coexisting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        let child_schema = schema("test.Record");
+        schemas.insert(
+            "",
+            if conflicting {
+                child_schema.with_conflicting_replacement()
+            } else {
+                child_schema.with_coexisting_replacement()
+            }
+            .validate()
+            .unwrap(),
+        );
+        let plan = plan_from_resolved_fixture(
+            vec![a.clone(), b.clone()],
+            vec![a, b],
+            HashMap::from([(a_id.into_inner(), old_a), (b_id.as_inner().clone(), old_b)]),
+            &schemas,
+        );
+        if conflicting {
+            assert!(plan.errors().iter().any(|error| error.resource_id == *b_id.as_inner()
+                && matches!(&error.kind, PlanErrorKind::CreateBeforeDestroyRequiredByDependent { dependent, .. } if dependent == "test.Parent.a")),
+                "a reversed dependency must identify B and its old dependent A: {:?}", plan.errors());
+        } else {
+            assert!(!plan.has_errors(), "{:?}", plan.errors());
+            assert!(
+                replacement_metadata(&plan, b_id.as_inner()).create_before_destroy,
+                "historical A -> B and new B -> A must promote B during planning"
+            );
+        }
     }
 }

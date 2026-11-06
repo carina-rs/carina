@@ -1806,12 +1806,8 @@ mod tests {
             )
             .collect(),
         };
-        build_effect_dependency_analysis(
-            &[effect],
-            std::iter::empty(),
-            ScheduleInputs::Apply(&Default::default()),
-        )
-        .expect_err("missing required target must fail dependency analysis")
+        build_effect_dependency_analysis(&[effect], std::iter::empty(), ScheduleInputs::Apply)
+            .expect_err("missing required target must fail dependency analysis")
     }
 
     #[test]

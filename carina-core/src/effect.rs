@@ -410,11 +410,14 @@ pub struct DeferredReplacePayload<S = ModuleSource, V: PlanValueKind = NoPlaceho
     pub dependency_template: crate::resource::DeferredDependencyTemplate,
     pub request:
         crate::replacement::ReplacementRequest<Box<DeferredForExpression<S, V, V::Template>>>,
-    preview: Option<crate::replacement::CheckedReplacement<ResolvedResourceId>>,
+    preview: Option<crate::replacement::ReplacementOrder>,
+    pub(crate) required_children: Vec<(ResolvedResourceId, String)>,
 }
 impl<S: PartialEq, V: PlanValueKind> PartialEq for DeferredReplacePayload<S, V> {
     fn eq(&self, other: &Self) -> bool {
-        self.request == other.request && self.dependency_template == other.dependency_template
+        self.request == other.request
+            && self.dependency_template == other.dependency_template
+            && self.required_children == other.required_children
     }
 }
 impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
@@ -427,6 +430,7 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
             dependency_template,
             request: crate::replacement::ReplacementRequest::new(template, deletes),
             preview: None,
+            required_children: Vec::new(),
         };
         // A schema-free default can admit delete-first; a CBD request remains
         // unchosen until the caller supplies its provider registry.
@@ -436,51 +440,85 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
     pub fn id(&self) -> &ResolvedResourceId {
         self.template.deferred_effect_id()
     }
+    pub(crate) fn require_create_first_for_dependencies(
+        &mut self,
+        requirements: &HashMap<ResolvedResourceId, String>,
+    ) {
+        if let Some(dependent) = requirements.get(self.id()) {
+            self.request
+                .require_create_first_in_place(dependent.clone());
+        }
+        for old in self.request.deletes.iter() {
+            if let Some(dependent) = requirements.get(&old.id) {
+                if let Some((_, previous)) = self
+                    .required_children
+                    .iter_mut()
+                    .find(|(id, _)| id == &old.id)
+                {
+                    *previous = dependent.clone();
+                } else {
+                    self.required_children
+                        .push((old.id.clone(), dependent.clone()));
+                }
+            }
+        }
+    }
+    pub(crate) fn required_by_child(&self, id: &ResolvedResourceId) -> Option<&str> {
+        self.request.required_by().or_else(|| {
+            self.required_children
+                .iter()
+                .find(|(child, _)| child == id)
+                .map(|(_, dependent)| dependent.as_str())
+        })
+    }
     pub fn preflight(
         &mut self,
         registry: &crate::schema::SchemaRegistry,
     ) -> Result<(), crate::plan::CreateBeforeDestroyError> {
-        let crate::resource::LoopDirective::Resolved(requested) = self
+        let requested = match self
             .template
             .template_resource()
             .directives()
             .create_before_destroy
-        else {
-            self.preview = None;
-            if self.request.required_by().is_none() {
-                return Ok(());
-            }
-            return self.preflight_order(true, registry);
+        {
+            crate::resource::LoopDirective::Resolved(requested) => Some(requested),
+            crate::resource::LoopDirective::PerElement(_) => None,
         };
-        self.preflight_order(requested, registry)
-    }
-    fn preflight_order(
-        &mut self,
-        requested: bool,
-        registry: &crate::schema::SchemaRegistry,
-    ) -> Result<(), crate::plan::CreateBeforeDestroyError> {
-        let old = &self.deletes[0];
-        let template_id = self.template.template_resource_id();
-        let target_id = ResolvedResourceId::with_provider_identity(
-            template_id.provider.clone(),
-            template_id.resource_type.clone(),
-            old.id.identity().clone(),
-            template_id.provider_instance.clone(),
-        );
-        let target: crate::resource::ResolvedResource =
-            crate::resource::ResolvedResource::from_id(target_id);
-        let mut resource = target.as_resource().clone();
-        resource.directives.create_before_destroy = requested;
-        resource.binding = old.binding.clone();
-        let mut request = crate::replacement::ReplacementRequest::new(
-            target.replace_inner(resource),
-            self.deletes.clone(),
-        );
-        if let Some(dependent) = self.request.required_by() {
-            request = request.require_create_first(dependent);
+        self.preview = None;
+        for old in self.request.deletes.iter() {
+            let required_by = self.required_by_child(&old.id);
+            if requested.is_none() && required_by.is_none() {
+                continue;
+            }
+            let template_id = self.template.template_resource_id();
+            let target_id = ResolvedResourceId::with_provider_identity(
+                template_id.provider.clone(),
+                template_id.resource_type.clone(),
+                old.id.identity().clone(),
+                template_id.provider_instance.clone(),
+            );
+            let target: crate::resource::ResolvedResource =
+                crate::resource::ResolvedResource::from_id(target_id);
+            let mut resource = target.as_resource().clone();
+            resource.directives.create_before_destroy = requested.unwrap_or_default();
+            resource.binding = old.binding.clone();
+            let mut request = crate::replacement::ReplacementRequest::new(
+                target.replace_inner(resource),
+                NonEmptyDeletes::try_new(vec![old.clone()]).expect("one old instance"),
+            );
+            if let Some(dependent) = required_by {
+                request = request.require_create_first(dependent);
+            }
+            let checked =
+                crate::replacement::resolve_replacement(request, registry)?.into_scheduling();
+            if self
+                .preview
+                .as_ref()
+                .is_none_or(|preview| !preview.is_create_first())
+            {
+                self.preview = Some(checked);
+            }
         }
-        let checked = crate::replacement::resolve_replacement(request, registry)?;
-        self.preview = Some(checked.into_scheduling());
         Ok(())
     }
     pub fn display_glyph(&self) -> &'static str {
@@ -512,13 +550,13 @@ impl<S: Serialize + Clone, V: PlanValueKind> Serialize for DeferredReplacePayloa
     {
         let mut state = serializer.serialize_struct(
             "DeferredReplacePayload",
-            if self.request.required_by().is_some() {
-                5
-            } else {
-                4
-            },
+            4 + usize::from(self.request.required_by().is_some())
+                + usize::from(!self.required_children.is_empty()),
         )?;
         state.serialize_field("deletes", &self.deletes)?;
+        if !self.required_children.is_empty() {
+            state.serialize_field("required_children", &self.required_children)?;
+        }
         if let Some(dependent) = self.request.required_by() {
             state.serialize_field("required_by", dependent)?;
         }
@@ -542,6 +580,8 @@ impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
             deletes: NonEmptyDeletes,
             #[serde(default)]
             required_by: Option<String>,
+            #[serde(default)]
+            required_children: Vec<(ResolvedResourceId, String)>,
             id: ResolvedResourceId,
             template: Box<DeferredForExpression<S, V, V::Template>>,
             dependency_template: crate::resource::DeferredDependencyTemplate,
@@ -550,12 +590,14 @@ impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
         let Wire {
             deletes,
             required_by,
+            required_children,
             id,
             template,
             dependency_template,
         } = Wire::deserialize(deserializer)?;
         validate_deferred_effect_id::<De::Error, S, V>(&id, &template)?;
         let mut payload = Self::new(deletes, template, dependency_template);
+        payload.required_children = required_children;
         if let Some(dependent) = required_by {
             payload.request = payload.request.require_create_first(dependent);
         }
@@ -1729,11 +1771,13 @@ impl<V: PlanValueKind> From<Effect<ModuleSource, V>> for Effect<SavedModuleSourc
                     request,
                     dependency_template,
                     preview,
+                    required_children,
                 } = *payload;
                 Self::DeferredReplace(Box::new(DeferredReplacePayload {
                     request: request.map_target(|template| Box::new((*template).into())),
                     dependency_template,
                     preview,
+                    required_children,
                 }))
             }
         }

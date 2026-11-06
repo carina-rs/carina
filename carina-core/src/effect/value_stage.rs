@@ -147,6 +147,7 @@ impl<S: Clone, P: PlanValueKind> EffectWithSource<S, P> {
                 Effect::DeferredReplace(Box::new(DeferredReplacePayload {
                     request: payload.request.clone().map_target(|_| mapped),
                     preview: payload.preview.clone(),
+                    required_children: payload.required_children.clone(),
                     dependency_template: payload.dependency_template.clone(),
                 }))
             }

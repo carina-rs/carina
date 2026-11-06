@@ -207,7 +207,14 @@ impl PendingCascadePlan {
         } = self;
         complete(&mut plan);
         add_deferred_create_effects_with_priors(&mut plan, deferred, &registry, &prior_attributes);
+        prepare_plan_replacements(&mut plan, &registry);
         plan
+    }
+}
+
+fn prepare_plan_replacements(plan: &mut Plan, registry: &SchemaRegistry) {
+    if let Err(error) = plan.prepare_replacements(registry) {
+        plan.add_error(error.into_plan_error());
     }
 }
 
@@ -937,6 +944,7 @@ pub(crate) fn create_plan_with_provider(
     )?;
     decompose_replace_into_effects(&mut build.plan, build.pending_replaces, directives_map);
     block_deletes_on_prior_consumer_updates(&mut build.plan, directives_map);
+    prepare_plan_replacements(&mut build.plan, registry);
     Ok(build.plan)
 }
 
@@ -1098,27 +1106,15 @@ fn add_deferred_create_effects_with_priors(
                 Box::new(template),
                 dependencies,
             );
-            let required_by = effect_requirements
-                .get(payload.id())
-                .or_else(|| {
-                    payload
-                        .deletes
-                        .iter()
-                        .find_map(|old| effect_requirements.get(&old.id))
-                })
-                .or_else(|| deferred_dependents.get(payload.id()))
-                .or_else(|| {
-                    payload
-                        .deletes
-                        .iter()
-                        .find_map(|old| deferred_dependents.get(&old.id))
-                })
-                .cloned();
-            if let Some(dependent) = required_by {
-                payload.request = payload.request.require_create_first(dependent);
-            }
+            payload.require_create_first_for_dependencies(&effect_requirements);
+            payload.require_create_first_for_dependencies(&deferred_dependents);
             if let Err(error) = payload.preflight(registry) {
-                let kind = match payload.request.required_by() {
+                let kind = match payload.request.required_by().or_else(|| {
+                    payload
+                        .required_children
+                        .first()
+                        .map(|(_, dependent)| dependent.as_str())
+                }) {
                     Some(dependent) => PlanErrorKind::CreateBeforeDestroyRequiredByDependent {
                         dependent: dependent.to_string(),
                         cause: error,

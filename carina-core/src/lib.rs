@@ -51,7 +51,7 @@ pub mod provider_source;
 pub mod provider_text;
 pub mod provider_wire;
 pub mod references;
-pub mod replacement;
+pub use plan::replacement;
 pub mod resolved_graph;
 pub mod resolver;
 #[cfg(test)]

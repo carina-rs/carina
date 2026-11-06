@@ -3,6 +3,11 @@
 //! A Plan is an ordered list of Effects to be executed.
 //! No side effects occur until the Plan is applied.
 
+// Admission and Plan own the only conversion between compiled endpoints and
+// their private scheduling projection. Executors cannot detach that projection.
+#[path = "replacement.rs"]
+pub mod replacement;
+
 use crate::resource::ResolvedDependencies;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -848,38 +853,8 @@ impl UnresolvedSavedPlan {
             abandoned_deposed,
             destroy_ordering_notices,
         };
-        let (effects, replacements, temporary_names) = plan
-            .admit_replacement_effects(schemas)
-            .map_err(crate::resource::ResolvedResourceError::Replacement)?
-            .into_parts();
-        plan.effects = effects;
-        plan.replacements = replacements;
-        for (id, name) in temporary_names {
-            for display in &mut plan.replace_display {
-                if plan
-                    .effects
-                    .get(display.create_idx)
-                    .is_some_and(|effect| effect.resource_id() == &id)
-                {
-                    display.temporary_name = Some(name.clone());
-                }
-            }
-            plan.permanent_name_overrides.retain(|previous| {
-                previous.resource_id.as_inner() != &id || previous.attribute != name.attribute
-            });
-            plan.permanent_name_overrides.push(PermanentNameOverride {
-                resource_id: ResolvedResourceId::new(id),
-                attribute: name.attribute,
-                temp_value: name.temporary_value,
-                original_value: Some(name.original_value),
-            });
-        }
-        for display in &mut plan.replace_display {
-            display.create_before_destroy = plan
-                .effects
-                .get(display.create_idx)
-                .is_some_and(|effect| plan.replacements.is_create_first(effect.resource_id()));
-        }
+        plan.prepare_replacements(schemas)
+            .map_err(|error| crate::resource::ResolvedResourceError::Replacement(error.cause))?;
         Ok(plan)
     }
 }
@@ -924,7 +899,6 @@ impl Plan {
     }
 
     pub(crate) fn add_replacement(&mut self, group: ReplacementGroup) {
-        self.replacements.insert(group.replacement.clone());
         let create_before_destroy = group.replacement.is_create_first();
         let temporary_name = group.replacement.temporary_name().cloned();
         let previous_attributes = group.replacement.old_instances()[0]
@@ -936,8 +910,11 @@ impl Plan {
         } else {
             (offset + 1, offset)
         };
-        self.effects
-            .extend(group.replacement.into_effects(group.consumer_updates));
+        self.replacements.extend_effects(
+            group.replacement,
+            group.consumer_updates,
+            &mut self.effects,
+        );
         self.replace_display.push(ReplaceDisplayMetadata {
             create_idx,
             delete_idx,
@@ -990,7 +967,7 @@ impl<S, V: PlanValueKind> Plan<S, V> {
         effects: Vec<Effect<S, Q>>,
     ) -> Plan<S, Q> {
         let Plan {
-            replacements,
+            replacements: _replacements,
             effects: _,
             ignored_change_summaries,
             replace_display,
@@ -1000,7 +977,9 @@ impl<S, V: PlanValueKind> Plan<S, V> {
             destroy_ordering_notices,
         } = self;
         Plan {
-            replacements,
+            // The replacement vector was mapped by a caller. Execution must
+            // re-admit its prepared endpoints rather than inherit a proof.
+            replacements: ReplacementScheduling::default(),
             effects,
             ignored_change_summaries,
             replace_display,
@@ -1015,14 +994,53 @@ impl<S, V: PlanValueKind> Plan<S, V> {
         self.effects.push(effect);
     }
 
-    pub fn replacement_scheduling(&self) -> &ReplacementScheduling {
-        &self.replacements
+    pub(crate) fn prepare_replacements(
+        &mut self,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Result<(), crate::replacement::ReplacementAdmissionError>
+    where
+        S: Clone,
+    {
+        let (effects, replacements, temporary_names) =
+            self.admit_replacement_effects(schemas)?.into_parts();
+        self.effects = effects;
+        self.replacements = replacements;
+        for (id, name) in temporary_names {
+            for display in &mut self.replace_display {
+                if self
+                    .effects
+                    .get(display.create_idx)
+                    .is_some_and(|effect| effect.resource_id() == &id)
+                {
+                    display.temporary_name = Some(name.clone());
+                }
+            }
+            self.permanent_name_overrides.retain(|previous| {
+                previous.resource_id.as_inner() != &id || previous.attribute != name.attribute
+            });
+            self.permanent_name_overrides.push(PermanentNameOverride {
+                resource_id: ResolvedResourceId::new(id),
+                attribute: name.attribute,
+                temp_value: name.temporary_value,
+                original_value: Some(name.original_value),
+            });
+        }
+        for display in &mut self.replace_display {
+            display.create_before_destroy = self
+                .effects
+                .get(display.create_idx)
+                .is_some_and(|effect| self.replacements.is_create_first(effect.resource_id()));
+        }
+        Ok(())
     }
 
     pub(crate) fn admit_replacement_effects(
         &self,
         registry: &crate::schema::SchemaRegistry,
-    ) -> Result<crate::replacement::AdmittedReplacementEffects<S, V>, CreateBeforeDestroyError>
+    ) -> Result<
+        crate::replacement::AdmittedReplacementEffects<S, V>,
+        crate::replacement::ReplacementAdmissionError,
+    >
     where
         S: Clone,
     {
@@ -1074,17 +1092,6 @@ impl<S, V: PlanValueKind> Plan<S, V> {
             },
             &associations,
         )
-    }
-
-    pub fn resolve_replacements(
-        &self,
-        registry: &crate::schema::SchemaRegistry,
-    ) -> Result<ReplacementScheduling, CreateBeforeDestroyError>
-    where
-        S: Clone,
-    {
-        let (_, scheduling, _) = self.admit_replacement_effects(registry)?.into_parts();
-        Ok(scheduling)
     }
 
     pub fn effects(&self) -> &[Effect<S, V>] {
@@ -1297,6 +1304,7 @@ impl<S, V: PlanValueKind> Plan<S, V> {
     }
 
     pub(crate) fn effects_mut(&mut self) -> &mut Vec<Effect<S, V>> {
+        self.replacements = ReplacementScheduling::default();
         &mut self.effects
     }
 
@@ -1366,6 +1374,7 @@ impl<S, V: PlanValueKind> Plan<S, V> {
         }
 
         self.effects = retained;
+        self.replacements.remap(&old_to_new);
         self.replace_display = self
             .replace_display
             .drain(..)
@@ -1582,6 +1591,29 @@ impl PlanSummary {
 impl std::fmt::Display for PlanSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.render_line())
+    }
+}
+
+impl<S: Clone, V: PlanValueKind> Plan<S, V> {
+    pub(crate) fn scheduling_effects(
+        &self,
+    ) -> crate::replacement::AdmittedReplacementEffects<S, V> {
+        crate::replacement::AdmittedReplacementEffects::from_compiled_parts(
+            self.effects.clone(),
+            self.replacements.clone(),
+            Vec::new(),
+        )
+    }
+}
+impl<S: Clone> Plan<S> {
+    pub fn dependency_analysis<'a>(
+        &self,
+        unresolved: impl IntoIterator<Item = &'a ResolvedResourceId>,
+    ) -> Result<
+        crate::effect::deps::DependencyAnalysis,
+        crate::effect::deps::DependencyAnalysisFailure,
+    > {
+        self.scheduling_effects().dependency_analysis(unresolved)
     }
 }
 

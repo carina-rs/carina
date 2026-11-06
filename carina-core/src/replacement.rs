@@ -42,6 +42,9 @@ impl<T> ReplacementRequest<T> {
     pub fn required_by(&self) -> Option<&str> {
         self.required_by.as_deref()
     }
+    pub(crate) fn require_create_first_in_place(&mut self, dependent: String) {
+        self.required_by = Some(dependent);
+    }
     pub fn require_create_first(mut self, dependent: impl Into<String>) -> Self {
         self.required_by = Some(dependent.into());
         self
@@ -141,25 +144,19 @@ impl<T> CheckedReplacement<T> {
             old.explicit_dependencies = dependencies.to_resolved_dependencies();
         }
     }
-    fn map_target<U>(self, map: impl FnOnce(T) -> U) -> CheckedReplacement<U> {
-        let admitted = match self.admitted {
-            Admitted::DeleteFirst(target) => Admitted::DeleteFirst(map(target)),
-            Admitted::CreateFirst(witness) => Admitted::CreateFirst(CreateFirst {
-                target: map(witness.target),
-                temporary_name: witness.temporary_name,
-            }),
-        };
-        CheckedReplacement {
-            admitted,
-            old_instances: self.old_instances,
-            required_by: self.required_by,
-        }
-    }
 }
 
 impl<S, P: PlanValueKind> CheckedReplacement<ResolvedResource<S, P>> {
-    pub(crate) fn into_scheduling(self) -> CheckedReplacement<ResolvedResourceId> {
-        self.map_target(|target| target.resolved_id())
+    pub(crate) fn into_scheduling(self) -> ReplacementOrder {
+        ReplacementOrder {
+            target: self.target().resolved_id(),
+            old_instances: self
+                .old_instances
+                .iter()
+                .map(|old| old.id.clone())
+                .collect(),
+            create_first: self.is_create_first(),
+        }
     }
 }
 
@@ -282,13 +279,21 @@ fn prepare_name<S, P: PlanValueKind>(
     }))
 }
 
-/// Creation dependencies request coexistence; historical delete edges do not.
+/// New consumers require coexistence. Old delete edges can additionally force
+/// promotion when the old and new dependency directions form a scheduling cycle.
 pub(crate) fn create_first_requirements<S, P: PlanValueKind>(
     effects: &[Effect<S, P>],
 ) -> HashMap<ResolvedResourceId, String> {
-    let mut requirements = HashMap::new();
-    for effect in effects {
-        let dependencies: crate::resource::ResolvedDependencies = match effect {
+    replacement_requirements(effects, &HashMap::new())
+}
+
+fn replacement_requirements<S, P: PlanValueKind>(
+    effects: &[Effect<S, P>],
+    associations: &HashMap<ResolvedResourceId, HashSet<ResolvedResourceId>>,
+) -> HashMap<ResolvedResourceId, String> {
+    let new_dependencies: Vec<crate::resource::ResolvedDependencies> = effects
+        .iter()
+        .map(|effect| match effect {
             Effect::Create(resource) | Effect::ResumeCreate { resource, .. } => {
                 resource.all_dependencies().cloned().collect()
             }
@@ -302,27 +307,196 @@ pub(crate) fn create_first_requirements<S, P: PlanValueKind>(
             | Effect::Remove { .. }
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. } => Default::default(),
-        };
-        for dependency in dependencies {
+        })
+        .collect();
+    let mut requirements = HashMap::new();
+    for (effect, dependencies) in effects.iter().zip(&new_dependencies) {
+        for dependency in dependencies.iter() {
             if dependency.as_inner() != effect.resource_id() {
                 requirements
-                    .entry(dependency)
+                    .entry(dependency.clone())
                     .or_insert_with(|| effect.resource_id().to_string());
             }
         }
     }
+    let creates: HashMap<_, _> = effects
+        .iter()
+        .enumerate()
+        .filter_map(|(index, effect)| match effect {
+            Effect::Create(resource) => Some((resource.resolved_id(), index)),
+            _ => None,
+        })
+        .collect();
+    let deletes: HashMap<_, _> = effects
+        .iter()
+        .enumerate()
+        .filter_map(|(index, effect)| match effect {
+            Effect::Delete {
+                id,
+                generation: EffectGeneration::Current,
+                ..
+            } => Some((id.clone(), index)),
+            _ => None,
+        })
+        .collect();
+    let pairs: Vec<_> = creates
+        .iter()
+        .flat_map(|(target, &create)| {
+            deletes
+                .iter()
+                .filter(move |(old, _)| {
+                    *old == target
+                        || associations
+                            .get(target)
+                            .is_some_and(|ids| ids.contains(*old))
+                })
+                .map(move |(_, &delete)| (target.clone(), create, delete))
+        })
+        .collect();
+    loop {
+        let create_first = |target: &ResolvedResourceId, index: usize| {
+            matches!(&effects[index], Effect::Create(resource) if resource.directives.create_before_destroy)
+                || requirements.contains_key(target)
+        };
+        let mut edges: HashMap<usize, HashSet<usize>> = HashMap::new();
+        for (index, dependencies) in new_dependencies.iter().enumerate() {
+            for dependency in dependencies.iter() {
+                if let Some(&upstream) = creates.get(dependency) {
+                    edges.entry(index).or_default().insert(upstream);
+                }
+            }
+        }
+        for &delete in deletes.values() {
+            if let Effect::Delete {
+                dependencies,
+                explicit_dependencies,
+                blocked_by_updates,
+                ..
+            } = &effects[delete]
+            {
+                let mut old_dependencies = dependencies.to_resolved_dependencies();
+                old_dependencies.extend(explicit_dependencies.iter().cloned());
+                for old_dependency in old_dependencies {
+                    if let Some(&upstream_delete) = deletes.get(&old_dependency) {
+                        edges.entry(upstream_delete).or_default().insert(delete);
+                    }
+                }
+                for consumer in blocked_by_updates.iter() {
+                    if let Some(&consumer) = creates.get(consumer) {
+                        edges.entry(delete).or_default().insert(consumer);
+                    }
+                }
+            }
+        }
+        for (target, create, delete) in &pairs {
+            if create_first(target, *create) {
+                edges.entry(*delete).or_default().insert(*create);
+                for (consumer, dependencies) in new_dependencies.iter().enumerate() {
+                    if consumer == *create || !dependencies.contains(target) {
+                        continue;
+                    }
+                    edges.entry(*delete).or_default().insert(consumer);
+                    for (child, child_create, child_delete) in &pairs {
+                        if *child_create == consumer && !create_first(child, consumer) {
+                            edges.entry(*child_delete).or_default().insert(*create);
+                        }
+                    }
+                }
+            } else {
+                edges.entry(*create).or_default().insert(*delete);
+            }
+        }
+        let promotions: Vec<_> = pairs
+            .iter()
+            .filter(|(target, create, delete)| {
+                !create_first(target, *create) && dependency_reaches(&edges, *delete, *create)
+            })
+            .map(|(target, create, delete)| {
+                let dependent = edges
+                    .get(delete)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .filter(|candidate| {
+                        effects[*candidate].resource_id() != target.as_inner()
+                            && dependency_reaches(&edges, *candidate, *create)
+                    })
+                    .min()
+                    .map(|index| effects[index].resource_id().to_string())
+                    .unwrap_or_else(|| target.to_string());
+                (target.clone(), dependent)
+            })
+            .collect();
+        if promotions.is_empty() {
+            break;
+        }
+        requirements.extend(promotions);
+    }
     requirements
+}
+
+fn dependency_reaches(edges: &HashMap<usize, HashSet<usize>>, start: usize, target: usize) -> bool {
+    let mut pending = vec![start];
+    let mut visited = HashSet::new();
+    while let Some(node) = pending.pop() {
+        if node == target {
+            return true;
+        }
+        if visited.insert(node) {
+            pending.extend(edges.get(&node).into_iter().flatten().copied());
+        }
+    }
+    false
+}
+
+/// An admission failure retains the rejected target and dependency request.
+#[derive(Debug, thiserror::Error)]
+#[error("{cause}")]
+pub struct ReplacementAdmissionError {
+    pub(crate) resource_id: Box<crate::resource::ResourceId>,
+    pub(crate) required_by: Option<String>,
+    #[source]
+    pub(crate) cause: CreateBeforeDestroyError,
+}
+impl ReplacementAdmissionError {
+    pub(crate) fn into_plan_error(self) -> crate::plan::PlanError {
+        let kind = match self.required_by {
+            Some(dependent) => crate::plan::PlanErrorKind::CreateBeforeDestroyRequiredByDependent {
+                dependent,
+                cause: self.cause,
+            },
+            None => self.cause.into(),
+        };
+        crate::plan::PlanError::new(*self.resource_id, kind)
+    }
 }
 
 /// Replacement endpoints and their scheduling proof are compiled together.
 /// Execution cannot retain a raw Create while using its prepared target's proof.
 ///
-/// ```compile_fail,E0603
+/// ```compile_fail,E0451
 /// use carina_core::replacement::AdmittedReplacementEffects;
 /// let unchecked = AdmittedReplacementEffects { effects: Vec::new() };
 /// ```
-#[derive(Debug)]
-pub(crate) struct AdmittedReplacementEffects<S, P: PlanValueKind> {
+///
+/// ```compile_fail,E0624
+/// use carina_core::replacement::AdmittedReplacementEffects;
+/// fn detach(owner: AdmittedReplacementEffects) {
+///     let (effects, proof, _) = owner.into_parts();
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use carina_core::{effect::Effect, replacement::AdmittedReplacementEffects};
+/// fn swap(owner: &mut AdmittedReplacementEffects, raw: Effect) {
+///     owner.effects[0] = raw;
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct AdmittedReplacementEffects<
+    S = crate::resource::ModuleSource,
+    P: PlanValueKind = crate::resource::NoPlaceholder,
+> {
     effects: Vec<Effect<S, P>>,
     scheduling: ReplacementScheduling,
     temporary_names: PreparedReplacementNames,
@@ -330,11 +504,11 @@ pub(crate) struct AdmittedReplacementEffects<S, P: PlanValueKind> {
 pub(crate) type PreparedReplacementNames = Vec<(crate::resource::ResourceId, TemporaryName)>;
 
 impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
-    pub(crate) fn resolve(
+    pub fn resolve(
         effects: &[Effect<S, P>],
         registry: &SchemaRegistry,
         previous: impl Fn(&ResolvedResourceId) -> HashMap<String, SnapshotValue>,
-    ) -> Result<Self, CreateBeforeDestroyError> {
+    ) -> Result<Self, ReplacementAdmissionError> {
         Self::resolve_with_associations(effects, registry, previous, &HashMap::new())
     }
     pub(crate) fn resolve_with_associations(
@@ -342,26 +516,28 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
         registry: &SchemaRegistry,
         previous: impl Fn(&ResolvedResourceId) -> HashMap<String, SnapshotValue>,
         associations: &HashMap<ResolvedResourceId, HashSet<ResolvedResourceId>>,
-    ) -> Result<Self, CreateBeforeDestroyError> {
+    ) -> Result<Self, ReplacementAdmissionError> {
         let mut effects = effects.to_vec();
-        let requirements = create_first_requirements(&effects);
+        let requirements = replacement_requirements(&effects, associations);
         let mut scheduling = ReplacementScheduling::default();
         let mut temporary_names = Vec::new();
         for index in 0..effects.len() {
             if let Effect::DeferredReplace(payload) = &mut effects[index] {
-                let required_by = requirements
-                    .get(payload.id())
-                    .or_else(|| {
-                        payload
-                            .deletes
-                            .iter()
-                            .find_map(|old| requirements.get(&old.id))
-                    })
-                    .cloned();
-                if let Some(dependent) = required_by {
-                    payload.request = payload.request.clone().require_create_first(dependent);
-                }
-                payload.preflight(registry)?;
+                payload.require_create_first_for_dependencies(&requirements);
+                payload
+                    .preflight(registry)
+                    .map_err(|cause| ReplacementAdmissionError {
+                        resource_id: Box::new(payload.id().as_inner().clone()),
+                        required_by: payload.request.required_by().map(str::to_owned).or_else(
+                            || {
+                                payload
+                                    .required_children
+                                    .first()
+                                    .map(|(_, dependent)| dependent.clone())
+                            },
+                        ),
+                        cause,
+                    })?;
             }
             let Effect::Create(target) = &effects[index] else {
                 continue;
@@ -402,12 +578,20 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                 if let Some(dependent) = requirements.get(&target.resolved_id()) {
                     request = request.require_create_first(dependent);
                 }
-                let checked = resolve_replacement(request, registry)?;
+                let resource_id = Box::new(request.target().id.clone());
+                let required_by = request.required_by().map(str::to_owned);
+                let checked = resolve_replacement(request, registry).map_err(|cause| {
+                    ReplacementAdmissionError {
+                        resource_id,
+                        required_by,
+                        cause,
+                    }
+                })?;
                 if let Some(name) = checked.temporary_name() {
                     temporary_names.push((checked.target().id.clone(), name.clone()));
                 }
                 effects[index] = Effect::Create(checked.target().clone());
-                scheduling.insert(checked);
+                scheduling.insert(checked.into_scheduling(), &effects, index);
             }
         }
         Ok(Self {
@@ -416,7 +600,44 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
             temporary_names,
         })
     }
-    pub(crate) fn into_parts(
+    pub fn effects(&self) -> &[Effect<S, P>] {
+        &self.effects
+    }
+    pub(super) fn from_compiled_parts(
+        effects: Vec<Effect<S, P>>,
+        scheduling: ReplacementScheduling,
+        temporary_names: PreparedReplacementNames,
+    ) -> Self {
+        Self {
+            effects,
+            scheduling,
+            temporary_names,
+        }
+    }
+    pub(crate) fn temporary_names(&self) -> &PreparedReplacementNames {
+        &self.temporary_names
+    }
+    pub(crate) fn append(&mut self, other: Self) {
+        let offset = self.effects.len();
+        self.effects.extend(other.effects);
+        for mut replacement in other.scheduling.replacements {
+            replacement.create += offset;
+            replacement.deletes =
+                ReplacementScheduling::delete_slots(&replacement.order, &self.effects);
+            self.scheduling.replacements.push(replacement);
+        }
+        self.temporary_names.extend(other.temporary_names);
+    }
+    pub(crate) fn replaces_current(&self, id: &crate::resource::ResourceId) -> bool {
+        self.scheduling.replacements.iter().any(|replacement| {
+            replacement
+                .order
+                .old_instances
+                .iter()
+                .any(|old| old.as_inner() == id)
+        })
+    }
+    pub(super) fn into_parts(
         self,
     ) -> (
         Vec<Effect<S, P>>,
@@ -427,37 +648,152 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
     }
 }
 
-/// Scheduling capabilities produced from checked owners. Positions in an
-/// effect vector never grant create-first permission.
-///
-/// ```compile_fail,E0451
-/// use carina_core::replacement::ReplacementScheduling;
-/// let unchecked = ReplacementScheduling { replacements: Vec::new() };
-/// ```
+impl<S: Clone> AdmittedReplacementEffects<S> {
+    pub fn dependency_analysis<'a>(
+        &self,
+        unresolved: impl IntoIterator<Item = &'a ResolvedResourceId>,
+    ) -> Result<
+        crate::effect::deps::DependencyAnalysis,
+        crate::effect::deps::DependencyAnalysisFailure,
+    > {
+        crate::effect::deps::build_admitted_effect_dependency_analysis(self, unresolved)
+    }
+    pub(crate) fn order_edges(
+        &self,
+        deps: &mut HashMap<usize, HashSet<usize>>,
+    ) -> HashSet<(usize, usize)> {
+        self.scheduling.order_edges(&self.effects, deps)
+    }
+    pub(crate) fn expand_deferred_replacements(self) -> (Self, Vec<(usize, usize)>, Vec<usize>) {
+        let expanded = crate::executor::parallel::expand_deferred_replace_effects(&self.effects);
+        let mut remap = vec![None; self.effects.len()];
+        for (index, source) in expanded.source_effect_indices.iter().enumerate() {
+            remap[*source] = Some(index);
+        }
+        let mut scheduling = self.scheduling;
+        scheduling.remap(&remap);
+        (
+            Self {
+                effects: expanded.effects,
+                scheduling,
+                temporary_names: self.temporary_names,
+            },
+            expanded.deferred_replace_delete_deps,
+            expanded.source_effect_indices,
+        )
+    }
+    pub(crate) fn from_materialized(
+        mut children: Vec<Effect<S>>,
+        replacements: Vec<CheckedReplacement<ResolvedResource<S>>>,
+    ) -> Self {
+        let mut scheduling = ReplacementScheduling::default();
+        let mut temporary_names = Vec::new();
+        for checked in replacements {
+            let create = children.iter().position(|child| matches!(child, Effect::Create(resource) if resource.resolved_id() == checked.target().resolved_id()))
+                .expect("materialized admission retains its target");
+            children[create] = Effect::Create(checked.target().clone());
+            if let Some(name) = checked.temporary_name() {
+                temporary_names.push((checked.target().id.clone(), name.clone()));
+            }
+            scheduling.insert(checked.into_scheduling(), &children, create);
+        }
+        Self {
+            effects: children,
+            scheduling,
+            temporary_names,
+        }
+    }
+}
+
+/// The value-free projection of a checked replacement. This is private to
+/// admission and display; callers cannot schedule a separate effect vector.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ReplacementOrder {
+    target: ResolvedResourceId,
+    old_instances: Vec<ResolvedResourceId>,
+    create_first: bool,
+}
+impl ReplacementOrder {
+    pub(crate) fn is_create_first(&self) -> bool {
+        self.create_first
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct BoundReplacement {
+    order: ReplacementOrder,
+    create: usize,
+    deletes: Vec<usize>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct ReplacementScheduling {
-    replacements: Vec<CheckedReplacement<ResolvedResourceId>>,
+pub(crate) struct ReplacementScheduling {
+    replacements: Vec<BoundReplacement>,
 }
 impl ReplacementScheduling {
     pub(crate) fn is_create_first(&self, target: &crate::resource::ResourceId) -> bool {
         self.replacements.iter().any(|replacement| {
-            replacement.target().as_inner() == target && replacement.is_create_first()
+            replacement.order.target.as_inner() == target && replacement.order.is_create_first()
         })
     }
-    pub(crate) fn insert<S, P: PlanValueKind>(
-        &mut self,
-        checked: CheckedReplacement<ResolvedResource<S, P>>,
-    ) {
-        self.replacements.push(checked.into_scheduling());
-    }
-    /// Admit all ordinary same-address replacement pairs through the resolver.
-    /// This also checks raw endpoints inserted by callers and untrusted plans.
-    pub fn resolve<S: Clone, P: PlanValueKind>(
+    fn delete_slots<S, P: PlanValueKind>(
+        order: &ReplacementOrder,
         effects: &[Effect<S, P>],
-        registry: &SchemaRegistry,
-        previous: impl Fn(&ResolvedResourceId) -> HashMap<String, SnapshotValue>,
-    ) -> Result<Self, CreateBeforeDestroyError> {
-        Ok(AdmittedReplacementEffects::resolve(effects, registry, previous)?.scheduling)
+    ) -> Vec<usize> {
+        effects
+            .iter()
+            .enumerate()
+            .filter_map(|(index, effect)| match effect {
+                Effect::Delete {
+                    id,
+                    generation: EffectGeneration::Current,
+                    ..
+                } if order.old_instances.contains(id) => Some(index),
+                _ => None,
+            })
+            .collect()
+    }
+    fn insert<S, P: PlanValueKind>(
+        &mut self,
+        order: ReplacementOrder,
+        effects: &[Effect<S, P>],
+        create: usize,
+    ) {
+        let deletes = Self::delete_slots(&order, effects);
+        self.replacements.push(BoundReplacement {
+            order,
+            create,
+            deletes,
+        });
+    }
+    pub(crate) fn extend_effects<S: Clone>(
+        &mut self,
+        checked: CheckedReplacement<ResolvedResource<S>>,
+        consumer_updates: crate::resource::ResolvedDependencies,
+        effects: &mut Vec<Effect<S>>,
+    ) {
+        let create = effects.len()
+            + if checked.is_create_first() {
+                0
+            } else {
+                checked.old_instances().len()
+            };
+        effects.extend(checked.clone().into_effects(consumer_updates));
+        self.insert(checked.into_scheduling(), effects, create);
+    }
+    pub(crate) fn remap(&mut self, indices: &[Option<usize>]) {
+        self.replacements.retain_mut(|replacement| {
+            let Some(create) = indices.get(replacement.create).copied().flatten() else {
+                return false;
+            };
+            replacement.create = create;
+            replacement.deletes = replacement
+                .deletes
+                .iter()
+                .filter_map(|old| indices.get(*old).copied().flatten())
+                .collect();
+            !replacement.deletes.is_empty()
+        });
     }
     pub(crate) fn order_edges<S>(
         &self,
@@ -466,29 +802,18 @@ impl ReplacementScheduling {
     ) -> HashSet<(usize, usize)> {
         let mut admitted_pairs = HashSet::new();
         for replacement in &self.replacements {
-            let Some(create) = effects.iter().position(|effect| matches!(effect.as_ref(), Effect::Create(target) if target.id == **replacement.target())) else { continue; };
-            for old in replacement.old_instances() {
-                let Some(delete) = effects.iter().position(|effect| matches!(effect.as_ref(), Effect::Delete { id, generation: EffectGeneration::Current, .. } if id == &old.id)) else { continue; };
+            let create = replacement.create;
+            for &delete in &replacement.deletes {
                 admitted_pairs.insert((create, delete));
-                if replacement.is_create_first() {
-                    deps.entry(delete).or_default().insert(create);
-                } else {
+                if !replacement.order.is_create_first() {
                     deps.entry(create).or_default().insert(delete);
+                    continue;
                 }
-            }
-        }
-        // A checked create-first owner retains its old generation until every
-        // dependent operation has switched to its new generation. The child's
-        // own replacement order remains independent of this parent window.
-        for parent in &self.replacements {
-            if !parent.is_create_first() {
-                continue;
-            }
-            let Some(parent_create) = effects.iter().position(|effect| matches!(effect.as_ref(), Effect::Create(resource) if resource.resolved_id() == *parent.target())) else { continue; };
-            for old in parent.old_instances() {
-                let Some(delete) = effects.iter().position(|effect| matches!(effect.as_ref(), Effect::Delete { id, generation: EffectGeneration::Current, .. } if id == &old.id)) else { continue; };
+                deps.entry(delete).or_default().insert(create);
+                // Parent lifetime windows use the same bound endpoints as pair
+                // ordering. Each child's own admitted order stays independent.
                 for (dependent, effect) in effects.iter().enumerate() {
-                    if effect.as_ref().resource_id() != parent.target().as_inner()
+                    if effect.as_ref().resource_id() != replacement.order.target.as_inner()
                         && matches!(
                             effect.as_ref(),
                             Effect::Create(_)
@@ -496,17 +821,17 @@ impl ReplacementScheduling {
                                 | Effect::Update { .. }
                                 | Effect::Read { .. }
                         )
-                        && effect.as_ref().blocking_keys().contains(parent.target())
+                        && effect
+                            .as_ref()
+                            .blocking_keys()
+                            .contains(&replacement.order.target)
                     {
                         deps.entry(delete).or_default().insert(dependent);
                         if let Some(child) = self.replacements.iter().find(|child| {
-                            child.target().as_inner() == effect.as_ref().resource_id()
-                                && !child.is_create_first()
+                            child.create == dependent && !child.order.is_create_first()
                         }) {
-                            for old_child in child.old_instances() {
-                                if let Some(child_delete) = effects.iter().position(|candidate| matches!(candidate.as_ref(), Effect::Delete { id, generation: EffectGeneration::Current, .. } if id == &old_child.id)) {
-                                    deps.entry(child_delete).or_default().insert(parent_create);
-                                }
+                            for &child_delete in &child.deletes {
+                                deps.entry(child_delete).or_default().insert(create);
                             }
                         }
                     }
@@ -630,8 +955,6 @@ mod tests {
             let checked =
                 resolve_replacement(fixture(create_first), &registry(UniqueNameSpec::Coexisting))
                     .unwrap();
-            let mut scheduling = ReplacementScheduling::default();
-            scheduling.insert(checked.clone());
             let mut effects = checked.into_effects(Default::default());
             for _ in 0..2 {
                 effects.reverse();
@@ -643,11 +966,13 @@ mod tests {
                     .iter()
                     .position(|effect| matches!(effect, Effect::Delete { .. }))
                     .unwrap();
-                let analysis = build_effect_dependency_analysis(
+                let analysis = AdmittedReplacementEffects::resolve(
                     &effects,
-                    std::iter::empty(),
-                    ScheduleInputs::Apply(&scheduling),
+                    &registry(UniqueNameSpec::Coexisting),
+                    |_| HashMap::new(),
                 )
+                .unwrap()
+                .dependency_analysis(std::iter::empty())
                 .unwrap();
                 let (after, before) = if create_first {
                     (delete, create)
@@ -696,7 +1021,7 @@ mod tests {
             let failure = build_effect_dependency_analysis(
                 &effects,
                 std::iter::empty(),
-                ScheduleInputs::Apply(&ReplacementScheduling::default()),
+                ScheduleInputs::Apply,
             )
             .unwrap_err();
             assert_eq!(failure.unresolved().len(), 2);
@@ -742,7 +1067,10 @@ mod tests {
         let dto = crate::plan::UnresolvedSavedPlan::from(saved);
         let loaded = dto.resolve_with_schemas(&schemas).unwrap();
         assert!(
-            loaded.replacement_scheduling().is_create_first(&target),
+            loaded
+                .scheduling_effects()
+                .scheduling
+                .is_create_first(&target),
             "loading must re-admit the group, including a differently addressed old instance"
         );
         assert!(
@@ -782,9 +1110,6 @@ mod tests {
         let child = resolve_replacement(child, &schemas).unwrap();
         let parent_id = parent.target().resolved_id();
         let child_id = child.target().resolved_id();
-        let mut scheduling = ReplacementScheduling::default();
-        scheduling.insert(parent.clone());
-        scheduling.insert(child.clone());
         let mut effects = parent.into_effects(Default::default());
         effects.extend(child.into_effects(Default::default()));
         let create = |id: &ResolvedResourceId| {
@@ -796,12 +1121,10 @@ mod tests {
                 .position(|effect| matches!(effect, Effect::Delete { id: old, .. } if old == id))
                 .unwrap()
         };
-        let graph = build_effect_dependency_analysis(
-            &effects,
-            std::iter::empty(),
-            ScheduleInputs::Apply(&scheduling),
-        )
-        .unwrap();
+        let graph = AdmittedReplacementEffects::resolve(&effects, &schemas, |_| HashMap::new())
+            .unwrap()
+            .dependency_analysis(std::iter::empty())
+            .unwrap();
         assert!(
             graph
                 .deps_of(delete(&child_id))
@@ -847,5 +1170,210 @@ mod tests {
                 CreateBeforeDestroyError::ReplacementCannotCoexist(_)
             ))
         ));
+    }
+    #[test]
+    fn review_4283_identity_proof_cannot_schedule_unprepared_attribute_create() {
+        let request = fixture(true);
+        let effects = vec![
+            Effect::Create(request.target().clone()),
+            request.old_instances()[0].to_delete_effect(),
+        ];
+        let admitted = AdmittedReplacementEffects::resolve(
+            &effects,
+            &registry(UniqueNameSpec::Attribute("name".into())),
+            |_| request.old_instances()[0].previous_attributes.clone(),
+        )
+        .unwrap();
+        let analysis =
+            build_effect_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply);
+        assert!(
+            analysis.is_err(),
+            "raw same-name endpoints must remain unadmitted: {analysis:?}"
+        );
+        admitted.dependency_analysis(std::iter::empty()).unwrap();
+        let Effect::Create(prepared) = &admitted.effects()[0] else {
+            unreachable!()
+        };
+        assert_ne!(prepared.get_attr("name"), request.target().get_attr("name"));
+
+        let checked = resolve_replacement(
+            request.clone(),
+            &registry(UniqueNameSpec::Attribute("name".into())),
+        )
+        .unwrap();
+        let mut plan = crate::plan::Plan::new();
+        plan.add(Effect::Remove {
+            id: ResolvedResourceId::with_identity("test.Record", "unrelated"),
+        });
+        plan.add_replacement(crate::plan::ReplacementGroup {
+            replacement: checked,
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".into()])
+                .unwrap(),
+            cascade_ref_hints: Vec::new(),
+            permanent_name_override: None,
+            consumer_updates: Default::default(),
+        });
+        plan.retain(|effect| !matches!(effect, Effect::Remove { .. }));
+        plan.dependency_analysis(std::iter::empty()).unwrap();
+        let mapped = plan.clone().with_value_stage(effects);
+        assert!(
+            mapped.dependency_analysis(std::iter::empty()).is_err(),
+            "mapping raw endpoints cannot inherit a scheduling proof"
+        );
+        plan.retain(|effect| !matches!(effect, Effect::Create(_)));
+        plan.add(Effect::Create(request.target().clone()));
+        assert!(
+            plan.dependency_analysis(std::iter::empty()).is_err(),
+            "retaining an old Delete cannot transfer admission to a raw Create"
+        );
+    }
+
+    #[test]
+    fn review_4283_reversed_historical_dependency_promotes_or_rejects() {
+        for (class, reversed) in [
+            (UniqueNameSpec::Coexisting, true),
+            (UniqueNameSpec::Conflicting, true),
+            (UniqueNameSpec::Conflicting, false),
+        ] {
+            let mut schemas = registry(class.clone());
+            schemas.insert(
+                "",
+                PatternResourceSchema::new("test.Parent")
+                    .with_coexisting_replacement()
+                    .validate()
+                    .unwrap(),
+            );
+            let mut a = fixture(true).map_target(|target| {
+                let mut resource = target.as_resource().clone();
+                resource.id = crate::resource::ResourceId::with_identity("test.Parent", "a");
+                resource.binding = Some(RootScope::new().resolve("a".into()));
+                ResolvedResource::from_resolved_parts(
+                    resource,
+                    Default::default(),
+                    Default::default(),
+                )
+            });
+            a.deletes.iter_mut().next().unwrap().id = a.target().resolved_id();
+            let a_id = a.target().resolved_id();
+            let b = fixture(false).map_target(|target| {
+                ResolvedResource::from_resolved_parts(
+                    target.as_resource().clone(),
+                    Default::default(),
+                    if reversed {
+                        std::iter::once(a_id.clone()).collect()
+                    } else {
+                        Default::default()
+                    },
+                )
+            });
+            let b_id = b.target().resolved_id();
+            a.deletes.iter_mut().next().unwrap().explicit_dependencies =
+                std::iter::once(b_id.clone()).collect();
+            let effects = vec![
+                Effect::Create(a.target().clone()),
+                a.deletes[0].to_delete_effect(),
+                Effect::Create(b.target().clone()),
+                b.deletes[0].to_delete_effect(),
+            ];
+            let admission =
+                AdmittedReplacementEffects::resolve(&effects, &schemas, |_| HashMap::new());
+            if !reversed {
+                let (_, scheduling, _) = admission.unwrap().into_parts();
+                assert!(
+                    !scheduling.is_create_first(b_id.as_inner()),
+                    "acyclic historical dependencies do not require coexistence"
+                );
+            } else if matches!(class, UniqueNameSpec::Conflicting) {
+                assert!(
+                    admission.is_err(),
+                    "historical delete edges require an impossible B create-first"
+                );
+            } else {
+                let (effects, scheduling, _) = admission.unwrap().into_parts();
+                assert!(
+                    scheduling.is_create_first(b_id.as_inner()),
+                    "B must be promoted before scheduling the reversed old/new dependency"
+                );
+                let graph = AdmittedReplacementEffects::from_compiled_parts(
+                    effects.clone(),
+                    scheduling,
+                    Vec::new(),
+                )
+                .dependency_analysis(std::iter::empty())
+                .unwrap();
+                let remaining = (0..effects.len()).collect();
+                let dependencies = graph.into_deps_of();
+                assert!(
+                    crate::executor::classify_stalled_effects(
+                        &effects,
+                        &dependencies,
+                        &remaining,
+                        &HashSet::new()
+                    )
+                    .iter()
+                    .all(|(_, failure)| !matches!(
+                        failure,
+                        crate::executor::EffectFailureKind::DependencyCycle { .. }
+                    )),
+                    "graph: {dependencies:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn review_4283_redacted_plan_debug_drops_scheduling_snapshots() {
+        let mut request = fixture(false);
+        request
+            .deletes
+            .iter_mut()
+            .next()
+            .unwrap()
+            .previous_attributes
+            .insert("secret".into(), string("REVIEW_STATIC_SECRET_PLAINTEXT"));
+        let id = request.target().id.clone();
+        let guide = crate::value::redact_secrets_in_state(&crate::resource::State::<
+            crate::resource::SnapshotLeaf,
+        >::existing(
+            id.clone(),
+            HashMap::from([(
+                "secret".into(),
+                Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(string(
+                    "REVIEW_STATIC_SECRET_PLAINTEXT",
+                )))),
+            )]),
+        ))
+        .unwrap();
+        let checked = resolve_replacement(request, &registry(UniqueNameSpec::Coexisting)).unwrap();
+        let mut plan = crate::plan::Plan::new();
+        plan.add_replacement(crate::plan::ReplacementGroup {
+            replacement: checked,
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".into()])
+                .unwrap(),
+            cascade_ref_hints: Vec::new(),
+            permanent_name_override: None,
+            consumer_updates: Default::default(),
+        });
+        let redacted = crate::value::redact_secrets_in_plan_with_desired_and_historical(
+            &plan,
+            &HashMap::<
+                crate::resource::ResourceId,
+                crate::resource::Resource<
+                    crate::resource::ModuleSource,
+                    crate::resource::SnapshotLeaf,
+                >,
+            >::new(),
+            &HashMap::from([(id, guide)]),
+        )
+        .unwrap();
+        assert!(
+            !serde_json::to_string(&redacted)
+                .unwrap()
+                .contains("REVIEW_STATIC_SECRET_PLAINTEXT")
+        );
+        assert!(
+            !format!("{redacted:?}").contains("REVIEW_STATIC_SECRET_PLAINTEXT"),
+            "redacted plan Debug retained a plaintext scheduling snapshot"
+        );
     }
 }

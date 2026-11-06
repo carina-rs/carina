@@ -380,6 +380,7 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
             self.planned_secret_hashes.as_ref(),
             &self.comparisons,
             self.references.as_ref(),
+            &result.permanent_name_overrides,
         )
     }
 }
@@ -1642,6 +1643,7 @@ pub(crate) fn build_state_after_apply<S: Clone>(
         planned_secret_hashes,
         &comparisons,
         None,
+        &HashMap::new(),
     )
 }
 
@@ -1650,6 +1652,10 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
     planned_secret_hashes: Option<&HashMap<ResourceId, PersistedAttributes>>,
     comparisons: &ResolvedComparisonTable,
     references: Option<&carina_core::references::ResolvedReferences>,
+    runtime_name_overrides: &HashMap<
+        ResourceId,
+        HashMap<String, carina_core::name_override::NameOverride>,
+    >,
 ) -> Result<StateFile, AppError> {
     let ApplyStateSave {
         state_file,
@@ -1679,7 +1685,13 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
         },
         &moved_origins,
     )?;
-    let permanent_name_overrides = plan.permanent_name_overrides_for_state();
+    let mut permanent_name_overrides = plan.permanent_name_overrides_for_state();
+    for (id, overrides) in runtime_name_overrides {
+        permanent_name_overrides
+            .entry(id.clone())
+            .or_default()
+            .extend(overrides.clone());
+    }
     for (id, planned) in &writeback.upserts {
         let resource = planned.resource;
         let existing = moved_origins.find_persisted_row(&state, id);
@@ -7696,6 +7708,85 @@ mod apply_state_save_tests {
             message,
             WritebackConflict::UpsertCleanupOverlap { id }.to_string()
         );
+    }
+    #[test]
+    fn review_4283_runtime_name_override_survives_checkpoint_and_final_writeback() {
+        let resource = resolved(
+            Resource::with_provider("mock", "test.resource", "thing", None).with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("new-temp".into())),
+            ),
+        );
+        let id = resource.id.clone();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            PatternResourceSchema::new("test.resource")
+                .attribute(
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .create_only()
+                        .build(),
+                )
+                .with_unique_name_attribute("name")
+                .validate()
+                .unwrap(),
+        );
+        let inputs = ApplyStateSaveInputs::new_for_test(
+            vec![resolved(Resource::with_provider(
+                "mock",
+                "test.resource",
+                "template",
+                None,
+            ))],
+            Plan::new(),
+            schemas.clone(),
+            None,
+        );
+        let mut result = ExecutionResult::empty();
+        result.runtime_synthesized_resources.push(resource);
+        result.applied_states.insert(
+            id.clone(),
+            complete_create(applied_name_state(&id, "new-temp")),
+        );
+        result.permanent_name_overrides.insert(
+            id.clone(),
+            HashMap::from([(
+                "name".into(),
+                NameOverride {
+                    temp_value: "new-temp".into(),
+                    original_value: Some("dsl-name".into()),
+                },
+            )]),
+        );
+        let checkpoint = inputs.build_state(StateFile::new(), &result).unwrap();
+        let final_state = inputs.build_state(checkpoint.clone(), &result).unwrap();
+        for state in [&checkpoint, &final_state] {
+            let row = state.find_resource_for_id(&id).unwrap();
+            assert_eq!(
+                row.name_overrides.get("name"),
+                Some(&NameOverride {
+                    temp_value: "new-temp".into(),
+                    original_value: Some("dsl-name".into()),
+                }),
+                "runtime overrides must persist with the original DSL value"
+            );
+            let mut desired = vec![
+                Resource::with_provider("mock", "test.resource", "thing", None).with_attribute(
+                    "name",
+                    Value::Concrete(ConcreteValue::String("dsl-name".into())),
+                ),
+            ];
+            apply_name_overrides(&mut desired, &Some(state.clone()));
+            assert_eq!(
+                desired[0].get_attr("name"),
+                Some(&Value::Concrete(ConcreteValue::String("new-temp".into())))
+            );
+            let next_plan = plan_after_writeback(&desired[0], state, &schemas);
+            assert!(
+                !next_plan.has_mutations(),
+                "runtime naming must converge: {next_plan:?}"
+            );
+        }
     }
 }
 
