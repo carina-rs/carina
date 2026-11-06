@@ -3475,7 +3475,9 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 40
+    // Validate version compatibility before decoding the payload. Format 42
+    // retains replacement history and create-first dependency requirements;
+    // format 41 uses typed Secret nodes exclusively. Format 40
     // requires an absolute source locator and its planned canonical identity.
     // Format 39 stores resolved dependency addresses and legacy migration
     // classifications.

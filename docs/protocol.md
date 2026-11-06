@@ -508,6 +508,12 @@ Format 40 plans from v0.11.0 may contain ordinary `FunctionCall` nodes named
 `secret`. Format 40 and older plans fail the version gate before payload
 decoding and must be regenerated with `carina plan --out`.
 
+Saved-plan format 42 retains replacement history (`previous_attributes`) and
+create-first dependency requirements (`required_by`, `required_children`). These
+are requests: loading a plan revalidates replacement order against the target's
+schema. Format 41 and older plans fail the version gate before payload decoding
+and must be regenerated with `carina plan --out`.
+
 State format 21 stores current and deposed dependencies and persisted
 `depends_on` directives as complete managed resource addresses. Pre-v21 state
 must pass configuration-aware legacy classification, warning reporting, and

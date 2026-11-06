@@ -707,6 +707,8 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 42 retains replacement history and create-first dependency
+    /// requirements for schema admission when loading saved plans.
     /// Plan format 41 encodes secret(...) only as a typed Secret node.
     /// Plan format 40 requires an absolute source locator and its planned
     /// canonical identity so a retargeted symlink requires replanning.
@@ -1131,7 +1133,8 @@ impl PlanFile {
 /// classification field is mandatory in the wire shape and is never
 /// defaulted. Format 40 requires the absolute source locator and canonical
 /// source identity captured at plan time. Format 41 removes the ordinary
-/// secret FunctionCall identity in favor of typed Secret nodes.
+/// secret FunctionCall identity in favor of typed Secret nodes. Format 42 adds
+/// replacement previous_attributes, required_by, and required_children.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PlanFileWire {
     version: u32,
@@ -2177,7 +2180,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 41;
+    pub const CURRENT_VERSION: u32 = 42;
 
     #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
@@ -5260,6 +5263,8 @@ fn build_plan_file_contents<E>(
         .collect();
 
     let contents = PlanFileContents {
+        // carina#4283: bumped 41→42 — retain replacement history and dependency
+        // requirements; loading re-admits requests against the target schema.
         // carina#4275: bumped 40→41 — secret(...) has no ordinary FunctionCall
         // identity; older saved plans must be regenerated before decoding.
         // carina#4202: bumped 39→40 — require the absolute source locator and

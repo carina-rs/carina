@@ -24,6 +24,17 @@ pub struct ReplacementRequest<T> {
     required_by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     prepared_name: Option<TemporaryName>,
+    #[serde(skip)]
+    naming: ReplacementNaming,
+}
+
+/// A continuation already has a provider-issued name. Admission still checks
+/// coexistence, but must not prepare another name for that operation.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+enum ReplacementNaming {
+    #[default]
+    Prepare,
+    Issued,
 }
 impl<T> ReplacementRequest<T> {
     pub fn new(target: T, old_instances: NonEmptyDeletes) -> Self {
@@ -32,6 +43,7 @@ impl<T> ReplacementRequest<T> {
             deletes: old_instances,
             required_by: None,
             prepared_name: None,
+            naming: ReplacementNaming::Prepare,
         }
     }
     pub fn target(&self) -> &T {
@@ -56,6 +68,7 @@ impl<T> ReplacementRequest<T> {
             deletes: self.deletes,
             required_by: self.required_by,
             prepared_name: self.prepared_name,
+            naming: self.naming,
         }
     }
     pub(crate) fn with_prepared_name(mut self, name: Option<TemporaryName>) -> Self {
@@ -106,6 +119,7 @@ pub struct CheckedReplacement<T> {
     admitted: Admitted<T>,
     old_instances: NonEmptyDeletes,
     required_by: Option<String>,
+    naming: ReplacementNaming,
 }
 impl<T> CheckedReplacement<T> {
     pub fn target(&self) -> &T {
@@ -136,6 +150,7 @@ impl<T> CheckedReplacement<T> {
             deletes: self.old_instances,
             required_by: self.required_by,
             prepared_name,
+            naming: self.naming,
         }
     }
     pub(crate) fn project_prior_explicit(
@@ -212,6 +227,7 @@ pub fn resolve_replacement<S: Clone, P: PlanValueKind>(
         deletes: old_instances,
         required_by,
         prepared_name,
+        naming,
     } = request;
     let admitted = if target.directives.create_before_destroy || required_by.is_some() {
         let schema = registry
@@ -233,6 +249,7 @@ pub fn resolve_replacement<S: Clone, P: PlanValueKind>(
             &old_instances,
             schema.as_schema(),
             prepared_name.as_ref(),
+            naming,
         )?;
         let mut resource = target.as_resource().clone();
         resource.directives.create_before_destroy = true;
@@ -253,6 +270,7 @@ pub fn resolve_replacement<S: Clone, P: PlanValueKind>(
         admitted,
         old_instances,
         required_by,
+        naming,
     })
 }
 
@@ -261,6 +279,7 @@ fn prepare_name<S, P: PlanValueKind>(
     old: &NonEmptyDeletes,
     schema: &crate::schema::CompiledResourceSchema,
     prepared: Option<&TemporaryName>,
+    naming: ReplacementNaming,
 ) -> Result<Option<TemporaryName>, CreateBeforeDestroyError> {
     let attribute = match &schema.unique_name {
         UniqueNameSpec::Coexisting => return Ok(None),
@@ -277,6 +296,9 @@ fn prepare_name<S, P: PlanValueKind>(
         }
         UniqueNameSpec::Attribute(attribute) => attribute,
     };
+    if naming == ReplacementNaming::Issued {
+        return Ok(None);
+    }
     if let Some(prepared) = prepared {
         if prepared.attribute != *attribute
             || target.prefixes.contains_key(attribute)
@@ -340,7 +362,7 @@ fn replacement_requirements<S, P: PlanValueKind>(
             }
             Effect::Update { to, .. } => to.all_dependencies().cloned().collect(),
             Effect::DeferredCreate(payload) => payload.dependency_template.dependencies(),
-            Effect::DeferredReplace(payload) => payload.dependency_template.dependencies(),
+            Effect::DeferredReplace(payload) => payload.dependency_template().dependencies(),
             Effect::Read { .. }
             | Effect::Delete { .. }
             | Effect::Wait { .. }
@@ -551,19 +573,11 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
         registry: &SchemaRegistry,
         previous: impl Fn(&ResolvedResourceId) -> HashMap<String, SnapshotValue>,
     ) -> Result<Self, ReplacementAdmissionError> {
-        Self::resolve_with_associations(effects, registry, previous, &HashMap::new())
-    }
-    pub(crate) fn resolve_with_associations(
-        effects: &[Effect<S, P>],
-        registry: &SchemaRegistry,
-        previous: impl Fn(&ResolvedResourceId) -> HashMap<String, SnapshotValue>,
-        associations: &HashMap<ResolvedResourceId, HashSet<ResolvedResourceId>>,
-    ) -> Result<Self, ReplacementAdmissionError> {
         Self::resolve_with_prepared_names(
             effects,
             registry,
             previous,
-            associations,
+            &HashMap::new(),
             &HashMap::new(),
         )
     }
@@ -603,14 +617,12 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                     .preflight(registry)
                     .map_err(|cause| ReplacementAdmissionError {
                         resource_id: Box::new(payload.id().as_inner().clone()),
-                        required_by: payload.request.required_by().map(str::to_owned).or_else(
-                            || {
-                                payload
-                                    .required_children
-                                    .first()
-                                    .map(|(_, dependent)| dependent.clone())
-                            },
-                        ),
+                        required_by: payload.required_by().map(str::to_owned).or_else(|| {
+                            payload
+                                .required_children()
+                                .first()
+                                .map(|(_, dependent)| dependent.clone())
+                        }),
                         cause,
                     })?;
             }
@@ -656,6 +668,9 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
             if let Ok(old) = NonEmptyDeletes::try_new(old) {
                 let mut request = ReplacementRequest::new(target.clone(), old)
                     .with_prepared_name(prepared_names.get(&target.resolved_id()).cloned());
+                if matches!(&effects[index], Effect::ResumeCreate { .. }) {
+                    request.naming = ReplacementNaming::Issued;
+                }
                 if let Some(dependent) = requirements.get(&target.resolved_id()) {
                     request = request.require_create_first(dependent);
                 }
@@ -1616,6 +1631,49 @@ mod tests {
             .is_err(),
             "a recovery generation still requires the target's coexistence admission"
         );
+    }
+
+    #[test]
+    fn review3_4283_resume_create_preserves_issued_attribute_name() {
+        let request = fixture(true).map_target(|target| {
+            let mut resource = target.as_resource().clone();
+            resource.set_attr("name", string("already-issued-name"));
+            target.replace_inner(resource)
+        });
+        let mut delete = request.deletes[0].to_delete_effect();
+        if let Effect::Delete { generation, .. } = &mut delete {
+            *generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+        }
+        let effects = vec![
+            Effect::ResumeCreate {
+                resource: request.target().clone(),
+                started_at: crate::provider::Timestamp::now(),
+            },
+            delete,
+        ];
+        let schemas = registry(UniqueNameSpec::Attribute("name".into()));
+        let admitted =
+            AdmittedReplacementEffects::resolve(&effects, &schemas, |_| HashMap::new()).unwrap();
+        let Effect::ResumeCreate { resource, .. } = &admitted.effects()[0] else {
+            panic!("admission must retain the continuation");
+        };
+        assert_eq!(
+            resource.get_attr("name"),
+            Some(&string("already-issued-name"))
+        );
+        assert!(
+            admitted.temporary_names().is_empty(),
+            "a continuation must not invent a name override"
+        );
+        let mut plan = crate::plan::Plan::new();
+        for effect in effects {
+            plan.add(effect);
+        }
+        plan.prepare_replacements(&schemas).unwrap();
+        assert!(plan.permanent_name_overrides.is_empty());
+        let readmitted = plan.admit_replacement_effects(&schemas).unwrap();
+        assert!(readmitted.temporary_names().is_empty());
+        assert_eq!(readmitted.effects()[0], admitted.effects()[0]);
     }
 
     #[test]

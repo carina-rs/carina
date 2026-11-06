@@ -12960,7 +12960,7 @@ async fn conflicting_deferred_case(
     if fail_delete {
         for effect in plan.effects_mut() {
             if let Effect::DeferredReplace(payload) = effect {
-                payload.deletes =
+                payload.unadmitted_request_mut().deletes =
                     NonEmptyDeletes::try_new(vec![payload.deletes[0].clone()]).unwrap();
             }
         }

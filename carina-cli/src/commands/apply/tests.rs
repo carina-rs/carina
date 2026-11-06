@@ -10666,7 +10666,7 @@ mod saved_plan_version_tests {
                 &error,
                 crate::error::AppError::UnsupportedPlanVersion {
                     found: 40,
-                    expected: 41,
+                    expected: 42,
                     ..
                 }
             ),
@@ -10723,8 +10723,8 @@ mod saved_plan_version_tests {
     }
 
     #[test]
-    fn typed_secret_nodes_require_plan_format_41() {
-        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 41);
+    fn replacement_admission_requests_require_plan_format_42() {
+        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 42);
     }
 
     #[tokio::test]
@@ -10870,7 +10870,7 @@ mod saved_plan_version_tests {
         );
     }
 
-    /// Format 40 and older predate typed-only secret nodes; reject their
+    /// Format 41 and older predate replacement admission requests; reject their
     /// headers before attempting to decode any format-specific payload.
     #[tokio::test]
     async fn previous_emitted_and_older_plan_versions_are_rejected_before_payload_decoding() {
@@ -10878,12 +10878,12 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            41,
-            "carina#4275 requires format 41 for typed secret nodes on top of carina#4202 format 40",
+            42,
+            "carina#4283 requires format 42 for replacement admission requests",
         );
-        let previous = 40;
+        let previous = 41;
 
-        for older_version in [previous, 39, 38, 37, 36, 35, 34, 33, 32] {
+        for older_version in [previous, 40, 39, 38, 37, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,

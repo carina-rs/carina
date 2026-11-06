@@ -1113,9 +1113,9 @@ fn add_deferred_create_effects_with_priors(
             payload.require_create_first_for_dependencies(&effect_requirements);
             payload.require_create_first_for_dependencies(&deferred_dependents);
             if let Err(error) = payload.preflight(registry) {
-                let kind = match payload.request.required_by().or_else(|| {
+                let kind = match payload.required_by().or_else(|| {
                     payload
-                        .required_children
+                        .required_children()
                         .first()
                         .map(|(_, dependent)| dependent.as_str())
                 }) {

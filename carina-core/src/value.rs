@@ -4535,7 +4535,7 @@ fn redact_secrets_in_effect_with_history<S: Clone>(
     )?;
     match &mut redacted {
         crate::effect::Effect::DeferredReplace(payload) => {
-            for old in payload.deletes.iter_mut() {
+            for old in payload.unadmitted_request_mut().deletes.iter_mut() {
                 old.previous_attributes =
                     redact_historical_attributes(&old.previous_attributes, |key| {
                         historical
@@ -4952,7 +4952,7 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<
             }
             Effect::DeferredReplace(payload) => {
                 let mut payload = payload.clone();
-                for old in payload.deletes.iter_mut() {
+                for old in payload.unadmitted_request_mut().deletes.iter_mut() {
                     if old
                         .previous_attributes
                         .values()

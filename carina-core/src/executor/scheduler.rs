@@ -34,7 +34,7 @@ impl<'a, S> PureMetaStep<'a, S> {
             Effect::DeferredReplace(payload) => Some(Self {
                 effect,
                 template: payload.template.as_ref(),
-                dependencies: &payload.dependency_template,
+                dependencies: payload.dependency_template(),
             }),
             Effect::Create(_)
             | Effect::ResumeCreate { .. }

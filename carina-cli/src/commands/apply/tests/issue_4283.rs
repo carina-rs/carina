@@ -568,9 +568,9 @@ async fn review2_4283_legacy_unbound_runtime_writeback_retires_old_address() {
         child.identity.as_str(),
     );
     child.identity =
-        carina_core::resource::ResourceIdentity::try_from("_opts[0]".to_owned()).unwrap();
+        carina_core::resource::ResourceIdentity::try_from("_options[0]".to_owned()).unwrap();
     child.binding = Some(carina_core::resource::absolute_binding_address_for_test(
-        "_opts[0]",
+        "_options[0]",
     ));
     state.upsert_resource(child).unwrap();
     fixture.write_state(&state);
@@ -588,6 +588,6 @@ async fn review2_4283_legacy_unbound_runtime_writeback_retires_old_address() {
         1,
         "successful replacement must retire its distinct legacy address: {children:?}"
     );
-    assert_ne!(children[0].identity.as_str(), "_opts[0]");
+    assert_ne!(children[0].identity.as_str(), "_options[0]");
     assert!(plan(&fixture, &cloud).await.plan.effects().is_empty());
 }

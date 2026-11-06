@@ -14,6 +14,7 @@ use carina_core::effect::{
     PriorInstanceDestroyDependencies,
 };
 use carina_core::executor::{AcceptedRequest, Applied, ExecutionResult};
+use carina_core::parser::StateBlockAddress;
 use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesForStateWriteback};
 #[cfg(test)]
 use carina_core::provider::SentRecord;
@@ -928,6 +929,7 @@ struct PlannedRemoveDeposed {
 
 enum ReplacementOutcome {
     CurrentRowOnly,
+    CurrentRowRetireOldAddress(ResolvedResourceId),
     CreateAppliedDeposeOld(PlannedDepose),
     DeleteSucceededCreateAbsent(ResolvedResourceId),
     KeepOld,
@@ -1053,6 +1055,7 @@ impl<'a, S> WritebackPlan<'a, S> {
     ) -> Result<(), WritebackConflict> {
         match outcome {
             ReplacementOutcome::CurrentRowOnly | ReplacementOutcome::KeepOld => Ok(()),
+            ReplacementOutcome::CurrentRowRetireOldAddress(id) => self.add_cleanup(id),
             ReplacementOutcome::CreateAppliedDeposeOld(depose) => {
                 self.deposes.push(depose);
                 Ok(())
@@ -1129,7 +1132,7 @@ fn classify_replacement_outcome<S>(
     };
     let create_result = create_upsert.filter(|upsert| upsert.source.is_create_result());
     Ok(match create_result {
-        Some(_upsert)
+        Some(upsert)
             if delete_succeeded(
                 successfully_deleted,
                 delete.id,
@@ -1137,7 +1140,21 @@ fn classify_replacement_outcome<S>(
                 delete.identifier,
             ) =>
         {
-            ReplacementOutcome::CurrentRowOnly
+            // A runtime replacement can adopt a legacy address without a
+            // Move. Keep its new upsert and retire the distinct old row.
+            // Explicit moves transfer their source row during finalization.
+            let old_address = StateBlockAddress::new(
+                delete.id.provider.clone(),
+                delete.id.resource_type.clone(),
+                delete.id.identity().clone(),
+            );
+            if !old_address.matches_resource_id(&upsert.resource.id)
+                && !old_address.matches_resource_id(moved_origins.origin_for(&upsert.resource.id))
+            {
+                ReplacementOutcome::CurrentRowRetireOldAddress(delete.id.clone())
+            } else {
+                ReplacementOutcome::CurrentRowOnly
+            }
         }
         Some(upsert) => {
             let new_identifier = upsert.source.created_identifier();

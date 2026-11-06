@@ -1730,7 +1730,7 @@ mod tests {
         deserialize_plan_value(serde_json::from_str(json).unwrap())
     }
 
-    fn deserialize_plan_value(value: serde_json::Value) -> SavedPlan {
+    fn replacement_fixture_registry() -> crate::schema::SchemaRegistry {
         let mut registry = crate::schema::SchemaRegistry::new();
         registry.insert(
             "",
@@ -1747,9 +1747,13 @@ mod tests {
                 .validate()
                 .unwrap(),
         );
+        registry
+    }
+
+    fn deserialize_plan_value(value: serde_json::Value) -> SavedPlan {
         serde_json::from_value::<UnresolvedSavedPlan>(value)
             .unwrap()
-            .resolve_with_schemas(&registry)
+            .resolve_with_schemas(&replacement_fixture_registry())
             .unwrap()
     }
 
@@ -1795,28 +1799,12 @@ mod tests {
                     blocked_by_updates: Default::default(),
                     previous_attributes: previous_attributes(),
                 };
-                let mut registry = crate::schema::SchemaRegistry::new();
-                registry.insert(
-                    "",
-                    crate::schema::PatternResourceSchema::new("ec2.Vpc")
-                        .attribute(
-                            crate::schema::PatternAttributeSchema::optional(
-                                "name",
-                                crate::schema::PatternAttributeType::string(),
-                            )
-                            .create_only()
-                            .build(),
-                        )
-                        .with_unique_name_attribute("name")
-                        .validate()
-                        .unwrap(),
-                );
                 crate::replacement::resolve_replacement(
                     crate::replacement::ReplacementRequest::new(
                         create.replace_inner(target),
                         crate::effect::NonEmptyDeletes::try_new(vec![old]).unwrap(),
                     ),
-                    &registry,
+                    &replacement_fixture_registry(),
                 )
                 .unwrap()
             });

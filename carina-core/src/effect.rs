@@ -407,13 +407,29 @@ impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
 
 /// Payload for [`Effect::DeferredReplace`]. Requests remain unadmitted until
 /// individual children have materialized. The preview is display-only evidence.
+/// The request cannot be changed while retaining its admitted preview.
+///
+/// ```compile_fail,E0616
+/// use carina_core::effect::DeferredReplacePayload;
+/// fn change(payload: &mut DeferredReplacePayload) {
+///     payload.request = payload.request.clone();
+/// }
+/// ```
+///
+/// The read-only request view cannot be used to replace its target either:
+///
+/// ```compile_fail,E0594
+/// use carina_core::effect::DeferredReplacePayload;
+/// fn change(payload: &mut DeferredReplacePayload) {
+///     payload.template = payload.template.clone();
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct DeferredReplacePayload<S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
-    pub dependency_template: crate::resource::DeferredDependencyTemplate,
-    pub request:
-        crate::replacement::ReplacementRequest<Box<DeferredForExpression<S, V, V::Template>>>,
+    dependency_template: crate::resource::DeferredDependencyTemplate,
+    request: crate::replacement::ReplacementRequest<Box<DeferredForExpression<S, V, V::Template>>>,
     preview: Option<crate::replacement::ReplacementOrder>,
-    pub(crate) required_children: Vec<(ResolvedResourceId, String)>,
+    required_children: Vec<(ResolvedResourceId, String)>,
 }
 impl<S: PartialEq, V: PlanValueKind> PartialEq for DeferredReplacePayload<S, V> {
     fn eq(&self, other: &Self) -> bool {
@@ -442,10 +458,24 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
     pub fn id(&self) -> &ResolvedResourceId {
         self.template.deferred_effect_id()
     }
+    pub fn dependency_template(&self) -> &crate::resource::DeferredDependencyTemplate {
+        &self.dependency_template
+    }
+    pub(crate) fn required_children(&self) -> &[(ResolvedResourceId, String)] {
+        &self.required_children
+    }
+    pub(crate) fn unadmitted_request_mut(
+        &mut self,
+    ) -> &mut crate::replacement::ReplacementRequest<Box<DeferredForExpression<S, V, V::Template>>>
+    {
+        self.preview = None;
+        &mut self.request
+    }
     pub(crate) fn require_create_first_for_dependencies(
         &mut self,
         requirements: &HashMap<ResolvedResourceId, String>,
     ) {
+        self.preview = None;
         if let Some(dependent) = requirements.get(self.id()) {
             self.request
                 .require_create_first_in_place(dependent.clone());
@@ -539,11 +569,6 @@ impl<S, V: PlanValueKind> std::ops::Deref for DeferredReplacePayload<S, V> {
         &self.request
     }
 }
-impl<S, V: PlanValueKind> std::ops::DerefMut for DeferredReplacePayload<S, V> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.request
-    }
-}
 
 impl<S: Serialize + Clone, V: PlanValueKind> Serialize for DeferredReplacePayload<S, V> {
     fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
@@ -598,12 +623,16 @@ impl<'de, S: serde::de::DeserializeOwned, V: PlanValueKind> Deserialize<'de>
             dependency_template,
         } = Wire::deserialize(deserializer)?;
         validate_deferred_effect_id::<De::Error, S, V>(&id, &template)?;
-        let mut payload = Self::new(deletes, template, dependency_template);
-        payload.required_children = required_children;
+        let mut request = crate::replacement::ReplacementRequest::new(template, deletes);
         if let Some(dependent) = required_by {
-            payload.request = payload.request.require_create_first(dependent);
+            request = request.require_create_first(dependent);
         }
-        Ok(payload)
+        Ok(Self {
+            request,
+            dependency_template,
+            required_children,
+            preview: None,
+        })
     }
 }
 
@@ -1679,7 +1708,11 @@ impl UnresolvedSavedEffect {
                 Effect::DeferredCreate(payload)
             }
             Self::DeferredReplace(mut payload) => {
-                payload.template.resolve_template_ignore_changes(schemas)?;
+                payload.preview = None;
+                payload
+                    .request
+                    .template
+                    .resolve_template_ignore_changes(schemas)?;
                 payload
                     .preflight(schemas)
                     .map_err(crate::resource::ResolvedResourceError::Replacement)?;
@@ -1772,13 +1805,13 @@ impl<V: PlanValueKind> From<Effect<ModuleSource, V>> for Effect<SavedModuleSourc
                 let DeferredReplacePayload {
                     request,
                     dependency_template,
-                    preview,
+                    preview: _,
                     required_children,
                 } = *payload;
                 Self::DeferredReplace(Box::new(DeferredReplacePayload {
                     request: request.map_target(|template| Box::new((*template).into())),
                     dependency_template,
-                    preview,
+                    preview: None,
                     required_children,
                 }))
             }
@@ -3352,6 +3385,87 @@ mod tests {
             }
             other => panic!("expected DeferredCreate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn review3_4283_changed_deferred_request_cannot_retain_create_first_preview() {
+        let Effect::DeferredReplace(mut payload) = deferred_replace_effect() else {
+            unreachable!();
+        };
+        payload
+            .unadmitted_request_mut()
+            .template
+            .template_directives_mut()
+            .create_before_destroy = crate::resource::LoopDirective::Resolved(true);
+        let mut schemas = crate::schema::SchemaRegistry::new();
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("route53.Record")
+                .with_coexisting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("test.Conflicting")
+                .with_conflicting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        payload.preflight(&schemas).unwrap();
+        assert_eq!(payload.display_glyph(), "+/-");
+        let mut decoded: DeferredReplacePayload<SavedModuleSource> =
+            serde_json::from_value(serde_json::to_value(&payload).unwrap()).unwrap();
+        assert_eq!(decoded.display_glyph(), "~");
+        decoded.preflight(&schemas).unwrap();
+        assert_eq!(decoded.display_glyph(), "+/-");
+
+        let mut changed =
+            compiled_deferred_for_template(crate::parser::DeferredForExpression::new(
+                None,
+                0,
+                "for opt in cert.domain_validation_options".to_owned(),
+                crate::parser::DeferredForTarget::bound(absolute_binding("validation_records"))
+                    .unwrap(),
+                Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
+                crate::parser::ForBinding::Simple("opt".to_owned()),
+                Resource::new("test.Conflicting", "validation_records"),
+            ));
+        changed
+            .template
+            .template_directives_mut()
+            .create_before_destroy = crate::resource::LoopDirective::Resolved(true);
+        // Public requests are read-only; internal edits discard their preview.
+        payload.unadmitted_request_mut().template = changed.template;
+        assert_eq!(
+            payload.display_glyph(),
+            "~",
+            "a changed request requires fresh admission"
+        );
+        assert!(payload.preflight(&schemas).is_err());
+    }
+
+    #[test]
+    fn review3_4283_deferred_requirements_invalidate_preview() {
+        let Effect::DeferredReplace(mut payload) = deferred_replace_effect() else {
+            unreachable!();
+        };
+        assert_eq!(payload.display_glyph(), "-/+");
+        payload.require_create_first_for_dependencies(&HashMap::from([(
+            payload.deletes[0].id.clone(),
+            "dependent".to_owned(),
+        )]));
+        assert_eq!(payload.display_glyph(), "~");
+        let mut schemas = crate::schema::SchemaRegistry::new();
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("route53.Record")
+                .with_conflicting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        assert!(payload.preflight(&schemas).is_err());
+        assert_eq!(payload.display_glyph(), "~");
     }
 
     #[test]
