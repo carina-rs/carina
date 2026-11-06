@@ -1,4 +1,7 @@
 use crate::resource::InsideSecret;
+
+mod rejected_findings;
+
 static TEST_OWNER: std::sync::LazyLock<crate::parser::SchemaTypeOwner> =
     std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
 

@@ -231,11 +231,15 @@ impl<'a> CheckedValue<'a> {
     }
 
     fn rejected(path: &FieldPath, error: TypeError) -> Self {
+        let primary = (path.clone(), error);
         Self {
             local: LocalOutcome::Rejected {
-                primary: (path.clone(), error),
+                primary: primary.clone(),
             },
-            findings: Default::default(),
+            findings: CheckedFindings {
+                local: vec![primary],
+                ..Default::default()
+            },
         }
     }
 
@@ -255,9 +259,9 @@ impl<'a> CheckedValue<'a> {
         if let LocalOutcome::Rejected { primary } = &self.local
             && self.findings.local.is_empty()
         {
-            // Containers may supply a more precise rendering than their
-            // aggregate primary error. A bare rejection already owns a
-            // finding; callers never have to push a matching one separately.
+            // Containers aggregate primary errors separately from their
+            // precise child findings. Supply a fallback only when no child
+            // or container constraint has already supplied a finding.
             self.findings.local.push(primary.clone());
         }
     }
@@ -1340,6 +1344,15 @@ mod tests {
             );
         }
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn rejected_value_records_its_finding_before_it_is_merged() {
+        let path = FieldPath::new().push_field("destination").push_field("arn");
+        let error = TypeError::ReadOnlyAttribute { name: "arn".into() };
+        let checked = CheckedValue::rejected(&path, error.clone());
+
+        assert_eq!(checked.findings.local, vec![(path, error)]);
     }
 
     #[test]
