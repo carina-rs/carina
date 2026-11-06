@@ -258,6 +258,37 @@ mod tests {
         }
     }
 
+    /// Unit-level coverage of the actual forwarding sink, without a compiled
+    /// WASM fixture. Split writes also exercise shared line buffering.
+    #[test]
+    fn guest_stderr_secret_plaintext_is_redacted_before_forwarding() {
+        const SECRET: &str = "guest-stderr-private-4305";
+        const MASK: &str = "(secret)";
+        let capture = Capture::default();
+        let stderr = GuestStderr::new(capture.clone());
+        let mut stream = stderr.p2_stream();
+        write_all(
+            stream.as_mut(),
+            b"provider: public-context-4305 password=guest-stderr-",
+        );
+        write_all(stream.as_mut(), b"private-4305\n");
+        drop(stream);
+        drop(stderr);
+        let text = capture.text();
+        assert!(
+            text.contains("public-context-4305"),
+            "non-secret stderr context was lost: {text}"
+        );
+        assert!(
+            !text.contains(SECRET),
+            "provider secret plaintext leaked through guest stderr forwarding: {text}"
+        );
+        assert!(
+            text.contains(MASK),
+            "missing {MASK} in forwarded guest stderr: {text}"
+        );
+    }
+
     #[test]
     fn guest_stderr_omits_the_entire_oversized_tail_until_newline_or_final_drop() {
         for terminate_with_newline in [false, true] {

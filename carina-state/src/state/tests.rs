@@ -1,4 +1,5 @@
 use super::*;
+mod provider_text_secret_redaction;
 use carina_core::resource::Directives;
 use carina_core::resource::{
     DeferredValue, PendingReRead, ReReadReason, ResolvedDependencies, SavedModuleSource,
