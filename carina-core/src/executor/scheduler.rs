@@ -5,7 +5,7 @@ use crate::effect::{Effect, SchedulerKey};
 use crate::parser::CompiledDeferredForExpression as DeferredForExpression;
 use crate::resource::ResolvedResourceId;
 
-use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
+use super::deferred_dispatch::{PureMetaCtx, dispatch_deferred_create};
 use super::parallel::apply_deferred_gate_deps;
 use crate::effect::deps::{UnresolvedRequiredDependency, relax_update_update_edges};
 
@@ -63,8 +63,8 @@ pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdenti
     };
 
     match dispatch_deferred_create(step.effect, step.template, step.dependencies, bindings, ctx) {
-        DeferredDispatchResult::Materialized(children) => PureMetaOutcome::Materialized(children),
-        DeferredDispatchResult::MaterializeFailed(failure) => PureMetaOutcome::Failed(failure),
+        Ok(children) => PureMetaOutcome::Materialized(children),
+        Err(failure) => PureMetaOutcome::Failed(failure),
     }
 }
 

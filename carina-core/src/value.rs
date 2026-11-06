@@ -4536,21 +4536,21 @@ fn redact_secrets_in_effect_with_history<S: Clone>(
     match &mut redacted {
         crate::effect::Effect::DeferredReplace(payload) => {
             for old in payload.unadmitted_request_mut().deletes.iter_mut() {
+                // Deposed snapshots carry their own persisted secret shape.
+                let historical = old
+                    .generation
+                    .is_current()
+                    .then(|| historical.get(old.id.as_inner()))
+                    .flatten();
                 old.previous_attributes =
                     redact_historical_attributes(&old.previous_attributes, |key| {
-                        historical
-                            .get(old.id.as_inner())
-                            .and_then(|state| state.attributes.get(key))
+                        historical.and_then(|state| state.attributes.get(key))
                     })?;
             }
         }
 
         crate::effect::Effect::Update { from, .. } => {
-            from.attributes = redact_historical_attributes(&from.attributes, |key| {
-                historical
-                    .get(&from.id)
-                    .and_then(|state| state.attributes.get(key))
-            })?;
+            **from = redact_secrets_in_state(from)?;
         }
         crate::effect::Effect::ReleaseListKeys { keys, .. } => {
             *keys = crate::effect::ReleasedListKeys::try_new(
@@ -4976,10 +4976,13 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<
             Effect::DeferredReplace(payload) => {
                 let mut payload = payload.clone();
                 for old in payload.unadmitted_request_mut().deletes.iter_mut() {
-                    if old
-                        .previous_attributes
-                        .values()
-                        .any(contains_redacted_secret)
+                    // Current-row verification has no evidence for a deposed
+                    // generation. Preserve its own persisted secret hashes.
+                    if old.generation.is_current()
+                        && old
+                            .previous_attributes
+                            .values()
+                            .any(contains_redacted_secret)
                     {
                         let (redacted, verified) = state_evidence(old.id.as_inner())?;
                         let saved = crate::resource::SnapshotState::existing(

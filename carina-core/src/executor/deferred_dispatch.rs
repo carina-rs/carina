@@ -484,14 +484,6 @@ fn admit_materialized<S: Clone>(
         .map_err(|error| DeferredCreateFailure::Replacement { error })
 }
 
-/// Result of synchronously dispatching a deferred scheduler-meta effect.
-pub(super) enum DeferredDispatchResult<S> {
-    /// Existing effects and materialized children admitted as one graph.
-    Materialized(crate::replacement::AdmittedReplacementEffects<S>),
-    /// Deferred-for materialization failed before any child effects existed.
-    MaterializeFailed(DeferredCreateFailure),
-}
-
 /// Shared inputs required to materialize deferred scheduler-meta effects.
 pub(super) struct PureMetaCtx<'a, S> {
     pub(super) existing: &'a crate::replacement::AdmittedReplacementEffects<S>,
@@ -510,21 +502,17 @@ pub(super) fn dispatch_deferred_create<
     dependencies: &crate::resource::DeferredDependencyTemplate,
     bindings: &ResolvedBindings,
     ctx: &PureMetaCtx<'_, S>,
-) -> DeferredDispatchResult<S> {
-    match materialize_deferred_create(template, dependencies, bindings, &ctx.identity_inputs) {
-        Ok(children) => match admit_materialized(
-            effect,
-            children,
-            ctx.identity_inputs.schemas,
-            ctx.ordinary_old,
-            ctx.requirements,
-            ctx.existing,
-        ) {
-            Ok(materialized) => DeferredDispatchResult::Materialized(materialized),
-            Err(error) => DeferredDispatchResult::MaterializeFailed(error),
-        },
-        Err(err) => DeferredDispatchResult::MaterializeFailed(err),
-    }
+) -> Result<crate::replacement::AdmittedReplacementEffects<S>, DeferredCreateFailure> {
+    let children =
+        materialize_deferred_create(template, dependencies, bindings, &ctx.identity_inputs)?;
+    admit_materialized(
+        effect,
+        children,
+        ctx.identity_inputs.schemas,
+        ctx.ordinary_old,
+        ctx.requirements,
+        ctx.existing,
+    )
 }
 
 #[cfg(test)]

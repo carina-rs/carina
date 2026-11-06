@@ -1361,6 +1361,115 @@ mod tests {
         registry
     }
 
+    fn deferred_deposed_secret_round_trip(deposed_attribute: &str, nested: bool) {
+        let secret = |text| {
+            Value::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(string(text)).into(),
+            ))
+        };
+        let mut old = fixture(false).deletes[0].clone();
+        let current = crate::resource::SnapshotState::existing(
+            old.id.as_inner().clone(),
+            HashMap::from([("secret".into(), secret("current-secret"))]),
+        );
+        old.previous_attributes = current.attributes.clone();
+        let current_guide = crate::value::redact_secrets_in_state(&current).unwrap();
+        let deposed_value = if nested {
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                "token".into(),
+                secret("deposed-secret"),
+            )])))
+        } else {
+            secret("deposed-secret")
+        };
+        let deposed_guide =
+            crate::value::redact_secrets_in_state(&crate::resource::SnapshotState::existing(
+                old.id.as_inner().clone(),
+                HashMap::from([(deposed_attribute.into(), deposed_value)]),
+            ))
+            .unwrap();
+        let mut deposed = old.clone();
+        deposed.generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+        deposed.identifier = crate::effect::fixture_applied_identifier("deposed-id");
+        deposed.previous_attributes = deposed_guide.attributes.clone();
+        let template = crate::parser::ExpandedDeferredForExpression::new(
+            None,
+            1,
+            "for value in upstream.items".into(),
+            crate::parser::DeferredForTarget::bound(RootScope::new().resolve("record".into()))
+                .unwrap(),
+            Value::root_resource_ref("upstream", "items", vec![]),
+            crate::parser::ForBinding::Simple("value".into()),
+            Resource::new("test.Record", "record"),
+        );
+        let mut plan = crate::plan::Plan::new();
+        plan.add(Effect::DeferredReplace(Box::new(
+            crate::test_support::compiled_replace(
+                NonEmptyDeletes::try_new(vec![old, deposed]).unwrap(),
+                Box::new(template),
+            ),
+        )));
+        let id = current.id.clone();
+        let saved = crate::value::redact_secrets_in_plan_with_desired_and_historical::<()>(
+            &plan,
+            &HashMap::new(),
+            &HashMap::from([(id.clone(), current_guide.clone())]),
+        )
+        .unwrap();
+        let json = serde_json::to_string(&saved).unwrap();
+        assert!(!json.contains("current-secret"));
+        assert!(!json.contains("deposed-secret\""));
+        let wire: crate::plan::UnresolvedSavedPlan = serde_json::from_str(&json).unwrap();
+        let saved = wire
+            .resolve_with_schemas(&registry(UniqueNameSpec::Conflicting))
+            .expect("saved replacement must resolve without changing generation evidence");
+        let restored = crate::value::rehydrate_plan_historical_secrets_from_verified_states(
+            &saved,
+            &HashMap::from([(id.clone(), current_guide.clone())]),
+            &HashMap::from([(id.clone(), current.clone())]),
+        )
+        .expect("deposed hashes must retain their own generation's evidence");
+        let Effect::DeferredReplace(payload) = &restored.effects()[0] else {
+            panic!("expected deferred replacement");
+        };
+        assert_eq!(payload.deletes[0].previous_attributes, current.attributes);
+        assert_eq!(
+            payload.deletes[1].previous_attributes,
+            deposed_guide.attributes
+        );
+
+        let different =
+            crate::value::redact_secrets_in_state(&crate::resource::SnapshotState::existing(
+                id.clone(),
+                HashMap::from([("secret".into(), secret("different-current-secret"))]),
+            ))
+            .unwrap();
+        assert!(
+            crate::value::rehydrate_plan_historical_secrets_from_verified_states(
+                &saved,
+                &HashMap::from([(id.clone(), different)]),
+                &HashMap::from([(id, current)]),
+            )
+            .is_err(),
+            "current-generation verification must still reject mismatched evidence",
+        );
+    }
+
+    #[test]
+    fn review11_4283_deferred_deposed_secret_hash_round_trip() {
+        deferred_deposed_secret_round_trip("secret", false);
+    }
+
+    #[test]
+    fn review11_4283_deferred_deposed_secret_shape_round_trip() {
+        deferred_deposed_secret_round_trip("retired_secret", false);
+    }
+
+    #[test]
+    fn review11_4283_deferred_deposed_secret_redaction_preserves_nested_shape() {
+        deferred_deposed_secret_round_trip("secret", true);
+    }
+
     #[test]
     fn review5_4283_moved_deposed_only_conflicting_replacement_is_rejected() {
         let request = fixture(true);

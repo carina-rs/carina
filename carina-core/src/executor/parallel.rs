@@ -21,8 +21,8 @@ use super::deferred_dispatch::{DeferredAnonymousIdentityGuard, PureMetaCtx};
 use super::provider_ready::ProviderPreparationContext;
 use super::replace::SingleEffectResult;
 use super::scheduler::{
-    FailureView, PureMetaOutcome, SchedulerDeps, dependency_failed_reason, failure_display_name,
-    try_dispatch_pure_meta, wait_dependency_failed_reason,
+    self, FailureView, PureMetaOutcome, SchedulerDeps, dependency_failed_reason,
+    failure_display_name, try_dispatch_pure_meta, wait_dependency_failed_reason,
 };
 use super::wait::{
     SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitEffectRef, WaitOutcome, WaitSignal,
@@ -444,9 +444,7 @@ pub(super) async fn execute_effects_sequential<
     let SchedulerDeps {
         mut deps_of,
         unresolved: scheduler_dependency_errors,
-    } = input
-        .compositions
-        .scheduler_dependencies(&admitted, resource_origins);
+    } = scheduler::build_scheduler_deps(&admitted, resource_origins.keys());
 
     // Build effect index -> binding name mapping for resolving dependency names
     let mut idx_to_binding: HashMap<usize, String> = effects
@@ -716,9 +714,8 @@ pub(super) async fn execute_effects_sequential<
                         effects = admitted.effects();
                         materialization_requirements =
                             crate::replacement::create_first_requirements(effects);
-                        let rebuilt = input
-                            .compositions
-                            .scheduler_dependencies(&admitted, resource_origins);
+                        let rebuilt =
+                            scheduler::build_scheduler_deps(&admitted, resource_origins.keys());
                         deps_of = rebuilt.deps_of;
                         for dependency in rebuilt.unresolved {
                             let failed_idx = dependency.effect_index();

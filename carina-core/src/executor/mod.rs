@@ -528,15 +528,6 @@ impl RuntimeCompositions<'_> {
             }
         }
     }
-
-    fn scheduler_dependencies<S: Clone>(
-        self,
-        admitted: &crate::replacement::AdmittedReplacementEffects<S>,
-        unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
-    ) -> scheduler::SchedulerDeps {
-        let _ = self;
-        scheduler::build_scheduler_deps(admitted, unresolved_resources.keys())
-    }
 }
 
 pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
