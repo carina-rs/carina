@@ -115,31 +115,30 @@ fn evaluate_secret_arguments<B: BindingAddress>(
         .map(EvalValue::from_expanded_value)
 }
 
-/// Coarse-grained return type for a built-in function. Used by the LSP to
-/// filter value-position completion candidates to those whose return type
-/// fits the attribute's declared type.
+/// A builtin's result type and the evidence it supplies at an authored sink.
+/// Every registry entry must choose a declaration. Judgement, projected type
+/// inference, and completion consume it exhaustively.
 ///
-/// Deliberately coarse: the enum carries only the base type (String, Int,
-/// List, Map, Secret) — not semantic subtypes (Cidr, AwsAccountId, Arn,
-/// etc.). A String-returning built-in like `join` is therefore not
-/// considered compatible with a `Custom { semantic_name: Some(..) }`
-/// attribute, because no built-in can guarantee the semantic invariant
-/// the Custom type requires.
-///
-/// `Bool` and `Float` variants are intentionally omitted because no
-/// built-in currently returns those types; add them when one does.
+/// Constructed strings use mixed interpolation's admission and value checks:
+/// a named string sink checks the result's value, once it is known. Ordinary
+/// strings retain their declared-assignment obligation at named sinks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuiltinReturnType {
+pub enum BuiltinResultTyping {
     /// Preserves the authored type and construction kind of this argument.
     Argument(usize),
-    /// Returns a plain `Value::Concrete(ConcreteValue::String)` (no semantic subtype).
-    String,
+    /// Returns an existing string, without construction evidence. Secret
+    /// external strings retain their existing completion suppression.
+    String { secret: bool },
+    /// Constructs a string, with the same evidence as mixed interpolation.
+    ConstructedString,
     /// Returns a `Value::Concrete(ConcreteValue::Int)`.
     Int,
     /// Returns a `Value::Concrete(ConcreteValue::List)` of some element type.
     List,
     /// Returns a list whose elements are statically known to be strings.
     StringList,
+    /// Returns a list whose elements each carry string-construction evidence.
+    ConstructedStringList,
     /// Returns a `Value::Concrete(ConcreteValue::Map)`.
     Map,
     /// Return shape depends on the arguments (e.g. `lookup`, `min`, `max`,
@@ -147,8 +146,6 @@ pub enum BuiltinReturnType {
     /// to match `Custom` / `Enum` attributes — the caller has no
     /// evidence the returned value satisfies those semantic constraints.
     Any,
-    /// Returns a `Value::Deferred(DeferredValue::Secret)` wrapper.
-    Secret,
 }
 
 /// Metadata for a built-in function, used by the LSP for completion, hover, and validation.
@@ -156,8 +153,8 @@ pub struct BuiltinFunctionInfo {
     pub name: &'static str,
     pub signature: &'static str,
     pub description: &'static str,
-    /// Coarse return-type classification — see `BuiltinReturnType`.
-    pub return_type: BuiltinReturnType,
+    /// The sole result-typing declaration — see `BuiltinResultTyping`.
+    pub result_typing: BuiltinResultTyping,
 }
 
 /// Register built-in functions in a single place.
@@ -179,24 +176,28 @@ macro_rules! register_builtins {
     };
     (@collect [$($info:tt)*] [$($functions:tt)*]
         intrinsic $name:ident($variant:ident, arity: $arity:expr) {
-            signature: $sig:expr, description: $desc:expr, return_type: $ret:expr,
+            signature: $sig:expr, description: $desc:expr, result_typing: $ret:expr,
         }, $($rest:tt)*
     ) => {
-        register_builtins!(@collect [ $($info)* $name { kind: Builtin::$variant, arity: $arity, signature: $sig, description: $desc, return_type: $ret, } ] [$($functions)*] $($rest)*);
+        register_builtins!(@collect [ $($info)* $name { kind: (Builtin::$variant), arity: $arity, signature: $sig, description: $desc, result_typing: $ret, } ] [$($functions)*] $($rest)*);
     };
     (@collect [$($info:tt)*] [$($functions:tt)*]
         $name:ident($handler:expr, arity: $arity:expr) {
-            signature: $sig:expr, description: $desc:expr, return_type: $ret:expr,
+            signature: $sig:expr, description: $desc:expr, result_typing: $ret:expr,
         }, $($rest:tt)*
     ) => {
-        register_builtins!(@collect [ $($info)* $name { kind: Builtin::Function(BuiltinFunction::$name), arity: $arity, signature: $sig, description: $desc, return_type: $ret, } ] [$($functions)* $name($handler, arity: $arity),] $($rest)*);
+        register_builtins!(@collect [ $($info)* $name { kind: (Builtin::Function(BuiltinFunction::$name)), arity: $arity, signature: $sig, description: $desc, result_typing: $ret, } ] [$($functions)* $name($handler, arity: $arity),] $($rest)*);
     };
-    (@generate [$( $info_name:ident { kind: $kind:expr, arity: $info_arity:expr, signature: $sig:expr, description: $desc:expr, return_type: $ret:expr, } )*]
+    (@generate [$( $info_name:ident { kind: ($($kind:tt)*), arity: $info_arity:expr, signature: $sig:expr, description: $desc:expr, result_typing: $ret:expr, } )*]
         [$( $name:ident($handler:expr, arity: $arity:expr), )*]
     ) => {
         impl Builtin {
             pub fn from_name(name: &str) -> Option<Self> {
-                match name { $( stringify!($info_name) => Some($kind), )* _ => None }
+                match name { $( stringify!($info_name) => Some($($kind)*), )* _ => None }
+            }
+
+            pub const fn result_typing(self) -> BuiltinResultTyping {
+                match self { $( $($kind)* => $ret, )* }
             }
         }
         /// Stable, typed identity for a registered built-in function.
@@ -272,7 +273,7 @@ macro_rules! register_builtins {
                         name: stringify!($info_name),
                         signature: $sig,
                         description: $desc,
-                        return_type: $ret,
+                        result_typing: $ret,
                     },
                 )*
             ];
@@ -341,97 +342,97 @@ register_builtins! {
     cidr_subnet(cidr_subnet::builtin_cidr_subnet, arity: 3) {
         signature: "cidr_subnet(prefix: String, newbits: Int, netnum: Int) -> String",
         description: "Calculates a subnet CIDR block within a given IP network address prefix.",
-        return_type: BuiltinReturnType::String,
+        result_typing: BuiltinResultTyping::ConstructedString,
     },
     concat(concat::builtin_concat, arity: 2) {
         signature: "concat(items: list, base_list: list) -> list",
         description: "Appends items to a list. Data-last: base_list |> concat(items).",
-        return_type: BuiltinReturnType::List,
+        result_typing: BuiltinResultTyping::List,
     },
     decrypt(decrypt::builtin_decrypt_with_config, arity: 1) {
         signature: "decrypt(ciphertext: String, key?: String) -> Secret",
         description: "Decrypts ciphertext using the configured provider's encryption service (e.g., AWS KMS) and marks the result as secret. Key is optional when embedded in ciphertext.",
-        return_type: BuiltinReturnType::Secret,
+        result_typing: BuiltinResultTyping::String { secret: true },
     },
     env(env::builtin_env, arity: 1) {
         signature: "env(name: String) -> String",
         description: "Reads an environment variable. Errors if the variable is not set.",
-        return_type: BuiltinReturnType::String,
+        result_typing: BuiltinResultTyping::String { secret: false },
     },
     flatten(flatten::builtin_flatten, arity: 1) {
         signature: "flatten(list: list) -> list",
         description: "Flattens nested lists by one level.",
-        return_type: BuiltinReturnType::List,
+        result_typing: BuiltinResultTyping::List,
     },
     join(join::builtin_join, arity: 2) {
         signature: "join(separator: String, list: list) -> String",
         description: "Joins list elements into a string using the separator.",
-        return_type: BuiltinReturnType::String,
+        result_typing: BuiltinResultTyping::ConstructedString,
     },
     keys(keys_values::builtin_keys, arity: 1) {
         signature: "keys(map: map) -> list",
         description: "Returns the keys of a map as a sorted list.",
-        return_type: BuiltinReturnType::StringList,
+        result_typing: BuiltinResultTyping::StringList,
     },
     length(length::builtin_length, arity: 1) {
         signature: "length(value: list | map | String) -> Int",
         description: "Returns the number of elements in a list or map, or characters in a string.",
-        return_type: BuiltinReturnType::Int,
+        result_typing: BuiltinResultTyping::Int,
     },
     lookup(lookup::builtin_lookup, arity: 3) {
         signature: "lookup(map: map, key: String, default: Any) -> Any",
         description: "Looks up a key in a map, returning the default value if the key is not found.",
-        return_type: BuiltinReturnType::Any,
+        result_typing: BuiltinResultTyping::Any,
     },
     lower(upper_lower::builtin_lower, arity: 1) {
         signature: "lower(string: String) -> String",
         description: "Converts a string to lowercase.",
-        return_type: BuiltinReturnType::String,
+        result_typing: BuiltinResultTyping::ConstructedString,
     },
     map(map::builtin_map, arity: 2) {
         signature: "map(accessor: String, collection: list | map) -> list | map",
         description: "Extracts a field from each element. Use a dot-prefixed accessor (e.g., \".field_name\"). Pipe form: collection |> map(\".field\").",
-        return_type: BuiltinReturnType::Any,
+        result_typing: BuiltinResultTyping::Any,
     },
     max(min_max::builtin_max, arity: 2) {
         signature: "max(a: Number, b: Number) -> Number",
         description: "Returns the maximum of two numbers.",
-        return_type: BuiltinReturnType::Any,
+        result_typing: BuiltinResultTyping::Any,
     },
     min(min_max::builtin_min, arity: 2) {
         signature: "min(a: Number, b: Number) -> Number",
         description: "Returns the minimum of two numbers.",
-        return_type: BuiltinReturnType::Any,
+        result_typing: BuiltinResultTyping::Any,
     },
     replace(replace::builtin_replace, arity: 3) {
         signature: "replace(search: String, replacement: String, string: String) -> String",
         description: "Replaces all occurrences of a search string. Data-last: String |> replace(search, replacement).",
-        return_type: BuiltinReturnType::String,
+        result_typing: BuiltinResultTyping::ConstructedString,
     },
     intrinsic secret(Secret, arity: 1) {
         signature: "secret(value: Any) -> Secret",
         description: "Marks a value as secret. The value is sent to the provider but stored only as an Argon2id hash in state.",
-        return_type: BuiltinReturnType::Argument(0),
+        result_typing: BuiltinResultTyping::Argument(0),
     },
     split(split::builtin_split, arity: 2) {
         signature: "split(separator: String, string: String) -> list",
         description: "Splits a string into a list using the separator.",
-        return_type: BuiltinReturnType::StringList,
+        result_typing: BuiltinResultTyping::ConstructedStringList,
     },
     trim(trim::builtin_trim, arity: 1) {
         signature: "trim(string: String) -> String",
         description: "Removes leading and trailing whitespace from a string.",
-        return_type: BuiltinReturnType::String,
+        result_typing: BuiltinResultTyping::ConstructedString,
     },
     upper(upper_lower::builtin_upper, arity: 1) {
         signature: "upper(string: String) -> String",
         description: "Converts a string to uppercase.",
-        return_type: BuiltinReturnType::String,
+        result_typing: BuiltinResultTyping::ConstructedString,
     },
     values(keys_values::builtin_values, arity: 1) {
         signature: "values(map: map) -> list",
         description: "Returns the values of a map as a list, sorted by key.",
-        return_type: BuiltinReturnType::List,
+        result_typing: BuiltinResultTyping::List,
     },
 }
 

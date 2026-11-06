@@ -699,7 +699,7 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
             }
             if !value.is_fully_resolved()
                 && (expression.requires_declared_assignment()
-                    || (expression.is_string_construction()
+                    || (expression.owns_constructed_value_checks()
                         && admission
                             == crate::parser::retained::ExpressionAdmission::DeferredInterpolation))
             {

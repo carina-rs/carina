@@ -1311,6 +1311,148 @@ fn issue_4282_module_join_at_plain_string_is_accepted() {
     assert_module_constructed_string("join('', ['carina-', n, '-role'])", "plain", None);
 }
 
+#[test]
+fn issue_4282_module_trim_at_named_string_uses_interpolation_rules() {
+    assert_module_constructed_string(r#"trim(" carina-${n}-role ")"#, "role_name", None);
+    assert_module_constructed_string(
+        "trim(' badx ')",
+        "role_name",
+        Some("does not match required pattern /^carina-[0-9]+-role$/"),
+    );
+    assert_module_constructed_string(
+        "trim(' carina-360000-role ')",
+        "role_name",
+        Some("length 18 is outside allowed range [1, 16]"),
+    );
+}
+
+#[test]
+fn issue_4282_module_secret_join_admits_named_string_like_interpolation() {
+    assert_module_constructed_string(
+        "secret(join('', ['carina-', n, '-role']))",
+        "role_name",
+        None,
+    );
+    assert_module_constructed_string(r#"secret("carina-${n}-role")"#, "role_name", None);
+}
+
+#[test]
+fn issue_4282_secret_join_rule_diagnostics_match_interpolation_and_stay_masked() {
+    let marker = "PRIVATE-4282";
+    let fixture = write_fixture(&[("providers.crn", "provider test {}\n"), ("main.crn", "")]);
+    let schemas = expression_typing_schemas();
+    let engine = engine_with_schemas(schemas.clone());
+    let mut expected = None;
+    for expression in [
+        format!("secret(join('', ['{marker}', '-suffix']))"),
+        format!(r#"secret("{marker}-${{'suffix'}}")"#),
+    ] {
+        std::fs::write(
+            fixture.path().join("main.crn"),
+            format!("test.r.typed {{ role_name = {expression} }}\n"),
+        )
+        .unwrap();
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        let lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
+        let errors = (cli_located_error_multiset(&cli), lsp_error_multiset(&lsp));
+        assert!(!errors.0.is_empty() && !errors.1.is_empty());
+        for error in errors.0.keys().chain(errors.1.keys()) {
+            assert!(error.message.contains("secret"), "{error:?}");
+            assert!(!error.message.contains(marker), "{error:?}");
+        }
+        assert!(!format!("{lsp:?}").contains(marker));
+        match &expected {
+            Some(expected) => assert_eq!(&errors, expected),
+            None => expected = Some(errors),
+        }
+    }
+}
+
+#[test]
+fn issue_4282_split_at_named_string_list_checks_values_in_cli_and_lsp() {
+    let name = || {
+        AttributeType::refined_string(
+            Some(carina_core::schema::TypeIdentity::from_schema_type(
+                "test", "Names", "Name",
+            )),
+            Some("^[a-z]+$".into()),
+            Some((Some(1), Some(3))),
+            None,
+        )
+    };
+    let schemas = single_schema_map(
+        ResourceSchema::new("Names")
+            .attribute(AttributeSchema::optional("names", AttributeType::list(name())).build()),
+    );
+    let fixture = write_fixture(&[("providers.crn", "provider test {}\n"), ("main.crn", "")]);
+    let engine = engine_with_schemas(schemas.clone());
+    for (input, expected_rule) in [
+        ("abc,def", None),
+        ("abc,abcd", Some("length 4 is outside allowed range [1, 3]")),
+        (
+            "abc,123",
+            Some("does not match required pattern /^[a-z]+$/"),
+        ),
+    ] {
+        for bound in [false, true] {
+            let elements = input
+                .split(',')
+                .map(|value| format!(r#""${{''}}{value}""#))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut expected = None;
+            for expression in [format!("split(',', '{input}')"), format!("[{elements}]")] {
+                let source = if bound {
+                    format!("let names = {expression}\ntest.Names {{ names = names }}\n")
+                } else {
+                    format!("test.Names {{ names = {expression} }}\n")
+                };
+                std::fs::write(fixture.path().join("main.crn"), source).unwrap();
+                let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+                let lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
+                let findings = lsp
+                    .iter()
+                    .filter(|diagnostic| {
+                        matches!(
+                            diagnostic.severity,
+                            Some(DiagnosticSeverity::ERROR | DiagnosticSeverity::WARNING),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                match expected_rule {
+                    None => assert!(
+                        cli.is_empty() && findings.is_empty(),
+                        "{input}, bound={bound}: {cli:#?} {lsp:#?}"
+                    ),
+                    Some(rule) => {
+                        assert!(
+                            !cli.is_empty() && !findings.is_empty(),
+                            "{input}, bound={bound}: CLI {cli:#?}; LSP {lsp:#?}"
+                        );
+                        assert!(cli.iter().all(|error| error.contains(rule)), "{cli:#?}");
+                        assert!(
+                            findings.iter().all(|error| error.message.contains(rule)),
+                            "{lsp:#?}"
+                        );
+                    }
+                }
+                let signatures = findings
+                    .iter()
+                    .map(|diagnostic| format!("{:?}: {}", diagnostic.severity, diagnostic.message))
+                    .collect::<Vec<_>>();
+                let actual = (
+                    cli_located_message_multiset(&cli),
+                    message_multiset(signatures.iter().map(String::as_str)),
+                );
+                match &expected {
+                    Some(expected) => assert_eq!(&actual, expected, "{input}, bound={bound}"),
+                    None => expected = Some(actual),
+                }
+            }
+        }
+    }
+}
+
 fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
     let provider_names: Vec<String> = schemas
         .iter()
@@ -7644,7 +7786,7 @@ exports {
 
 #[test]
 fn unannotated_export_of_dynamic_lookup_demands_annotation() {
-    // `lookup` is a `BuiltinReturnType::Any` builtin — the return type
+    // `lookup` is a `BuiltinResultTyping::Any` builtin — the return type
     // depends on arguments. Unannotated, the inferer cannot determine
     // a static type and must surface "type annotation required".
     let fixture = write_fixture(&[(

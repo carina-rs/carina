@@ -1892,6 +1892,13 @@ mod judgement {
             matches!(self.kind(), Some(InferredKind::StringConstruction(_)))
                 && self.alternatives.is_empty()
         }
+        pub(crate) fn owns_constructed_value_checks(&self) -> bool {
+            self.is_string_construction()
+                || self
+                    .member
+                    .as_deref()
+                    .is_some_and(Self::owns_constructed_value_checks)
+        }
         /// Borrow the assigned reference for diagnostics when the judgement
         /// preserves it through interpolation. Evaluation keeps the stored value.
         pub fn assignment_value<'a, P: ValueKind, B: BindingAddress>(
@@ -3452,7 +3459,9 @@ mod judgement {
                     declaration()
                 }
                 ExprKind::Sequence => authored_child(children.last()),
-                ExprKind::Secret => authored_child(children.first()),
+                ExprKind::Secret => {
+                    builtin_result(crate::builtins::Builtin::Secret.result_typing(), children)
+                }
                 ExprKind::Call(name) => {
                     let mut argument_failure = None;
                     let signature = self
@@ -3488,44 +3497,8 @@ mod judgement {
                     {
                         return ordinary(Ok(ty.clone()), false);
                     }
-                    let builtin = crate::builtins::builtin_functions()
-                        .iter()
-                        .find(|builtin| builtin.name == name);
-                    use crate::builtins::BuiltinReturnType;
-                    let concrete = children.iter().all(JudgedExpr::concrete);
-                    match builtin.map(|builtin| builtin.return_type) {
-                        Some(BuiltinReturnType::Argument(index)) => children
-                            .get(index)
-                            .cloned()
-                            .unwrap_or_else(|| incomplete("builtin argument")),
-                        Some(BuiltinReturnType::String | BuiltinReturnType::Secret) => {
-                            ordinary(Ok(TypeExpr::String), concrete)
-                        }
-                        Some(BuiltinReturnType::Int) => ordinary(Ok(TypeExpr::Int), concrete),
-                        Some(BuiltinReturnType::StringList) => {
-                            ordinary(Ok(TypeExpr::List(Box::new(TypeExpr::String))), concrete)
-                        }
-                        Some(return_type @ (BuiltinReturnType::List | BuiltinReturnType::Map)) => {
-                            let shape = if matches!(return_type, BuiltinReturnType::List) {
-                                CollectionKind::List
-                            } else {
-                                CollectionKind::Map
-                            };
-                            let mut result = collection(
-                                value_dependent("builtin return type depends on arguments")
-                                    .static_type()
-                                    .cloned(),
-                                shape,
-                                concrete,
-                            );
-                            result.data_mut().member = Some(Arc::new(value_dependent(
-                                "builtin elements require resolved constraint checks",
-                            )));
-                            result
-                        }
-                        Some(BuiltinReturnType::Any) => {
-                            value_dependent("builtin return type depends on arguments")
-                        }
+                    match crate::builtins::Builtin::from_name(name) {
+                        Some(builtin) => builtin_result(builtin.result_typing(), children),
                         None if signature.is_some() => {
                             value_dependent("unannotated function result")
                         }
@@ -3910,6 +3883,56 @@ mod judgement {
                 })
                 .collect(),
         );
+        result
+    }
+
+    /// Interpret the registry declaration once for both calls and intrinsics.
+    fn builtin_result(
+        result_typing: crate::builtins::BuiltinResultTyping,
+        children: &[JudgedExpr],
+    ) -> JudgedExpr {
+        use crate::builtins::BuiltinResultTyping as R;
+        let concrete = children.iter().all(JudgedExpr::concrete);
+        match result_typing {
+            R::Argument(index) => children
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| incomplete("builtin argument")),
+            R::String { .. } => declared(Ok(TypeExpr::String), concrete),
+            R::ConstructedString => {
+                declared(Ok(TypeExpr::String), concrete).with_kind(InferredKind::StringConstruction)
+            }
+            R::Int => declared(Ok(TypeExpr::Int), concrete),
+            R::StringList => declared(Ok(TypeExpr::List(Box::new(TypeExpr::String))), concrete),
+            R::ConstructedStringList => {
+                let mut result = collection(
+                    Ok(TypeExpr::List(Box::new(TypeExpr::String))),
+                    CollectionKind::List,
+                    concrete,
+                );
+                result.data_mut().member = Some(Arc::new(
+                    declared(Ok(TypeExpr::String), concrete)
+                        .with_kind(InferredKind::StringConstruction),
+                ));
+                result
+            }
+            R::List => builtin_collection(CollectionKind::List, concrete),
+            R::Map => builtin_collection(CollectionKind::Map, concrete),
+            R::Any => value_dependent("builtin return type depends on arguments"),
+        }
+    }
+
+    fn builtin_collection(shape: CollectionKind, concrete: bool) -> JudgedExpr {
+        let mut result = collection(
+            value_dependent("builtin return type depends on arguments")
+                .static_type()
+                .cloned(),
+            shape,
+            concrete,
+        );
+        result.data_mut().member = Some(Arc::new(value_dependent(
+            "builtin elements require resolved constraint checks",
+        )));
         result
     }
 

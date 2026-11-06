@@ -2069,8 +2069,8 @@ impl CompletionProvider {
 
     /// Return built-in function completions whose declared return type is
     /// compatible with the attribute's declared `AttributeType`. Used by
-    /// value-position completion to avoid suggesting `concat` / `join` /
-    /// etc. at cursors whose type is e.g. an `aws_account_id`.
+    /// value-position completion. Constructed strings may enter named string
+    /// sinks, whose constraints are checked against the resulting value.
     pub(super) fn builtin_function_completions_for_type(
         attr_type: &AttributeType,
     ) -> Vec<CompletionItem> {
@@ -2081,11 +2081,11 @@ impl CompletionProvider {
     }
 
     fn builtin_completions_matching(
-        accept: impl Fn(builtins::BuiltinReturnType) -> bool,
+        accept: impl Fn(builtins::BuiltinResultTyping) -> bool,
     ) -> Vec<CompletionItem> {
         builtins::builtin_functions()
             .iter()
-            .filter(|func| accept(func.return_type))
+            .filter(|func| accept(func.result_typing))
             .map(|func| CompletionItem {
                 label: func.name.to_string(),
                 kind: Some(CompletionItemKind::FUNCTION),
@@ -2562,71 +2562,52 @@ fn infer_for_binding_type(
     Some(export_type.map(|_type_expr| projected))
 }
 
-/// Decide whether a built-in's declared return type is assignable to the
-/// attribute's declared `AttributeType`.
-///
-/// Matching rules:
-/// * `BuiltinReturnType::Any` fits any base-typed attribute (String, Int,
-///   List, Map) — the built-in's concrete shape depends on its arguments.
-///   It does not fit `Custom` or `Enum`: no argument-derived result
-///   can prove the semantic invariant those types require.
-/// * A built-in returning plain `String` fits only a schema-declared
-///   `String` or a `Union` containing one. It does **not** fit a `Custom`
-///   type (even one whose base is `String`) because the Custom type
-///   carries a semantic meaning the built-in cannot produce (e.g. an
-///   `aws_account_id` must be a 12-digit string, and `join(...)` offers
-///   no such guarantee).
-/// * `List`, `Map`, `Int`, `Secret` match their corresponding
-///   `AttributeType` constructor. For `List` / `Map` the inner type
-///   doesn't participate in the check — the built-in's declared element
-///   type is unknown at this layer.
+/// Filter builtins by their sole result-typing declaration. Constructed
+/// strings fit named string sinks; existing external strings fit plain String
+/// only. Preserve the existing completion policy for all other result types.
 fn return_type_fits(
-    ret: builtins::BuiltinReturnType,
+    ret: builtins::BuiltinResultTyping,
     attr_type: &AttributeType,
     budget: &mut carina_core::schema::ShapeWalkBudget,
 ) -> bool {
-    use builtins::BuiltinReturnType as R;
-    // Shape's deliberate omission of a `Ref` variant lifts the
-    // carina#3349 invariant (Ref must be peeled before a wildcard
-    // arm sees it) into the type system: this match cannot leak Ref
-    // into the trailing wildcard. Bare completion-time helpers use
-    // `shape_ref_free`; an unexpected Ref falls through to `false`,
-    // matching the existing silent fallback contract.
+    use builtins::BuiltinResultTyping as R;
+    // Resolve Ref before inspecting shape; this helper has no owning defs.
     let Ok(shape) = attr_type.shape_ref_free() else {
         return false;
     };
-    match shape {
-        Shape::UnloadedSchemaType(_) => false,
-        Shape::Union => {
-            let Ok(Some(members)) = attr_type.union_members_ref_free_with_budget(budget) else {
-                return false;
-            };
-            members
-                .iter()
-                .flatten()
-                .any(|member| return_type_fits(ret, member.as_attr(), budget))
-        }
+    if matches!(shape, Shape::Union) {
+        let Ok(Some(members)) = attr_type.union_members_ref_free_with_budget(budget) else {
+            return false;
+        };
+        return members
+            .iter()
+            .flatten()
+            .any(|member| return_type_fits(ret, member.as_attr(), budget));
+    }
+    let plain_string = matches!(
+        shape,
         Shape::String {
             identity: None,
             pattern: None,
             length: None,
             to_dsl: None,
             ..
-        } => matches!(ret, R::String | R::Any),
-        Shape::Reference { .. } | Shape::String { .. } => false,
-        Shape::Int { .. } => matches!(ret, R::Int | R::Any),
-        // No built-in currently returns a Bool; leave as unfit.
-        Shape::Bool => false,
-        Shape::List { .. } => matches!(ret, R::List | R::StringList | R::Any),
-        Shape::Map { .. } => matches!(ret, R::Map | R::Any),
-        // Enum expects a specific identifier form; no built-in
-        // currently produces such values, and `Any` alone doesn't give us
-        // enough confidence to suggest one.
-        Shape::Enum { .. } => false,
-        // Float, Duration, and Struct attributes — no matching built-in today.
-        Shape::Float { .. } => false,
-        Shape::Duration => false,
-        Shape::Struct { .. } => false,
+        }
+    );
+    match ret {
+        R::String { secret: false } => plain_string,
+        R::ConstructedString => matches!(shape, Shape::String { .. }),
+        R::Int => matches!(shape, Shape::Int { .. }),
+        R::List | R::StringList | R::ConstructedStringList => matches!(shape, Shape::List { .. }),
+        R::Map => matches!(shape, Shape::Map { .. }),
+        R::Any => {
+            plain_string
+                || matches!(
+                    shape,
+                    Shape::Int { .. } | Shape::List { .. } | Shape::Map { .. }
+                )
+        }
+        R::Argument(_) | R::String { secret: true } => false,
     }
 }
 
@@ -2887,6 +2868,82 @@ mod return_type_fits_tests {
     }
 
     #[test]
+    fn issue_4282_named_string_completion_adds_only_constructed_builtins() {
+        let plain =
+            CompletionProvider::builtin_function_completions_for_type(&AttributeType::string());
+        assert_eq!(
+            plain
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "cidr_subnet",
+                "env",
+                "join",
+                "lookup",
+                "lower",
+                "map",
+                "max",
+                "min",
+                "replace",
+                "trim",
+                "upper"
+            ],
+        );
+        let named = AttributeType::refined_string(
+            Some(TypeIdentity::new(Some("test"), ["Role"], "Name")),
+            Some(carina_core::schema::CompiledPattern::try_new("^[a-z]+$").unwrap()),
+            Some((Some(1), Some(16))),
+            None,
+        );
+        for sink in [
+            named.clone(),
+            AttributeType::union(vec![AttributeType::bool(), named]),
+        ] {
+            let constructed = CompletionProvider::builtin_function_completions_for_type(&sink);
+            assert_eq!(
+                constructed
+                    .iter()
+                    .map(|item| item.label.as_str())
+                    .collect::<Vec<_>>(),
+                ["cidr_subnet", "join", "lower", "replace", "trim", "upper"],
+            );
+            for item in constructed {
+                assert_eq!(
+                    Some(&item),
+                    plain.iter().find(|plain| plain.label == item.label)
+                );
+            }
+        }
+        for (sink, labels) in [
+            (
+                AttributeType::int(),
+                vec!["length", "lookup", "map", "max", "min"],
+            ),
+            (
+                AttributeType::list(AttributeType::string()),
+                vec![
+                    "concat", "flatten", "keys", "lookup", "map", "max", "min", "split", "values",
+                ],
+            ),
+            (
+                AttributeType::map(AttributeType::string()),
+                vec!["lookup", "map", "max", "min"],
+            ),
+            (AttributeType::bool(), vec![]),
+        ] {
+            let items = CompletionProvider::builtin_function_completions_for_type(&sink);
+            assert_eq!(
+                items
+                    .iter()
+                    .map(|item| item.label.as_str())
+                    .collect::<Vec<_>>(),
+                labels
+            );
+        }
+    }
+
+    #[test]
     fn ref_member_is_skipped_when_string_sibling_fits() {
         let attr_type = AttributeType::union(vec![
             AttributeType::ref_("ResolvedOnlyWithDefs"),
@@ -2895,7 +2952,7 @@ mod return_type_fits_tests {
         let mut budget = carina_core::schema::ShapeWalkBudget::new(8);
 
         assert!(return_type_fits(
-            builtins::BuiltinReturnType::String,
+            builtins::BuiltinResultTyping::String { secret: false },
             &attr_type,
             &mut budget,
         ));

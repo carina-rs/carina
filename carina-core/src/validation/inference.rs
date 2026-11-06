@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use crate::builtins::{BuiltinReturnType, builtin_functions};
+use crate::builtins::{BuiltinResultTyping, builtin_functions};
 use crate::parser::{ExportParamLike, TypeExpr};
 use crate::provider::ProviderLoadedSchemaRegistry;
 use crate::resource::{
@@ -1048,7 +1048,7 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
     let return_type = builtin_functions()
         .iter()
         .find(|f| f.name == name)
-        .map(|f| f.return_type);
+        .map(|f| f.result_typing);
     let Some(return_type) = return_type else {
         return match bindings.get(name) {
             Some(InferenceBinding::UserFunction {
@@ -1067,24 +1067,28 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
         };
     };
     match return_type {
-        BuiltinReturnType::String | BuiltinReturnType::Secret => Ok(TypeExpr::String),
-        BuiltinReturnType::Int => Ok(TypeExpr::Int),
-        BuiltinReturnType::List => Err(InferenceError::UnknownType {
+        BuiltinResultTyping::String { .. } | BuiltinResultTyping::ConstructedString => {
+            Ok(TypeExpr::String)
+        }
+        BuiltinResultTyping::Int => Ok(TypeExpr::Int),
+        BuiltinResultTyping::List => Err(InferenceError::UnknownType {
             reason: format!(
                 "built-in `{}` returns a list whose element type depends on arguments",
                 name
             ),
         }
         .into()),
-        BuiltinReturnType::StringList => Ok(TypeExpr::List(Box::new(TypeExpr::String))),
-        BuiltinReturnType::Map => Err(InferenceError::UnknownType {
+        BuiltinResultTyping::StringList | BuiltinResultTyping::ConstructedStringList => {
+            Ok(TypeExpr::List(Box::new(TypeExpr::String)))
+        }
+        BuiltinResultTyping::Map => Err(InferenceError::UnknownType {
             reason: format!(
                 "built-in `{}` returns a map whose value type depends on arguments",
                 name
             ),
         }
         .into()),
-        BuiltinReturnType::Argument(index) => args.get(index).map_or_else(
+        BuiltinResultTyping::Argument(index) => args.get(index).map_or_else(
             || {
                 Err(InferenceError::UnknownType {
                     reason: format!("built-in `{name}` has no argument to wrap as secret"),
@@ -1100,7 +1104,7 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
                 )
             },
         ),
-        BuiltinReturnType::Any => Err(InferenceError::UnknownType {
+        BuiltinResultTyping::Any => Err(InferenceError::UnknownType {
             reason: format!("built-in `{}` return type depends on arguments", name),
         }
         .into()),

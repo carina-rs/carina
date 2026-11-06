@@ -763,3 +763,49 @@ fn interpolated_conditional_waits_for_its_condition() {
         Ok(ExpressionAdmission::DeferredInterpolation)
     );
 }
+
+#[test]
+fn issue_4282_deferred_builtin_construction_matches_interpolation_admission() {
+    let sink = TypeExpr::SchemaType {
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "mock",
+            crate::schema::TypeIdentity::new(Some("mock"), ["test"], "Name"),
+            crate::schema::RefinedScalarKind::String,
+        )
+        .unbounded_witness_for_test(),
+    };
+    for expression in [
+        "join('', [src.name, '-suffix'])",
+        "upper(src.name)",
+        "lower(src.name)",
+        "replace('a', 'b', src.name)",
+        "trim(src.name)",
+        "cidr_subnet(src.name, 4, 1)",
+        "secret(join('', [src.name, '-suffix']))",
+        "split(',', src.name)[0]",
+    ] {
+        let (_, report) = source_schema_report(&format!(
+            "let src = mock.test.Source {{}}\nlet result = {expression}"
+        ));
+        let result = report.binding(&RelativeBindingName::new("result")).unwrap();
+        assert_eq!(result.static_type(), Ok(&TypeExpr::String), "{expression}");
+        assert!(result.is_string_construction(), "{expression}");
+        assert_eq!(
+            admit_expression(result, &sink),
+            Ok(ExpressionAdmission::DeferredInterpolation),
+            "{expression}",
+        );
+        assert!(
+            admit_expression(result, &TypeExpr::Int).is_err(),
+            "{expression}"
+        );
+    }
+    let (_, report) =
+        source_schema_report("let src = mock.test.Source {}\nlet result = split(',', src.name)");
+    let result = report.binding(&RelativeBindingName::new("result")).unwrap();
+    assert_eq!(
+        admit_expression(result, &TypeExpr::List(Box::new(sink))),
+        Ok(ExpressionAdmission::DeferredInterpolation),
+    );
+    assert!(admit_expression(result, &TypeExpr::List(Box::new(TypeExpr::Int))).is_err());
+}

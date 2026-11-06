@@ -1689,3 +1689,174 @@ fn handle_mismatches_use_the_same_type_formatter_and_preserve_handle_wording() {
         "output: expected resource handle p.Expected; got resource handle p.Values from 'source'"
     );
 }
+
+// #4282: builtin construction evidence must reach the same named field and
+// resolved-value checker as an equivalent mixed interpolation.
+fn constructed_builtin_at_named_field(expression: &str, sink: DraftType) -> Result<(), String> {
+    let loaded = snapshot(vec![("p", vec![sink])]);
+    let runtime = ProviderContext {
+        decryptor: Some(Arc::new(|_, _| Ok("abc".into()))),
+        ..ProviderContext::new(crate::EnvironmentSnapshot::new([(
+            "ISSUE_4282".into(),
+            "abc".into(),
+        )]))
+    };
+    let context = loaded.provider_context().with_runtime(&runtime);
+    let mut parsed = crate::parser::parse(
+        &format!("let result = {expression}\nlet target = p.Values {{ value0 = result }}"),
+        context.as_provider_context(),
+    )
+    .unwrap();
+    crate::parser::resolve_resource_refs_with_config(&mut parsed, context.as_provider_context())
+        .unwrap();
+    let configuration = crate::config_loader::load_buffer_configuration(
+        &parsed,
+        loaded.schema_registry(),
+        context.as_provider_context(),
+    );
+    let signatures = HashMap::new();
+    let uses = check_bare_binding_uses(&ValidationTypeContext::new(
+        configuration.judged(),
+        &context,
+        &signatures,
+    ));
+    let expected = inference::attribute_type_to_type_expr(declaration(&loaded, "p", 0), "p");
+    typecheck::check_type_expr_value(
+        &expected,
+        &parsed.variables["result"],
+        &context,
+        configuration
+            .judged()
+            .report()
+            .binding(&crate::resource::RelativeBindingName::new("result"))
+            .unwrap(),
+    )
+    .require_provider_schemas()
+    .map_err(|error| error.to_string())?;
+    match uses.findings().first() {
+        Some(finding) => Err(finding.error.to_string()),
+        None => Ok(()),
+    }
+}
+
+fn assert_constructed_builtin_at_named_field(expression: &str, value: &str) {
+    let interpolation = format!(r#""${{''}}{value}""#);
+    for declaration in [
+        string(1, 32, None),
+        string(1, 32, Some("^never$")),
+        string(1, 1, None),
+    ] {
+        let expected = constructed_builtin_at_named_field(&interpolation, declaration.clone());
+        let actual = constructed_builtin_at_named_field(expression, declaration);
+        assert_eq!(actual, expected, "{expression}");
+    }
+    assert!(constructed_builtin_at_named_field(expression, string(1, 32, None)).is_ok());
+}
+
+#[test]
+fn issue_4282_upper_at_named_string_uses_interpolation_rules() {
+    assert_constructed_builtin_at_named_field("upper('abc')", "ABC");
+}
+
+#[test]
+fn issue_4282_lower_at_named_string_uses_interpolation_rules() {
+    assert_constructed_builtin_at_named_field("lower('ABC')", "abc");
+}
+
+#[test]
+fn issue_4282_replace_at_named_string_uses_interpolation_rules() {
+    assert_constructed_builtin_at_named_field("replace('X', 'b', 'aXc')", "abc");
+}
+
+#[test]
+fn issue_4282_trim_at_named_string_uses_interpolation_rules() {
+    assert_constructed_builtin_at_named_field("trim(' abc ')", "abc");
+}
+
+#[test]
+fn issue_4282_cidr_subnet_at_named_string_uses_interpolation_rules() {
+    assert_constructed_builtin_at_named_field("cidr_subnet('10.0.0.0/16', 4, 1)", "10.0.16.0/20");
+}
+
+#[test]
+fn issue_4282_split_checks_each_named_string_element() {
+    for (input, accepted) in [
+        ("abc,def", true),
+        ("abc,TOOLONG", false),
+        ("abc,123", false),
+    ] {
+        let declaration = DraftType::list(string(1, 3, Some("^[a-z]+$")));
+        let actual = constructed_builtin_at_named_field(
+            &format!("split(',', '{input}')"),
+            declaration.clone(),
+        );
+        let elements = input
+            .split(',')
+            .map(|value| format!(r#""${{''}}{value}""#))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let expected = constructed_builtin_at_named_field(&format!("[{elements}]"), declaration);
+        assert_eq!(actual, expected, "{input}");
+        assert_eq!(actual.is_ok(), accepted, "{input}: {actual:?}");
+    }
+}
+
+#[test]
+fn issue_4282_external_strings_and_keys_keep_named_sink_rejection() {
+    let loaded = snapshot(vec![("p", vec![string(1, 32, None)])]);
+    for expression in ["env('ISSUE_4282')", "decrypt('ciphertext')"] {
+        assert!(constructed_builtin_at_named_field(expression, string(1, 32, None)).is_err());
+        let parsed = crate::parser::parse(
+            &format!("let result = {expression}"),
+            loaded.provider_context().as_provider_context(),
+        )
+        .unwrap();
+        let report = crate::parser::retained::judge_expressions(
+            &parsed,
+            loaded.schema_registry(),
+            loaded.provider_context().as_provider_context(),
+        );
+        let error = crate::parser::retained::admit_expression(
+            report
+                .binding(&crate::resource::RelativeBindingName::new("result"))
+                .unwrap(),
+            &annotation(&loaded),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "expected aws.iam.Role.Name, got String");
+    }
+    assert!(
+        constructed_builtin_at_named_field(
+            "keys({ abc = 1 })",
+            DraftType::list(string(1, 32, None)),
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn issue_4282_secret_join_preserves_construction_and_masks_errors() {
+    let marker = "PRIVATE-4282";
+    assert!(
+        constructed_builtin_at_named_field(
+            "secret(join('', ['valid', '-suffix']))",
+            string(1, 32, None),
+        )
+        .is_ok()
+    );
+    for declaration in [string(1, 32, None), string(1, 3, None)] {
+        let actual = constructed_builtin_at_named_field(
+            &format!("secret(join('', ['{marker}', '-suffix']))"),
+            declaration.clone(),
+        );
+        let expected = constructed_builtin_at_named_field(
+            &format!(r#"secret("{marker}-${{'suffix'}}")"#),
+            declaration,
+        );
+        assert_eq!(actual, expected);
+        if let Err(error) = actual {
+            assert!(!error.contains(marker), "{error}");
+            assert_eq!(error, "expected aws.iam.Role.Name, got secret");
+        }
+    }
+}

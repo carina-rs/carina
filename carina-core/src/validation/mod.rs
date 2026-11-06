@@ -1354,6 +1354,30 @@ fn precheck_value_source<B: BindingAddress>(
     ) {
         return None;
     }
+    if admission.is_ok() && expression.owns_constructed_value_checks() {
+        // A constructed collection is admitted by its member judgements, not
+        // by assigning its coarse List<String> projection to the named sink.
+        // Use the existing constraint checker on any statically known result.
+        let evaluated = crate::resolver::project_ref_value_status(
+            value,
+            &crate::binding_index::ResolvedBindings::default(),
+            context.raw_provider_context(),
+        )
+        .ok()
+        .and_then(|resolved| match resolved {
+            crate::resolver::ValueResolution::Present(value) => Some(value),
+            crate::resolver::ValueResolution::Absent
+            | crate::resolver::ValueResolution::Unknown(_) => None,
+        });
+        return binding_value_constraints(
+            use_site,
+            evaluated.as_ref().unwrap_or(value),
+            declared_type,
+            sink,
+            context,
+        )
+        .err();
+    }
     let interpolation_sink =
         lift_type_expr(&INTERPOLATION_REF_SINK).expect("built-in interpolation operand types lift");
     let lifted_sink;
