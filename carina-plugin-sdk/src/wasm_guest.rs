@@ -1237,11 +1237,9 @@ macro_rules! export_provider {
                     poll_after_secs: u32,
                     error: wit_types::ProviderError,
                 },
-
             }
 
             impl CreateStepEncodeFailure {
-
                 fn into_create_verdict(self) -> wit_types::CreateVerdict {
                     match self {
                         Self::PendingToken {
@@ -1316,7 +1314,6 @@ macro_rules! export_provider {
             }
 
             impl ResumeStepEncodeFailure {
-
                 fn into_resume_verdict(
                     self,
                     previous: wit_types::ResumePending,

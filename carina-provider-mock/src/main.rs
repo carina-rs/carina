@@ -993,9 +993,9 @@ impl CarinaProvider for MockProcessProvider {
             }));
         }
 
-        let unencodable_created = matches!(
+        let unencodable_token_create_done_identifier = matches!(
             request.resource.attributes.get("create_mode"),
-            Some(Value::String(mode)) if mode == "unencodable_created"
+            Some(Value::String(mode)) if mode == "unencodable_token_create_done_identifier"
         );
         let unencodable_pending = matches!(
             request.resource.attributes.get("create_mode"),
@@ -1016,7 +1016,7 @@ impl CarinaProvider for MockProcessProvider {
         let mode = Self::create_mode(&request.resource.attributes);
         let sent = Self::sent_attributes(&request.resource.attributes);
         let canonical_identifier = Self::canonical_identifier(&request.resource.attributes);
-        if unencodable_created {
+        if unencodable_token_create_done_identifier {
             let (identifier, _attributes) = self.create_done(request, None);
             let token = CreateOperation {
                 remaining: 100,

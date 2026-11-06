@@ -3581,20 +3581,24 @@ async fn wasm_mock_exercises_not_created_identifier_reported_and_malformed_pendi
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn initial_issued_encode_failure_is_identifier_reported_never_not_created() {
+async fn initial_token_encode_failure_with_create_done_identifier_is_identifier_reported() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
         .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
-    let id =
-        ResourceId::with_provider_identity("mock", "test.resource", "unencodable-created", None);
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "unencodable-create-done-token",
+        None,
+    );
     let resource = resource_with_string_attribute(
         "test.resource",
-        "unencodable-created",
+        "unencodable-create-done-token",
         "create_mode",
-        "unencodable_created",
+        "unencodable_token_create_done_identifier",
     );
 
     let failure = provider

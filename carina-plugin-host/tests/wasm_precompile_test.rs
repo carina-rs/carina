@@ -97,11 +97,7 @@ fn wasm_path() -> Option<PathBuf> {
     let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
     // Cargo uses hyphens in binary names but underscores in library names; check both.
     for name in &["carina_provider_mock.wasm", "carina-provider-mock.wasm"] {
-        let path = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| workspace_root.join("target"))
-            .join("wasm32-wasip2/debug")
-            .join(name);
+        let path = workspace_root.join("target/wasm32-wasip2/debug").join(name);
         if path.exists() {
             return Some(path);
         }
