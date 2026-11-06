@@ -699,7 +699,7 @@ mod provider_scope_evidence_tests {
 /// }
 /// ```
 ///
-/// Raw contents cannot record a production plan without creation admission.
+/// Raw contents cannot record a production plan without input admission.
 ///
 /// ```compile_fail
 /// use carina_cli::commands::plan::PlanFileContents;
@@ -1702,7 +1702,7 @@ impl Deref for PlanFile {
     }
 }
 
-/// An immutable saved-plan snapshot constructed only from creation admission.
+/// An immutable saved-plan snapshot constructed only from input admission.
 /// Raw `PlanFileContents` remains a transport/fixture type and cannot record a
 /// production plan. No mutable or deserialization seam exposes this owner.
 struct CheckedPlanFileContents {
@@ -5059,7 +5059,7 @@ fn build_plan_file<E>(
     state_file: &Option<StateFile>,
     directive_changes: Vec<PersistedDirectiveChange>,
     validated_plan: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
-    checked: &carina_core::creation::CreationCheckedPlan,
+    checked: &carina_core::input_rules::InputCheckedPlan,
 ) -> Result<PlanFile, PlanSaveError> {
     let ctx = validated_plan.resources();
     let parsed = ctx.parsed();
@@ -5114,7 +5114,7 @@ fn build_plan_file_contents<E>(
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
-    checked: &carina_core::creation::CreationCheckedPlan,
+    checked: &carina_core::input_rules::InputCheckedPlan,
 ) -> Result<CheckedPlanFileContents, PlanSaveError> {
     assert_eq!(
         ctx.data_sources.len(),

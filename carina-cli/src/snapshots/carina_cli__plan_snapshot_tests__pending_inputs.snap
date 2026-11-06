@@ -11,7 +11,7 @@ Execution Plan:
         │
         └─ + mock.test.creation_constrained bucket
               name: suffix.identifier
-              name [mock.name.not_ipv4]: creation check pending until apply
+              name [mock.name.not_ipv4]: input check pending until apply
 
 Exports:
 

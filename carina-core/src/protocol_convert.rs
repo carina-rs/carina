@@ -43,9 +43,9 @@ use crate::schema::{
     AttributeSchema as DraftAttributeSchema, AttributeSchemaParts,
     AttributeType as DraftAttributeType, CharSet, Compiled,
     CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
-    CompiledStructField as StructField, ConfigSchemaValidationError, CreationConstraintError,
-    CreationInputPath, CreationPredicate, CreationRule, CreationRuleCode, CreationRuleParts,
-    FieldGroup, FieldGroupKind, IdentityMode, InputMode, NonEmptyString, RawShape,
+    CompiledStructField as StructField, ConfigSchemaValidationError, FieldGroup, FieldGroupKind,
+    IdentityMode, InputMode, InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleError,
+    InputRuleParts, InputRuleScope, InputRuleTarget, NonEmptyString, RawShape,
     ResourceSchema as DraftResourceSchema, ResourceSchemaParts, ResourceSchemaValidationError,
     ResourceValidation, SchemaKind, SchemaValidationIssueLocation, StructField as DraftStructField,
     StructFieldParts, TypeIdentity, UniqueNameSpec, ValidatedConfigSchema,
@@ -654,7 +654,7 @@ impl Error for SchemaDecodeError {
     }
 }
 
-fn creation_charset_to_protocol(set: &CharSet) -> protocol::CharSet {
+fn input_charset_to_protocol(set: &CharSet) -> protocol::CharSet {
     protocol::CharSet {
         ranges: set
             .ranges()
@@ -667,117 +667,148 @@ fn creation_charset_to_protocol(set: &CharSet) -> protocol::CharSet {
     }
 }
 
-fn creation_rule_to_protocol(rule: &CreationRule<Compiled>) -> protocol::CreationRule {
-    let CreationRuleParts {
-        path,
+fn input_rule_to_protocol(rule: &InputRule<Compiled>) -> protocol::InputRule {
+    let InputRuleParts {
+        scope,
+        target,
         code,
         predicate,
     } = rule.parts();
     let predicate = match predicate {
-        CreationPredicate::Length { min, max } => protocol::CreationPredicate::Length {
+        InputPredicate::Length { min, max } => protocol::InputPredicate::Length {
             min: *min,
             max: *max,
         },
-        CreationPredicate::AllowedChars(set) => {
-            protocol::CreationPredicate::AllowedChars(creation_charset_to_protocol(set))
+        InputPredicate::AllowedChars(set) => {
+            protocol::InputPredicate::AllowedChars(input_charset_to_protocol(set))
         }
-        CreationPredicate::FirstChar(set) => {
-            protocol::CreationPredicate::FirstChar(creation_charset_to_protocol(set))
+        InputPredicate::FirstChar(set) => {
+            protocol::InputPredicate::FirstChar(input_charset_to_protocol(set))
         }
-        CreationPredicate::LastChar(set) => {
-            protocol::CreationPredicate::LastChar(creation_charset_to_protocol(set))
+        InputPredicate::LastChar(set) => {
+            protocol::InputPredicate::LastChar(input_charset_to_protocol(set))
         }
-        CreationPredicate::NoSubstring(token) => {
-            protocol::CreationPredicate::NoSubstring(token.as_str().to_owned())
+        InputPredicate::NoSubstring(token) => {
+            protocol::InputPredicate::NoSubstring(token.as_str().to_owned())
         }
-        CreationPredicate::NoPrefix(token) => {
-            protocol::CreationPredicate::NoPrefix(token.as_str().to_owned())
+        InputPredicate::NoPrefix(token) => {
+            protocol::InputPredicate::NoPrefix(token.as_str().to_owned())
         }
-        CreationPredicate::NoSuffix(token) => {
-            protocol::CreationPredicate::NoSuffix(token.as_str().to_owned())
-        }
-        CreationPredicate::NoAdjacent { left, right } => protocol::CreationPredicate::NoAdjacent {
-            left: creation_charset_to_protocol(left),
-            right: creation_charset_to_protocol(right),
+        InputPredicate::ForbiddenPrefix {
+            prefix,
+            ignore_ascii_case,
+        } => protocol::InputPredicate::ForbiddenPrefix {
+            prefix: prefix.as_str().to_owned(),
+            ignore_ascii_case: *ignore_ascii_case,
         },
-        CreationPredicate::NotIpv4 => protocol::CreationPredicate::NotIpv4,
-        CreationPredicate::Matches(pattern) => {
-            protocol::CreationPredicate::Matches(pattern.as_str().to_owned())
+        InputPredicate::NoSuffix(token) => {
+            protocol::InputPredicate::NoSuffix(token.as_str().to_owned())
         }
-        CreationPredicate::NotMatches(pattern) => {
-            protocol::CreationPredicate::NotMatches(pattern.as_str().to_owned())
+        InputPredicate::NoAdjacent { left, right } => protocol::InputPredicate::NoAdjacent {
+            left: input_charset_to_protocol(left),
+            right: input_charset_to_protocol(right),
+        },
+        InputPredicate::NotIpv4 => protocol::InputPredicate::NotIpv4,
+        InputPredicate::Matches(pattern) => {
+            protocol::InputPredicate::Matches(pattern.as_str().to_owned())
+        }
+        InputPredicate::NotMatches(pattern) => {
+            protocol::InputPredicate::NotMatches(pattern.as_str().to_owned())
         }
     };
-    protocol::CreationRule {
-        path: path.as_str().to_owned(),
+    protocol::InputRule {
+        scope: match scope {
+            InputRuleScope::CreateOnly => protocol::InputRuleScope::CreateOnly,
+            InputRuleScope::EveryWrite => protocol::InputRuleScope::EveryWrite,
+        },
+        target: match target {
+            InputRuleTarget::Value(path) => {
+                protocol::InputRuleTarget::Value(path.as_str().to_owned())
+            }
+            InputRuleTarget::MapKeys(path) => {
+                protocol::InputRuleTarget::MapKeys(path.as_str().to_owned())
+            }
+        },
         code: code.as_str().to_owned(),
         predicate,
     }
 }
 
-fn protocol_to_creation_charset(
-    set: &protocol::CharSet,
-) -> Result<CharSet, CreationConstraintError> {
+fn protocol_to_input_charset(set: &protocol::CharSet) -> Result<CharSet, InputRuleError> {
     let protocol::CharSet { ranges } = set;
     let ranges = ranges
         .iter()
         .map(|range| {
             let protocol::CharRange { start, end } = range;
-            let start =
-                char::from_u32(*start).ok_or(CreationConstraintError::InvalidUnicodeScalar)?;
-            let end = char::from_u32(*end).ok_or(CreationConstraintError::InvalidUnicodeScalar)?;
+            let start = char::from_u32(*start).ok_or(InputRuleError::InvalidUnicodeScalar)?;
+            let end = char::from_u32(*end).ok_or(InputRuleError::InvalidUnicodeScalar)?;
             Ok((start, end))
         })
         .collect::<Result<Vec<_>, _>>()?;
     CharSet::new(ranges)
 }
 
-fn protocol_to_creation_rule(
-    rule: &protocol::CreationRule,
-) -> Result<CreationRule, CreationConstraintError> {
-    let protocol::CreationRule {
-        path,
+fn protocol_to_input_rule(rule: &protocol::InputRule) -> Result<InputRule, InputRuleError> {
+    let protocol::InputRule {
+        scope,
+        target,
         code,
         predicate,
     } = rule;
-    let path = CreationInputPath::new(path.clone())?;
-    let code = CreationRuleCode::new(code.clone())?;
+    let scope = match scope {
+        protocol::InputRuleScope::CreateOnly => InputRuleScope::CreateOnly,
+        protocol::InputRuleScope::EveryWrite => InputRuleScope::EveryWrite,
+    };
+    let target = match target {
+        protocol::InputRuleTarget::Value(path) => {
+            InputRuleTarget::Value(InputPath::new(path.clone())?)
+        }
+        protocol::InputRuleTarget::MapKeys(path) => {
+            InputRuleTarget::MapKeys(InputPath::new(path.clone())?)
+        }
+    };
+    let code = InputRuleCode::new(code.clone())?;
     let predicate = match predicate {
-        protocol::CreationPredicate::Length { min, max } => CreationPredicate::Length {
+        protocol::InputPredicate::Length { min, max } => InputPredicate::Length {
             min: *min,
             max: *max,
         },
-        protocol::CreationPredicate::AllowedChars(set) => {
-            CreationPredicate::AllowedChars(protocol_to_creation_charset(set)?)
+        protocol::InputPredicate::AllowedChars(set) => {
+            InputPredicate::AllowedChars(protocol_to_input_charset(set)?)
         }
-        protocol::CreationPredicate::FirstChar(set) => {
-            CreationPredicate::FirstChar(protocol_to_creation_charset(set)?)
+        protocol::InputPredicate::FirstChar(set) => {
+            InputPredicate::FirstChar(protocol_to_input_charset(set)?)
         }
-        protocol::CreationPredicate::LastChar(set) => {
-            CreationPredicate::LastChar(protocol_to_creation_charset(set)?)
+        protocol::InputPredicate::LastChar(set) => {
+            InputPredicate::LastChar(protocol_to_input_charset(set)?)
         }
-        protocol::CreationPredicate::NoSubstring(token) => {
-            CreationPredicate::NoSubstring(NonEmptyString::new(token.clone())?)
+        protocol::InputPredicate::NoSubstring(token) => {
+            InputPredicate::NoSubstring(NonEmptyString::new(token.clone())?)
         }
-        protocol::CreationPredicate::NoPrefix(token) => {
-            CreationPredicate::NoPrefix(NonEmptyString::new(token.clone())?)
+        protocol::InputPredicate::NoPrefix(token) => {
+            InputPredicate::NoPrefix(NonEmptyString::new(token.clone())?)
         }
-        protocol::CreationPredicate::NoSuffix(token) => {
-            CreationPredicate::NoSuffix(NonEmptyString::new(token.clone())?)
-        }
-        protocol::CreationPredicate::NoAdjacent { left, right } => CreationPredicate::NoAdjacent {
-            left: protocol_to_creation_charset(left)?,
-            right: protocol_to_creation_charset(right)?,
+        protocol::InputPredicate::ForbiddenPrefix {
+            prefix,
+            ignore_ascii_case,
+        } => InputPredicate::ForbiddenPrefix {
+            prefix: NonEmptyString::new(prefix.clone())?,
+            ignore_ascii_case: *ignore_ascii_case,
         },
-        protocol::CreationPredicate::NotIpv4 => CreationPredicate::NotIpv4,
-        protocol::CreationPredicate::Matches(pattern) => {
-            CreationPredicate::Matches(pattern.clone())
+        protocol::InputPredicate::NoSuffix(token) => {
+            InputPredicate::NoSuffix(NonEmptyString::new(token.clone())?)
         }
-        protocol::CreationPredicate::NotMatches(pattern) => {
-            CreationPredicate::NotMatches(pattern.clone())
+        protocol::InputPredicate::NoAdjacent { left, right } => InputPredicate::NoAdjacent {
+            left: protocol_to_input_charset(left)?,
+            right: protocol_to_input_charset(right)?,
+        },
+        protocol::InputPredicate::NotIpv4 => InputPredicate::NotIpv4,
+        protocol::InputPredicate::Matches(pattern) => InputPredicate::Matches(pattern.clone()),
+        protocol::InputPredicate::NotMatches(pattern) => {
+            InputPredicate::NotMatches(pattern.clone())
         }
     };
-    Ok(CreationRule::new(path, code, predicate))
+    Ok(InputRule::new(scope, target, code, predicate))
 }
 
 /// Convert a validated resource schema into its current protocol record.
@@ -789,7 +820,7 @@ pub fn resource_schema_to_protocol(
         attributes,
         description,
         validation,
-        creation_constraints,
+        input_rules,
         kind,
         unique_name,
         operation_config,
@@ -844,10 +875,7 @@ pub fn resource_schema_to_protocol(
         unique_name,
         operation_config: operation_config.cloned(),
         validators,
-        creation_constraints: creation_constraints
-            .iter()
-            .map(creation_rule_to_protocol)
-            .collect(),
+        input_rules: input_rules.iter().map(input_rule_to_protocol).collect(),
         field_groups: field_groups.iter().map(field_group_to_protocol).collect(),
         default_prevent_destroy,
         defs,
@@ -1275,7 +1303,7 @@ pub fn protocol_to_resource_schema(
         operation_config,
         validators,
         field_groups,
-        creation_constraints,
+        input_rules,
         default_prevent_destroy,
         defs,
     } = schema;
@@ -1312,18 +1340,18 @@ pub fn protocol_to_resource_schema(
         })?);
     }
 
-    for (index, rule) in creation_constraints.iter().enumerate() {
+    for (index, rule) in input_rules.iter().enumerate() {
         let rule =
-            protocol_to_creation_rule(rule).map_err(|error| SchemaDecodeError::InvalidSchema {
+            protocol_to_input_rule(rule).map_err(|error| SchemaDecodeError::InvalidSchema {
                 detail: "creation constraint is invalid".into(),
                 resource_type: Some(resource_type.as_str().into()),
                 attribute_path: Vec::new(),
-                schema_issue_location: Some(Box::new(
-                    SchemaValidationIssueLocation::CreationConstraint(index),
-                )),
+                schema_issue_location: Some(Box::new(SchemaValidationIssueLocation::InputRule(
+                    index,
+                ))),
                 source: Some(Box::new(error)),
             })?;
-        core = core.creation_constraint(rule);
+        core = core.input_rule(rule);
     }
 
     for (name, definition) in defs {
@@ -4872,7 +4900,7 @@ mod tests {
             operation_config: None,
             validators: Vec::new(),
             field_groups: Vec::new(),
-            creation_constraints: Vec::new(),
+            input_rules: Vec::new(),
             default_prevent_destroy: false,
             defs: Default::default(),
         };

@@ -2070,7 +2070,7 @@ macro_rules! export_provider {
                             );
                         }
                     };
-                    // The shared projection retains creation constraints, including [].
+                    // The shared projection retains scoped input rules, including [].
                     match $crate::provider_schema_to_json(cache.witness()) {
                         Ok(json) => json,
                         Err(error) => {

@@ -1,9 +1,7 @@
 use super::*;
-use crate::creation::{CreationCheckedPlan, CreationContext};
+use crate::input_rules::{InputCheckedPlan, InputWriteContext};
 use crate::provider::{AppliedIdentifier, CreateAttempt, InFlightCreate, PendingToken, Sent};
-use crate::schema::{
-    AttributeSchema, CreationInputPath, CreationPredicate, CreationRule, CreationRuleCode,
-};
+use crate::schema::{AttributeSchema, InputPath, InputPredicate, InputRule, InputRuleCode};
 
 fn schemas() -> SchemaRegistry {
     let mut registry = SchemaRegistry::new();
@@ -13,10 +11,11 @@ fn schemas() -> SchemaRegistry {
             .attribute(
                 AttributeSchema::optional("name", crate::schema::AttributeType::string()).build(),
             )
-            .creation_constraint(CreationRule::new(
-                CreationInputPath::new("name").unwrap(),
-                CreationRuleCode::new("bucket.not_ipv4").unwrap(),
-                CreationPredicate::NotIpv4,
+            .input_rule(InputRule::value(
+                crate::schema::InputRuleScope::CreateOnly,
+                InputPath::new("name").unwrap(),
+                InputRuleCode::new("bucket.not_ipv4").unwrap(),
+                InputPredicate::NotIpv4,
             ))
             .validate()
             .unwrap(),
@@ -50,13 +49,13 @@ fn legacy() -> ResolvedResource {
 fn checked(
     plan: Plan,
     current: &HashMap<ResourceId, Current>,
-) -> Result<CreationCheckedPlan, crate::creation::CreationAdmissionFailure> {
+) -> Result<InputCheckedPlan, crate::input_rules::InputAdmissionFailure> {
     PendingCascadePlan {
         plan,
         deferred: ResolvedDeferredCreateTargets::default(),
     }
     .finish(|_| {})
-    .check_creation(&schemas(), current)
+    .check_inputs(&schemas(), current)
 }
 
 fn delete(resource: &ResolvedResource) -> ReplacementDelete {
@@ -99,7 +98,7 @@ fn creation_admission_rejects_known_create_without_leaking_input() {
     let error = &rejected.errors()[0];
     assert_eq!(error.resource_id, legacy().id);
     assert!(
-        matches!(&error.kind, PlanErrorKind::CreationConstraint { path, code, context: CreationContext::Create, .. } if path == "name" && code == "bucket.not_ipv4")
+        matches!(&error.kind, PlanErrorKind::InputRule { path, code, context: InputWriteContext::Create, .. } if path == "name" && code == "bucket.not_ipv4")
     );
     assert!(!format!("{error:?}").contains("192.168.1.1"));
     assert!(!format!("{rejected:?}").contains("192.168.1.1"));
@@ -116,7 +115,7 @@ fn creation_admission_checks_both_replacement_orders_including_cascades() {
         add_replacement(&mut plan, cbd, cascade);
         let rejected = checked(plan, &HashMap::new()).unwrap_err();
         assert_eq!(rejected.errors().len(), 2);
-        assert!(rejected.errors().iter().all(|error| matches!(&error.kind, PlanErrorKind::CreationConstraint { context: CreationContext::Replacement { create_before_destroy }, .. } if *create_before_destroy == cbd)));
+        assert!(rejected.errors().iter().all(|error| matches!(&error.kind, PlanErrorKind::InputRule { context: InputWriteContext::Replacement { create_before_destroy }, .. } if *create_before_destroy == cbd)));
     }
 }
 
@@ -209,7 +208,7 @@ fn creation_admission_exempts_noncreating_effects_and_adoption() {
     assert!(
         checked(plan, &HashMap::new())
             .unwrap()
-            .pending_creation()
+            .pending_inputs()
             .is_empty()
     );
     // Adoption/no-op has no creating effect, even with legacy values in state.
@@ -258,12 +257,12 @@ fn creation_admission_optional_absence_is_exempt_but_unknown_is_pending() {
         let mut plan = Plan::new();
         plan.add(Effect::Create(resource(value)));
         let checked = checked(plan, &HashMap::new()).unwrap();
-        assert_eq!(!checked.pending_creation().is_empty(), pending);
-        assert_eq!(checked.ensure_creation_ready().is_err(), pending);
+        assert_eq!(!checked.pending_inputs().is_empty(), pending);
+        assert_eq!(checked.ensure_inputs_ready().is_err(), pending);
         if pending {
             assert_eq!(
-                checked.ensure_creation_ready().unwrap_err().to_string(),
-                "creation check pending; apply-time discharge not implemented"
+                checked.ensure_inputs_ready().unwrap_err().to_string(),
+                "input check pending; apply-time discharge not implemented"
             );
         }
     }
@@ -275,9 +274,9 @@ fn creation_admission_deferred_template_retains_exact_slot_obligation() {
     let mut plan = Plan::new();
     plan.add(Effect::DeferredCreate(payload));
     let checked = checked(plan, &HashMap::new()).unwrap();
-    assert_eq!(checked.pending_creation().len(), 1);
-    assert_eq!(checked.pending_creation()[0].target().effect_index(), 0);
-    assert!(checked.ensure_creation_ready().is_err());
+    assert_eq!(checked.pending_inputs().len(), 1);
+    assert_eq!(checked.pending_inputs()[0].target().effect_index(), 0);
+    assert!(checked.ensure_inputs_ready().is_err());
 }
 
 fn deferred_payload() -> DeferredCreatePayload {
@@ -321,8 +320,8 @@ fn creation_admission_deferred_replace_retains_all_absorbed_delete_slots() {
         deletes: NonEmptyDeletes::try_new(deletes.into()).unwrap(),
     })));
     let checked = checked(plan, &HashMap::new()).unwrap();
-    assert_eq!(checked.pending_creation().len(), 1);
-    let obligation = &checked.pending_creation()[0];
+    assert_eq!(checked.pending_inputs().len(), 1);
+    let obligation = &checked.pending_inputs()[0];
     assert!(obligation.target().is_template());
     assert_eq!(obligation.paired_deletes().len(), 2);
     assert_eq!(
@@ -337,7 +336,7 @@ fn creation_admission_deferred_replace_retains_all_absorbed_delete_slots() {
         obligation.paired_deletes()[0].instance(),
         obligation.paired_deletes()[1].instance()
     );
-    assert!(checked.ensure_creation_ready().is_err());
+    assert!(checked.ensure_inputs_ready().is_err());
 }
 
 #[test]
@@ -347,7 +346,7 @@ fn creation_admission_delete_first_pending_is_paired_with_exact_delete() {
         &HashMap::new(),
     )
     .unwrap();
-    let obligation = &checked.pending_creation()[0];
+    let obligation = &checked.pending_inputs()[0];
     assert_eq!(obligation.target().effect_index(), 1);
     assert_eq!(obligation.paired_delete().unwrap().effect_index(), 0);
 }
@@ -361,10 +360,11 @@ fn creation_admission_required_absence_stays_pending() {
             .attribute(
                 AttributeSchema::required("name", crate::schema::AttributeType::string()).build(),
             )
-            .creation_constraint(CreationRule::new(
-                CreationInputPath::new("name").unwrap(),
-                CreationRuleCode::new("bucket.not_ipv4").unwrap(),
-                CreationPredicate::NotIpv4,
+            .input_rule(InputRule::value(
+                crate::schema::InputRuleScope::CreateOnly,
+                InputPath::new("name").unwrap(),
+                InputRuleCode::new("bucket.not_ipv4").unwrap(),
+                InputPredicate::NotIpv4,
             ))
             .validate()
             .unwrap(),
@@ -376,9 +376,9 @@ fn creation_admission_required_absence_stays_pending() {
         deferred: ResolvedDeferredCreateTargets::default(),
     }
     .finish(|_| {})
-    .check_creation(&schemas, &HashMap::new())
+    .check_inputs(&schemas, &HashMap::new())
     .unwrap();
-    assert_eq!(plan.pending_creation().len(), 1);
+    assert_eq!(plan.pending_inputs().len(), 1);
 }
 
 #[test]
@@ -394,17 +394,17 @@ fn creation_admission_slots_are_scoped_to_the_exact_finalized_plan() {
     )
     .unwrap();
     assert_ne!(
-        first.pending_creation()[0].target(),
-        second.pending_creation()[0].target()
+        first.pending_inputs()[0].target(),
+        second.pending_inputs()[0].target()
     );
     assert_ne!(
-        first.pending_creation()[0].paired_delete(),
-        second.pending_creation()[0].paired_delete()
+        first.pending_inputs()[0].paired_delete(),
+        second.pending_inputs()[0].paired_delete()
     );
     let cloned = first.clone();
     assert_eq!(
-        first.pending_creation()[0].target(),
-        cloned.pending_creation()[0].target()
+        first.pending_inputs()[0].target(),
+        cloned.pending_inputs()[0].target()
     );
 }
 
@@ -412,18 +412,20 @@ fn creation_admission_slots_are_scoped_to_the_exact_finalized_plan() {
 fn creation_admission_collects_all_diagnostics_in_stable_resource_path_code_order() {
     let run = |reverse: bool| {
         let mut rules = vec![
-            CreationRule::new(
-                CreationInputPath::new("name").unwrap(),
-                CreationRuleCode::new("z.length").unwrap(),
-                CreationPredicate::Length {
+            InputRule::value(
+                crate::schema::InputRuleScope::CreateOnly,
+                InputPath::new("name").unwrap(),
+                InputRuleCode::new("z.length").unwrap(),
+                InputPredicate::Length {
                     min: None,
                     max: Some(3),
                 },
             ),
-            CreationRule::new(
-                CreationInputPath::new("name").unwrap(),
-                CreationRuleCode::new("a.ipv4").unwrap(),
-                CreationPredicate::NotIpv4,
+            InputRule::value(
+                crate::schema::InputRuleScope::CreateOnly,
+                InputPath::new("name").unwrap(),
+                InputRuleCode::new("a.ipv4").unwrap(),
+                InputPredicate::NotIpv4,
             ),
         ];
         if reverse {
@@ -433,7 +435,7 @@ fn creation_admission_collects_all_diagnostics_in_stable_resource_path_code_orde
             crate::schema::ResourceSchema::new("Bucket").attribute(
                 AttributeSchema::optional("name", crate::schema::AttributeType::string()).build(),
             ),
-            |schema, rule| schema.creation_constraint(rule),
+            |schema, rule| schema.input_rule(rule),
         );
         let mut schemas = SchemaRegistry::new();
         schemas.insert("mock", schema.validate().unwrap());
@@ -458,7 +460,7 @@ fn creation_admission_collects_all_diagnostics_in_stable_resource_path_code_orde
             deferred: Default::default(),
         }
         .finish(|_| {})
-        .check_creation(&schemas, &HashMap::new())
+        .check_inputs(&schemas, &HashMap::new())
         .unwrap_err()
         .errors()
         .to_vec()
@@ -485,10 +487,11 @@ fn creation_admission_nested_absence_unknown_and_secret_values_remain_distinct()
                 )
                 .build(),
             )
-            .creation_constraint(CreationRule::new(
-                CreationInputPath::new("config.name").unwrap(),
-                CreationRuleCode::new("bucket.not_ipv4").unwrap(),
-                CreationPredicate::NotIpv4,
+            .input_rule(InputRule::value(
+                crate::schema::InputRuleScope::CreateOnly,
+                InputPath::new("config.name").unwrap(),
+                InputRuleCode::new("bucket.not_ipv4").unwrap(),
+                InputPredicate::NotIpv4,
             ))
             .validate()
             .unwrap(),
@@ -507,26 +510,366 @@ fn creation_admission_nested_absence_unknown_and_secret_values_remain_distinct()
             deferred: Default::default(),
         }
         .finish(|_| {})
-        .check_creation(&schemas, &HashMap::new())
+        .check_inputs(&schemas, &HashMap::new())
     };
-    assert!(make(None).unwrap().pending_creation().is_empty());
+    assert!(make(None).unwrap().pending_inputs().is_empty());
     assert_eq!(
         make(Some(Value::Concrete(
             ConcreteValue::Map(Default::default())
         )))
         .unwrap()
-        .pending_creation()
+        .pending_inputs()
         .len(),
         1
     );
-    assert_eq!(make(Some(unknown())).unwrap().pending_creation().len(), 1);
+    assert_eq!(make(Some(unknown())).unwrap().pending_inputs().len(), 1);
     let secret = string("192.168.1.1").into_secret();
     let rejected = make(Some(Value::Concrete(ConcreteValue::Map(
         indexmap::IndexMap::from([("name".into(), secret)]),
     ))))
     .unwrap_err();
     assert!(
-        matches!(&rejected.errors()[0].kind, PlanErrorKind::CreationConstraint { path, .. } if path == "config.name")
+        matches!(&rejected.errors()[0].kind, PlanErrorKind::InputRule { path, .. } if path == "config.name")
     );
     assert!(!format!("{:?}", rejected.errors()).contains("192.168.1.1"));
+}
+
+#[test]
+fn input_scope_classification_table_covers_every_effect_variant() {
+    use crate::schema::{AttributeType, InputRuleScope, ResourceSchema};
+    let resource = resource(Some(string("valid-name")));
+    let deleted = delete(&resource);
+    let attempt = CreateAttempt::new(resource.id.clone()).0;
+    let unissued = InFlightCreate::from_pending(attempt.pending(
+        PendingToken::new("unissued"),
+        Sent::AllRequestAttributes,
+        1,
+    ));
+    let issued = InFlightCreate::from_pending(
+        CreateAttempt::new(resource.id.clone())
+            .0
+            .issued(
+                AppliedIdentifier::new("existing").unwrap(),
+                Sent::AllRequestAttributes,
+            )
+            .pending(PendingToken::new("issued"), 1),
+    );
+    let DeferredCreatePayload {
+        template,
+        dependency_template,
+    } = deferred_payload();
+    let mut cases = vec![
+        ("create", Effect::Create(resource.clone()), None, 1, 1),
+        (
+            "resume unissued",
+            Effect::ResumeCreate {
+                resource: resource.clone(),
+                started_at: unissued.started_at().clone(),
+            },
+            Some(Current::create_in_flight(unissued)),
+            1,
+            1,
+        ),
+        (
+            "resume issued",
+            Effect::ResumeCreate {
+                resource: resource.clone(),
+                started_at: issued.started_at().clone(),
+            },
+            Some(Current::create_in_flight(issued)),
+            0,
+            0,
+        ),
+        (
+            "update",
+            Effect::Update {
+                from: Box::new(
+                    State::existing(resource.id.clone(), HashMap::new()).with_identifier("old"),
+                ),
+                identifier: AppliedIdentifier::new("old").unwrap(),
+                to: resource.clone(),
+                changed_attributes: vec!["name".into()],
+            },
+            None,
+            0,
+            1,
+        ),
+        (
+            "read",
+            Effect::Read {
+                resource: crate::resource::ResolvedDataSource::collect_resolved([
+                    crate::resource::DataSource::with_provider("mock", "Bucket", "lookup", None),
+                ])
+                .unwrap()
+                .remove(0),
+            },
+            None,
+            0,
+            0,
+        ),
+        (
+            "delete",
+            Effect::Delete {
+                id: deleted.id,
+                identifier: deleted.identifier,
+                generation: EffectGeneration::Current,
+                directives: deleted.directives,
+                binding: deleted.binding,
+                dependencies: deleted.dependencies,
+                explicit_dependencies: deleted.explicit_dependencies,
+                blocked_by_updates: Default::default(),
+            },
+            None,
+            0,
+            0,
+        ),
+        (
+            "import",
+            Effect::Import {
+                id: resource.resolved_id().clone(),
+                identifier: string("old"),
+            },
+            None,
+            0,
+            0,
+        ),
+        (
+            "remove",
+            Effect::Remove {
+                id: resource.resolved_id().clone(),
+            },
+            None,
+            0,
+            0,
+        ),
+        (
+            "move",
+            Effect::Move {
+                from: resource.resolved_id().clone(),
+                to: resource.resolved_id().clone(),
+                origin: None,
+            },
+            None,
+            0,
+            0,
+        ),
+        (
+            "release",
+            Effect::ReleaseListKeys {
+                id: resource.resolved_id(),
+                attribute: "settings".into(),
+                key_field: crate::schema::FieldName::declared("key"),
+                keys: crate::effect::ReleasedListKeys::try_new(vec![
+                    crate::effect::ReleasedListKey::new("entry", string("value")),
+                ])
+                .unwrap(),
+            },
+            None,
+            0,
+            0,
+        ),
+        (
+            "wait",
+            Effect::Wait {
+                id: ResolvedResourceId::with_provider_identity("mock", "Bucket", "wait", None),
+                target_id: crate::wait::ManagedWaitTarget::new(&resource),
+                until: crate::wait::predicate::WaitPredicate::equals(
+                    crate::wait::predicate::AttrPath::single("name"),
+                    string("ready"),
+                )
+                .unwrap(),
+                until_surface: "resource.name == ready".into(),
+                timeout: std::time::Duration::from_secs(1),
+                interval: std::time::Duration::from_secs(1),
+                explicit_dependencies: Default::default(),
+            },
+            None,
+            0,
+            0,
+        ),
+        (
+            "deferred create",
+            Effect::DeferredCreate(deferred_payload()),
+            None,
+            1,
+            1,
+        ),
+        (
+            "deferred replace",
+            Effect::DeferredReplace(Box::new(DeferredReplacePayload {
+                template,
+                dependency_template,
+                deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                    id: resource.resolved_id().clone(),
+                    identifier: AppliedIdentifier::new("old").unwrap(),
+                    directives: Default::default(),
+                    binding: None,
+                    dependencies: Default::default(),
+                    explicit_dependencies: Default::default(),
+                    blocked_by_updates: Default::default(),
+                }])
+                .unwrap(),
+            })),
+            None,
+            1,
+            1,
+        ),
+    ];
+    // This match is deliberately exhaustive alongside the explicit table:
+    // introducing another Effect variant requires updating its coverage here.
+    for (_, effect, _, _, _) in &cases {
+        match effect {
+            Effect::Read { .. }
+            | Effect::Create(_)
+            | Effect::ResumeCreate { .. }
+            | Effect::Update { .. }
+            | Effect::Delete { .. }
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate(_)
+            | Effect::DeferredReplace(_) => {}
+        }
+    }
+    for scope in [InputRuleScope::CreateOnly, InputRuleScope::EveryWrite] {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            ResourceSchema::new("Bucket")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .input_rule(InputRule::value(
+                    scope,
+                    InputPath::new("name").unwrap(),
+                    InputRuleCode::new("test.scope").unwrap(),
+                    InputPredicate::NotIpv4,
+                ))
+                .validate()
+                .unwrap(),
+        );
+        for (label, effect, prior, create_count, write_count) in &mut cases {
+            let mut plan = Plan::new();
+            plan.add(effect.clone());
+            let current = prior
+                .clone()
+                .map(|prior| HashMap::from([(resource.id.clone(), prior)]))
+                .unwrap_or_default();
+            let finalized = PendingCascadePlan {
+                plan,
+                deferred: Default::default(),
+            }
+            .finish(|_| {});
+            let count = finalized
+                .write_sites(&schemas, &current)
+                .map(|site| site.applicable_rules().count())
+                .sum::<usize>();
+            let expected = match scope {
+                InputRuleScope::CreateOnly => *create_count,
+                InputRuleScope::EveryWrite => *write_count,
+            };
+            assert_eq!(count, expected, "{label}, {scope:?}");
+        }
+        for cbd in [false, true] {
+            let finalized = PendingCascadePlan {
+                plan: replacement(cbd, resource.clone()),
+                deferred: Default::default(),
+            }
+            .finish(|_| {});
+            let current = HashMap::new();
+            let sites = finalized
+                .write_sites(&schemas, &current)
+                .collect::<Vec<_>>();
+            assert_eq!(sites.len(), 1);
+            assert_eq!(
+                sites[0].context(),
+                InputWriteContext::Replacement {
+                    create_before_destroy: cbd
+                }
+            );
+            assert_eq!(sites[0].applicable_rules().count(), 1);
+        }
+    }
+}
+
+#[test]
+fn issue_3900_actual_generated_temporary_name_exceeding_length_rejects_plan() {
+    use crate::schema::{AttributeType, InputRuleScope, ResourceSchema};
+    let original = "a".repeat(24);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Bucket")
+            .attribute(
+                AttributeSchema::optional("name", AttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("generation", AttributeType::int())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("name")
+            .input_rule(InputRule::value(
+                InputRuleScope::CreateOnly,
+                InputPath::new("name").unwrap(),
+                InputRuleCode::new("name.max_length").unwrap(),
+                InputPredicate::Length {
+                    min: None,
+                    max: Some(32),
+                },
+            ))
+            .validate()
+            .unwrap(),
+    );
+    let desired = Resource::with_provider("mock", "Bucket", "bucket", None)
+        .with_attribute("name", string(&original))
+        .with_attribute("generation", Value::Concrete(ConcreteValue::Int(2)));
+    let from = State::existing(
+        desired.id.clone(),
+        HashMap::from([
+            ("name".into(), string(&original).to_snapshot()),
+            (
+                "generation".into(),
+                Value::Concrete(ConcreteValue::Int(1)).to_snapshot(),
+            ),
+        ]),
+    )
+    .with_identifier("old");
+    let temporary = generate_temporary_name(
+        &desired,
+        &from,
+        schemas
+            .get("mock", "Bucket", crate::schema::SchemaKind::Resource)
+            .unwrap()
+            .as_schema(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(temporary.temporary_value.len(), 33);
+    assert!(original.len() <= 32);
+    let resolved = ResolvedResource::resolve_raw_fixture(desired, &schemas).unwrap();
+    let (raw, value_deps, explicit_deps, persisted_deps, persisted_explicit, reads) =
+        resolved.into_parts();
+    let resolved = ResolvedResource::from_resolved_parts_with_reads(
+        apply_temporary_name(raw, Some(&temporary)),
+        value_deps,
+        explicit_deps,
+        reads,
+    )
+    .with_persisted_destroy_dependencies(persisted_deps, persisted_explicit);
+    let mut plan = replacement(true, resolved);
+    plan.replace_display_mut()[0].temporary_name = Some(temporary.clone());
+    let rejected = PendingCascadePlan {
+        plan,
+        deferred: Default::default(),
+    }
+    .finish(|_| {})
+    .check_inputs(&schemas, &HashMap::new())
+    .unwrap_err();
+    assert!(
+        matches!(&rejected.errors()[0].kind, PlanErrorKind::InputRule { path, code, .. } if path == "name" && code == "name.max_length")
+    );
+    assert!(!format!("{:?}", rejected.errors()).contains(&temporary.temporary_value));
 }

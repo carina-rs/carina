@@ -1890,10 +1890,10 @@ fn render_detail_row<S>(
     attr_prefix: &str,
 ) {
     match row {
-        DetailRow::PendingCreation { path, codes } => {
+        DetailRow::PendingInput { path, codes } => {
             writeln!(
                 out,
-                "{}{} [{}]: creation check pending until apply",
+                "{}{} [{}]: input check pending until apply",
                 attr_prefix,
                 path,
                 codes

@@ -201,7 +201,7 @@ impl PendingCascadePlan {
     /// Complete the remaining planning steps, then emit the very same deferred
     /// targets already consulted during CBD promotion. The callback sees only
     /// the diff plan, preserving the historical ancillary-effect ordering.
-    pub fn finish(self, complete: impl FnOnce(&mut Plan)) -> crate::creation::FinalizedPlan {
+    pub fn finish(self, complete: impl FnOnce(&mut Plan)) -> crate::input_rules::FinalizedPlan {
         self.finish_with_desired_ids(std::iter::empty(), complete)
     }
 
@@ -209,7 +209,7 @@ impl PendingCascadePlan {
         self,
         desired_ids: impl IntoIterator<Item = &'a ResolvedResourceId>,
         complete: impl FnOnce(&mut Plan),
-    ) -> crate::creation::FinalizedPlan {
+    ) -> crate::input_rules::FinalizedPlan {
         let Self { mut plan, deferred } = self;
         complete(&mut plan);
         add_deferred_create_effects(&mut plan, deferred);
@@ -223,7 +223,7 @@ impl PendingCascadePlan {
             Err(failure) => failure.into_parts().0,
         };
         plan.record_unresolved_delete_ordering_analysis(&analysis);
-        crate::creation::FinalizedPlan::new(plan)
+        crate::input_rules::FinalizedPlan::new(plan)
     }
 }
 
@@ -232,10 +232,10 @@ impl PendingCascadePlan {
 /// resource or general effect can use this trusted bootstrap entry point.
 pub fn finalize_bootstrap_create(
     request: &crate::provider::CreateRequest,
-) -> crate::creation::FinalizedPlan<crate::resource::ProviderModuleSource> {
+) -> crate::input_rules::FinalizedPlan<crate::resource::ProviderModuleSource> {
     let mut plan = Plan::default();
     plan.add(Effect::Create(request.resource().as_inner().clone()));
-    crate::creation::FinalizedPlan::new(plan)
+    crate::input_rules::FinalizedPlan::new(plan)
 }
 
 fn add_key_releases(plan: &mut Plan, id: &ResourceId, releases: Vec<PlannedListKeyRelease>) {

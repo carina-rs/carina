@@ -19,7 +19,6 @@ pub mod binding_index;
 mod binding_index_split_tests;
 pub mod builtins;
 pub mod config_loader;
-pub mod creation;
 pub mod data_source_value;
 pub mod deps;
 pub mod desired;
@@ -34,6 +33,7 @@ pub mod formatter;
 pub mod heredoc;
 pub mod hint;
 pub mod identifier;
+pub mod input_rules;
 pub mod integer_arithmetic;
 #[doc(hidden)]
 pub mod json_field_order;

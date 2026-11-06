@@ -1,7 +1,7 @@
 //! Test fixtures use the real differ-owned finalization boundary, including
 //! ancillary effects installed by the finalization callback.
 
-pub fn finalize(plan: carina_core::plan::Plan) -> carina_core::creation::FinalizedPlan {
+pub fn finalize(plan: carina_core::plan::Plan) -> carina_core::input_rules::FinalizedPlan {
     use carina_core::{differ::*, provider::*, resource::*, schema::SchemaRegistry};
     use std::collections::{HashMap, HashSet};
     let schemas = SchemaRegistry::new();
@@ -24,9 +24,9 @@ pub fn finalize(plan: carina_core::plan::Plan) -> carina_core::creation::Finaliz
     .finish(|final_plan| *final_plan = plan)
 }
 
-pub fn checked(plan: carina_core::plan::Plan) -> carina_core::creation::CreationCheckedPlan {
+pub fn checked(plan: carina_core::plan::Plan) -> carina_core::input_rules::InputCheckedPlan {
     finalize(plan)
-        .check_creation(
+        .check_inputs(
             &carina_core::schema::SchemaRegistry::new(),
             &std::collections::HashMap::new(),
         )

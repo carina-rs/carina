@@ -7874,9 +7874,7 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
 
 #[tokio::test]
 async fn creation_constrained_state_bucket_bootstrap_is_admitted_before_dispatch() {
-    use carina_core::schema::{
-        CreationInputPath, CreationPredicate, CreationRule, CreationRuleCode,
-    };
+    use carina_core::schema::{InputPath, InputPredicate, InputRule, InputRuleCode};
     let provider = BootstrapRecordingProvider {
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Success,
@@ -7892,10 +7890,11 @@ async fn creation_constrained_state_bucket_bootstrap_is_admitted_before_dispatch
             .attribute(
                 PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
             )
-            .creation_constraint(CreationRule::new(
-                CreationInputPath::new("bucket").unwrap(),
-                CreationRuleCode::new("bucket.not_ipv4").unwrap(),
-                CreationPredicate::NotIpv4,
+            .input_rule(InputRule::value(
+                carina_core::schema::InputRuleScope::CreateOnly,
+                InputPath::new("bucket").unwrap(),
+                InputRuleCode::new("bucket.not_ipv4").unwrap(),
+                InputPredicate::NotIpv4,
             ))
             .validate()
             .unwrap(),

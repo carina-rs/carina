@@ -2035,7 +2035,7 @@ impl WasmBindingCreationError {
     }
 }
 
-fn map_binding_creation_error<T>(
+fn map_binding_input_rule_error<T>(
     failure: WasmBindingCreationError,
     instantiation: impl FnOnce(wasmtime::Error) -> T,
     info_call: impl FnOnce(wasmtime::Error) -> T,
@@ -3299,7 +3299,7 @@ async fn create_runtime_instance(
     )
     .await;
     result.map_err(|failure| {
-        map_binding_creation_error(
+        map_binding_input_rule_error(
             failure,
             |failure| {
                 WasmProviderInstanceError::Instantiation(
@@ -3331,7 +3331,7 @@ fn single_attempt_load_error(
     world: InstantiationWorld,
     failure: WasmBindingCreationError,
 ) -> WasmProviderLoadError {
-    map_binding_creation_error(
+    map_binding_input_rule_error(
         failure,
         |failure| {
             ProviderInstantiationError::from_single_attempt(engine, component, world, failure)
@@ -3365,7 +3365,7 @@ type CreateInstanceResult = Result<LiveInstance, WasmProviderLoadError>;
 fn create_instance_auto(rebuild: &mut RebuildContext) -> BoxFuture<'_, CreateInstanceResult> {
     Box::pin(async move {
         let map_load_error = |failure| {
-            map_binding_creation_error(
+            map_binding_input_rule_error(
                 failure,
                 Result::<wasmtime::Error, WasmProviderLoadError>::Ok,
                 |error| Err(info_call_load_error(error)),

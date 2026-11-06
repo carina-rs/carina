@@ -115,7 +115,7 @@ impl std::error::Error for SchemaSerializationError {
 }
 
 /// Serialize one aggregate provider-schema witness through the core protocol
-/// seam, including required creation constraints on every resource. Raw drafts
+/// seam, including required scoped input rules on every resource. Raw drafts
 /// or independently sourced tables cannot enter this API:
 ///
 /// ```compile_fail

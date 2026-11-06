@@ -130,21 +130,21 @@ fn validate_has_no_creation_findings_for_legacy_name() {
 }
 
 #[test]
-fn pending_creation_saves_without_certificates_and_live_apply_stops_before_all_effects() {
+fn pending_inputs_saves_without_certificates_and_live_apply_stops_before_all_effects() {
     let fixture = Fixture::new();
     fs::write(fixture.0.path().join("main.crn"), "let suffix = mock.test.resource { name = 'suffix' }\nlet pending = mock.test.creation_constrained { name = suffix.identifier }\n").unwrap();
     let output = fixture.run(&["plan", "--refresh=false", "--out", "plan.json"]);
     assert!(output.status.success(), "{}", text(&output));
     assert!(
-        text(&output).contains("creation check pending until apply"),
+        text(&output).contains("input check pending until apply"),
         "{}",
         text(&output)
     );
     let saved = fs::read_to_string(fixture.0.path().join("plan.json")).unwrap();
     for field in [
-        "pending_creation",
-        "PendingCreationObligation",
-        "CreationCheckedPlan",
+        "pending_inputs",
+        "PendingInputObligation",
+        "InputCheckedPlan",
         "paired_delete",
     ] {
         assert!(!saved.contains(field));
@@ -152,7 +152,7 @@ fn pending_creation_saves_without_certificates_and_live_apply_stops_before_all_e
     let output = fixture.run(&["apply", "--auto-approve", "--lock=false"]);
     assert_eq!(output.status.code(), Some(1), "{}", text(&output));
     assert!(
-        text(&output).contains("creation check pending; apply-time discharge not implemented"),
+        text(&output).contains("input check pending; apply-time discharge not implemented"),
         "{}",
         text(&output)
     );
@@ -203,7 +203,7 @@ fn replacement_rejection_keeps_old_resource_and_runs_no_mutations() {
 }
 
 #[test]
-fn saved_plan_without_creation_constraints_still_applies() {
+fn saved_plan_without_input_rules_still_applies() {
     let fixture = Fixture::new();
     fs::write(
         fixture.0.path().join("main.crn"),
@@ -214,4 +214,98 @@ fn saved_plan_without_creation_constraints_still_applies() {
     assert!(output.status.success(), "{}", text(&output));
     let output = fixture.run(&["apply", "--auto-approve", "--lock=false", "plan.json"]);
     assert!(output.status.success(), "{}", text(&output));
+}
+
+#[test]
+fn input_default_tags_reserved_prefix_is_rejected_before_plan_output() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.path().join("providers.crn"),
+        "provider mock { default_tags = { 'AWS:private-key' = 'secret-default-value' } }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        "let tagged = mock.test.input_constrained { name = 'valid-name' }\n",
+    )
+    .unwrap();
+    let output = fixture.run(&["plan", "--refresh=false", "--out", "plan.json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        text(&output).contains("mock.tags.reserved_prefix"),
+        "{}",
+        text(&output)
+    );
+    assert!(!text(&output).contains("AWS:private-key"));
+    assert!(!text(&output).contains("secret-default-value"));
+    assert!(!fixture.0.path().join("plan.json").exists());
+}
+
+#[test]
+fn input_validate_reports_every_write_but_not_create_only_in_multi_file_directory() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.path().join("values.crn"),
+        "let legacy_name = '192.168.1.1'\nlet tags = { 'aWs:private-key' = 'secret-tag-value' }\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        "let tagged = mock.test.input_constrained { name = legacy_name tags = tags }\n",
+    )
+    .unwrap();
+    let output = fixture.run(&["validate", "."]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        text(&output).contains("mock.tags.reserved_prefix"),
+        "{}",
+        text(&output)
+    );
+    assert!(!text(&output).contains("mock.name.not_ipv4"));
+    assert!(!text(&output).contains("aWs:private-key"));
+    assert!(!text(&output).contains("secret-tag-value"));
+}
+
+#[test]
+fn input_update_rejects_authored_reserved_tag_without_mutating_state() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        "let tagged = mock.test.input_constrained { name = 'valid-name' comment = 'before' }\n",
+    )
+    .unwrap();
+    let seed = fixture.run(&["apply", "--auto-approve", "--lock=false"]);
+    assert!(seed.status.success(), "{}", text(&seed));
+    let before = fs::read(fixture.0.path().join("carina.state.json")).unwrap();
+    fs::write(fixture.0.path().join("main.crn"),
+        "let tagged = mock.test.input_constrained { name = 'valid-name' comment = 'after' tags = { 'aws:probe' = 'secret' } }\n").unwrap();
+    let output = fixture.run(&["apply", "--auto-approve", "--lock=false"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        text(&output).contains("mock.tags.reserved_prefix"),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(
+        fs::read(fixture.0.path().join("carina.state.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn input_rules_do_not_reject_import_desired_values_that_are_never_written() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.path().join("main.crn"),
+        "let tagged = mock.test.input_constrained { name = 'valid-name' tags = { 'aws:cloudformation:stack-id' = 'observed' } }\n").unwrap();
+    fs::write(
+        fixture.0.path().join("imports.crn"),
+        "import { to = mock.test.input_constrained 'tagged' id = 'existing-id' }\n",
+    )
+    .unwrap();
+    let output = fixture.run(&["plan", "--refresh=false", "--out", "plan.json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(!text(&output).contains("mock.tags.reserved_prefix"));
+    let saved = fs::read_to_string(fixture.0.path().join("plan.json")).unwrap();
+    assert!(saved.contains("\"Import\""));
+    assert!(!saved.contains("\"Create\""));
 }

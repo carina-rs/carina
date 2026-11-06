@@ -486,7 +486,7 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
     let plan = prepared
         .value
         .finish(|_| {})
-        .check_creation(&fixture.registry, &HashMap::new())
+        .check_inputs(&fixture.registry, &HashMap::new())
         .unwrap();
     preparation
         .display(
@@ -825,8 +825,8 @@ async fn round9_scalar_to_list_union_enumerates_planning_and_display_operands() 
     fixture.calls.lock().unwrap().clear();
     ReferencePreparation::default()
         .display(
-            crate::creation::FinalizedPlan::new(plan.clone())
-                .check_creation(&fixture.registry, &HashMap::new())
+            crate::input_rules::FinalizedPlan::new(plan.clone())
+                .check_inputs(&fixture.registry, &HashMap::new())
                 .unwrap(),
             &prepare_empty_for_tests(),
             crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, &fixture.saved),
@@ -2195,8 +2195,8 @@ async fn apply_concrete_plan_reference_reresolves_without_widening_equivalent_pa
                 provider_context: crate::parser::ProviderContext::clone(
                     &crate::parser::LoadedProviderContext::empty_for_test(),
                 ),
-                plan: &crate::creation::FinalizedPlan::new(plan.clone())
-                    .check_creation(&SchemaRegistry::new(), &HashMap::new())
+                plan: &crate::input_rules::FinalizedPlan::new(plan.clone())
+                    .check_inputs(&SchemaRegistry::new(), &HashMap::new())
                     .unwrap(),
                 provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                     resource_origins: &origins,

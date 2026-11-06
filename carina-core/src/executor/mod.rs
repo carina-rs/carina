@@ -455,7 +455,7 @@ pub enum Applied {
 /// fn bypass<'a>(input: &mut LiveExecutionInput<'a>, raw: &'a Plan) { input.plan = raw; }
 /// ```
 pub struct LiveExecutionInput<'a> {
-    pub plan: &'a crate::creation::CreationCheckedPlan,
+    pub plan: &'a crate::input_rules::InputCheckedPlan,
     /// Explicitly identifies whether provider-bound effects contain authored
     /// values or plan-normalized values paired with their authored origins.
     /// The executor never infers this from a missing map entry.
@@ -555,8 +555,17 @@ impl RuntimeCompositions<'_> {
     }
 }
 
+enum RuntimeInputAdmission {
+    Checked {
+        first_pending: Option<crate::input_rules::InputEffectTarget>,
+    },
+    /// TODO(#4267 phase 5): re-admit the saved effects under the apply lock.
+    /// Only SavedExecutionInput can produce this explicit legacy disposition.
+    SavedPlanRecheckRequired,
+}
+
 pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
-    creation_pending: Option<crate::creation::CreationEffectTarget>,
+    input_admission: RuntimeInputAdmission,
     pub(super) plan: &'a crate::plan::Plan<S>,
     pub(super) provider_check_inputs: ProviderCheckInputs<'a, S>,
     pub(super) compositions: RuntimeCompositions<'a>,
@@ -601,10 +610,12 @@ impl<'a> LiveExecutionInput<'a> {
             checkpoint_sink,
         } = self;
         RuntimeExecutionInput {
-            creation_pending: plan
-                .pending_creation()
-                .first()
-                .map(|obligation| obligation.target().clone()),
+            input_admission: RuntimeInputAdmission::Checked {
+                first_pending: plan
+                    .pending_inputs()
+                    .first()
+                    .map(|obligation| obligation.target().clone()),
+            },
             plan,
             provider_check_inputs,
             compositions: RuntimeCompositions::Live(compositions),
@@ -648,9 +659,7 @@ impl<'a> SavedExecutionInput<'a> {
             checkpoint_sink,
         } = self;
         RuntimeExecutionInput {
-            // Saved-plan creation re-admission belongs to phase 5. Preserve
-            // the existing saved-plan path until that transition is added.
-            creation_pending: None,
+            input_admission: RuntimeInputAdmission::SavedPlanRecheckRequired,
             plan,
             provider_check_inputs,
             compositions: RuntimeCompositions::Saved(compositions),
@@ -2032,7 +2041,15 @@ async fn execute_runtime_plan<S: Clone + crate::resource::AnonymousIdentityModul
     observer: &dyn ExecutionObserver<S>,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome<S> {
-    if let Some(target) = input.creation_pending {
+    let pending = match &input.input_admission {
+        RuntimeInputAdmission::Checked { first_pending } => first_pending.as_ref(),
+        RuntimeInputAdmission::SavedPlanRecheckRequired => {
+            // TODO(#4267 phase 5): replace this named legacy branch with the
+            // locked saved-plan -> InputCheckedPlan transition, for both scopes.
+            None
+        }
+    };
+    if let Some(target) = pending {
         let mut result = ExecutionResult::empty();
         result.bindings = input.bindings;
         result.managed_current = input.managed_current;
@@ -2045,7 +2062,7 @@ async fn execute_runtime_plan<S: Clone + crate::resource::AnonymousIdentityModul
             observer,
             FailureReport::Effect {
                 effect,
-                kind: EffectFailureKind::execution(crate::creation::CreationCheckPending),
+                kind: EffectFailureKind::execution(crate::input_rules::InputCheckPending),
                 context: FailureEventContext {
                     recovery: None,
                     duration: std::time::Duration::ZERO,

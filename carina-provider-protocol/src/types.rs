@@ -1841,28 +1841,53 @@ pub struct CharSet {
     pub ranges: Vec<CharRange>,
 }
 
-/// Portable creation-only string predicates. Regexes use the schema dialect.
+/// Portable desired-input predicates. Regexes use the schema dialect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-pub enum CreationPredicate {
-    Length { min: Option<u64>, max: Option<u64> },
+pub enum InputPredicate {
+    Length {
+        min: Option<u64>,
+        max: Option<u64>,
+    },
     AllowedChars(CharSet),
     FirstChar(CharSet),
     LastChar(CharSet),
     NoSubstring(String),
     NoPrefix(String),
+    ForbiddenPrefix {
+        prefix: String,
+        ignore_ascii_case: bool,
+    },
     NoSuffix(String),
-    NoAdjacent { left: CharSet, right: CharSet },
+    NoAdjacent {
+        left: CharSet,
+        right: CharSet,
+    },
     NotIpv4,
     Matches(String),
     NotMatches(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputRuleScope {
+    CreateOnly,
+    EveryWrite,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CreationRule {
-    pub path: String,
+#[serde(tag = "kind", content = "path", rename_all = "snake_case")]
+pub enum InputRuleTarget {
+    Value(String),
+    MapKeys(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputRule {
+    pub scope: InputRuleScope,
+    pub target: InputRuleTarget,
     pub code: String,
-    pub predicate: CreationPredicate,
+    pub predicate: InputPredicate,
 }
 
 /// Schema types for resource validation and completion.
@@ -1883,8 +1908,8 @@ pub struct ResourceSchema {
     /// Protocol-v16 cardinality constraints over sibling attributes.
     /// Required even when empty so version skew fails during JSON loading.
     pub field_groups: Vec<FieldGroup>,
-    /// Protocol-v23 creation-only string rules. Required, including `[]`.
-    pub creation_constraints: Vec<CreationRule>,
+    /// Protocol-v23 scoped desired-input rules. Required, including `[]`.
+    pub input_rules: Vec<InputRule>,
     /// Whether the resource type is protected from destruction unless the
     /// user explicitly opts out. Required so version skew fails closed.
     pub default_prevent_destroy: bool,
@@ -2350,7 +2375,7 @@ mod tests {
         let resource_error = serde_json::from_value::<ResourceSchema>(serde_json::json!({
             "resource_type": "test.Widget",
             "attributes": {},
-            "creation_constraints":[],
+            "input_rules":[],
             "default_prevent_destroy": false
         }))
         .expect_err("protocol v16 resource field_groups must not default")
@@ -2373,7 +2398,7 @@ mod tests {
             "resource_type": "test.Resource",
             "attributes": {},
             "field_groups": [],
-            "creation_constraints": []
+            "input_rules": []
         }))
         .expect_err("protocol v16 default_prevent_destroy must not default")
         .to_string();
@@ -3336,7 +3361,7 @@ mod tests {
                 "resource_type":"ec2.SecurityGroup",
                 "attributes":{},
                 "field_groups":[],
-                "creation_constraints":[],
+                "input_rules":[],
                 "default_prevent_destroy":false,
                 "unique_name_attribute":"group_name"
             }"#,
@@ -3352,7 +3377,7 @@ mod tests {
                 "resource_type":"ec2.Vpc",
                 "attributes":{},
                 "field_groups":[],
-                "creation_constraints":[],
+                "input_rules":[],
                 "default_prevent_destroy":false,
                 "unique_name_attribute":null
             }"#,
@@ -3365,7 +3390,7 @@ mod tests {
                 "resource_type":"ec2.Vpc",
                 "attributes":{},
                 "field_groups":[],
-                "creation_constraints":[],
+                "input_rules":[],
                 "default_prevent_destroy":false
             }"#,
         )
@@ -3377,7 +3402,7 @@ mod tests {
                 "resource_type":"logs.LogGroup",
                 "attributes":{},
                 "field_groups":[],
-                "creation_constraints":[],
+                "input_rules":[],
                 "default_prevent_destroy":false,
                 "name_attribute":"log_group_name"
             }"#,
@@ -3396,7 +3421,7 @@ mod tests {
                 "resource_type":"s3.Bucket",
                 "attributes":{},
                 "field_groups":[],
-                "creation_constraints":[],
+                "input_rules":[],
                 "default_prevent_destroy":false,
                 "unique_name_attribute":{"type":"attribute","value":"bucket_name"}
             }"#,
@@ -3412,7 +3437,7 @@ mod tests {
                 "resource_type":"ec2.Vpc",
                 "attributes":{},
                 "field_groups":[],
-                "creation_constraints":[],
+                "input_rules":[],
                 "default_prevent_destroy":false,
                 "unique_name_attribute":{"type":"coexisting"}
             }"#,
@@ -3425,7 +3450,7 @@ mod tests {
                 "resource_type":"organizations.Organization",
                 "attributes":{},
                 "field_groups":[],
-                "creation_constraints":[],
+                "input_rules":[],
                 "default_prevent_destroy":false,
                 "unique_name_attribute":{"type":"conflicting"}
             }"#,
@@ -3458,7 +3483,7 @@ mod tests {
                 operation_config: None,
                 validators: vec![],
                 field_groups: vec![],
-                creation_constraints: Vec::new(),
+                input_rules: Vec::new(),
                 default_prevent_destroy: false,
                 defs: std::collections::BTreeMap::new(),
             };
@@ -3475,7 +3500,7 @@ mod tests {
                 "resource_type":"s3.Bucket",
                 "attributes":{},
                 "field_groups":[],
-                "creation_constraints":[],
+                "input_rules":[],
                 "default_prevent_destroy":false,
                 "unique_name_attribute":{"type":"attribute"}
             }"#,
@@ -3500,7 +3525,7 @@ mod tests {
                 "resource_type":"ec2.Vpc",
                 "attributes":{},
                 "field_groups":[],
-                "creation_constraints":[],
+                "input_rules":[],
                 "default_prevent_destroy":false,
                 "unique_name_attribute":{"type":"coexists"}
             }"#,
@@ -3529,7 +3554,7 @@ mod tests {
             operation_config: None,
             validators: vec![],
             field_groups: vec![],
-            creation_constraints: Vec::new(),
+            input_rules: Vec::new(),
             default_prevent_destroy: false,
             defs: std::collections::BTreeMap::from([(
                 "Statement".to_string(),
@@ -3738,7 +3763,7 @@ mod tests {
 
     #[test]
     fn test_resource_schema_with_operation_config() {
-        let json = r#"{"resource_type":"ec2.tgw","attributes":{},"field_groups":[],"creation_constraints":[],"default_prevent_destroy":false,"operation_config":{"delete_timeout_secs":1800}}"#;
+        let json = r#"{"resource_type":"ec2.tgw","attributes":{},"field_groups":[],"input_rules":[],"default_prevent_destroy":false,"operation_config":{"delete_timeout_secs":1800}}"#;
         let schema: ResourceSchema = serde_json::from_str(json).unwrap();
         assert_eq!(
             schema.operation_config.unwrap().delete_timeout_secs,
@@ -3748,7 +3773,7 @@ mod tests {
 
     #[test]
     fn test_resource_schema_without_operation_config() {
-        let json = r#"{"resource_type":"ec2.Vpc","attributes":{},"field_groups":[],"creation_constraints":[],"default_prevent_destroy":false}"#;
+        let json = r#"{"resource_type":"ec2.Vpc","attributes":{},"field_groups":[],"input_rules":[],"default_prevent_destroy":false}"#;
         let schema: ResourceSchema = serde_json::from_str(json).unwrap();
         assert!(schema.operation_config.is_none());
     }

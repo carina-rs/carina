@@ -631,7 +631,7 @@ impl ReferencePreparation {
     #[allow(clippy::too_many_arguments)]
     pub async fn display(
         &mut self,
-        plan: crate::creation::CreationCheckedPlan,
+        plan: crate::input_rules::InputCheckedPlan,
         planning: &ResolvedReferences,
         historical: crate::detail_rows::HistoricalDisplayAttributes,
         detail: crate::detail_rows::DetailLevel,
@@ -761,7 +761,7 @@ impl ReferencePreparation {
                 },
             )
             .await?;
-        let plan = match crate::creation::FinalizedPlan::new(prepared.value).check_creation(
+        let plan = match crate::input_rules::FinalizedPlan::new(prepared.value).check_inputs(
             registry,
             &prior
                 .materialize_current_states(desired, registry)
@@ -905,7 +905,7 @@ impl<'run> RecordingSession<'run> {
     #[allow(clippy::too_many_arguments)]
     fn render(
         self,
-        plan: Arc<crate::creation::CreationCheckedPlan>,
+        plan: Arc<crate::input_rules::InputCheckedPlan>,
         planning: &ResolvedReferences,
         historical: crate::detail_rows::HistoricalDisplayAttributes,
         detail: crate::detail_rows::DetailLevel,

@@ -1336,7 +1336,7 @@ async fn test_wasm_mock_provider_factory() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn wasm_schema_preserves_creation_constraints() {
+async fn wasm_schema_preserves_input_rules() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let schemas = factory.schemas();
@@ -1344,17 +1344,80 @@ async fn wasm_schema_preserves_creation_constraints() {
         .iter()
         .find(|schema| schema.parts().resource_type == "test.creation_constrained")
         .unwrap();
-    let rules = constrained.parts().creation_constraints;
+    let rules = constrained.parts().input_rules;
     assert_eq!(rules.len(), 1);
     assert_eq!(rules[0].path().as_str(), "name");
     assert_eq!(rules[0].code().as_str(), "mock.name.not_ipv4");
-    assert!(rules[0].evaluate("bucket").is_ok());
-    assert!(rules[0].evaluate("192.168.0.1").is_err());
+    // Evaluation now requires the real finalized-plan write-site boundary.
+    let admit = |name: &str| {
+        let mut registry = carina_core::schema::SchemaRegistry::new();
+        registry.insert("mock", constrained.clone());
+        let resource = carina_core::resource::Resource::with_provider(
+            "mock",
+            "test.creation_constrained",
+            "example",
+            None,
+        )
+        .with_attribute(
+            "name",
+            carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::String(
+                name.into(),
+            )),
+        );
+        let mut plan = carina_core::plan::Plan::new();
+        plan.add(carina_core::effect::Effect::Create(
+            carina_core::resource::ResolvedResource::resolve_raw_fixture(resource, &registry)
+                .unwrap(),
+        ));
+        input_rule_fixture::finalize(plan).check_inputs(&registry, &HashMap::new())
+    };
+    assert!(admit("bucket").is_ok());
+    assert!(admit("192.168.0.1").is_err());
     let empty = schemas
         .iter()
         .find(|schema| schema.parts().resource_type == "test.short_budget")
         .unwrap();
-    assert!(empty.parts().creation_constraints.is_empty());
+    assert!(empty.parts().input_rules.is_empty());
+}
+
+#[path = "../../carina-core/tests/support/creation.rs"]
+#[allow(dead_code)]
+mod input_rule_fixture;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_schema_preserves_every_write_map_key_rule_and_native_fingerprint() {
+    use carina_core::schema::{
+        InputPredicate, InputRuleScope, InputRuleTarget, SchemaKind, SchemaRegistry,
+    };
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let mut guest = SchemaRegistry::new();
+    for schema in factory.schemas() {
+        guest.insert("mock", schema);
+    }
+    let mut native = SchemaRegistry::new();
+    native.insert(
+        "mock",
+        carina_provider_mock::desired_input_rule_schema()
+            .validate()
+            .unwrap(),
+    );
+    let guest = guest
+        .get("mock", "test.input_constrained", SchemaKind::Resource)
+        .unwrap();
+    let native = native
+        .get("mock", "test.input_constrained", SchemaKind::Resource)
+        .unwrap();
+    assert_eq!(guest.semantic_fingerprint(), native.semantic_fingerprint());
+    let rules = guest.parts().input_rules;
+    let tags = rules
+        .iter()
+        .find(|rule| rule.scope() == InputRuleScope::EveryWrite)
+        .unwrap();
+    assert!(matches!(tags.target(), InputRuleTarget::MapKeys(path) if path.as_str() == "tags"));
+    assert!(
+        matches!(tags.predicate(), InputPredicate::ForbiddenPrefix { prefix, ignore_ascii_case: true } if prefix.as_str() == "aws:")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

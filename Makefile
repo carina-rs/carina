@@ -12,8 +12,8 @@ plan-image-inline:
 
 plan-all-create:
 	$(PLAN_FIXTURE) all_create
-plan-pending-creation:
-	$(PLAN_FIXTURE) pending_creation
+plan-pending-inputs:
+	$(PLAN_FIXTURE) pending_inputs
 plan-no-changes:
 	$(PLAN_FIXTURE) no_changes
 plan-state-only-directive-change:

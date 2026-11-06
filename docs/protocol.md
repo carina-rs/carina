@@ -4,7 +4,7 @@ The current protocol and minimum supported provider protocol are both **23**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
-| 23 | 23 | Required creation-only string constraints on every resource schema. |
+| 23 | 23 | Required scoped desired-input rules on every resource schema. |
 | 22 | 22 | Optional entry-count bound on `Map` attribute types. |
 | 21 | 21 | Required provider-wide identity assignability declarations in the schema envelope. |
 | 20 | 20 | Create-outcome names describe cloud knowledge; identifier-bearing payloads are `create-identified` and `resume-identified`. |
@@ -17,47 +17,84 @@ The current protocol and minimum supported provider protocol are both **23**.
 
 ## Version 23
 
-Every resource schema requires a `creation_constraints` array, including `[]`
-when no rules are declared. Each rule carries a canonical dotted input `path`,
-a stable lowercase dotted diagnostic `code`, and a tagged `predicate`:
+Every resource schema requires an `input_rules` array, including `[]` when
+no rules are declared. Each rule requires a `scope`, a typed `target`, a stable
+lowercase dotted diagnostic `code`, and a tagged `predicate`:
 
 ```json
 {
-  "path": "name",
+  "scope": "create_only",
+  "target": {"kind": "value", "path": "name"},
   "code": "s3.name.length",
   "predicate": {"kind": "length", "value": {"min": 3, "max": 63}}
 }
 ```
 
+The scopes are `create_only` and `every_write`. Create-only rules participate in
+Create, every replacement create half, deferred creates/replacements, and
+ResumeCreate without a known identifier. Every-write rules additionally check
+Update's desired resource. Issued resumes, reads, import/adoption, moves and
+removals are excluded. Rules never inspect read-back, current, refresh or loaded
+state values. Validation and LSP diagnostics check known every-write inputs;
+create-only rules remain silent because the eventual effect is unknown there.
+
+A target is either `{"kind":"value","path":"name"}` for a writable
+String-based leaf or `{"kind":"map_keys","path":"tags"}` for the keys of a
+writable map with String-based keys. Paths are canonical dotted attributes or
+struct fields without collection indices, wildcards or block aliases. Schema
+admission checks the target type and inherited provider-populated mode.
+
 The predicates are `length`, `allowed_chars`, `first_char`, `last_char`,
-`no_substring`, `no_prefix`, `no_suffix`, `no_adjacent`, `not_ipv4`, `matches`,
-and `not_matches`. Character sets contain inclusive Unicode scalar ranges as
-`{"ranges":[{"start":97,"end":122}]}`. Hosts validate endpoints and canonicalize
-sets by sorting and coalescing ranges. Length counts Unicode scalar values.
-Endpoint rules reject an empty string; allowed-character and adjacency rules
-accept it. IPv4 form means four decimal octets in 0–255 with no leading zeroes
-on multi-digit octets. Regexes use the existing schema-pattern dialect and are
-compiled once at schema admission.
+`no_substring`, `no_prefix`, `forbidden_prefix`, `no_suffix`, `no_adjacent`,
+`not_ipv4`, `matches`, and `not_matches`. A reserved tag-key declaration is:
 
-Admission rejects unknown paths, block aliases, provider-populated paths
-(including inherited modes), non-String-based types, duplicate path/code pairs,
-invalid diagnostic codes, empty character sets or forbidden tokens, and length
-rules with no bounds or inverted bounds. Paths identify attributes or nested
-struct fields; they contain no collection indices or wildcards. All declared
-rules are conjunctive. An absent optional input is exempt.
+```json
+{
+  "scope": "every_write",
+  "target": {"kind": "map_keys", "path": "tags"},
+  "code": "tags.reserved_prefix",
+  "predicate": {
+    "kind": "forbidden_prefix",
+    "value": {"prefix": "aws:", "ignore_ascii_case": true}
+  }
+}
+```
 
-These declarations are separate from ordinary type refinements and resource
-validators. This phase admits and transports the data and supplies a pure
-concrete-string evaluator; plan/apply evaluation is added in subsequent phases.
-Ordinary validation and LSP diagnostics do not evaluate creation rules. The
-semantic schema fingerprint includes every declaration and uses encoding v11.
+ASCII case folding affects only ASCII letters. Character sets contain inclusive
+Unicode scalar ranges as `{"ranges":[{"start":97,"end":122}]}`. Hosts validate
+endpoints and canonicalize sets by sorting and coalescing ranges. Length counts
+Unicode scalar values. Endpoint rules reject an empty string; allowed-character
+and adjacency rules accept it. IPv4 form means four decimal octets in 0–255
+with no leading zeroes on multi-digit octets. Regexes use the existing
+schema-pattern dialect and are compiled once at schema admission.
 
-`PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both 23. Hosts reject
-version-22 providers before ordinary schema decoding, and JSON missing the new
-field fails closed. The explicit read-only v12 migration adapter supplies an
-empty array. The SDK's existing schema JSON export carries the declarations;
-no WIT function or CRUD request field is added. AWS, AWSCC, and GitHub providers
-must rebuild against protocol 23.
+Admission rejects unknown or provider-populated paths, incorrect target types,
+duplicate target/code declarations, invalid diagnostic codes, empty
+character sets or forbidden tokens, and missing or inverted length bounds.
+Rules are conjunctive. An absent optional input is exempt when no value is sent.
+Schema attribute defaults are currently authoring metadata: the host does not
+insert them into requests. Values materialized by normalization are checked.
+Unknown desired inputs retain pending obligations, including on Updates; live
+apply fails closed until apply-time discharge is implemented.
+
+Finalized plans expose only classified desired write sites. Predicate evaluation
+requires an applicable rule bound to such a site; arbitrary strings and state
+values cannot invoke it. Replacement checks see the generated temporary name.
+Plan normalization and dispatch share the host default-tag merge, and authored
+validation reuses that same merge before checking desired inputs. Diagnostics
+name only the attribute, code and reason, including for secret values.
+
+The semantic schema fingerprint includes each rule's scope, target and complete
+predicate payload and remains encoding v11. Checked plans and pending obligations
+are not serialized. Saved-plan input re-admission under the apply lock remains
+an explicitly typed TODO for phase 5.
+
+`PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` remain 23. Hosts reject
+version-22 providers before ordinary schema decoding. Missing `input_rules`,
+`scope` or `target` fails closed. The explicit read-only v12 migration adapter
+supplies an empty array. The SDK's existing schema JSON export carries the
+rules; no WIT function or CRUD request field is added. AWS, AWSCC, and GitHub
+providers must rebuild against protocol 23.
 
 ## Version 22
 

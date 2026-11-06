@@ -30,13 +30,10 @@ use crate::moved_hint::MovedBlockHint;
 use crate::plan_summary::PlanChangeSummary;
 
 #[test]
-fn snapshot_pending_creation() {
+fn snapshot_pending_inputs() {
     let runtime = crate::test_support::TestCommandRuntime::new();
-    let fixture = build_plan_from_fixture_name(&runtime, "pending_creation").unwrap();
-    assert_eq!(
-        fixture.checked.as_ref().unwrap().pending_creation().len(),
-        1
-    );
+    let fixture = build_plan_from_fixture_name(&runtime, "pending_inputs").unwrap();
+    assert_eq!(fixture.checked.as_ref().unwrap().pending_inputs().len(), 1);
     let provider = provider_router_for_plan(&runtime, &fixture.plan).unwrap();
     let display = tokio::runtime::Runtime::new()
         .unwrap()
@@ -55,7 +52,7 @@ fn snapshot_pending_creation() {
         &provider,
     )
     .unwrap();
-    insta::assert_snapshot!("pending_creation", output);
+    insta::assert_snapshot!("pending_inputs", output);
 }
 
 #[allow(clippy::too_many_arguments)]

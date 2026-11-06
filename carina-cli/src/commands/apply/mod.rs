@@ -230,7 +230,7 @@ async fn prepare_bootstrap_creation(
 ) -> Result<
     (
         carina_core::provider::CreateRequest,
-        carina_core::creation::CreationCheckedPlan<carina_core::resource::ProviderModuleSource>,
+        carina_core::input_rules::InputCheckedPlan<carina_core::resource::ProviderModuleSource>,
     ),
     AppError,
 > {
@@ -251,7 +251,7 @@ async fn prepare_bootstrap_creation(
         .await
         .map_err(AppError::from_state_bucket_preparation)?;
     let checked = match carina_core::differ::finalize_bootstrap_create(&request)
-        .check_creation(context.schemas, &HashMap::new())
+        .check_inputs(context.schemas, &HashMap::new())
     {
         Ok(plan) => plan,
         Err(plan) => {
@@ -261,11 +261,11 @@ async fn prepare_bootstrap_creation(
                     &plan,
                     Path::new("."),
                 )
-                .expect_err("bootstrap creation rejection has diagnostics"),
+                .expect_err("bootstrap input rejection has diagnostics"),
             );
         }
     };
-    checked.ensure_creation_ready()?;
+    checked.ensure_inputs_ready()?;
     Ok((request, checked))
 }
 
@@ -803,7 +803,7 @@ struct ApplyExecutionState<
 }
 
 async fn execute_effects_with_observer(
-    plan: &carina_core::creation::CreationCheckedPlan,
+    plan: &carina_core::input_rules::InputCheckedPlan,
     compositions: &[carina_core::resource::LiveComposition],
     context: ApplyExecutionContext<'_>,
     state: ApplyExecutionState<'_>,
@@ -2751,7 +2751,7 @@ async fn run_apply_locked_owned(
             )?;
             moved_hints.eprint(color_mode);
 
-            plan.checked().ensure_creation_ready()?;
+            plan.checked().ensure_inputs_ready()?;
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
             if confirm_apply(&runtime, stdin, cancel.clone(), auto_approve).await?
                 == ApplyConfirmation::Cancelled

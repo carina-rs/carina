@@ -226,13 +226,13 @@ pub enum PlannedPlan {
         references: carina_core::references::ResolvedReferences,
     },
     Unrendered {
-        plan: carina_core::creation::CreationCheckedPlan,
+        plan: carina_core::input_rules::InputCheckedPlan,
         references: carina_core::references::ResolvedReferences,
     },
 }
 
 impl PlannedPlan {
-    pub(crate) fn checked(&self) -> &carina_core::creation::CreationCheckedPlan {
+    pub(crate) fn checked(&self) -> &carina_core::input_rules::InputCheckedPlan {
         match self {
             Self::Rendered { display, .. } => display.checked_plan(),
             Self::Unrendered { plan, .. } => plan,
@@ -291,7 +291,7 @@ impl std::ops::Deref for PlanOutcome {
 /// plans exit through a distinct type before a historical view is constructed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_plan_outcome(
-    plan: carina_core::creation::FinalizedPlan,
+    plan: carina_core::input_rules::FinalizedPlan,
     planning: carina_core::references::ResolvedReferences,
     preparation: &mut carina_core::references::ReferencePreparation,
     row_request: RowRequest,
@@ -301,12 +301,12 @@ pub(crate) async fn prepare_plan_outcome(
     explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     provider: &ProviderRouter,
 ) -> Result<PlanOutcome, AppError> {
-    let plan = match plan.check_creation(schemas, managed_current) {
+    let plan = match plan.check_inputs(schemas, managed_current) {
         Ok(plan) => plan,
         Err(plan) => {
             let plan = plan.into_plan();
             let errors = NonEmptyPlanErrors::try_from(plan.errors().to_vec())
-                .expect("creation rejection contains diagnostics");
+                .expect("input rejection contains diagnostics");
             return Ok(PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }));
         }
     };

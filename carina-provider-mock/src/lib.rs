@@ -113,8 +113,9 @@ pub fn uses_builtin_provider<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a
 /// Schemas exposed by Carina's built-in `provider mock {}` implementation.
 pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
     let schemas = vec![
-        creation_constraint_schema(),
-        creation_constraint_schema_for("test.creation_conflicting").with_conflicting_replacement(),
+        input_rule_schema(),
+        desired_input_rule_schema(),
+        input_rule_schema_for("test.creation_conflicting").with_conflicting_replacement(),
         ResourceSchema::new("test.resource")
             .attribute(
                 AttributeSchema::required("name", AttributeType::string())
@@ -410,11 +411,11 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
 }
 
 /// Portable creation-declaration fixture shared by native and WASM schemas.
-pub fn creation_constraint_schema() -> ResourceSchema {
-    creation_constraint_schema_for("test.creation_constrained").with_coexisting_replacement()
+pub fn input_rule_schema() -> ResourceSchema {
+    input_rule_schema_for("test.creation_constrained").with_coexisting_replacement()
 }
 
-fn creation_constraint_schema_for(resource_type: &str) -> ResourceSchema {
+fn input_rule_schema_for(resource_type: &str) -> ResourceSchema {
     ResourceSchema::new(resource_type)
         .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
         .attribute(
@@ -423,10 +424,31 @@ fn creation_constraint_schema_for(resource_type: &str) -> ResourceSchema {
                 .build(),
         )
         .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
-        .creation_constraint(carina_core::schema::CreationRule::new(
-            carina_core::schema::CreationInputPath::new("name").unwrap(),
-            carina_core::schema::CreationRuleCode::new("mock.name.not_ipv4").unwrap(),
-            carina_core::schema::CreationPredicate::NotIpv4,
+        .input_rule(carina_core::schema::InputRule::value(
+            carina_core::schema::InputRuleScope::CreateOnly,
+            carina_core::schema::InputPath::new("name").unwrap(),
+            carina_core::schema::InputRuleCode::new("mock.name.not_ipv4").unwrap(),
+            carina_core::schema::InputPredicate::NotIpv4,
+        ))
+}
+
+/// Desired-only reserved tag-key fixture, shared by native and WASM paths.
+pub fn desired_input_rule_schema() -> ResourceSchema {
+    input_rule_schema_for("test.input_constrained")
+        .with_coexisting_replacement()
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        )
+        .input_rule(carina_core::schema::InputRule::new(
+            carina_core::schema::InputRuleScope::EveryWrite,
+            carina_core::schema::InputRuleTarget::MapKeys(
+                carina_core::schema::InputPath::new("tags").unwrap(),
+            ),
+            carina_core::schema::InputRuleCode::new("mock.tags.reserved_prefix").unwrap(),
+            carina_core::schema::InputPredicate::ForbiddenPrefix {
+                prefix: carina_core::schema::NonEmptyString::new("aws:").unwrap(),
+                ignore_ascii_case: true,
+            },
         ))
 }
 

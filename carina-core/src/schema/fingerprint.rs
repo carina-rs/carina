@@ -12,10 +12,10 @@ use sha2::{Digest, Sha256};
 use super::{
     AssignabilityEdge, AttrTypeKind, CharSet, Compiled, CompiledAttributeSchema as AttributeSchema,
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
-    CompiledStructField as StructField, CreationPredicate, CreationRule, CreationRuleParts,
-    DslTransform, FieldGroup, FieldGroupKind, IdentityMode, InputMode, OwnerBoundResourceSchema,
-    ReferenceForm, ReferenceForms, ResourceValidation, SchemaKind, TypeIdentity, UniqueNameSpec,
-    ValidatorType,
+    CompiledStructField as StructField, DslTransform, FieldGroup, FieldGroupKind, IdentityMode,
+    InputMode, InputPredicate, InputRule, InputRuleParts, InputRuleScope, InputRuleTarget,
+    OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceValidation, SchemaKind,
+    TypeIdentity, UniqueNameSpec, ValidatorType,
 };
 use crate::resource::Value;
 
@@ -167,7 +167,7 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
         attributes,
         description: _description,
         validation,
-        creation_constraints,
+        input_rules,
         kind,
         unique_name,
         operation_config,
@@ -189,7 +189,7 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
     }
 
     encode_resource_validation(encoder, validation);
-    encode_creation_constraints(encoder, creation_constraints);
+    encode_input_rules(encoder, input_rules);
     encode_unique_name(encoder, unique_name);
     encoder.option(operation_config.as_ref(), encode_operation_config);
 
@@ -233,7 +233,7 @@ fn encode_field_groups(encoder: &mut CanonicalEncoder, groups: &[FieldGroup]) {
     }
 }
 
-fn encode_creation_charset(encoder: &mut CanonicalEncoder, set: &CharSet) {
+fn encode_input_charset(encoder: &mut CanonicalEncoder, set: &CharSet) {
     encoder.usize(set.ranges().len());
     for (start, end) in set.ranges() {
         encoder.u32(u32::from(*start));
@@ -241,59 +241,81 @@ fn encode_creation_charset(encoder: &mut CanonicalEncoder, set: &CharSet) {
     }
 }
 
-fn encode_creation_constraints(encoder: &mut CanonicalEncoder, rules: &[CreationRule<Compiled>]) {
+fn encode_input_rules(encoder: &mut CanonicalEncoder, rules: &[InputRule<Compiled>]) {
     let mut encoded: Vec<_> = rules
         .iter()
         .map(|rule| {
-            let CreationRuleParts {
-                path,
+            let InputRuleParts {
+                scope,
+                target,
                 code,
                 predicate,
             } = rule.parts();
             let mut encoder = CanonicalEncoder::default();
-            encoder.string(path.as_str());
+            encoder.tag(match scope {
+                InputRuleScope::CreateOnly => 0,
+                InputRuleScope::EveryWrite => 1,
+            });
+            match target {
+                InputRuleTarget::Value(path) => {
+                    encoder.tag(0);
+                    encoder.string(path.as_str());
+                }
+                InputRuleTarget::MapKeys(path) => {
+                    encoder.tag(1);
+                    encoder.string(path.as_str());
+                }
+            }
             encoder.string(code.as_str());
             match predicate {
-                CreationPredicate::Length { min, max } => {
+                InputPredicate::Length { min, max } => {
                     encoder.tag(0);
                     encoder.option(*min, CanonicalEncoder::u64);
                     encoder.option(*max, CanonicalEncoder::u64);
                 }
-                CreationPredicate::AllowedChars(set) => {
+                InputPredicate::AllowedChars(set) => {
                     encoder.tag(1);
-                    encode_creation_charset(&mut encoder, set);
+                    encode_input_charset(&mut encoder, set);
                 }
-                CreationPredicate::FirstChar(set) => {
+                InputPredicate::FirstChar(set) => {
                     encoder.tag(2);
-                    encode_creation_charset(&mut encoder, set);
+                    encode_input_charset(&mut encoder, set);
                 }
-                CreationPredicate::LastChar(set) => {
+                InputPredicate::LastChar(set) => {
                     encoder.tag(3);
-                    encode_creation_charset(&mut encoder, set);
+                    encode_input_charset(&mut encoder, set);
                 }
-                CreationPredicate::NoSubstring(token) => {
+                InputPredicate::NoSubstring(token) => {
                     encoder.tag(4);
                     encoder.string(token.as_str());
                 }
-                CreationPredicate::NoPrefix(token) => {
+                InputPredicate::NoPrefix(token) => {
                     encoder.tag(5);
                     encoder.string(token.as_str());
                 }
-                CreationPredicate::NoSuffix(token) => {
+                InputPredicate::ForbiddenPrefix {
+                    prefix,
+                    ignore_ascii_case,
+                } => {
+                    encoder.tag(11);
+                    encoder.string(prefix.as_str());
+                    encoder.bool(*ignore_ascii_case);
+                }
+                InputPredicate::NoSuffix(token) => {
                     encoder.tag(6);
                     encoder.string(token.as_str());
                 }
-                CreationPredicate::NoAdjacent { left, right } => {
+                InputPredicate::NoAdjacent { left, right } => {
                     encoder.tag(7);
-                    encode_creation_charset(&mut encoder, left);
-                    encode_creation_charset(&mut encoder, right);
+                    encode_input_charset(&mut encoder, left);
+                    encode_input_charset(&mut encoder, right);
                 }
-                CreationPredicate::NotIpv4 => encoder.tag(8),
-                CreationPredicate::Matches(pattern) => {
+                InputPredicate::NotIpv4 => encoder.tag(8),
+                InputPredicate::Matches(pattern) => {
                     encoder.tag(9);
                     encoder.string(pattern.as_str());
                 }
-                CreationPredicate::NotMatches(pattern) => {
+                InputPredicate::NotMatches(pattern) => {
                     encoder.tag(10);
                     encoder.string(pattern.as_str());
                 }
@@ -865,17 +887,17 @@ mod tests {
     #[test]
     fn creation_fingerprints_encode_every_payload_and_ignore_rule_order() {
         use super::super::{
-            CharSet, CreationInputPath, CreationPredicate, CreationRule, CreationRuleCode,
-            NonEmptyString,
+            CharSet, InputPath, InputPredicate, InputRule, InputRuleCode, NonEmptyString,
         };
         let rule = |path: &str, code: &str, predicate| {
-            CreationRule::new(
-                CreationInputPath::new(path).unwrap(),
-                CreationRuleCode::new(code).unwrap(),
+            InputRule::value(
+                crate::schema::InputRuleScope::CreateOnly,
+                InputPath::new(path).unwrap(),
+                InputRuleCode::new(code).unwrap(),
                 predicate,
             )
         };
-        let fingerprint = |rules: Vec<CreationRule>| {
+        let fingerprint = |rules: Vec<InputRule>| {
             rules
                 .into_iter()
                 .fold(
@@ -894,7 +916,7 @@ mod tests {
                             )
                             .build(),
                         ),
-                    |schema, rule| schema.creation_constraint(rule),
+                    |schema, rule| schema.input_rule(rule),
                 )
                 .validate()
                 .unwrap()
@@ -903,75 +925,67 @@ mod tests {
         };
         let token = |value: &str| NonEmptyString::new(value).unwrap();
         let predicates = vec![
-            CreationPredicate::Length {
+            InputPredicate::Length {
                 min: Some(1),
                 max: Some(63),
             },
-            CreationPredicate::Length {
+            InputPredicate::Length {
                 min: Some(2),
                 max: Some(63),
             },
-            CreationPredicate::Length {
+            InputPredicate::Length {
                 min: Some(1),
                 max: Some(64),
             },
-            CreationPredicate::AllowedChars(CharSet::ascii_lowercase()),
-            CreationPredicate::AllowedChars(CharSet::ascii_digits()),
-            CreationPredicate::FirstChar(CharSet::ascii_lowercase()),
-            CreationPredicate::LastChar(CharSet::ascii_lowercase()),
-            CreationPredicate::NoSubstring(token("ab")),
-            CreationPredicate::NoSubstring(token("ac")),
-            CreationPredicate::NoPrefix(token("ab")),
-            CreationPredicate::NoSuffix(token("ab")),
-            CreationPredicate::NoAdjacent {
+            InputPredicate::AllowedChars(CharSet::ascii_lowercase()),
+            InputPredicate::AllowedChars(CharSet::ascii_digits()),
+            InputPredicate::FirstChar(CharSet::ascii_lowercase()),
+            InputPredicate::LastChar(CharSet::ascii_lowercase()),
+            InputPredicate::NoSubstring(token("ab")),
+            InputPredicate::NoSubstring(token("ac")),
+            InputPredicate::NoPrefix(token("ab")),
+            InputPredicate::NoSuffix(token("ab")),
+            InputPredicate::NoAdjacent {
                 left: CharSet::ascii_lowercase(),
                 right: CharSet::ascii_digits(),
             },
-            CreationPredicate::NoAdjacent {
+            InputPredicate::NoAdjacent {
                 left: CharSet::ascii_digits(),
                 right: CharSet::ascii_lowercase(),
             },
-            CreationPredicate::NotIpv4,
-            CreationPredicate::Matches("^a$".into()),
-            CreationPredicate::Matches("^b$".into()),
-            CreationPredicate::NotMatches("^a$".into()),
+            InputPredicate::NotIpv4,
+            InputPredicate::Matches("^a$".into()),
+            InputPredicate::Matches("^b$".into()),
+            InputPredicate::NotMatches("^a$".into()),
         ];
         let mut encodings = std::collections::BTreeSet::new();
         encodings.insert(fingerprint(vec![]));
         for predicate in predicates {
             assert!(encodings.insert(fingerprint(vec![rule("name", "test.rule", predicate)])));
         }
-        let a = rule("name", "test.first", CreationPredicate::NotIpv4);
-        let b = rule("other", "test.second", CreationPredicate::NotIpv4);
+        let a = rule("name", "test.first", InputPredicate::NotIpv4);
+        let b = rule("other", "test.second", InputPredicate::NotIpv4);
         assert_eq!(
             fingerprint(vec![a.clone(), b.clone()]),
             fingerprint(vec![b.clone(), a.clone()])
         );
         assert_ne!(
             fingerprint(vec![a.clone()]),
-            fingerprint(vec![rule(
-                "other",
-                "test.first",
-                CreationPredicate::NotIpv4
-            )])
+            fingerprint(vec![rule("other", "test.first", InputPredicate::NotIpv4)])
         );
         assert_ne!(
             fingerprint(vec![a]),
-            fingerprint(vec![rule(
-                "name",
-                "test.changed",
-                CreationPredicate::NotIpv4
-            )])
+            fingerprint(vec![rule("name", "test.changed", InputPredicate::NotIpv4)])
         );
         let canonical = rule(
             "name",
             "test.chars",
-            CreationPredicate::AllowedChars(CharSet::new([('a', 'f')]).unwrap()),
+            InputPredicate::AllowedChars(CharSet::new([('a', 'f')]).unwrap()),
         );
         let reordered = rule(
             "name",
             "test.chars",
-            CreationPredicate::AllowedChars(CharSet::new([('d', 'f'), ('a', 'd')]).unwrap()),
+            InputPredicate::AllowedChars(CharSet::new([('d', 'f'), ('a', 'd')]).unwrap()),
         );
         assert_eq!(fingerprint(vec![canonical]), fingerprint(vec![reordered]));
     }

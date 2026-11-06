@@ -194,14 +194,13 @@
 
 mod compile_schema;
 mod compiled_pattern;
-mod creation;
+mod input_rules;
 pub use compiled_pattern::{
     Compiled, CompiledPattern, Draft, PatternCompileError, PatternCompileErrorSource, PatternForm,
 };
-pub use creation::{
-    CharSet, CreationConstraintError, CreationInputPath, CreationPredicate, CreationRule,
-    CreationRuleCode, CreationRuleParts, CreationViolation, CreationViolationReason,
-    NonEmptyString,
+pub use input_rules::{
+    CharSet, InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleError, InputRuleParts,
+    InputRuleScope, InputRuleTarget, InputViolation, InputViolationReason, NonEmptyString,
 };
 
 use crate::provider_text::{ProviderString, ProviderText};
@@ -7919,7 +7918,7 @@ pub enum UniqueNameSpec {
 ///     attributes,
 ///     description,
 ///     validation,
-///     creation_constraints,
+///     input_rules,
 ///     kind,
 ///     unique_name,
 ///     operation_config,
@@ -7934,7 +7933,7 @@ pub enum UniqueNameSpec {
 ///     attributes,
 ///     description,
 ///     validation,
-///     creation_constraints,
+///     input_rules,
 ///     kind,
 ///     unique_name,
 ///     operation_config,
@@ -7953,8 +7952,8 @@ pub struct PatternResourceSchema<R: PatternForm = Draft> {
     pub(crate) description: Option<ProviderText>,
     /// Cross-attribute validation, including its fingerprintable source.
     pub(crate) validation: ResourceValidation,
-    /// Creation-only input constraints; absent optional input is exempt.
-    pub(crate) creation_constraints: Vec<CreationRule<R>>,
+    /// Scoped desired-input rules; only classified write sites may evaluate them.
+    pub(crate) input_rules: Vec<InputRule<R>>,
     /// Whether this is a managed resource or a data source.
     /// Data sources must be used with the `read` keyword.
     pub(crate) kind: SchemaKind,
@@ -7999,7 +7998,7 @@ pub struct ResourceSchemaParts<'a, R: PatternForm = Draft> {
     pub attributes: &'a BTreeMap<String, PatternAttributeSchema<R>>,
     pub description: Option<&'a str>,
     pub validation: &'a ResourceValidation,
-    pub creation_constraints: &'a [CreationRule<R>],
+    pub input_rules: &'a [InputRule<R>],
     pub kind: SchemaKind,
     pub unique_name: &'a UniqueNameSpec,
     pub operation_config: Option<&'a OperationConfig>,
@@ -8039,7 +8038,7 @@ pub enum SchemaValidationIssueLocation {
     Attribute(ProviderString),
     Definition(ProviderString),
     FieldGroup(usize),
-    CreationConstraint(usize),
+    InputRule(usize),
     UniqueName,
     DefaultPreventDestroy,
 }
@@ -8050,7 +8049,7 @@ impl SchemaValidationIssueLocation {
             Self::Attribute(path) => path.as_str().to_owned(),
             Self::Definition(path) => format!("defs.{}", path.as_str()),
             Self::FieldGroup(index) => format!("field_groups[{index}]"),
-            Self::CreationConstraint(index) => format!("creation_constraints[{index}]"),
+            Self::InputRule(index) => format!("input_rules[{index}]"),
             Self::UniqueName => "unique_name".into(),
             Self::DefaultPreventDestroy => "default_prevent_destroy".into(),
         }
@@ -8061,7 +8060,7 @@ impl SchemaValidationIssueLocation {
             Self::Attribute(path) => Self::Attribute(format!("{}{suffix}", path.as_str()).into()),
             Self::Definition(path) => Self::Definition(format!("{}{suffix}", path.as_str()).into()),
             Self::FieldGroup(_)
-            | Self::CreationConstraint(_)
+            | Self::InputRule(_)
             | Self::UniqueName
             | Self::DefaultPreventDestroy => {
                 unreachable!("schema-level issue locations cannot have type-path descendants")
@@ -8074,7 +8073,7 @@ impl SchemaValidationIssueLocation {
             Self::Attribute(path) => Some(path.as_str()),
             Self::Definition(_)
             | Self::FieldGroup(_)
-            | Self::CreationConstraint(_)
+            | Self::InputRule(_)
             | Self::UniqueName
             | Self::DefaultPreventDestroy => None,
         }
@@ -8087,7 +8086,7 @@ impl fmt::Display for SchemaValidationIssueLocation {
             Self::Attribute(path) => write!(f, "{path}"),
             Self::Definition(path) => write!(f, "defs.{path}"),
             Self::FieldGroup(index) => write!(f, "field_groups[{index}]"),
-            Self::CreationConstraint(index) => write!(f, "creation_constraints[{index}]"),
+            Self::InputRule(index) => write!(f, "input_rules[{index}]"),
             Self::UniqueName => f.write_str("unique_name"),
             Self::DefaultPreventDestroy => f.write_str("default_prevent_destroy"),
         }
@@ -8096,7 +8095,7 @@ impl fmt::Display for SchemaValidationIssueLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SchemaDefinitionIssue {
-    creation_error: Option<CreationConstraintError>,
+    input_rule_error: Option<InputRuleError>,
     pattern_error: Option<PatternCompileError>,
     location: SchemaValidationIssueLocation,
     path: ProviderString,
@@ -8127,12 +8126,12 @@ pub struct ResourceSchemaValidationError {
 }
 
 impl ResourceSchemaValidationError {
-    pub fn creation_errors(
+    pub fn input_rule_errors(
         &self,
-    ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &CreationConstraintError)> {
+    ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &InputRuleError)> {
         self.issues.iter().filter_map(|issue| {
             issue
-                .creation_error
+                .input_rule_error
                 .as_ref()
                 .map(|error| (&issue.location, error))
         })
@@ -9759,7 +9758,7 @@ fn push_schema_issue(
     message: impl Into<String>,
 ) {
     issues.push(SchemaDefinitionIssue {
-        creation_error: None,
+        input_rule_error: None,
         pattern_error: None,
         path: location.raw_path().into(),
         location: location.clone(),
@@ -11200,7 +11199,7 @@ impl<R: PatternForm> PatternResourceSchema<R> {
             duplicate_attributes: Vec::new(),
             description: None,
             validation: ResourceValidation::None,
-            creation_constraints: Vec::new(),
+            input_rules: Vec::new(),
             kind: SchemaKind::Resource,
             unique_name: UniqueNameSpec::Conflicting,
             operation_config: None,
@@ -11218,7 +11217,7 @@ impl<R: PatternForm> PatternResourceSchema<R> {
             attributes: &self.attributes,
             description: self.description.as_deref(),
             validation: &self.validation,
-            creation_constraints: &self.creation_constraints,
+            input_rules: &self.input_rules,
             kind: self.kind,
             unique_name: &self.unique_name,
             operation_config: self.operation_config.as_ref(),
@@ -11246,14 +11245,14 @@ impl<R: PatternForm> PatternResourceSchema<R> {
         &self.validation
     }
 
-    /// Add a portable rule evaluated only when an effect creates a resource.
-    pub fn creation_constraint(mut self, rule: CreationRule<R>) -> Self {
-        self.creation_constraints.push(rule);
+    /// Add a portable rule with an explicit desired-write scope and target.
+    pub fn input_rule(mut self, rule: InputRule<R>) -> Self {
+        self.input_rules.push(rule);
         self
     }
 
-    pub fn creation_constraints(&self) -> &[CreationRule<R>] {
-        &self.creation_constraints
+    pub fn input_rules(&self) -> &[InputRule<R>] {
+        &self.input_rules
     }
 
     pub fn kind(&self) -> SchemaKind {
@@ -14268,7 +14267,7 @@ impl PatternResourceSchema<Draft> {
     pub fn validate(self) -> Result<ValidatedResourceSchema, ResourceSchemaValidationError> {
         let mut issues = Vec::new();
         let identity_paths = self.validate_definition(&mut issues);
-        self.validate_creation_constraints(&mut issues);
+        self.validate_input_rules(&mut issues);
         let resource_type = self.resource_type.clone();
         let schema = self.compile_patterns(&mut issues);
         finish_resource_schema_validation(resource_type, schema, identity_paths, issues)

@@ -1,32 +1,72 @@
 use carina_core::protocol_convert::{protocol_to_resource_schema, resource_schema_to_protocol};
 use carina_core::schema::{
-    AttributeSchema, AttributeType, CharSet, Compiled, CreationConstraintError, CreationInputPath,
-    CreationPredicate, CreationRule, CreationRuleCode, NonEmptyString, ResourceSchema, StructField,
+    AttributeSchema, AttributeType, CharSet, InputPath, InputPredicate, InputRule, InputRuleCode,
+    InputRuleError, NonEmptyString, ResourceSchema, StructField,
 };
 
-fn rule(path: &str, code: &str, predicate: CreationPredicate<String>) -> CreationRule {
-    CreationRule::new(
-        CreationInputPath::new(path).unwrap(),
-        CreationRuleCode::new(code).unwrap(),
+fn rule(path: &str, code: &str, predicate: InputPredicate<String>) -> InputRule {
+    InputRule::value(
+        carina_core::schema::InputRuleScope::CreateOnly,
+        InputPath::new(path).unwrap(),
+        InputRuleCode::new(code).unwrap(),
         predicate,
     )
 }
 
-fn schema(rules: Vec<CreationRule>) -> ResourceSchema {
+fn schema(rules: Vec<InputRule>) -> ResourceSchema {
     rules.into_iter().fold(
         ResourceSchema::new("test.Bucket")
             .attribute(AttributeSchema::optional("name", AttributeType::string()).build()),
-        |schema, rule| schema.creation_constraint(rule),
+        |schema, rule| schema.input_rule(rule),
     )
 }
 
-fn compiled(predicate: CreationPredicate<String>) -> CreationRule<Compiled> {
-    schema(vec![rule("name", "test.rule", predicate)])
-        .validate()
-        .unwrap()
-        .as_schema()
-        .creation_constraints()[0]
-        .clone()
+#[path = "support/creation.rs"]
+#[allow(dead_code)]
+mod fixture;
+
+#[derive(Debug)]
+struct CheckedRuleFixture(carina_core::schema::ValidatedResourceSchema);
+
+impl CheckedRuleFixture {
+    fn evaluate(&self, value: &str) -> Result<(), carina_core::schema::InputViolation> {
+        evaluate_schema(&self.0, value)
+    }
+}
+
+fn evaluate_schema(
+    schema: &carina_core::schema::ValidatedResourceSchema,
+    value: &str,
+) -> Result<(), carina_core::schema::InputViolation> {
+    use carina_core::{effect::Effect, input_rules::InputVerdict, plan::Plan, resource::*};
+    let mut registry = carina_core::schema::SchemaRegistry::new();
+    registry.insert("mock", schema.clone());
+    let resource = Resource::with_provider("mock", "test.Bucket", "example", None)
+        .with_attribute("name", Value::Concrete(ConcreteValue::String(value.into())));
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(
+        ResolvedResource::resolve_raw_fixture(resource, &registry).unwrap(),
+    ));
+    let finalized = fixture::finalize(plan);
+    let current = std::collections::HashMap::new();
+    for site in finalized.write_sites(&registry, &current) {
+        for rule in site.applicable_rules() {
+            match rule.evaluate() {
+                InputVerdict::Proven => {}
+                InputVerdict::Violation(violation) => return Err(violation),
+                InputVerdict::Undecided => panic!("literal fixture must be decidable"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compiled(predicate: InputPredicate<String>) -> CheckedRuleFixture {
+    CheckedRuleFixture(
+        schema(vec![rule("name", "test.rule", predicate)])
+            .validate()
+            .unwrap(),
+    )
 }
 
 fn token(value: &str) -> NonEmptyString {
@@ -37,7 +77,7 @@ fn token(value: &str) -> NonEmptyString {
 fn creation_primitive_vectors() {
     let vectors = [
         (
-            CreationPredicate::Length {
+            InputPredicate::Length {
                 min: Some(2),
                 max: Some(3),
             },
@@ -45,7 +85,7 @@ fn creation_primitive_vectors() {
             vec!["a", "abcd"],
         ),
         (
-            CreationPredicate::Length {
+            InputPredicate::Length {
                 min: None,
                 max: Some(0),
             },
@@ -53,7 +93,7 @@ fn creation_primitive_vectors() {
             vec!["a"],
         ),
         (
-            CreationPredicate::Length {
+            InputPredicate::Length {
                 min: Some(2),
                 max: None,
             },
@@ -61,37 +101,37 @@ fn creation_primitive_vectors() {
             vec!["", "a"],
         ),
         (
-            CreationPredicate::AllowedChars(CharSet::ascii_lowercase()),
+            InputPredicate::AllowedChars(CharSet::ascii_lowercase()),
             vec!["", "abc"],
             vec!["A", "é"],
         ),
         (
-            CreationPredicate::FirstChar(CharSet::ascii_alphanumeric()),
+            InputPredicate::FirstChar(CharSet::ascii_alphanumeric()),
             vec!["a-", "9."],
             vec!["", "-a", "éa"],
         ),
         (
-            CreationPredicate::LastChar(CharSet::ascii_alphanumeric()),
+            InputPredicate::LastChar(CharSet::ascii_alphanumeric()),
             vec!["-a", ".9"],
             vec!["", "a-", "aé"],
         ),
         (
-            CreationPredicate::NoSubstring(token("..")),
+            InputPredicate::NoSubstring(token("..")),
             vec!["", "a.b"],
             vec!["..", "a..b"],
         ),
         (
-            CreationPredicate::NoPrefix(token("xn--")),
+            InputPredicate::NoPrefix(token("xn--")),
             vec!["", "a-xn--"],
             vec!["xn--", "xn--bucket"],
         ),
         (
-            CreationPredicate::NoSuffix(token("--x-s3")),
+            InputPredicate::NoSuffix(token("--x-s3")),
             vec!["", "--x-s3-a"],
             vec!["--x-s3", "a--x-s3"],
         ),
         (
-            CreationPredicate::NoAdjacent {
+            InputPredicate::NoAdjacent {
                 left: CharSet::ascii_lowercase(),
                 right: CharSet::ascii_digits(),
             },
@@ -99,17 +139,17 @@ fn creation_primitive_vectors() {
             vec!["a1", "-z9-"],
         ),
         (
-            CreationPredicate::NotIpv4,
+            InputPredicate::NotIpv4,
             vec!["", "256.1.2.3", "1.2.3", "01.2.3.4"],
             vec!["0.0.0.0", "192.168.1.1", "255.255.255.255"],
         ),
         (
-            CreationPredicate::Matches("^\\d+$".into()),
+            InputPredicate::Matches("^\\d+$".into()),
             vec!["123"],
             vec!["", "١٢٣", "x123"],
         ),
         (
-            CreationPredicate::NotMatches("bad".into()),
+            InputPredicate::NotMatches("bad".into()),
             vec!["", "good"],
             vec!["bad", "a-bad-b"],
         ),
@@ -129,7 +169,7 @@ fn creation_primitive_vectors() {
 
 #[test]
 fn creation_ipv4_uses_strict_decimal_dotted_quads() {
-    let rule = compiled(CreationPredicate::NotIpv4);
+    let rule = compiled(InputPredicate::NotIpv4);
     for value in ["1.2.3.4", "0.10.100.255"] {
         assert!(rule.evaluate(value).is_err());
     }
@@ -154,12 +194,12 @@ fn creation_ipv4_uses_strict_decimal_dotted_quads() {
     }
 }
 
-fn s3_rules() -> Vec<CreationRule> {
+fn s3_rules() -> Vec<InputRule> {
     let mut rules = vec![
         rule(
             "name",
             "s3.length",
-            CreationPredicate::Length {
+            InputPredicate::Length {
                 min: Some(3),
                 max: Some(63),
             },
@@ -167,35 +207,35 @@ fn s3_rules() -> Vec<CreationRule> {
         rule(
             "name",
             "s3.chars",
-            CreationPredicate::AllowedChars(
+            InputPredicate::AllowedChars(
                 CharSet::new([('a', 'z'), ('0', '9'), ('.', '.'), ('-', '-')]).unwrap(),
             ),
         ),
         rule(
             "name",
             "s3.first",
-            CreationPredicate::FirstChar(CharSet::ascii_alphanumeric()),
+            InputPredicate::FirstChar(CharSet::ascii_alphanumeric()),
         ),
         rule(
             "name",
             "s3.last",
-            CreationPredicate::LastChar(CharSet::ascii_alphanumeric()),
+            InputPredicate::LastChar(CharSet::ascii_alphanumeric()),
         ),
         rule(
             "name",
             "s3.dots",
-            CreationPredicate::NoAdjacent {
+            InputPredicate::NoAdjacent {
                 left: CharSet::new([('.', '.')]).unwrap(),
                 right: CharSet::new([('.', '.')]).unwrap(),
             },
         ),
-        rule("name", "s3.ipv4", CreationPredicate::NotIpv4),
+        rule("name", "s3.ipv4", InputPredicate::NotIpv4),
     ];
     for (index, prefix) in ["xn--", "sthree-", "amzn-s3-demo-"].into_iter().enumerate() {
         rules.push(rule(
             "name",
             &format!("s3.prefix{index}"),
-            CreationPredicate::NoPrefix(token(prefix)),
+            InputPredicate::NoPrefix(token(prefix)),
         ));
     }
     for (index, suffix) in ["-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3"]
@@ -205,7 +245,7 @@ fn s3_rules() -> Vec<CreationRule> {
         rules.push(rule(
             "name",
             &format!("s3.suffix{index}"),
-            CreationPredicate::NoSuffix(token(suffix)),
+            InputPredicate::NoSuffix(token(suffix)),
         ));
     }
     rules
@@ -214,13 +254,7 @@ fn s3_rules() -> Vec<CreationRule> {
 #[test]
 fn creation_s3_rule_boundaries_and_reserved_names() {
     let schema = schema(s3_rules()).validate().unwrap();
-    let accepted = |value: &str| {
-        schema
-            .as_schema()
-            .creation_constraints()
-            .iter()
-            .all(|rule| rule.evaluate(value).is_ok())
-    };
+    let accepted = |value: &str| evaluate_schema(&schema, value).is_ok();
     for value in ["abc", "a.b-c9", "bucket-an", &"a".repeat(63)] {
         assert!(accepted(value), "{value}");
     }
@@ -252,75 +286,80 @@ fn creation_charset_is_nonempty_canonical_and_unicode_scalar_based() {
     assert_eq!(set.ranges(), &[('a', 'f'), ('😀', '🙏')]);
     assert!(set.contains('😀'));
     assert!(!set.contains('g'));
-    assert_eq!(
-        CharSet::new([]).unwrap_err(),
-        CreationConstraintError::EmptyCharSet
-    );
+    assert_eq!(CharSet::new([]).unwrap_err(), InputRuleError::EmptyCharSet);
     assert_eq!(
         CharSet::new([('z', 'a')]).unwrap_err(),
-        CreationConstraintError::InvertedCharRange
+        InputRuleError::InvertedCharRange
     );
     assert!(NonEmptyString::new("").is_err());
     for code in [
         "", "S3.name", "s3..name", ".name", "s3.name.", "s3.name-", "a\n",
     ] {
-        assert!(CreationRuleCode::new(code).is_err(), "{code:?}");
+        assert!(InputRuleCode::new(code).is_err(), "{code:?}");
     }
     for path in [
         "", ".name", "name.", "a..b", "name[0]", " name", "a.*", "a\nb",
     ] {
-        assert!(CreationInputPath::new(path).is_err(), "{path:?}");
+        assert!(InputPath::new(path).is_err(), "{path:?}");
     }
 }
 
 #[test]
 fn creation_admission_rejects_invalid_paths_types_bounds_and_duplicates() {
     for (path, expected) in [
-        ("missing", CreationConstraintError::UnknownPath),
-        ("output", CreationConstraintError::ProviderPopulatedPath),
-        ("count", CreationConstraintError::NonStringPath),
+        ("missing", InputRuleError::UnknownPath),
+        ("output", InputRuleError::ProviderPopulatedPath),
+        ("count", InputRuleError::NonStringPath),
     ] {
-        let error = schema(vec![rule(path, "test.rule", CreationPredicate::NotIpv4)])
+        let error = schema(vec![rule(path, "test.rule", InputPredicate::NotIpv4)])
             .attribute(
                 AttributeSchema::provider_populated("output", AttributeType::string()).build(),
             )
             .attribute(AttributeSchema::optional("count", AttributeType::int()).build())
             .validate()
             .unwrap_err();
-        assert!(error.creation_errors().any(|(_, error)| *error == expected));
+        assert!(
+            error
+                .input_rule_errors()
+                .any(|(_, error)| *error == expected)
+        );
     }
     for (predicate, expected) in [
         (
-            CreationPredicate::Length {
+            InputPredicate::Length {
                 min: None,
                 max: None,
             },
-            CreationConstraintError::EmptyLengthBounds,
+            InputRuleError::EmptyLengthBounds,
         ),
         (
-            CreationPredicate::Length {
+            InputPredicate::Length {
                 min: Some(4),
                 max: Some(3),
             },
-            CreationConstraintError::InvertedLengthBounds,
+            InputRuleError::InvertedLengthBounds,
         ),
     ] {
         let error = schema(vec![rule("name", "test.rule", predicate)])
             .validate()
             .unwrap_err();
-        assert!(error.creation_errors().any(|(_, error)| *error == expected));
+        assert!(
+            error
+                .input_rule_errors()
+                .any(|(_, error)| *error == expected)
+        );
     }
-    let same = rule("name", "test.rule", CreationPredicate::NotIpv4);
+    let same = rule("name", "test.rule", InputPredicate::NotIpv4);
     let error = schema(vec![same.clone(), same]).validate().unwrap_err();
     assert!(
         error
-            .creation_errors()
-            .any(|(_, error)| *error == CreationConstraintError::DuplicateRule)
+            .input_rule_errors()
+            .any(|(_, error)| *error == InputRuleError::DuplicateRule)
     );
     let error = schema(vec![rule(
         "name",
         "test.regex",
-        CreationPredicate::Matches("[".into()),
+        InputPredicate::Matches("[".into()),
     )])
     .validate()
     .unwrap_err();
@@ -344,14 +383,14 @@ fn creation_nested_paths_follow_refs_and_inherit_provider_populated_mode() {
         let result = ResourceSchema::new("test.Nested")
             .attribute(attribute)
             .with_def("Nested", nested.clone())
-            .creation_constraint(rule("nested.name", "test.name", CreationPredicate::NotIpv4))
+            .input_rule(rule("nested.name", "test.name", InputPredicate::NotIpv4))
             .validate();
         if provider_populated {
             assert!(
                 result
                     .unwrap_err()
-                    .creation_errors()
-                    .any(|(_, error)| *error == CreationConstraintError::ProviderPopulatedPath)
+                    .input_rule_errors()
+                    .any(|(_, error)| *error == InputRuleError::ProviderPopulatedPath)
             );
         } else {
             assert!(result.is_ok());
@@ -363,13 +402,13 @@ fn creation_nested_paths_follow_refs_and_inherit_provider_populated_mode() {
                 .with_block_name("alias")
                 .build(),
         )
-        .creation_constraint(rule("alias.name", "test.name", CreationPredicate::NotIpv4))
+        .input_rule(rule("alias.name", "test.name", InputPredicate::NotIpv4))
         .validate()
         .unwrap_err();
     assert!(
         error
-            .creation_errors()
-            .any(|(_, error)| *error == CreationConstraintError::UnknownPath)
+            .input_rule_errors()
+            .any(|(_, error)| *error == InputRuleError::UnknownPath)
     );
 }
 
@@ -380,36 +419,36 @@ fn creation_protocol_round_trip_retains_every_primitive_and_empty_collection() {
         rule(
             "name",
             "test.substring",
-            CreationPredicate::NoSubstring(token("secret")),
+            InputPredicate::NoSubstring(token("secret")),
         ),
         rule(
             "name",
             "test.match",
-            CreationPredicate::Matches("^\\w+$".into()),
+            InputPredicate::Matches("^\\w+$".into()),
         ),
         rule(
             "name",
             "test.not_match",
-            CreationPredicate::NotMatches("forbidden".into()),
+            InputPredicate::NotMatches("forbidden".into()),
         ),
     ]);
     for rules in [vec![], rules] {
         let original = schema(rules).validate().unwrap();
         let protocol = resource_schema_to_protocol(&original).unwrap();
         let json = serde_json::to_value(&protocol).unwrap();
-        assert!(json["creation_constraints"].is_array());
+        assert!(json["input_rules"].is_array());
         let decoded_protocol = serde_json::from_value(json).unwrap();
         let decoded = protocol_to_resource_schema(&decoded_protocol).unwrap();
         assert_eq!(
-            original.as_schema().creation_constraints(),
-            decoded.as_schema().creation_constraints()
+            original.as_schema().input_rules(),
+            decoded.as_schema().input_rules()
         );
     }
 }
 
 #[test]
 fn creation_violation_diagnostics_do_not_contain_input_values() {
-    let rule = compiled(CreationPredicate::AllowedChars(CharSet::ascii_digits()));
+    let rule = compiled(InputPredicate::AllowedChars(CharSet::ascii_digits()));
     let violation = rule.evaluate("very-secret-value").unwrap_err();
     assert!(!violation.to_string().contains("very-secret-value"));
     assert!(!format!("{violation:?}").contains("very-secret-value"));
@@ -422,43 +461,40 @@ fn creation_protocol_admission_preserves_typed_declaration_errors() {
     let base = serde_json::to_value(resource_schema_to_protocol(&original).unwrap()).unwrap();
     for (rule, expected) in [
         (
-            serde_json::json!({"path":"name", "code":"INVALID", "predicate":{"kind":"not_ipv4"}}),
-            CreationConstraintError::InvalidCode,
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"INVALID", "predicate":{"kind":"not_ipv4"}}),
+            InputRuleError::InvalidCode,
         ),
         (
-            serde_json::json!({"path":"name[0]", "code":"test.rule", "predicate":{"kind":"not_ipv4"}}),
-            CreationConstraintError::InvalidPath,
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name[0]"}, "code":"test.rule", "predicate":{"kind":"not_ipv4"}}),
+            InputRuleError::InvalidPath,
         ),
         (
-            serde_json::json!({"path":"name", "code":"test.rule", "predicate":{"kind":"no_prefix", "value":""}}),
-            CreationConstraintError::EmptyToken,
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "predicate":{"kind":"no_prefix", "value":""}}),
+            InputRuleError::EmptyToken,
         ),
         (
-            serde_json::json!({"path":"name", "code":"test.rule", "predicate":{"kind":"allowed_chars", "value":{"ranges":[]}}}),
-            CreationConstraintError::EmptyCharSet,
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "predicate":{"kind":"allowed_chars", "value":{"ranges":[]}}}),
+            InputRuleError::EmptyCharSet,
         ),
         (
-            serde_json::json!({"path":"name", "code":"test.rule", "predicate":{"kind":"first_char", "value":{"ranges":[{"start":122,"end":97}]}}}),
-            CreationConstraintError::InvertedCharRange,
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "predicate":{"kind":"first_char", "value":{"ranges":[{"start":122,"end":97}]}}}),
+            InputRuleError::InvertedCharRange,
         ),
         (
-            serde_json::json!({"path":"name", "code":"test.rule", "predicate":{"kind":"last_char", "value":{"ranges":[{"start":55296,"end":57343}]}}}),
-            CreationConstraintError::InvalidUnicodeScalar,
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "predicate":{"kind":"last_char", "value":{"ranges":[{"start":55296,"end":57343}]}}}),
+            InputRuleError::InvalidUnicodeScalar,
         ),
         (
-            serde_json::json!({"path":"name", "code":"test.rule", "predicate":{"kind":"last_char", "value":{"ranges":[{"start":1114112,"end":1114112}]}}}),
-            CreationConstraintError::InvalidUnicodeScalar,
+            serde_json::json!({"scope":"create_only", "target":{"kind":"value","path":"name"}, "code":"test.rule", "predicate":{"kind":"last_char", "value":{"ranges":[{"start":1114112,"end":1114112}]}}}),
+            InputRuleError::InvalidUnicodeScalar,
         ),
     ] {
         let mut json = base.clone();
-        json["creation_constraints"] = serde_json::json!([rule]);
+        json["input_rules"] = serde_json::json!([rule]);
         let wire = serde_json::from_value(json).unwrap();
         let error = protocol_to_resource_schema(&wire).unwrap_err();
         assert_eq!(
-            error
-                .source()
-                .unwrap()
-                .downcast_ref::<CreationConstraintError>(),
+            error.source().unwrap().downcast_ref::<InputRuleError>(),
             Some(&expected)
         );
     }
@@ -490,7 +526,7 @@ fn creation_admission_accepts_string_refinements_enums_and_reference_leaves() {
     ] {
         ResourceSchema::new("test.Bucket")
             .attribute(AttributeSchema::optional("name", ty).build())
-            .creation_constraint(rule("name", "test.rule", CreationPredicate::NotIpv4))
+            .input_rule(rule("name", "test.rule", InputPredicate::NotIpv4))
             .validate()
             .unwrap();
     }
@@ -513,6 +549,6 @@ fn creation_charsets_canonicalize_at_unicode_scalar_boundaries() {
     }
     assert!(!set.contains('\u{d7fe}'));
     assert!(!set.contains('\u{e001}'));
-    let rule = compiled(CreationPredicate::AllowedChars(set));
+    let rule = compiled(InputPredicate::AllowedChars(set));
     assert!(rule.evaluate("\u{d7ff}\u{e000}\u{10ffff}").is_ok());
 }

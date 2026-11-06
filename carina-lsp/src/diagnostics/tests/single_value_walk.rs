@@ -333,17 +333,16 @@ fn directory_diagnostics(
 }
 
 #[test]
-fn creation_constraints_produce_no_lsp_value_findings() {
-    use carina_core::schema::{
-        CreationInputPath, CreationPredicate, CreationRule, CreationRuleCode,
-    };
+fn input_rules_produce_no_lsp_value_findings() {
+    use carina_core::schema::{InputPath, InputPredicate, InputRule, InputRuleCode};
     let engine = engine_with_schema(
         ResourceSchema::new("test.Widget")
             .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
-            .creation_constraint(CreationRule::new(
-                CreationInputPath::new("name").unwrap(),
-                CreationRuleCode::new("test.not_ipv4").unwrap(),
-                CreationPredicate::NotIpv4,
+            .input_rule(InputRule::value(
+                carina_core::schema::InputRuleScope::CreateOnly,
+                InputPath::new("name").unwrap(),
+                InputRuleCode::new("test.not_ipv4").unwrap(),
+                InputPredicate::NotIpv4,
             )),
     );
     let diagnostics = directory_diagnostics(
@@ -359,6 +358,72 @@ fn creation_constraints_produce_no_lsp_value_findings() {
         "main.crn",
     );
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn input_every_write_matches_validate_for_multifile_desired_values_and_defaults() {
+    use carina_core::schema::{
+        InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleScope, InputRuleTarget,
+        NonEmptyString,
+    };
+    for scope in [InputRuleScope::CreateOnly, InputRuleScope::EveryWrite] {
+        let engine = engine_with_schema(
+            ResourceSchema::new("test.Widget")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .attribute(
+                    AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                        .build(),
+                )
+                .input_rule(InputRule::new(
+                    scope,
+                    InputRuleTarget::MapKeys(InputPath::new("tags").unwrap()),
+                    InputRuleCode::new("tags.reserved_prefix").unwrap(),
+                    InputPredicate::ForbiddenPrefix {
+                        prefix: NonEmptyString::new("aws:").unwrap(),
+                        ignore_ascii_case: true,
+                    },
+                )),
+        );
+        for via_default in [false, true] {
+            let providers = if via_default {
+                "provider test { default_tags = { 'AWS:private-key' = 'secret-value' } }\n"
+            } else {
+                "provider test {}\n"
+            };
+            let main = if via_default {
+                "let bucket = test.test.Widget { name = 'valid' }\n"
+            } else {
+                "let bucket = test.test.Widget { name = 'valid' tags = shared_tags }\n"
+            };
+            let diagnostics = directory_diagnostics(
+                &engine,
+                &[
+                    ("providers.crn", providers),
+                    (
+                        "values.crn",
+                        "let shared_tags = { 'aWs:private-key' = 'secret-value' }\n",
+                    ),
+                    ("main.crn", main),
+                ],
+                "main.crn",
+            );
+            let findings = diagnostics
+                .iter()
+                .filter(|d| d.message.contains("tags.reserved_prefix"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                findings.len(),
+                usize::from(scope == InputRuleScope::EveryWrite),
+                "{scope:?}, default={via_default}: {diagnostics:#?}"
+            );
+            for finding in findings {
+                assert_eq!(finding.severity, Some(DiagnosticSeverity::ERROR));
+                assert!(finding.message.contains("has a forbidden prefix"));
+                assert!(!finding.message.contains("private-key"));
+                assert!(!finding.message.contains("secret-value"));
+            }
+        }
+    }
 }
 
 fn assert_directory_findings(

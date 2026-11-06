@@ -23,15 +23,15 @@ use crate::effect::{
 };
 use crate::plan::Plan;
 
-pub(super) fn checked_fixture_plan(plan: &Plan) -> crate::creation::CreationCheckedPlan {
-    crate::creation::FinalizedPlan::new(plan.clone())
-        .check_creation(&SchemaRegistry::new(), &HashMap::new())
+pub(super) fn checked_fixture_plan(plan: &Plan) -> crate::input_rules::InputCheckedPlan {
+    crate::input_rules::FinalizedPlan::new(plan.clone())
+        .check_inputs(&SchemaRegistry::new(), &HashMap::new())
         .expect("fixture plan admits creation")
 }
 
 #[tokio::test]
-async fn pending_creation_admission_blocks_every_effect_before_dispatch() {
-    use crate::schema::{CreationInputPath, CreationPredicate, CreationRule, CreationRuleCode};
+async fn pending_inputs_admission_blocks_every_effect_before_dispatch() {
+    use crate::schema::{InputPath, InputPredicate, InputRule, InputRuleCode};
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
@@ -39,10 +39,11 @@ async fn pending_creation_admission_blocks_every_effect_before_dispatch() {
             .attribute(
                 PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
             )
-            .creation_constraint(CreationRule::new(
-                CreationInputPath::new("name").unwrap(),
-                CreationRuleCode::new("bucket.not_ipv4").unwrap(),
-                CreationPredicate::NotIpv4,
+            .input_rule(InputRule::value(
+                crate::schema::InputRuleScope::CreateOnly,
+                InputPath::new("name").unwrap(),
+                InputRuleCode::new("bucket.not_ipv4").unwrap(),
+                InputPredicate::NotIpv4,
             ))
             .validate()
             .unwrap(),
@@ -70,8 +71,8 @@ async fn pending_creation_admission_blocks_every_effect_before_dispatch() {
     plan.add(Effect::Create(
         ResolvedResource::resolve_raw_fixture(resource, &schemas).unwrap(),
     ));
-    let checked = crate::creation::FinalizedPlan::new(plan)
-        .check_creation(&schemas, &HashMap::new())
+    let checked = crate::input_rules::FinalizedPlan::new(plan)
+        .check_inputs(&schemas, &HashMap::new())
         .unwrap();
     let provider = MockProvider::new();
     let input = ExecutionInput {
@@ -108,7 +109,7 @@ async fn pending_creation_admission_blocks_every_effect_before_dispatch() {
     assert!(
         error
             .as_error()
-            .downcast_ref::<crate::creation::CreationCheckPending>()
+            .downcast_ref::<crate::input_rules::InputCheckPending>()
             .is_some()
     );
     assert!(provider.call_log.lock().unwrap().is_empty());

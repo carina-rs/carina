@@ -64,7 +64,7 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
         match &err.kind {
             PlanErrorKind::PreventDestroy { .. } => prevent_destroy_count += 1,
             PlanErrorKind::SchemaNotRegistered(_)
-            | PlanErrorKind::CreationConstraint { .. }
+            | PlanErrorKind::InputRule { .. }
             | PlanErrorKind::ReplacementCannotCoexist(_)
             | PlanErrorKind::CreateBeforeDestroyRequiredByDependent { .. }
             | PlanErrorKind::MissingProviderIdentifier

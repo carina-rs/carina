@@ -248,7 +248,7 @@ impl FixtureReferences {
 /// Complete output of fixture-based plan construction.
 pub struct FixturePlan {
     pub plan: Plan,
-    pub checked: Option<carina_core::creation::CreationCheckedPlan>,
+    pub checked: Option<carina_core::input_rules::InputCheckedPlan>,
     pub references: FixtureReferences,
     pub moved_hints: MovedBlockHints,
     /// Resolved desired resources, including unchanged resources omitted from

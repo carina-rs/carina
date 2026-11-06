@@ -92,11 +92,11 @@ pub enum CreateBeforeDestroyError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PlanErrorKind {
-    CreationConstraint {
+    InputRule {
         path: String,
         code: String,
         reason: String,
-        context: crate::creation::CreationContext,
+        context: crate::input_rules::InputWriteContext,
     },
     PreventDestroy {
         action: PreventDestroyAction,
@@ -346,7 +346,18 @@ impl PlanErrorKind {
 
     fn fmt_context(&self, f: &mut std::fmt::Formatter<'_>, project_dir: &Path) -> std::fmt::Result {
         match self {
-            Self::CreationConstraint { path, code, reason, .. } => write!(f, "cannot create: {path} [{code}]: {reason}"),
+            Self::InputRule { path, code, reason, context } => {
+                let operation = match context {
+                    crate::input_rules::InputWriteContext::Update => "update",
+                    crate::input_rules::InputWriteContext::AuthoredDesired => "write input",
+                    crate::input_rules::InputWriteContext::Create
+                    | crate::input_rules::InputWriteContext::Replacement { .. }
+                    | crate::input_rules::InputWriteContext::ResumeCreate
+                    | crate::input_rules::InputWriteContext::DeferredCreate
+                    | crate::input_rules::InputWriteContext::DeferredReplacement => "create",
+                };
+                write!(f, "cannot {operation}: {path} [{code}]: {reason}")
+            }
             Self::PreventDestroy { action, source } => match source {
                 PreventDestroySource::ExplicitDirective => {
                     f.write_str(Self::explicit_prevent_destroy_message(*action))
@@ -477,7 +488,7 @@ impl PlanError {
             // not a second user-facing resource identity.
             PlanErrorKind::ModuleConstraint(diagnostic) => write!(f, "{diagnostic}"),
             kind @ (PlanErrorKind::PreventDestroy { .. }
-            | PlanErrorKind::CreationConstraint { .. }
+            | PlanErrorKind::InputRule { .. }
             | PlanErrorKind::SchemaNotRegistered(_)
             | PlanErrorKind::ReplacementCannotCoexist(_)
             | PlanErrorKind::CreateBeforeDestroyRequiredByDependent { .. }

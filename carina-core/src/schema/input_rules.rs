@@ -1,6 +1,5 @@
-//! Portable, creation-only string declarations. Admission checks their shape;
-//! ordinary value validation does not evaluate them. An absent optional input
-//! is exempt, while unresolved presence must be handled by creation admission.
+//! Portable desired-input declarations. Scope and target are required schema
+//! data; only classified desired write sites can evaluate these declarations.
 
 use std::{collections::HashSet, fmt};
 
@@ -9,32 +8,34 @@ use super::{
     PatternResourceSchema, SchemaDefinitionIssue, SchemaValidationIssueLocation,
 };
 
-/// A malformed creation declaration, independent of any input value.
+/// A malformed input declaration, independent of any input value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum CreationConstraintError {
-    #[error("creation input path must be a dotted sequence of attribute identifiers")]
+pub enum InputRuleError {
+    #[error("input input path must be a dotted sequence of attribute identifiers")]
     InvalidPath,
-    #[error("creation rule code must contain lowercase identifier segments separated by dots")]
+    #[error("input rule code must contain lowercase identifier segments separated by dots")]
     InvalidCode,
-    #[error("forbidden creation token must not be empty")]
+    #[error("forbidden input token must not be empty")]
     EmptyToken,
-    #[error("creation character set must not be empty")]
+    #[error("input character set must not be empty")]
     EmptyCharSet,
-    #[error("creation character range has inverted endpoints")]
+    #[error("input character range has inverted endpoints")]
     InvertedCharRange,
-    #[error("creation character range endpoint is not a Unicode scalar")]
+    #[error("input character range endpoint is not a Unicode scalar")]
     InvalidUnicodeScalar,
-    #[error("creation length must have at least one bound")]
+    #[error("input length must have at least one bound")]
     EmptyLengthBounds,
-    #[error("creation length minimum exceeds maximum")]
+    #[error("input length minimum exceeds maximum")]
     InvertedLengthBounds,
-    #[error("creation input path does not name a canonical attribute or struct field")]
+    #[error("input input path does not name a canonical attribute or struct field")]
     UnknownPath,
-    #[error("creation input path is provider-populated")]
+    #[error("input input path is provider-populated")]
     ProviderPopulatedPath,
-    #[error("creation input path must have a String-based type")]
+    #[error("input input path must have a String-based type")]
     NonStringPath,
-    #[error("duplicate creation rule path and code")]
+    #[error("input map-key target must name a map with String-based keys")]
+    NonStringKeyMapPath,
+    #[error("duplicate input rule target and code")]
     DuplicateRule,
 }
 
@@ -44,15 +45,13 @@ pub enum CreationConstraintError {
 pub struct CharSet(Vec<(char, char)>);
 
 impl CharSet {
-    pub fn new(
-        ranges: impl IntoIterator<Item = (char, char)>,
-    ) -> Result<Self, CreationConstraintError> {
+    pub fn new(ranges: impl IntoIterator<Item = (char, char)>) -> Result<Self, InputRuleError> {
         let mut ranges: Vec<_> = ranges.into_iter().collect();
         if ranges.is_empty() {
-            return Err(CreationConstraintError::EmptyCharSet);
+            return Err(InputRuleError::EmptyCharSet);
         }
         if ranges.iter().any(|(start, end)| start > end) {
-            return Err(CreationConstraintError::InvertedCharRange);
+            return Err(InputRuleError::InvertedCharRange);
         }
         ranges.sort_unstable();
         let mut canonical: Vec<(char, char)> = Vec::new();
@@ -105,10 +104,10 @@ impl CharSet {
 pub struct NonEmptyString(String);
 
 impl NonEmptyString {
-    pub fn new(value: impl Into<String>) -> Result<Self, CreationConstraintError> {
+    pub fn new(value: impl Into<String>) -> Result<Self, InputRuleError> {
         let value = value.into();
         if value.is_empty() {
-            Err(CreationConstraintError::EmptyToken)
+            Err(InputRuleError::EmptyToken)
         } else {
             Ok(Self(value))
         }
@@ -120,10 +119,10 @@ impl NonEmptyString {
 
 /// A stable diagnostic identifier, with `[a-z][a-z0-9_]*` dot-separated segments.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CreationRuleCode(String);
+pub struct InputRuleCode(String);
 
-impl CreationRuleCode {
-    pub fn new(value: impl Into<String>) -> Result<Self, CreationConstraintError> {
+impl InputRuleCode {
+    pub fn new(value: impl Into<String>) -> Result<Self, InputRuleError> {
         let value = value.into();
         if value.split('.').all(|segment| {
             segment
@@ -136,7 +135,7 @@ impl CreationRuleCode {
         }) {
             Ok(Self(value))
         } else {
-            Err(CreationConstraintError::InvalidCode)
+            Err(InputRuleError::InvalidCode)
         }
     }
     pub fn as_str(&self) -> &str {
@@ -144,7 +143,7 @@ impl CreationRuleCode {
     }
 }
 
-impl fmt::Display for CreationRuleCode {
+impl fmt::Display for InputRuleCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -153,10 +152,10 @@ impl fmt::Display for CreationRuleCode {
 /// A canonical dotted attribute/struct-field path, without block aliases or
 /// collection wildcards. Schema admission proves it names a writable string.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CreationInputPath(String);
+pub struct InputPath(String);
 
-impl CreationInputPath {
-    pub fn new(value: impl Into<String>) -> Result<Self, CreationConstraintError> {
+impl InputPath {
+    pub fn new(value: impl Into<String>) -> Result<Self, InputRuleError> {
         let value = value.into();
         if value.split('.').all(|segment| {
             segment
@@ -169,7 +168,7 @@ impl CreationInputPath {
         }) {
             Ok(Self(value))
         } else {
-            Err(CreationConstraintError::InvalidPath)
+            Err(InputRuleError::InvalidPath)
         }
     }
     pub fn as_str(&self) -> &str {
@@ -180,7 +179,7 @@ impl CreationInputPath {
     }
 }
 
-impl fmt::Display for CreationInputPath {
+impl fmt::Display for InputPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -190,68 +189,135 @@ impl fmt::Display for CreationInputPath {
 /// matching ordinary String refinements. Empty strings satisfy AllowedChars
 /// and NoAdjacent, but fail FirstChar and LastChar.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CreationPredicate<P> {
-    Length { min: Option<u64>, max: Option<u64> },
+pub enum InputPredicate<P> {
+    Length {
+        min: Option<u64>,
+        max: Option<u64>,
+    },
     AllowedChars(CharSet),
     FirstChar(CharSet),
     LastChar(CharSet),
     NoSubstring(NonEmptyString),
     NoPrefix(NonEmptyString),
+    ForbiddenPrefix {
+        prefix: NonEmptyString,
+        ignore_ascii_case: bool,
+    },
     NoSuffix(NonEmptyString),
-    NoAdjacent { left: CharSet, right: CharSet },
+    NoAdjacent {
+        left: CharSet,
+        right: CharSet,
+    },
     NotIpv4,
     Matches(P),
     NotMatches(P),
 }
 
+/// The closed set of write scopes. Adding a scope requires updating the
+/// exhaustive applicability decision in the write-site classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum InputRuleScope {
+    CreateOnly,
+    EveryWrite,
+}
+
+/// What the predicate inspects, independent of the attribute's nominal type.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum InputRuleTarget {
+    Value(InputPath),
+    MapKeys(InputPath),
+}
+
+impl InputRuleTarget {
+    pub fn path(&self) -> &InputPath {
+        match self {
+            Self::Value(path) | Self::MapKeys(path) => path,
+        }
+    }
+}
+
+/// Schema declarations cannot evaluate arbitrary desired or observed strings.
+/// Evaluation requires an applicable rule obtained from a classified write site.
+///
+/// ```compile_fail
+/// use carina_core::schema::{Compiled, InputRule};
+/// fn bypass(rule: &InputRule<Compiled>, observed: &str) {
+///     let _ = rule.evaluate(observed);
+/// }
+/// ```
+/// ```compile_fail
+/// use carina_core::schema::InputRuleScope;
+/// fn ignores_scope(scope: InputRuleScope) -> bool {
+///     match scope { InputRuleScope::CreateOnly => true }
+/// }
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreationRule<R: PatternForm = Draft> {
-    path: CreationInputPath,
-    code: CreationRuleCode,
-    predicate: CreationPredicate<R::Pattern>,
+pub struct InputRule<R: PatternForm = Draft> {
+    scope: InputRuleScope,
+    target: InputRuleTarget,
+    code: InputRuleCode,
+    predicate: InputPredicate<R::Pattern>,
 }
 
 /// Exhaustive read-only declaration view for transport and fingerprinting.
 #[derive(Debug, Clone, Copy)]
-pub struct CreationRuleParts<'a, R: PatternForm = Draft> {
-    pub path: &'a CreationInputPath,
-    pub code: &'a CreationRuleCode,
-    pub predicate: &'a CreationPredicate<R::Pattern>,
+pub struct InputRuleParts<'a, R: PatternForm = Draft> {
+    pub scope: InputRuleScope,
+    pub target: &'a InputRuleTarget,
+    pub code: &'a InputRuleCode,
+    pub predicate: &'a InputPredicate<R::Pattern>,
 }
 
-impl<R: PatternForm> CreationRule<R> {
+impl<R: PatternForm> InputRule<R> {
     pub fn new(
-        path: CreationInputPath,
-        code: CreationRuleCode,
-        predicate: CreationPredicate<R::Pattern>,
+        scope: InputRuleScope,
+        target: InputRuleTarget,
+        code: InputRuleCode,
+        predicate: InputPredicate<R::Pattern>,
     ) -> Self {
         Self {
-            path,
+            scope,
+            target,
             code,
             predicate,
         }
     }
-    pub fn parts(&self) -> CreationRuleParts<'_, R> {
-        CreationRuleParts {
-            path: &self.path,
+    pub fn value(
+        scope: InputRuleScope,
+        path: InputPath,
+        code: InputRuleCode,
+        predicate: InputPredicate<R::Pattern>,
+    ) -> Self {
+        Self::new(scope, InputRuleTarget::Value(path), code, predicate)
+    }
+    pub fn parts(&self) -> InputRuleParts<'_, R> {
+        InputRuleParts {
+            scope: self.scope,
+            target: &self.target,
             code: &self.code,
             predicate: &self.predicate,
         }
     }
-    pub fn path(&self) -> &CreationInputPath {
-        &self.path
+    pub fn path(&self) -> &InputPath {
+        self.target.path()
     }
-    pub fn code(&self) -> &CreationRuleCode {
+    pub fn scope(&self) -> InputRuleScope {
+        self.scope
+    }
+    pub fn target(&self) -> &InputRuleTarget {
+        &self.target
+    }
+    pub fn code(&self) -> &InputRuleCode {
         &self.code
     }
-    pub fn predicate(&self) -> &CreationPredicate<R::Pattern> {
+    pub fn predicate(&self) -> &InputPredicate<R::Pattern> {
         &self.predicate
     }
 }
 
 /// A safe reason that never retains the rejected input string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub enum CreationViolationReason {
+pub enum InputViolationReason {
     #[error("length is outside the permitted character-count bounds")]
     Length,
     #[error("contains a character outside the permitted set")]
@@ -264,6 +330,8 @@ pub enum CreationViolationReason {
     NoSubstring,
     #[error("has a forbidden prefix")]
     NoPrefix,
+    #[error("has a forbidden prefix")]
+    ForbiddenPrefix,
     #[error("has a forbidden suffix")]
     NoSuffix,
     #[error("contains a forbidden adjacent character pair")]
@@ -278,214 +346,152 @@ pub enum CreationViolationReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{path} [{code}]: {reason}")]
-pub struct CreationViolation {
-    path: CreationInputPath,
-    code: CreationRuleCode,
-    reason: CreationViolationReason,
+pub struct InputViolation {
+    pub(crate) path: InputPath,
+    pub(crate) code: InputRuleCode,
+    pub(crate) reason: InputViolationReason,
 }
 
-impl CreationViolation {
-    pub fn path(&self) -> &CreationInputPath {
+impl InputViolation {
+    pub fn path(&self) -> &InputPath {
         &self.path
     }
-    pub fn code(&self) -> &CreationRuleCode {
+    pub fn code(&self) -> &InputRuleCode {
         &self.code
     }
-    pub fn reason(&self) -> CreationViolationReason {
+    pub fn reason(&self) -> InputViolationReason {
         self.reason
     }
 }
 
-impl CreationRule<Compiled> {
-    /// Evaluate one known, present string. This pure helper is not evidence
-    /// that an effect is eligible for creation or that a plan was checked.
-    pub fn evaluate(&self, value: &str) -> Result<(), CreationViolation> {
-        let (accepted, reason) = match &self.predicate {
-            CreationPredicate::Length { min, max } => {
-                let count = u64::try_from(value.chars().count()).expect("string length fits u64");
-                (
-                    min.is_none_or(|min| count >= min) && max.is_none_or(|max| count <= max),
-                    CreationViolationReason::Length,
-                )
-            }
-            CreationPredicate::AllowedChars(set) => (
-                value.chars().all(|ch| set.contains(ch)),
-                CreationViolationReason::AllowedChars,
-            ),
-            CreationPredicate::FirstChar(set) => (
-                value.chars().next().is_some_and(|ch| set.contains(ch)),
-                CreationViolationReason::FirstChar,
-            ),
-            CreationPredicate::LastChar(set) => (
-                value.chars().next_back().is_some_and(|ch| set.contains(ch)),
-                CreationViolationReason::LastChar,
-            ),
-            CreationPredicate::NoSubstring(token) => (
-                !value.contains(token.as_str()),
-                CreationViolationReason::NoSubstring,
-            ),
-            CreationPredicate::NoPrefix(token) => (
-                !value.starts_with(token.as_str()),
-                CreationViolationReason::NoPrefix,
-            ),
-            CreationPredicate::NoSuffix(token) => (
-                !value.ends_with(token.as_str()),
-                CreationViolationReason::NoSuffix,
-            ),
-            CreationPredicate::NoAdjacent { left, right } => (
-                !value
-                    .chars()
-                    .zip(value.chars().skip(1))
-                    .any(|(a, b)| left.contains(a) && right.contains(b)),
-                CreationViolationReason::NoAdjacent,
-            ),
-            CreationPredicate::NotIpv4 => (!is_ipv4(value), CreationViolationReason::NotIpv4),
-            CreationPredicate::Matches(pattern) => {
-                (pattern.is_match(value), CreationViolationReason::Matches)
-            }
-            CreationPredicate::NotMatches(pattern) => (
-                !pattern.is_match(value),
-                CreationViolationReason::NotMatches,
-            ),
-        };
-        if accepted {
-            Ok(())
-        } else {
-            Err(CreationViolation {
-                path: self.path.clone(),
-                code: self.code.clone(),
-                reason,
-            })
-        }
-    }
-}
-
-/// Strict decimal dotted quad: exactly four ASCII octets in 0..=255, without
-/// signs, whitespace or leading zeroes on multi-digit octets.
-fn is_ipv4(value: &str) -> bool {
-    let mut octets = value.split('.');
-    for _ in 0..4 {
-        let Some(octet) = octets.next() else {
-            return false;
-        };
-        if octet.is_empty()
-            || octet.len() > 3
-            || (octet.len() > 1 && octet.starts_with('0'))
-            || !octet.bytes().all(|byte| byte.is_ascii_digit())
-            || octet.parse::<u8>().is_err()
-        {
-            return false;
-        }
-    }
-    octets.next().is_none()
-}
-
-impl CreationRule<Draft> {
+impl InputRule<Draft> {
     pub(super) fn compile_patterns(
         self,
         index: usize,
         issues: &mut Vec<SchemaDefinitionIssue>,
-    ) -> Option<CreationRule<Compiled>> {
+    ) -> Option<InputRule<Compiled>> {
         let Self {
-            path,
+            scope,
+            target,
             code,
             predicate,
         } = self;
         let mut compile = |source: String| match CompiledPattern::try_new(&source) {
             Ok(pattern) => Some(pattern),
             Err(error) => {
-                let location = SchemaValidationIssueLocation::CreationConstraint(index);
+                let location = SchemaValidationIssueLocation::InputRule(index);
                 issues.push(SchemaDefinitionIssue {
                     path: location.raw_path().into(),
                     location,
                     message: error.to_string().into(),
                     pattern_error: Some(error),
-                    creation_error: None,
+                    input_rule_error: None,
                 });
                 None
             }
         };
         let predicate = match predicate {
-            CreationPredicate::Length { min, max } => CreationPredicate::Length { min, max },
-            CreationPredicate::AllowedChars(set) => CreationPredicate::AllowedChars(set),
-            CreationPredicate::FirstChar(set) => CreationPredicate::FirstChar(set),
-            CreationPredicate::LastChar(set) => CreationPredicate::LastChar(set),
-            CreationPredicate::NoSubstring(token) => CreationPredicate::NoSubstring(token),
-            CreationPredicate::NoPrefix(token) => CreationPredicate::NoPrefix(token),
-            CreationPredicate::NoSuffix(token) => CreationPredicate::NoSuffix(token),
-            CreationPredicate::NoAdjacent { left, right } => {
-                CreationPredicate::NoAdjacent { left, right }
+            InputPredicate::Length { min, max } => InputPredicate::Length { min, max },
+            InputPredicate::AllowedChars(set) => InputPredicate::AllowedChars(set),
+            InputPredicate::FirstChar(set) => InputPredicate::FirstChar(set),
+            InputPredicate::LastChar(set) => InputPredicate::LastChar(set),
+            InputPredicate::NoSubstring(token) => InputPredicate::NoSubstring(token),
+            InputPredicate::NoPrefix(token) => InputPredicate::NoPrefix(token),
+            InputPredicate::ForbiddenPrefix {
+                prefix,
+                ignore_ascii_case,
+            } => InputPredicate::ForbiddenPrefix {
+                prefix,
+                ignore_ascii_case,
+            },
+            InputPredicate::NoSuffix(token) => InputPredicate::NoSuffix(token),
+            InputPredicate::NoAdjacent { left, right } => {
+                InputPredicate::NoAdjacent { left, right }
             }
-            CreationPredicate::NotIpv4 => CreationPredicate::NotIpv4,
-            CreationPredicate::Matches(pattern) => CreationPredicate::Matches(compile(pattern)?),
-            CreationPredicate::NotMatches(pattern) => {
-                CreationPredicate::NotMatches(compile(pattern)?)
-            }
+            InputPredicate::NotIpv4 => InputPredicate::NotIpv4,
+            InputPredicate::Matches(pattern) => InputPredicate::Matches(compile(pattern)?),
+            InputPredicate::NotMatches(pattern) => InputPredicate::NotMatches(compile(pattern)?),
         };
-        Some(CreationRule::new(path, code, predicate))
+        Some(InputRule::new(scope, target, code, predicate))
     }
 }
 
 impl<R: PatternForm> PatternResourceSchema<R> {
-    pub(super) fn validate_creation_constraints(&self, issues: &mut Vec<SchemaDefinitionIssue>) {
+    pub(super) fn validate_input_rules(&self, issues: &mut Vec<SchemaDefinitionIssue>) {
         let mut seen = HashSet::new();
-        for (index, rule) in self.creation_constraints.iter().enumerate() {
-            let mut reject = |error: CreationConstraintError| {
-                let location = SchemaValidationIssueLocation::CreationConstraint(index);
+        for (index, rule) in self.input_rules.iter().enumerate() {
+            let mut reject = |error: InputRuleError| {
+                let location = SchemaValidationIssueLocation::InputRule(index);
                 issues.push(SchemaDefinitionIssue {
                     path: location.raw_path().into(),
                     location,
                     message: error.to_string().into(),
                     pattern_error: None,
-                    creation_error: Some(error),
+                    input_rule_error: Some(error),
                 });
             };
-            if !seen.insert((rule.path(), rule.code())) {
-                reject(CreationConstraintError::DuplicateRule);
+            if !seen.insert((rule.target(), rule.code())) {
+                reject(InputRuleError::DuplicateRule);
             }
-            if let CreationPredicate::Length { min, max } = rule.predicate() {
+            if let InputPredicate::Length { min, max } = rule.predicate() {
                 match (min, max) {
-                    (None, None) => reject(CreationConstraintError::EmptyLengthBounds),
+                    (None, None) => reject(InputRuleError::EmptyLengthBounds),
                     (Some(min), Some(max)) if min > max => {
-                        reject(CreationConstraintError::InvertedLengthBounds)
+                        reject(InputRuleError::InvertedLengthBounds)
                     }
                     (Some(_), Some(_)) | (None, Some(_)) | (Some(_), None) => {}
                 }
             }
-            if let Err(error) = self.creation_path_type(rule.path()) {
+            if let Err(error) = self.input_target_type(rule.target()) {
                 reject(error);
             }
         }
     }
 
-    fn creation_path_type(&self, path: &CreationInputPath) -> Result<(), CreationConstraintError> {
+    fn input_target_type(&self, target: &InputRuleTarget) -> Result<(), InputRuleError> {
+        let path = target.path();
         let mut segments = path.segments();
-        let root = segments.next().expect("creation paths are nonempty");
+        let root = segments.next().expect("input paths are nonempty");
         let attribute = self
             .attributes
             .get(root)
-            .ok_or(CreationConstraintError::UnknownPath)?;
+            .ok_or(InputRuleError::UnknownPath)?;
         let mut ty = &attribute.attr_type;
         let mut provider_populated = attribute.input_mode.is_provider_populated();
         for segment in segments {
-            ty = peel_refs(ty, &self.defs).ok_or(CreationConstraintError::UnknownPath)?;
+            ty = peel_refs(ty, &self.defs).ok_or(InputRuleError::UnknownPath)?;
             let AttrTypeKind::Struct { fields, .. } = &ty.kind else {
-                return Err(CreationConstraintError::UnknownPath);
+                return Err(InputRuleError::UnknownPath);
             };
             let field = fields
                 .iter()
                 .find(|field| field.name == segment)
-                .ok_or(CreationConstraintError::UnknownPath)?;
+                .ok_or(InputRuleError::UnknownPath)?;
             provider_populated |= field.declared_input_mode.is_provider_populated();
             ty = &field.field_type;
         }
         if provider_populated {
-            return Err(CreationConstraintError::ProviderPopulatedPath);
+            return Err(InputRuleError::ProviderPopulatedPath);
         }
-        if string_based(ty, &self.defs, &mut HashSet::new()) {
-            Ok(())
-        } else {
-            Err(CreationConstraintError::NonStringPath)
+        match target {
+            InputRuleTarget::Value(_) => {
+                if string_based(ty, &self.defs, &mut HashSet::new()) {
+                    Ok(())
+                } else {
+                    Err(InputRuleError::NonStringPath)
+                }
+            }
+            InputRuleTarget::MapKeys(_) => {
+                let ty = peel_refs(ty, &self.defs).ok_or(InputRuleError::UnknownPath)?;
+                match &ty.kind {
+                    AttrTypeKind::Map { key, .. }
+                        if string_based(key, &self.defs, &mut HashSet::new()) =>
+                    {
+                        Ok(())
+                    }
+                    _ => Err(InputRuleError::NonStringKeyMapPath),
+                }
+            }
         }
     }
 }

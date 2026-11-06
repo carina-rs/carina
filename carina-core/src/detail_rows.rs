@@ -412,10 +412,10 @@ fn combine_with_desired_secret_shape(
 /// Both CLI and TUI consume these to render effect details.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DetailRow {
-    /// Creation eligibility cannot yet be decided for this exact create slot.
-    PendingCreation {
-        path: crate::schema::CreationInputPath,
-        codes: Vec<crate::schema::CreationRuleCode>,
+    /// Input eligibility cannot yet be decided for this exact desired write slot.
+    PendingInput {
+        path: crate::schema::InputPath,
+        codes: Vec<crate::schema::InputRuleCode>,
     },
     /// A preformatted informational line.
     Text { text: String },
@@ -708,7 +708,7 @@ pub enum ListOfMapsDiffField {
 /// ```
 #[derive(Debug)]
 pub struct PreparedPlanDisplay {
-    plan: std::sync::Arc<crate::creation::CreationCheckedPlan>,
+    plan: std::sync::Arc<crate::input_rules::InputCheckedPlan>,
     historical: HistoricalDisplayAttributes,
     detail: DetailLevel,
     rows: Vec<Vec<DetailRow>>,
@@ -717,7 +717,7 @@ pub struct PreparedPlanDisplay {
 impl PreparedPlanDisplay {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
-        plan: std::sync::Arc<crate::creation::CreationCheckedPlan>,
+        plan: std::sync::Arc<crate::input_rules::InputCheckedPlan>,
         historical: HistoricalDisplayAttributes,
         detail: DetailLevel,
         registry: &SchemaRegistry,
@@ -776,7 +776,7 @@ impl PreparedPlanDisplay {
         &self.plan
     }
 
-    pub fn checked_plan(&self) -> &crate::creation::CreationCheckedPlan {
+    pub fn checked_plan(&self) -> &crate::input_rules::InputCheckedPlan {
         &self.plan
     }
 

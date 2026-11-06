@@ -43,6 +43,7 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 argon2 = "0.5"
+carina-provider-mock = { path = "../carina-provider-mock" }
 carina-core = { path = "../carina-core", features = ["test-utils"] }
 carina-plugin-host = { path = ".", features = ["test-utils"] }
 carina-provider-resolver = { path = "../carina-provider-resolver", features = ["test-utils"] }
