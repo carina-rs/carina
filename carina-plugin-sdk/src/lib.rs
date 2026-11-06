@@ -89,7 +89,7 @@ use carina_provider_protocol::types::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// Failure while projecting validated SDK schemas onto version-22 JSON.
+/// Failure while projecting validated SDK schemas onto version-23 JSON.
 #[derive(Debug)]
 pub enum SchemaSerializationError {
     Convert(carina_core::protocol_convert::ProtocolConvertError),
@@ -115,7 +115,8 @@ impl std::error::Error for SchemaSerializationError {
 }
 
 /// Serialize one aggregate provider-schema witness through the core protocol
-/// seam. Raw drafts or independently sourced tables cannot enter this API:
+/// seam, including required creation constraints on every resource. Raw drafts
+/// or independently sourced tables cannot enter this API:
 ///
 /// ```compile_fail
 /// use carina_core::schema::ResourceSchema;

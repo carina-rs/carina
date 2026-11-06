@@ -113,6 +113,7 @@ pub fn uses_builtin_provider<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a
 /// Schemas exposed by Carina's built-in `provider mock {}` implementation.
 pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
     let schemas = vec![
+        creation_constraint_schema(),
         ResourceSchema::new("test.resource")
             .attribute(
                 AttributeSchema::required("name", AttributeType::string())
@@ -405,6 +406,17 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
         })
         .chain(std::iter::once(references::resource_schema()))
         .collect()
+}
+
+/// Portable creation-declaration fixture shared by native and WASM schemas.
+pub fn creation_constraint_schema() -> ResourceSchema {
+    ResourceSchema::new("test.creation_constrained")
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .creation_constraint(carina_core::schema::CreationRule::new(
+            carina_core::schema::CreationInputPath::new("name").unwrap(),
+            carina_core::schema::CreationRuleCode::new("mock.name.not_ipv4").unwrap(),
+            carina_core::schema::CreationPredicate::NotIpv4,
+        ))
 }
 
 /// Portable unique-list fixture shared by native diagnostics and the WASM mock.

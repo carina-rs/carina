@@ -1336,6 +1336,28 @@ async fn test_wasm_mock_provider_factory() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn wasm_schema_preserves_creation_constraints() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let schemas = factory.schemas();
+    let constrained = schemas
+        .iter()
+        .find(|schema| schema.parts().resource_type == "test.creation_constrained")
+        .unwrap();
+    let rules = constrained.parts().creation_constraints;
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].path().as_str(), "name");
+    assert_eq!(rules[0].code().as_str(), "mock.name.not_ipv4");
+    assert!(rules[0].evaluate("bucket").is_ok());
+    assert!(rules[0].evaluate("192.168.0.1").is_err());
+    let empty = schemas
+        .iter()
+        .find(|schema| schema.parts().resource_type == "test.short_budget")
+        .unwrap();
+    assert!(empty.parts().creation_constraints.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn wasm_schema_preserves_unique_list_refinement() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;

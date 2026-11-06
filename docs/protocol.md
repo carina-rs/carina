@@ -1,9 +1,10 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **22**.
+The current protocol and minimum supported provider protocol are both **23**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 23 | 23 | Required creation-only string constraints on every resource schema. |
 | 22 | 22 | Optional entry-count bound on `Map` attribute types. |
 | 21 | 21 | Required provider-wide identity assignability declarations in the schema envelope. |
 | 20 | 20 | Create-outcome names describe cloud knowledge; identifier-bearing payloads are `create-identified` and `resume-identified`. |
@@ -13,6 +14,50 @@ The current protocol and minimum supported provider protocol are both **22**.
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 23
+
+Every resource schema requires a `creation_constraints` array, including `[]`
+when no rules are declared. Each rule carries a canonical dotted input `path`,
+a stable lowercase dotted diagnostic `code`, and a tagged `predicate`:
+
+```json
+{
+  "path": "name",
+  "code": "s3.name.length",
+  "predicate": {"kind": "length", "value": {"min": 3, "max": 63}}
+}
+```
+
+The predicates are `length`, `allowed_chars`, `first_char`, `last_char`,
+`no_substring`, `no_prefix`, `no_suffix`, `no_adjacent`, `not_ipv4`, `matches`,
+and `not_matches`. Character sets contain inclusive Unicode scalar ranges as
+`{"ranges":[{"start":97,"end":122}]}`. Hosts validate endpoints and canonicalize
+sets by sorting and coalescing ranges. Length counts Unicode scalar values.
+Endpoint rules reject an empty string; allowed-character and adjacency rules
+accept it. IPv4 form means four decimal octets in 0–255 with no leading zeroes
+on multi-digit octets. Regexes use the existing schema-pattern dialect and are
+compiled once at schema admission.
+
+Admission rejects unknown paths, block aliases, provider-populated paths
+(including inherited modes), non-String-based types, duplicate path/code pairs,
+invalid diagnostic codes, empty character sets or forbidden tokens, and length
+rules with no bounds or inverted bounds. Paths identify attributes or nested
+struct fields; they contain no collection indices or wildcards. All declared
+rules are conjunctive. An absent optional input is exempt.
+
+These declarations are separate from ordinary type refinements and resource
+validators. This phase admits and transports the data and supplies a pure
+concrete-string evaluator; plan/apply evaluation is added in subsequent phases.
+Ordinary validation and LSP diagnostics do not evaluate creation rules. The
+semantic schema fingerprint includes every declaration and uses encoding v11.
+
+`PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both 23. Hosts reject
+version-22 providers before ordinary schema decoding, and JSON missing the new
+field fails closed. The explicit read-only v12 migration adapter supplies an
+empty array. The SDK's existing schema JSON export carries the declarations;
+no WIT function or CRUD request field is added. AWS, AWSCC, and GitHub providers
+must rebuild against protocol 23.
 
 ## Version 22
 

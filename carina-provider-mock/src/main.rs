@@ -701,6 +701,9 @@ impl CarinaProvider for MockProcessProvider {
     fn schemas(&self) -> Vec<CoreValidatedResourceSchema> {
         vec![
             carina_provider_mock::references::resource_schema(),
+            carina_provider_mock::creation_constraint_schema()
+                .validate()
+                .expect("mock creation schema must be valid"),
             CoreResourceSchema::new("test.read_back")
                 .attribute(
                     CoreAttributeSchema::optional(

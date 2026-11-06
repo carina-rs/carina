@@ -10,15 +10,16 @@
 use sha2::{Digest, Sha256};
 
 use super::{
-    AssignabilityEdge, AttrTypeKind, CompiledAttributeSchema as AttributeSchema,
+    AssignabilityEdge, AttrTypeKind, CharSet, Compiled, CompiledAttributeSchema as AttributeSchema,
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
-    CompiledStructField as StructField, DslTransform, FieldGroup, FieldGroupKind, IdentityMode,
-    InputMode, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceValidation,
-    SchemaKind, TypeIdentity, UniqueNameSpec, ValidatorType,
+    CompiledStructField as StructField, CreationPredicate, CreationRule, CreationRuleParts,
+    DslTransform, FieldGroup, FieldGroupKind, IdentityMode, InputMode, OwnerBoundResourceSchema,
+    ReferenceForm, ReferenceForms, ResourceValidation, SchemaKind, TypeIdentity, UniqueNameSpec,
+    ValidatorType,
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v10";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v11";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -166,6 +167,7 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
         attributes,
         description: _description,
         validation,
+        creation_constraints,
         kind,
         unique_name,
         operation_config,
@@ -187,6 +189,7 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
     }
 
     encode_resource_validation(encoder, validation);
+    encode_creation_constraints(encoder, creation_constraints);
     encode_unique_name(encoder, unique_name);
     encoder.option(operation_config.as_ref(), encode_operation_config);
 
@@ -227,6 +230,81 @@ fn encode_field_groups(encoder: &mut CanonicalEncoder, groups: &[FieldGroup]) {
     encoder.usize(encoded.len());
     for group in encoded {
         encoder.bytes(&group);
+    }
+}
+
+fn encode_creation_charset(encoder: &mut CanonicalEncoder, set: &CharSet) {
+    encoder.usize(set.ranges().len());
+    for (start, end) in set.ranges() {
+        encoder.u32(u32::from(*start));
+        encoder.u32(u32::from(*end));
+    }
+}
+
+fn encode_creation_constraints(encoder: &mut CanonicalEncoder, rules: &[CreationRule<Compiled>]) {
+    let mut encoded: Vec<_> = rules
+        .iter()
+        .map(|rule| {
+            let CreationRuleParts {
+                path,
+                code,
+                predicate,
+            } = rule.parts();
+            let mut encoder = CanonicalEncoder::default();
+            encoder.string(path.as_str());
+            encoder.string(code.as_str());
+            match predicate {
+                CreationPredicate::Length { min, max } => {
+                    encoder.tag(0);
+                    encoder.option(*min, CanonicalEncoder::u64);
+                    encoder.option(*max, CanonicalEncoder::u64);
+                }
+                CreationPredicate::AllowedChars(set) => {
+                    encoder.tag(1);
+                    encode_creation_charset(&mut encoder, set);
+                }
+                CreationPredicate::FirstChar(set) => {
+                    encoder.tag(2);
+                    encode_creation_charset(&mut encoder, set);
+                }
+                CreationPredicate::LastChar(set) => {
+                    encoder.tag(3);
+                    encode_creation_charset(&mut encoder, set);
+                }
+                CreationPredicate::NoSubstring(token) => {
+                    encoder.tag(4);
+                    encoder.string(token.as_str());
+                }
+                CreationPredicate::NoPrefix(token) => {
+                    encoder.tag(5);
+                    encoder.string(token.as_str());
+                }
+                CreationPredicate::NoSuffix(token) => {
+                    encoder.tag(6);
+                    encoder.string(token.as_str());
+                }
+                CreationPredicate::NoAdjacent { left, right } => {
+                    encoder.tag(7);
+                    encode_creation_charset(&mut encoder, left);
+                    encode_creation_charset(&mut encoder, right);
+                }
+                CreationPredicate::NotIpv4 => encoder.tag(8),
+                CreationPredicate::Matches(pattern) => {
+                    encoder.tag(9);
+                    encoder.string(pattern.as_str());
+                }
+                CreationPredicate::NotMatches(pattern) => {
+                    encoder.tag(10);
+                    encoder.string(pattern.as_str());
+                }
+            }
+            encoder.finish()
+        })
+        .collect();
+    encoded.sort();
+    encoder.usize(encoded.len());
+    for rule in encoded {
+        encoder.bytes(&rule);
     }
 }
 
@@ -783,5 +861,118 @@ mod tests {
             without, changed,
             "removing a form must change the fingerprint"
         );
+    }
+    #[test]
+    fn creation_fingerprints_encode_every_payload_and_ignore_rule_order() {
+        use super::super::{
+            CharSet, CreationInputPath, CreationPredicate, CreationRule, CreationRuleCode,
+            NonEmptyString,
+        };
+        let rule = |path: &str, code: &str, predicate| {
+            CreationRule::new(
+                CreationInputPath::new(path).unwrap(),
+                CreationRuleCode::new(code).unwrap(),
+                predicate,
+            )
+        };
+        let fingerprint = |rules: Vec<CreationRule>| {
+            rules
+                .into_iter()
+                .fold(
+                    PatternResourceSchema::new("test.Widget")
+                        .attribute(
+                            PatternAttributeSchema::optional(
+                                "name",
+                                PatternAttributeType::string(),
+                            )
+                            .build(),
+                        )
+                        .attribute(
+                            PatternAttributeSchema::optional(
+                                "other",
+                                PatternAttributeType::string(),
+                            )
+                            .build(),
+                        ),
+                    |schema, rule| schema.creation_constraint(rule),
+                )
+                .validate()
+                .unwrap()
+                .as_schema()
+                .semantic_fingerprint()
+        };
+        let token = |value: &str| NonEmptyString::new(value).unwrap();
+        let predicates = vec![
+            CreationPredicate::Length {
+                min: Some(1),
+                max: Some(63),
+            },
+            CreationPredicate::Length {
+                min: Some(2),
+                max: Some(63),
+            },
+            CreationPredicate::Length {
+                min: Some(1),
+                max: Some(64),
+            },
+            CreationPredicate::AllowedChars(CharSet::ascii_lowercase()),
+            CreationPredicate::AllowedChars(CharSet::ascii_digits()),
+            CreationPredicate::FirstChar(CharSet::ascii_lowercase()),
+            CreationPredicate::LastChar(CharSet::ascii_lowercase()),
+            CreationPredicate::NoSubstring(token("ab")),
+            CreationPredicate::NoSubstring(token("ac")),
+            CreationPredicate::NoPrefix(token("ab")),
+            CreationPredicate::NoSuffix(token("ab")),
+            CreationPredicate::NoAdjacent {
+                left: CharSet::ascii_lowercase(),
+                right: CharSet::ascii_digits(),
+            },
+            CreationPredicate::NoAdjacent {
+                left: CharSet::ascii_digits(),
+                right: CharSet::ascii_lowercase(),
+            },
+            CreationPredicate::NotIpv4,
+            CreationPredicate::Matches("^a$".into()),
+            CreationPredicate::Matches("^b$".into()),
+            CreationPredicate::NotMatches("^a$".into()),
+        ];
+        let mut encodings = std::collections::BTreeSet::new();
+        encodings.insert(fingerprint(vec![]));
+        for predicate in predicates {
+            assert!(encodings.insert(fingerprint(vec![rule("name", "test.rule", predicate)])));
+        }
+        let a = rule("name", "test.first", CreationPredicate::NotIpv4);
+        let b = rule("other", "test.second", CreationPredicate::NotIpv4);
+        assert_eq!(
+            fingerprint(vec![a.clone(), b.clone()]),
+            fingerprint(vec![b.clone(), a.clone()])
+        );
+        assert_ne!(
+            fingerprint(vec![a.clone()]),
+            fingerprint(vec![rule(
+                "other",
+                "test.first",
+                CreationPredicate::NotIpv4
+            )])
+        );
+        assert_ne!(
+            fingerprint(vec![a]),
+            fingerprint(vec![rule(
+                "name",
+                "test.changed",
+                CreationPredicate::NotIpv4
+            )])
+        );
+        let canonical = rule(
+            "name",
+            "test.chars",
+            CreationPredicate::AllowedChars(CharSet::new([('a', 'f')]).unwrap()),
+        );
+        let reordered = rule(
+            "name",
+            "test.chars",
+            CreationPredicate::AllowedChars(CharSet::new([('d', 'f'), ('a', 'd')]).unwrap()),
+        );
+        assert_eq!(fingerprint(vec![canonical]), fingerprint(vec![reordered]));
     }
 }

@@ -188,7 +188,7 @@ pub fn visit_normalized_resource<T>(
     visitor(&resource.resource)
 }
 
-/// Render one error chain for protocol-v22 metadata's string-only failure
+/// Render one error chain for protocol-v23 metadata's string-only failure
 /// channel. Each source is appended at most once even when a legacy outer
 /// display already includes its immediate source text.
 #[doc(hidden)]
@@ -2070,6 +2070,7 @@ macro_rules! export_provider {
                             );
                         }
                     };
+                    // The shared projection retains creation constraints, including [].
                     match $crate::provider_schema_to_json(cache.witness()) {
                         Ok(json) => json,
                         Err(error) => {
