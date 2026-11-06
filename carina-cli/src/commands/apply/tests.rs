@@ -10782,7 +10782,7 @@ mod saved_plan_version_tests {
             rejected_saved_plan_message(&plan_path, &json, "format 38 must require replanning")
                 .await;
         assert!(
-            message.contains("Unsupported plan file version: 38 (expected 41)"),
+            message.contains("Unsupported plan file version: 38 (expected 42)"),
             "{message}"
         );
         assert!(!message.contains("corrupted"), "{message}");

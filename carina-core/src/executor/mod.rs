@@ -1647,22 +1647,22 @@ impl<S: Clone> ExecutionAccumulator<S> {
         &mut self,
         admitted: &crate::replacement::AdmittedReplacementEffects<S>,
     ) {
-        self.mutate(|result| {
-            result.replacement_writeback = admitted.writeback().to_vec();
-            for (id, name) in admitted.temporary_names() {
-                result
-                    .permanent_name_overrides
-                    .entry(id.clone())
-                    .or_default()
-                    .insert(
-                        name.attribute.clone(),
-                        crate::name_override::NameOverride {
-                            temp_value: name.temporary_value.clone(),
-                            original_value: Some(name.original_value.clone()),
-                        },
-                    );
-            }
-        });
+        // Admission describes future work. Include its metadata in subsequent
+        // checkpoints without publishing a checkpoint before execution progresses.
+        self.fields.replacement_writeback = admitted.writeback().to_vec();
+        for (id, name) in admitted.temporary_names() {
+            self.fields
+                .permanent_name_overrides
+                .entry(id.clone())
+                .or_default()
+                .insert(
+                    name.attribute.clone(),
+                    crate::name_override::NameOverride {
+                        temp_value: name.temporary_value.clone(),
+                        original_value: Some(name.original_value.clone()),
+                    },
+                );
+        }
     }
 
     pub(super) fn insert_published(&mut self, id: ResourceId, applied: Applied, state: &State) {

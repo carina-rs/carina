@@ -22,6 +22,7 @@ use carina_core::executor::{
     LiveExecutionInput, ProviderCheckInputs, SavedExecutionInput, UnresolvedResource,
 };
 use carina_core::paths::ResolvedPath;
+#[cfg(any(test, feature = "test-utils"))]
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ProviderRouter};
