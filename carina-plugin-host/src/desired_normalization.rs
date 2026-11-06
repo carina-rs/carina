@@ -17,46 +17,32 @@ fn id_to_wit(id: &carina_provider_protocol::types::ResourceId) -> wit::ResourceI
     }
 }
 
-pub(crate) fn encode(
-    batch: &NormalizationBatch,
-) -> Result<Vec<WitDesiredResource>, NormalizationError> {
+pub(crate) fn encode(batch: &NormalizationBatch) -> Vec<WitDesiredResource> {
     batch
         .resources()
         .iter()
-        .enumerate()
-        .map(|(index, resource)| {
-            let attributes = resource
+        .map(|resource| WitDesiredResource {
+            id: id_to_wit(&resource.id),
+            attributes: resource
                 .attributes
                 .iter()
-                .map(|(name, value)| {
-                    to_wit(value, &resource.id, name)
-                        .map(|value| (name.clone(), value))
-                        .map_err(|error| error.with_resource_index(index))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(WitDesiredResource {
-                id: id_to_wit(&resource.id),
-                attributes,
-            })
+                .map(|(name, value)| (name.clone(), to_wit(value)))
+                .collect(),
         })
         .collect()
 }
 
-fn to_wit(
-    value: &Wire,
-    id: &carina_provider_protocol::types::ResourceId,
-    attribute: &str,
-) -> Result<wit::DesiredValue, NormalizationError> {
-    Ok(match value {
+fn to_wit(value: &Wire) -> wit::DesiredValue {
+    match value {
         Wire::Bool(value) => wit::DesiredValue::BoolVal(*value),
         Wire::Int(value) => wit::DesiredValue::IntVal(*value),
-        Wire::Float(value) => wit::DesiredValue::FloatVal(*value),
+        Wire::Float(value) => wit::DesiredValue::FloatVal(value.get()),
         Wire::String(value) => wit::DesiredValue::StrVal(value.clone()),
         Wire::Deferred(slot) => wit::DesiredValue::DeferredVal(*slot),
-        Wire::StringList(_) => wit::DesiredValue::StringListVal(value.to_json(id, attribute)?),
-        Wire::List(_) => wit::DesiredValue::ListVal(value.to_json(id, attribute)?),
-        Wire::Map(_) => wit::DesiredValue::MapVal(value.to_json(id, attribute)?),
-    })
+        Wire::StringList(_) => wit::DesiredValue::StringListVal(value.to_json()),
+        Wire::List(_) => wit::DesiredValue::ListVal(value.to_json()),
+        Wire::Map(_) => wit::DesiredValue::MapVal(value.to_json()),
+    }
 }
 
 fn from_wit(
@@ -67,7 +53,11 @@ fn from_wit(
     Ok(match value {
         wit::DesiredValue::BoolVal(value) => Wire::Bool(*value),
         wit::DesiredValue::IntVal(value) => Wire::Int(*value),
-        wit::DesiredValue::FloatVal(value) => Wire::Float(*value),
+        wit::DesiredValue::FloatVal(value) => {
+            Wire::Float(carina_core::FiniteF64::new(*value).map_err(|source| {
+                NormalizationError::new(id.clone(), attribute, Kind::Conversion).with_source(source)
+            })?)
+        }
         wit::DesiredValue::StrVal(value) => Wire::String(value.clone()),
         wit::DesiredValue::DeferredVal(slot) => Wire::Deferred(*slot),
         wit::DesiredValue::ListVal(json) => Wire::from_json_list(json, id, attribute)?,
@@ -148,6 +138,46 @@ mod tests {
     }
 
     #[test]
+    fn raw_desired_floats_keep_typed_sources_and_never_publish_partial_updates() {
+        use std::error::Error;
+        for (raw, category) in [
+            (f64::NAN, carina_core::NonFiniteFloatError::NaN),
+            (
+                f64::INFINITY,
+                carina_core::NonFiniteFloatError::PositiveInfinity,
+            ),
+            (
+                f64::NEG_INFINITY,
+                carina_core::NonFiniteFloatError::NegativeInfinity,
+            ),
+        ] {
+            let mut resources = vec![
+                Resource::new("test", "first").with_attribute("known", string("before")),
+                Resource::new("test", "second").with_attribute("known", string("before")),
+            ];
+            let original = resources.clone();
+            let batch = NormalizationBatch::new(&resources).unwrap();
+            let mut returned = encode(&batch);
+            returned[0].attributes[0].1 = wit::DesiredValue::StrVal("after".into());
+            returned[1]
+                .attributes
+                .push(("ratio".into(), wit::DesiredValue::FloatVal(raw)));
+            let error = apply(&mut resources, batch, returned).unwrap_err();
+            assert_eq!(error.resource_index, Some(1));
+            assert_eq!(error.resource_id.identity, "second");
+            assert_eq!(error.attribute, "ratio");
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<carina_core::NonFiniteFloatError>(),
+                Some(&category)
+            );
+            assert_eq!(resources, original);
+        }
+    }
+
+    #[test]
     fn native_and_wasm_normalization_preserve_both_dependency_phases() {
         fn normalize<D>(
             resource: &mut Resource<
@@ -161,7 +191,7 @@ mod tests {
             let original_binding = resource.binding.clone();
             let original_secret = resource.attributes["secret"].clone();
             let batch = NormalizationBatch::new(std::slice::from_ref(resource)).unwrap();
-            let mut returned = encode(&batch).unwrap();
+            let mut returned = encode(&batch);
             returned[0]
                 .attributes
                 .iter_mut()
@@ -211,7 +241,7 @@ mod tests {
     fn host_projection_and_sdk_view_agree_on_leaf_classification() {
         let mut resources = fixture();
         let batch = NormalizationBatch::new(&resources).unwrap();
-        let wire = encode(&batch).unwrap();
+        let wire = encode(&batch);
         assert!(matches!(
             wire[0]
                 .attributes
@@ -273,7 +303,7 @@ mod tests {
         ];
         let original = resources.clone();
         let batch = NormalizationBatch::new(&resources).unwrap();
-        let mut returned = encode(&batch).unwrap();
+        let mut returned = encode(&batch);
         returned.swap(0, 1);
         let error = apply(&mut resources, batch, returned).unwrap_err();
         assert!(
@@ -297,7 +327,7 @@ mod tests {
             resources
                 .push(Resource::new("test", "example").with_attribute("known", string("before")));
             let batch = NormalizationBatch::new(&resources).unwrap();
-            let mut returned = encode(&batch).unwrap();
+            let mut returned = encode(&batch);
             returned[1]
                 .attributes
                 .push(("added".into(), wit::DesiredValue::BoolVal(true)));
@@ -367,7 +397,7 @@ mod tests {
             Resource::new("test", "second").with_attribute("value", string("before")),
         ];
         let batch = NormalizationBatch::new(&resources).unwrap();
-        let mut returned = encode(&batch).unwrap();
+        let mut returned = encode(&batch);
         returned[0].attributes[0].1 = wit::DesiredValue::StrVal("changed".into());
         returned[1].attributes[0].1 = wit::DesiredValue::MapVal("private-bad-json".into());
         let error = apply(&mut resources, batch, returned).unwrap_err();

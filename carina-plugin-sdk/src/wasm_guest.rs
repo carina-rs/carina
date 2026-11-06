@@ -233,6 +233,7 @@ pub fn protocol_20_default_resource_directives() -> proto::Directives {
 /// JSON-backed WIT value variant being decoded.
 #[derive(Debug, Clone, Copy)]
 pub enum WitValueVariant {
+    FloatVal,
     StringListVal,
     ListVal,
     MapVal,
@@ -243,6 +244,7 @@ pub enum WitValueVariant {
 impl std::fmt::Display for WitValueVariant {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            Self::FloatVal => "float-val",
             Self::StringListVal => "string-list-val",
             Self::ListVal => "list-val",
             Self::MapVal => "map-val",
@@ -252,7 +254,7 @@ impl std::fmt::Display for WitValueVariant {
     }
 }
 
-/// Failure to decode a JSON-backed value received from the WASM host.
+/// Failure to decode a raw scalar or JSON-backed value received from the WASM host.
 ///
 /// The raw JSON is never retained because `secret-val` can contain plaintext
 /// credentials. Syntax errors retain their structured serde source.
@@ -265,6 +267,7 @@ pub struct WasmValueDecodeError {
 
 #[derive(Debug)]
 enum WasmValueDecodeErrorKind {
+    InvalidFloat(carina_provider_protocol::NonFiniteFloatError),
     InvalidJson(serde_json::Error),
     ExpectedArray,
     ExpectedObject,
@@ -297,6 +300,7 @@ impl std::fmt::Display for WasmValueDecodeError {
             write!(f, " attribute '{}'", self.attribute_path.join("."))?;
         }
         match &self.kind {
+            WasmValueDecodeErrorKind::InvalidFloat(_) => Ok(()),
             WasmValueDecodeErrorKind::InvalidJson(error) => {
                 write!(f, ": invalid JSON: {error}")
             }
@@ -321,7 +325,33 @@ impl std::fmt::Display for WasmValueDecodeError {
     }
 }
 
-impl std::error::Error for WasmValueDecodeError {}
+impl std::error::Error for WasmValueDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            WasmValueDecodeErrorKind::InvalidFloat(source) => Some(source),
+            WasmValueDecodeErrorKind::InvalidJson(_source) => None,
+            WasmValueDecodeErrorKind::ExpectedArray
+            | WasmValueDecodeErrorKind::ExpectedObject
+            | WasmValueDecodeErrorKind::ExpectedString { index: _ }
+            | WasmValueDecodeErrorKind::Null
+            | WasmValueDecodeErrorKind::UnsupportedNumber
+            | WasmValueDecodeErrorKind::MalformedPersistedSecret
+            | WasmValueDecodeErrorKind::ReservedPersistedKey => None,
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn decode_float(
+    value: f64,
+) -> Result<carina_provider_protocol::FiniteF64, WasmValueDecodeError> {
+    carina_provider_protocol::FiniteF64::new(value).map_err(|source| {
+        WasmValueDecodeError::new(
+            WitValueVariant::FloatVal,
+            WasmValueDecodeErrorKind::InvalidFloat(source),
+        )
+    })
+}
 
 fn json_to_proto_value_for_variant(
     v: serde_json::Value,
@@ -333,7 +363,14 @@ fn json_to_proto_value_for_variant(
             if let Some(i) = n.as_i64() {
                 Ok(proto::Value::Int(i))
             } else if let Some(f) = n.as_f64() {
-                Ok(proto::Value::Float(f))
+                Ok(proto::Value::Float(
+                    carina_provider_protocol::FiniteF64::new(f).map_err(|source| {
+                        WasmValueDecodeError::new(
+                            wit_variant,
+                            WasmValueDecodeErrorKind::InvalidFloat(source),
+                        )
+                    })?,
+                ))
             } else {
                 Err(WasmValueDecodeError::new(
                     wit_variant,
@@ -377,7 +414,14 @@ fn json_to_proto_persisted_value_for_variant(
             if let Some(value) = value.as_i64() {
                 Ok(proto::PersistedValue::Int(value))
             } else if let Some(value) = value.as_f64() {
-                Ok(proto::PersistedValue::Float(value))
+                Ok(proto::PersistedValue::Float(
+                    carina_provider_protocol::FiniteF64::new(value).map_err(|source| {
+                        WasmValueDecodeError::new(
+                            wit_variant,
+                            WasmValueDecodeErrorKind::InvalidFloat(source),
+                        )
+                    })?,
+                ))
             } else {
                 Err(WasmValueDecodeError::new(
                     wit_variant,
@@ -551,123 +595,58 @@ pub fn decode_redacted_secret_val(digest: &str) -> proto::PersistedValue {
 
 /// Render a decode error for boundaries that cannot transport a typed error.
 pub fn format_wasm_value_decode_error(error: &WasmValueDecodeError) -> String {
-    error.to_string()
+    render_error_chain(error)
 }
 
-/// Failure to encode a proto value into a JSON-backed WIT value.
-#[derive(Debug)]
-pub struct WasmValueEncodeError {
-    kind: WasmValueEncodeErrorKind,
-    attribute_path: Vec<String>,
-}
-
-#[derive(Debug)]
-enum WasmValueEncodeErrorKind {
-    NonFiniteFloat(f64),
-}
-
-impl WasmValueEncodeError {
-    fn non_finite_float(value: f64) -> Self {
-        Self {
-            kind: WasmValueEncodeErrorKind::NonFiniteFloat(value),
-            attribute_path: Vec::new(),
-        }
-    }
-
-    pub fn prepend_attribute(mut self, name: &str) -> Self {
-        self.attribute_path.insert(0, name.to_string());
-        self
-    }
-}
-
-impl std::fmt::Display for WasmValueEncodeError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("failed to encode a JSON-backed WIT value")?;
-        if !self.attribute_path.is_empty() {
-            write!(f, " at attribute '{}'", self.attribute_path.join("."))?;
-        }
-        match &self.kind {
-            WasmValueEncodeErrorKind::NonFiniteFloat(value) => {
-                write!(f, ": non-finite float {value} is not valid JSON")
-            }
-        }
-    }
-}
-
-impl std::error::Error for WasmValueEncodeError {}
-
-pub fn proto_value_to_json(v: &proto::Value) -> Result<serde_json::Value, WasmValueEncodeError> {
+pub fn proto_value_to_json(v: &proto::Value) -> serde_json::Value {
     match v {
-        proto::Value::Bool(b) => Ok(serde_json::Value::Bool(*b)),
-        proto::Value::Int(i) => Ok(serde_json::Value::Number((*i).into())),
-        proto::Value::Float(f) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| WasmValueEncodeError::non_finite_float(*f)),
-        proto::Value::String(s) => Ok(serde_json::Value::String(s.clone())),
-        proto::Value::StringList(items) => Ok(serde_json::Value::Array(
-            items
-                .iter()
-                .map(|s| serde_json::Value::String(s.clone()))
-                .collect(),
-        )),
-        proto::Value::List(items) => Ok(serde_json::Value::Array(
-            items
-                .iter()
-                .map(proto_value_to_json)
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        proto::Value::Map(map) => {
-            let obj = map
-                .iter()
-                .map(|(key, value)| {
-                    proto_value_to_json(value)
-                        .map(|value| (key.clone(), value))
-                        .map_err(|error| error.prepend_attribute(key))
-                })
-                .collect::<Result<serde_json::Map<String, serde_json::Value>, _>>()?;
-            Ok(serde_json::Value::Object(obj))
+        proto::Value::Bool(value) => (*value).into(),
+        proto::Value::Int(value) => (*value).into(),
+        proto::Value::Float(value) => serde_json::Value::Number(value.to_json_number()),
+        proto::Value::String(value) => value.clone().into(),
+        proto::Value::StringList(values) => {
+            serde_json::Value::Array(values.iter().cloned().map(Into::into).collect())
         }
-    }
-}
-
-pub fn proto_persisted_value_to_json(
-    v: &proto::PersistedValue,
-) -> Result<serde_json::Value, WasmValueEncodeError> {
-    match v {
-        proto::PersistedValue::Bool(value) => Ok(serde_json::Value::Bool(*value)),
-        proto::PersistedValue::Int(value) => Ok(serde_json::Value::Number((*value).into())),
-        proto::PersistedValue::Float(value) => serde_json::Number::from_f64(*value)
-            .map(serde_json::Value::Number)
-            .ok_or_else(|| WasmValueEncodeError::non_finite_float(*value)),
-        proto::PersistedValue::String(value) => Ok(serde_json::Value::String(value.clone())),
-        proto::PersistedValue::RedactedSecret(digest) => Ok(serde_json::json!({
-            PERSISTED_SECRET_KEY: digest,
-        })),
-        proto::PersistedValue::StringList(values) => Ok(serde_json::Value::Array(
+        proto::Value::List(values) => {
+            serde_json::Value::Array(values.iter().map(proto_value_to_json).collect())
+        }
+        proto::Value::Map(values) => serde_json::Value::Object(
             values
                 .iter()
-                .map(|value| serde_json::Value::String(value.clone()))
+                .map(|(key, value)| (key.clone(), proto_value_to_json(value)))
                 .collect(),
-        )),
-        proto::PersistedValue::List(values) => values
-            .iter()
-            .map(proto_persisted_value_to_json)
-            .collect::<Result<Vec<_>, _>>()
-            .map(serde_json::Value::Array),
-        proto::PersistedValue::Map(values) => values
-            .iter()
-            .map(|(key, value)| {
-                let encoded_key = if key.starts_with('$') {
-                    format!("${key}")
-                } else {
-                    key.clone()
-                };
-                proto_persisted_value_to_json(value)
-                    .map(|value| (encoded_key, value))
-                    .map_err(|error| error.prepend_attribute(key))
-            })
-            .collect::<Result<serde_json::Map<_, _>, _>>()
-            .map(serde_json::Value::Object),
+        ),
+    }
+}
+
+pub fn proto_persisted_value_to_json(v: &proto::PersistedValue) -> serde_json::Value {
+    match v {
+        proto::PersistedValue::Bool(value) => (*value).into(),
+        proto::PersistedValue::Int(value) => (*value).into(),
+        proto::PersistedValue::Float(value) => serde_json::Value::Number(value.to_json_number()),
+        proto::PersistedValue::String(value) => value.clone().into(),
+        proto::PersistedValue::RedactedSecret(digest) => {
+            serde_json::json!({ PERSISTED_SECRET_KEY: digest })
+        }
+        proto::PersistedValue::StringList(values) => {
+            serde_json::Value::Array(values.iter().cloned().map(Into::into).collect())
+        }
+        proto::PersistedValue::List(values) => {
+            serde_json::Value::Array(values.iter().map(proto_persisted_value_to_json).collect())
+        }
+        proto::PersistedValue::Map(values) => serde_json::Value::Object(
+            values
+                .iter()
+                .map(|(key, value)| {
+                    let key = if key.starts_with('$') {
+                        format!("${key}")
+                    } else {
+                        key.clone()
+                    };
+                    (key, proto_persisted_value_to_json(value))
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -850,7 +829,7 @@ macro_rules! export_provider {
                 match v {
                     wit_types::Value::BoolVal(b) => Ok(proto::Value::Bool(*b)),
                     wit_types::Value::IntVal(i) => Ok(proto::Value::Int(*i)),
-                    wit_types::Value::FloatVal(f) => Ok(proto::Value::Float(*f)),
+                    wit_types::Value::FloatVal(f) => Ok(proto::Value::Float(helpers::decode_float(*f)?)),
                     wit_types::Value::StrVal(s) => Ok(proto::Value::String(s.clone())),
                     wit_types::Value::StringListVal(json) => helpers::decode_string_list_val(json),
                     wit_types::Value::ListVal(json) => helpers::decode_list_val(json),
@@ -877,7 +856,7 @@ macro_rules! export_provider {
                         Ok(proto::PersistedValue::Int(*value))
                     }
                     wit_types::PersistedValue::FloatVal(value) => {
-                        Ok(proto::PersistedValue::Float(*value))
+                        Ok(proto::PersistedValue::Float(helpers::decode_float(*value)?))
                     }
                     wit_types::PersistedValue::StrVal(value) => {
                         Ok(proto::PersistedValue::String(value.clone()))
@@ -899,30 +878,30 @@ macro_rules! export_provider {
 
             fn proto_to_wit_value(
                 v: &proto::Value,
-            ) -> Result<wit_types::Value, helpers::WasmValueEncodeError> {
-                Ok(match v {
+            ) -> wit_types::Value {
+                match v {
                     proto::Value::Bool(b) => wit_types::Value::BoolVal(*b),
                     proto::Value::Int(i) => wit_types::Value::IntVal(*i),
-                    proto::Value::Float(f) => wit_types::Value::FloatVal(*f),
+                    proto::Value::Float(f) => wit_types::Value::FloatVal(f.get()),
                     proto::Value::String(s) => wit_types::Value::StrVal(s.clone()),
                     proto::Value::StringList(items) => {
                         wit_types::Value::StringListVal(serde_json::to_string(items).unwrap())
                     }
                     proto::Value::List(_) => {
-                        let json = helpers::proto_value_to_json(v)?;
+                        let json = helpers::proto_value_to_json(v);
                         wit_types::Value::ListVal(serde_json::to_string(&json).unwrap())
                     }
                     proto::Value::Map(_) => {
-                        let json = helpers::proto_value_to_json(v)?;
+                        let json = helpers::proto_value_to_json(v);
                         wit_types::Value::MapVal(serde_json::to_string(&json).unwrap())
                     }
-                })
+                }
             }
 
             fn proto_to_wit_persisted_value(
                 v: &proto::PersistedValue,
-            ) -> Result<wit_types::PersistedValue, helpers::WasmValueEncodeError> {
-                Ok(match v {
+            ) -> wit_types::PersistedValue {
+                match v {
                     proto::PersistedValue::Bool(value) => {
                         wit_types::PersistedValue::BoolVal(*value)
                     }
@@ -930,7 +909,7 @@ macro_rules! export_provider {
                         wit_types::PersistedValue::IntVal(*value)
                     }
                     proto::PersistedValue::Float(value) => {
-                        wit_types::PersistedValue::FloatVal(*value)
+                        wit_types::PersistedValue::FloatVal(value.get())
                     }
                     proto::PersistedValue::String(value) => {
                         wit_types::PersistedValue::StrVal(value.clone())
@@ -944,14 +923,14 @@ macro_rules! export_provider {
                         )
                     }
                     proto::PersistedValue::List(_) => {
-                        let json = helpers::proto_persisted_value_to_json(v)?;
+                        let json = helpers::proto_persisted_value_to_json(v);
                         wit_types::PersistedValue::ListVal(serde_json::to_string(&json).unwrap())
                     }
                     proto::PersistedValue::Map(_) => {
-                        let json = helpers::proto_persisted_value_to_json(v)?;
+                        let json = helpers::proto_persisted_value_to_json(v);
                         wit_types::PersistedValue::MapVal(serde_json::to_string(&json).unwrap())
                     }
-                })
+                }
             }
 
             fn wit_to_proto_value_map(
@@ -982,31 +961,17 @@ macro_rules! export_provider {
 
             fn proto_to_wit_value_map(
                 map: &BTreeMap<String, proto::Value>,
-            ) -> Result<
-                Vec<(String, wit_types::Value)>,
-                helpers::WasmValueEncodeError,
-            > {
+            ) -> Vec<(String, wit_types::Value)> {
                 map.iter()
-                    .map(|(key, value)| {
-                        proto_to_wit_value(value)
-                            .map(|value| (key.clone(), value))
-                            .map_err(|error| error.prepend_attribute(key))
-                    })
+                    .map(|(key, value)| (key.clone(), proto_to_wit_value(value)))
                     .collect()
             }
 
             fn proto_to_wit_persisted_value_map(
                 map: &BTreeMap<String, proto::PersistedValue>,
-            ) -> Result<
-                Vec<(String, wit_types::PersistedValue)>,
-                helpers::WasmValueEncodeError,
-            > {
+            ) -> Vec<(String, wit_types::PersistedValue)> {
                 map.iter()
-                    .map(|(key, value)| {
-                        proto_to_wit_persisted_value(value)
-                            .map(|value| (key.clone(), value))
-                            .map_err(|error| error.prepend_attribute(key))
-                    })
+                    .map(|(key, value)| (key.clone(), proto_to_wit_persisted_value(value)))
                     .collect()
             }
 
@@ -1036,78 +1001,78 @@ macro_rules! export_provider {
 
             fn proto_to_wit_state(
                 state: &proto::State,
-            ) -> Result<wit_types::State, helpers::WasmValueEncodeError> {
-                Ok(wit_types::State {
+            ) -> wit_types::State {
+                wit_types::State {
                     identifier: state.identifier.clone(),
-                    attributes: proto_to_wit_value_map(&state.attributes)?,
+                    attributes: proto_to_wit_value_map(&state.attributes),
                     exists: state.exists,
-                })
+                }
             }
 
             fn proto_to_wit_persisted_state(
                 state: &proto::PersistedState,
-            ) -> Result<wit_types::PersistedState, helpers::WasmValueEncodeError> {
-                Ok(wit_types::PersistedState {
+            ) -> wit_types::PersistedState {
+                wit_types::PersistedState {
                     identifier: state.identifier.clone(),
-                    attributes: proto_to_wit_persisted_value_map(&state.attributes)?,
+                    attributes: proto_to_wit_persisted_value_map(&state.attributes),
                     exists: state.exists,
-                })
+                }
             }
 
             fn proto_to_wit_applied_state(
                 state: &proto::AppliedState,
-            ) -> Result<wit_types::AppliedState, helpers::WasmValueEncodeError> {
+            ) -> wit_types::AppliedState {
                 let proto::AppliedState {
                     id: _protocol_id,
                     identifier,
                     attributes,
                 } = state;
-                Ok(wit_types::AppliedState {
+                wit_types::AppliedState {
                     identifier: identifier.as_str().to_string(),
-                    attributes: proto_to_wit_value_map(attributes)?,
-                })
+                    attributes: proto_to_wit_value_map(attributes),
+                }
             }
 
             fn proto_to_wit_read_outcome(
                 outcome: &proto::ReadOutcome,
-            ) -> Result<wit_types::ReadOutcome, helpers::WasmValueEncodeError> {
-                Ok(match outcome {
+            ) -> wit_types::ReadOutcome {
+                match outcome {
                     proto::ReadOutcome::NotFound { id: _protocol_id } => {
                         wit_types::ReadOutcome::NotFound
                     }
                     proto::ReadOutcome::Found { state } => {
-                        wit_types::ReadOutcome::Found(proto_to_wit_applied_state(state)?)
+                        wit_types::ReadOutcome::Found(proto_to_wit_applied_state(state))
                     }
-                })
+                }
             }
 
             fn proto_to_wit_applied_persisted_state(
                 state: &proto::AppliedPersistedState,
-            ) -> Result<wit_types::AppliedPersistedState, helpers::WasmValueEncodeError> {
+            ) -> wit_types::AppliedPersistedState {
                 let proto::AppliedPersistedState {
                     id: _protocol_id,
                     identifier,
                     attributes,
                 } = state;
-                Ok(wit_types::AppliedPersistedState {
+                wit_types::AppliedPersistedState {
                     identifier: identifier.as_str().to_string(),
-                    attributes: proto_to_wit_persisted_value_map(attributes)?,
-                })
+                    attributes: proto_to_wit_persisted_value_map(attributes),
+                }
             }
 
             fn proto_to_wit_update_outcome(
                 outcome: &proto::UpdateOutcome,
-            ) -> Result<wit_types::UpdateOutcome, helpers::WasmValueEncodeError> {
-                Ok(match outcome {
+            ) -> wit_types::UpdateOutcome {
+                match outcome {
                     proto::UpdateOutcome::Success { state } => {
                         wit_types::UpdateOutcome::Success(proto_to_wit_applied_persisted_state(
                             state,
-                        )?)
+                        ))
                     }
                     proto::UpdateOutcome::PartialSuccess { state, diagnostic } => {
                         wit_types::UpdateOutcome::PartialSuccess(
                             wit_types::UpdatePartialSuccess {
-                                state: proto_to_wit_applied_persisted_state(state)?,
+                                state: proto_to_wit_applied_persisted_state(state),
                                 diagnostic: wit_types::PartialReadDiagnostic {
                                     reason: diagnostic.reason.clone(),
                                     missing_attributes: diagnostic.missing_attributes.clone(),
@@ -1115,7 +1080,7 @@ macro_rules! export_provider {
                             },
                         )
                     }
-                })
+                }
             }
 
             fn sdk_to_wit_pending<T: serde::Serialize + $crate::PhasedToken>(
@@ -1235,11 +1200,11 @@ macro_rules! export_provider {
             fn proto_to_wit_created_state(
                 identifier: proto::AppliedIdentifier,
                 attributes: BTreeMap<String, proto::Value>,
-            ) -> Result<wit_types::AppliedState, helpers::WasmValueEncodeError> {
-                Ok(wit_types::AppliedState {
+            ) -> wit_types::AppliedState {
+                wit_types::AppliedState {
                     identifier: identifier.into_inner(),
-                    attributes: proto_to_wit_value_map(&attributes)?,
-                })
+                    attributes: proto_to_wit_value_map(&attributes),
+                }
             }
 
             fn proto_to_wit_create_progress(progress: proto::CreateProgress) -> wit_types::CreateProgress {
@@ -1272,25 +1237,9 @@ macro_rules! export_provider {
                     poll_after_secs: u32,
                     error: wit_types::ProviderError,
                 },
-                /// A finished result established an identifier; only its
-                /// returned attributes failed to cross the boundary.
-                IdentifierReportedAttributes(wit_types::CreateIdentified),
             }
 
             impl CreateStepEncodeFailure {
-                fn create_identified(
-                    identifier: proto::AppliedIdentifier,
-                    sent: wit_types::SentAttributes,
-                    error: wit_types::ProviderError,
-                ) -> wit_types::CreateIdentified {
-                    wit_types::CreateIdentified {
-                        identifier: identifier.into_inner(),
-                        read: wit_types::Observation::ReadFailed(error.clone()),
-                        sent,
-                        error,
-                    }
-                }
-
                 fn into_create_verdict(self) -> wit_types::CreateVerdict {
                     match self {
                         Self::PendingToken {
@@ -1311,9 +1260,6 @@ macro_rules! export_provider {
                                 "WASM boundary failed to encode a dispatched create continuation token without an identifier; refusing to report the create as not created"
                             ),
                         },
-                        Self::IdentifierReportedAttributes(identified) => {
-                            wit_types::CreateVerdict::IdentifierReported(identified)
-                        }
                     }
                 }
 
@@ -1349,9 +1295,6 @@ macro_rules! export_provider {
                                 error,
                             })
                         }
-                        Self::IdentifierReportedAttributes(identified) => {
-                            wit_types::PollVerdict::IdentifierReported(identified)
-                        }
                     }
                 }
             }
@@ -1364,7 +1307,6 @@ macro_rules! export_provider {
                     poll_after_secs: u32,
                     error: wit_types::ProviderError,
                 },
-                IdentifierReported(wit_types::ResumeIdentified),
                 /// A resent create still has the persisted pre-call resume
                 /// continuation available if its replacement token cannot be
                 /// encoded.
@@ -1372,17 +1314,6 @@ macro_rules! export_provider {
             }
 
             impl ResumeStepEncodeFailure {
-                fn identifier_reported(
-                    identifier: proto::AppliedIdentifier,
-                    error: wit_types::ProviderError,
-                ) -> Self {
-                    Self::IdentifierReported(wit_types::ResumeIdentified {
-                        identifier: identifier.into_inner(),
-                        read: wit_types::Observation::ReadFailed(error.clone()),
-                        error,
-                    })
-                }
-
                 fn into_resume_verdict(
                     self,
                     previous: wit_types::ResumePending,
@@ -1412,7 +1343,6 @@ macro_rules! export_provider {
                                 error,
                             })
                         }
-                        Self::IdentifierReported(identified) => wit_types::ResumeVerdict::IdentifierReported(identified),
                         Self::Resent(error) => {
                             error.into_resent_resume_verdict(previous)
                         }
@@ -1503,73 +1433,40 @@ macro_rules! export_provider {
             }
 
             fn sdk_to_wit_protocol_create_step<T: serde::Serialize>(
-                step: proto::CreateStep<
-                    BTreeMap<String, proto::Value>,
-                    proto::PartialReadDiagnostic,
-                    T,
-                >,
+                step: proto::CreateStep<BTreeMap<String, proto::Value>, proto::PartialReadDiagnostic, T>,
                 operation: &'static str,
             ) -> Result<wit_types::CreateStep, CreateStepEncodeFailure> {
                 match step {
                     proto::CreateStep::Success {
                         identifier,
                         attributes,
-                    } => match proto_to_wit_created_state(identifier.clone(), attributes) {
-                        Ok(state) => Ok(wit_types::CreateStep::Success(state)),
-                        Err(error) => {
-                            let error =
-                                boundary_encode_to_provider_error(operation, None, error);
-                            Err(CreateStepEncodeFailure::IdentifierReportedAttributes(
-                                CreateStepEncodeFailure::create_identified(
-                                    identifier,
-                                    wit_types::SentAttributes::All,
-                                    error,
-                                ),
-                            ))
-                        }
-                    },
+                    } => Ok(wit_types::CreateStep::Success(proto_to_wit_created_state(
+                        identifier, attributes,
+                    ))),
                     proto::CreateStep::PartialSuccess {
                         identifier,
                         attributes,
                         diagnostic,
-                    } => match proto_to_wit_created_state(identifier.clone(), attributes) {
-                        Ok(state) => Ok(wit_types::CreateStep::PartialSuccess(
-                                wit_types::CreatePartialSuccess {
-                                    state,
-                                    diagnostic: proto_to_wit_partial_read_diagnostic(diagnostic),
-                                },
-                            )),
-                        Err(error) => {
-                            let error =
-                                boundary_encode_to_provider_error(operation, None, error);
-                            Err(CreateStepEncodeFailure::IdentifierReportedAttributes(
-                                CreateStepEncodeFailure::create_identified(
-                                    identifier,
-                                    wit_types::SentAttributes::All,
-                                    error,
-                                ),
-                            ))
-                        }
-                    },
-                    proto::CreateStep::Pending(pending) => sdk_to_wit_pending_create(
-                        pending,
-                        operation,
-                    )
-                    .map(wit_types::CreateStep::Pending),
+                    } => Ok(wit_types::CreateStep::PartialSuccess(
+                        wit_types::CreatePartialSuccess {
+                            state: proto_to_wit_created_state(identifier, attributes),
+                            diagnostic: proto_to_wit_partial_read_diagnostic(diagnostic),
+                        },
+                    )),
+                    proto::CreateStep::Pending(pending) => {
+                        sdk_to_wit_pending_create(pending, operation)
+                            .map(wit_types::CreateStep::Pending)
+                    }
                 }
             }
 
             fn proto_to_wit_observation(
                 observation: proto::Observation<proto::ReadOutcome, proto::ProviderError>,
-                operation: &'static str,
             ) -> wit_types::Observation {
                 match observation {
-                    proto::Observation::Read(read) => match proto_to_wit_read_outcome(&read) {
-                        Ok(read) => wit_types::Observation::Read(read),
-                        Err(error) => wit_types::Observation::ReadFailed(
-                            boundary_encode_to_provider_error(operation, Some("observation"), error),
-                        ),
-                    },
+                    proto::Observation::Read(read) => {
+                        wit_types::Observation::Read(proto_to_wit_read_outcome(&read))
+                    }
                     proto::Observation::ReadFailed(error) => {
                         wit_types::Observation::ReadFailed(proto_to_wit_provider_error(error))
                     }
@@ -1578,12 +1475,11 @@ macro_rules! export_provider {
 
             fn sdk_to_wit_create_identified(
                 identified: proto::CreateIdentified<proto::ReadOutcome, proto::ProviderError>,
-                operation: &'static str,
             ) -> wit_types::CreateIdentified {
                 let (identifier, observation, sent, error) = identified.into_parts();
                 wit_types::CreateIdentified {
                     identifier: identifier.into_inner(),
-                    read: proto_to_wit_observation(observation, operation),
+                    read: proto_to_wit_observation(observation),
                     sent: proto_to_wit_sent(&sent),
                     error: proto_to_wit_provider_error(error),
                 }
@@ -1591,12 +1487,11 @@ macro_rules! export_provider {
 
             fn sdk_to_wit_resume_identified(
                 identified: proto::ResumeIdentified<proto::ReadOutcome, proto::ProviderError>,
-                operation: &'static str,
             ) -> wit_types::ResumeIdentified {
                 let (identifier, observation, error) = identified.into_parts();
                 wit_types::ResumeIdentified {
                     identifier: identifier.into_inner(),
-                    read: proto_to_wit_observation(observation, operation),
+                    read: proto_to_wit_observation(observation),
                     error: proto_to_wit_provider_error(error),
                 }
             }
@@ -1610,9 +1505,9 @@ macro_rules! export_provider {
                         wit_types::CreateVerdict::NotCreated(proto_to_wit_provider_error(error)),
                     ),
                     proto::CreateVerdict::IdentifierReported(identified) => Ok(
-                        wit_types::CreateVerdict::IdentifierReported(sdk_to_wit_create_identified(
-                            identified, operation,
-                        )),
+                        wit_types::CreateVerdict::IdentifierReported(
+                            sdk_to_wit_create_identified(identified),
+                        ),
                     ),
                     proto::CreateVerdict::NoResource(error) => Ok(
                         wit_types::CreateVerdict::NoResource(proto_to_wit_provider_error(error)),
@@ -1621,9 +1516,9 @@ macro_rules! export_provider {
                         let proto::CreateInFlight { pending, error } = in_flight;
                         sdk_to_wit_pending_create(pending, operation).map(|pending| {
                             wit_types::CreateVerdict::InFlight(wit_types::CreateInFlight {
-                                    pending,
-                                    error: proto_to_wit_provider_error(error),
-                                })
+                                pending,
+                                error: proto_to_wit_provider_error(error),
+                            })
                         })
                     }
                 }
@@ -1638,9 +1533,11 @@ macro_rules! export_provider {
                     proto::PollVerdict::NotCreated(error) => {
                         wit_types::PollVerdict::NotCreated(proto_to_wit_provider_error(error))
                     }
-                    proto::PollVerdict::IdentifierReported(identified) => wit_types::PollVerdict::IdentifierReported(
-                        sdk_to_wit_create_identified(identified, operation),
-                    ),
+                    proto::PollVerdict::IdentifierReported(identified) => {
+                        wit_types::PollVerdict::IdentifierReported(
+                            sdk_to_wit_create_identified(identified),
+                        )
+                    }
                     proto::PollVerdict::NoResource(error) => {
                         wit_types::PollVerdict::NoResource(proto_to_wit_provider_error(error))
                     }
@@ -1670,31 +1567,19 @@ macro_rules! export_provider {
                     proto::ResumeStep::Completed {
                         identifier,
                         attributes,
-                    } => match proto_to_wit_created_state(identifier.clone(), attributes) {
-                        Ok(state) => Ok(wit_types::ResumeStep::Completed(state)),
-                        Err(error) => {
-                            let error =
-                                boundary_encode_to_provider_error(operation, None, error);
-                            Err(ResumeStepEncodeFailure::identifier_reported(identifier, error))
-                        }
-                    },
+                    } => Ok(wit_types::ResumeStep::Completed(proto_to_wit_created_state(
+                        identifier, attributes,
+                    ))),
                     proto::ResumeStep::PartialSuccess {
                         identifier,
                         attributes,
                         diagnostic,
-                    } => match proto_to_wit_created_state(identifier.clone(), attributes) {
-                        Ok(state) => Ok(wit_types::ResumeStep::PartialSuccess(
-                            wit_types::CreatePartialSuccess {
-                                state,
-                                diagnostic: proto_to_wit_partial_read_diagnostic(diagnostic),
-                            },
-                        )),
-                        Err(error) => {
-                            let error =
-                                boundary_encode_to_provider_error(operation, None, error);
-                            Err(ResumeStepEncodeFailure::identifier_reported(identifier, error))
-                        }
-                    },
+                    } => Ok(wit_types::ResumeStep::PartialSuccess(
+                        wit_types::CreatePartialSuccess {
+                            state: proto_to_wit_created_state(identifier, attributes),
+                            diagnostic: proto_to_wit_partial_read_diagnostic(diagnostic),
+                        },
+                    )),
                     proto::ResumeStep::Pending(pending) => {
                         sdk_to_wit_resume_pending(pending, operation)
                             .map(wit_types::ResumeStep::Pending)
@@ -1716,9 +1601,11 @@ macro_rules! export_provider {
                     proto::ResumeVerdict::NotCreated(error) => {
                         wit_types::ResumeVerdict::NotCreated(proto_to_wit_provider_error(error))
                     }
-                    proto::ResumeVerdict::IdentifierReported(identified) => wit_types::ResumeVerdict::IdentifierReported(
-                        sdk_to_wit_resume_identified(identified, operation),
-                    ),
+                    proto::ResumeVerdict::IdentifierReported(identified) => {
+                        wit_types::ResumeVerdict::IdentifierReported(
+                            sdk_to_wit_resume_identified(identified),
+                        )
+                    }
                     proto::ResumeVerdict::NoResource(error) => {
                         wit_types::ResumeVerdict::NoResource(proto_to_wit_provider_error(error))
                     }
@@ -1834,9 +1721,7 @@ macro_rules! export_provider {
             ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
                 match outcome {
                     $crate::UpdateOutcome::Done(outcome) => {
-                        proto_to_wit_update_outcome(outcome).map_err(|error| {
-                            boundary_encode_to_provider_error(operation, None, error)
-                        })
+                        Ok(proto_to_wit_update_outcome(outcome))
                     }
                     $crate::UpdateOutcome::Pending(pending) => sdk_to_wit_pending(pending)
                         .map(wit_types::UpdateOutcome::Pending)
@@ -1876,7 +1761,16 @@ macro_rules! export_provider {
                 Ok(match value {
                     wit_types::DesiredValue::BoolVal(value) => V::Bool(*value),
                     wit_types::DesiredValue::IntVal(value) => V::Int(*value),
-                    wit_types::DesiredValue::FloatVal(value) => V::Float(*value),
+                    wit_types::DesiredValue::FloatVal(value) => {
+                        V::Float($crate::FiniteF64::new(*value).map_err(|source| {
+                            $crate::DesiredNormalizationError::new(
+                                id.clone(),
+                                attribute,
+                                $crate::protocol::normalization::NormalizationErrorKind::Conversion,
+                            )
+                            .with_source(source)
+                        })?)
+                    }
                     wit_types::DesiredValue::StrVal(value) => V::String(value.clone()),
                     wit_types::DesiredValue::DeferredVal(slot) => V::Deferred(*slot),
                     wit_types::DesiredValue::ListVal(json) => V::from_json_list(json, id, attribute)?,
@@ -1885,24 +1779,31 @@ macro_rules! export_provider {
                 })
             }
 
-            fn desired_to_wit_value(value: &$crate::protocol::normalization::NormalizationValue, id: &proto::ResourceId, attribute: &str) -> Result<wit_types::DesiredValue, $crate::DesiredNormalizationError> {
+            fn desired_to_wit_value(
+                value: &$crate::protocol::normalization::NormalizationValue,
+            ) -> wit_types::DesiredValue {
                 use $crate::protocol::normalization::NormalizationValue as V;
-                Ok(match value {
+                match value {
                     V::Bool(value) => wit_types::DesiredValue::BoolVal(*value),
                     V::Int(value) => wit_types::DesiredValue::IntVal(*value),
-                    V::Float(value) => wit_types::DesiredValue::FloatVal(*value),
+                    V::Float(value) => wit_types::DesiredValue::FloatVal(value.get()),
                     V::String(value) => wit_types::DesiredValue::StrVal(value.clone()),
                     V::Deferred(slot) => wit_types::DesiredValue::DeferredVal(*slot),
-                    V::StringList(_) => wit_types::DesiredValue::StringListVal(value.to_json(id, attribute)?),
-                    V::List(_) => wit_types::DesiredValue::ListVal(value.to_json(id, attribute)?),
-                    V::Map(_) => wit_types::DesiredValue::MapVal(value.to_json(id, attribute)?),
-                })
+                    V::StringList(_) => wit_types::DesiredValue::StringListVal(value.to_json()),
+                    V::List(_) => wit_types::DesiredValue::ListVal(value.to_json()),
+                    V::Map(_) => wit_types::DesiredValue::MapVal(value.to_json()),
+                }
             }
 
-            fn normalized_to_wit_resource(res: &$crate::NormalizedResource) -> Result<wit_types::DesiredResource, $crate::DesiredNormalizationError> {
-                helpers::visit_normalized_resource(res, |resource| {
-                    let attributes = resource.attributes.iter().map(|(name, value)| desired_to_wit_value(value, &resource.id, name).map(|value| (name.clone(),value))).collect::<Result<Vec<_>,_>>()?;
-                    Ok(wit_types::DesiredResource { id: proto_to_wit_resource_id(&resource.id), attributes })
+            fn normalized_to_wit_resource(
+                res: &$crate::NormalizedResource,
+            ) -> wit_types::DesiredResource {
+                helpers::visit_normalized_resource(res, |resource| wit_types::DesiredResource {
+                    id: proto_to_wit_resource_id(&resource.id),
+                    attributes: resource.attributes
+                        .iter()
+                        .map(|(name, value)| (name.clone(), desired_to_wit_value(value)))
+                        .collect(),
                 })
             }
 
@@ -1977,10 +1878,6 @@ macro_rules! export_provider {
                 desired_resource_boundary_to_provider_error("decode", error)
             }
 
-            fn desired_resource_encode_to_provider_error(error: $crate::DesiredNormalizationError) -> wit_types::ProviderError {
-                desired_resource_boundary_to_provider_error("encode", error)
-            }
-
             fn desired_resource_boundary_to_provider_error(direction: &str, error: $crate::DesiredNormalizationError) -> wit_types::ProviderError {
                 let mut error: proto::ProviderError = error.into();
                 error.message = format!("WASM boundary {direction} error in normalize_desired: {}", error.message);
@@ -1995,27 +1892,6 @@ macro_rules! export_provider {
                     message: format!(
                         "WASM boundary decode error in {operation} identifier: {error}"
                     ),
-                    resource_id: None,
-                    cause: None,
-                    provider_name: None,
-                    operation: Some(operation.to_string()),
-                    status: None,
-                    code: None,
-                    request_id: None,
-                })
-            }
-
-            fn boundary_encode_to_provider_error(
-                operation: &'static str,
-                part: Option<&'static str>,
-                error: helpers::WasmValueEncodeError,
-            ) -> wit_types::ProviderError {
-                let location = part.map_or_else(
-                    || operation.to_string(),
-                    |part| format!("{operation} {part}"),
-                );
-                wit_types::ProviderError::Internal(wit_types::ErrorDetail {
-                    message: format!("WASM boundary encode error in {location}: {error}"),
                     resource_id: None,
                     cause: None,
                     provider_name: None,
@@ -2262,10 +2138,7 @@ macro_rules! export_provider {
                         &identifier,
                         proto::ReadRequest,
                     ) {
-                        Ok(outcome) => proto_to_wit_read_outcome(&outcome)
-                            .map_err(|error| {
-                                boundary_encode_to_provider_error("read", None, error)
-                            }),
+                        Ok(outcome) => Ok(proto_to_wit_read_outcome(&outcome)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -2279,9 +2152,7 @@ macro_rules! export_provider {
                     })?;
                     let provider = get_provider().lock().unwrap();
                     match $crate::CarinaProvider::read_data_source(&*provider, &proto_res) {
-                        Ok(state) => proto_to_wit_state(&state).map_err(|error| {
-                            boundary_encode_to_provider_error("read_data_source", None, error)
-                        }),
+                        Ok(state) => Ok(proto_to_wit_state(&state)),
                         Err(e) => Err(proto_to_wit_provider_error(e)),
                     }
                 }
@@ -2579,7 +2450,9 @@ macro_rules! export_provider {
                         &wit_to_proto_type_identity(&ty),
                         &value,
                     )
-                    .map_err(validate_string_to_provider_error)
+                    .map_err(|error| {
+                        validate_string_to_provider_error(helpers::render_error_chain(&error))
+                    })
                 }
 
                 fn resolve_references(
@@ -2625,11 +2498,10 @@ macro_rules! export_provider {
                         $crate::CarinaProvider::normalize_desired(&*provider, proto_resources)
                     }
                     .map_err(proto_to_wit_provider_error)?;
-                    result
+                    Ok(result
                         .iter()
                         .map(normalized_to_wit_resource)
-                        .collect::<Result<_, _>>()
-                        .map_err(desired_resource_encode_to_provider_error)
+                        .collect())
                 }
 
                 fn normalize_state(
@@ -2651,15 +2523,10 @@ macro_rules! export_provider {
                         $crate::CarinaProvider::normalize_state(&*provider, proto_states)
                     }
                     .map_err(proto_to_wit_provider_error)?;
-                    result
+                    Ok(result
                         .into_iter()
-                        .map(|(key, state)| {
-                            proto_to_wit_persisted_state(&state).map(|state| (key, state))
-                        })
-                        .collect::<Result<_, _>>()
-                        .map_err(|error| {
-                            boundary_encode_to_provider_error("normalize_state", None, error)
-                        })
+                        .map(|(key, state)| (key, proto_to_wit_persisted_state(&state)))
+                        .collect())
                 }
 
                 fn hydrate_read_state(
@@ -2704,19 +2571,10 @@ macro_rules! export_provider {
                         )
                     }
                     .map_err(proto_to_wit_provider_error)?;
-                    proto_states
+                    Ok(proto_states
                         .into_iter()
-                        .map(|(key, state)| {
-                            proto_to_wit_persisted_state(&state).map(|state| (key, state))
-                        })
-                        .collect::<Result<_, _>>()
-                        .map_err(|error| {
-                            boundary_encode_to_provider_error(
-                                "hydrate_read_state",
-                                None,
-                                error,
-                            )
-                        })
+                        .map(|(key, state)| (key, proto_to_wit_persisted_state(&state)))
+                        .collect())
                 }
 
             }
@@ -2897,13 +2755,37 @@ mod tests {
     }
 
     #[test]
-    fn nested_non_finite_float_is_rejected_during_guest_encoding() {
-        let value = proto::Value::List(vec![proto::Value::Float(f64::NAN)]);
-
-        let error = proto_value_to_json(&value)
-            .expect_err("nested non-finite floats must fail guest boundary encoding");
-
-        assert!(error.to_string().contains("non-finite float"));
+    fn raw_non_finite_float_is_rejected_during_guest_decoding() {
+        use std::error::Error;
+        for (raw, category) in [
+            (f64::NAN, crate::NonFiniteFloatError::NaN),
+            (f64::INFINITY, crate::NonFiniteFloatError::PositiveInfinity),
+            (
+                f64::NEG_INFINITY,
+                crate::NonFiniteFloatError::NegativeInfinity,
+            ),
+        ] {
+            let error = decode_float(raw).unwrap_err().prepend_attribute("ratio");
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<crate::NonFiniteFloatError>(),
+                Some(&category)
+            );
+            let rendered = render_error_chain(&error);
+            assert_eq!(
+                rendered.matches("float-val attribute 'ratio'").count(),
+                1,
+                "{rendered}"
+            );
+            assert_eq!(
+                rendered.matches(&category.to_string()).count(),
+                1,
+                "{rendered}"
+            );
+            assert_eq!(format_wasm_value_decode_error(&error), rendered);
+        }
     }
 
     #[test]
@@ -2948,7 +2830,7 @@ mod tests {
                 proto::PersistedValue::String("user".to_string()),
             ),
         ]));
-        let encoded = proto_persisted_value_to_json(&value).expect("encode persisted value");
+        let encoded = proto_persisted_value_to_json(&value);
 
         assert_eq!(encoded["plain"], marker);
         assert_eq!(encoded["typed"], serde_json::json!({"$secret": digest}));
@@ -2958,7 +2840,7 @@ mod tests {
             proto::Value::String(digest.to_string()),
         )]));
         assert_eq!(
-            proto_value_to_json(&ordinary).expect("encode ordinary map"),
+            proto_value_to_json(&ordinary),
             serde_json::json!({"$secret": digest}),
             "the ordinary type treats a $secret key as user data",
         );

@@ -511,10 +511,9 @@ fn type_aware_exact_numeric_i64_boundary() {
             (i64::MIN, -9_223_372_036_854_775_808.0, true),
             (3, 3.0, true),
             (3, 3.5, false),
-            (0, f64::NAN, false),
         ] {
             let a = Value::Concrete(ConcreteValue::Int(integer));
-            let b = Value::Concrete(ConcreteValue::Float(float));
+            let b = Value::Concrete(ConcreteValue::Float(crate::finite(float)));
             for (a, b) in [(&a, &b), (&b, &a)] {
                 assert_eq!(
                     type_aware_equal(
@@ -535,12 +534,12 @@ fn type_aware_exact_numeric_i64_boundary() {
 fn type_aware_int_float_coercion() {
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(42)),
-        &Value::Concrete(ConcreteValue::Float(42.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(42.0))),
         Some(&AttributeType::float()),
         crate::schema::empty_defs_for_schema_walks(),
     ));
     assert!(type_aware_equal(
-        &Value::Concrete(ConcreteValue::Float(42.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(42.0))),
         &Value::Concrete(ConcreteValue::Int(42)),
         Some(&AttributeType::float()),
         crate::schema::empty_defs_for_schema_walks(),
@@ -548,14 +547,14 @@ fn type_aware_int_float_coercion() {
     // Non-exact conversion should not be equal
     assert!(!type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(42)),
-        &Value::Concrete(ConcreteValue::Float(42.5)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(42.5))),
         Some(&AttributeType::float()),
         crate::schema::empty_defs_for_schema_walks(),
     ));
     // Without type info, Int and Float are not equal
     assert!(!type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(42)),
-        &Value::Concrete(ConcreteValue::Float(42.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(42.0))),
         None,
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -597,7 +596,7 @@ fn type_aware_int_float_coercion_for_int_type() {
     // Int type also allows coercion (e.g., provider returns Float for an Int field)
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(10)),
-        &Value::Concrete(ConcreteValue::Float(10.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(10.0))),
         Some(&AttributeType::int()),
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -613,8 +612,8 @@ fn type_aware_list_with_inner_type() {
             Value::Concrete(ConcreteValue::Int(2))
         ])),
         &Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::Float(2.0)),
-            Value::Concrete(ConcreteValue::Float(1.0))
+            Value::Concrete(ConcreteValue::Float(crate::finite(2.0))),
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.0)))
         ])),
         Some(&list_type),
         crate::schema::empty_defs_for_schema_walks(),
@@ -642,7 +641,7 @@ fn type_aware_struct_per_field() {
     let b = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "count".to_string(),
-            Value::Concrete(ConcreteValue::Float(5.0)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(5.0))),
         ),
         (
             "name".to_string(),
@@ -662,7 +661,7 @@ fn type_aware_union_numeric() {
     let union_type = AttributeType::union(vec![AttributeType::int(), AttributeType::float()]);
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(7)),
-        &Value::Concrete(ConcreteValue::Float(7.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(7.0))),
         Some(&union_type),
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -677,7 +676,7 @@ fn type_aware_custom_delegates_to_base() {
     );
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(8080)),
-        &Value::Concrete(ConcreteValue::Float(8080.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(8080.0))),
         Some(&custom_type),
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -698,7 +697,7 @@ fn type_aware_diff_no_change_with_schema() {
     let mut current_attrs = HashMap::new();
     current_attrs.insert(
         "port".to_string(),
-        Value::Concrete(ConcreteValue::Float(443.0)),
+        Value::Concrete(ConcreteValue::Float(crate::finite(443.0))),
     );
     let current = State::existing(
         ResourceId::with_identity("test.resource", "test"),

@@ -403,6 +403,7 @@ impl ResidualModuleResolutionError {
                 }
                 ParseError::Syntax(_)
                 | ParseError::UnavailableSecret(_)
+                | ParseError::InvalidFloatLiteral { line: _, source: _ }
                 | ParseError::InvalidExpression {
                     line: _,
                     message: _,

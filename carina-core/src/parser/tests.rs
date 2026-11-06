@@ -285,9 +285,9 @@ fn min_exact_numeric_dsl() {
     let parsed = parse_and_resolve("let x = min(9007199254740993, 9007199254740992.0)").unwrap();
     assert_eq!(
         parsed.variables.get("x"),
-        Some(&Value::Concrete(ConcreteValue::Float(
+        Some(&Value::Concrete(ConcreteValue::Float(crate::finite(
             9_007_199_254_740_992.0
-        )))
+        ))))
     );
 }
 
@@ -2830,7 +2830,7 @@ fn schema_type_serde_preserves_every_scalar_kind_without_registry() {
             ),
             RefinedScalarKind::Float => crate::schema::CompiledAttributeType::refined_float(
                 Some(identity),
-                Some((Some(0.5), Some(9.5))),
+                Some((Some(crate::finite(0.5)), Some(crate::finite(9.5)))),
             ),
         };
         let original = TypeExpr::SchemaType {
@@ -2860,7 +2860,10 @@ fn schema_type_serde_preserves_every_scalar_kind_without_registry() {
                 assert_eq!(range, Some((Some(2), Some(42))));
             }
             crate::schema::RawShape::Float { range, .. } => {
-                assert_eq!(range, Some((Some(0.5), Some(9.5))));
+                assert_eq!(
+                    range,
+                    Some((Some(crate::finite(0.5)), Some(crate::finite(9.5))))
+                );
             }
             _ => panic!("scalar witness must retain its declaration"),
         }
@@ -3235,7 +3238,7 @@ fn parse_float_literal() {
     .unwrap();
     assert_eq!(
         result.resources[0].get_attr("weight"),
-        Some(&Value::Concrete(ConcreteValue::Float(2.5)))
+        Some(&Value::Concrete(ConcreteValue::Float(crate::finite(2.5))))
     );
 }
 
@@ -3255,7 +3258,7 @@ fn parse_negative_float_literal() {
     .unwrap();
     assert_eq!(
         result.resources[0].get_attr("offset"),
-        Some(&Value::Concrete(ConcreteValue::Float(-0.5)))
+        Some(&Value::Concrete(ConcreteValue::Float(crate::finite(-0.5))))
     );
 }
 
@@ -12577,6 +12580,38 @@ fn schema_custom_type_validation_accepts_a_loaded_context_witness() {
 }
 
 #[test]
+fn schema_custom_type_validation_preserves_bridge_decode_error_chain() {
+    let owned = crate::parser::OwnedTypeIdentity::provider(
+        "test",
+        TypeIdentity::bare("Count"),
+        crate::schema::RefinedScalarKind::Int,
+    )
+    .unbounded_witness_for_test();
+    let config = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            HashSet::from([(*owned).clone()]),
+            Box::new(|_, _| Ok(())),
+        ),
+        ..ProviderContext::new(crate::EnvironmentSnapshot::empty())
+    };
+    let value = ExpandedValue::Concrete(ExpandedConcreteValue::EnumIdentifier(
+        crate::resource::RawEnumIdentifier::parse("not_an_integer"),
+    ));
+
+    let error = super::functions::validate_schema_custom_type_with_context(&owned, &value, &config)
+        .expect_err("invalid integer bridge text must fail decoding");
+    let message = error.to_string();
+    assert!(
+        message.contains("invalid integer bridge value"),
+        "{message}"
+    );
+    assert!(
+        message.contains("invalid digit found in string"),
+        "{message}"
+    );
+}
+
+#[test]
 fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
     let identity = TypeIdentity::from_dotted("test.Widget.SecretId");
     let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
@@ -12622,7 +12657,7 @@ fn provider_context_validator_receives_canonical_numeric_text() {
         ),
         (
             RefinedScalarKind::Float,
-            ExpandedValue::Concrete(ExpandedConcreteValue::Float(1.25)),
+            ExpandedValue::Concrete(ExpandedConcreteValue::Float(crate::finite(1.25))),
         ),
         (
             RefinedScalarKind::String,

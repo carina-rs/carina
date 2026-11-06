@@ -7315,7 +7315,10 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         "description",
         Value::Concrete(ConcreteValue::String("new".into())),
     );
-    to_resource.set_attr("size", Value::Concrete(ConcreteValue::Float(1.0)));
+    to_resource.set_attr(
+        "size",
+        Value::Concrete(ConcreteValue::Float(crate::finite(1.0))),
+    );
     to_resource.set_attr(
         "items",
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(

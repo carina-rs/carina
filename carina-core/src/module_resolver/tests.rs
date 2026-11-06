@@ -1322,6 +1322,47 @@ let second = alias { label = "second" }
     }
 }
 
+#[test]
+fn module_parse_error_preserves_float_literal_error_chain() {
+    let temp = tempfile::tempdir().unwrap();
+    let module = temp.path().join("child");
+    fs::create_dir(&module).unwrap();
+    fs::write(module.join("main.crn"), "arguments {}\n").unwrap();
+    // Exponent notation is not part of the DSL; this decimal also overflows f64.
+    fs::write(
+        module.join("ratios.crn"),
+        format!("\n\nlet ratio = 1{}.0\n", "0".repeat(400)),
+    )
+    .unwrap();
+    let source = "let child = use { source = './child' }\nchild {}\n";
+    let root_file = temp.path().join("main.crn");
+    fs::write(&root_file, source).unwrap();
+    let parsed = crate::parser::parse_file(
+        source,
+        &root_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+
+    let error = resolve_modules(parsed, temp.path())
+        .expect_err("an overflowing module literal must fail parsing");
+    let relative = error.display_relative_to(temp.path());
+    assert!(relative.contains("child/ratios.crn"), "{relative}");
+    assert!(
+        relative.contains("Invalid float literal at line 3"),
+        "{relative}"
+    );
+    assert_eq!(
+        relative.matches("non-finite float +inf").count(),
+        1,
+        "{relative}"
+    );
+    assert!(
+        !relative.contains(&temp.path().display().to_string()),
+        "{relative}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn module_parse_error_preserves_symlink_followed_by_parent_components() {
@@ -10373,7 +10414,7 @@ fn argument_type_mismatch_error_escapes_string_literal_value() {
 
 #[test]
 fn argument_type_mismatch_error_preserves_float_fraction() {
-    let value = Value::Concrete(ConcreteValue::Float(1.0));
+    let value = Value::Concrete(ConcreteValue::Float(crate::finite(1.0)));
 
     let msg = module_argument_type_error("count", TypeExpr::Int, value);
 

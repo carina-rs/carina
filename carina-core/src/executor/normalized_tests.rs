@@ -255,8 +255,8 @@ async fn invalid_default_tag_fails_normalization_without_mutating_resources() {
     let default_tags = IndexMap::from([
         ("ManagedBy".to_string(), string_value("carina")),
         (
-            "InvalidNumber".to_string(),
-            Value::Concrete(ConcreteValue::Float(f64::NAN)),
+            "InvalidEnum".to_string(),
+            Value::Concrete(ConcreteValue::enum_identifier("test.Mode.invalid")),
         ),
     ]);
     let mut resource: Resource = Resource::with_provider("test", "thing", "example", None);
@@ -272,21 +272,22 @@ async fn invalid_default_tag_fails_normalization_without_mutating_resources() {
         &schemas,
     )
     .await
-    .expect_err("a non-finite default tag must fail normalization");
+    .expect_err("an unresolved enum default tag must fail normalization");
 
     let rendered = error.to_string();
     assert!(
         rendered
-            .starts_with("failed to encode default tag: key 'InvalidNumber' of provider 'test': "),
+            .starts_with("failed to encode default tag: key 'InvalidEnum' of provider 'test': "),
         "{rendered}"
     );
     assert!(rendered.contains("provider 'test'"), "{rendered}");
-    assert!(rendered.contains("InvalidNumber"), "{rendered}");
+    assert!(rendered.contains("InvalidEnum"), "{rendered}");
     assert!(
         error.detail().cause().is_some(),
         "default-tag failure must retain its typed terminal cause"
     );
-    let leaf = "cannot serialize at WASM provider boundary: non-finite float NaN";
+    let leaf =
+        "cannot serialize at WASM provider boundary: unresolved enum identifier test.Mode.invalid";
     assert_eq!(rendered.matches(leaf).count(), 1, "{rendered}");
     assert_eq!(
         resources, original,

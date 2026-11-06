@@ -1382,10 +1382,24 @@ impl LocatedParseError {
 
     fn render(&self, fallback: &Path) -> String {
         if let Some(finding) = self.error.element_diagnostic() {
-            return finding.to_string();
+            let location = finding.location();
+            let span = location.span();
+            // Located::Display already includes the detail. Render its chain
+            // separately so the diagnostic appears only once.
+            return format!(
+                "{}:{}:{}: {}",
+                location.file().path().display(),
+                span.start_line(),
+                span.start_column(),
+                crate::executor::render_error_chain(finding.detail())
+            );
         }
         let location = self.source_file.as_deref().unwrap_or(fallback);
-        format!("{}: {}", location.display(), self.error)
+        format!(
+            "{}: {}",
+            location.display(),
+            crate::executor::render_error_chain(self.error.as_ref())
+        )
     }
 }
 
@@ -2485,6 +2499,28 @@ mod tests {
     }
 
     #[test]
+    fn load_configuration_preserves_float_literal_error_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("main.crn"), "let name = 'example'\n").unwrap();
+        let ratios = dir.path().join("ratios.crn");
+        // Exponent notation is not part of the DSL; this decimal also overflows f64.
+        fs::write(&ratios, format!("\n\nlet ratio = 1{}.0\n", "0".repeat(400))).unwrap();
+
+        let error = match load_configuration_with_config(
+            &crate::paths::ResolvedPath::new(dir.path()).unwrap(),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            &SchemaRegistry::new(),
+        ) {
+            Ok(_) => panic!("overflowing float literal unexpectedly loaded"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains(&ratios.display().to_string()), "{error}");
+        assert!(error.contains("Invalid float literal at line 3"), "{error}");
+        assert_eq!(error.matches("non-finite float +inf").count(), 1, "{error}");
+    }
+
+    #[test]
     fn load_configuration_renders_a_function_body_file_once() {
         let dir = create_temp_dir("function_body_file_once");
         let main = dir.join("main.crn");
@@ -2512,6 +2548,11 @@ mod tests {
             "{error}"
         );
         assert!(!error.contains(&main.display().to_string()), "{error}");
+        assert_eq!(
+            error.matches("cannot apply access .name to string").count(),
+            1,
+            "{error}"
+        );
         cleanup(&dir);
     }
 
@@ -2538,6 +2579,11 @@ mod tests {
 
         assert_eq!(
             error.matches(&main.display().to_string()).count(),
+            1,
+            "{error}"
+        );
+        assert_eq!(
+            error.matches("cannot apply access .name to string").count(),
             1,
             "{error}"
         );

@@ -3045,6 +3045,10 @@ impl<'de> Deserialize<'de> for ValueString {
 
 /// Concrete-axis variants: values that carry their own runtime type
 /// and are safe to type-check at validate time.
+/// Non-finite raw floats cannot be used as a value payload.
+/// ```compile_fail,E0308
+/// let _: carina_core::resource::ExpandedConcreteValue = carina_core::resource::ConcreteValue::Float(f64::NAN);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ConcreteValue<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     String(ValueString),
@@ -3059,7 +3063,7 @@ pub enum ConcreteValue<P: ValueKind = NoPlaceholder, B: BindingAddress = Absolut
     EnumIdentifier(RawEnumIdentifier),
     CanonicalEnum(CanonicalEnumValue),
     Int(i64),
-    Float(f64),
+    Float(carina_provider_protocol::FiniteF64),
     Bool(bool),
     /// Time duration carried as `std::time::Duration`.
     ///
@@ -4568,7 +4572,7 @@ where
             EnumIdentifier(RawEnumIdentifier),
             CanonicalEnum(CanonicalEnumValue),
             Int(i64),
-            Float(f64),
+            Float(carina_provider_protocol::FiniteF64),
             Bool(bool),
             #[serde(with = "duration_secs")]
             Duration(std::time::Duration),
@@ -5481,7 +5485,7 @@ pub enum ConcreteValueRef<
     EnumIdentifier(&'a RawEnumIdentifier),
     CanonicalEnum(&'a CanonicalEnumValue),
     Int(i64),
-    Float(f64),
+    Float(carina_provider_protocol::FiniteF64),
     Bool(bool),
     Duration(std::time::Duration),
     List(&'a [Value<P, B>]),
@@ -8023,14 +8027,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             Value::Concrete(ConcreteValue::CanonicalEnum(c)) => c.hash(hasher),
             Value::Concrete(ConcreteValue::Int(i)) => i.hash(hasher),
             Value::Concrete(ConcreteValue::Float(f)) => {
-                // Float equality treats +0.0 and -0.0 as equal, so their
-                // canonical hashes must also agree. Other values use their
-                // bits for deterministic hashing (NaN never compares equal).
-                if *f == 0.0 {
-                    0.0_f64.to_bits().hash(hasher);
-                } else {
-                    f.to_bits().hash(hasher);
-                }
+                f.hash(hasher);
             }
             Value::Concrete(ConcreteValue::Bool(b)) => b.hash(hasher),
             Value::Concrete(ConcreteValue::Duration(d)) => d.as_secs().hash(hasher),

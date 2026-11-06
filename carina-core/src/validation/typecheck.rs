@@ -1564,7 +1564,7 @@ mod tests {
             ),
             (
                 RefinedScalarKind::Float,
-                Value::Concrete(ConcreteValue::Float(3.5)),
+                Value::Concrete(ConcreteValue::Float(crate::finite(3.5))),
                 true,
             ),
             (RefinedScalarKind::Float, string("3.5"), false),
@@ -1830,12 +1830,12 @@ mod tests {
             (TypeExpr::Int, Value::Concrete(ConcreteValue::Int(1)), true),
             (
                 TypeExpr::Int,
-                Value::Concrete(ConcreteValue::Float(1.0)),
+                Value::Concrete(ConcreteValue::Float(crate::finite(1.0))),
                 false,
             ),
             (
                 TypeExpr::Float,
-                Value::Concrete(ConcreteValue::Float(1.0)),
+                Value::Concrete(ConcreteValue::Float(crate::finite(1.0))),
                 true,
             ),
             (

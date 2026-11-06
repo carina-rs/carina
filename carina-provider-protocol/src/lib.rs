@@ -1,8 +1,10 @@
+mod finite_f64;
 mod host_pattern;
 pub mod http_trace;
 pub mod normalization;
 pub mod types;
 
+pub use finite_f64::{FiniteF64, NonFiniteFloatError};
 pub use host_pattern::{HostPattern, HostPatternError};
 
 use std::future::Future;
@@ -448,6 +450,11 @@ where
 pub const PERSISTED_SECRET_KEY: &str = "$secret";
 
 pub use types::*;
+
+#[cfg(test)]
+pub(crate) fn finite(value: f64) -> FiniteF64 {
+    FiniteF64::new(value).unwrap()
+}
 
 #[cfg(test)]
 mod operation_poll_tests {

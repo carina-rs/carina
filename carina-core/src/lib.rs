@@ -2,6 +2,8 @@
 //!
 //! Core library for an infrastructure management tool that treats side effects as values
 
+pub use carina_provider_protocol::{FiniteF64, NonFiniteFloatError};
+
 mod environment;
 mod user_dirs;
 mod value_description;
@@ -65,6 +67,11 @@ pub mod validation;
 pub mod value;
 pub mod version_constraint;
 pub mod wait;
+
+#[cfg(test)]
+pub(crate) fn finite(value: f64) -> carina_provider_protocol::FiniteF64 {
+    carina_provider_protocol::FiniteF64::new(value).unwrap()
+}
 
 #[cfg(test)]
 pub(crate) mod test_support {

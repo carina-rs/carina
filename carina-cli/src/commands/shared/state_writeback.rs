@@ -647,8 +647,8 @@ pub(crate) struct SkippedExport {
 /// earlier resources in the same apply succeeded. Those per-export
 /// resolution failures are reported in [`ExportResolution::skipped`]
 /// and omitted from `state.exports` so the writeback still persists
-/// completed resources. Genuine serialization corruption, such as a
-/// non-finite float, remains an error and aborts writeback.
+/// completed resources. Genuine serialization corruption remains an error
+/// and aborts writeback.
 pub(crate) struct ResolveExportValuesPostApplyInput<'a, D = ()> {
     pub export_params: &'a carina_core::validation::ExportsCheckedPreApply<
         carina_core::parser::ExpandedInferredExportParam,
@@ -789,7 +789,6 @@ pub(crate) fn materialize_exports(
                         reason: format!("unresolved function call {name}(...)"),
                     });
                 }
-                Err(e @ SerializationError::NonFiniteFloat { .. }) => return Err(e.into()),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -5707,6 +5706,7 @@ mod apply_state_save_tests {
         assert_eq!(
             row.deposed[0].persisted_attributes().get("cidr_block"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("10.0.0.0/16"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
@@ -6397,6 +6397,7 @@ mod apply_state_save_tests {
                 .expect("row has applied attributes")
                 .get("password"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("plain-secret"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
 
@@ -6486,6 +6487,7 @@ mod apply_state_save_tests {
                 .expect("row has applied attributes")
                 .get("password"),
             carina_core::value::json_to_dsl_value(&serde_json::json!(marker))
+                .unwrap()
                 .map(|value| value.to_snapshot()),
         );
     }
@@ -6556,6 +6558,7 @@ mod apply_state_save_tests {
                 .expect("row has applied attributes")
                 .get("password"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("plain-secret"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(row.write_only_attributes(), ["password"]);
@@ -7111,6 +7114,7 @@ mod apply_state_save_tests {
         assert_eq!(
             deposed.persisted_attributes().get("name"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("old.example.com"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert!(
@@ -7262,6 +7266,7 @@ mod apply_state_save_tests {
         assert_eq!(
             deposed.persisted_attributes().get("name"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("newer"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
@@ -7639,6 +7644,7 @@ mod apply_state_save_tests {
         assert_eq!(
             row.deposed[0].persisted_attributes().get("bucket_name"),
             carina_core::value::json_to_dsl_value(&serde_json::json!("old-name"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         let deposed_attributes = serde_json::to_value(row.deposed[0].persisted_attributes())
@@ -8286,41 +8292,12 @@ mod stage4_unknown_err_tests {
         );
     }
 
-    /// Non-finite floats (NaN / +inf / -inf) cannot be represented in
-    /// JSON. The persisted export encoder must surface them as
-    /// `SerializationError::NonFiniteFloat` rather than silently dropping the export.
-    /// (#2859)
+    /// Malformed numeric exports fail before they can enter state bindings.
     #[test]
-    fn non_finite_float_returns_err() {
-        for f in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            let v = Value::Concrete(ConcreteValue::Float(f));
-            let err = PersistedExportValue::encode(&v).unwrap_err();
-            match err {
-                SerializationError::NonFiniteFloat {
-                    value,
-                    context: SerializationContext::StateWriteback,
-                } => {
-                    // NaN != NaN, so compare via classification.
-                    assert_eq!(
-                        value.is_nan(),
-                        f.is_nan(),
-                        "NaN classification mismatch for {f}"
-                    );
-                    assert_eq!(
-                        value.is_infinite(),
-                        f.is_infinite(),
-                        "infinite classification mismatch for {f}"
-                    );
-                    if f.is_infinite() {
-                        assert_eq!(
-                            value.is_sign_negative(),
-                            f.is_sign_negative(),
-                            "sign mismatch for {f}"
-                        );
-                    }
-                }
-                other => panic!("expected NonFiniteFloat/StateWriteback for {f}, got: {other:?}"),
-            }
+    fn overflowing_export_is_rejected_during_loading() {
+        for json in ["1e999", "-1e999", "[1e999]", r#"{"nested":-1e999}"#] {
+            let error = serde_json::from_str::<PersistedExportValue>(json).unwrap_err();
+            assert!(error.to_string().contains("number out of range"), "{error}");
         }
     }
 }

@@ -660,13 +660,7 @@ fn parse_primary_eval_with_mode_inner(
             ))))
         }
         Rule::float => {
-            let f: f64 = inner
-                .as_str()
-                .parse()
-                .map_err(|e| ParseError::InvalidExpression {
-                    line: inner.line_col().0,
-                    message: format!("invalid float literal: {e}"),
-                })?;
+            let f = super::super::error::parse_float_literal(inner.as_str(), inner.line_col().0)?;
             Ok(EvalValue::from_value(Value::Concrete(
                 ConcreteValue::Float(f),
             )))

@@ -766,7 +766,7 @@ mod tests {
         let integer = 9_007_199_254_740_993;
         let args = [
             secret(Value::Concrete(ConcreteValue::Int(integer))),
-            Value::Concrete(ConcreteValue::Float(0.5)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(0.5))),
         ];
         let error = evaluate_builtin_to_value("max", &args).unwrap_err();
         assert!(!error.contains(&integer.to_string()), "{error}");

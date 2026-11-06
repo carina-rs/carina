@@ -5758,7 +5758,9 @@ fn test_canonical_create_only_string_covers_concrete_scalars() {
         Some("Int(42)".to_string())
     );
     assert_eq!(
-        canonical_create_only_value_string_for_test(&Value::Concrete(ConcreteValue::Float(3.5))),
+        canonical_create_only_value_string_for_test(&Value::Concrete(ConcreteValue::Float(
+            crate::finite(3.5)
+        ))),
         Some("Float(3.5)".to_string())
     );
     assert_eq!(
@@ -5831,7 +5833,7 @@ fn test_canonical_create_only_string_matches_state_round_trip() {
         vec![
             Value::Concrete(ConcreteValue::String("alpha".into())),
             Value::Concrete(ConcreteValue::Int(42)),
-            Value::Concrete(ConcreteValue::Float(3.5)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(3.5))),
             Value::Concrete(ConcreteValue::Bool(true)),
             Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(300))),
             Value::Concrete(ConcreteValue::StringList(vec![

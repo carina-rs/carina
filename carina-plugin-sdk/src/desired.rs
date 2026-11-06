@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use carina_core::desired::NormalizationBatch;
-use carina_core::protocol_convert::{ProtocolConvertError, protocol_to_resource_id};
+use carina_core::protocol_convert::protocol_to_resource_id;
 use carina_core::provider::{
     ProviderError as NativeProviderError, ProviderReady, ProviderResult as NativeProviderResult,
     ResourceWirePayload,
@@ -22,11 +22,14 @@ use carina_provider_protocol::normalization::{
 pub use carina_provider_protocol::normalization::NormalizationError as DesiredNormalizationError;
 
 /// A known scalar. Containers and deferred core values cannot be put here.
+/// ```compile_fail,E0308
+/// let _ = carina_plugin_sdk::DesiredScalar::Float(f64::NAN);
+/// ```
 #[derive(Debug, Clone)]
 pub enum DesiredScalar {
     String(ValueString),
     Int(i64),
-    Float(f64),
+    Float(carina_provider_protocol::FiniteF64),
     Bool(bool),
 }
 
@@ -564,12 +567,7 @@ impl Encoder<'_> {
                 DesiredScalar::String(value) => Wire::String(value.expose_plaintext().into()),
                 DesiredScalar::Int(value) => Wire::Int(value),
                 DesiredScalar::Bool(value) => Wire::Bool(value),
-                DesiredScalar::Float(value) if value.is_finite() => Wire::Float(value),
-                DesiredScalar::Float(_) => {
-                    return Err(
-                        error(Kind::Conversion).with_source(ProtocolConvertError::NonFiniteFloat)
-                    );
-                }
+                DesiredScalar::Float(value) => Wire::Float(value),
             },
             DesiredValue::List(list) => {
                 let mut values = Vec::with_capacity(list.values.len());

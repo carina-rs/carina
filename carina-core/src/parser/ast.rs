@@ -2482,6 +2482,9 @@ impl<B: BindingAddress> ValidationBlock<ParserPlaceholder, B> {
 // `CompareOp` lives in `expressions::validate_expr` (re-exported above).
 
 /// Validate expression AST node
+/// ```compile_fail,E0308
+/// let _: carina_core::parser::ValidateExpr = carina_core::parser::ValidateExpr::Float(f64::NAN);
+/// ```
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ValidateExpr<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     /// Boolean literal
@@ -2489,7 +2492,7 @@ pub enum ValidateExpr<P: ValueKind = NoPlaceholder, B: BindingAddress = Absolute
     /// Integer literal
     Int(i64),
     /// Float literal
-    Float(f64),
+    Float(carina_provider_protocol::FiniteF64),
     /// Duration literal (`75min`, `1h`, `30s`).
     Duration(std::time::Duration),
     /// String literal

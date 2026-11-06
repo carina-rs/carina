@@ -1533,8 +1533,14 @@ fn unique_list_compares_canonical_string_or_list_containers() {
 fn unique_float_list_keeps_integer_and_float_spellings_distinct() {
     let list = unique_list_from_protocol(AttributeType::float(), true);
     for items in [
-        vec![ConcreteValue::Int(1), ConcreteValue::Float(1.0)],
-        vec![ConcreteValue::Float(1.0), ConcreteValue::Int(1)],
+        vec![
+            ConcreteValue::Int(1),
+            ConcreteValue::Float(crate::finite(1.0)),
+        ],
+        vec![
+            ConcreteValue::Float(crate::finite(1.0)),
+            ConcreteValue::Int(1),
+        ],
         vec![
             ConcreteValue::Int(9_007_199_254_740_992),
             ConcreteValue::Int(9_007_199_254_740_993),
@@ -1944,6 +1950,7 @@ fn explicit_json_null_is_absent_for_groups_and_required_fields() {
     let decoded = crate::value::json_to_dsl_value(&serde_json::json!({
         "sliding_window": null
     }))
+    .unwrap()
     .expect("an object remains a map when its null member is omitted");
     assert_eq!(
         choice_struct(FieldGroupKind::ExactlyOne)
@@ -3045,7 +3052,7 @@ fn domain_name_builtins_reject_non_string_values() {
             .expect("Domain name types must be registered built-ins");
         for value in [
             Value::Concrete(ConcreteValue::Int(123)),
-            Value::Concrete(ConcreteValue::Float(1.2)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.2))),
             Value::Concrete(ConcreteValue::Bool(true)),
             Value::Concrete(ConcreteValue::List(vec![])),
         ] {
@@ -3248,7 +3255,7 @@ fn https_url_builtin_rejects_non_string_values() {
         .expect("HttpsUrl must be a registered built-in");
     for value in [
         Value::Concrete(ConcreteValue::Int(443)),
-        Value::Concrete(ConcreteValue::Float(443.0)),
+        Value::Concrete(ConcreteValue::Float(crate::finite(443.0))),
         Value::Concrete(ConcreteValue::Bool(true)),
         Value::Concrete(ConcreteValue::List(vec![])),
     ] {
@@ -3430,33 +3437,10 @@ fn schema_admission_rejects_an_unknown_unique_name_attribute() {
 }
 
 #[test]
-fn schema_admission_rejects_every_non_finite_default_at_top_level_and_nested() {
-    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        let error = admission_error(
-            PatternResourceSchema::new("test.Widget").attribute(
-                PatternAttributeSchema::optional("threshold", PatternAttributeType::float())
-                    .with_default(Value::Concrete(ConcreteValue::Float(value)))
-                    .build(),
-            ),
-        );
-        assert!(error.contains("threshold"), "{error}");
-        assert!(error.contains("finite"), "{error}");
+fn schema_defaults_require_finite_admission() {
+    for json in ["1e999", "[1e999]", r#"{"threshold":-1e999}"#] {
+        assert!(serde_json::from_str::<carina_provider_protocol::types::Value>(json).is_err());
     }
-
-    let error = admission_error(
-        PatternResourceSchema::new("test.Widget").attribute(
-            PatternAttributeSchema::optional(
-                "thresholds",
-                PatternAttributeType::list(PatternAttributeType::float()),
-            )
-            .with_default(Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::Float(f64::NAN),
-            )])))
-            .build(),
-        ),
-    );
-    assert!(error.contains("thresholds[0]"), "{error}");
-    assert!(error.contains("finite"), "{error}");
 }
 
 #[test]
@@ -5630,11 +5614,11 @@ fn validate_enum_rejects_double_namespace() {
 fn validate_float_type() {
     let t = AttributeType::float();
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::Float(2.5)))
+        t.validate(&Value::Concrete(ConcreteValue::Float(crate::finite(2.5))))
             .is_ok()
     );
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::Float(-0.5)))
+        t.validate(&Value::Concrete(ConcreteValue::Float(crate::finite(-0.5))))
             .is_ok()
     );
     assert!(t.validate(&Value::Concrete(ConcreteValue::Int(42))).is_ok()); // integers are valid numbers
@@ -5649,28 +5633,11 @@ fn validate_float_type() {
 }
 
 #[test]
-fn validate_float_rejects_non_finite() {
-    let t = AttributeType::float();
-    assert!(
-        t.validate(&Value::Concrete(ConcreteValue::Float(f64::NAN)))
-            .is_err()
-    );
-    assert!(
-        t.validate(&Value::Concrete(ConcreteValue::Float(f64::INFINITY)))
-            .is_err()
-    );
-    assert!(
-        t.validate(&Value::Concrete(ConcreteValue::Float(f64::NEG_INFINITY)))
-            .is_err()
-    );
-}
-
-#[test]
 fn validate_int_rejects_float() {
     let t = AttributeType::int();
     assert!(t.validate(&Value::Concrete(ConcreteValue::Int(42))).is_ok());
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::Float(2.5)))
+        t.validate(&Value::Concrete(ConcreteValue::Float(crate::finite(2.5))))
             .is_err()
     ); // strict integer typing
 }
@@ -9435,8 +9402,14 @@ fn finite_assignability_universe() -> Vec<NamedAssignableType> {
     );
     let int_0_100 = AttributeType::refined_int(None, Some((Some(0), Some(100))));
     let int_25_75 = AttributeType::refined_int(None, Some((Some(25), Some(75))));
-    let float_0_100 = AttributeType::refined_float(None, Some((Some(0.0), Some(100.0))));
-    let float_25_75 = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+    let float_0_100 = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+    );
+    let float_25_75 = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
+    );
     let status = AttributeType::enum_(
         crate::schema::enum_identity("Status", Some("aws.test.Widget")),
         Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
@@ -9708,11 +9681,17 @@ fn assignability_rule_10_accepts_all_identityless_refinement_sinks() {
             vec![
                 NamedAssignableType::new(
                     "Float(range=0..100)",
-                    AttributeType::refined_float(None, Some((Some(0.0), Some(100.0)))),
+                    AttributeType::refined_float(
+                        None,
+                        Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+                    ),
                 ),
                 NamedAssignableType::new(
                     "Float(range=25..75)",
-                    AttributeType::refined_float(None, Some((Some(25.0), Some(75.0)))),
+                    AttributeType::refined_float(
+                        None,
+                        Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
+                    ),
                 ),
             ],
         ),
@@ -9766,11 +9745,17 @@ fn assignability_rule_8_rejects_unproven_refined_sources() {
         (
             NamedAssignableType::new(
                 "Float(range=0..100)",
-                AttributeType::refined_float(None, Some((Some(0.0), Some(100.0)))),
+                AttributeType::refined_float(
+                    None,
+                    Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+                ),
             ),
             NamedAssignableType::new(
                 "Float(range=25..75)",
-                AttributeType::refined_float(None, Some((Some(25.0), Some(75.0)))),
+                AttributeType::refined_float(
+                    None,
+                    Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
+                ),
             ),
         ),
     ];
@@ -10756,7 +10741,10 @@ fn assignable_plain_int_accepts_identityless_range_sink() {
 
 #[test]
 fn assignable_plain_float_accepts_identityless_range_sink() {
-    let sink = AttributeType::refined_float(None, Some((Some(1.0), Some(65_535.0))));
+    let sink = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(1.0)), Some(crate::finite(65_535.0)))),
+    );
 
     assert!(assignable(&AttributeType::float(), &sink));
 }
@@ -10764,10 +10752,13 @@ fn assignable_plain_float_accepts_identityless_range_sink() {
 #[test]
 fn float_range_exact_numeric_int_bounds() {
     for (integer, range) in [
-        (9_007_199_254_740_993, (None, Some(9_007_199_254_740_992.0))),
+        (
+            9_007_199_254_740_993,
+            (None, Some(crate::finite(9_007_199_254_740_992.0))),
+        ),
         (
             -9_007_199_254_740_993,
-            (Some(-9_007_199_254_740_992.0), None),
+            (Some(crate::finite(-9_007_199_254_740_992.0)), None),
         ),
     ] {
         let attr_type = AttributeType::refined_float(None, Some(range));
@@ -10792,26 +10783,26 @@ fn assignable_exact_numeric_int_float_bounds() {
     for (source, sink, expected) in [
         (
             (None, Some(9_007_199_254_740_993)),
-            (None, Some(9_007_199_254_740_992.0)),
+            (None, Some(crate::finite(9_007_199_254_740_992.0))),
             false,
         ),
         (
             (Some(-9_007_199_254_740_993), None),
-            (Some(-9_007_199_254_740_992.0), None),
+            (Some(crate::finite(-9_007_199_254_740_992.0)), None),
             false,
         ),
         (
             (None, Some(i64::MAX)),
-            (None, Some(9_223_372_036_854_775_808.0)),
+            (None, Some(crate::finite(9_223_372_036_854_775_808.0))),
             true,
         ),
         (
             (Some(i64::MIN), None),
-            (Some(-9_223_372_036_854_775_808.0), None),
+            (Some(crate::finite(-9_223_372_036_854_775_808.0)), None),
             true,
         ),
-        ((Some(3), Some(4)), (Some(3.5), None), false),
-        ((Some(3), Some(4)), (None, Some(3.5)), false),
+        ((Some(3), Some(4)), (Some(crate::finite(3.5)), None), false),
+        ((Some(3), Some(4)), (None, Some(crate::finite(3.5))), false),
     ] {
         assert_eq!(
             assignable(
@@ -10827,11 +10818,15 @@ fn assignable_exact_numeric_int_float_bounds() {
 #[test]
 fn assignable_int_float_missing_bounds_use_i64_limits() {
     for (source, sink, expected) in [
-        ((Some(0), None), (Some(-1.0), Some(1e300)), true),
-        ((None, None), (None, Some(1e300)), true),
-        ((None, None), (None, Some(9.0e18)), false),
-        ((None, None), (Some(-1e300), None), true),
-        ((None, None), (Some(-9.0e18), None), false),
+        (
+            (Some(0), None),
+            (Some(crate::finite(-1.0)), Some(crate::finite(1e300))),
+            true,
+        ),
+        ((None, None), (None, Some(crate::finite(1e300))), true),
+        ((None, None), (None, Some(crate::finite(9.0e18))), false),
+        ((None, None), (Some(crate::finite(-1e300)), None), true),
+        ((None, None), (Some(crate::finite(-9.0e18)), None), false),
     ] {
         assert_eq!(
             assignable(
@@ -10853,7 +10848,10 @@ fn assignable_int_source_widens_to_float_sink() {
 #[test]
 fn assignable_identified_int_without_range_widens_to_ranged_float_sink() {
     let source = AttributeType::refined_int(Some(TypeIdentity::bare("Count")), None);
-    let sink = AttributeType::refined_float(None, Some((Some(0.0), Some(100.0))));
+    let sink = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+    );
 
     assert!(
         assignable(&source, &sink),
@@ -10863,8 +10861,14 @@ fn assignable_identified_int_without_range_widens_to_ranged_float_sink() {
 
 #[test]
 fn assignable_wider_float_range_rejects_narrower_identityless_range_sink() {
-    let source = AttributeType::refined_float(None, Some((Some(0.0), Some(100.0))));
-    let sink = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+    let source = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+    );
+    let sink = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
+    );
 
     assert!(!assignable(&source, &sink));
 }
@@ -11332,12 +11336,15 @@ fn typed_ref_anonymous_refined_int_defers_range_constraints() {
 fn typed_ref_anonymous_refined_float_defers_range_constraints() {
     for range in [
         None,
-        Some((Some(30.0), Some(60.0))),
-        Some((Some(0.0), Some(100.0))),
-        Some((Some(100.0), Some(200.0))),
+        Some((Some(crate::finite(30.0)), Some(crate::finite(60.0)))),
+        Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+        Some((Some(crate::finite(100.0)), Some(crate::finite(200.0)))),
     ] {
         let source = AttributeType::refined_float(Some(TypeIdentity::bare("Ratio")), range);
-        let sink = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+        let sink = AttributeType::refined_float(
+            None,
+            Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
+        );
         let actual = assignable(&source, &sink);
         assert!(
             actual,
@@ -11374,7 +11381,10 @@ fn typed_ref_anonymous_refined_numeric_preserves_identity_range_and_primitive_ru
         );
     }
 
-    let narrow_float = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+    let narrow_float = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
+    );
     assert!(
         !assignable(&wide_int, &narrow_float),
         "Int to Float widening still requires identity-less source range containment"
@@ -17410,4 +17420,12 @@ fn draft_keyed_partial_update_rejects_unresolvable_shapes() {
             "{error}"
         );
     }
+}
+
+#[test]
+fn unbounded_integer_range_is_assignable_to_unbounded_float_range() {
+    assert!(super::i64_range_assignable_to_f64(
+        Some(&(None, None)),
+        Some(&(None, None))
+    ));
 }
