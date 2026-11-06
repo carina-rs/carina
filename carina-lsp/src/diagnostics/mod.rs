@@ -1209,7 +1209,7 @@ impl DiagnosticRun<'_> {
                 }
             }
             // The shared authority owns ordinary direct bare-binding sinks
-            // even when they succeed. Admitted builtin and collection
+            // even when they succeed. Admitted single builtin string
             // constructions retain their enclosing schema value checks.
             // Native interpolation keeps its existing operand suppression.
             // An enum-typed argument must not
@@ -1529,7 +1529,22 @@ impl DiagnosticRun<'_> {
                         let attr_value = if contains_function_call(authored_attr_value) {
                             semantic_resource_attributes
                                 .as_ref()
-                                .filter(|_| judged_expression.is_string_construction())
+                                .filter(|_| {
+                                    validated_schema
+                                        .effective_attribute_by_authored_name(attr_name)
+                                        .is_some_and(|attribute| {
+                                            let sink =
+                                                carina_core::validation::expression_sink_type(
+                                                    attribute.field_type(),
+                                                    validated_schema.owner(),
+                                                    validated_schema.schema().as_schema().defs(),
+                                                );
+                                            let expression = judged_expression
+                                                .for_sink(&sink, self.provider_context.catalog());
+                                            expression.is_single_string_construction()
+                                                || expression.has_constructed_members()
+                                        })
+                                })
                                 .and_then(|attributes| attributes.get(attr_name))
                                 .or_else(|| {
                                     resolved_resource_attributes

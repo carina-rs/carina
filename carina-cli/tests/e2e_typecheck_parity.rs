@@ -8220,3 +8220,6 @@ mod review_4282;
 
 #[path = "e2e_typecheck_parity/review_round1_4282.rs"]
 mod review_round1_4282;
+
+#[path = "e2e_typecheck_parity/review_round2_4282.rs"]
+mod review_round2_4282;

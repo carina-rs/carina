@@ -74,7 +74,8 @@ fn findings(
     (cli, lsp_message_multiset(&lsp))
 }
 
-// These complete message multisets were verified against origin/main 980fff07f.
+// Compatibility multisets were verified against origin/main 980fff07f.
+// Constructed builtin lists use main's equivalent interpolation-list messages.
 // Keep its wording and counts even when the two frontends differ.
 fn assert_findings(source: &str, argument_type: Option<&str>, cli: Vec<String>, lsp: Vec<String>) {
     let actual = findings(source, argument_type);
@@ -292,7 +293,7 @@ fn issue_4282_round1_mixed_list_keeps_main_messages_and_counts() {
 }
 
 #[test]
-fn issue_4282_round1_mixed_builtin_list_keeps_main_messages_and_counts() {
+fn issue_4282_round1_mixed_builtin_list_uses_main_interpolation_messages_and_counts() {
     for (expression, invalid) in [
         ("[join('', ['a']), 'b']", false),
         ("[join('', ['A']), 'b']", true),
@@ -310,8 +311,8 @@ fn issue_4282_round1_mixed_builtin_list_keeps_main_messages_and_counts() {
             );
             let mut cli = vec![];
             let mut lsp = vec![pipe_hint("join")];
-            if bound {
-                let error = "expected mock.test.Resource.Name, got String";
+            if bound && invalid {
+                let error = "List item at index 0: Invalid Name value 'A': does not match required pattern /^[a-z]+$/";
                 cli.push(error.into());
                 lsp.push(error.into());
             } else if invalid {

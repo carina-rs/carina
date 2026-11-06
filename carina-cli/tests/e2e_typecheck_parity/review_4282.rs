@@ -89,8 +89,19 @@ fn issue_4282_sibling_lets_supply_constructed_values_to_cli_and_lsp() {
                 let schemas = schemas(true);
                 let cli = cli_diagnostics(factories_for(&schemas), &fixture);
                 let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+                let expected_lsp = if bound && attribute == "names" && invalid {
+                    vec![format!(
+                        "List item at index 0: Invalid Name value 'A': {pattern}"
+                    )]
+                } else {
+                    expected_lsp
+                };
                 let expected_cli = if !invalid {
                     vec![]
+                } else if attribute == "names" && bound {
+                    vec![format!(
+                        "List item at index 0: Invalid Name value 'A': {pattern}"
+                    )]
                 } else if attribute == "names" {
                     vec![format!(
                         "test.Names.<pending>: List item at index 0: Invalid value 'A' for 'names' (Name): {pattern}"
