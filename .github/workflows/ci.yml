@@ -159,6 +159,8 @@ jobs:
       - run: bash scripts/check-wit-bindgen-workspace.sh
       - run: bash scripts/check-provider-sdk-bindings.sh
       - run: bash scripts/test-check-provider-sdk-bindings.sh
+      - run: bash scripts/check-test-utils-dev-only.sh
+      - run: bash scripts/test-check-test-utils-dev-only.sh
 
   check-plan-fixtures:
     name: Check Plan Fixtures
