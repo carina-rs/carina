@@ -1,4 +1,6 @@
 use super::*;
+#[path = "input_discharge_tests.rs"]
+mod input_discharge_tests;
 use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
@@ -29,91 +31,6 @@ pub(super) fn checked_fixture_plan(plan: &Plan) -> crate::input_rules::InputChec
         .expect("fixture plan admits creation")
 }
 
-#[tokio::test]
-async fn pending_inputs_admission_blocks_every_effect_before_dispatch() {
-    use crate::schema::{InputPath, InputPredicate, InputRule, InputRuleCode};
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert(
-        "mock",
-        PatternResourceSchema::new("Bucket")
-            .attribute(
-                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
-            )
-            .input_rule(InputRule::value(
-                crate::schema::InputRuleScope::CreateOnly,
-                InputPath::new("name").unwrap(),
-                InputRuleCode::new("bucket.not_ipv4").unwrap(),
-                InputPredicate::NotIpv4,
-            ))
-            .validate()
-            .unwrap(),
-    );
-    let id = ResourceId::with_provider_identity("mock", "Bucket", "bucket", None);
-    let mut plan = Plan::new();
-    plan.add(Effect::Delete {
-        id: ResolvedResourceId::new(id.clone()),
-        identifier: AppliedIdentifier::new("old-bucket").unwrap(),
-        generation: EffectGeneration::Current,
-        directives: Default::default(),
-        binding: None,
-        dependencies: Default::default(),
-        explicit_dependencies: Default::default(),
-        blocked_by_updates: Default::default(),
-    });
-    let resource = Resource::from_id(id).with_attribute(
-        "name",
-        Value::Deferred(DeferredValue::Unknown(
-            crate::resource::ApplyTimeUnknown::PendingReRead(
-                crate::resource::PendingReRead::not_found(),
-            ),
-        )),
-    );
-    plan.add(Effect::Create(
-        ResolvedResource::resolve_raw_fixture(resource, &schemas).unwrap(),
-    ));
-    let checked = crate::input_rules::FinalizedPlan::new(plan)
-        .check_inputs(&schemas, &HashMap::new())
-        .unwrap();
-    let provider = MockProvider::new();
-    let input = ExecutionInput {
-        plan: &checked,
-        provider_context: crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-        provider_check_inputs: ProviderCheckInputs::Authored,
-        compositions: &[],
-        bindings: Default::default(),
-        managed_current: HashMap::new(),
-        data_source_values: ExecutableDataSourceValues::empty(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &schemas,
-        parallelism: TEST_UNCAPPED,
-        precompleted_success_count: 0,
-        checkpoint_sink: ExecutionCheckpointSink::noop(),
-    };
-    let outcome = execute_plan(
-        &provider,
-        input,
-        &MockObserver::new(),
-        ShutdownToken::running(),
-    )
-    .await;
-    let ExecutionOutcome::Completed(result) = outcome else {
-        panic!("pending admission is a failure, not cancellation")
-    };
-    assert_eq!(result.success_count, 0);
-    assert_eq!(result.failure_count(), 1);
-    let EffectFailureKind::Execution { error } = result.failures()[0].kind() else {
-        panic!("expected typed pending failure")
-    };
-    assert!(
-        error
-            .as_error()
-            .downcast_ref::<crate::input_rules::InputCheckPending>()
-            .is_some()
-    );
-    assert!(provider.call_log.lock().unwrap().is_empty());
-}
 use crate::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
     ProviderError, ProviderReadyDataSource, ProviderResult, ReadOutcome, ReadRequest,
@@ -646,6 +563,7 @@ enum ClassifiedCreateFixture {
 }
 
 enum ResumeFixture {
+    Resent,
     Resumed,
     Partial,
     IdentifierReportedFound,
@@ -868,12 +786,38 @@ impl Provider for MockProvider {
         &self,
         request: crate::provider::ResumeCreateRequest,
     ) -> BoxFuture<'_, Result<crate::provider::ResumeOutcome, crate::provider::ResumeFailure>> {
+        let call_log = Arc::clone(&self.call_log);
+        let create_resources = Arc::clone(&self.create_resources);
         let result = {
             let mut results = self.resume_results.lock().unwrap();
             (!results.is_empty()).then(|| results.remove(0))
         };
         Box::pin(async move {
             match result.expect("unexpected resume_create") {
+                ResumeFixture::Resent => {
+                    let id = request.id().clone();
+                    let (resume, create) = request.into_parts();
+                    let crate::provider::Resume::Unissued(attempt) = resume else {
+                        return Err(resume.preserve(ProviderError::internal(
+                            "resent fixture requires an unissued continuation",
+                        )));
+                    };
+                    call_log
+                        .lock()
+                        .unwrap()
+                        .push(("create".into(), id.to_string()));
+                    create_resources
+                        .lock()
+                        .unwrap()
+                        .push(create.resource().as_resource().clone());
+                    Ok(attempt
+                        .resend()
+                        .issued(
+                            AppliedIdentifier::new("resent-id").unwrap(),
+                            crate::provider::Sent::AllRequestAttributes,
+                        )
+                        .succeeded(create.resource().as_resource().resolved_attributes()))
+                }
                 ResumeFixture::Resumed => {
                     let (resume, _create_request) = request.into_parts();
                     let crate::provider::Resume::Issued(resumed) = resume else {
@@ -995,6 +939,7 @@ impl Provider for MockProvider {
         id: &ResourceId,
         _identifier: &crate::provider::AppliedIdentifier,
         request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         let id_str = id.to_string();
         self.call_log
@@ -1738,6 +1683,7 @@ impl Provider for DelayedCountingProvider {
         id: &ResourceId,
         _identifier: &crate::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         let id = id.clone();
         let started = self.started.clone();
@@ -1854,6 +1800,7 @@ impl Provider for PendingWaitProvider {
         _id: &ResourceId,
         _identifier: &crate::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("update not used")) })
     }
@@ -2091,6 +2038,7 @@ impl Provider for PendingRefreshProvider {
         _id: &ResourceId,
         _identifier: &crate::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::api_error("update failed")) })
     }
@@ -2183,6 +2131,7 @@ impl Provider for CheckpointBlockingProvider {
         _id: &ResourceId,
         _identifier: &AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("update not used")) })
     }
@@ -2273,6 +2222,7 @@ impl Provider for ControlledReadyCreateProvider {
         _id: &ResourceId,
         _identifier: &crate::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("update not used")) })
     }
@@ -8724,6 +8674,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
             _id: &ResourceId,
             _identifier: &crate::provider::AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: crate::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not implemented")) })
         }
@@ -8866,6 +8817,7 @@ impl Provider for YieldingUpdateProvider {
         id: &ResourceId,
         identifier: &crate::provider::AppliedIdentifier,
         request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.clone();
@@ -9768,6 +9720,7 @@ impl Provider for RecordingMockProvider {
         _id: &ResourceId,
         _identifier: &crate::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
@@ -9891,6 +9844,7 @@ impl Provider for CascadeReplaceProvider {
         _id: &ResourceId,
         _identifier: &crate::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("update not used")) })
     }
@@ -11090,6 +11044,7 @@ impl Provider for IdentifierAwareProvider {
         _id: &ResourceId,
         _identifier: &crate::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
         Box::pin(async move { Err(ProviderError::api_error("update not expected")) })
     }
@@ -12028,6 +11983,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
             _id: &ResourceId,
             _identifier: &crate::provider::AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: crate::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("update not used")) })
         }

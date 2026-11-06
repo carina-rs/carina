@@ -4115,6 +4115,26 @@ impl ResumeFailure {
     }
 }
 
+/// Provider-facing update witness, minted only when dispatch consumes the
+/// exact request that passed input discharge. It cannot be copied or forged.
+///
+/// ```compile_fail,E0624
+/// use carina_core::provider::UpdateAttempt;
+/// let attempt = UpdateAttempt::new();
+/// ```
+/// ```compile_fail,E0423
+/// use carina_core::provider::UpdateAttempt;
+/// let attempt = UpdateAttempt(());
+/// ```
+#[derive(Debug)]
+pub struct UpdateAttempt(());
+
+impl UpdateAttempt {
+    pub(crate) fn new() -> Self {
+        Self(())
+    }
+}
+
 /// Provider-facing initial-create witness. Its constructor is core-private;
 /// implementations can only consume the value supplied by the executor.
 ///
@@ -4132,8 +4152,15 @@ impl ResumeFailure {
 ///     error: ProviderError,
 /// ) -> CreateFailure {
 ///     let _issued = attempt.issued(identifier, Sent::AllRequestAttributes);
-///     CreateAttempt::new(ResourceId::new("p", "t", "n")).0.not_created(error)
+///     CreateAttempt::new(ResourceId::with_provider_identity("p", "t", "n", None)).0.not_created(error)
 /// }
+/// ```
+///
+/// Test utilities do not expose a witness constructor either:
+///
+/// ```compile_fail,E0599
+/// use carina_core::{provider::CreateAttempt, resource::ResourceId};
+/// let attempt = CreateAttempt::for_test(ResourceId::with_provider_identity("p", "t", "n", None));
 /// ```
 #[derive(Debug)]
 pub struct CreateAttempt {
@@ -4153,13 +4180,6 @@ impl CreateAttempt {
             },
             CreateCallCancellationReceiver { receiver },
         )
-    }
-
-    /// Construct an initial-create witness in cross-crate tests.
-    #[cfg(feature = "test-utils")]
-    #[doc(hidden)]
-    pub fn for_test(id: ResourceId) -> Self {
-        Self::new(id).0
     }
 
     pub fn not_created(self, error: ProviderError) -> CreateFailure {
@@ -5245,11 +5265,23 @@ pub trait Provider: Send + Sync {
     /// used for read-modify-write paths or for resolving
     /// server-assigned identifiers; it MUST NOT be used to derive
     /// additional fields to write back.
+    ///
+    /// A raw request cannot be dispatched without the core-minted witness:
+    ///
+    /// ```compile_fail,E0061
+    /// use carina_core::provider::{AppliedIdentifier, Provider, UpdateRequest};
+    /// use carina_core::resource::ResourceId;
+    /// fn bypass(provider: &dyn Provider, id: &ResourceId,
+    ///           identifier: &AppliedIdentifier, request: UpdateRequest) {
+    ///     let _ = provider.update(id, identifier, request);
+    /// }
+    /// ```
     fn update(
         &self,
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        attempt: UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>>;
 
     /// Delete an existing resource. `identifier` is the cloud-side
@@ -6255,6 +6287,7 @@ impl Provider for ComparisonFixtureProvider {
         _id: &ResourceId,
         _identifier: &AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         Box::pin(async { panic!("comparison fixture must not dispatch update") })
     }
@@ -6523,9 +6556,10 @@ impl Provider for ProviderRouter {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        attempt: UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         match self.get_provider_or_error(id) {
-            Ok(provider) => provider.update(id, identifier, request),
+            Ok(provider) => provider.update(id, identifier, request, attempt),
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
@@ -8277,8 +8311,9 @@ impl Provider for Box<dyn Provider> {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        attempt: UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
-        (**self).update(id, identifier, request)
+        (**self).update(id, identifier, request, attempt)
     }
 
     fn delete(
@@ -10988,6 +11023,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             id: &ResourceId,
             identifier: &AppliedIdentifier,
             request: UpdateRequest,
+            _attempt: crate::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             let id = id.clone();
             let identifier = identifier.clone();
@@ -11369,6 +11405,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             _id: &ResourceId,
             _identifier: &AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: crate::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not supported")) })
         }
@@ -11481,12 +11518,13 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     async fn mock_provider_create_returns_existing() {
         let provider = MockProvider;
         let resource = Resource::new("test", "example");
-        let id = resource.id.clone();
-        let (create, _cancellation) = crate::executor::dispatch_create(
-            &provider,
-            &id,
-            CreateRequest::checked(resolved_for_test(resource)),
-        );
+        let prepared = crate::differ::finalize_bootstrap_create(CreateRequest::checked(
+            resolved_for_test(resource),
+        ))
+        .check_inputs(&SchemaRegistry::new(), &HashMap::new())
+        .expect("fixture inputs discharge");
+        let (create, _cancellation) =
+            crate::executor::dispatch_prepared_create(&provider, prepared);
         let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
@@ -11553,12 +11591,12 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let resource = Resource::with_provider("mock", "test", "example", None);
-        let id = resource.id.clone();
-        let (create, _cancellation) = crate::executor::dispatch_create(
-            &router,
-            &id,
-            CreateRequest::checked(resolved_for_test(resource)),
-        );
+        let prepared = crate::differ::finalize_bootstrap_create(CreateRequest::checked(
+            resolved_for_test(resource),
+        ))
+        .check_inputs(&SchemaRegistry::new(), &HashMap::new())
+        .expect("fixture inputs discharge");
+        let (create, _cancellation) = crate::executor::dispatch_prepared_create(&router, prepared);
         let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
@@ -12957,8 +12995,10 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             .expect("fixture has no ignored write-only paths");
         let identifier =
             AppliedIdentifier::new("mock-id-123").expect("fixture identifier is non-empty");
-        let state = router
-            .update(&id, &identifier, request)
+        let prepared = crate::differ::finalize_update_request(identifier.clone(), request)
+            .check_inputs(&SchemaRegistry::new(), &HashMap::new())
+            .expect("fixture inputs discharge");
+        let state = crate::executor::dispatch_prepared_update(&router, &identifier, prepared)
             .await
             .unwrap()
             .into_state_for_writeback();
@@ -13037,6 +13077,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             _id: &ResourceId,
             _identifier: &AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: crate::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not supported")) })
         }
@@ -13669,6 +13710,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
                 id: &ResourceId,
                 identifier: &AppliedIdentifier,
                 _request: UpdateRequest,
+                _attempt: crate::provider::UpdateAttempt,
             ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
                 let id = id.clone();
                 let identifier = identifier.to_string();

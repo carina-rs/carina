@@ -136,6 +136,13 @@ impl PairedInputDelete {
 ///     let _ = applicable.evaluate();
 /// }
 /// ```
+/// The executor constructor requires discharge authority and is inaccessible
+/// outside core.
+///
+/// ```compile_fail
+/// use carina_core::input_rules::executor_write_site;
+/// use carina_core::executor::input_discharge::DischargeToken;
+/// ```
 pub struct WriteSite<'a> {
     target: Option<InputEffectTarget>,
     resource_id: &'a ResourceId,
@@ -178,6 +185,12 @@ pub struct ApplicableInputRule<'s, 'a> {
 }
 
 impl ApplicableInputRule<'_, '_> {
+    pub(crate) fn path(&self) -> &InputPath {
+        self.rule.path()
+    }
+    pub(crate) fn code(&self) -> &InputRuleCode {
+        self.rule.code()
+    }
     pub fn evaluate(&self) -> InputVerdict {
         verdict(self.site, self.rule)
     }
@@ -191,6 +204,12 @@ enum WriteSiteSource<'a, S> {
         types: Option<&'a TypeFacts>,
     },
     Authored(&'a crate::resource::Resource),
+    Executor {
+        authority: &'a crate::executor::input_discharge::DischargeToken,
+        admission: &'a PendingInputObligation,
+        resource_id: &'a ResourceId,
+        attributes: &'a IndexMap<String, Value>,
+    },
 }
 
 /// The sole classifier and constructor of desired write sites. Current is
@@ -200,7 +219,12 @@ fn classify_write_site<'a, S>(
     source: WriteSiteSource<'a, S>,
     schemas: &'a SchemaRegistry,
 ) -> Option<WriteSite<'a>> {
+    let executor_admission = match &source {
+        WriteSiteSource::Executor { admission, .. } => Some(*admission),
+        _ => None,
+    };
     let (types, authored) = match &source {
+        WriteSiteSource::Executor { .. } => (None, None),
         WriteSiteSource::Authored(resource) => (
             None,
             Some(AuthoredAttributes::Resource(&resource.attributes)),
@@ -224,6 +248,21 @@ fn classify_write_site<'a, S>(
         }
     };
     let (target, resource_id, attributes, context, paired_deletes) = match source {
+        WriteSiteSource::Executor {
+            authority,
+            admission,
+            resource_id,
+            attributes,
+        } => {
+            let _ = authority;
+            (
+                Some(admission.target.clone()),
+                resource_id,
+                Some(attributes),
+                admission.context,
+                admission.paired_deletes.clone(),
+            )
+        }
         WriteSiteSource::Authored(resource) => (
             None,
             &resource.id,
@@ -345,16 +384,23 @@ fn classify_write_site<'a, S>(
             )
         }
     };
-    let schema = schemas
-        .get(
-            &resource_id.provider,
-            &resource_id.resource_type,
-            SchemaKind::Resource,
-        )?
-        .schema();
-    let mut rules = schema
-        .as_schema()
-        .input_rules()
+    let schema = match executor_admission {
+        Some(admission) => admission.schema.as_ref(),
+        None => schemas
+            .get(
+                &resource_id.provider,
+                &resource_id.resource_type,
+                SchemaKind::Resource,
+            )?
+            .schema(),
+    };
+    // Discharge must consume the declarations that were admitted. A changed
+    // registry cannot erase an obligation or change its optional-path meaning.
+    let declarations = executor_admission.map_or_else(
+        || schema.as_schema().input_rules(),
+        |admission| admission.rules.as_slice(),
+    );
+    let mut rules = declarations
         .iter()
         .filter(|rule| {
             // Exhaustive in both scope and write context: adding either requires a
@@ -410,6 +456,8 @@ pub struct PendingInputObligation {
     target: InputEffectTarget,
     rules: Vec<InputRule<Compiled>>,
     paired_deletes: Vec<PairedInputDelete>,
+    context: InputWriteContext,
+    schema: Arc<ValidatedResourceSchema>,
 }
 
 impl PendingInputObligation {
@@ -548,6 +596,7 @@ impl<S> FinalizedPlan<S> {
     ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>> {
         let mut diagnostics = Vec::new();
         let mut pending = Vec::new();
+        let mut write_checks = Vec::new();
         for index in 0..self.plan.effects().len() {
             let Some(view) = classify_write_site(
                 WriteSiteSource::Finalized {
@@ -563,6 +612,17 @@ impl<S> FinalizedPlan<S> {
             let resource_id = view.resource_id;
             let context = view.context;
             let mut undecided = Vec::new();
+            // Normalization can change even statically proven values. Retain
+            // the classified authority for rechecking the exact wire request.
+            if !view.rules.is_empty() {
+                write_checks.push(PendingInputObligation {
+                    target: view.target.clone().expect("finalized slot"),
+                    rules: view.rules.iter().map(|rule| (*rule).clone()).collect(),
+                    paired_deletes: view.paired_deletes.clone(),
+                    context,
+                    schema: Arc::new(view.schema.clone()),
+                });
+            }
             for applicable in view.applicable_rules() {
                 let rule = applicable.rule;
                 match applicable.evaluate() {
@@ -586,6 +646,8 @@ impl<S> FinalizedPlan<S> {
                         .expect("finalized sites carry an exact effect slot"),
                     rules: undecided,
                     paired_deletes: view.paired_deletes,
+                    context,
+                    schema: Arc::new(view.schema.clone()),
                 });
             }
         }
@@ -635,7 +697,10 @@ impl<S> FinalizedPlan<S> {
         } else {
             Ok(InputCheckedPlan {
                 plan: self.plan,
-                pending,
+                obligations: Box::new(InputObligations {
+                    pending,
+                    write_checks,
+                }),
             })
         }
     }
@@ -923,7 +988,13 @@ fn project_known_value<P: crate::resource::ValueKind, B: crate::resource::Bindin
 #[derive(Debug, Clone)]
 pub struct InputCheckedPlan<S = ModuleSource> {
     plan: Plan<S>,
+    obligations: Box<InputObligations>,
+}
+
+#[derive(Debug, Clone)]
+struct InputObligations {
     pending: Vec<PendingInputObligation>,
+    write_checks: Vec<PendingInputObligation>,
 }
 
 impl<S> Deref for InputCheckedPlan<S> {
@@ -934,14 +1005,17 @@ impl<S> Deref for InputCheckedPlan<S> {
 }
 
 impl<S> InputCheckedPlan<S> {
+    pub(crate) fn execution_input_checks(&self) -> Vec<PendingInputObligation> {
+        self.obligations.write_checks.clone()
+    }
     pub fn plan(&self) -> &Plan<S> {
         &self.plan
     }
     pub fn pending_inputs(&self) -> &[PendingInputObligation] {
-        &self.pending
+        &self.obligations.pending
     }
     pub fn ensure_inputs_ready(&self) -> Result<(), InputCheckPending> {
-        if self.pending.is_empty() {
+        if self.obligations.pending.is_empty() {
             Ok(())
         } else {
             Err(InputCheckPending)
@@ -949,7 +1023,7 @@ impl<S> InputCheckedPlan<S> {
     }
     pub(crate) fn pending_rows(&self, effect_index: usize) -> Vec<crate::detail_rows::DetailRow> {
         let mut paths: BTreeMap<InputPath, Vec<InputRuleCode>> = BTreeMap::new();
-        for obligation in &self.pending {
+        for obligation in &self.obligations.pending {
             if obligation.target.effect_index == effect_index {
                 for rule in &obligation.rules {
                     paths
@@ -968,6 +1042,29 @@ impl<S> InputCheckedPlan<S> {
             })
             .collect()
     }
+}
+
+/// Only executor discharge can supply this unforgeable constructor token.
+///
+/// ```compile_fail
+/// use carina_core::input_rules::executor_write_site;
+/// ```
+pub(crate) fn executor_write_site<'a>(
+    authority: &'a crate::executor::input_discharge::DischargeToken,
+    admission: &'a PendingInputObligation,
+    resource_id: &'a ResourceId,
+    attributes: &'a IndexMap<String, Value>,
+    schemas: &'a SchemaRegistry,
+) -> Option<WriteSite<'a>> {
+    classify_write_site::<ModuleSource>(
+        WriteSiteSource::Executor {
+            authority,
+            admission,
+            resource_id,
+            attributes,
+        },
+        schemas,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

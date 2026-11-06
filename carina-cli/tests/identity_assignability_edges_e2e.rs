@@ -478,6 +478,7 @@ impl Provider for OutputMock {
         _: &ResourceId,
         _: &AppliedIdentifier,
         _: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         Box::pin(async { unreachable!("this fixture never updates") })
     }

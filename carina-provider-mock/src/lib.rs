@@ -421,6 +421,11 @@ pub fn estimated_input_rule_schema() -> ResourceSchema {
     ResourceSchema::new("test.estimated_input")
         .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
         .attribute(
+            AttributeSchema::optional("generation", AttributeType::int())
+                .create_only()
+                .build(),
+        )
+        .attribute(
             AttributeSchema::provider_populated(
                 "short_part",
                 AttributeType::refined_string(
@@ -1753,6 +1758,7 @@ impl Provider for MockProvider {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.as_str().to_string();
@@ -2028,8 +2034,12 @@ mod tests {
                 let request =
                     carina_core::executor::prepare_create_request(resource, &preparation).await;
                 let request = request.expect("mock test resource should pass create preparation");
+                assert_eq!(request.resource().id, id);
+                let prepared = carina_core::differ::finalize_bootstrap_create(request)
+                    .check_inputs(&schemas, &std::collections::HashMap::new())
+                    .expect("fixture inputs discharge");
                 let (create, _cancellation) =
-                    carina_core::executor::dispatch_create(provider, &id, request);
+                    carina_core::executor::dispatch_prepared_create(provider, prepared);
                 create.await
             },
         )
@@ -3000,10 +3010,17 @@ mod tests {
                     let request = request.expect("update request should pass checked preparation");
                     let identifier = AppliedIdentifier::new("mock-id")
                         .expect("the mock identifier is non-empty");
-                    provider
-                        .update(&id, &identifier, request)
-                        .await
-                        .expect("update should succeed");
+                    let prepared =
+                        carina_core::differ::finalize_update_request(identifier.clone(), request)
+                            .check_inputs(&schemas, &std::collections::HashMap::new())
+                            .expect("fixture inputs discharge");
+                    carina_core::executor::dispatch_prepared_update(
+                        &provider,
+                        &identifier,
+                        prepared,
+                    )
+                    .await
+                    .expect("update should succeed");
 
                     provider
                         .delete(&id, &identifier, delete_request_without_schema())

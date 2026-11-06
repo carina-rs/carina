@@ -416,6 +416,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &carina_core::provider::AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: carina_core::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             unreachable!("import path must not call update")
         }

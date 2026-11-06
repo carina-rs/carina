@@ -231,11 +231,43 @@ impl PendingCascadePlan {
 /// exists. Its payload has already crossed provider preparation; no raw
 /// resource or general effect can use this trusted bootstrap entry point.
 pub fn finalize_bootstrap_create(
-    request: &crate::provider::CreateRequest,
-) -> crate::input_rules::FinalizedPlan<crate::resource::ProviderModuleSource> {
+    request: crate::provider::CreateRequest,
+) -> crate::executor::FinalizedWrite<crate::provider::CreateRequest> {
     let mut plan = Plan::default();
     plan.add(Effect::Create(request.resource().as_inner().clone()));
-    crate::input_rules::FinalizedPlan::new(plan)
+    crate::executor::FinalizedWrite::new(request, plan)
+}
+
+/// Finalize an already provider-ready update, retaining its exact patch for
+/// input discharge. Only sent values enter admission; current state is never
+/// treated as desired input.
+pub fn finalize_update_request(
+    identifier: crate::provider::AppliedIdentifier,
+    request: crate::provider::UpdateRequest,
+) -> crate::executor::FinalizedWrite<crate::provider::UpdateRequest> {
+    let mut desired = Resource::from_id(request.from().id.clone());
+    desired.attributes = request
+        .patch()
+        .ops
+        .iter()
+        .filter_map(|op| {
+            op.sent_value()
+                .map(|value| (op.key().to_owned(), value.clone()))
+        })
+        .collect();
+    let mut plan = Plan::default();
+    plan.add(Effect::Update {
+        from: Box::new(request.from().clone()),
+        identifier,
+        to: ResolvedResource::new(desired.into()),
+        changed_attributes: request
+            .patch()
+            .ops
+            .iter()
+            .map(|op| op.key().to_owned())
+            .collect(),
+    });
+    crate::executor::FinalizedWrite::new(request, plan)
 }
 
 fn add_key_releases(plan: &mut Plan, id: &ResourceId, releases: Vec<PlannedListKeyRelease>) {

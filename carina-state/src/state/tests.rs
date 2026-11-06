@@ -10,6 +10,121 @@ use carina_core::schema::{
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+// Capture an attempt only after a real provider-ready request has passed
+// admission and discharge. This helper is private to state writeback tests.
+fn create_attempt_for_test(id: ResourceId) -> carina_core::provider::CreateAttempt {
+    use carina_core::provider::*;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    struct CaptureAttempt(std::sync::Mutex<Option<CreateAttempt>>);
+
+    impl Provider for CaptureAttempt {
+        fn name(&self) -> &str {
+            "capture-attempt"
+        }
+        fn read(
+            &self,
+            _: &ResourceId,
+            _: &AppliedIdentifier,
+            _: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+            panic!("unexpected fixture read")
+        }
+        fn read_data_source(
+            &self,
+            _: &ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::resource::State>> {
+            panic!("unexpected fixture data-source read")
+        }
+        fn create(
+            &self,
+            _: &ResourceId,
+            _: CreateRequest,
+            attempt: CreateAttempt,
+        ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+            *self.0.lock().unwrap() = Some(attempt);
+            Box::pin(std::future::pending())
+        }
+        fn resume_create(
+            &self,
+            _: ResumeCreateRequest,
+        ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
+            panic!("unexpected fixture resume")
+        }
+        fn update(
+            &self,
+            _: &ResourceId,
+            _: &AppliedIdentifier,
+            _: UpdateRequest,
+            _: UpdateAttempt,
+        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+            panic!("unexpected fixture update")
+        }
+        fn delete(
+            &self,
+            _: &ResourceId,
+            _: &AppliedIdentifier,
+            _: DeleteRequest,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            panic!("unexpected fixture delete")
+        }
+        fn required_permissions(
+            &self,
+            _: &ResourceId,
+            _: carina_core::effect::PlanOp,
+        ) -> ProviderResult<Vec<String>> {
+            panic!("unexpected fixture permissions")
+        }
+    }
+
+    fn ready<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("fixture preparation must complete synchronously"),
+        }
+    }
+
+    let provider = CaptureAttempt(std::sync::Mutex::new(None));
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+    let schemas = carina_core::schema::SchemaRegistry::new();
+    carina_core::validation::deferred_types::with_session_for_test(
+        &carina_core::parser::LoadedProviderContext::empty_for_test(),
+        |type_checks| {
+            let preparation = carina_core::executor::ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                &NoopNormalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let request = ready(carina_core::executor::prepare_create_request(
+                Resource::from_id(id),
+                &preparation,
+            ))
+            .expect("fixture passes provider preparation");
+            let prepared = carina_core::differ::finalize_bootstrap_create(request)
+                .check_inputs(&schemas, &HashMap::new())
+                .expect("fixture inputs discharge");
+            let (create, _cancellation) =
+                carina_core::executor::dispatch_prepared_create(&provider, prepared);
+            let mut create = std::pin::pin!(create);
+            assert!(
+                create
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+        },
+    );
+    provider.0.into_inner().unwrap().unwrap()
+}
+
 fn published_exports_from_state(state: &StateFile) -> PublishedExports {
     let bytes = carina_core::utils::pretty_with_newline_bytes(state)
         .expect("test state must serialize with the state writer encoding");
@@ -7833,8 +7948,8 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
 #[test]
 fn resumed_persisted_create_records_nested_write_only_sent_values() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateAttempt, CreateObservation, IdentifiedCreate,
-        PendingToken, PersistedAttributes, Sent,
+        AppliedIdentifier, AppliedState, CreateObservation, IdentifiedCreate, PendingToken,
+        PersistedAttributes, Sent,
     };
 
     let (resource, schema) = nested_write_only_state_fixture("resumed-secret");
@@ -7852,7 +7967,7 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
         sent_config,
     )]))
     .unwrap();
-    let pending = CreateAttempt::for_test(resource.id.clone())
+    let pending = create_attempt_for_test(resource.id.clone())
         .issued(identifier.clone(), Sent::AllRequestAttributes)
         .pending(PendingToken::new("resume-token"), 1)
         .persist(PersistedAttributes::default(), sent_secrets);
@@ -7901,14 +8016,14 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
 #[test]
 fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateAttempt, CreateObservation, IdentifiedCreate,
+        AppliedIdentifier, AppliedState, CreateObservation, IdentifiedCreate,
         PartialReadDiagnostic, PendingToken, PersistedAttributes, Sent,
     };
 
     for key in ["computed\x1b[2J".to_string(), "x".repeat(9000)] {
         let resource = Resource::with_provider("mock", "test.Widget", "example", None);
         let identifier = AppliedIdentifier::new("persisted-id").unwrap();
-        let pending = CreateAttempt::for_test(resource.id.clone())
+        let pending = create_attempt_for_test(resource.id.clone())
             .issued(identifier.clone(), Sent::AllRequestAttributes)
             .pending(PendingToken::new("persisted-token"), 1)
             .persist(
@@ -7956,7 +8071,7 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
 #[test]
 fn resumed_partial_create_records_exact_missing_attributes() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateAttempt, CreateObservation, IdentifiedCreate,
+        AppliedIdentifier, AppliedState, CreateObservation, IdentifiedCreate,
         PartialReadDiagnostic, PendingToken, PersistedAttributes, Sent, SentRecord,
     };
 
@@ -7965,7 +8080,7 @@ fn resumed_partial_create_records_exact_missing_attributes() {
         Value::Concrete(ConcreteValue::String("example".into())),
     );
     let identifier = AppliedIdentifier::new("persisted-id").unwrap();
-    let pending = CreateAttempt::for_test(resource.id.clone())
+    let pending = create_attempt_for_test(resource.id.clone())
         .issued(identifier.clone(), Sent::AllRequestAttributes)
         .pending(PendingToken::new("persisted-token"), 1)
         .persist(
@@ -8028,8 +8143,8 @@ fn resumed_partial_create_records_exact_missing_attributes() {
 #[test]
 fn unobserved_not_found_create_records_identifier_and_partial_read() {
     use carina_core::provider::{
-        AppliedIdentifier, CreateAttempt, CreateFailureKind, CreateObservation, Observation,
-        ProviderError, ReadOutcome, Sent, UnobservedReason,
+        AppliedIdentifier, CreateFailureKind, CreateObservation, Observation, ProviderError,
+        ReadOutcome, Sent, UnobservedReason,
     };
 
     let resource = Resource::with_provider("awscc", "logs.LogGroup", "logs", None).with_attribute(
@@ -8037,7 +8152,7 @@ fn unobserved_not_found_create_records_identifier_and_partial_read() {
         Value::Concrete(ConcreteValue::String("application-logs".into())),
     );
     let identifier = AppliedIdentifier::new("application-logs").unwrap();
-    let failure = CreateAttempt::for_test(resource.id.clone())
+    let failure = create_attempt_for_test(resource.id.clone())
         .issued(identifier.clone(), Sent::only(Vec::<String>::new()))
         .identifier_reported(
             Observation::Read(ReadOutcome::not_found(resource.id.clone())),
@@ -8098,7 +8213,7 @@ fn unobserved_not_found_create_records_identifier_and_partial_read() {
 #[test]
 fn unobserved_read_failed_observation_records_identifier_and_provider_error_detail() {
     use carina_core::provider::{
-        AppliedIdentifier, CreateAttempt, CreateFailureKind, Observation, ProviderError, Sent,
+        AppliedIdentifier, CreateFailureKind, Observation, ProviderError, Sent,
     };
 
     let resource = Resource::with_provider("awscc", "logs.LogGroup", "logs", None).with_attribute(
@@ -8108,7 +8223,7 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
     let identifier = AppliedIdentifier::new("application-logs").unwrap();
     let read_error = ProviderError::api_error("read-back access denied");
     let read_error_display = read_error.to_string();
-    let failure = CreateAttempt::for_test(resource.id.clone())
+    let failure = create_attempt_for_test(resource.id.clone())
         .issued(identifier, Sent::only(Vec::<String>::new()))
         .identifier_reported(
             Observation::ReadFailed(read_error),
@@ -8156,9 +8271,8 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
 fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappers() {
     use carina_core::differ::Diff;
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateAttempt, CreateFailureKind, CreateObservation,
-        IdentifiedCreate, Observation, PendingToken, PersistedAttributes, ProviderError,
-        ReadOutcome, Sent,
+        AppliedIdentifier, AppliedState, CreateFailureKind, CreateObservation, IdentifiedCreate,
+        Observation, PendingToken, PersistedAttributes, ProviderError, ReadOutcome, Sent,
     };
     use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
     use carina_core::schema::SchemaRegistry;
@@ -8265,7 +8379,7 @@ fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrap
                 sent_actions,
             )]))
             .unwrap();
-            let pending = CreateAttempt::for_test(resource.id.clone())
+            let pending = create_attempt_for_test(resource.id.clone())
                 .issued(identifier.clone(), Sent::AllRequestAttributes)
                 .pending(PendingToken::new(format!("resume-{wrapper}")), 1)
                 .persist(PersistedAttributes::default(), sent_secrets);
@@ -8275,7 +8389,7 @@ fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrap
                 CreateObservation::Observed(observed_state()),
             )
         } else {
-            let failed = CreateAttempt::for_test(resource.id.clone())
+            let failed = create_attempt_for_test(resource.id.clone())
                 .issued(identifier.clone(), Sent::AllRequestAttributes)
                 .identifier_reported(
                     Observation::Read(ReadOutcome::found(observed_state())),

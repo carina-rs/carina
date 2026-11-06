@@ -3416,6 +3416,7 @@ mod historical_display_tests {
             _: &ResourceId,
             _: &carina_core::provider::AppliedIdentifier,
             _: carina_core::provider::UpdateRequest,
+            _attempt: carina_core::provider::UpdateAttempt,
         ) -> carina_core::provider::BoxFuture<
             '_,
             carina_core::provider::ProviderResult<carina_core::provider::UpdateOutcome>,
@@ -4567,10 +4568,7 @@ mod managed_current_serde_tests {
         ReloadedCurrentStateEntry, SavedManagedCurrent, SavedManagedCurrentKind,
     };
     use carina_core::effect::UnresolvedSavedEffect;
-    use carina_core::provider::{
-        AppliedIdentifier, CreateAttempt, CreateFailureKind, EgressSent, ProviderError, Sent,
-        UnknownCreateOutcome,
-    };
+    use carina_core::provider::{AppliedIdentifier, ProviderError, Sent, UnknownCreateOutcome};
     use carina_core::resource::{
         Current, ResolvedResource, Resource, ResourceId, State, fixture_present_current,
     };
@@ -4629,14 +4627,7 @@ mod managed_current_serde_tests {
     }
 
     fn unknown_outcome(id: ResourceId) -> UnknownCreateOutcome {
-        let failure = CreateAttempt::for_test(id).outcome_unknown(
-            EgressSent::for_test(),
-            ProviderError::api_error("guest trapped"),
-        );
-        let CreateFailureKind::OutcomeUnknown { unknown, .. } = failure.into_kind() else {
-            panic!("the egress witness must mint an unknown outcome")
-        };
-        unknown
+        crate::fixture_unknown_create_outcome(&id, ProviderError::api_error("guest trapped"))
     }
 
     #[test]

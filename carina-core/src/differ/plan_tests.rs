@@ -1190,6 +1190,7 @@ impl crate::provider::Provider for HintProvider {
         _id: &ResourceId,
         _identifier: &crate::provider::AppliedIdentifier,
         _request: crate::provider::UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> crate::provider::BoxFuture<
         '_,
         crate::provider::ProviderResult<crate::provider::UpdateOutcome>,

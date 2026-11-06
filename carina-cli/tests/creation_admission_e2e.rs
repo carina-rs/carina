@@ -55,6 +55,67 @@ fn text(output: &Output) -> String {
 }
 
 #[test]
+fn live_input_discharge_multifile_runtime_violation_preserves_replaced_resource() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.path().join("values.crn"), "").unwrap();
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        "let legacy = mock.test.estimated_input { name = 'valid-name' generation = 1 }\n",
+    )
+    .unwrap();
+    let output = fixture.run(&["apply", "--auto-approve", "--lock=false"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let before: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.0.path().join("mock-state.json")).unwrap())
+            .unwrap();
+    fs::write(fixture.0.path().join("op.log"), "").unwrap();
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        "let producer = mock.test.resource { name = 'long-apply-only-identifier' }\n\
+         let legacy = mock.test.estimated_input { name = producer.identifier generation = 2 }\n",
+    )
+    .unwrap();
+    let output = fixture.run(&["apply", "--auto-approve", "--lock=false"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        text(&output).contains("mock.name.length"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        !text(&output).contains("long-apply-only-identifier-id"),
+        "{}",
+        text(&output)
+    );
+    let operations = fs::read_to_string(fixture.0.path().join("op.log")).unwrap();
+    let creates: Vec<_> = operations
+        .lines()
+        .filter(|line| line.starts_with("create "))
+        .collect();
+    assert_eq!(
+        creates.len(),
+        1,
+        "only the prerequisite may mutate: {operations}"
+    );
+    assert!(creates[0].contains("producer"), "{operations}");
+    assert!(
+        !operations.lines().any(|line| line.starts_with("delete ")),
+        "{operations}"
+    );
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.0.path().join("mock-state.json")).unwrap())
+            .unwrap();
+    for (key, value) in before["states"].as_object().unwrap() {
+        assert_eq!(&after["states"][key], value, "old resource changed");
+    }
+    let saved = fs::read_to_string(fixture.0.path().join("carina.state.json")).unwrap();
+    assert!(
+        saved.contains("valid-name"),
+        "old resource must remain persisted"
+    );
+}
+
+#[test]
 fn refined_multifile_template_is_proven_during_plan() {
     let fixture = Fixture::new();
     fs::write(
@@ -183,7 +244,7 @@ fn validate_has_no_creation_findings_for_legacy_name() {
 }
 
 #[test]
-fn pending_inputs_saves_without_certificates_and_live_apply_stops_before_all_effects() {
+fn pending_inputs_saves_without_certificates_and_live_apply_discharges_before_create() {
     let fixture = Fixture::new();
     fs::write(fixture.0.path().join("main.crn"), "let suffix = mock.test.resource { name = 'suffix' }\nlet pending = mock.test.creation_constrained { name = suffix.identifier }\n").unwrap();
     let output = fixture.run(&["plan", "--refresh=false", "--out", "plan.json"]);
@@ -203,14 +264,27 @@ fn pending_inputs_saves_without_certificates_and_live_apply_stops_before_all_eff
         assert!(!saved.contains(field));
     }
     let output = fixture.run(&["apply", "--auto-approve", "--lock=false"]);
-    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
-    assert!(
-        text(&output).contains("input check pending; apply-time discharge not implemented"),
-        "{}",
-        text(&output)
+    assert!(output.status.success(), "{}", text(&output));
+    let operations = fs::read_to_string(fixture.0.path().join("op.log")).unwrap();
+    assert_eq!(
+        operations
+            .lines()
+            .filter(|line| line.starts_with("create "))
+            .collect::<Vec<_>>(),
+        [
+            "create test.resource.suffix",
+            "create test.creation_constrained.pending"
+        ],
+        "{operations}",
     );
-    assert!(!fixture.0.path().join("op.log").exists());
-    assert!(!fixture.0.path().join("carina.state.json").exists());
+    let provider_state: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.0.path().join("mock-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        provider_state["states"]["test.creation_constrained.pending"]["name"],
+        "suffix-id"
+    );
+    assert!(fixture.0.path().join("carina.state.json").exists());
 }
 
 #[test]

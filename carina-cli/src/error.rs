@@ -986,6 +986,8 @@ impl std::error::Error for AwsCredentialStartupError {}
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error(transparent)]
+    BootstrapInputDischarge(#[from] carina_core::executor::WriteInputError),
+    #[error(transparent)]
     InputCheckPending(#[from] carina_core::input_rules::InputCheckPending),
     #[error(transparent)]
     CommandInput(#[from] std::sync::Arc<CommandInputError>),

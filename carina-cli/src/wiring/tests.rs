@@ -756,6 +756,7 @@ impl Provider for RawEnumStateProvider {
         _id: &ResourceId,
         _identifier: &AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         Box::pin(async { panic!("raw enum test must not update") })
     }
@@ -4384,6 +4385,7 @@ impl Provider for CascadeCreateProvider {
         _id: &ResourceId,
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("update not used")) })
     }
@@ -4490,6 +4492,7 @@ impl Provider for ReadWithRetryProvider {
         id: &ResourceId,
         identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.to_string();
@@ -4790,15 +4793,8 @@ async fn read_with_retry_does_not_retry_not_found() {
 async fn outcome_unknown_refresh_preserves_managed_and_orphan_rows_without_provider_read() {
     let provider = ReadWithRetryProvider::new(ReadBehavior::Success);
     let id = ResourceId::with_provider_identity("test", "test.Resource", "unknown", None);
-    let failure = carina_core::provider::CreateAttempt::for_test(id.clone()).outcome_unknown(
-        carina_core::provider::EgressSent::for_test(),
-        ProviderError::api_error("guest trapped"),
-    );
-    let carina_core::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } =
-        failure.into_kind()
-    else {
-        panic!("the egress witness must mint an unknown outcome")
-    };
+    let unknown =
+        crate::fixture_unknown_create_outcome(&id, ProviderError::api_error("guest trapped"));
 
     let refreshed = refresh_loaded_resource_with_retry(
         &provider,
@@ -11752,6 +11748,7 @@ mod read_with_retry_identifier_tests {
             id: &ResourceId,
             identifier: &carina_core::provider::AppliedIdentifier,
             _request: carina_core::provider::UpdateRequest,
+            _attempt: carina_core::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             let id = id.clone();
             let identifier = identifier.to_string();
@@ -14321,6 +14318,7 @@ mod resolved_value_constraint_gate {
             _id: &ResourceId,
             _identifier: &carina_core::provider::AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: carina_core::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("unexpected update")) })
         }
@@ -15371,8 +15369,11 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                 let request = carina_core::executor::prepare_create_request(resource, &preparation)
                     .await
                     .unwrap();
+                let prepared = carina_core::differ::finalize_bootstrap_create(request)
+                    .check_inputs(ctx.schemas(), &HashMap::new())
+                    .expect("fixture inputs discharge");
                 let (create, cancellation) =
-                    carina_core::executor::dispatch_create(&provider, &id, request);
+                    carina_core::executor::dispatch_prepared_create(&provider, prepared);
                 create.await.unwrap();
                 drop(cancellation);
                 let identifier = carina_core::provider::AppliedIdentifier::new("mock-id").unwrap();

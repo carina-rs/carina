@@ -13,6 +13,7 @@
 
 pub(crate) mod basic;
 mod deferred_dispatch;
+pub(crate) mod input_discharge;
 pub mod normalized;
 #[cfg(test)]
 mod normalized_tests;
@@ -25,6 +26,7 @@ pub(super) mod scheduler;
 pub(crate) mod wait;
 
 pub use deferred_dispatch::{AnonymousIdentityCollisionSource, DeferredCreateFailure};
+pub use input_discharge::{DeletePermit, FinalizedWrite, PreparedWrite, WriteInputError};
 pub use parallel::classify_stalled_effects;
 pub use wait::StartMarker;
 
@@ -134,24 +136,54 @@ use parallel::execute_effects_sequential;
 
 pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 
-/// Prepare dispatch of an already checked create request while minting the
-/// unforgeable initial-attempt witness and its cancellation receiver inside
-/// core. The supervising caller must retain the receiver until the returned
-/// future settles. Executor-owned abandonment paths drain it before saving
-/// the cancellation classification.
-pub fn dispatch_create<'a, P: Provider + ?Sized>(
-    provider: &'a P,
-    id: &'a ResourceId,
-    request: CreateRequest,
+/// Scheduled create dispatch consumes its prepared request without rebuilding
+/// or normalizing it. Provider readiness alone cannot authorize this path.
+///
+/// The former raw dispatch entry point is unavailable outside core:
+///
+/// ```compile_fail,E0432
+/// use carina_core::executor::dispatch_create;
+/// ```
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::dispatch_prepared_create, provider::{Provider, CreateRequest}};
+/// fn bypass(provider: &dyn Provider, raw: CreateRequest) {
+///     let _ = dispatch_prepared_create(provider, raw);
+/// }
+/// ```
+pub fn dispatch_prepared_create<P: Provider + ?Sized>(
+    provider: &P,
+    prepared: PreparedWrite<CreateRequest>,
 ) -> (
-    impl std::future::Future<Output = Result<CreateOutcome, CreateFailure>> + 'a,
+    impl std::future::Future<Output = Result<CreateOutcome, CreateFailure>> + '_,
     crate::provider::CreateCallCancellationReceiver,
 ) {
+    let id = prepared.resource_id().clone();
+    let (request, _) = prepared.into_parts();
     let (attempt, cancellation) = crate::provider::CreateAttempt::new(id.clone());
     (
-        dispatch_create_with_attempt(provider, id, request, attempt),
+        async move { dispatch_create_with_attempt(provider, &id, request, attempt).await },
         cancellation,
     )
+}
+
+/// Scheduled update dispatch also consumes the exact checked patch.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::dispatch_prepared_update, provider::{Provider, AppliedIdentifier, UpdateRequest}};
+/// fn bypass(provider: &dyn Provider, id: &AppliedIdentifier, raw: UpdateRequest) {
+///     let _ = dispatch_prepared_update(provider, id, raw);
+/// }
+/// ```
+pub async fn dispatch_prepared_update<P: Provider + ?Sized>(
+    provider: &P,
+    identifier: &crate::provider::AppliedIdentifier,
+    prepared: PreparedWrite<crate::provider::UpdateRequest>,
+) -> crate::provider::ProviderResult<crate::provider::UpdateOutcome> {
+    let id = prepared.resource_id().clone();
+    let (request, _) = prepared.into_parts();
+    let attempt = crate::provider::UpdateAttempt::new();
+    provider.update(&id, identifier, request, attempt).await
 }
 
 async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
@@ -557,7 +589,7 @@ impl RuntimeCompositions<'_> {
 
 enum RuntimeInputAdmission {
     Checked {
-        first_pending: Option<crate::input_rules::InputEffectTarget>,
+        checks: Vec<crate::input_rules::PendingInputObligation>,
     },
     /// TODO(#4267 phase 5): re-admit the saved effects under the apply lock.
     /// Only SavedExecutionInput can produce this explicit legacy disposition.
@@ -611,10 +643,7 @@ impl<'a> LiveExecutionInput<'a> {
         } = self;
         RuntimeExecutionInput {
             input_admission: RuntimeInputAdmission::Checked {
-                first_pending: plan
-                    .pending_inputs()
-                    .first()
-                    .map(|obligation| obligation.target().clone()),
+                checks: plan.execution_input_checks(),
             },
             plan,
             provider_check_inputs,
@@ -1163,6 +1192,13 @@ impl std::fmt::Display for UnsatisfiedDependency {
 /// Typed reason an effect did not complete successfully.
 #[derive(Debug, Clone)]
 pub enum EffectFailureKind {
+    InputRule {
+        violation: crate::schema::InputViolation,
+    },
+    UnresolvedInputRule {
+        path: crate::schema::InputPath,
+        code: crate::schema::InputRuleCode,
+    },
     Provider {
         error: ReportedError,
         note: Option<crate::provider_text::ProviderText>,
@@ -1194,6 +1230,8 @@ impl EffectFailureKind {
     /// Short final-summary label. The observer renders the full cause once.
     pub fn label(&self) -> &'static str {
         match self {
+            Self::InputRule { .. } => "input rule violation",
+            Self::UnresolvedInputRule { .. } => "input rule unresolved",
             Self::Provider { .. } => "provider error",
             Self::Execution { .. } => "execution error",
             Self::DeferredMaterialization { .. } => "deferred materialization failure",
@@ -1279,6 +1317,8 @@ impl EffectFailureKind {
             Self::Provider { error, .. } | Self::Execution { error } => Some(error.as_error()),
             Self::DeferredMaterialization { failure } => Some(failure.as_ref()),
             Self::MissingDependency { .. }
+            | Self::InputRule { .. }
+            | Self::UnresolvedInputRule { .. }
             | Self::DependencyCycle { .. }
             | Self::BlockedByDependencyCycle { .. }
             | Self::NoProgress { .. }
@@ -1290,6 +1330,11 @@ impl EffectFailureKind {
 impl std::fmt::Display for EffectFailureKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InputRule { violation } => violation.fmt(formatter),
+            Self::UnresolvedInputRule { path, code } => write!(
+                formatter,
+                "input rule {code} at {path} could not be discharged"
+            ),
             Self::Provider { error, note } => {
                 error.fmt(formatter)?;
                 if let Some(note) = note {
@@ -2041,40 +2086,6 @@ async fn execute_runtime_plan<S: Clone + crate::resource::AnonymousIdentityModul
     observer: &dyn ExecutionObserver<S>,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome<S> {
-    let pending = match &input.input_admission {
-        RuntimeInputAdmission::Checked { first_pending } => first_pending.as_ref(),
-        RuntimeInputAdmission::SavedPlanRecheckRequired => {
-            // TODO(#4267 phase 5): replace this named legacy branch with the
-            // locked saved-plan -> InputCheckedPlan transition, for both scopes.
-            None
-        }
-    };
-    if let Some(target) = pending {
-        let mut result = ExecutionResult::empty();
-        result.bindings = input.bindings;
-        result.managed_current = input.managed_current;
-        let effect = input
-            .plan
-            .effects()
-            .get(target.effect_index())
-            .expect("checked obligation targets an immutable effect slot");
-        result.failures.record(
-            observer,
-            FailureReport::Effect {
-                effect,
-                kind: EffectFailureKind::execution(crate::input_rules::InputCheckPending),
-                context: FailureEventContext {
-                    recovery: None,
-                    duration: std::time::Duration::ZERO,
-                    progress: ProgressInfo {
-                        completed: 0,
-                        total: input.plan.effects().len(),
-                    },
-                },
-            },
-        );
-        return ExecutionOutcome::Completed(result);
-    }
     let (result, was_cancelled) = execute_effects_sequential(
         provider,
         comparison_provider,

@@ -1058,6 +1058,7 @@ mod tests {
             id: &ResourceId,
             identifier: &crate::provider::AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: crate::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             let id = id.clone();
             let identifier = identifier.to_string();

@@ -3173,6 +3173,7 @@ impl Provider for FailBCreateProvider {
         id: &ResourceId,
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
         Box::pin(async move { Err(ProviderError::internal("unexpected update").for_resource(id)) })
@@ -3650,6 +3651,7 @@ impl Provider for ApplyCascadeProvider {
         id: &ResourceId,
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
         Box::pin(async move { Err(ProviderError::internal("unexpected update").for_resource(id)) })
@@ -4043,6 +4045,7 @@ impl Provider for ApplyTimeReadProvider {
         id: &ResourceId,
         identifier: &carina_core::provider::AppliedIdentifier,
         request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.clone();
@@ -7418,6 +7421,7 @@ impl Provider for BootstrapRecordingProvider {
         _id: &ResourceId,
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("unexpected update")) })
     }

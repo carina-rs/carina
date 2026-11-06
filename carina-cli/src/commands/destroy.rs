@@ -3778,16 +3778,10 @@ mod tests {
             "unknown",
             None,
         ));
-        let failure = carina_core::provider::CreateAttempt::for_test(resource.id.clone())
-            .outcome_unknown(
-                carina_core::provider::EgressSent::for_test(),
-                carina_core::provider::ProviderError::api_error("guest trapped"),
-            );
-        let carina_core::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } =
-            failure.into_kind()
-        else {
-            panic!("the egress witness must mint an unknown outcome")
-        };
+        let unknown = crate::fixture_unknown_create_outcome(
+            &resource.id,
+            carina_core::provider::ProviderError::api_error("guest trapped"),
+        );
         let current_states = HashMap::from([(
             resource.id.clone(),
             Current::create_outcome_unknown(unknown),

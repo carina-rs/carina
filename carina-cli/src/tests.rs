@@ -427,6 +427,7 @@ impl Provider for TestProvider {
         _id: &ResourceId,
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let state = self
             .update_result

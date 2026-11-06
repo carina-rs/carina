@@ -227,13 +227,7 @@ async fn prepare_bootstrap_creation(
     resource: Resource,
     context: &BootstrapCreateContext<'_>,
     session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-) -> Result<
-    (
-        carina_core::provider::CreateRequest,
-        carina_core::input_rules::InputCheckedPlan<carina_core::resource::ProviderModuleSource>,
-    ),
-    AppError,
-> {
+) -> Result<carina_core::executor::PreparedWrite<carina_core::provider::CreateRequest>, AppError> {
     let bindings = bootstrap_resolved_bindings(context.parsed);
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(
         &context.parsed.compositions,
@@ -250,23 +244,20 @@ async fn prepare_bootstrap_creation(
     let request = carina_core::executor::prepare_create_request(resource, &preparation)
         .await
         .map_err(AppError::from_state_bucket_preparation)?;
-    let checked = match carina_core::differ::finalize_bootstrap_create(&request)
+    match carina_core::differ::finalize_bootstrap_create(request)
         .check_inputs(context.schemas, &HashMap::new())
     {
-        Ok(plan) => plan,
-        Err(plan) => {
-            return Err(
-                crate::commands::shared::plan_errors::render_plan_errors_and_abort(
-                    color_mode,
-                    &plan,
-                    Path::new("."),
-                )
-                .expect_err("bootstrap input rejection has diagnostics"),
-            );
-        }
-    };
-    checked.ensure_inputs_ready()?;
-    Ok((request, checked))
+        Ok(prepared) => Ok(prepared),
+        Err(carina_core::executor::WriteInputError::Admission(plan)) => Err(
+            crate::commands::shared::plan_errors::render_plan_errors_and_abort(
+                color_mode,
+                &plan,
+                Path::new("."),
+            )
+            .expect_err("bootstrap input rejection has diagnostics"),
+        ),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn create_checked_auto_bootstrap_bucket(
@@ -284,7 +275,7 @@ async fn create_checked_auto_bootstrap_bucket(
             async |session| {
                 // The backend sends this exact bucket name itself. Use a no-op
                 // normalizer so a provider rewrite cannot certify a different name.
-                let (_request, _creation_checked) =
+                let _prepared =
                     prepare_bootstrap_creation(color_mode, resource, &context, session).await?;
                 context
                     .backend
@@ -310,8 +301,9 @@ async fn create_checked_bootstrap_resource(
             context.provider_context,
             async |session| {
                 let id = resource.id.clone();
-                let (request, _creation_checked) =
+                let prepared =
                     prepare_bootstrap_creation(color_mode, resource, &context, session).await?;
+                let request = prepared.request();
                 let BootstrapCreateContext {
                     provider_context: _provider_context,
                     backend,
@@ -326,9 +318,9 @@ async fn create_checked_bootstrap_resource(
                     comparison_provider.comparison_for(schemas, &resolved.id)?;
                 let owner_schema = resolved_comparison.owner_schema();
                 let schema = Some(owner_schema.schema().as_schema());
-                let accepted_request = AcceptedRequest::from_create_request(&request);
+                let accepted_request = AcceptedRequest::from_create_request(request);
                 let (create, create_cancellation) =
-                    carina_core::executor::dispatch_create(operation_provider, &id, request);
+                    carina_core::executor::dispatch_prepared_create(operation_provider, prepared);
                 let outcome = create.await;
                 // Bootstrap creates are not part of the parallel executor, but they still
                 // retain the reporter until the guest call has settled.
@@ -2751,7 +2743,6 @@ async fn run_apply_locked_owned(
             )?;
             moved_hints.eprint(color_mode);
 
-            plan.checked().ensure_inputs_ready()?;
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
             if confirm_apply(&runtime, stdin, cancel.clone(), auto_approve).await?
                 == ApplyConfirmation::Cancelled

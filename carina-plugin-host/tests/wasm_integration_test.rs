@@ -436,13 +436,44 @@ where
         id: &'a ResourceId,
         request: CreateRequest,
     ) -> BoxFuture<'a, Result<CreateOutcome, CreateFailure>> {
-        let (create, cancellation) = carina_core::executor::dispatch_create(self, id, request);
+        assert_eq!(&request.resource().id, id);
+        let prepared = carina_core::differ::finalize_bootstrap_create(request)
+            .check_inputs(
+                &carina_core::schema::SchemaRegistry::new(),
+                &std::collections::HashMap::new(),
+            )
+            .expect("fixture inputs discharge");
+        let (create, cancellation) =
+            carina_core::executor::dispatch_prepared_create(self, prepared);
         Box::pin(async move {
             let _cancellation = cancellation;
             create.await
         })
     }
 }
+
+trait DispatchUpdateForTest: Provider {
+    fn update_for_test<'a>(
+        &'a self,
+        id: &ResourceId,
+        identifier: &'a carina_core::provider::AppliedIdentifier,
+        request: UpdateRequest,
+    ) -> BoxFuture<'a, carina_core::provider::ProviderResult<carina_core::provider::UpdateOutcome>>
+    {
+        assert_eq!(&request.from().id, id);
+        let prepared = carina_core::differ::finalize_update_request(identifier.clone(), request)
+            .check_inputs(
+                &carina_core::schema::SchemaRegistry::new(),
+                &std::collections::HashMap::new(),
+            )
+            .expect("fixture inputs discharge");
+        Box::pin(carina_core::executor::dispatch_prepared_update(
+            self, identifier, prepared,
+        ))
+    }
+}
+
+impl<T: Provider + ?Sized> DispatchUpdateForTest for T {}
 
 async fn update_request_for_test<P: StateValueLeaf>(
     resource: Resource,
@@ -3097,7 +3128,7 @@ async fn test_wasm_fresh_read_uses_updated_read_back_controls() {
     .await;
     let updated = updater
         .provider()
-        .update(&id, &identifier, request)
+        .update_for_test(&id, &identifier, request)
         .await
         .unwrap()
         .into_state_for_writeback();
@@ -3160,7 +3191,7 @@ async fn test_wasm_pending_update_polls_until_success() {
 
     let state = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update_for_test(&id, &created_identifier, request)
         .await
         .expect("pending update should settle")
         .into_state_for_writeback();
@@ -3212,7 +3243,7 @@ async fn test_wasm_update_read_back_completes_within_budget() {
 
     let state = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update_for_test(&id, &created_identifier, request)
         .await
         .expect("update read-back should settle within the default budget")
         .into_state_for_writeback();
@@ -3264,7 +3295,7 @@ async fn test_wasm_update_read_back_budget_returns_partial_then_refresh_complete
 
     let outcome = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update_for_test(&id, &created_identifier, request)
         .await
         .expect("the final update attempt should return a partial success");
     let diagnostic = outcome
@@ -3338,7 +3369,7 @@ async fn test_wasm_update_read_back_phase_regression_is_protocol_violation_and_r
 
     let error = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update_for_test(&id, &created_identifier, request)
         .await
         .expect_err("read-back must not regress to operation pending");
     assert!(error.to_string().contains("polling protocol"), "{error}");
@@ -5194,7 +5225,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     let updated = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update_for_test(&id, &created_identifier, request)
         .await
         .expect("update should succeed")
         .into_state_for_writeback();
@@ -5305,7 +5336,7 @@ async fn test_wasm_update_accepts_redacted_secret_in_current_state() {
 
     let updated = provider
         .provider()
-        .update(&id, &mock_identifier(), request)
+        .update_for_test(&id, &mock_identifier(), request)
         .await
         .expect("persisted current-state secrets must cross the update boundary")
         .into_state_for_writeback();
@@ -5350,7 +5381,7 @@ async fn test_wasm_update_carries_unchanged_redacted_secret_into_outcome() {
 
     let updated = provider
         .provider()
-        .update(&id, &mock_identifier(), request)
+        .update_for_test(&id, &mock_identifier(), request)
         .await
         .expect("unchanged persisted secrets must cross the update outcome boundary")
         .into_state_for_writeback();
@@ -5419,7 +5450,7 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
     let request = update_request_for_test(resource, from, &["color".to_string()]).await;
     let updated = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update_for_test(&id, &created_identifier, request)
         .await
         .expect("update should preserve the unchanged persisted attribute")
         .into_state_for_writeback();

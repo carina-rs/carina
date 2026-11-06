@@ -18,6 +18,126 @@ pub(super) struct SchedulerDeps {
     pub(super) unresolved: Vec<UnresolvedRequiredDependency>,
 }
 
+/// Internal preparation nodes mirror their write solely for diagnostics. They
+/// are excluded from effect analysis, so they cannot become value producers.
+#[derive(Default)]
+pub(super) struct PreparationNodes {
+    writes: HashMap<usize, usize>,
+    pairs: Vec<(usize, usize, Vec<usize>)>,
+    replacement_templates: HashSet<usize>,
+}
+
+impl PreparationNodes {
+    pub(super) fn install<S: Clone>(
+        effects: &mut Vec<Effect<S>>,
+        pairs: Vec<(usize, Vec<usize>)>,
+        replacement_templates: HashSet<usize>,
+    ) -> Self {
+        let mut nodes = Self {
+            replacement_templates,
+            ..Self::default()
+        };
+        for (write, deletes) in pairs {
+            let preparation = effects.len();
+            effects.push(effects[write].clone());
+            nodes.writes.insert(preparation, write);
+            nodes.pairs.push((preparation, write, deletes));
+        }
+        nodes
+    }
+
+    pub(super) fn write(&self, node: usize) -> Option<usize> {
+        self.writes.get(&node).copied()
+    }
+
+    pub(super) fn dependencies<S>(
+        &self,
+        effects: &[Effect<S>],
+        deps: &mut HashMap<usize, HashSet<usize>>,
+    ) {
+        for &template in &self.replacement_templates {
+            let Effect::DeferredReplace(payload) = &effects[template] else {
+                unreachable!("replacement template")
+            };
+            let inputs = payload.dependency_template.dependencies();
+            if let Some(dependencies) = deps.get_mut(&template) {
+                dependencies.retain(|&index| {
+                    !matches!(effects[index], Effect::Delete { .. })
+                        && inputs
+                            .iter()
+                            .any(|id| id.as_inner() == effects[index].resource_id())
+                });
+            }
+        }
+        for (preparation, write, deletes) in &self.pairs {
+            // A request's value prerequisites do not include teardown/order
+            // edges. Inheriting the paired Delete here creates a false cycle.
+            let inputs = deps
+                .get(write)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&index| {
+                    let Effect::Create(resource) = &effects[*write] else {
+                        unreachable!("preparation write")
+                    };
+                    !matches!(effects[index], Effect::Delete { .. })
+                        && resource
+                            .value_dependencies()
+                            .iter()
+                            .any(|id| id.as_inner() == effects[index].resource_id())
+                })
+                .collect();
+            deps.insert(*preparation, inputs);
+            deps.entry(*write).or_default().insert(*preparation);
+            for delete in deletes {
+                deps.entry(*delete).or_default().insert(*preparation);
+            }
+        }
+    }
+
+    pub(super) fn rebuild<S>(
+        &self,
+        effects: &[Effect<S>],
+        origins: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
+        deferred_pairs: &[(usize, usize)],
+    ) -> SchedulerDeps {
+        let actual: Vec<_> = (0..effects.len())
+            .filter(|index| !self.writes.contains_key(index))
+            .collect();
+        let refs: Vec<_> = actual.iter().map(|&index| &effects[index]).collect();
+        let (mut analysis, mut unresolved) =
+            match build_effect_dependency_analysis(&refs, origins.keys(), ScheduleInputs::Apply) {
+                Ok(analysis) => (analysis, Vec::new()),
+                Err(error) => error.into_parts(),
+            };
+        relax_update_update_edges(&refs, &mut analysis);
+        let mut deps: HashMap<_, _> = analysis
+            .into_deps_of()
+            .into_iter()
+            .map(|(index, dependencies)| {
+                (
+                    actual[index],
+                    dependencies
+                        .into_iter()
+                        .map(|index| actual[index])
+                        .collect(),
+                )
+            })
+            .collect();
+        for dependency in &mut unresolved {
+            dependency.remap_effect_index(actual[dependency.effect_index()]);
+        }
+        // Edges retain the scheduler's actual slot numbering.
+        apply_deferred_replace_delete_deps(effects, &mut deps, deferred_pairs);
+        self.dependencies(effects, &mut deps);
+        SchedulerDeps {
+            deps_of: deps,
+            unresolved,
+        }
+    }
+}
+
 pub(super) struct PureMetaStep<'a, S> {
     effect: &'a Effect<S>,
     template: &'a DeferredForExpression<S>,

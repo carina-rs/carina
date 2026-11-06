@@ -14,12 +14,15 @@ use crate::resource::{ResourceId, ResourceIdentity};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
 use super::basic::{
-    BasicEffectCompletion, BasicEffectCtx, ExecutionState, count_actionable_effects,
-    execute_basic_effect, process_basic_result, refresh_pending_states, resolve_data_source,
+    BasicEffectCompletion, BasicEffectCtx, ExecutionState, PreparedBasicRequest,
+    count_actionable_effects, execute_basic_effect, prepare_basic_request, process_basic_result,
+    refresh_pending_states, resolve_data_source,
 };
 use super::deferred_dispatch::{DeferredAnonymousIdentityGuard, PureMetaCtx};
+use super::input_discharge::ExecutionInputChecks;
 use super::provider_ready::ProviderPreparationContext;
 use super::replace::SingleEffectResult;
+use super::scheduler::PreparationNodes;
 use super::scheduler::{
     FailureView, PureMetaOutcome, SchedulerDeps, dependency_failed_reason, failure_display_name,
     try_dispatch_pure_meta, wait_dependency_failed_reason,
@@ -508,9 +511,21 @@ pub(super) async fn execute_effects_sequential<
     let ExpandedEffects {
         effects: expanded_effects,
         deferred_replace_delete_deps,
-        source_effect_indices: _,
+        source_effect_indices,
     } = expand_deferred_replace_effects(input.plan.effects());
     let mut effects = expanded_effects;
+    let mut input_checks = ExecutionInputChecks::new(
+        match &mut input.input_admission {
+            super::RuntimeInputAdmission::Checked { checks } => std::mem::take(checks),
+            // TODO(#4267 phase 5): saved-plan re-admission stays a named legacy path.
+            super::RuntimeInputAdmission::SavedPlanRecheckRequired => Vec::new(),
+        },
+        &effects,
+        &source_effect_indices,
+    );
+    let mut prepared_requests: HashMap<usize, PreparedBasicRequest> = HashMap::new();
+    let mut prepared_materializations: HashMap<usize, Vec<Effect<S>>> = HashMap::new();
+    let mut prepared_children: HashMap<usize, Vec<PreparedBasicRequest>> = HashMap::new();
     let mut total = count_runtime_effects(&effects, &input.data_source_values);
     let completed = AtomicUsize::new(0);
 
@@ -570,10 +585,17 @@ pub(super) async fn execute_effects_sequential<
         &deferred_replace_delete_deps,
     );
 
+    let replacement_templates = input_checks.replacement_templates(&effects);
+    let preparation_pairs = input_checks.preparation_pairs(&effects);
+    let preparation_nodes =
+        PreparationNodes::install(&mut effects, preparation_pairs, replacement_templates);
+    preparation_nodes.dependencies(&effects, &mut deps_of);
+
     // Build effect index -> binding name mapping for resolving dependency names
     let mut idx_to_binding: HashMap<usize, String> = effects
         .iter()
         .enumerate()
+        .filter(|(idx, _)| preparation_nodes.write(*idx).is_none())
         .filter_map(|(idx, effect)| failure_display_name(effect).map(|b| (idx, b)))
         .collect();
 
@@ -670,7 +692,10 @@ pub(super) async fn execute_effects_sequential<
         // Emit Waiting events for effects that have unmet dependencies
         if !cancelled {
             for &idx in &actionable_indices {
-                if dispatched.contains(&idx) || newly_ready.contains(&idx) {
+                if preparation_nodes.write(idx).is_some()
+                    || dispatched.contains(&idx)
+                    || newly_ready.contains(&idx)
+                {
                     continue;
                 }
                 let deps = &deps_of[&idx];
@@ -697,6 +722,16 @@ pub(super) async fn execute_effects_sequential<
         for idx in newly_ready {
             dispatched.insert(idx);
             let effect = effects[idx].clone();
+            if let Some(write) = preparation_nodes.write(idx)
+                && dispatched.contains(&write)
+            {
+                completed_indices.insert(idx);
+                if failed_indices.contains(&write) {
+                    failed_indices.insert(idx);
+                }
+                completed_synchronous_dispatch = true;
+                continue;
+            }
 
             let failure_view = FailureView::new(&effects, &deps_of, &failed_indices);
             if let Some(failed_dep) = failure_view.find_failed_dependency(idx) {
@@ -721,6 +756,11 @@ pub(super) async fn execute_effects_sequential<
                 accumulated.mutate(|result| result.skip_count += 1);
                 failed_indices.insert(idx);
                 completed_indices.insert(idx);
+                if let Some(write) = preparation_nodes.write(idx) {
+                    failed_indices.insert(write);
+                    completed_indices.insert(write);
+                    dispatched.insert(write);
+                }
                 completed_synchronous_dispatch = true;
                 continue;
             }
@@ -733,7 +773,13 @@ pub(super) async fn execute_effects_sequential<
                     type_checks,
                 },
             };
-            match try_dispatch_pure_meta(&effect, &accumulated.result().bindings, &dispatch_ctx) {
+            let was_prepared = prepared_materializations.contains_key(&idx);
+            let meta = if let Some(children) = prepared_materializations.remove(&idx) {
+                PureMetaOutcome::Materialized(children)
+            } else {
+                try_dispatch_pure_meta(&effect, &accumulated.result().bindings, &dispatch_ctx)
+            };
+            match meta {
                 PureMetaOutcome::NotPureMeta => {}
                 PureMetaOutcome::Failed(failure) => {
                     record_effect_failure(
@@ -761,7 +807,9 @@ pub(super) async fn execute_effects_sequential<
                         Effect::DeferredReplace(payload) => payload.template.as_ref(),
                         _ => unreachable!("pure meta materialization has a deferred template"),
                     };
-                    if let Err(error) = anonymous_identity_guard.admit(template, &children) {
+                    if !was_prepared
+                        && let Err(error) = anonymous_identity_guard.admit(template, &children)
+                    {
                         record_effect_failure(
                             &mut accumulated,
                             observer,
@@ -781,8 +829,39 @@ pub(super) async fn execute_effects_sequential<
                         completed_synchronous_dispatch = true;
                         break;
                     }
+                    if input_checks.has_rules(idx) {
+                        let check = input_checks
+                            .take_write(idx)
+                            .expect("template prepared exactly once");
+                        let snapshot = accumulated.result().bindings.clone();
+                        let module_gate = &module_gate;
+                        let configs = input.provider_configs;
+                        let normalizer = input.normalizer;
+                        let factories = input.factories;
+                        let schemas = input.schemas;
+                        in_flight.push_non_wait(idx, move |_start| async move {
+                            let context = ProviderPreparationContext::new(
+                                &snapshot,
+                                module_gate,
+                                configs,
+                                normalizer,
+                                factories,
+                                schemas,
+                                type_checks,
+                            );
+                            let outcome =
+                                super::input_discharge::prepare_cohort(check, children, &context)
+                                    .await;
+                            (idx, SingleEffectResult::Materialized { outcome })
+                        });
+                        continue;
+                    }
                     if !children.is_empty() {
                         total += count_actionable_effects(&children);
+                        let mut prepared = prepared_children
+                            .remove(&idx)
+                            .unwrap_or_default()
+                            .into_iter();
                         for child in children {
                             let child_idx = effects.len();
                             if let Effect::Create(resource) = &child {
@@ -795,9 +874,13 @@ pub(super) async fn execute_effects_sequential<
                                 idx_to_binding.insert(child_idx, binding);
                             }
                             effects.push(child);
+                            if let Some(request) = prepared.next() {
+                                input_checks.register_prepared_child(child_idx);
+                                prepared_requests.insert(child_idx, request);
+                            }
                             actionable_indices.push(child_idx);
                         }
-                        let rebuilt = input.compositions.scheduler_dependencies(
+                        let rebuilt = preparation_nodes.rebuild(
                             &effects,
                             resource_origins,
                             &deferred_replace_delete_deps,
@@ -869,6 +952,14 @@ pub(super) async fn execute_effects_sequential<
                 | Effect::DeferredCreate(_)
                 | Effect::DeferredReplace(_) => None,
             };
+            let preparation_write = preparation_nodes.write(idx);
+            let check = input_checks.take_write(preparation_write.unwrap_or(idx));
+            let authorized_delete = if matches!(effect, Effect::Delete { .. }) {
+                input_checks.authorize_delete(idx).map(Some)
+            } else {
+                Ok(None)
+            };
+            let prepared_request = prepared_requests.remove(&idx);
             let completed_ref = &completed;
             let effect_for_future = effect.clone();
             let make_future = move |wait_cancel_rx: Option<
@@ -892,24 +983,44 @@ pub(super) async fn execute_effects_sequential<
                     // be dispatched (carina#3164). The compiler enforces
                     // exhaustiveness on the outer `match effect { ... }`
                     // below.
-                    Some(basic) => SingleEffectResult::Basic(Box::new(
-                        execute_basic_effect(
-                            basic,
-                            &BasicEffectCtx {
-                                provider,
-                                comparison_provider,
-                                provider_check_inputs,
-                                runtime_authored,
-                                preparation: &preparation,
-                                resume_create,
-                                completed: completed_ref,
-                                total,
+                    Some(basic) => {
+                        let context = BasicEffectCtx {
+                            provider,
+                            comparison_provider,
+                            provider_check_inputs,
+                            runtime_authored,
+                            preparation: &preparation,
+                            resume_create,
+                            completed: completed_ref,
+                            total,
+                        };
+                        let prepared = match prepared_request {
+                            Some(prepared) => Ok(prepared),
+                            None => match (authorized_delete, check) {
+                                (Ok(delete), Ok(check)) => {
+                                    prepare_basic_request(&basic, &context, check, delete).await
+                                }
+                                (Err(failure), _) | (_, Err(failure)) => Err(failure),
                             },
-                            in_flight_start,
-                            observer,
-                        )
-                        .await,
-                    )),
+                        };
+                        if let Some(write) = preparation_write {
+                            SingleEffectResult::Preparation {
+                                write,
+                                outcome: prepared,
+                            }
+                        } else {
+                            SingleEffectResult::Basic(Box::new(
+                                execute_basic_effect(
+                                    basic,
+                                    prepared,
+                                    &context,
+                                    in_flight_start,
+                                    observer,
+                                )
+                                .await,
+                            ))
+                        }
+                    }
                     None => match &effect_for_future {
                         Effect::Create(_)
                         | Effect::ResumeCreate { .. }
@@ -1113,6 +1224,9 @@ pub(super) async fn execute_effects_sequential<
                     }
                     dispatched.insert(idx);
                     completed_indices.insert(idx);
+                    if preparation_nodes.write(idx).is_some() {
+                        continue;
+                    }
                     observer.on_event(&ExecutionEvent::EffectSkipped {
                         effect: &effects[idx],
                         reason: SKIP_REASON_CANCELLED,
@@ -1134,6 +1248,13 @@ pub(super) async fn execute_effects_sequential<
                 ) {
                     dispatched.insert(idx);
                     completed_indices.insert(idx);
+                    if let Some(write) = preparation_nodes.write(idx) {
+                        failed_indices.insert(idx);
+                        if !dispatched.insert(write) {
+                            continue;
+                        }
+                        completed_indices.insert(write);
+                    }
                     record_effect_failure(
                         &mut accumulated,
                         observer,
@@ -1189,6 +1310,60 @@ pub(super) async fn execute_effects_sequential<
 
         // Process the result and update shared state immediately
         match effect_result {
+            SingleEffectResult::Preparation { write, outcome } => match outcome {
+                Ok(prepared) => {
+                    input_checks.publish_permits(prepared.delete_permits());
+                    prepared_requests.insert(write, prepared);
+                }
+                Err(failure) => {
+                    failed_indices.extend([finished_idx, write]);
+                    completed_indices.insert(write);
+                    dispatched.insert(write);
+                    record_effect_failure(
+                        &mut accumulated,
+                        observer,
+                        &effects[write],
+                        failure,
+                        FailureEventContext {
+                            recovery: None,
+                            duration: std::time::Duration::ZERO,
+                            progress: ProgressInfo {
+                                completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                                total,
+                            },
+                        },
+                    );
+                }
+            },
+            SingleEffectResult::Materialized { outcome } => match outcome {
+                Ok(cohort) => {
+                    let (children, prepared, permits) = cohort.into_parts();
+                    input_checks.publish_permits(permits);
+                    prepared_children.insert(finished_idx, prepared);
+                    prepared_materializations.insert(finished_idx, children);
+                    // Re-enter the materialization handler only to append the
+                    // already prepared cohort and rebuild scheduler edges.
+                    dispatched.remove(&finished_idx);
+                    completed_indices.remove(&finished_idx);
+                }
+                Err(failure) => {
+                    failed_indices.insert(finished_idx);
+                    record_effect_failure(
+                        &mut accumulated,
+                        observer,
+                        &effects[finished_idx],
+                        failure,
+                        FailureEventContext {
+                            recovery: None,
+                            duration: std::time::Duration::ZERO,
+                            progress: ProgressInfo {
+                                completed: completed.load(Ordering::Relaxed),
+                                total,
+                            },
+                        },
+                    );
+                }
+            },
             SingleEffectResult::Basic(basic) => {
                 let completion = process_basic_result(
                     *basic,
@@ -1651,6 +1826,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &crate::provider::AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: crate::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("update not used")) })
         }

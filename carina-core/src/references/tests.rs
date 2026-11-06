@@ -106,6 +106,7 @@ impl Provider for TableProvider {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let mut attributes = request.from().attributes.clone();
         for op in &request.patch().ops {

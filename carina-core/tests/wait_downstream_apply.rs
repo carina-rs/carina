@@ -282,6 +282,7 @@ impl Provider for MockProvider {
         id: &ResourceId,
         identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.to_string();
