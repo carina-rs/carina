@@ -977,7 +977,6 @@ mod tests {
         plan.add_replacement(ReplacementGroup {
             changed_create_only: ChangedCreateOnly::new(vec!["cidr_block".to_string()]).unwrap(),
             cascade_ref_hints: Vec::new(),
-            permanent_name_override: None,
             consumer_updates: Default::default(),
             replacement: {
                 let mut old = crate::effect::DeferredReplaceDelete {

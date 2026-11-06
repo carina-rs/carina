@@ -354,6 +354,88 @@ fn deferred_create_targets_absorb_matching_map_key_orphan_deletes() {
 }
 
 #[test]
+fn review6_4283_deposed_only_deferred_create_preflights_conflicting_cbd() {
+    deposed_only_deferred_preflight(true);
+}
+
+#[test]
+fn review6_4283_deposed_only_deferred_create_preflights_dependent_requirement() {
+    deposed_only_deferred_preflight(false);
+}
+
+fn deposed_only_deferred_preflight(explicit: bool) {
+    let mut target = deferred_replace_test_target();
+    target.template_directives_mut().create_before_destroy =
+        crate::resource::LoopDirective::Resolved(explicit);
+    let mut old = delete_effect_for_binding("validation_records[0]");
+    let Effect::Delete { generation, .. } = &mut old else {
+        unreachable!()
+    };
+    *generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        crate::schema::PatternResourceSchema::new("route53.Record")
+            .with_conflicting_replacement()
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "",
+        crate::schema::PatternResourceSchema::new("test.Consumer")
+            .validate()
+            .unwrap(),
+    );
+    let old_id = ResolvedResourceId::new(old.resource_id().clone());
+    let mut plan = Plan::new();
+    plan.add(old);
+    if !explicit {
+        plan.add(Effect::Create(ResolvedResource::from_resolved_parts(
+            Resource::new("test.Consumer", "consumer").into_value_snapshot(),
+            std::iter::once(old_id).collect(),
+            Default::default(),
+        )));
+    }
+    let configuration = crate::parser::ExpandedParsedFile {
+        resources: vec![
+            Resource::with_provider("aws", "acm.Certificate", "cert", None)
+                .with_root_binding("cert"),
+        ],
+        ..Default::default()
+    };
+    let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
+    let (template, dependencies) = graph.compile_deferred_for(target).unwrap();
+    plan.add(Effect::DeferredCreate(DeferredCreatePayload::new(
+        Box::new(template),
+        dependencies,
+    )));
+    assert!(
+        plan.effects()
+            .iter()
+            .any(|effect| matches!(effect, Effect::DeferredCreate(_)))
+    );
+    let result = plan.prepare_replacements(&schemas);
+    assert!(
+        matches!(
+            result,
+            Err(crate::replacement::ReplacementAdmissionError {
+                cause: CreateBeforeDestroyError::ReplacementCannotCoexist(_),
+                ..
+            })
+        ),
+        "a known Conflicting request must fail before its parent can apply: {result:?}"
+    );
+    let saved: crate::plan::UnresolvedSavedPlan =
+        serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+    assert!(matches!(
+        saved.resolve_with_schemas(&schemas),
+        Err(crate::resource::ResolvedResourceError::Replacement(
+            CreateBeforeDestroyError::ReplacementCannotCoexist(_)
+        ))
+    ));
+}
+
+#[test]
 fn deferred_create_targets_do_not_absorb_deposed_deletes() {
     let target = deferred_replace_test_target();
     let deposed_key = crate::resource::DeposedKey::new_unique();

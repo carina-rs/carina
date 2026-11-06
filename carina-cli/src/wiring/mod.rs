@@ -226,7 +226,7 @@ pub enum PlannedPlan {
         references: carina_core::references::ResolvedReferences,
     },
     Unrendered {
-        plan: Plan,
+        plan: Box<carina_core::plan::AdmittedPlan>,
         references: carina_core::references::ResolvedReferences,
     },
 }
@@ -240,9 +240,9 @@ impl PlannedPlan {
 }
 
 impl std::ops::Deref for PlannedPlan {
-    type Target = Plan;
+    type Target = carina_core::plan::AdmittedPlan;
 
-    fn deref(&self) -> &Plan {
+    fn deref(&self) -> &carina_core::plan::AdmittedPlan {
         match self {
             Self::Rendered { display, .. } => display.plan(),
             Self::Unrendered { plan, .. } => plan,
@@ -298,6 +298,7 @@ pub(crate) async fn prepare_plan_outcome(
     if let Ok(errors) = NonEmptyPlanErrors::try_from(plan.errors().to_vec()) {
         return Ok(PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }));
     }
+    let plan = plan.admit(schemas)?;
     let planned = match row_request {
         RowRequest::Render(detail) => {
             let historical = crate::commands::plan::collect_historical_display_attributes(
@@ -316,7 +317,7 @@ pub(crate) async fn prepare_plan_outcome(
             }
         }
         RowRequest::None => PlannedPlan::Unrendered {
-            plan,
+            plan: Box::new(plan),
             references: planning,
         },
     };

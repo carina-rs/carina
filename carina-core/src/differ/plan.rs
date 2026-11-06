@@ -9,8 +9,8 @@ use crate::effect::{
 };
 use crate::parser::{DeferredForExpression, ResolvedDeferredForExpressions};
 use crate::plan::{
-    CreateBeforeDestroyError, PermanentNameOverride, Plan, PlanError, PlanErrorKind,
-    PreventDestroyAction, ReplacementGroup,
+    CreateBeforeDestroyError, Plan, PlanError, PlanErrorKind, PreventDestroyAction,
+    ReplacementGroup,
 };
 use crate::provider::{LiftedSavedAttrs, Provider, ProviderRouter};
 use crate::replacement::{CheckedReplacement, ReplacementRequest, resolve_replacement};
@@ -1723,18 +1723,7 @@ fn decompose_replace_into_effects(
     pending_replaces.sort_by_key(|pending| pending.replacement.target().id.to_string());
     for mut pending in pending_replaces {
         pending.replacement.project_prior_explicit(prior_directives);
-        let permanent_name_override =
-            pending
-                .replacement
-                .temporary_name()
-                .map(|name| PermanentNameOverride {
-                    resource_id: pending.replacement.target().resolved_id(),
-                    attribute: name.attribute.clone(),
-                    temp_value: name.temporary_value.clone(),
-                    original_value: Some(name.original_value.clone()),
-                });
         plan.add_replacement(ReplacementGroup {
-            permanent_name_override,
             replacement: pending.replacement,
             changed_create_only: pending.changed_create_only,
             cascade_ref_hints: pending.cascade_ref_hints,

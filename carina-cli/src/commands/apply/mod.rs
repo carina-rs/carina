@@ -741,7 +741,7 @@ struct ApplyExecutionState<
 }
 
 async fn execute_effects_with_observer(
-    plan: &Plan,
+    plan: &carina_core::plan::AdmittedPlan,
     compositions: &[carina_core::resource::LiveComposition],
     context: ApplyExecutionContext<'_>,
     state: ApplyExecutionState<'_>,
@@ -2682,7 +2682,7 @@ async fn run_apply_locked_owned(
             let state_save_inputs = Arc::new(
                 ApplyStateSaveInputs::new(
                     resolved_resources.clone(),
-                    plan.clone(),
+                    plan.clone().into_unadmitted(),
                     ctx.schemas().clone(),
                     None,
                     provider.as_ref(),
@@ -4297,7 +4297,7 @@ async fn run_apply_from_plan_locked_owned(
             let provider = Arc::new(provider);
             let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
                 resolved_sorted_resources.clone(),
-                (*plan).clone(),
+                plan.clone().into_unadmitted(),
                 wiring.schemas().clone(),
                 Some(rehydrated_plan_file.planned_secret_hashes().clone()),
                 provider.as_ref(),

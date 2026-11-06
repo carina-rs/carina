@@ -399,7 +399,10 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
             plan.add(effect);
         }
         plan.prepare_replacements(&COEXISTING_TEST_SCHEMAS).unwrap();
-        let actual = build_plan_scheduler_dependency_edges(&plan, &borrowed);
+        let actual = build_plan_scheduler_dependency_edges(
+            &plan.admit(&COEXISTING_TEST_SCHEMAS).unwrap(),
+            &borrowed,
+        );
 
         assert_eq!(actual, expected, "scheduler-edge export drifted for {case}");
         actual
@@ -2278,7 +2281,7 @@ async fn unsettled_loaded_type_check_blocks_create_dispatch() {
             );
             let input = ExecutionInput {
                 provider_context: catalog.as_provider_context().clone(),
-                plan: &plan,
+                plan: &plan.clone().admit(&schemas).unwrap(),
                 provider_check_inputs: ProviderCheckInputs::Authored,
                 compositions: &[],
                 bindings: ResolvedBindings::default(),
@@ -2330,7 +2333,7 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -2382,7 +2385,7 @@ async fn checkpoint_sink_receives_each_completed_effect_before_execution_ends() 
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -2438,7 +2441,7 @@ async fn precompleted_state_only_result_is_checkpointed_before_provider_completi
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -2522,7 +2525,7 @@ async fn execute_lifecycle_fixture_with_observer(
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan,
+        plan: &plan.clone().admit(&COEXISTING_TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -3517,7 +3520,7 @@ async fn invalid_resolved_create_value_never_reaches_provider() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -3586,7 +3589,7 @@ async fn invalid_secret_create_value_is_masked_and_never_reaches_provider() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
             data_source_origins: &[],
@@ -3659,7 +3662,7 @@ async fn invalid_resolved_value_is_rejected_before_provider_normalization() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -3757,7 +3760,7 @@ async fn runtime_integer_arithmetic_failures_abort_before_dependent_provider_cal
             provider_context: crate::parser::ProviderContext::clone(
                 &crate::parser::LoadedProviderContext::empty_for_test(),
             ),
-            plan: &plan,
+            plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
             provider_check_inputs: ProviderCheckInputs::Authored,
             compositions: &[],
             bindings,
@@ -3824,7 +3827,7 @@ async fn invalid_resolved_update_value_never_reaches_provider() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -3888,7 +3891,7 @@ async fn execute_plan_missing_update_schema_fails_before_provider_update() {
                 provider_context: crate::parser::ProviderContext::clone(
                     &crate::parser::LoadedProviderContext::empty_for_test(),
                 ),
-                plan: &plan,
+                plan: &plan.clone().admit(&schemas).unwrap(),
                 provider_check_inputs: ProviderCheckInputs::Authored,
                 compositions: &[],
                 bindings: ResolvedBindings::default(),
@@ -4013,7 +4016,7 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -4156,7 +4159,7 @@ async fn absent_entirely_write_only_struct_stays_reassert_during_apply_augmentat
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -4247,7 +4250,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
             data_source_origins: &[],
@@ -4358,7 +4361,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
             data_source_origins: &[],
@@ -4433,7 +4436,7 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -4518,7 +4521,7 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -4607,7 +4610,7 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
             data_source_origins: std::slice::from_ref(&data_source_origin),
@@ -4802,7 +4805,7 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
             data_source_origins: std::slice::from_ref(&data_source_origin),
@@ -4915,7 +4918,7 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -4988,7 +4991,7 @@ async fn nested_forwarded_module_constraint_blocks_provider_dispatch() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings,
@@ -5054,7 +5057,7 @@ async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch(
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&outer),
         bindings,
@@ -5129,7 +5132,7 @@ async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() 
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings,
@@ -5186,7 +5189,7 @@ async fn repeated_module_violation_blocks_every_dispatch_but_reports_once() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -5264,7 +5267,7 @@ async fn module_constraint_rechecks_after_binding_changes_in_same_apply() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings,
@@ -5322,7 +5325,7 @@ async fn unresolved_instance_constraint_waits_for_terminal_sweep() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -5388,7 +5391,7 @@ async fn unapplied_module_argument_reference_stays_pending_at_early_gate() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -5450,7 +5453,7 @@ async fn terminal_module_constraint_sweep_rejects_unconsumed_violation() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings,
@@ -5498,7 +5501,7 @@ async fn terminal_module_constraint_sweep_rejects_still_pending_input() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -5550,7 +5553,7 @@ async fn terminal_pending_constraint_is_silent_after_failed_and_skipped_effects(
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -5605,7 +5608,7 @@ async fn terminal_pending_constraint_is_silent_after_failure_without_skips() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -5687,7 +5690,7 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
             data_source_origins: &[],
@@ -5836,7 +5839,7 @@ async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later(
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -5877,7 +5880,7 @@ async fn cancelled_skip_batch_publishes_one_cumulative_checkpoint() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -5917,7 +5920,7 @@ async fn execute_plan_with_empty_plan_and_pre_cancelled_token_returns_completed(
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -5956,7 +5959,7 @@ async fn execute_plan_cancelled_after_three_completed_keeps_in_flight_and_drops_
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6018,7 +6021,7 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6088,7 +6091,7 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6152,7 +6155,7 @@ async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6193,7 +6196,7 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6257,7 +6260,7 @@ async fn cleanup_abandonment_checkpoints_unknown_outcome_after_guest_egress() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6297,7 +6300,7 @@ async fn execute_plan_harvests_ready_effect_before_cleanup_priority() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6361,7 +6364,7 @@ async fn execute_plan_cleanup_priority_abandons_a_pending_failure_refresh() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6401,7 +6404,7 @@ async fn test_simple_create() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6454,7 +6457,7 @@ async fn partial_create_records_state_and_diagnostic() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6511,7 +6514,7 @@ async fn test_apply_renormalizes_after_resolution() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6612,7 +6615,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
             data_source_origins: &[],
@@ -6695,7 +6698,7 @@ async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error(
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
             data_source_origins: &[],
@@ -6822,7 +6825,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
             data_source_origins: &data_source_origins
@@ -6882,7 +6885,7 @@ async fn test_apply_reapplies_host_enum_canonicalization() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&ALIAS_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6956,7 +6959,7 @@ async fn test_apply_reapplies_host_enum_canonicalization_update_path() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&ALIAS_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7020,7 +7023,7 @@ async fn test_apply_reapplies_canonicalize_stage() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&CANON_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7091,7 +7094,7 @@ async fn test_apply_renormalizes_update_path() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7186,7 +7189,7 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&DEFAULT_TAG_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7290,7 +7293,7 @@ async fn wire_boundary_executor_never_dispatches_non_wire_desired_values() {
             provider_context: crate::parser::ProviderContext::clone(
                 &crate::parser::LoadedProviderContext::empty_for_test(),
             ),
-            plan: &plan,
+            plan: &plan.clone().admit(&DEFAULT_TAG_SCHEMAS).unwrap(),
             provider_check_inputs: ProviderCheckInputs::Authored,
             compositions: &[],
             bindings: ResolvedBindings::default(),
@@ -7413,7 +7416,7 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&AUGMENT_COMPARISON_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7490,7 +7493,7 @@ async fn test_apply_effective_changed_includes_resource_ref_changed_during_resol
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&AUGMENT_COMPARISON_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -7572,7 +7575,7 @@ async fn test_apply_effective_changed_includes_updatable_and_skips_create_only_w
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&AUGMENT_COMPARISON_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7641,7 +7644,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&AUGMENT_COMPARISON_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7707,7 +7710,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&AUGMENT_COMPARISON_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7768,7 +7771,7 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7902,7 +7905,7 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8028,7 +8031,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8103,7 +8106,7 @@ async fn test_simple_delete() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8146,7 +8149,7 @@ async fn test_failed_effect_propagates_to_dependent() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8191,7 +8194,7 @@ async fn test_observer_events_emitted_correctly() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8230,7 +8233,7 @@ async fn test_read_effect_is_no_op() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8300,7 +8303,7 @@ async fn release_list_keys_never_reaches_provider_executor() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8353,7 +8356,7 @@ async fn test_independent_effects_run_in_parallel() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8409,7 +8412,7 @@ async fn test_parallel_failure_skips_dependents() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8463,7 +8466,7 @@ async fn test_dependency_levels_sequential_chain() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8695,7 +8698,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8933,7 +8936,7 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &[],
@@ -9019,7 +9022,7 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &[],
@@ -9095,7 +9098,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -9374,7 +9377,7 @@ async fn test_update_effect_binding_map_propagation() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -9430,7 +9433,7 @@ async fn update_protocol_violation_preserves_identifier_for_recovery_refresh() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -9590,7 +9593,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -10058,7 +10061,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &[],
@@ -10185,7 +10188,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -10359,7 +10362,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -10452,7 +10455,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -10576,7 +10579,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -10692,7 +10695,7 @@ async fn test_apply_rejects_wrong_shape_access_without_wait_guidance() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -10860,7 +10863,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -11094,7 +11097,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -11149,7 +11152,7 @@ async fn deferred_materialization_failure_retains_reason_in_result_and_event() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &origins,
             data_source_origins: &[],
@@ -11224,7 +11227,7 @@ async fn apply_time_unbound_child_collision_with_another_desired_id_is_typed_err
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -11274,7 +11277,7 @@ async fn apply_time_unbound_child_collision_with_unabsorbed_state_row_is_typed_e
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -11346,7 +11349,7 @@ async fn unbound_deferred_replace_deletes_conflicting_legacy_rows_before_creatin
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -11388,7 +11391,7 @@ async fn unbound_deferred_replace_keeps_legacy_rows_when_gate_fails() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -11454,7 +11457,7 @@ async fn completed_plain_anonymous_delete_releases_id_for_unbound_deferred_child
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -11507,7 +11510,7 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -11562,7 +11565,7 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -11667,7 +11670,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&COEXISTING_TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -11766,7 +11769,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&COEXISTING_TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -12040,7 +12043,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
             data_source_origins: &[],
@@ -12237,7 +12240,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -12390,7 +12393,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -12535,7 +12538,7 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -12625,7 +12628,7 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -12737,7 +12740,7 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -12791,7 +12794,7 @@ async fn deferred_create_reports_iterable_reference_when_binding_missing() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &origins,
             data_source_origins: &[],
@@ -12994,7 +12997,7 @@ async fn conflicting_deferred_case(
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -13183,7 +13186,7 @@ fn issue_4283_deferred_prior_snapshot_uses_persisted_secret_shape() {
 
 #[tokio::test]
 async fn review_4283_anonymous_delete_waits_for_forbidden_cbd_admission() {
-    let (mut template, bindings, schemas, child) = anonymous_deferred_collision_fixture();
+    let (mut template, _bindings, schemas, child) = anonymous_deferred_collision_fixture();
     template.template_directives_mut().create_before_destroy =
         crate::resource::LoopDirective::Resolved(true);
     let child_id = child.id.clone();
@@ -13203,37 +13206,17 @@ async fn review_4283_anonymous_delete_waits_for_forbidden_cbd_admission() {
     plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
         Box::new(template),
     )));
-    let current = Current::from_snapshot(
-        State::existing(child_id.clone(), HashMap::new()).with_identifier("existing"),
-    );
-    let input = ExecutionInput {
-        provider_context: crate::parser::ProviderContext::clone(
-            &crate::parser::LoadedProviderContext::empty_for_test(),
-        ),
-        plan: &plan,
-        provider_check_inputs: ProviderCheckInputs::Authored,
-        compositions: &[],
-        bindings,
-        managed_current: HashMap::from([(child_id.clone(), current)]),
-        data_source_values: ExecutableDataSourceValues::empty(),
-        normalizer: &NoopNormalizer,
-        provider_configs: &[],
-        factories: &[],
-        schemas: &schemas,
-        parallelism: NonZeroUsize::new(1).unwrap(),
-        precompleted_success_count: 0,
-        checkpoint_sink: ExecutionCheckpointSink::noop(),
-    };
-    let observer = MockObserver::new();
-    let result =
-        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
-    assert_eq!(result.failure_count(), 1, "events: {:?}", observer.events());
+    let error = plan
+        .admit(&schemas)
+        .expect_err("known forbidden CBD must fail admission");
+    assert!(matches!(
+        error.cause,
+        crate::plan::CreateBeforeDestroyError::ReplacementCannotCoexist(_)
+    ));
     assert!(
         provider.calls().is_empty(),
-        "admission failed after destroying the old child: {:?}",
-        provider.calls()
+        "admission must precede every provider call"
     );
-    assert!(result.managed_current.contains_key(&child_id));
 }
 
 #[tokio::test]
@@ -13317,7 +13300,7 @@ async fn review5_4283_unbound_loop_after_read_does_not_block_unrelated_replaceme
         provider_context: crate::parser::LoadedProviderContext::empty_for_test()
             .as_provider_context()
             .clone(),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -13485,6 +13468,24 @@ async fn deposed_deferred_admission(coexisting: bool, absorbed: bool, bound: boo
     provider.push_create(Ok(
         State::existing(child_id.clone(), HashMap::new()).with_identifier("new-child")
     ));
+    let plan = match plan.admit(&schemas) {
+        Ok(plan) => plan,
+        Err(error) => {
+            assert!(
+                !coexisting,
+                "a Coexisting child must pass admission: {error:?}"
+            );
+            assert!(matches!(
+                error.cause,
+                crate::plan::CreateBeforeDestroyError::ReplacementCannotCoexist(_)
+            ));
+            assert!(
+                provider.calls().is_empty(),
+                "preflight must preserve every old generation"
+            );
+            return;
+        }
+    };
     let input = ExecutionInput {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -13755,7 +13756,7 @@ async fn review_4283_runtime_attribute_name_override_reaches_checkpoints() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -13905,7 +13906,7 @@ async fn deferred_reversed_history(coexisting_child: bool) {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: Default::default(),
@@ -13951,6 +13952,68 @@ async fn deferred_reversed_history(coexisting_child: bool) {
             < call_position(&calls, "delete", &child_id.to_string()),
         "historical inversion requires child coexistence: {calls:?}"
     );
+}
+
+#[test]
+fn review6_4283_historical_secret_rehydration_preserves_approval_order() {
+    for create_first in [false, true] {
+        let id = test_resolved_id("test", "validation_records[0]");
+        let verified = State::existing(
+            id.as_inner().clone(),
+            HashMap::from([(
+                "secret".into(),
+                crate::resource::SnapshotValue::Deferred(crate::resource::DeferredValue::Secret(
+                    Box::new(crate::resource::SnapshotValue::Concrete(
+                        crate::resource::ConcreteValue::String("historical-secret".into()),
+                    ))
+                    .into(),
+                )),
+            )]),
+        );
+        let guide = crate::value::redact_secrets_in_state(&verified).unwrap();
+        let template = if create_first {
+            coexisting_validation_deferred_for_expression()
+        } else {
+            validation_deferred_for_expression()
+        };
+        let mut plan = Plan::new();
+        plan.add(Effect::DeferredReplace(Box::new(
+            crate::test_support::compiled_replace(
+                NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                    generation: EffectGeneration::Current,
+                    id: id.clone(),
+                    identifier: crate::effect::fixture_applied_identifier("old-child"),
+                    directives: Default::default(),
+                    binding: Some(absolute_binding("validation_records[0]")),
+                    dependencies: Default::default(),
+                    explicit_dependencies: Default::default(),
+                    blocked_by_updates: Default::default(),
+                    previous_attributes: guide.attributes.clone(),
+                }])
+                .unwrap(),
+                Box::new(template),
+            ),
+        )));
+        plan.prepare_replacements(&COEXISTING_TEST_SCHEMAS).unwrap();
+        let restored = crate::value::rehydrate_plan_historical_secrets_from_verified_states(
+            &plan,
+            &HashMap::from([(id.as_inner().clone(), guide)]),
+            &HashMap::from([(id.as_inner().clone(), verified.clone())]),
+        )
+        .unwrap();
+        // Restoration produces a draft. The display boundary accepts only
+        // the capability returned by admission of that final draft.
+        let restored = restored.admit(&COEXISTING_TEST_SCHEMAS).unwrap();
+        let Effect::DeferredReplace(payload) = &restored.effects()[0] else {
+            panic!("historical restoration changed the deferred endpoint");
+        };
+        assert_eq!(payload.deletes[0].previous_attributes, verified.attributes);
+        assert_eq!(
+            payload.display_glyph(),
+            if create_first { "+/-" } else { "-/+" },
+            "approval must retain the checked replacement order after historical restoration"
+        );
+    }
 }
 
 #[test]

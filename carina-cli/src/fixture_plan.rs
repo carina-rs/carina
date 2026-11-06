@@ -771,7 +771,7 @@ where
             }
             let (plan, references) = match plan {
                 crate::wiring::PlannedPlan::Unrendered { plan, references } => {
-                    (plan, FixtureReferences(references))
+                    (*plan, FixtureReferences(references))
                 }
                 crate::wiring::PlannedPlan::Rendered {
                     display,
@@ -802,7 +802,7 @@ where
             .expect("fixture exports must resolve without secrets");
 
             FixturePlan {
-                plan,
+                plan: plan.into_unadmitted(),
                 references,
                 moved_hints,
                 desired_resources: resolved_resources,

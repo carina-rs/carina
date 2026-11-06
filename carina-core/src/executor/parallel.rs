@@ -40,27 +40,12 @@ use super::{ExecutionInput, ProviderCheckInputs};
 pub(super) fn apply_deferred_gate_deps<S: Clone>(
     admitted: &crate::replacement::AdmittedReplacementEffects<S>,
     deps_of: &mut HashMap<usize, HashSet<usize>>,
-    deferred_replace_delete_deps: &[(usize, usize)],
 ) {
-    let effects = admitted.effects();
-    for gate in 0..effects.len() {
+    for gate in 0..admitted.effects().len() {
         for delete in admitted.deferred_delete_candidates(gate) {
             if let Some(dependencies) = deps_of.get_mut(&delete) {
                 dependencies.insert(gate);
             }
-        }
-    }
-
-    for &(gate_idx, delete_idx) in deferred_replace_delete_deps {
-        let Some(Effect::DeferredReplace(_payload)) = effects.get(gate_idx) else {
-            continue;
-        };
-
-        if deps_of.contains_key(&delete_idx) {
-            // The gate owns its absorbed rows. A failed or skipped gate must
-            // therefore skip the deletes instead of destroying live state
-            // before the replacement shape is known.
-            deps_of.entry(delete_idx).or_default().insert(gate_idx);
         }
     }
 }
@@ -401,38 +386,9 @@ pub(super) async fn execute_effects_sequential<
     let module_gate = input.compositions.module_constraint_gate();
     let type_checks = input.type_checks;
 
-    let admitted = match input.plan.admit_replacement_effects(input.schemas) {
-        Ok(replacements) => replacements,
-        Err(error) => {
-            let effect = input
-                .plan
-                .effects()
-                .iter()
-                .find(|effect| effect.resource_id() == error.resource_id.as_ref())
-                .expect("replacement admission errors identify their endpoint");
-            {
-                record_effect_failure(
-                    &mut accumulated,
-                    observer,
-                    effect,
-                    EffectFailureKind::deferred(super::DeferredCreateFailure::Replacement {
-                        error,
-                    }),
-                    FailureEventContext {
-                        recovery: None,
-                        duration: std::time::Duration::ZERO,
-                        progress: ProgressInfo {
-                            completed: 0,
-                            total: input.plan.effects().len(),
-                        },
-                    },
-                );
-            }
-            return (accumulated.finish(&input.checkpoint_sink), false);
-        }
-    };
+    let admitted = input.plan.admitted_effects();
     accumulated.record_replacement_metadata(&admitted);
-    let (mut admitted, deferred_replace_delete_deps, _) = admitted.expand_deferred_replacements();
+    let (mut admitted, _, _) = admitted.expand_deferred_replacements();
     let mut effects = admitted.effects();
     let mut materialization_requirements = crate::replacement::create_first_requirements(effects);
     let mut total = count_runtime_effects(effects, &input.data_source_values);
@@ -488,11 +444,9 @@ pub(super) async fn execute_effects_sequential<
     let SchedulerDeps {
         mut deps_of,
         unresolved: scheduler_dependency_errors,
-    } = input.compositions.scheduler_dependencies(
-        &admitted,
-        resource_origins,
-        &deferred_replace_delete_deps,
-    );
+    } = input
+        .compositions
+        .scheduler_dependencies(&admitted, resource_origins);
 
     // Build effect index -> binding name mapping for resolving dependency names
     let mut idx_to_binding: HashMap<usize, String> = effects
@@ -783,11 +737,9 @@ pub(super) async fn execute_effects_sequential<
                         effects = admitted.effects();
                         materialization_requirements =
                             crate::replacement::create_first_requirements(effects);
-                        let rebuilt = input.compositions.scheduler_dependencies(
-                            &admitted,
-                            resource_origins,
-                            &deferred_replace_delete_deps,
-                        );
+                        let rebuilt = input
+                            .compositions
+                            .scheduler_dependencies(&admitted, resource_origins);
                         deps_of = rebuilt.deps_of;
                         for dependency in rebuilt.unresolved {
                             let failed_idx = dependency.effect_index();
@@ -1475,7 +1427,7 @@ mod tests {
             (1, HashSet::new()),
             (2, HashSet::new()),
         ]);
-        apply_deferred_gate_deps(&admitted, &mut deps_of, &[]);
+        apply_deferred_gate_deps(&admitted, &mut deps_of);
         assert_eq!(deps_of[&0], HashSet::from([1]));
         assert!(
             deps_of[&2].is_empty(),
@@ -1521,7 +1473,7 @@ mod tests {
             |_| HashMap::new(),
         )
         .unwrap();
-        apply_deferred_gate_deps(&admitted, &mut deps_of, &[]);
+        apply_deferred_gate_deps(&admitted, &mut deps_of);
 
         assert_eq!(deps_of.get(&0), Some(&HashSet::from([1, 2])));
         assert_eq!(deps_of.get(&1), Some(&HashSet::new()));
@@ -1851,11 +1803,12 @@ mod tests {
                     &SchemaRegistry::new(),
                     plan.effects().iter().map(Effect::resource_id),
                 );
+                let admitted_plan = plan.clone().admit(&schemas).unwrap();
                 let mut input: RuntimeExecutionInput = ExecutionInput {
                     provider_context: crate::parser::ProviderContext::clone(
                         &crate::parser::LoadedProviderContext::empty_for_test(),
                     ),
-                    plan: &plan,
+                    plan: &admitted_plan,
                     provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                         resource_origins: &unresolved,
                         data_source_origins: &[],
@@ -2017,11 +1970,12 @@ mod tests {
                     &SchemaRegistry::new(),
                     plan.effects().iter().map(Effect::resource_id),
                 );
+                let admitted_plan = plan.clone().admit(&schemas).unwrap();
                 let mut input: RuntimeExecutionInput = ExecutionInput {
                     provider_context: crate::parser::ProviderContext::clone(
                         &crate::parser::LoadedProviderContext::empty_for_test(),
                     ),
-                    plan: &plan,
+                    plan: &admitted_plan,
                     provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                         resource_origins: &unresolved,
                         data_source_origins: &[],

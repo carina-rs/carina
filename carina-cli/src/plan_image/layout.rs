@@ -2318,7 +2318,7 @@ mod tests {
             &[],
         );
         build_model(PlanImageInput {
-            plan,
+            plan: &crate::test_support::admit_fixture_plan(plan, None),
             desired_resources: &desired,
             unresolved_resources: &unresolved,
             compositions: &[],
@@ -2334,7 +2334,7 @@ mod tests {
             .expect("fixture mock inputs must be valid");
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         build_model(PlanImageInput {
-            plan: &fixture.plan,
+            plan: &crate::test_support::admit_fixture_plan(&fixture.plan, Some(&fixture.schemas)),
             desired_resources: &fixture.desired_resources,
             unresolved_resources: &fixture.unresolved_resources,
             compositions: &fixture.compositions,
@@ -2474,7 +2474,7 @@ mod tests {
         }
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         let model = build_model(PlanImageInput {
-            plan: &fixture.plan,
+            plan: &crate::test_support::admit_fixture_plan(&fixture.plan, Some(&fixture.schemas)),
             desired_resources: &fixture.desired_resources,
             unresolved_resources: &fixture.unresolved_resources,
             compositions: &fixture.compositions,
@@ -2494,7 +2494,7 @@ mod tests {
             .map(|replacement| replacement.delete_idx)
             .collect();
         let scheduler_edges = carina_core::executor::build_plan_scheduler_dependency_edges(
-            &fixture.plan,
+            &crate::test_support::admit_fixture_plan(&fixture.plan, Some(&fixture.schemas)),
             &unresolved,
         );
         if fixture_name == "deferred_for_with_paired_destroy" {
@@ -3444,7 +3444,7 @@ mod tests {
         .expect("fixture mock inputs must be valid");
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         let model = build_model(PlanImageInput {
-            plan: &fixture.plan,
+            plan: &crate::test_support::admit_fixture_plan(&fixture.plan, Some(&fixture.schemas)),
             desired_resources: &fixture.desired_resources,
             unresolved_resources: &fixture.unresolved_resources,
             compositions: &fixture.compositions,

@@ -177,13 +177,7 @@ impl<S, P: PlanValueKind> CheckedReplacement<ResolvedResource<S, P>> {
             old_instances: self
                 .old_instances
                 .iter()
-                .map(|old| {
-                    crate::effect::DeletedInstanceKey::new(
-                        old.id.as_inner().clone(),
-                        old.generation.clone(),
-                        old.identifier.as_str().to_owned(),
-                    )
-                })
+                .map(DeferredReplaceDelete::instance_key)
                 .collect(),
             create_first: self.is_create_first(),
         }
@@ -774,23 +768,6 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                 return Err(rejected.expect("every remaining promotion was rejected"));
             }
         }
-        for effect in &mut effects {
-            if let Effect::DeferredReplace(payload) = effect {
-                payload.require_create_first_for_dependencies(&requirements);
-                payload
-                    .preflight(registry)
-                    .map_err(|cause| ReplacementAdmissionError {
-                        resource_id: Box::new(payload.id().as_inner().clone()),
-                        required_by: payload.required_by().map(str::to_owned).or_else(|| {
-                            payload
-                                .required_children()
-                                .first()
-                                .map(|(_, dependent)| dependent.clone())
-                        }),
-                        cause,
-                    })?;
-            }
-        }
         for (index, checked) in checked_replacements {
             if let Some(name) = checked.temporary_name() {
                 temporary_names.push((checked.target().id.clone(), name.clone()));
@@ -805,12 +782,81 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
             }
             scheduling.insert(checked.into_scheduling(), &effects, index);
         }
-        Ok(Self {
+        let mut admitted = Self {
             effects,
             scheduling,
             temporary_names,
             writeback,
-        })
+        };
+        for gate in 0..admitted.effects.len() {
+            // Use the same historical candidates as the runtime gate. A plain
+            // DeferredCreate can replace deposed-only generations too.
+            let candidates = admitted.deferred_delete_candidates(gate);
+            let mut preview = match &admitted.effects[gate] {
+                Effect::DeferredCreate(payload) => {
+                    let deletes = candidates
+                        .into_iter()
+                        .map(|index| {
+                            let Effect::Delete {
+                                id,
+                                identifier,
+                                generation,
+                                directives,
+                                binding,
+                                dependencies,
+                                explicit_dependencies,
+                                blocked_by_updates,
+                            } = &admitted.effects[index]
+                            else {
+                                unreachable!()
+                            };
+                            DeferredReplaceDelete {
+                                id: id.clone(),
+                                identifier: identifier.clone(),
+                                generation: generation.clone(),
+                                directives: directives.clone(),
+                                binding: binding.clone(),
+                                dependencies: dependencies.clone(),
+                                explicit_dependencies: explicit_dependencies.clone(),
+                                blocked_by_updates: blocked_by_updates.clone(),
+                                previous_attributes: previous(&DeletedInstanceKey::new(
+                                    id.as_inner().clone(),
+                                    generation.clone(),
+                                    identifier.as_str(),
+                                )),
+                            }
+                        })
+                        .collect();
+                    let Ok(deletes) = NonEmptyDeletes::try_new(deletes) else {
+                        continue;
+                    };
+                    crate::effect::DeferredReplacePayload::new(
+                        deletes,
+                        payload.template.clone(),
+                        payload.dependency_template.clone(),
+                    )
+                }
+                Effect::DeferredReplace(payload) => (**payload).clone(),
+                _ => continue,
+            };
+            preview.require_create_first_for_dependencies(&requirements);
+            preview
+                .preflight(registry)
+                .map_err(|cause| ReplacementAdmissionError {
+                    resource_id: Box::new(preview.id().as_inner().clone()),
+                    required_by: preview.required_by().map(str::to_owned).or_else(|| {
+                        preview
+                            .required_children()
+                            .first()
+                            .map(|(_, dependent)| dependent.clone())
+                    }),
+                    cause,
+                })?;
+            if let Effect::DeferredReplace(payload) = &mut admitted.effects[gate] {
+                **payload = preview;
+            }
+        }
+        Ok(admitted)
     }
     pub fn effects(&self) -> &[Effect<S, P>] {
         &self.effects
@@ -819,12 +865,13 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
         effects: Vec<Effect<S, P>>,
         scheduling: ReplacementScheduling,
         temporary_names: PreparedReplacementNames,
+        writeback: Vec<ReplacementWriteback>,
     ) -> Self {
         Self {
             effects,
             scheduling,
             temporary_names,
-            writeback: Vec::new(),
+            writeback,
         }
     }
     pub(crate) fn temporary_names(&self) -> &PreparedReplacementNames {
@@ -907,7 +954,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
     }
 }
 
-impl<S: Clone> AdmittedReplacementEffects<S> {
+impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
     /// The same candidate set owns both the gate barrier and materialization's
     /// historical inputs. Deletes already owned by a concrete replacement
     /// cannot also belong to an unrelated deferred loop.
@@ -969,7 +1016,9 @@ impl<S: Clone> AdmittedReplacementEffects<S> {
             })
             .collect()
     }
+}
 
+impl<S: Clone> AdmittedReplacementEffects<S> {
     pub fn dependency_analysis<'a>(
         &self,
         unresolved: impl IntoIterator<Item = &'a ResolvedResourceId>,
@@ -1571,7 +1620,6 @@ mod tests {
             changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".into()])
                 .unwrap(),
             cascade_ref_hints: Vec::new(),
-            permanent_name_override: None,
             consumer_updates: Default::default(),
         });
         plan.add_delete(deposed.clone());
@@ -1862,7 +1910,6 @@ mod tests {
             changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".into()])
                 .unwrap(),
             cascade_ref_hints: Vec::new(),
-            permanent_name_override: None,
             consumer_updates: Default::default(),
         });
         let saved: crate::plan::SavedPlan = plan.to_snapshot().into();
@@ -2012,7 +2059,6 @@ mod tests {
             changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".into()])
                 .unwrap(),
             cascade_ref_hints: Vec::new(),
-            permanent_name_override: None,
             consumer_updates: Default::default(),
         });
         plan.retain(|effect| !matches!(effect, Effect::Remove { .. }));
@@ -2100,6 +2146,7 @@ mod tests {
                     effects.clone(),
                     scheduling,
                     Vec::new(),
+                    Vec::new(),
                 )
                 .dependency_analysis(std::iter::empty())
                 .unwrap();
@@ -2153,7 +2200,6 @@ mod tests {
             changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".into()])
                 .unwrap(),
             cascade_ref_hints: Vec::new(),
-            permanent_name_override: None,
             consumer_updates: Default::default(),
         });
         let redacted = crate::value::redact_secrets_in_plan_with_desired_and_historical(
@@ -2225,7 +2271,6 @@ mod tests {
                 changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".into()])
                     .unwrap(),
                 cascade_ref_hints: Vec::new(),
-                permanent_name_override: None,
                 consumer_updates: Default::default(),
             });
             plan.prepare_replacements(&schemas).unwrap();
@@ -2344,7 +2389,6 @@ mod tests {
             changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".into()])
                 .unwrap(),
             cascade_ref_hints: Vec::new(),
-            permanent_name_override: None,
             consumer_updates: Default::default(),
         });
         let json = serde_json::to_value(&plan).unwrap();

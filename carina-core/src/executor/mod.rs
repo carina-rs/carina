@@ -63,20 +63,17 @@ pub struct PlanSchedulerEndpoint {
 /// Dependency-analysis failures retain their partial edge graph, matching the
 /// scheduler's behavior for unaffected effects.
 pub fn build_plan_scheduler_dependency_edges(
-    plan: &crate::plan::Plan,
+    plan: &crate::plan::AdmittedPlan,
     unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
 ) -> BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)> {
     let (admitted, deferred_replace_delete_deps, source_effect_indices) =
-        plan.scheduling_effects().expand_deferred_replacements();
+        plan.admitted_effects().expand_deferred_replacements();
     let deferred_replace_teardowns: HashSet<_> = deferred_replace_delete_deps
         .iter()
         .map(|(_, delete_idx)| *delete_idx)
         .collect();
-    let scheduler::SchedulerDeps { deps_of, .. } = scheduler::build_scheduler_deps(
-        &admitted,
-        unresolved_resources.keys(),
-        &deferred_replace_delete_deps,
-    );
+    let scheduler::SchedulerDeps { deps_of, .. } =
+        scheduler::build_scheduler_deps(&admitted, unresolved_resources.keys());
 
     deps_of
         .into_iter()
@@ -447,7 +444,7 @@ pub enum Applied {
 
 /// Input data required to execute a plan.
 pub struct LiveExecutionInput<'a> {
-    pub plan: &'a crate::plan::Plan,
+    pub plan: &'a crate::plan::AdmittedPlan,
     /// Explicitly identifies whether provider-bound effects contain authored
     /// values or plan-normalized values paired with their authored origins.
     /// The executor never infers this from a missing map entry.
@@ -501,7 +498,7 @@ pub struct LiveExecutionInput<'a> {
 /// Keeping the composition slice in a distinct input type prevents a
 /// deserialized plan from entering the live validation/expansion lifecycle.
 pub struct SavedExecutionInput<'a> {
-    pub plan: &'a crate::plan::Plan<SavedModuleSource>,
+    pub plan: &'a crate::plan::AdmittedPlan<SavedModuleSource>,
     pub provider_check_inputs: ProviderCheckInputs<'a, SavedModuleSource>,
     pub compositions: &'a [crate::resource::SavedComposition<crate::resource::NoPlaceholder>],
     pub bindings: ResolvedBindings,
@@ -540,19 +537,14 @@ impl RuntimeCompositions<'_> {
         self,
         admitted: &crate::replacement::AdmittedReplacementEffects<S>,
         unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
-        deferred_replace_delete_deps: &[(usize, usize)],
     ) -> scheduler::SchedulerDeps {
         let _ = self;
-        scheduler::build_scheduler_deps(
-            admitted,
-            unresolved_resources.keys(),
-            deferred_replace_delete_deps,
-        )
+        scheduler::build_scheduler_deps(admitted, unresolved_resources.keys())
     }
 }
 
 pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
-    pub(super) plan: &'a crate::plan::Plan<S>,
+    pub(super) plan: &'a crate::plan::AdmittedPlan<S>,
     pub(super) provider_check_inputs: ProviderCheckInputs<'a, S>,
     pub(super) compositions: RuntimeCompositions<'a>,
     pub(super) bindings: ResolvedBindings,

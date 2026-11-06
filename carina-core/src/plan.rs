@@ -631,7 +631,6 @@ pub(crate) struct ReplacementGroup {
     pub replacement: CheckedReplacement<ResolvedResource>,
     pub changed_create_only: ChangedCreateOnly,
     pub cascade_ref_hints: Vec<(String, String)>,
-    pub permanent_name_override: Option<PermanentNameOverride>,
     pub consumer_updates: ResolvedDependencies,
 }
 
@@ -690,7 +689,7 @@ impl IgnoredChangeSummary {
     }
 }
 
-/// Plan containing admitted replacement metadata and effects to be executed.
+/// Mutable plan inputs. Rendering and execution require [`AdmittedPlan`].
 /// Decode [`UnresolvedSavedPlan`] and resolve it with schemas to load a plan.
 ///
 /// ```compile_fail,E0277
@@ -755,6 +754,88 @@ impl<S, V: PlanValueKind> Default for Plan<S, V> {
 
 pub type SavedPlan = Plan<SavedModuleSource, SnapshotLeaf>;
 pub type SnapshotPlan<S = ModuleSource> = Plan<S, SnapshotLeaf>;
+
+/// An immutable plan whose final effects have passed replacement admission.
+/// Transformations operate on its draft view and return a [`Plan`], so their
+/// output must cross [`Plan::admit`] before it can be rendered or executed.
+///
+/// A draft cannot enter the display boundary:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{detail_rows::{PlanDisplay, HistoricalDisplayAttributes, DetailComparisons}, plan::Plan};
+/// let draft = Plan::new();
+/// let historical = HistoricalDisplayAttributes::for_plan(&draft);
+/// PlanDisplay::unprepared(&draft, &historical, DetailComparisons::RecordedEffects);
+/// ```
+///
+/// A draft cannot enter the executor either:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::LiveExecutionInput, plan::Plan};
+/// fn bypass<'a>(input: &mut LiveExecutionInput<'a>, draft: &'a Plan) {
+///     input.plan = draft;
+/// }
+/// ```
+///
+/// Admission cannot survive mutation:
+///
+/// ```compile_fail,E0596
+/// use carina_core::{effect::Effect, plan::AdmittedPlan};
+/// fn change(plan: &mut AdmittedPlan, effect: Effect) {
+///     plan.add(effect);
+/// }
+/// ```
+///
+/// A transformed plan cannot retain the execution capability:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{plan::AdmittedPlan, value::rehydrate_plan_historical_secrets_from_verified_states};
+/// use std::collections::HashMap;
+/// fn transform(plan: &AdmittedPlan) -> AdmittedPlan {
+///     rehydrate_plan_historical_secrets_from_verified_states(plan, &HashMap::new(), &HashMap::new()).unwrap()
+/// }
+/// ```
+#[derive(Debug, Clone, Serialize)]
+#[serde(
+    transparent,
+    bound(serialize = "S: Serialize + Clone, V: PlanValueKind")
+)]
+pub struct AdmittedPlan<S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
+    plan: Plan<S, V>,
+    #[serde(skip)]
+    writeback: Vec<crate::replacement::ReplacementWriteback>,
+}
+
+impl<S, V: PlanValueKind> std::ops::Deref for AdmittedPlan<S, V> {
+    type Target = Plan<S, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.plan
+    }
+}
+
+impl<S: PartialEq, V: PlanValueKind> PartialEq for AdmittedPlan<S, V> {
+    fn eq(&self, other: &Self) -> bool {
+        self.plan == other.plan
+    }
+}
+
+impl<S, V: PlanValueKind> AdmittedPlan<S, V> {
+    pub fn into_unadmitted(self) -> Plan<S, V> {
+        self.plan
+    }
+}
+
+impl<S: Clone, V: PlanValueKind> AdmittedPlan<S, V> {
+    pub(crate) fn admitted_effects(&self) -> crate::replacement::AdmittedReplacementEffects<S, V> {
+        crate::replacement::AdmittedReplacementEffects::from_compiled_parts(
+            self.effects.clone(),
+            self.replacements.clone(),
+            self.replacement_inputs.prepared_names.clone(),
+            self.writeback.clone(),
+        )
+    }
+}
 
 /// Deserialized saved-plan effects before managed resources have crossed the
 /// fingerprint-checked schema-resolution boundary.
@@ -975,10 +1056,6 @@ impl Plan {
             temporary_name,
             previous_attributes,
         });
-
-        if let Some(override_) = group.permanent_name_override {
-            self.permanent_name_overrides.push(override_);
-        }
     }
 }
 
@@ -1070,8 +1147,33 @@ impl<S, V: PlanValueKind> Plan<S, V> {
     where
         S: Clone,
     {
-        let (effects, replacements, temporary_names) =
-            self.admit_replacement_effects(schemas)?.into_parts();
+        let admitted = self.admit_replacement_effects(schemas)?;
+        self.install_admission(admitted);
+        Ok(())
+    }
+
+    /// Admit the final draft and seal it against further mutation.
+    pub fn admit(
+        mut self,
+        schemas: &crate::schema::SchemaRegistry,
+    ) -> Result<AdmittedPlan<S, V>, crate::replacement::ReplacementAdmissionError>
+    where
+        S: Clone,
+    {
+        let admitted = self.admit_replacement_effects(schemas)?;
+        let writeback = admitted.writeback().to_vec();
+        self.install_admission(admitted);
+        Ok(AdmittedPlan {
+            plan: self,
+            writeback,
+        })
+    }
+
+    fn install_admission(&mut self, admitted: crate::replacement::AdmittedReplacementEffects<S, V>)
+    where
+        S: Clone,
+    {
+        let (effects, replacements, temporary_names) = admitted.into_parts();
         self.effects = effects;
         self.replacements = replacements;
         self.replacement_inputs.prepared_names = temporary_names.clone();
@@ -1101,7 +1203,6 @@ impl<S, V: PlanValueKind> Plan<S, V> {
                 .get(display.create_idx)
                 .is_some_and(|effect| self.replacements.is_create_first(effect.resource_id()));
         }
-        Ok(())
     }
 
     pub(crate) fn admit_replacement_effects(
@@ -1706,6 +1807,7 @@ impl<S: Clone, V: PlanValueKind> Plan<S, V> {
             self.effects.clone(),
             self.replacements.clone(),
             Vec::new(),
+            Vec::new(),
         )
     }
 }
@@ -1895,7 +1997,6 @@ mod tests {
             replacement: admitted_fixture().clone(),
             changed_create_only: changed_create_only(),
             cascade_ref_hints: cascade_ref_hints(),
-            permanent_name_override: None,
             consumer_updates,
         }
     }
@@ -2244,19 +2345,19 @@ mod tests {
     }
 
     #[test]
-    fn plan_add_replacement_pushes_permanent_name_override_on_cbd() {
+    fn plan_admission_builds_permanent_name_override_on_cbd() {
         let override_ = permanent_name_override();
-        let mut group = replacement_group(Default::default());
-        group.permanent_name_override = Some(override_.clone());
-
+        let group = replacement_group(Default::default());
         let mut plan = Plan::new();
         plan.add_replacement(group);
+        plan.prepare_replacements(&replacement_fixture_registry())
+            .unwrap();
 
         assert_eq!(plan.permanent_name_overrides, vec![override_]);
     }
 
     #[test]
-    fn plan_add_replacement_skips_permanent_name_override_on_dbc() {
+    fn plan_admission_skips_permanent_name_override_on_dbc() {
         let mut group = replacement_group(Default::default());
         let request = group.replacement.into_request();
         let mut target = request.target().as_resource().clone();
@@ -2266,10 +2367,11 @@ mod tests {
             &crate::schema::SchemaRegistry::new(),
         )
         .unwrap();
-        group.permanent_name_override = None;
 
         let mut plan = Plan::new();
         plan.add_replacement(group);
+        plan.prepare_replacements(&replacement_fixture_registry())
+            .unwrap();
 
         assert!(plan.permanent_name_overrides.is_empty());
     }
@@ -2450,10 +2552,11 @@ mod tests {
 
     #[test]
     fn plan_permanent_name_overrides_round_trips_through_serde() {
-        let mut group = replacement_group(Default::default());
-        group.permanent_name_override = Some(permanent_name_override());
+        let group = replacement_group(Default::default());
         let mut plan = Plan::new();
         plan.add_replacement(group);
+        plan.prepare_replacements(&replacement_fixture_registry())
+            .unwrap();
 
         let json = serde_json::to_string(&plan).unwrap();
         let deserialized = deserialize_plan(&json);

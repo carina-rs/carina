@@ -467,7 +467,7 @@ async fn execute_mock_http_plan(
             provider_context: carina_core::parser::ProviderContext::clone(
                 &carina_core::parser::LoadedProviderContext::empty_for_test(),
             ),
-            plan,
+            plan: &plan.clone().admit(schemas).unwrap(),
             provider_check_inputs: carina_core::executor::ProviderCheckInputs::Authored,
             compositions: &[],
             bindings: Default::default(),
@@ -12216,4 +12216,4 @@ fn saved_plan_reloaded_resolved_data_source_retains_folded_module_dependency() {
 }
 
 #[path = "tests/issue_4283.rs"]
-mod issue_4283;
+pub(super) mod issue_4283;

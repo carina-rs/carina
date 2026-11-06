@@ -15331,7 +15331,6 @@ mod tests {
             changed_create_only: ChangedCreateOnly::new(vec!["bucket_name".to_string()])
                 .expect("test replacement has a create-only attribute"),
             cascade_ref_hints: vec![("vpc_id".to_string(), "vpc.id".to_string())],
-            permanent_name_override,
             consumer_updates: Default::default(),
             replacement: {
                 let mut old = crate::effect::DeferredReplaceDelete {
@@ -15354,6 +15353,9 @@ mod tests {
                 )
             },
         });
+        if let Some(override_) = permanent_name_override {
+            plan.permanent_name_overrides.push(override_);
+        }
         plan
     }
 

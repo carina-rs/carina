@@ -564,7 +564,7 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
             provider_context: carina_core::parser::ProviderContext::clone(
                 &carina_core::parser::LoadedProviderContext::empty_for_test(),
             ),
-            plan: &plan,
+            plan: &plan.clone().admit(&schemas).unwrap(),
             provider_check_inputs: ProviderCheckInputs::Authored,
             compositions: &[],
             bindings: Default::default(),

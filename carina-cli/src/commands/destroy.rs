@@ -952,6 +952,7 @@ async fn run_destroy_locked_owned(
         destroy_plan.add(delete_effects[*idx].clone());
     }
     destroy_plan.record_unresolved_delete_ordering_analysis(&dependency_analysis);
+    let destroy_plan = destroy_plan.admit(ctx.schemas())?;
     let historical_display =
         collect_historical_display_attributes(&destroy_plan, &managed_current, state_file.as_ref());
 

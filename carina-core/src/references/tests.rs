@@ -486,7 +486,7 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
     let plan = prepared.value.finish(|_| {});
     preparation
         .display(
-            plan.clone(),
+            plan.clone().admit(&fixture.registry).unwrap(),
             &prepared.references,
             crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, &fixture.saved),
             crate::detail_rows::DetailLevel::Full,
@@ -821,7 +821,7 @@ async fn round9_scalar_to_list_union_enumerates_planning_and_display_operands() 
     fixture.calls.lock().unwrap().clear();
     ReferencePreparation::default()
         .display(
-            plan.clone(),
+            plan.clone().admit(&fixture.registry).unwrap(),
             &prepare_empty_for_tests(),
             crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, &fixture.saved),
             crate::detail_rows::DetailLevel::Full,
@@ -2189,7 +2189,7 @@ async fn apply_concrete_plan_reference_reresolves_without_widening_equivalent_pa
                 provider_context: crate::parser::ProviderContext::clone(
                     &crate::parser::LoadedProviderContext::empty_for_test(),
                 ),
-                plan: &plan,
+                plan: &plan.clone().admit(&fixture.registry).unwrap(),
                 provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                     resource_origins: &origins,
                     data_source_origins: &[],

@@ -251,7 +251,7 @@ fn app_for_run(
     comparisons: carina_core::detail_rows::DetailComparisons<'_>,
 ) -> Result<App, TuiError> {
     App::new(
-        plan,
+        &plan.clone().admit(schemas).unwrap(),
         schemas,
         historical_display,
         prev_explicit,

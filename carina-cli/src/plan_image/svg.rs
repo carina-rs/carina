@@ -1201,7 +1201,7 @@ mod tests {
         });
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         let model = build_model(PlanImageInput {
-            plan: &fixture.plan,
+            plan: &crate::test_support::admit_fixture_plan(&fixture.plan, Some(&fixture.schemas)),
             desired_resources: &fixture.desired_resources,
             unresolved_resources: &fixture.unresolved_resources,
             compositions: &fixture.compositions,
@@ -1294,7 +1294,7 @@ mod tests {
             &[],
         );
         let model = build_model(PlanImageInput {
-            plan: &plan,
+            plan: &crate::test_support::admit_fixture_plan(&plan, None),
             desired_resources: &desired,
             unresolved_resources: &[],
             compositions: &[],
@@ -1356,7 +1356,7 @@ mod tests {
             &[],
         );
         let model = build_model(PlanImageInput {
-            plan: &plan,
+            plan: &crate::test_support::admit_fixture_plan(&plan, None),
             desired_resources: &desired,
             unresolved_resources: &[],
             compositions: &[],
@@ -1475,7 +1475,7 @@ mod tests {
             &[],
         );
         let model = build_model(PlanImageInput {
-            plan: &plan,
+            plan: &crate::test_support::admit_fixture_plan(&plan, None),
             desired_resources: &desired,
             unresolved_resources: &unresolved,
             compositions: &[],
@@ -1633,7 +1633,7 @@ mod tests {
         .expect("fixture mock inputs must be valid");
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         let model = build_model(PlanImageInput {
-            plan: &fixture.plan,
+            plan: &crate::test_support::admit_fixture_plan(&fixture.plan, Some(&fixture.schemas)),
             desired_resources: &fixture.desired_resources,
             unresolved_resources: &fixture.unresolved_resources,
             compositions: &fixture.compositions,

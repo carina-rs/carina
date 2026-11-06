@@ -618,11 +618,25 @@ async fn review5_4283_secret_plan_conversion_readmits_deferred_previews() {
     }
 }
 
-async fn saved_plan_conversion_preview(create_first: bool, secret: bool) {
+pub(in crate::commands::apply) async fn saved_plan_conversion_fixture(
+    create_first: bool,
+    secret: bool,
+) -> (
+    crate::commands::plan::ReloadedPlanFile,
+    SchemaRegistry,
+    Box<dyn Provider>,
+) {
     let fixture = ApplyCancellationFixture::new().with_raw_config("");
     let cloud = Cloud::default();
     cloud.0.lock().unwrap().coexisting_child = create_first;
     write_config(&fixture, "old");
+    if secret {
+        let path = fixture.config_path().join("main.crn");
+        let text = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("value = opt.value", "value = secret(opt.value)");
+        std::fs::write(path, text).unwrap();
+    }
     apply(&fixture, &cloud).await;
     write_config(&fixture, "new");
     let path = fixture.config_path().join("main.crn");
@@ -656,7 +670,6 @@ async fn saved_plan_conversion_preview(create_first: bool, secret: bool) {
         .unwrap()
         .resolve_with_schemas(loaded.context().schemas())
         .unwrap();
-    let expected = if create_first { "+/-" } else { "-/+" };
     let live = if secret {
         rehydrate_desired_plan_file_from_parts(
             resolved,
@@ -676,6 +689,16 @@ async fn saved_plan_conversion_preview(create_first: bool, secret: bool) {
             .into_live_without_secrets(loaded.context().schemas())
             .unwrap()
     };
+    (
+        live,
+        loaded.context().schemas().clone(),
+        Box::new(Mock(cloud)),
+    )
+}
+
+async fn saved_plan_conversion_preview(create_first: bool, secret: bool) {
+    let (live, _, _) = saved_plan_conversion_fixture(create_first, secret).await;
+    let expected = if create_first { "+/-" } else { "-/+" };
     let glyph = live
         .plan()
         .effects()

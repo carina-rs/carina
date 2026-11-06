@@ -96,7 +96,6 @@ pub(super) fn failure_display_name<S>(effect: &Effect<S>) -> Option<String> {
 pub(super) fn build_scheduler_deps<'a, S: Clone>(
     admitted: &crate::replacement::AdmittedReplacementEffects<S>,
     unresolved_resources: impl IntoIterator<Item = &'a ResolvedResourceId>,
-    deferred_replace_delete_deps: &[(usize, usize)],
 ) -> SchedulerDeps {
     let effects = admitted.effects();
     let (mut analysis, unresolved) = match admitted.dependency_analysis(unresolved_resources) {
@@ -105,7 +104,7 @@ pub(super) fn build_scheduler_deps<'a, S: Clone>(
     };
     relax_update_update_edges(effects, &mut analysis);
     let mut deps_of = analysis.into_deps_of();
-    apply_deferred_gate_deps(admitted, &mut deps_of, deferred_replace_delete_deps);
+    apply_deferred_gate_deps(admitted, &mut deps_of);
     SchedulerDeps {
         deps_of,
         unresolved,
