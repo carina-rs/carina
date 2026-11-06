@@ -13,7 +13,7 @@ use crate::plan::{
     ReplacementGroup,
 };
 use crate::provider::{LiftedSavedAttrs, Provider, ProviderRouter};
-use crate::replacement::{CheckedReplacement, ReplacementRequest, resolve_replacement};
+use crate::replacement::{ReplacementRequest, resolve_replacement};
 use crate::resource::{
     AbsoluteBindingAddress, ConcreteValue, Current, Directives, PlanInputCurrent, PlanInputDesired,
     PlanInputDesiredResources, ResolvedDataSource, ResolvedResource, ResolvedResourceId, Resource,
@@ -225,13 +225,6 @@ fn add_key_releases(plan: &mut Plan, id: &ResourceId, releases: Vec<PlannedListK
             keys: release.keys,
         });
     }
-}
-
-pub(crate) struct PendingReplace {
-    pub replacement: CheckedReplacement<ResolvedResource>,
-    pub changed_create_only: ChangedCreateOnly,
-    pub cascade_ref_hints: Vec<(String, String)>,
-    pub consumer_updates: ResolvedDependencies,
 }
 
 struct RefAttr {
@@ -1045,13 +1038,9 @@ fn add_deferred_create_effects_with_schemas(
             .filter_map(|effect| {
                 let Effect::Delete {
                     id,
-                    identifier,
                     generation: EffectGeneration::Current,
-                    directives,
                     binding,
-                    dependencies,
-                    explicit_dependencies,
-                    blocked_by_updates,
+                    ..
                 } = effect
                 else {
                     return None;
@@ -1067,22 +1056,12 @@ fn add_deferred_create_effects_with_schemas(
                 let matches = binding.as_ref().is_some_and(|binding| {
                     super::binding_matches_deferred_template(binding, template.target())
                 });
-                matches.then(|| DeferredReplaceDelete {
-                    generation: crate::effect::EffectGeneration::Current,
-                    previous_attributes: plan
-                        .previous_delete_attributes(&crate::effect::DeletedInstanceKey::new(
-                            id.as_inner().clone(),
-                            EffectGeneration::Current,
-                            identifier.as_str(),
-                        ))
-                        .unwrap_or_default(),
-                    id: id.clone(),
-                    identifier: identifier.clone(),
-                    directives: directives.clone(),
-                    binding: binding.clone(),
-                    dependencies: dependencies.clone(),
-                    explicit_dependencies: explicit_dependencies.clone(),
-                    blocked_by_updates: blocked_by_updates.clone(),
+                if !matches {
+                    return None;
+                }
+                effect.to_delete_payload(|instance| {
+                    plan.previous_delete_attributes(instance)
+                        .unwrap_or_default()
                 })
             })
             .collect();
@@ -1155,7 +1134,7 @@ fn add_deferred_create_effects_with_schemas(
 
 struct PlanBuild {
     plan: Plan,
-    pending_replaces: HashMap<ResolvedResourceId, PendingReplace>,
+    pending_replaces: HashMap<ResolvedResourceId, ReplacementGroup>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1688,7 +1667,7 @@ fn pending_replace_from_parts(
     changed_create_only: ChangedCreateOnly,
     cascade_ref_hints: Vec<(String, String)>,
     registry: &SchemaRegistry,
-) -> Result<PendingReplace, CreateBeforeDestroyError> {
+) -> Result<ReplacementGroup, CreateBeforeDestroyError> {
     let old = DeferredReplaceDelete {
         generation: crate::effect::EffectGeneration::Current,
         id: ResolvedResourceId::new(from.id.clone()),
@@ -1700,7 +1679,7 @@ fn pending_replace_from_parts(
         blocked_by_updates: Default::default(),
         previous_attributes: from.attributes.clone(),
     };
-    Ok(PendingReplace {
+    Ok(ReplacementGroup {
         replacement: resolve_replacement(
             ReplacementRequest::new(
                 to,
@@ -1716,19 +1695,14 @@ fn pending_replace_from_parts(
 
 fn decompose_replace_into_effects(
     plan: &mut Plan,
-    pending_replaces: HashMap<ResolvedResourceId, PendingReplace>,
+    pending_replaces: HashMap<ResolvedResourceId, ReplacementGroup>,
     prior_directives: &HashMap<ResourceId, PersistedDirectives>,
 ) {
     let mut pending_replaces: Vec<_> = pending_replaces.into_values().collect();
     pending_replaces.sort_by_key(|pending| pending.replacement.target().id.to_string());
     for mut pending in pending_replaces {
         pending.replacement.project_prior_explicit(prior_directives);
-        plan.add_replacement(ReplacementGroup {
-            replacement: pending.replacement,
-            changed_create_only: pending.changed_create_only,
-            cascade_ref_hints: pending.cascade_ref_hints,
-            consumer_updates: pending.consumer_updates,
-        });
+        plan.add_replacement(pending);
     }
 }
 
@@ -1756,7 +1730,7 @@ fn known_binding_names(
 #[allow(clippy::too_many_arguments)]
 fn cascade_dependent_updates(
     plan: &mut Plan,
-    pending_replaces: &mut HashMap<ResolvedResourceId, PendingReplace>,
+    pending_replaces: &mut HashMap<ResolvedResourceId, ReplacementGroup>,
     dependents: &CascadeDependents<'_>,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
@@ -1801,7 +1775,7 @@ fn cascade_dependent_updates(
 
 fn promote_referenced_replaces_to_cbd(
     plan: &mut Plan,
-    pending_replaces: &mut HashMap<ResolvedResourceId, PendingReplace>,
+    pending_replaces: &mut HashMap<ResolvedResourceId, ReplacementGroup>,
     dependents: &CascadeDependents<'_>,
     registry: &SchemaRegistry,
 ) -> std::ops::ControlFlow<()> {
@@ -1872,7 +1846,7 @@ fn promote_referenced_replaces_to_cbd(
 }
 
 fn mark_pending_create_before_destroy(
-    pending: &mut PendingReplace,
+    pending: &mut ReplacementGroup,
     registry: &SchemaRegistry,
     dependent: &str,
 ) -> Result<(), CreateBeforeDestroyError> {
@@ -1891,7 +1865,7 @@ fn mark_pending_create_before_destroy(
 #[allow(clippy::too_many_arguments)]
 fn promote_pending_replaces_for_dependents(
     plan: &mut Plan,
-    pending_replaces: &mut HashMap<ResolvedResourceId, PendingReplace>,
+    pending_replaces: &mut HashMap<ResolvedResourceId, ReplacementGroup>,
     unresolved_managed: &[ResolvedResource],
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
@@ -2023,7 +1997,7 @@ fn promote_pending_replaces_for_dependents(
 }
 
 fn merge_pending_create_only(
-    pending: &mut PendingReplace,
+    pending: &mut ReplacementGroup,
     attrs: ChangedCreateOnly,
     ref_hints: Vec<(String, String)>,
 ) {
@@ -2047,7 +2021,7 @@ fn promote_resource_to_pending_replace(
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,
     outcome_unknown_import_replacements: &HashSet<OutcomeUnknownImportReplacement>,
-) -> Option<PendingReplace> {
+) -> Option<ReplacementGroup> {
     let (from, identifier) = if let Some(update) = take_update_from_plan(plan, &resource.id) {
         update
     } else {

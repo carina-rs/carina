@@ -681,13 +681,10 @@ pub(in crate::commands::apply) async fn saved_plan_conversion_fixture(
                 source_dir: fixture.config_path(),
             },
             loaded.context().provider_context(),
-            loaded.context().schemas(),
         )
         .unwrap()
     } else {
-        resolved
-            .into_live_without_secrets(loaded.context().schemas())
-            .unwrap()
+        resolved.into_live_without_secrets().unwrap()
     };
     (
         live,
@@ -697,10 +694,10 @@ pub(in crate::commands::apply) async fn saved_plan_conversion_fixture(
 }
 
 async fn saved_plan_conversion_preview(create_first: bool, secret: bool) {
-    let (live, _, _) = saved_plan_conversion_fixture(create_first, secret).await;
+    let (live, schemas, _) = saved_plan_conversion_fixture(create_first, secret).await;
+    let admitted = live.plan().clone().admit(&schemas).unwrap();
     let expected = if create_first { "+/-" } else { "-/+" };
-    let glyph = live
-        .plan()
+    let glyph = admitted
         .effects()
         .iter()
         .find_map(|effect| match effect {

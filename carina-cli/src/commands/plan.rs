@@ -4266,29 +4266,10 @@ pub(crate) struct LivePlanFileValues {
     pub(crate) upstream_snapshot: HashMap<String, HashMap<String, Value>>,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum PlanRehydrationError {
-    #[error(transparent)]
-    Secret(#[from] carina_core::value::SecretRehydrationSiteError),
-    #[error(transparent)]
-    Replacement(#[from] carina_core::replacement::ReplacementAdmissionError),
-}
-
-impl From<carina_core::resource::UnavailableSecretError> for PlanRehydrationError {
-    fn from(error: carina_core::resource::UnavailableSecretError) -> Self {
-        Self::Secret(error.into())
-    }
-}
-
 impl ReloadedPlanFile<SnapshotLeaf> {
-    pub(crate) fn into_live(
-        self,
-        mut values: LivePlanFileValues,
-        schemas: &carina_core::schema::SchemaRegistry,
-    ) -> Result<ReloadedPlanFile, carina_core::replacement::ReplacementAdmissionError> {
-        // Preflight converted requests early. This remains a draft; only final
-        // admission after historical restoration grants display/execution access.
-        values.plan.prepare_replacements(schemas)?;
+    pub(crate) fn into_live(self, values: LivePlanFileValues) -> ReloadedPlanFile {
+        // Desired values are live, but historical names may still be redacted.
+        // Final admission after historical verification prepares replacements.
         let Self {
             refresh_rows,
             data_source_refresh_rows,
@@ -4322,7 +4303,7 @@ impl ReloadedPlanFile<SnapshotLeaf> {
             data_source_origins: _,
             upstream_snapshot: _,
         } = contents;
-        Ok(ReloadedPlanFile {
+        ReloadedPlanFile {
             refresh_rows,
             data_source_refresh_rows,
             evidence,
@@ -4353,13 +4334,12 @@ impl ReloadedPlanFile<SnapshotLeaf> {
                 provider_configs: values.provider_configs,
                 upstream_snapshot: values.upstream_snapshot,
             },
-        })
+        }
     }
 
     pub(crate) fn into_live_without_secrets(
         self,
-        schemas: &carina_core::schema::SchemaRegistry,
-    ) -> Result<ReloadedPlanFile, PlanRehydrationError> {
+    ) -> Result<ReloadedPlanFile, carina_core::value::SecretRehydrationSiteError> {
         let parsed = carina_core::parser::ExpandedInferredFile::default();
         let values = LivePlanFileValues {
             plan: carina_core::value::rehydrate_plan_desired_secrets(
@@ -4415,7 +4395,7 @@ impl ReloadedPlanFile<SnapshotLeaf> {
                 })
                 .collect::<Result<_, carina_core::resource::UnavailableSecretError>>()?,
         };
-        Ok(self.into_live(values, schemas)?)
+        Ok(self.into_live(values))
     }
 }
 

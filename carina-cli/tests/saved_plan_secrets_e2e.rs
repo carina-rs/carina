@@ -2542,6 +2542,60 @@ let item = mock.test.resource {
 }
 
 #[test]
+fn saved_cbd_replacement_preserves_approved_name_after_historical_secret_verification() {
+    let scenario = Scenario::new(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+let item = mock.test.resource {
+  name = secret("private-prior-name")
+}
+"#,
+    );
+    assert_success(
+        "initial apply",
+        &scenario.carina(&["apply", "--auto-approve", "--lock=false", "."]),
+    );
+    scenario.write_main(
+        r#"backend local { path = "carina.state.json" }
+provider mock {}
+let item = mock.test.resource {
+  name = "approved-distinct-name"
+  directives { create_before_destroy = true }
+}
+"#,
+    );
+    assert_success("save replacement plan", &scenario.plan());
+    let saved: Value = serde_json::from_str(&scenario.plan_text()).unwrap();
+    let target = saved["plan"]["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|effect| effect.get("Create"))
+        .expect("approved create");
+    assert_eq!(
+        target["attributes"]["name"]["String"],
+        "approved-distinct-name"
+    );
+    let prior_name =
+        saved["plan"]["replacement_inputs"]["old_instances"][0]["attributes"]["name"].to_string();
+    assert!(prior_name.contains(V2_SECRET_PREFIX));
+    assert!(!prior_name.contains("private-prior-name"));
+    assert_success("apply approved replacement plan", &scenario.apply_plan());
+    let state = scenario.state_json();
+    let row = state["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["identity"] == "item")
+        .expect("replacement state row");
+    assert_eq!(
+        row["current"]["attributes"]["name"],
+        "approved-distinct-name",
+    );
+    assert!(row["name_overrides"].as_object().unwrap().is_empty());
+}
+
+#[test]
 fn old_secret_is_masked_when_replacement_uses_public_text() {
     const PLAINTEXT: &str = "PUBLIC_REPLACE_OLD_SECRET_PLAINABC_3861";
     let scenario = Scenario::new(

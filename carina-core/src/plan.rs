@@ -964,7 +964,9 @@ impl UnresolvedSavedPlan {
             .into_iter()
             .map(|effect| effect.resolve_with_schemas(schemas))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut plan = Plan {
+        // Historical secret placeholders are still unverified. Preserve the
+        // approved targets until final admission after historical restoration.
+        Ok(Plan {
             replacements: ReplacementScheduling::default(),
             effects,
             ignored_change_summaries,
@@ -974,10 +976,7 @@ impl UnresolvedSavedPlan {
             errors,
             abandoned_deposed,
             destroy_ordering_notices,
-        };
-        plan.prepare_replacements(schemas)
-            .map_err(|error| crate::resource::ResolvedResourceError::Replacement(error.cause))?;
-        Ok(plan)
+        })
     }
 }
 

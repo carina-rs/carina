@@ -2406,6 +2406,41 @@ impl<S, V: PlanValueKind> EffectWithSource<S, V> {
         }
     }
 
+    /// Capture a delete endpoint with the history of that exact generation.
+    pub(crate) fn to_delete_payload(
+        &self,
+        previous: impl FnOnce(&DeletedInstanceKey) -> HashMap<String, SnapshotValue>,
+    ) -> Option<DeferredReplaceDelete> {
+        let Self::Delete {
+            id,
+            identifier,
+            generation,
+            directives,
+            binding,
+            dependencies,
+            explicit_dependencies,
+            blocked_by_updates,
+        } = self
+        else {
+            return None;
+        };
+        Some(DeferredReplaceDelete {
+            id: id.clone(),
+            identifier: identifier.clone(),
+            generation: generation.clone(),
+            directives: directives.clone(),
+            binding: binding.clone(),
+            dependencies: dependencies.clone(),
+            explicit_dependencies: explicit_dependencies.clone(),
+            blocked_by_updates: blocked_by_updates.clone(),
+            previous_attributes: previous(&DeletedInstanceKey::new(
+                id.as_inner().clone(),
+                generation.clone(),
+                identifier.as_str(),
+            )),
+        })
+    }
+
     /// Returns the effect's resource identity, not its typed scheduling key.
     ///
     /// `Effect::identity()` is total because all scheduler-bound payloads went

@@ -1440,7 +1440,7 @@ mod tests {
     }
 
     #[test]
-    fn deposed_delete_and_current_create_same_identity_have_no_replacement_edge() {
+    fn deposed_delete_and_current_create_require_replacement_admission() {
         let delete = Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", "thing")),
             identifier: crate::effect::fixture_applied_identifier("thing-old"),
@@ -1454,19 +1454,24 @@ mod tests {
             blocked_by_updates: Default::default(),
         };
         let create = create_effect("thing");
-
-        let deps = build_effect_dependency_analysis(
-            &[delete, create],
-            std::iter::empty(),
-            ScheduleInputs::Apply,
+        let effects = [delete, create];
+        // Recovery generations need the same admission as current instances.
+        let error =
+            build_effect_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
+                .expect_err("raw replacement endpoints must not choose their own order");
+        assert_eq!(error.unresolved().len(), 2);
+        let admitted = crate::replacement::AdmittedReplacementEffects::resolve(
+            &effects,
+            &crate::schema::SchemaRegistry::new(),
+            |_| HashMap::new(),
         )
-        .expect("dependency analysis must resolve")
-        .into_deps_of();
-
-        assert!(
-            !deps[&1].contains(&0),
-            "current create must not be ordered after deposed delete as a replacement"
-        );
+        .unwrap();
+        let deps = admitted
+            .dependency_analysis(std::iter::empty())
+            .expect("admitted dependency analysis must resolve")
+            .into_deps_of();
+        assert!(deps[&1].contains(&0), "default replacement is delete-first");
+        assert!(!deps[&0].contains(&1));
     }
 
     #[test]

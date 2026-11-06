@@ -428,10 +428,12 @@ fn deposed_only_deferred_preflight(explicit: bool) {
     let saved: crate::plan::UnresolvedSavedPlan =
         serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
     assert!(matches!(
-        saved.resolve_with_schemas(&schemas),
-        Err(crate::resource::ResolvedResourceError::Replacement(
-            CreateBeforeDestroyError::ReplacementCannotCoexist(_)
-        ))
+        saved
+            .resolve_with_schemas(&schemas)
+            .unwrap()
+            .admit(&schemas)
+            .map_err(|error| error.cause),
+        Err(CreateBeforeDestroyError::ReplacementCannotCoexist(_))
     ));
 }
 

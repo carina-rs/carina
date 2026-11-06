@@ -377,13 +377,8 @@ impl ReloadedVerifiedPlanFile {
             check_loaded_providers(&plan_file, &schema_references, ctx, apply_target)?;
             let plan_file = plan_file
                 .resolve_with_schemas(ctx.schemas())?
-                .into_live_without_secrets(ctx.schemas())
-                .map_err(|error| match error {
-                    crate::commands::plan::PlanRehydrationError::Secret(error) => {
-                        saved_plan_secret_rehydration_error(error, apply_target)
-                    }
-                    crate::commands::plan::PlanRehydrationError::Replacement(error) => error.into(),
-                })?;
+                .into_live_without_secrets()
+                .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
             Ok(SavedPlanArtifactsChecked::new(
                 RehydratedPlanFile {
                     plan_file,
@@ -552,10 +547,6 @@ impl TestSavedPlanSecretCandidates {
 }
 
 impl SavedPlanSecretCandidates {
-    pub(super) fn schemas(&self) -> &carina_core::schema::SchemaRegistry {
-        self.validated.context().schemas()
-    }
-
     pub(super) fn provider_context(&self) -> &carina_core::parser::LoadedProviderContext {
         self.validated.context().provider_context()
     }
@@ -2064,7 +2055,7 @@ mod tests {
         .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
         .expect("resolve saved plan");
         let plan_file = plan_file
-            .into_live_without_secrets(&carina_core::schema::SchemaRegistry::new())
+            .into_live_without_secrets()
             .expect("desired data-source inputs contain no hashes");
         let pending = DesiredVerifiedPlanFile {
             plan_file,

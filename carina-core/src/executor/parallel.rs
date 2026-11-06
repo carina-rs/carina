@@ -606,52 +606,31 @@ pub(super) async fn execute_effects_sequential<
             let ordinary_old = admitted
                 .deferred_delete_candidates(idx)
                 .into_iter()
-                .filter_map(|index| match &effects[index] {
-                    Effect::Delete {
-                        id,
-                        identifier,
-                        generation,
-                        directives,
-                        binding,
-                        dependencies,
-                        explicit_dependencies,
-                        blocked_by_updates,
-                    } => Some(crate::effect::DeferredReplaceDelete {
-                        generation: generation.clone(),
-                        id: id.clone(),
-                        identifier: identifier.clone(),
-                        directives: directives.clone(),
-                        binding: binding.clone(),
-                        dependencies: dependencies.clone(),
-                        explicit_dependencies: explicit_dependencies.clone(),
-                        blocked_by_updates: blocked_by_updates.clone(),
-                        previous_attributes: input
+                .filter_map(|index| {
+                    effects[index].to_delete_payload(|instance| {
+                        input
                             .plan
-                            .previous_delete_attributes(&crate::effect::DeletedInstanceKey::new(
-                                id.as_inner().clone(),
-                                generation.clone(),
-                                identifier.as_str(),
-                            ))
+                            .previous_delete_attributes(instance)
                             .or_else(|| {
-                                if !generation.is_current() {
+                                if !instance.generation().is_current() {
                                     return None;
                                 }
                                 accumulated
                                     .result()
                                     .managed_current
-                                    .get(id.as_inner())
+                                    .get(instance.id())
                                     .and_then(|current| match current {
                                         crate::resource::Current::Present(present)
-                                            if present.identifier() == identifier =>
+                                            if present.identifier().as_str()
+                                                == instance.identifier() =>
                                         {
                                             Some(present.state().to_snapshot().attributes)
                                         }
                                         _ => None,
                                     })
                             })
-                            .unwrap_or_default(),
-                    }),
-                    _ => None,
+                            .unwrap_or_default()
+                    })
                 })
                 .collect::<Vec<_>>();
             let dispatch_ctx = PureMetaCtx {

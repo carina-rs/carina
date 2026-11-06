@@ -1177,15 +1177,12 @@ mod tests {
         summary: &PlanChangeSummary,
     ) -> GraphModel {
         let plan = crate::test_support::admit_fixture_plan(plan, None);
-        build_model(PlanImageInput {
-            plan: &plan,
+        build_model(input(
+            &plan,
             desired_resources,
             unresolved_resources,
-            compositions: &[],
-            expansion_trace: None,
-            state: None,
             summary,
-        })
+        ))
     }
 
     fn input<'a>(
