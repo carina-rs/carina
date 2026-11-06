@@ -986,6 +986,8 @@ impl std::error::Error for AwsCredentialStartupError {}
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error(transparent)]
+    CreationCheckPending(#[from] carina_core::creation::CreationCheckPending),
+    #[error(transparent)]
     CommandInput(#[from] std::sync::Arc<CommandInputError>),
 
     #[error(transparent)]

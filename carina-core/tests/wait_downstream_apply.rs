@@ -510,7 +510,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         provider_context: carina_core::parser::ProviderContext::clone(
             provider_types.provider_context(),
         ),
-        plan: &plan,
+        plan: &creation_fixture::checked(plan.clone()),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &[],
@@ -718,7 +718,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         provider_context: carina_core::parser::ProviderContext::clone(
             provider_types.provider_context(),
         ),
-        plan: &plan,
+        plan: &creation_fixture::checked(plan.clone()),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &[],
@@ -916,3 +916,5 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
          dependency edge — both halves of the wait binding must hold"
     );
 }
+#[path = "support/creation.rs"]
+mod creation_fixture;

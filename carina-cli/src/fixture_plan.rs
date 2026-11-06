@@ -248,6 +248,7 @@ impl FixtureReferences {
 /// Complete output of fixture-based plan construction.
 pub struct FixturePlan {
     pub plan: Plan,
+    pub checked: Option<carina_core::creation::CreationCheckedPlan>,
     pub references: FixtureReferences,
     pub moved_hints: MovedBlockHints,
     /// Resolved desired resources, including unchanged resources omitted from
@@ -277,6 +278,35 @@ pub struct FixturePlan {
     /// can render the composition-group header the same way the
     /// real `carina plan` command does (carina#3322).
     pub expansion_trace: carina_core::resource::ExpansionTrace,
+}
+
+impl FixturePlan {
+    pub async fn prepare_display(
+        &self,
+        detail: carina_core::detail_rows::DetailLevel,
+        provider: &ProviderRouter,
+    ) -> ProviderResult<Option<carina_core::detail_rows::PreparedPlanDisplay>> {
+        let Some(checked) = &self.checked else {
+            return Ok(None);
+        };
+        let historical = delete_instance_attributes_from_plan(
+            &self.plan,
+            &self.managed_current,
+            self.state_file.as_ref(),
+        );
+        carina_core::references::ReferencePreparation::default()
+            .display(
+                checked.clone(),
+                &self.references.0,
+                historical,
+                detail,
+                &self.schemas,
+                &self.prev_explicit,
+                provider,
+            )
+            .await
+            .map(|display| Some(display.value))
+    }
 }
 
 /// Build an explicitly scoped provider router for rendering a hand-built plan.
@@ -715,6 +745,7 @@ where
             let references = FixtureReferences(carina_core::references::prepare_empty_for_tests());
             FixturePlan {
                 plan,
+                checked: None,
                 references,
                 moved_hints,
                 // Error plans abort before resolved-resource and export consumers.
@@ -769,15 +800,19 @@ where
             if let Some(migrated) = migrated_legacy_state {
                 state_file = Some(migrated);
             }
-            let (plan, references) = match plan {
+            let (checked, references) = match plan {
                 crate::wiring::PlannedPlan::Unrendered { plan, references } => {
                     (plan, FixtureReferences(references))
                 }
                 crate::wiring::PlannedPlan::Rendered {
                     display,
                     references,
-                } => (display.plan().clone(), FixtureReferences(references)),
+                } => (
+                    display.checked_plan().clone(),
+                    FixtureReferences(references),
+                ),
             };
+            let plan = checked.plan().clone();
             let moved_hints =
                 detect_moved_block_hints(&plan, &managed_current, &schemas, &provider_router)
                     .expect("fixture moved-hint comparisons must resolve");
@@ -803,6 +838,7 @@ where
 
             FixturePlan {
                 plan,
+                checked: Some(checked),
                 references,
                 moved_hints,
                 desired_resources: resolved_resources,

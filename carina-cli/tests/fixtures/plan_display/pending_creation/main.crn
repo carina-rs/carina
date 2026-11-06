@@ -1,0 +1,7 @@
+let suffix = mock.test.resource {
+  name = "suffix"
+}
+
+let bucket = mock.test.creation_constrained {
+  name = suffix.identifier
+}

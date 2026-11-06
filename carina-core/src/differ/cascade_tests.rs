@@ -1,5 +1,6 @@
 use super::*;
 use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+use std::ops::Deref;
 
 use crate::resource::{ResolvedDependencies, ResolvedResourceId};
 use std::collections::HashSet;
@@ -185,6 +186,8 @@ fn plan_from_resolved_fixture(
     )
     .expect("test provider hints should succeed")
     .finish(|_| {})
+    .deref()
+    .clone()
 }
 
 fn standard_states() -> HashMap<ResourceId, State> {
@@ -1343,7 +1346,7 @@ fn deferred_create_cbd_plan(
     )
     .unwrap()
     .finish(|_| {});
-    (plan, id)
+    (plan.deref().clone(), id)
 }
 
 #[test]

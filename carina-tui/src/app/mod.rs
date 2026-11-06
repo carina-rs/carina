@@ -994,7 +994,8 @@ fn effect_to_node<S, V: carina_core::resource::PlanValueKind>(
             let template = &payload.template;
             let verb = deferred_for_verb(plan, template);
             let upstream_binding = template.binding_description();
-            let rows = deferred_for_detail_rows(template, &upstream_binding, verb);
+            let mut rows = deferred_for_detail_rows(template, &upstream_binding, verb);
+            rows.extend(detail_rows);
             TreeNode {
                 effect_label: format!(
                     "{} {}",
@@ -1014,7 +1015,8 @@ fn effect_to_node<S, V: carina_core::resource::PlanValueKind>(
         Effect::DeferredReplace(payload) => {
             let verb = deferred_for_verb(plan, &payload.template);
             let upstream_binding = payload.template.binding_description();
-            let rows = deferred_for_detail_rows(&payload.template, &upstream_binding, verb);
+            let mut rows = deferred_for_detail_rows(&payload.template, &upstream_binding, verb);
+            rows.extend(detail_rows);
             TreeNode {
                 effect_label: format!(
                     "{} {}",

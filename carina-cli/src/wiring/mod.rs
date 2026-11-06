@@ -226,12 +226,18 @@ pub enum PlannedPlan {
         references: carina_core::references::ResolvedReferences,
     },
     Unrendered {
-        plan: Plan,
+        plan: carina_core::creation::CreationCheckedPlan,
         references: carina_core::references::ResolvedReferences,
     },
 }
 
 impl PlannedPlan {
+    pub(crate) fn checked(&self) -> &carina_core::creation::CreationCheckedPlan {
+        match self {
+            Self::Rendered { display, .. } => display.checked_plan(),
+            Self::Unrendered { plan, .. } => plan,
+        }
+    }
     pub(crate) fn references(&self) -> &carina_core::references::ResolvedReferences {
         match self {
             Self::Rendered { references, .. } | Self::Unrendered { references, .. } => references,
@@ -285,7 +291,7 @@ impl std::ops::Deref for PlanOutcome {
 /// plans exit through a distinct type before a historical view is constructed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_plan_outcome(
-    plan: Plan,
+    plan: carina_core::creation::FinalizedPlan,
     planning: carina_core::references::ResolvedReferences,
     preparation: &mut carina_core::references::ReferencePreparation,
     row_request: RowRequest,
@@ -295,9 +301,15 @@ pub(crate) async fn prepare_plan_outcome(
     explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     provider: &ProviderRouter,
 ) -> Result<PlanOutcome, AppError> {
-    if let Ok(errors) = NonEmptyPlanErrors::try_from(plan.errors().to_vec()) {
-        return Ok(PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }));
-    }
+    let plan = match plan.check_creation(schemas, managed_current) {
+        Ok(plan) => plan,
+        Err(plan) => {
+            let plan = plan.into_plan();
+            let errors = NonEmptyPlanErrors::try_from(plan.errors().to_vec())
+                .expect("creation rejection contains diagnostics");
+            return Ok(PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }));
+        }
+    };
     let planned = match row_request {
         RowRequest::Render(detail) => {
             let historical = crate::commands::plan::collect_historical_display_attributes(
@@ -7050,7 +7062,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     )
                     .await?;
                 let mut state_block_result = Ok(());
-                let mut plan = prepared.value.finish(|plan| {
+                let plan = prepared.value.finish_with_desired_ids(resolved_desired_ids.ids.iter(), |plan| {
                     add_deposed_delete_effects(plan, state_file, &addressed.moved_pairs);
                     block_deletes_on_prior_consumer_updates(plan, &directives_map);
                     override_aware_resources.apply_plan_stability(
@@ -7076,17 +7088,6 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     );
                 });
                 state_block_result?;
-
-                let analysis = carina_core::effect::deps::build_effect_dependency_analysis(
-                    plan.effects(),
-                    resolved_desired_ids.ids.iter(),
-                    carina_core::effect::deps::ScheduleInputs::Apply,
-                );
-                let analysis = match analysis {
-                    Ok(analysis) => analysis,
-                    Err(failure) => failure.into_parts().0,
-                };
-                plan.record_unresolved_delete_ordering_analysis(&analysis);
 
                 let moved_origins = addressed
                     .moved_pairs

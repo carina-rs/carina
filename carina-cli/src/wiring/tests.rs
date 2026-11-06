@@ -9426,7 +9426,10 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         provider_context: carina_core::parser::ProviderContext::clone(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan_ctx.plan,
+        plan: match &plan_ctx.plan {
+            PlanOutcome::Planned(plan) => plan.checked(),
+            PlanOutcome::Diagnostics(_) => panic!("expected checked plan"),
+        },
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &data_source_origins,

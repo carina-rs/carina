@@ -261,3 +261,6 @@ pub(crate) fn empty_state_block_targets() -> crate::wiring::ResolvedStateBlockTa
         removed_from: carina_state::ResolvedRemovedClaims::resolve(&[], None),
     }
 }
+#[cfg(test)]
+#[path = "../../carina-core/tests/support/creation.rs"]
+pub(crate) mod creation_fixture;

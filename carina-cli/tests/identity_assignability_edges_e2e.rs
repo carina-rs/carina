@@ -540,7 +540,7 @@ fn identity_edges_apply_checks_unknown_value_before_consumer_create() {
         creates: Mutex::new(Vec::new()),
     };
     let input = LiveExecutionInput {
-        plan: &fixture.plan,
+        plan: &creation_fixture::checked(fixture.plan.clone()),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &origins,
             data_source_origins: &[],
@@ -634,3 +634,6 @@ fn identity_edges_use_the_data_source_input_owner() {
         }
     }
 }
+
+#[path = "../../carina-core/tests/support/creation.rs"]
+mod creation_fixture;

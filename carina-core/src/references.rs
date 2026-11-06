@@ -631,7 +631,7 @@ impl ReferencePreparation {
     #[allow(clippy::too_many_arguments)]
     pub async fn display(
         &mut self,
-        plan: crate::plan::Plan,
+        plan: crate::creation::CreationCheckedPlan,
         planning: &ResolvedReferences,
         historical: crate::detail_rows::HistoricalDisplayAttributes,
         detail: crate::detail_rows::DetailLevel,
@@ -761,7 +761,22 @@ impl ReferencePreparation {
                 },
             )
             .await?;
-        let plan = prepared.value;
+        let plan = match crate::creation::FinalizedPlan::new(prepared.value).check_creation(
+            registry,
+            &prior
+                .materialize_current_states(desired, registry)
+                .into_iter()
+                .map(|(id, input)| (id, input.into_current()))
+                .collect(),
+        ) {
+            Ok(plan) => plan,
+            Err(plan) => {
+                return Ok(PreparedComparison {
+                    value: plan.into_plan(),
+                    references: prepared.references,
+                });
+            }
+        };
         let historical =
             crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, saved);
         let display = self
@@ -776,7 +791,7 @@ impl ReferencePreparation {
             )
             .await?;
         Ok(PreparedComparison {
-            value: plan,
+            value: plan.plan().clone(),
             references: display.references,
         })
     }
@@ -890,7 +905,7 @@ impl<'run> RecordingSession<'run> {
     #[allow(clippy::too_many_arguments)]
     fn render(
         self,
-        plan: Arc<crate::plan::Plan>,
+        plan: Arc<crate::creation::CreationCheckedPlan>,
         planning: &ResolvedReferences,
         historical: crate::detail_rows::HistoricalDisplayAttributes,
         detail: crate::detail_rows::DetailLevel,

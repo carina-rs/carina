@@ -698,6 +698,13 @@ mod provider_scope_evidence_tests {
 ///     let _ = serde_json::to_string(contents);
 /// }
 /// ```
+///
+/// Raw contents cannot record a production plan without creation admission.
+///
+/// ```compile_fail
+/// use carina_cli::commands::plan::PlanFileContents;
+/// fn record_raw(contents: PlanFileContents) { let _ = contents.record(); }
+/// ```
 #[derive(Debug, Clone)]
 pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueKind = SnapshotLeaf>
 {
@@ -1695,21 +1702,28 @@ impl Deref for PlanFile {
     }
 }
 
-impl PlanFileContents {
-    /// Atomically bind these contents to the schemas and provider artifacts
-    /// loaded in the exact context that produced the completed plan.
-    pub fn record<E>(
+/// An immutable saved-plan snapshot constructed only from creation admission.
+/// Raw `PlanFileContents` remains a transport/fixture type and cannot record a
+/// production plan. No mutable or deserialization seam exposes this owner.
+struct CheckedPlanFileContents {
+    snapshot: PlanFileContents,
+}
+
+impl CheckedPlanFileContents {
+    fn record<E>(
         self,
         validated: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
         persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        self.record_with_context(
+        self.snapshot.record_with_context(
             validated.context(),
             &validated.resources().provider,
             persisted_directive_changes,
         )
     }
+}
 
+impl PlanFileContents {
     /// Record hand-built plan contents in unit and integration fixtures.
     #[cfg(any(test, feature = "test-utils"))]
     pub fn record_for_test<R>(
@@ -3548,7 +3562,7 @@ mod historical_display_tests {
             request: crate::wiring::RowRequest,
         ) -> Result<crate::wiring::PlanOutcome, AppError> {
             crate::wiring::prepare_plan_outcome(
-                plan,
+                crate::test_support::creation_fixture::finalize(plan),
                 carina_core::references::prepare_empty_for_tests(),
                 &mut carina_core::references::ReferencePreparation::default(),
                 request,
@@ -3759,7 +3773,7 @@ mod historical_display_tests {
         for detail in [crate::DetailLevel::Full, crate::DetailLevel::Explicit] {
             let display = preparation
                 .display(
-                    plan.clone(),
+                    crate::test_support::creation_fixture::checked(plan.clone()),
                     &references,
                     historical.clone(),
                     detail.to_core(),
@@ -5045,6 +5059,7 @@ fn build_plan_file<E>(
     state_file: &Option<StateFile>,
     directive_changes: Vec<PersistedDirectiveChange>,
     validated_plan: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
+    checked: &carina_core::creation::CreationCheckedPlan,
 ) -> Result<PlanFile, PlanSaveError> {
     let ctx = validated_plan.resources();
     let parsed = ctx.parsed();
@@ -5055,6 +5070,7 @@ fn build_plan_file<E>(
         backend_config,
         state_file,
         ctx,
+        checked,
     )?
     .record(validated_plan, directive_changes)
     .map_err(PlanSaveError::from)
@@ -5080,7 +5096,12 @@ fn build_plan_file_from_parts<E, R>(
         backend_config,
         state_file,
         ctx,
+        match &ctx.plan {
+            crate::wiring::PlanOutcome::Planned(plan) => plan.checked(),
+            crate::wiring::PlanOutcome::Diagnostics(_) => panic!("cannot save a diagnostic plan"),
+        },
     )?
+    .snapshot
     .record_for_test(validated_config, directive_changes)
     .map_err(PlanSaveError::from)
 }
@@ -5093,7 +5114,8 @@ fn build_plan_file_contents<E>(
     backend_config: Option<BackendConfig>,
     state_file: &Option<StateFile>,
     ctx: &crate::wiring::PlanContext,
-) -> Result<PlanFileContents, PlanSaveError> {
+    checked: &carina_core::creation::CreationCheckedPlan,
+) -> Result<CheckedPlanFileContents, PlanSaveError> {
     assert_eq!(
         ctx.data_sources.len(),
         parsed.data_sources.len(),
@@ -5370,7 +5392,7 @@ fn build_plan_file_contents<E>(
         provider_configs,
         backend_config,
         plan: redact_secrets_in_plan_with_desired_and_historical(
-            &ctx.plan,
+            checked.plan(),
             &redacted_desired_resources,
             &redacted_managed_states,
         )?,
@@ -5487,7 +5509,7 @@ fn build_plan_file_contents<E>(
             })
             .collect(),
     };
-    Ok(contents)
+    Ok(CheckedPlanFileContents { snapshot: contents })
 }
 
 /// Preserve typed plan-save failures where available, while adding the CLI's
@@ -6034,6 +6056,7 @@ pub(crate) async fn run_plan_using(
             &state_file,
             directive_changes.clone(),
             &validated_plan,
+            planned.checked(),
         )
         .map_err(|error| map_plan_save_error(error, "--json"))?;
         let json_str = serde_json::to_string_pretty(&plan_file)
@@ -6116,6 +6139,7 @@ pub(crate) async fn run_plan_using(
             &state_file,
             directive_changes.clone(),
             &validated_plan,
+            planned.checked(),
         )
         .map_err(|error| map_plan_save_error(error, "--out"))?;
         let json_out = carina_core::utils::pretty_with_newline(&plan_file)
@@ -8202,7 +8226,7 @@ mod run_plan_out_tests {
         let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan,
+                plan: crate::test_support::creation_fixture::checked(plan),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -8615,7 +8639,7 @@ mod run_plan_out_tests {
         let parsed = resolve_file_for_test(parsed, tmp.path());
         let ctx = crate::wiring::PlanContext {
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: Plan::new(),
+                plan: crate::test_support::creation_fixture::checked(Plan::new()),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -8716,7 +8740,7 @@ mod run_plan_out_tests {
         let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: Plan::new(),
+                plan: crate::test_support::creation_fixture::checked(Plan::new()),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -8789,7 +8813,7 @@ mod run_plan_out_tests {
             legacy_dependency_classification: None,
             migrated_legacy_state: None,
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: Plan::new(),
+                plan: crate::test_support::creation_fixture::checked(Plan::new()),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -8875,7 +8899,7 @@ mod run_plan_out_tests {
             legacy_dependency_classification: None,
             migrated_legacy_state: None,
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: Plan::new(),
+                plan: crate::test_support::creation_fixture::checked(Plan::new()),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),

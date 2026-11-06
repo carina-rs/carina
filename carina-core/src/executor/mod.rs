@@ -449,8 +449,13 @@ pub enum Applied {
 }
 
 /// Input data required to execute a plan.
+///
+/// ```compile_fail
+/// use carina_core::{executor::LiveExecutionInput, plan::Plan};
+/// fn bypass<'a>(input: &mut LiveExecutionInput<'a>, raw: &'a Plan) { input.plan = raw; }
+/// ```
 pub struct LiveExecutionInput<'a> {
-    pub plan: &'a crate::plan::Plan,
+    pub plan: &'a crate::creation::CreationCheckedPlan,
     /// Explicitly identifies whether provider-bound effects contain authored
     /// values or plan-normalized values paired with their authored origins.
     /// The executor never infers this from a missing map entry.
@@ -551,6 +556,7 @@ impl RuntimeCompositions<'_> {
 }
 
 pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
+    creation_pending: Option<crate::creation::CreationEffectTarget>,
     pub(super) plan: &'a crate::plan::Plan<S>,
     pub(super) provider_check_inputs: ProviderCheckInputs<'a, S>,
     pub(super) compositions: RuntimeCompositions<'a>,
@@ -595,6 +601,10 @@ impl<'a> LiveExecutionInput<'a> {
             checkpoint_sink,
         } = self;
         RuntimeExecutionInput {
+            creation_pending: plan
+                .pending_creation()
+                .first()
+                .map(|obligation| obligation.target().clone()),
             plan,
             provider_check_inputs,
             compositions: RuntimeCompositions::Live(compositions),
@@ -638,6 +648,9 @@ impl<'a> SavedExecutionInput<'a> {
             checkpoint_sink,
         } = self;
         RuntimeExecutionInput {
+            // Saved-plan creation re-admission belongs to phase 5. Preserve
+            // the existing saved-plan path until that transition is added.
+            creation_pending: None,
             plan,
             provider_check_inputs,
             compositions: RuntimeCompositions::Saved(compositions),
@@ -2019,6 +2032,32 @@ async fn execute_runtime_plan<S: Clone + crate::resource::AnonymousIdentityModul
     observer: &dyn ExecutionObserver<S>,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome<S> {
+    if let Some(target) = input.creation_pending {
+        let mut result = ExecutionResult::empty();
+        result.bindings = input.bindings;
+        result.managed_current = input.managed_current;
+        let effect = input
+            .plan
+            .effects()
+            .get(target.effect_index())
+            .expect("checked obligation targets an immutable effect slot");
+        result.failures.record(
+            observer,
+            FailureReport::Effect {
+                effect,
+                kind: EffectFailureKind::execution(crate::creation::CreationCheckPending),
+                context: FailureEventContext {
+                    recovery: None,
+                    duration: std::time::Duration::ZERO,
+                    progress: ProgressInfo {
+                        completed: 0,
+                        total: input.plan.effects().len(),
+                    },
+                },
+            },
+        );
+        return ExecutionOutcome::Completed(result);
+    }
     let (result, was_cancelled) = execute_effects_sequential(
         provider,
         comparison_provider,

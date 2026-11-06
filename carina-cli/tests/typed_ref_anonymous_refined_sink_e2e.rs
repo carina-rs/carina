@@ -598,7 +598,7 @@ fn apply_unknown_outputs(attributes: &str, output: Value, port: i64) -> Executio
         creates: Mutex::new(Vec::new()),
     };
     let input = LiveExecutionInput {
-        plan: &fixture.plan,
+        plan: &creation_fixture::checked(fixture.plan.clone()),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &origins,
             data_source_origins: &[],
@@ -758,3 +758,6 @@ fn typed_ref_secret_constraint_error_does_not_leak_value() {
         );
     }
 }
+
+#[path = "../../carina-core/tests/support/creation.rs"]
+mod creation_fixture;

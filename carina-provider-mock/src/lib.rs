@@ -114,6 +114,7 @@ pub fn uses_builtin_provider<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a
 pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
     let schemas = vec![
         creation_constraint_schema(),
+        creation_constraint_schema_for("test.creation_conflicting").with_conflicting_replacement(),
         ResourceSchema::new("test.resource")
             .attribute(
                 AttributeSchema::required("name", AttributeType::string())
@@ -410,8 +411,18 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
 
 /// Portable creation-declaration fixture shared by native and WASM schemas.
 pub fn creation_constraint_schema() -> ResourceSchema {
-    ResourceSchema::new("test.creation_constrained")
+    creation_constraint_schema_for("test.creation_constrained").with_coexisting_replacement()
+}
+
+fn creation_constraint_schema_for(resource_type: &str) -> ResourceSchema {
+    ResourceSchema::new(resource_type)
         .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("generation", AttributeType::int())
+                .create_only()
+                .build(),
+        )
+        .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
         .creation_constraint(carina_core::schema::CreationRule::new(
             carina_core::schema::CreationInputPath::new("name").unwrap(),
             carina_core::schema::CreationRuleCode::new("mock.name.not_ipv4").unwrap(),

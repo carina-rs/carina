@@ -1806,11 +1806,12 @@ mod tests {
                     &SchemaRegistry::new(),
                     plan.effects().iter().map(Effect::resource_id),
                 );
+                let checked_plan = crate::executor::tests::checked_fixture_plan(&plan);
                 let mut input: RuntimeExecutionInput = ExecutionInput {
                     provider_context: crate::parser::ProviderContext::clone(
                         &crate::parser::LoadedProviderContext::empty_for_test(),
                     ),
-                    plan: &plan,
+                    plan: &checked_plan,
                     provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                         resource_origins: &unresolved,
                         data_source_origins: &[],
@@ -1972,11 +1973,12 @@ mod tests {
                     &SchemaRegistry::new(),
                     plan.effects().iter().map(Effect::resource_id),
                 );
+                let checked_plan = crate::executor::tests::checked_fixture_plan(&plan);
                 let mut input: RuntimeExecutionInput = ExecutionInput {
                     provider_context: crate::parser::ProviderContext::clone(
                         &crate::parser::LoadedProviderContext::empty_for_test(),
                     ),
-                    plan: &plan,
+                    plan: &checked_plan,
                     provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                         resource_origins: &unresolved,
                         data_source_origins: &[],

@@ -332,6 +332,35 @@ fn directory_diagnostics(
     engine.analyze(&create_document_at(&source, path.clone()), Some(&path))
 }
 
+#[test]
+fn creation_constraints_produce_no_lsp_value_findings() {
+    use carina_core::schema::{
+        CreationInputPath, CreationPredicate, CreationRule, CreationRuleCode,
+    };
+    let engine = engine_with_schema(
+        ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .creation_constraint(CreationRule::new(
+                CreationInputPath::new("name").unwrap(),
+                CreationRuleCode::new("test.not_ipv4").unwrap(),
+                CreationPredicate::NotIpv4,
+            )),
+    );
+    let diagnostics = directory_diagnostics(
+        &engine,
+        &[
+            ("values.crn", "let legacy = '192.168.1.1'\n"),
+            ("exports.crn", "exports { name = bucket.name }\n"),
+            (
+                "main.crn",
+                "let bucket = test.test.Widget { name = legacy }\n",
+            ),
+        ],
+        "main.crn",
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
 fn assert_directory_findings(
     diagnostics: Vec<Diagnostic>,
     expected: &[(&str, DiagnosticSeverity, Range)],

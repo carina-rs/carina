@@ -1890,6 +1890,20 @@ fn render_detail_row<S>(
     attr_prefix: &str,
 ) {
     match row {
+        DetailRow::PendingCreation { path, codes } => {
+            writeln!(
+                out,
+                "{}{} [{}]: creation check pending until apply",
+                attr_prefix,
+                path,
+                codes
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .unwrap();
+        }
         DetailRow::Text { text } => {
             writeln!(out, "{}{}", attr_prefix, text).unwrap();
         }

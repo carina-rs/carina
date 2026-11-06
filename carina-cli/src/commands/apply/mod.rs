@@ -22,6 +22,7 @@ use carina_core::executor::{
     LiveExecutionInput, ProviderCheckInputs, SavedExecutionInput, UnresolvedResource,
 };
 use carina_core::paths::ResolvedPath;
+#[cfg(any(test, feature = "test-utils"))]
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ProviderRouter};
@@ -221,6 +222,82 @@ struct BootstrapCreateContext<'a> {
     schemas: &'a carina_core::schema::SchemaRegistry,
 }
 
+async fn prepare_bootstrap_creation(
+    color_mode: crate::output_style::ColorMode,
+    resource: Resource,
+    context: &BootstrapCreateContext<'_>,
+    session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+) -> Result<
+    (
+        carina_core::provider::CreateRequest,
+        carina_core::creation::CreationCheckedPlan<carina_core::resource::ProviderModuleSource>,
+    ),
+    AppError,
+> {
+    let bindings = bootstrap_resolved_bindings(context.parsed);
+    let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(
+        &context.parsed.compositions,
+    );
+    let preparation = carina_core::executor::ProviderPreparationContext::new(
+        &bindings,
+        &module_gate,
+        context.provider_configs.as_provider_configs(),
+        context.normalizer,
+        context.factories,
+        context.schemas,
+        session,
+    );
+    let request = carina_core::executor::prepare_create_request(resource, &preparation)
+        .await
+        .map_err(AppError::from_state_bucket_preparation)?;
+    let checked = match carina_core::differ::finalize_bootstrap_create(&request)
+        .check_creation(context.schemas, &HashMap::new())
+    {
+        Ok(plan) => plan,
+        Err(plan) => {
+            return Err(
+                crate::commands::shared::plan_errors::render_plan_errors_and_abort(
+                    color_mode,
+                    &plan,
+                    Path::new("."),
+                )
+                .expect_err("bootstrap creation rejection has diagnostics"),
+            );
+        }
+    };
+    checked.ensure_creation_ready()?;
+    Ok((request, checked))
+}
+
+async fn create_checked_auto_bootstrap_bucket(
+    color_mode: crate::output_style::ColorMode,
+    resource: Resource,
+    context: BootstrapCreateContext<'_>,
+) -> Result<(), AppError> {
+    let context = BootstrapCreateContext {
+        normalizer: &carina_core::provider::NoopNormalizer,
+        ..context
+    };
+    crate::wiring::settle_type_checks(
+        carina_core::validation::deferred_types::TypeCheckSession::run_async(
+            context.provider_context,
+            async |session| {
+                // The backend sends this exact bucket name itself. Use a no-op
+                // normalizer so a provider rewrite cannot certify a different name.
+                let (_request, _creation_checked) =
+                    prepare_bootstrap_creation(color_mode, resource, &context, session).await?;
+                context
+                    .backend
+                    .create_bucket()
+                    .await
+                    .map_err(AppError::Backend)
+            },
+        )
+        .await,
+        AppError::Validation,
+    )
+}
+
 async fn create_checked_bootstrap_resource(
     color_mode: crate::output_style::ColorMode,
     operation_provider: &dyn Provider,
@@ -232,33 +309,18 @@ async fn create_checked_bootstrap_resource(
         carina_core::validation::deferred_types::TypeCheckSession::run_async(
             context.provider_context,
             async |session| {
+                let id = resource.id.clone();
+                let (request, _creation_checked) =
+                    prepare_bootstrap_creation(color_mode, resource, &context, session).await?;
                 let BootstrapCreateContext {
                     provider_context: _provider_context,
                     backend,
-                    parsed,
-                    provider_configs,
-                    normalizer,
-                    factories,
+                    parsed: _,
+                    provider_configs: _,
+                    normalizer: _,
+                    factories: _,
                     schemas,
                 } = context;
-                let id = resource.id.clone();
-                let bindings = bootstrap_resolved_bindings(parsed);
-                let module_gate =
-                    carina_core::executor::ModuleConstraintGate::from_live_compositions(
-                        &parsed.compositions,
-                    );
-                let preparation = carina_core::executor::ProviderPreparationContext::new(
-                    &bindings,
-                    &module_gate,
-                    provider_configs.as_provider_configs(),
-                    normalizer,
-                    factories,
-                    schemas,
-                    session,
-                );
-                let request = carina_core::executor::prepare_create_request(resource, &preparation)
-                    .await
-                    .map_err(AppError::from_state_bucket_preparation)?;
                 let resolved = request.resource().as_inner().clone();
                 let resolved_comparison =
                     comparison_provider.comparison_for(schemas, &resolved.id)?;
@@ -741,7 +803,7 @@ struct ApplyExecutionState<
 }
 
 async fn execute_effects_with_observer(
-    plan: &Plan,
+    plan: &carina_core::creation::CreationCheckedPlan,
     compositions: &[carina_core::resource::LiveComposition],
     context: ApplyExecutionContext<'_>,
     state: ApplyExecutionState<'_>,
@@ -1856,12 +1918,46 @@ async fn run_apply_with_observer_factory(
                         "Auto-creating state bucket: {}",
                         bucket_name.cyan(color_mode)
                     );
-                    backend.create_bucket().await.map_err(AppError::Backend)?;
-                    println!("  {} Created state bucket", "✓".green(color_mode));
-
                     let backend_provider_name = backend
                         .provider_name()
                         .ok_or("Backend does not specify a provider name")?;
+                    let backend_resource_type = backend
+                        .resource_type()
+                        .ok_or("Backend does not specify a resource type")?;
+                    let bootstrap_provider_inputs = load_apply_provider_inputs(
+                        runtime,
+                        validated_config.resources().parsed(),
+                        base_dir,
+                        provider_context,
+                    )
+                    .await?;
+                    let resource = Resource::with_provider(
+                        backend_provider_name,
+                        backend_resource_type,
+                        "_backend_bootstrap",
+                        None,
+                    )
+                    .with_attribute(
+                        "bucket",
+                        Value::Concrete(carina_core::resource::ConcreteValue::String(
+                            bucket_name.clone().into(),
+                        )),
+                    );
+                    create_checked_auto_bootstrap_bucket(
+                        color_mode,
+                        resource,
+                        BootstrapCreateContext {
+                            provider_context: validated_config.context().provider_context(),
+                            backend: backend.as_ref(),
+                            parsed: validated_config.resources().parsed(),
+                            provider_configs: bootstrap_provider_inputs.configs(),
+                            normalizer: &carina_core::provider::NoopNormalizer,
+                            factories: validated_config.context().factories(),
+                            schemas: validated_config.context().schemas(),
+                        },
+                    )
+                    .await?;
+                    println!("  {} Created state bucket", "✓".green(color_mode));
 
                     // Append resource definition to backend file
                     let target_file = backend_file.as_ref().unwrap_or(project);
@@ -2655,6 +2751,7 @@ async fn run_apply_locked_owned(
             )?;
             moved_hints.eprint(color_mode);
 
+            plan.checked().ensure_creation_ready()?;
             let stdin = tokio::io::BufReader::new(tokio::io::stdin());
             if confirm_apply(&runtime, stdin, cancel.clone(), auto_approve).await?
                 == ApplyConfirmation::Cancelled
@@ -2700,7 +2797,7 @@ async fn run_apply_locked_owned(
             // them from the plan.
             let state_only_success_count = execute_state_only_effects(color_mode, &plan);
             let outcome = execute_effects_with_observer(
-                &plan,
+                plan.checked(),
                 &pre_resolve_compositions,
                 ApplyExecutionContext {
                     provider: provider.as_ref(),

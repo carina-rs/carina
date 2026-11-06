@@ -92,6 +92,12 @@ pub enum CreateBeforeDestroyError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PlanErrorKind {
+    CreationConstraint {
+        path: String,
+        code: String,
+        reason: String,
+        context: crate::creation::CreationContext,
+    },
     PreventDestroy {
         action: PreventDestroyAction,
         source: PreventDestroySource,
@@ -340,6 +346,7 @@ impl PlanErrorKind {
 
     fn fmt_context(&self, f: &mut std::fmt::Formatter<'_>, project_dir: &Path) -> std::fmt::Result {
         match self {
+            Self::CreationConstraint { path, code, reason, .. } => write!(f, "cannot create: {path} [{code}]: {reason}"),
             Self::PreventDestroy { action, source } => match source {
                 PreventDestroySource::ExplicitDirective => {
                     f.write_str(Self::explicit_prevent_destroy_message(*action))
@@ -470,6 +477,7 @@ impl PlanError {
             // not a second user-facing resource identity.
             PlanErrorKind::ModuleConstraint(diagnostic) => write!(f, "{diagnostic}"),
             kind @ (PlanErrorKind::PreventDestroy { .. }
+            | PlanErrorKind::CreationConstraint { .. }
             | PlanErrorKind::SchemaNotRegistered(_)
             | PlanErrorKind::ReplacementCannotCoexist(_)
             | PlanErrorKind::CreateBeforeDestroyRequiredByDependent { .. }
