@@ -10945,3 +10945,125 @@ fn review2_resource_type_mismatch_preserves_main_origin_text() {
         "mock.test.Resource.example: cannot assign Int to 'name': expected String, got Int (from source.value)"
     );
 }
+
+#[test]
+fn issue_4282_deferred_builtin_results_use_existing_resolved_value_checks() {
+    let identity = TypeIdentity::new(Some("mock"), ["test"], "Name");
+    let schema = PatternResourceSchema::new("test.Source")
+        .attribute(PatternAttributeSchema::optional("name", PatternAttributeType::string()).build())
+        .attribute(
+            PatternAttributeSchema::optional(
+                "sink",
+                PatternAttributeType::refined_string(
+                    Some(identity.clone()),
+                    Some("^[a-z]+$".into()),
+                    Some((Some(1), Some(3))),
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let scalar = TypeExpr::SchemaType {
+        owned: crate::parser::ResolvedSchemaType::from_schema_declaration(
+            "mock",
+            schema.as_schema().attributes["sink"].attr_type(),
+        )
+        .unwrap(),
+    };
+    let config = loaded_context_for_test(ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            HashSet::from([crate::parser::OwnedTypeIdentity::provider(
+                "mock",
+                identity,
+                crate::schema::RefinedScalarKind::String,
+            )]),
+            Box::new(|_, _| Ok(())),
+        ),
+        ..expression_validation_config()
+    });
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", schema);
+    for (expression, list) in [
+        ("join('', [src.name, ''])", false),
+        ("trim(src.name)", false),
+        ("secret(join('', [src.name, '']))", false),
+        ("split(',', src.name)", true),
+    ] {
+        let parsed = crate::parser::parse_and_resolve(&format!(
+            "let src = mock.test.Source {{}}\nlet result = {expression}",
+        ))
+        .unwrap();
+        let report = crate::parser::retained::judge_expressions(&parsed, &schemas, &config);
+        let evidence = report.binding(&RelativeBindingName::new("result")).unwrap();
+        let expected = if list {
+            TypeExpr::List(Box::new(scalar.clone()))
+        } else {
+            scalar.clone()
+        };
+        assert_eq!(
+            crate::parser::retained::admit_expression(evidence, &expected),
+            Ok(crate::parser::retained::ExpressionAdmission::DeferredInterpolation),
+            "{expression}",
+        );
+        let authored = parsed.variables["result"]
+            .clone()
+            .resolve_root(&RootScope::new())
+            .into_expanded()
+            .unwrap();
+        assert!(!authored.is_fully_resolved());
+        assert!(
+            typecheck::check_type_expr_value(&expected, &authored, &config, evidence)
+                .require_provider_schemas()
+                .is_ok(),
+            "{expression}"
+        );
+        for (input, accepted) in [("abc", true), ("abcd", false), ("123", false)] {
+            let source = Resource::with_provider("mock", "test.Source", "src", None)
+                .with_binding("src")
+                .with_attribute("name", Value::Concrete(ConcreteValue::String(input.into())))
+                .resolve_root(&RootScope::new())
+                .into_expanded(&schemas)
+                .unwrap();
+            let bindings = crate::binding_index::ResolvedBindings::pre_apply_live(
+                crate::binding_index::LivePreApplyInputs {
+                    managed: &[source],
+                    compositions: &[],
+                    managed_current: &HashMap::new(),
+                    data_source_values: &crate::data_source_value::DataSourceValues::empty(),
+                    remote_bindings: &HashMap::new(),
+                    wait_aliases: &[],
+                },
+            );
+            let resolved = deferred_types::with_session_for_test(&config, |session| {
+                crate::resolver::resolve_ref_value_with_config(&authored, &bindings, session)
+            })
+            .unwrap();
+            let checked = typecheck::check_type_expr_value(&expected, &resolved, &config, evidence)
+                .require_provider_schemas();
+            assert_eq!(
+                checked.is_ok(),
+                accepted,
+                "{expression}: {input}: {checked:?}"
+            );
+            if let Err(error) = checked {
+                let message = error.to_string();
+                if expression.starts_with("secret(") {
+                    assert!(!message.contains(input), "{message}");
+                    assert!(message.contains("secret"), "{message}");
+                } else {
+                    assert!(
+                        message.contains(if input == "abcd" {
+                            "length 4 is outside allowed range [1, 3]"
+                        } else {
+                            "does not match required pattern /^[a-z]+$/"
+                        }),
+                        "{message}"
+                    );
+                }
+            }
+        }
+        assert!(!authored.is_fully_resolved());
+    }
+}

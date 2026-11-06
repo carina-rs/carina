@@ -194,6 +194,19 @@ pub(crate) enum RefSink<'a> {
 }
 
 impl<'a> RefSink<'a> {
+    fn expression_type(self) -> TypeExpr {
+        match self {
+            Self::EffectiveType {
+                attr_type,
+                defs,
+                owner: crate::parser::SchemaTypeOwner::Provider(provider),
+                ..
+            } => expression_sink_type(attr_type, provider, defs),
+            Self::Interpolation => INTERPOLATION_REF_SINK.clone(),
+            Self::TypeExpr(ty) => ty.clone(),
+        }
+    }
+
     fn from_effective_type(
         effective: crate::schema::EffectiveType<'a>,
         owner: &'a crate::parser::SchemaTypeOwner,
@@ -575,7 +588,8 @@ pub struct ValidationTypeContext<'a, B: BindingAddress = RelativeBindingName> {
     expression_report: &'a crate::parser::retained::ExpressionReport<B>,
 }
 
-pub(crate) fn expression_sink_type(
+/// Project the effective schema sink for authored expression judgement.
+pub fn expression_sink_type(
     attr_type: &AttributeType,
     owner: &str,
     defs: &std::collections::BTreeMap<String, AttributeType>,
@@ -763,6 +777,7 @@ impl std::error::Error for BindingUseFinding {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BindingUseReport {
     findings: Vec<BindingUseFinding>,
+    expression_owned_uses: Vec<crate::parser::BareBindingUse>,
 }
 
 impl std::fmt::Display for BindingUseReport {
@@ -1306,6 +1321,19 @@ fn deferred_value_mismatch<B: BindingAddress>(
     }
 }
 
+fn binding_use_expression<'a, B: BindingAddress>(
+    use_site: &crate::parser::BareBindingUse,
+    context: &'a ValidationTypeContext<'_, B>,
+) -> Result<&'a crate::parser::retained::JudgedExpr, crate::parser::retained::MissingEvidence> {
+    let report = match &use_site.owner {
+        crate::parser::BindingUseOwner::Resource(address) => context
+            .expression_report
+            .for_resource(address.resource_id()),
+        crate::parser::BindingUseOwner::ModuleArgument { .. } => Ok(context.expression_report),
+    }?;
+    report.expression_in(&use_site.expression_instance, use_site.location())
+}
+
 fn precheck_value_source<B: BindingAddress>(
     use_site: &crate::parser::BareBindingUse,
     value: &GenericValue<ParserPlaceholder, B>,
@@ -1314,15 +1342,7 @@ fn precheck_value_source<B: BindingAddress>(
     context: &ValidationTypeContext<'_, B>,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
 ) -> Option<BindingResolutionError> {
-    let report = match &use_site.owner {
-        crate::parser::BindingUseOwner::Resource(address) => context
-            .expression_report
-            .for_resource(address.resource_id()),
-        crate::parser::BindingUseOwner::ModuleArgument { .. } => Ok(context.expression_report),
-    };
-    let expression = match report
-        .and_then(|report| report.expression_in(&use_site.expression_instance, use_site.location()))
-    {
+    let expression = match binding_use_expression(use_site, context) {
         Ok(expression) => expression,
         Err(error) => {
             return Some(BindingResolutionError::DeferredAccess(Box::new(
@@ -1332,16 +1352,7 @@ fn precheck_value_source<B: BindingAddress>(
             )));
         }
     };
-    let expected = match sink {
-        RefSink::EffectiveType {
-            attr_type,
-            defs,
-            owner: crate::parser::SchemaTypeOwner::Provider(provider),
-            ..
-        } => expression_sink_type(attr_type, provider, defs),
-        RefSink::Interpolation => INTERPOLATION_REF_SINK.clone(),
-        RefSink::TypeExpr(ty) => ty.clone(),
-    };
+    let expected = sink.expression_type();
     let admission =
         crate::parser::retained::admit_expression(expression, &expected).map_err(|error| {
             BindingResolutionError::DeferredAccess(Box::new(
@@ -1418,6 +1429,19 @@ fn resolve_value_source_against_sink<B: BindingAddress>(
     context: &ValidationTypeContext<'_, B>,
     diagnostic_path: &impl Fn(ReferencePathRef<'_, B>) -> ModuleCallDiagnosticPath,
 ) -> Result<(), BindingResolutionError> {
+    let expected = sink.expression_type();
+    let builtin_members = binding_use_expression(use_site, context).is_ok_and(|expression| {
+        expression
+            .for_sink(&expected, context.raw_provider_context())
+            .has_builtin_constructed_members()
+    });
+    // Builtin bootstrap types describe the result, not a nominal declaration.
+    // Check its evaluated members through main's existing binding-value path.
+    let evaluated = builtin_members
+        .then(|| context.file.value_at_use(use_site))
+        .flatten();
+    let value = evaluated.as_ref().unwrap_or(value);
+    let declared_type = if builtin_members { None } else { declared_type };
     let mut prechecked = precheck_value_source(
         use_site,
         value,
@@ -1777,16 +1801,26 @@ pub fn binding_use_authority_owns_module_argument<E, D, B: BindingAddress>(
                 argument: owner_argument,
                 value_span: _,
             } if owner == call && owner_argument == argument
-        ) && !file
-            .expression_report()
-            .expression_in(&use_site.expression_instance, use_site.location())
-            .is_ok_and(crate::parser::retained::JudgedExpr::is_string_construction)
-            && (use_site.path.segments().len() == 1
-                || report
-                    .findings()
-                    .iter()
-                    .any(|finding| same_authored_use(&finding.use_site, use_site)))
+        ) && binding_use_authority_owns_use(report, use_site)
     })
+}
+
+/// Whether binding-use validation owns this sink. A single builtin string
+/// construction transfers ownership after admission against the actual sink.
+/// Collections retain main's binding and per-element value checks.
+pub fn binding_use_authority_owns_use(
+    report: &BindingUseReport,
+    use_site: &crate::parser::BareBindingUse,
+) -> bool {
+    !report
+        .expression_owned_uses
+        .iter()
+        .any(|owned| same_authored_use(owned, use_site))
+        && (use_site.path.segments().len() == 1
+            || report
+                .findings()
+                .iter()
+                .any(|finding| same_authored_use(&finding.use_site, use_site)))
 }
 
 /// Whether parsing reserved this entire module argument because a structural
@@ -1809,6 +1843,10 @@ pub fn module_argument_has_pending_binding_use<E, D, B: BindingAddress>(
 }
 
 trait BindingUseInput<B: BindingAddress> {
+    fn value_at_use(
+        &self,
+        use_site: &crate::parser::BareBindingUse,
+    ) -> Option<GenericValue<ParserPlaceholder, B>>;
     fn check_uses(
         &self,
         context: &ValidationTypeContext<'_, B>,
@@ -1822,6 +1860,46 @@ impl<
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 > BindingUseInput<B> for crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>
 {
+    fn value_at_use(
+        &self,
+        use_site: &crate::parser::BareBindingUse,
+    ) -> Option<GenericValue<ParserPlaceholder, B>> {
+        use crate::parser::{AttributePathSegment, BindingUseOwner};
+        let mut segments = use_site.path.segments().iter();
+        let AttributePathSegment::Attribute(root) = segments.next()? else {
+            return None;
+        };
+        let mut value = match &use_site.owner {
+            BindingUseOwner::Resource(address) => self
+                .iter_all_resources()
+                .find(|resource| resource.id() == address.resource_id())?
+                .attributes()
+                .get(root)?
+                .clone(),
+            BindingUseOwner::ModuleArgument { call, argument, .. } => self
+                .module_calls
+                .iter()
+                .find(|candidate| candidate.id() == call)?
+                .argument(argument)?
+                .walker_value()
+                .clone(),
+        };
+        for segment in segments {
+            value = match (segment, &value) {
+                (
+                    AttributePathSegment::ListIndex(index),
+                    GenericValue::Concrete(crate::resource::ConcreteValue::List(items)),
+                ) => items.get(*index)?.clone(),
+                (
+                    AttributePathSegment::Key(key) | AttributePathSegment::StructField(key),
+                    GenericValue::Concrete(crate::resource::ConcreteValue::Map(entries)),
+                ) => entries.get(key)?.clone(),
+                _ => return None,
+            };
+        }
+        Some(value)
+    }
+
     fn check_uses(
         &self,
         context: &ValidationTypeContext<'_, B>,
@@ -1846,6 +1924,7 @@ where
 {
     let mut report = BindingUseReport {
         findings: Vec::new(),
+        expression_owned_uses: Vec::new(),
     };
 
     for record in file.bare_binding_uses().records() {
@@ -1861,10 +1940,47 @@ where
                 record.authored.location(),
             )
         });
-        if evidence.is_ok_and(crate::parser::retained::JudgedExpr::is_string_construction) {
-            // The complete string construction owns its sink constraints;
-            // its reference operands are rendered, not assigned to that sink.
-            continue;
+        let expected = match &record.authored.owner {
+            crate::parser::BindingUseOwner::Resource(address) => {
+                resource_sink(file, address, &record.authored.path, context.schemas)
+                    .map(RefSink::expression_type)
+            }
+            crate::parser::BindingUseOwner::ModuleArgument { call, argument, .. } => {
+                module_argument_type(file, call, argument, context.module_signatures)
+                    .and_then(|expected| {
+                        resolve_module_argument_path_type(
+                            &expected,
+                            &record.authored.path,
+                            context.raw_provider_context(),
+                        )
+                        .ok()
+                        .flatten()
+                    })
+                    .map(|expected| expected.as_type_expr())
+            }
+        };
+        if let Ok(expression) = evidence {
+            let fallback = INTERPOLATION_REF_SINK.clone();
+            let sink = expected.as_ref().unwrap_or(&fallback);
+            let sink_judged = expression.for_sink(sink, context.raw_provider_context());
+            if sink_judged.is_interpolation() {
+                // Native interpolation keeps main's operand suppression.
+                if matches!(
+                    record.authored.owner,
+                    crate::parser::BindingUseOwner::ModuleArgument { .. }
+                ) {
+                    report.expression_owned_uses.push(record.authored.clone());
+                }
+                continue;
+            }
+            if sink_judged.is_single_string_construction()
+                && expected.as_ref().is_some_and(|sink| {
+                    crate::parser::retained::admit_expression(expression, sink).is_ok()
+                })
+            {
+                report.expression_owned_uses.push(record.authored.clone());
+                continue;
+            }
         }
         let mut result = match &record.authored.owner {
             crate::parser::BindingUseOwner::Resource(address) => {
@@ -5260,7 +5376,7 @@ fn validate_resource_ref_types_inner<
                         None => check_deferred_access_type(access, sink_type,
                             if std::ptr::eq(access, assignment_value)
                                 && expression.check_owner() == crate::parser::retained::ExpressionCheckOwner::BindingIndex
-                                && expression.requires_declared_assignment()
+                                && sink.is_some_and(|sink| expression.for_sink(&sink.expression_type(), bindings.provider_context()).requires_declared_assignment())
                             {
                                 // A substituted parameter keeps its declared evidence.
                                 // The caller's projected access belongs to another instance.
@@ -5424,7 +5540,7 @@ fn deferred_iterable_shape(
 }
 
 fn deferred_iterable_shape_for_phase(
-    expression: &crate::parser::retained::JudgedExpr,
+    expression: &crate::parser::retained::SinkJudgedExpr<'_>,
 ) -> Result<DeferredIterableShape, crate::static_type::InferenceIssue> {
     match expression.collection_kind() {
         Some(kind) => Ok(kind.into()),
@@ -5500,7 +5616,7 @@ fn validate_deferred_for_iterable_types_with_bindings<
     tree: &crate::parser::AnalysisTree<'_, ParserPlaceholder, ParserPlaceholder, D, B, E>,
     _schemas: &SchemaRegistry,
     _bindings: &inference::InferenceBindings<ParserPlaceholder, B>,
-    _provider_context: &ProviderContext,
+    provider_context: &ProviderContext,
 ) -> Vec<crate::parser::Located<DeferredForIterableTypeDiagnostic>> {
     let mut diagnostics = Vec::new();
     for deferred in tree.for_iterables() {
@@ -5530,6 +5646,7 @@ fn validate_deferred_for_iterable_types_with_bindings<
                 DeferredIterableValidationContext {
                     expected,
                     judged,
+                    provider_context,
                     location: deferred.location(),
                     expression: deferred.iterable(),
                 },
@@ -5613,6 +5730,7 @@ impl std::fmt::Display for DeferredIterableKind {
 
 struct DeferredIterableValidationContext<'a, B: BindingAddress> {
     expected: DeferredIterableKind,
+    provider_context: &'a ProviderContext,
     judged: &'a crate::parser::retained::JudgedExpr,
     location: &'a crate::parser::DeclarationLocation,
     expression: &'a GenericValue<ParserPlaceholder, B>,
@@ -5639,7 +5757,12 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
         return;
     }
 
-    let inferred = match deferred_iterable_shape_for_phase(context.judged) {
+    let sink = match context.expected {
+        DeferredIterableKind::List => TypeExpr::List(Box::new(TypeExpr::String)),
+        DeferredIterableKind::Map => TypeExpr::Map(Box::new(TypeExpr::String)),
+    };
+    let judged = context.judged.for_sink(&sink, context.provider_context);
+    let inferred = match deferred_iterable_shape_for_phase(&judged) {
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
             error @ (inference::InferenceError::InsideSecret { .. }

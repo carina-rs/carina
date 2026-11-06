@@ -1445,7 +1445,7 @@ pub(crate) use judgement::{
 };
 pub use judgement::{
     CollectionKind, ExpressionAdmission, ExpressionCheckOwner, ExpressionReport, JudgedExpr,
-    ProviderAuthorityUnavailable, admit_expression,
+    ProviderAuthorityUnavailable, SinkJudgedExpr, admit_expression,
 };
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) fn value_dependent_judgement_for_test() -> JudgedExpr {
@@ -1519,6 +1519,9 @@ mod judgement {
         Literal,
         EnumIdentifier,
         StringConstruction(Knowledge),
+        // Builtins keep ordinary assignment diagnostics outside string sinks.
+        BuiltinConstruction(Knowledge),
+        BuiltinStringList(Knowledge),
         List(Knowledge),
         Map(Knowledge),
         // Loop slots are inferred from the iterable, never annotated sources.
@@ -1531,6 +1534,8 @@ mod judgement {
                 Self::Ordinary(knowledge)
                 | Self::Reference(knowledge)
                 | Self::StringConstruction(knowledge)
+                | Self::BuiltinConstruction(knowledge)
+                | Self::BuiltinStringList(knowledge)
                 | Self::List(knowledge)
                 | Self::Map(knowledge) => knowledge,
                 Self::Literal | Self::EnumIdentifier => Knowledge::Known,
@@ -1633,21 +1638,6 @@ mod judgement {
     }
 
     impl ExprJudgement {
-        fn kind(&self) -> Option<InferredKind> {
-            match self {
-                ExprJudgement::Typed { kind, .. } => Some(*kind),
-                ExprJudgement::Rejected { source, .. } => source.kind(),
-                ExprJudgement::ValueDependent {
-                    shape: Some((CollectionKind::List, knowledge)),
-                    ..
-                } => Some(InferredKind::List(*knowledge)),
-                ExprJudgement::ValueDependent {
-                    shape: Some((CollectionKind::Map, knowledge)),
-                    ..
-                } => Some(InferredKind::Map(*knowledge)),
-                _ => None,
-            }
-        }
         fn static_type(&self) -> Result<&TypeExpr, InferenceIssue> {
             match self {
                 ExprJudgement::Typed { ty, .. } => Ok(ty),
@@ -1683,6 +1673,28 @@ mod judgement {
     /// ```compile_fail,E0616
     /// use carina_core::parser::retained::JudgedExpr;
     /// fn overwrite_judgement(expression: &mut JudgedExpr) { expression.judgement = unreachable!(); }
+    /// ```
+    ///
+    /// Construction categories require a sink-judged view.
+    /// ```compile_fail,E0599
+    /// use carina_core::parser::retained::JudgedExpr;
+    /// fn construction(expression: &JudgedExpr) { expression.is_single_string_construction(); }
+    /// ```
+    /// ```compile_fail,E0599
+    /// use carina_core::parser::retained::JudgedExpr;
+    /// fn members(expression: &JudgedExpr) { expression.has_constructed_members(); }
+    /// ```
+    /// ```compile_fail,E0599
+    /// use carina_core::parser::retained::JudgedExpr;
+    /// fn collection(expression: &JudgedExpr) { expression.collection_kind(); }
+    /// ```
+    /// ```compile_fail,E0599
+    /// use carina_core::parser::retained::JudgedExpr;
+    /// fn kind(expression: &JudgedExpr) { expression.kind(); }
+    /// ```
+    /// ```compile_fail,E0599
+    /// use carina_core::parser::retained::JudgedExpr;
+    /// fn assignment(expression: &JudgedExpr) { expression.requires_declared_assignment(); }
     /// ```
     #[derive(Debug, Clone, PartialEq)]
     pub struct JudgedExpr(Arc<JudgedExprData>);
@@ -1761,9 +1773,6 @@ mod judgement {
                 ExprJudgement::AuthorityUnavailable(_) | ExprJudgement::Declaration => {}
             }
         }
-        fn kind(&self) -> Option<InferredKind> {
-            self.judgement.kind()
-        }
         fn with_kind(mut self, kind: impl FnOnce(Knowledge) -> InferredKind) -> Self {
             self.set_kind(kind);
             self
@@ -1774,12 +1783,19 @@ mod judgement {
             }
         }
         fn materialize_output(&mut self) {
-            if let ExprJudgement::Typed {
-                kind: kind @ InferredKind::StringConstruction(_),
-                ..
-            } = &mut self.data_mut().judgement
-            {
-                *kind = InferredKind::StringConstruction(Knowledge::Known);
+            if let ExprJudgement::Typed { kind, .. } = &mut self.data_mut().judgement {
+                *kind = match *kind {
+                    InferredKind::StringConstruction(_) => {
+                        InferredKind::StringConstruction(Knowledge::Known)
+                    }
+                    InferredKind::BuiltinConstruction(_) => {
+                        InferredKind::BuiltinConstruction(Knowledge::Known)
+                    }
+                    InferredKind::BuiltinStringList(_) => {
+                        InferredKind::BuiltinStringList(Knowledge::Known)
+                    }
+                    other => other,
+                };
             }
         }
         fn concrete(&self) -> bool {
@@ -1811,7 +1827,10 @@ mod judgement {
             };
         }
         fn sink_owner(&self, sink: &TypeExpr) -> FailureOwner {
-            if self.requires_declared_assignment()
+            if self
+                .authority
+                .as_ref()
+                .is_some_and(|config| self.for_sink(sink, config).requires_declared_assignment())
                 && self.static_type() == Ok(&TypeExpr::String)
                 && sink.is_string_shaped()
                 && !matches!(sink, TypeExpr::String)
@@ -1872,12 +1891,6 @@ mod judgement {
                 .get(index)
                 .ok_or_else(|| MissingEvidence::new(format!("branch {index}")))
         }
-        pub(crate) fn requires_declared_assignment(&self) -> bool {
-            matches!(
-                self.kind(),
-                Some(InferredKind::Ordinary(_) | InferredKind::Reference(_))
-            ) && self.alternatives.is_empty()
-        }
         pub(crate) fn assignment_source_type(&self) -> Option<&TypeExpr> {
             match &self.judgement {
                 ExprJudgement::Typed { ty, .. } => Some(ty),
@@ -1888,9 +1901,76 @@ mod judgement {
                 _ => None,
             }
         }
-        pub(crate) fn is_string_construction(&self) -> bool {
-            matches!(self.kind(), Some(InferredKind::StringConstruction(_)))
-                && self.alternatives.is_empty()
+        /// Interpret builtin evidence as an ordinary result at other sinks.
+        /// This also preserves the original collection diagnostic granularity.
+        pub fn for_sink<'a>(
+            &'a self,
+            sink: &'a TypeExpr,
+            config: &'a super::super::ProviderContext,
+        ) -> SinkJudgedExpr<'a> {
+            fn string_sink(actual: &TypeExpr, sink: &TypeExpr) -> bool {
+                match sink {
+                    TypeExpr::Union(members) => {
+                        members.iter().any(|sink| string_sink(actual, sink))
+                    }
+                    TypeExpr::List(inner) => match actual {
+                        TypeExpr::List(member) => string_sink(member, inner),
+                        _ => false,
+                    },
+                    _ => actual == &TypeExpr::String && sink.is_string_shaped(),
+                }
+            }
+            let expression = if matches!(
+                self.judgement,
+                ExprJudgement::Typed {
+                    kind: InferredKind::BuiltinConstruction(_) | InferredKind::BuiltinStringList(_),
+                    ..
+                }
+            ) && let (Ok(actual), Ok(sink)) = (
+                self.static_type(),
+                crate::validation::resolve_type_expr(sink, config),
+            ) && !string_sink(actual, &sink)
+            {
+                let mut ordinary = self.clone();
+                ordinary.set_kind(InferredKind::Ordinary);
+                ordinary.data_mut().member = None;
+                std::borrow::Cow::Owned(ordinary)
+            } else {
+                std::borrow::Cow::Borrowed(self)
+            };
+            SinkJudgedExpr {
+                expression,
+                sink,
+                config,
+            }
+        }
+        fn is_enum_identifier(&self) -> bool {
+            fn is_enum(judgement: &ExprJudgement) -> bool {
+                match judgement {
+                    ExprJudgement::Typed {
+                        kind: InferredKind::EnumIdentifier,
+                        ..
+                    } => true,
+                    ExprJudgement::Rejected { source, .. } => is_enum(source),
+                    _ => false,
+                }
+            }
+            is_enum(&self.judgement)
+        }
+        // Intrinsic reference provenance controls single-reference unwrapping.
+        // It does not interpret construction evidence or admit a sink.
+        fn preserves_reference_assignment(&self) -> bool {
+            fn reference(judgement: &ExprJudgement) -> bool {
+                match judgement {
+                    ExprJudgement::Typed {
+                        kind: InferredKind::Ordinary(_) | InferredKind::Reference(_),
+                        ..
+                    } => true,
+                    ExprJudgement::Rejected { source, .. } => reference(source),
+                    _ => false,
+                }
+            }
+            reference(&self.judgement) && self.alternatives.is_empty()
         }
         /// Borrow the assigned reference for diagnostics when the judgement
         /// preserves it through interpolation. Evaluation keeps the stored value.
@@ -1898,12 +1978,12 @@ mod judgement {
             &self,
             value: &'a Value<P, B>,
         ) -> &'a Value<P, B> {
-            let reference_assignment = self.requires_declared_assignment()
+            let reference_assignment = self.preserves_reference_assignment()
                 || (!self.alternatives.is_empty()
                     && self
                         .alternatives
                         .iter()
-                        .all(|branch| branch.requires_declared_assignment()));
+                        .all(Self::preserves_reference_assignment));
             if reference_assignment
                 && let Value::Deferred(crate::resource::DeferredValue::Interpolation(parts)) = value
                 && let [crate::resource::InterpolationPart::Expr(inner)] = parts.as_slice()
@@ -1949,13 +2029,6 @@ mod judgement {
                 .and_then(|operands| operands.get(index))
                 .ok_or_else(|| MissingEvidence::new(format!("coalesce operand {index}")))
         }
-        pub fn collection_kind(&self) -> Option<CollectionKind> {
-            match self.kind() {
-                Some(InferredKind::List(_)) => Some(CollectionKind::List),
-                Some(InferredKind::Map(_)) => Some(CollectionKind::Map),
-                _ => None,
-            }
-        }
         fn value_shape(&self) -> Option<ValueShape> {
             if let Some(first) = self.alternatives.first() {
                 let shape = first.value_shape()?;
@@ -1965,11 +2038,30 @@ mod judgement {
                     .all(|branch| branch.value_shape() == Some(shape))
                     .then_some(shape);
             }
-            match self.kind() {
-                Some(InferredKind::List(_)) => Some(ValueShape::List),
-                Some(InferredKind::Map(_)) => Some(ValueShape::Map),
-                _ => self.static_type().ok().and_then(ValueShape::of_type),
+            fn collection_shape(judgement: &ExprJudgement) -> Option<ValueShape> {
+                match judgement {
+                    ExprJudgement::Typed {
+                        kind: InferredKind::List(_),
+                        ..
+                    }
+                    | ExprJudgement::ValueDependent {
+                        shape: Some((CollectionKind::List, _)),
+                        ..
+                    } => Some(ValueShape::List),
+                    ExprJudgement::Typed {
+                        kind: InferredKind::Map(_),
+                        ..
+                    }
+                    | ExprJudgement::ValueDependent {
+                        shape: Some((CollectionKind::Map, _)),
+                        ..
+                    } => Some(ValueShape::Map),
+                    ExprJudgement::Rejected { source, .. } => collection_shape(source),
+                    _ => None,
+                }
             }
+            collection_shape(&self.judgement)
+                .or_else(|| self.static_type().ok().and_then(ValueShape::of_type))
         }
         fn type_description(&self) -> String {
             self.static_type()
@@ -1979,6 +2071,113 @@ mod judgement {
                         .map(|shape| format!("{shape:?}"))
                         .unwrap_or_else(|| "value-dependent expression".into())
                 })
+        }
+    }
+
+    /// Expression evidence interpreted at a particular sink. Only this view
+    /// exposes construction and assignment categories.
+    pub struct SinkJudgedExpr<'a> {
+        expression: std::borrow::Cow<'a, JudgedExpr>,
+        sink: &'a TypeExpr,
+        config: &'a super::super::ProviderContext,
+    }
+
+    impl std::ops::Deref for SinkJudgedExpr<'_> {
+        type Target = JudgedExpr;
+        fn deref(&self) -> &Self::Target {
+            &self.expression
+        }
+    }
+
+    impl SinkJudgedExpr<'_> {
+        fn kind(&self) -> Option<InferredKind> {
+            fn read(judgement: &ExprJudgement) -> Option<InferredKind> {
+                match judgement {
+                    ExprJudgement::Typed { kind, .. } => Some(*kind),
+                    ExprJudgement::Rejected { source, .. } => read(source),
+                    ExprJudgement::ValueDependent {
+                        shape: Some((CollectionKind::List, knowledge)),
+                        ..
+                    } => Some(InferredKind::List(*knowledge)),
+                    ExprJudgement::ValueDependent {
+                        shape: Some((CollectionKind::Map, knowledge)),
+                        ..
+                    } => Some(InferredKind::Map(*knowledge)),
+                    _ => None,
+                }
+            }
+            read(&self.expression.judgement)
+        }
+
+        pub(crate) fn requires_declared_assignment(&self) -> bool {
+            matches!(
+                self.kind(),
+                Some(InferredKind::Ordinary(_) | InferredKind::Reference(_))
+            ) && self.alternatives.is_empty()
+        }
+        /// This entire value is one constructed string, never a collection.
+        pub fn is_single_string_construction(&self) -> bool {
+            self.alternatives.is_empty()
+                && matches!(
+                    self.kind(),
+                    Some(
+                        InferredKind::StringConstruction(_) | InferredKind::BuiltinConstruction(_)
+                    )
+                )
+        }
+
+        pub(crate) fn is_interpolation(&self) -> bool {
+            self.alternatives.is_empty()
+                && matches!(self.kind(), Some(InferredKind::StringConstruction(_)))
+        }
+
+        /// Collection members carry evidence at their own element sinks.
+        /// This never grants scalar string admission.
+        pub fn has_constructed_members(&self) -> bool {
+            self.constructed_members(false)
+        }
+
+        pub(crate) fn has_builtin_constructed_members(&self) -> bool {
+            self.constructed_members(true)
+        }
+
+        fn constructed_members(&self, builtin_only: bool) -> bool {
+            let Ok(sink) = crate::validation::resolve_type_expr(self.sink, self.config) else {
+                return false;
+            };
+            match sink {
+                TypeExpr::List(inner) if self.collection_kind() == Some(CollectionKind::List) => {
+                    self.elements().any(|child| {
+                        let child = child.for_sink(&inner, self.config);
+                        (child.is_single_string_construction()
+                            && (!builtin_only
+                                || matches!(
+                                    child.kind(),
+                                    Some(InferredKind::BuiltinConstruction(_))
+                                )))
+                            || child.constructed_members(builtin_only)
+                    })
+                }
+                TypeExpr::Union(members) => members.iter().any(|sink| {
+                    self.expression
+                        .for_sink(sink, self.config)
+                        .constructed_members(builtin_only)
+                }),
+                _ => false,
+            }
+        }
+
+        pub fn collection_kind(&self) -> Option<CollectionKind> {
+            match self.kind() {
+                Some(InferredKind::List(_)) => Some(CollectionKind::List),
+                Some(InferredKind::BuiltinStringList(_))
+                    if matches!(self.static_type(), Ok(TypeExpr::List(_))) =>
+                {
+                    Some(CollectionKind::List)
+                }
+                Some(InferredKind::Map(_)) => Some(CollectionKind::Map),
+                _ => None,
+            }
         }
     }
 
@@ -2072,6 +2271,7 @@ mod judgement {
         config: &super::super::ProviderContext,
     ) -> Result<ExpressionAdmission, InferenceError> {
         use ExpressionAdmission::{DeferredInterpolation, ProviderPending, ValueCheck};
+        let expression = expression.for_sink(sink, config);
         let (ty, kind, concrete) = match &expression.judgement {
             ExprJudgement::Failed { error, .. } | ExprJudgement::Rejected { error, .. } => {
                 return Err(error.clone());
@@ -2079,7 +2279,7 @@ mod judgement {
             ExprJudgement::AuthorityUnavailable(authority) => {
                 return Ok(ProviderPending(authority.clone()));
             }
-            ExprJudgement::Declaration => return Err(assignment_error(expression, sink)),
+            ExprJudgement::Declaration => return Err(assignment_error(&expression, sink)),
             ExprJudgement::Typed { ty, kind, .. } => {
                 (Some(ty), Some(kind), kind.knowledge() == Knowledge::Known)
             }
@@ -2133,8 +2333,8 @@ mod judgement {
             }
             return members
                 .iter()
-                .find_map(|member| admit_with_context(expression, member, context, config).ok())
-                .ok_or_else(|| assignment_error(expression, sink));
+                .find_map(|member| admit_with_context(&expression, member, context, config).ok())
+                .ok_or_else(|| assignment_error(&expression, sink));
         }
         if let Some(shape) = expression.collection_kind() {
             let child_context = if matches!(
@@ -2172,7 +2372,7 @@ mod judgement {
                     })
                     .collect::<Result<_, _>>()?,
                 (CollectionKind::List | CollectionKind::Map, _) => {
-                    return Err(assignment_error(expression, sink));
+                    return Err(assignment_error(&expression, sink));
                 }
             };
             return pairs
@@ -2193,7 +2393,7 @@ mod judgement {
             return if actual == expected {
                 Ok(ValueCheck)
             } else {
-                Err(assignment_error(expression, sink))
+                Err(assignment_error(&expression, sink))
             };
         }
         if let Some(authority) = unavailable_type(actual) {
@@ -2204,12 +2404,12 @@ mod judgement {
             {
                 Ok(ProviderPending(authority))
             } else {
-                Err(assignment_error(expression, sink))
+                Err(assignment_error(&expression, sink))
             };
         }
         if expression.requires_declared_assignment() {
             if *actual == TypeExpr::String && !matches!(sink, TypeExpr::String) {
-                return Err(assignment_error(expression, sink));
+                return Err(assignment_error(&expression, sink));
             }
             return match crate::validation::typecheck::inferred_type_assignment(
                 sink,
@@ -2218,13 +2418,13 @@ mod judgement {
             ) {
                 crate::schema::TypeAssignability::Assignable => Ok(ValueCheck),
                 crate::schema::TypeAssignability::Mismatch => {
-                    Err(assignment_error(expression, sink))
+                    Err(assignment_error(&expression, sink))
                 }
                 crate::schema::TypeAssignability::Unchecked(evidence) => evidence
                     .into_types()
                     .find_map(|ty| pending_type(&ty))
                     .map(ProviderPending)
-                    .ok_or_else(|| assignment_error(expression, sink)),
+                    .ok_or_else(|| assignment_error(&expression, sink)),
             };
         }
         if context == AdmissionContext::StructValue && concrete {
@@ -2237,10 +2437,16 @@ mod judgement {
             ) {
                 Ok(ProviderPending(authority))
             } else {
-                Err(assignment_error(expression, sink))
+                Err(assignment_error(&expression, sink))
             };
         }
-        if kind == Some(&InferredKind::StringConstruction(Knowledge::Deferred)) {
+        if matches!(
+            kind,
+            Some(
+                InferredKind::StringConstruction(Knowledge::Deferred)
+                    | InferredKind::BuiltinConstruction(Knowledge::Deferred)
+            )
+        ) {
             return if sink.is_string_shaped() || matches!(sink, TypeExpr::Ref(_)) {
                 Ok(DeferredInterpolation)
             } else if expression.diagnostic_scope.is_secret() {
@@ -2283,7 +2489,7 @@ mod judgement {
         if shaped {
             Ok(ValueCheck)
         } else {
-            Err(assignment_error(expression, sink))
+            Err(assignment_error(&expression, sink))
         }
     }
 
@@ -2880,12 +3086,18 @@ mod judgement {
             result.data_mut().origin = Some(root.location.clone());
             result.data_mut().authority = Some(self.authority.clone());
             if matches!(root.kind, ExprKind::Reference { .. }) {
-                if matches!(result.kind(), Some(InferredKind::Ordinary(_))) {
+                if matches!(
+                    result.judgement,
+                    ExprJudgement::Typed {
+                        kind: InferredKind::Ordinary(_),
+                        ..
+                    }
+                ) {
                     result.set_kind(InferredKind::Reference);
                 }
                 // The binding pass owns reference existence and field errors.
                 // A containing operation preserves that ownership.
-                if result.kind() != Some(InferredKind::EnumIdentifier) {
+                if !result.is_enum_identifier() {
                     result.report_at(FailureOwner::BindingIndex);
                 }
             }
@@ -3004,7 +3216,8 @@ mod judgement {
             } else {
                 finding
             };
-            if expression.kind() == Some(InferredKind::StringConstruction(Knowledge::Deferred))
+            if expression.for_sink(sink, self.config).kind()
+                == Some(InferredKind::StringConstruction(Knowledge::Deferred))
                 && !self.function_errors.contains(&finding)
             {
                 self.function_errors.push(finding.clone());
@@ -3105,7 +3318,7 @@ mod judgement {
             if base.is_value_dependent()
                 || base.failed()
                 || matches!(base.judgement, ExprJudgement::AuthorityUnavailable(_))
-                || base.kind() == Some(InferredKind::EnumIdentifier)
+                || base.is_enum_identifier()
             {
                 return base.clone();
             }
@@ -3311,14 +3524,14 @@ mod judgement {
                     let left = child_type(0);
                     let right = child_type(1);
                     let right_expression = &children[1];
-                    let empty = match right_expression.collection_kind() {
-                        Some(CollectionKind::List)
+                    let empty = match right_expression.value_shape() {
+                        Some(ValueShape::List)
                             if right_expression.elements.is_empty()
                                 && right_expression.member.is_none() =>
                         {
                             EmptyCoalesceDefault::List
                         }
-                        Some(CollectionKind::Map)
+                        Some(ValueShape::Map)
                             if right_expression.fields.is_empty()
                                 && right_expression.member.is_none() =>
                         {
@@ -3452,7 +3665,9 @@ mod judgement {
                     declaration()
                 }
                 ExprKind::Sequence => authored_child(children.last()),
-                ExprKind::Secret => authored_child(children.first()),
+                ExprKind::Secret => {
+                    builtin_result(crate::builtins::Builtin::Secret.result_typing(), children)
+                }
                 ExprKind::Call(name) => {
                     let mut argument_failure = None;
                     let signature = self
@@ -3488,44 +3703,8 @@ mod judgement {
                     {
                         return ordinary(Ok(ty.clone()), false);
                     }
-                    let builtin = crate::builtins::builtin_functions()
-                        .iter()
-                        .find(|builtin| builtin.name == name);
-                    use crate::builtins::BuiltinReturnType;
-                    let concrete = children.iter().all(JudgedExpr::concrete);
-                    match builtin.map(|builtin| builtin.return_type) {
-                        Some(BuiltinReturnType::Argument(index)) => children
-                            .get(index)
-                            .cloned()
-                            .unwrap_or_else(|| incomplete("builtin argument")),
-                        Some(BuiltinReturnType::String | BuiltinReturnType::Secret) => {
-                            ordinary(Ok(TypeExpr::String), concrete)
-                        }
-                        Some(BuiltinReturnType::Int) => ordinary(Ok(TypeExpr::Int), concrete),
-                        Some(BuiltinReturnType::StringList) => {
-                            ordinary(Ok(TypeExpr::List(Box::new(TypeExpr::String))), concrete)
-                        }
-                        Some(return_type @ (BuiltinReturnType::List | BuiltinReturnType::Map)) => {
-                            let shape = if matches!(return_type, BuiltinReturnType::List) {
-                                CollectionKind::List
-                            } else {
-                                CollectionKind::Map
-                            };
-                            let mut result = collection(
-                                value_dependent("builtin return type depends on arguments")
-                                    .static_type()
-                                    .cloned(),
-                                shape,
-                                concrete,
-                            );
-                            result.data_mut().member = Some(Arc::new(value_dependent(
-                                "builtin elements require resolved constraint checks",
-                            )));
-                            result
-                        }
-                        Some(BuiltinReturnType::Any) => {
-                            value_dependent("builtin return type depends on arguments")
-                        }
+                    match crate::builtins::Builtin::from_name(name) {
+                        Some(builtin) => builtin_result(builtin.result_typing(), children),
                         None if signature.is_some() => {
                             value_dependent("unannotated function result")
                         }
@@ -3677,8 +3856,14 @@ mod judgement {
                             (Err(_), Ok(_))
                                 if branches[0].elements.is_empty()
                                     && matches!(
-                                        branches[0].kind(),
-                                        Some(InferredKind::List(_))
+                                        branches[0].judgement,
+                                        ExprJudgement::Typed {
+                                            kind: InferredKind::List(_),
+                                            ..
+                                        } | ExprJudgement::ValueDependent {
+                                            shape: Some((CollectionKind::List, _)),
+                                            ..
+                                        }
                                     ) =>
                             {
                                 ty = branch.static_type().cloned()
@@ -3798,8 +3983,9 @@ mod judgement {
                                 // check's resource, argument, and source context.
                                 // Folded branches and other boundaries still
                                 // need the judge to report their rejection.
-                                let owner = if judged.requires_declared_assignment()
-                                    && matches!(judged.kind(), Some(InferredKind::Ordinary(_)))
+                                let sink_judged = judged.for_sink(&expected, self.config);
+                                let owner = if sink_judged.requires_declared_assignment()
+                                    && matches!(sink_judged.kind(), Some(InferredKind::Ordinary(_)))
                                     && judged.check_owner() == ExpressionCheckOwner::BindingIndex
                                 {
                                     FailureOwner::BindingIndex
@@ -3837,8 +4023,11 @@ mod judgement {
 
     fn loop_element(mut expression: JudgedExpr) -> JudgedExpr {
         if matches!(
-            expression.kind(),
-            Some(InferredKind::Ordinary(_) | InferredKind::Reference(_))
+            expression.judgement,
+            ExprJudgement::Typed {
+                kind: InferredKind::Ordinary(_) | InferredKind::Reference(_),
+                ..
+            }
         ) {
             expression.set_kind(|_| InferredKind::LoopSlot);
         }
@@ -3910,6 +4099,55 @@ mod judgement {
                 })
                 .collect(),
         );
+        result
+    }
+
+    /// Interpret the registry declaration once for both calls and intrinsics.
+    fn builtin_result(
+        result_typing: crate::builtins::BuiltinResultTyping,
+        children: &[JudgedExpr],
+    ) -> JudgedExpr {
+        use crate::builtins::BuiltinResultTyping as R;
+        let concrete = children.iter().all(JudgedExpr::concrete);
+        match result_typing {
+            R::Argument(index) => children
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| incomplete("builtin argument")),
+            R::String | R::SecretString => declared(Ok(TypeExpr::String), concrete),
+            R::ConstructedString => declared(Ok(TypeExpr::String), concrete)
+                .with_kind(InferredKind::BuiltinConstruction),
+            R::Int => declared(Ok(TypeExpr::Int), concrete),
+            R::StringList => declared(Ok(TypeExpr::List(Box::new(TypeExpr::String))), concrete),
+            R::ConstructedStringList => {
+                let mut result = collection(
+                    Ok(TypeExpr::List(Box::new(TypeExpr::String))),
+                    CollectionKind::List,
+                    concrete,
+                );
+                result.data_mut().member = Some(Arc::new(
+                    declared(Ok(TypeExpr::String), concrete)
+                        .with_kind(InferredKind::BuiltinConstruction),
+                ));
+                result.with_kind(InferredKind::BuiltinStringList)
+            }
+            R::List => builtin_collection(CollectionKind::List, concrete),
+            R::Map => builtin_collection(CollectionKind::Map, concrete),
+            R::Any => value_dependent("builtin return type depends on arguments"),
+        }
+    }
+
+    fn builtin_collection(shape: CollectionKind, concrete: bool) -> JudgedExpr {
+        let mut result = collection(
+            value_dependent("builtin return type depends on arguments")
+                .static_type()
+                .cloned(),
+            shape,
+            concrete,
+        );
+        result.data_mut().member = Some(Arc::new(value_dependent(
+            "builtin elements require resolved constraint checks",
+        )));
         result
     }
 
