@@ -706,12 +706,11 @@ fn unique_list_count_error_stays_in_the_second_resource() {
     let attributes = resource.attributes();
     let tree =
         carina_core::parser::AnalysisTree::try_from_file(document.parsed().unwrap()).unwrap();
-    let (diagnostics, reported_duplicate) = test_engine().validate_container_value(
+    let (diagnostics, reported_duplicate) = test_engine().render_container_findings(
         &document,
         tree.project_resources().nth(1).unwrap(),
         "values",
-        attributes.get("values").unwrap(),
-        &effective_type,
+        effective_type.validate_collect(attributes.get("values").unwrap()),
     );
     let diagnostic = only_message_diagnostic(&diagnostics, "outside allowed range");
     assert_eq!(diagnostic.range.start.line, 4, "{diagnostics:?}");
@@ -793,12 +792,11 @@ fn unique_list_item_error_does_not_mark_a_duplicate_as_reported() {
     let engine = test_engine();
     let tree =
         carina_core::parser::AnalysisTree::try_from_file(document.parsed().unwrap()).unwrap();
-    let (diagnostics, reported_duplicate) = engine.validate_container_value(
+    let (diagnostics, reported_duplicate) = engine.render_container_findings(
         &document,
         tree.project_resources().next().unwrap(),
         "matrix",
-        value,
-        &effective_type,
+        effective_type.validate_collect(value),
     );
     assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
     assert!(diagnostics[0].message.contains("expected String"));

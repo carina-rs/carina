@@ -6753,7 +6753,7 @@ fn scalar_kind_from_base(attribute_type: &AttributeType) -> Option<RefinedScalar
 /// project by convention: enum spelling always resolves through the exact
 /// owning schema type, while refined strings may still accept their raw
 /// identifier-shaped DSL literal.
-pub fn canonicalize_custom_type_value(
+pub(crate) fn canonicalize_custom_type_value(
     declared_type: &AttributeType,
     value: &Value,
 ) -> Result<Option<CanonicalCustomTypeValue>, CustomTypeCanonicalizationError> {
@@ -7374,19 +7374,6 @@ fn custom_validator_bridge_message(error: crate::schema::TypeError) -> String {
     }
 }
 
-fn validate_declared_custom_type_locally(
-    declared_type: &AttributeType,
-    value: &Value,
-) -> Result<Option<CanonicalCustomTypeValue>, crate::schema::TypeError> {
-    declared_type.validate_identified_scalar_value(value)?;
-    // Reference identities choose the plan resolver, never guest validation.
-    if matches!(declared_type.raw_shape(), RawShape::Reference { .. }) {
-        return Ok(None);
-    }
-    canonicalize_custom_type_value(declared_type, value)
-        .map_err(CustomTypeCanonicalizationError::into_type_error)
-}
-
 #[derive(Debug)]
 pub enum CustomTypeFactoryValidationError {
     InvalidValue(crate::schema::TypeError),
@@ -7414,18 +7401,30 @@ pub fn validate_custom_type_with_factory(
     declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
     value: &Value,
 ) -> Result<(), CustomTypeFactoryValidationError> {
-    let declared_type = declaration.declared_type();
-    let identity = declaration.identity();
-    let canonical = validate_declared_custom_type_locally(declared_type, value)
-        .map_err(CustomTypeFactoryValidationError::InvalidValue)?;
-    if local_custom_validator(declared_type).is_some() {
-        return Ok(());
-    }
-    canonical.map_or(Ok(()), |canonical| {
-        factory
-            .validate_custom_type(identity, &canonical)
-            .map_err(CustomTypeFactoryValidationError::ProviderRejected)
+    crate::schema::validate_custom_type_leaf(declaration, value, |proof| {
+        proof.map_or(Ok(()), |proof| {
+            dispatch_validated_custom_type(factory, proof)
+        })
     })
+    .map_err(CustomTypeFactoryValidationError::InvalidValue)?
+}
+
+fn dispatch_validated_custom_type(
+    factory: &dyn ProviderFactory,
+    proof: crate::schema::LocallyValidatedCustomType<'_>,
+) -> Result<(), CustomTypeFactoryValidationError> {
+    factory
+        .validate_custom_type(proof.declaration().identity(), proof.canonical())
+        .map_err(CustomTypeFactoryValidationError::ProviderRejected)
+}
+
+pub(crate) fn validate_validated_custom_type_with_factory(
+    factory: &dyn ProviderFactory,
+    proof: crate::schema::LocallyValidatedCustomType<'_>,
+) -> Result<(), crate::parser::CustomTypeValidationError> {
+    let identity = proof.declaration().identity().clone();
+    dispatch_validated_custom_type(factory, proof)
+        .map_err(|error| owner_validation_error(factory.name(), &identity, error))
 }
 
 fn owner_validation_error(
@@ -7457,6 +7456,7 @@ fn owner_validation_error(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn validate_custom_type_declaration_with_factory(
     factory: &dyn ProviderFactory,
     declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
@@ -7908,29 +7908,46 @@ where
             .into_annotation())
     }
 
-    fn validate<'a>(
+    fn annotation_declarations(
         &self,
-        target: crate::parser::CustomTypeValidationTarget<'a>,
-        value: &'a crate::resource::Value,
-    ) -> Result<(), crate::parser::CustomTypeValidationError> {
-        let factories = self.factories.as_factories();
-        match target {
-            crate::parser::CustomTypeValidationTarget::Declaration { owner, declaration } => {
-                let Some(owner_index) = self.index.get(owner) else {
-                    return Err(
+        owned: &crate::parser::OwnedTypeIdentity,
+    ) -> Result<BTreeMap<String, Vec<AttributeType>>, crate::parser::CustomTypeValidationError>
+    {
+        owned
+            .provider_names()
+            .map(|owner| {
+                let declarations = self
+                    .index
+                    .get(owner)
+                    .and_then(|index| index.declarations.get(owned.identity()))
+                    .filter(|declarations| !declarations.is_empty())
+                    .ok_or_else(|| {
                         crate::parser::CustomTypeValidationError::MissingDeclaration {
                             owner: owner.to_string(),
-                            identity: declaration.identity().clone(),
-                        },
-                    );
-                };
-                let factory = factories[owner_index.factory_index].as_ref();
-                validate_custom_type_declaration_with_factory(factory, declaration, value)
+                            identity: owned.identity().clone(),
+                        }
+                    })?;
+                Ok((owner.to_string(), declarations.clone()))
+            })
+            .collect()
+    }
+
+    fn validate_validated(
+        &self,
+        owner: &str,
+        proof: crate::schema::LocallyValidatedCustomType<'_>,
+    ) -> Result<(), crate::parser::CustomTypeValidationError> {
+        let owner_index = self.index.get(owner).ok_or_else(|| {
+            crate::parser::CustomTypeValidationError::MissingDeclaration {
+                owner: owner.to_string(),
+                identity: proof.declaration().identity().clone(),
             }
-            crate::parser::CustomTypeValidationTarget::Annotation(owned) => {
-                validate_custom_type_annotation(factories, &self.index, owned, value)
-            }
-        }
+        })?;
+        let factories = self.factories.as_factories();
+        validate_validated_custom_type_with_factory(
+            factories[owner_index.factory_index].as_ref(),
+            proof,
+        )
     }
 
     fn enum_declaration(
@@ -8074,25 +8091,22 @@ pub fn loaded_provider_snapshot_from_factories(
     }
 }
 
-fn validate_custom_type_annotation(
-    factories: &[Box<dyn ProviderFactory>],
-    index: &BTreeMap<String, OwnerCustomTypeIndex>,
+pub(crate) fn validate_custom_type_annotation(
+    resolver: &dyn crate::parser::CustomTypeResolver,
     owned: &crate::parser::OwnedTypeIdentity,
     value: &Value,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
     use crate::parser::{CustomTypeValidationError, SchemaTypeOwner};
 
+    let declarations_by_owner = resolver.annotation_declarations(owned)?;
     let identity = owned.identity();
     let mut first_enum_definition: Option<(String, EnumDefinitionSignature)> = None;
     for owner in owned.owners().iter() {
         let SchemaTypeOwner::Provider(owner) = owner;
-        let Some(owner_index) = index.get(owner) else {
-            return Err(CustomTypeValidationError::MissingDeclaration {
-                owner: owner.clone(),
-                identity: identity.clone(),
-            });
-        };
-        let Some(declarations) = owner_index.declarations.get(identity) else {
+        let Some(declarations) = declarations_by_owner
+            .get(owner)
+            .filter(|declarations| !declarations.is_empty())
+        else {
             return Err(CustomTypeValidationError::MissingDeclaration {
                 owner: owner.clone(),
                 identity: identity.clone(),
@@ -8119,23 +8133,48 @@ fn validate_custom_type_annotation(
     let mut first_enum_spelling: Option<(String, String)> = None;
     for owner in owned.owners().iter() {
         let SchemaTypeOwner::Provider(owner) = owner;
-        let Some(owner_index) = index.get(owner) else {
+        let Some(declarations) = declarations_by_owner
+            .get(owner)
+            .filter(|declarations| !declarations.is_empty())
+        else {
             return Err(CustomTypeValidationError::MissingDeclaration {
                 owner: owner.clone(),
                 identity: identity.clone(),
             });
         };
-        let Some(declarations) = owner_index.declarations.get(identity) else {
-            return Err(CustomTypeValidationError::MissingDeclaration {
-                owner: owner.clone(),
-                identity: identity.clone(),
-            });
-        };
-        let factory = factories[owner_index.factory_index].as_ref();
-        let mut bridge: Option<(RefinedScalarKind, CanonicalCustomTypeValue)> = None;
+        let mut bridge: Option<(
+            RefinedScalarKind,
+            crate::schema::LocallyValidatedCustomType<'_>,
+        )> = None;
         for declaration in declarations {
+            // Reference identities are indexed for annotations but have no
+            // provider validation capability. Preserve their offline checks.
+            if matches!(declaration.raw_shape(), RawShape::Reference { .. }) {
+                declaration
+                    .validate_identified_scalar_value(value)
+                    .map_err(|error| CustomTypeValidationError::InvalidDeclarationValue {
+                        owner: owner.clone(),
+                        identity: identity.clone(),
+                        error: Box::new(error),
+                    })?;
+                continue;
+            }
+            let identified = crate::parser::IdentifiedCustomTypeDeclaration::new(declaration)
+                .ok_or_else(|| CustomTypeValidationError::InvalidDeclarationValue {
+                    owner: owner.clone(),
+                    identity: identity.clone(),
+                    error: Box::new(
+                        CustomTypeCanonicalizationError::UnidentifiedDeclaration {
+                            type_name: declaration.type_name(),
+                        }
+                        .into_type_error(),
+                    ),
+                })?;
             let canonical =
-                validate_declared_custom_type_locally(declaration, value).map_err(|error| {
+                crate::schema::validate_custom_type_annotation_leaf(identified, value, |proof| {
+                    proof
+                })
+                .map_err(|error| {
                     CustomTypeValidationError::InvalidDeclarationValue {
                         owner: owner.clone(),
                         identity: identity.clone(),
@@ -8144,8 +8183,9 @@ fn validate_custom_type_annotation(
                 })?;
 
             if enum_definition_signature(declaration).is_some()
-                && let Some(canonical) = &canonical
+                && let Some(proof) = &canonical
             {
+                let canonical = proof.canonical();
                 if let Some((first_owner, first_spelling)) = &first_enum_spelling {
                     if first_owner != owner && first_spelling != canonical.as_str() {
                         return Err(CustomTypeValidationError::ConflictingEnumSpelling {
@@ -8172,7 +8212,7 @@ fn validate_custom_type_annotation(
                     });
                 };
                 if let Some((previous_kind, previous)) = &bridge {
-                    if *previous_kind != kind || previous != &canonical {
+                    if *previous_kind != kind || previous.canonical() != canonical.canonical() {
                         return Err(CustomTypeValidationError::Rejected {
                             owner: owner.clone(),
                             identity: identity.clone(),
@@ -8186,22 +8226,8 @@ fn validate_custom_type_annotation(
                 }
             }
         }
-        if let Some((_kind, canonical)) = bridge {
-            factory
-                .validate_custom_type(identity, &canonical)
-                .map_err(|error| {
-                    let error = if error.detail().provider_name.is_some() {
-                        error
-                    } else {
-                        error.for_provider(owner)
-                    };
-                    CustomTypeValidationError::ProviderRejected {
-                        owner: owner.clone(),
-                        identity: identity.clone(),
-                        error: std::sync::Arc::new(error),
-                        masked: false,
-                    }
-                })?;
+        if let Some((_kind, proof)) = bridge {
+            resolver.validate_validated(owner, proof)?;
         }
     }
     Ok(())
@@ -8279,6 +8305,64 @@ impl Provider for Box<dyn Provider> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn issue_4276_round1_external_canonicalization_cannot_bypass_local_validation() {
+        // Compile as an external crate: unit tests themselves can access
+        // crate-private constructors and would miss a public API escape hatch.
+        let executable = std::env::current_exe().unwrap();
+        let dependencies = executable.parent().unwrap();
+        let library = std::fs::read_dir(dependencies)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with("libcarina_core-") && name.ends_with(".rlib")
+                })
+            })
+            .max_by_key(|entry| entry.metadata().unwrap().modified().unwrap())
+            .expect("the core test binary has a matching library dependency")
+            .path();
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("bypass.rs");
+        std::fs::write(&source, r#"
+use carina_core::provider::{ProviderFactory, canonicalize_custom_type_value, identified_custom_type_identity};
+use carina_core::resource::Value;
+use carina_core::schema::CompiledAttributeType;
+
+pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType, raw: &Value) {
+    let canonical = canonicalize_custom_type_value(declaration, raw).unwrap().unwrap();
+    factory.validate_custom_type(identified_custom_type_identity(declaration).unwrap(), &canonical).unwrap();
+}
+"#).unwrap();
+        let output = std::process::Command::new("rustc")
+            .args([
+                "--edition=2024",
+                "--crate-type=lib",
+                "--emit=metadata",
+                "--crate-name=carina_4276_bypass",
+            ])
+            .arg("--extern")
+            .arg(format!("carina_core={}", library.display()))
+            .arg("-L")
+            .arg(format!("dependency={}", dependencies.display()))
+            .arg(&source)
+            .arg("-o")
+            .arg(directory.path().join("bypass.rmeta"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            !output.status.success(),
+            "an external caller can manufacture a factory input without local validation"
+        );
+        assert!(
+            stderr.contains("E0603")
+                && stderr.contains("canonicalize_custom_type_value")
+                && stderr.contains("private"),
+            "{stderr}"
+        );
+    }
+
     mod assignability_edges_stage_a {
         use std::sync::{
             Arc,
@@ -9247,6 +9331,67 @@ mod tests {
     }
 
     #[test]
+    fn issue_4276_annotation_reference_stays_offline() {
+        use crate::parser::{CustomTypeValidationError, OwnedTypeIdentity};
+        let identity = TypeIdentity::bare("Reference");
+        let declaration = AttributeType::reference(identity.clone(), None, Some((Some(3), None)));
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(ConfigOnlyCustomTypeFactory)];
+        let index = BTreeMap::from([(
+            "config-owner".into(),
+            OwnerCustomTypeIndex {
+                factory_index: 0,
+                declarations: BTreeMap::from([(identity.clone(), vec![declaration])]),
+            },
+        )]);
+        let owned =
+            OwnedTypeIdentity::provider("config-owner", identity, RefinedScalarKind::String);
+        let resolver = FactoryCustomTypeResolver::with_index(
+            factories.as_slice(),
+            index,
+            &SchemaRegistry::new(),
+        );
+        // main validates Reference constraints locally and never creates a provider bridge.
+        assert_eq!(
+            validate_custom_type_annotation(&resolver, &owned, &string_value("valid")),
+            Ok(())
+        );
+        assert!(matches!(
+            validate_custom_type_annotation(&resolver, &owned, &string_value("x")),
+            Err(CustomTypeValidationError::InvalidDeclarationValue { .. })
+        ));
+    }
+
+    #[test]
+    fn issue_4276_annotation_unidentified_index_returns_typed_error() {
+        use crate::parser::{CustomTypeValidationError, OwnedTypeIdentity};
+        let identity = TypeIdentity::bare("Indexed");
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(ConfigOnlyCustomTypeFactory)];
+        let index = BTreeMap::from([(
+            "config-owner".into(),
+            OwnerCustomTypeIndex {
+                factory_index: 0,
+                declarations: BTreeMap::from([(identity.clone(), vec![AttributeType::string()])]),
+            },
+        )]);
+        let owned =
+            OwnedTypeIdentity::provider("config-owner", identity, RefinedScalarKind::String);
+        let resolver = FactoryCustomTypeResolver::with_index(
+            factories.as_slice(),
+            index,
+            &SchemaRegistry::new(),
+        );
+        let result = validate_custom_type_annotation(&resolver, &owned, &string_value("value"));
+        // main's local declaration check/canonicalizer returns a typed failure here.
+        assert!(
+            matches!(
+                result,
+                Err(CustomTypeValidationError::InvalidDeclarationValue { .. })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[test]
     fn provider_custom_type_index_retains_scalar_kinds_for_resolution() {
         use crate::parser::{
             OwnedTypeIdentity, ProviderContext, ProviderCustomTypes, ResourceTypePath, TypeExpr,
@@ -9324,7 +9469,7 @@ mod tests {
                     crate::schema::RefinedScalarKind::String
                 ))
         );
-        crate::parser::CustomTypeResolver::validate(
+        crate::parser::validate_custom_type_value(
             &custom_types,
             crate::parser::CustomTypeValidationTarget::Annotation(
                 &crate::parser::OwnedTypeIdentity::provider(

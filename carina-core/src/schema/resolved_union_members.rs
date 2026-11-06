@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 
 use super::ResolvedAttrType;
 #[cfg(test)]
-use super::{Compiled, RefPathResolution, select_union_member_on_path};
+use super::{Compiled, RefPathResolution, value_validation::select_union_member_on_path};
 #[cfg(test)]
 use crate::resource::Value;
 
@@ -194,28 +194,16 @@ impl<'a> UnionMembers<'a, Compiled> {
         value: &Value,
         visited_refs: &mut Vec<&'a str>,
     ) -> Option<ResolvedUnionMember<'a, Compiled>> {
-        let projected = value.as_concrete()?;
+        value.as_concrete()?;
         let restore_len = visited_refs.len();
         for name in &self.visited_refs {
             if !visited_refs.contains(name) {
                 visited_refs.push(name);
             }
         }
-        let expected = self
-            .members
-            .iter()
-            .map(PatternAttributeType::type_name)
-            .collect::<Vec<_>>()
-            .join(" | ");
-        let Ok(selected) = select_union_member_on_path(
-            self.members,
-            value,
-            projected,
-            expected,
-            self.defs,
-            super::FieldAncestry::WRITABLE,
-            visited_refs,
-        ) else {
+        let Some(selected) =
+            select_union_member_on_path(self.members, value, self.defs, visited_refs)
+        else {
             visited_refs.truncate(restore_len);
             return None;
         };

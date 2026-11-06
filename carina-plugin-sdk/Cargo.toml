@@ -10,6 +10,7 @@ workspace = true
 
 [features]
 test-utils = [
+    "carina-core/test-utils",
     "dep:aws-smithy-runtime-api",
     "dep:aws-smithy-types",
     "dep:http",

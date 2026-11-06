@@ -227,6 +227,14 @@ mod fingerprint;
 mod resolved_attr_type;
 mod resolved_union_members;
 mod type_identity;
+mod value_validation;
+pub use value_validation::{
+    LocallyValidatedCustomType, ResourceValueValidation, ValidatedCustomTypeLookup,
+    ValueValidationFindings,
+};
+pub(crate) use value_validation::{
+    validate_custom_type_annotation_leaf, validate_custom_type_leaf,
+};
 
 pub use assignability::{AssignmentSink, SinkAuthority, TypeAssignability, TypeAssignmentDeferral};
 pub(crate) use assignability_edges::AssignabilityClosure;
@@ -485,23 +493,12 @@ where
     })
 }
 
-/// External validator resolved from the exact declared refined type.
-///
-/// Provider-owned call sites pair this declaration with its schema owner before
-/// invoking the owning factory. A [`TypeIdentity`] alone is descriptive metadata
-/// and is never used as routing authority.
-pub type CustomTypeLookup<'a> = &'a (
-        dyn Fn(&PatternAttributeType<Compiled>, &Value) -> Result<(), TypeError> + Send + Sync + 'a
-    );
+/// Provider dispatch consumes the sealed proof made by the combined value walk.
+pub type CustomTypeLookup<'a> = &'a dyn ValidatedCustomTypeLookup;
 
-/// A [`CustomTypeLookup`] that approves every value. Pass to
-/// `validate_with_origins_and_lookup` from contexts that have no
-/// `ProviderContext` (snapshot tests, schema unit tests). The
-/// schema-attached `validate` closure still runs for built-in
-/// validators registered directly on the type.
 #[cfg(test)]
 pub(crate) fn no_lookup() -> CustomTypeLookup<'static> {
-    &|_declared_type, _value| Ok(())
+    &|_declared_type: &CompiledAttributeType, _value: &Value| Ok(())
 }
 
 fn attributes_without_placeholders<P: PlaceholderKind, B: BindingAddress>(
@@ -516,297 +513,6 @@ fn attributes_without_placeholders<P: PlaceholderKind, B: BindingAddress>(
             ))
         })
         .collect()
-}
-
-/// Walk an [`AttributeType`] and apply `lookup` to every identified refined node
-/// reached. Pushes any returned error into `errors`, tagged with
-/// `attr_name` so it points back at the user-visible attribute. Used
-/// by `ResourceSchema::validate_inner` to bridge provider-supplied
-/// validators that the schema's own closure cannot carry (e.g. WASM
-/// plugins, where the real validator lives behind the factory's
-/// `validate_custom_type`).
-fn walk_custom_lookup<P: PlaceholderKind, B: BindingAddress>(
-    attr_type: &PatternAttributeType<Compiled>,
-    value: &Value<P, B>,
-    attr_name: Option<&str>,
-    lookup: CustomTypeLookup<'_>,
-    defs: &std::collections::BTreeMap<String, PatternAttributeType<Compiled>>,
-    errors: &mut Vec<TypeError>,
-) {
-    let mut visited_refs = Vec::new();
-    walk_custom_lookup_on_path(
-        attr_type,
-        value,
-        attr_name,
-        lookup,
-        defs,
-        errors,
-        &mut visited_refs,
-    );
-}
-
-fn walk_custom_lookup_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-    attr_type: &'a PatternAttributeType<Compiled>,
-    value: &Value<P, B>,
-    attr_name: Option<&str>,
-    lookup: CustomTypeLookup<'_>,
-    defs: &'a std::collections::BTreeMap<String, PatternAttributeType<Compiled>>,
-    errors: &mut Vec<TypeError>,
-    visited_refs: &mut Vec<&'a str>,
-) {
-    if let Value::Deferred(DeferredValue::ModuleIf(deferred)) = value {
-        for branch in &deferred.values()[1..] {
-            walk_custom_lookup_on_path(
-                attr_type,
-                branch,
-                attr_name,
-                lookup,
-                defs,
-                errors,
-                visited_refs,
-            );
-        }
-        return;
-    }
-    // `Secret` is a sensitivity wrapper, not an unresolved value. Providers
-    // may validate the plaintext, but diagnostics crossing back out of this
-    // boundary must discard every user-derived value/message.
-    if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        let result = inner.try_inspect(|value| {
-            let mut secret_errors = Vec::new();
-            walk_custom_lookup_on_path(
-                attr_type,
-                value,
-                attr_name,
-                lookup,
-                defs,
-                &mut secret_errors,
-                visited_refs,
-            );
-            Err::<(), _>(secret_errors)
-        });
-        errors.extend(result.err().into_iter().flatten());
-        return;
-    }
-    if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
-        walk_custom_lookup_on_path(
-            attr_type,
-            value,
-            attr_name,
-            lookup,
-            defs,
-            errors,
-            visited_refs,
-        );
-        walk_custom_lookup_on_path(
-            attr_type,
-            default,
-            attr_name,
-            lookup,
-            defs,
-            errors,
-            visited_refs,
-        );
-        return;
-    }
-    // Skip deferred-resolution values — same convention as
-    // `AttrTypeKind::validate`, plus `ResourceRef` / `Interpolation`
-    // which only resolve to a concrete string at apply time.
-    if matches!(
-        value,
-        Value::Deferred(DeferredValue::FunctionCall { .. })
-            | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
-            | Value::Deferred(DeferredValue::Access(_))
-            | Value::Deferred(DeferredValue::ResourceRef { .. })
-            | Value::Deferred(DeferredValue::IntegerArithmetic(_))
-            | Value::Deferred(DeferredValue::Interpolation(_))
-            | Value::Deferred(DeferredValue::Unknown(_))
-            | Value::Deferred(DeferredValue::Placeholder(_))
-    ) {
-        return;
-    }
-    match &attr_type.kind {
-        AttrTypeKind::UnloadedSchemaType(_) => errors.push(TypeError::from(
-            crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
-        )),
-        // Reference leaves have portable offline constraints and no custom
-        // validator callback. Their identity selects only the plan resolver.
-        AttrTypeKind::Reference {
-            identity: _,
-            pattern: _,
-            length: _,
-        } => {}
-        AttrTypeKind::String { binding, .. }
-        | AttrTypeKind::Int { binding, .. }
-        | AttrTypeKind::Float { binding, .. } => {
-            if binding.callback().is_none() {
-                run_identified_lookup(
-                    attr_type,
-                    binding.identity(),
-                    value,
-                    attr_name,
-                    lookup,
-                    errors,
-                );
-            }
-        }
-        AttrTypeKind::Enum {
-            identity, validate, ..
-        } => {
-            if validate.is_some() {
-                return;
-            }
-            let resolver = EnumValueResolver::with_defs(attr_type, defs);
-            let canonical = match value {
-                Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => resolver.resolve_raw(raw),
-                Value::Concrete(ConcreteValue::String(text)) => {
-                    resolver.resolve_state_text(text.expose_plaintext())
-                }
-                Value::Concrete(ConcreteValue::CanonicalEnum(value))
-                    if value.identity().same_type(identity) =>
-                {
-                    Ok(value.clone())
-                }
-                _ => return,
-            };
-            let Ok(canonical) = canonical else {
-                // The schema validation pass reports the resolver failure. Do
-                // not call a provider validator with an unresolved spelling.
-                return;
-            };
-            let resolved = Value::Concrete(ConcreteValue::CanonicalEnum(canonical));
-            if let Err(e) = lookup(attr_type, &resolved) {
-                errors.push(match attr_name {
-                    Some(attr_name) => e.with_attribute(attr_name),
-                    None => e,
-                });
-            }
-        }
-        AttrTypeKind::List {
-            element_type: inner,
-            ..
-        } => {
-            if let Value::Concrete(ConcreteValue::List(items)) = value {
-                for item in items {
-                    // Descending to an item consumes one value level, so a
-                    // recursive schema may legitimately revisit the same Ref.
-                    walk_custom_lookup(inner, item, attr_name, lookup, defs, errors);
-                }
-            }
-        }
-        AttrTypeKind::Map { value: inner, .. } => {
-            if let Value::Concrete(ConcreteValue::Map(map)) = value {
-                for v in map.values() {
-                    walk_custom_lookup(inner, v, attr_name, lookup, defs, errors);
-                }
-            }
-        }
-        AttrTypeKind::Struct { fields, .. } => {
-            if let Value::Concrete(ConcreteValue::Map(map)) = value {
-                for f in fields {
-                    if let Some(v) = map.get(&f.name) {
-                        walk_custom_lookup(&f.field_type, v, attr_name, lookup, defs, errors);
-                    }
-                }
-            }
-        }
-        AttrTypeKind::Union(members) => {
-            // Union semantics: a value is valid if *any* member accepts
-            // it. The previous loop walked every member and pushed
-            // every error, so a value that legitimately matched one arm
-            // (e.g. an IPv4 CIDR like `"10.0.0.0/8"` matching
-            // `ipv4_cidr()` inside `types::cidr()`) still surfaced the
-            // failure from the sibling IPv6 arm's validator. See
-            // awscc#217.
-            //
-            // Walk every member into a local buffer; if any member
-            // emits no errors the Union succeeds and the sibling
-            // failures are discarded. If every member fails, keep the
-            // smallest error set so the user-facing diagnostic stays
-            // pointed at the closest near-match.
-            let mut best: Option<Vec<TypeError>> = None;
-            for member in members.as_raw_slice() {
-                let Ok(resolution) = resolve_refs_on_path(member, defs, visited_refs) else {
-                    // A missing or cyclic Ref is not a viable Union member.
-                    continue;
-                };
-                let mut local = Vec::new();
-                walk_custom_lookup_on_path(
-                    resolution.attr,
-                    value,
-                    attr_name,
-                    lookup,
-                    defs,
-                    &mut local,
-                    visited_refs,
-                );
-                visited_refs.truncate(resolution.restore_len);
-                if local.is_empty() {
-                    return;
-                }
-                if best.as_ref().is_none_or(|b| local.len() < b.len()) {
-                    best = Some(local);
-                }
-            }
-            if let Some(b) = best {
-                errors.extend(b);
-            }
-        }
-        AttrTypeKind::Bool
-        | AttrTypeKind::Duration
-        | AttrTypeKind::ResourceHandle { .. }
-        | AttrTypeKind::StringLiteralSet { .. } => {}
-        // `Ref`: resolve via the schema's def map and continue the
-        // walk. The resolved target (typically a `Struct`) may carry
-        // identity-bearing custom types whose validators must run.
-        // A missing def name is reported by the effective/rootless validator
-        // as `ValidationFailed`; here we just skip the custom-lookup
-        // walk so a user-facing dangling-Ref does not abort the
-        // process (carina#3345).
-        AttrTypeKind::Ref(_) => match resolve_refs_on_path(attr_type, defs, visited_refs) {
-            Ok(resolution) => {
-                walk_custom_lookup_on_path(
-                    resolution.attr,
-                    value,
-                    attr_name,
-                    lookup,
-                    defs,
-                    errors,
-                    visited_refs,
-                );
-                visited_refs.truncate(resolution.restore_len);
-            }
-            Err(_) => {
-                // Skip — the `validate_attr` pass already emitted
-                // the dangling-Ref or cyclic-path diagnostic for this
-                // attribute/member.
-            }
-        },
-    }
-}
-
-fn run_identified_lookup<P: PlaceholderKind, B: BindingAddress>(
-    attribute_type: &PatternAttributeType<Compiled>,
-    identity: Option<&TypeIdentity>,
-    value: &Value<P, B>,
-    attr_name: Option<&str>,
-    lookup: CustomTypeLookup<'_>,
-    errors: &mut Vec<TypeError>,
-) {
-    let Some(value) = value
-        .to_expanded()
-        .and_then(Value::try_into_address_free_absolute)
-    else {
-        return;
-    };
-    if identity.is_some()
-        && let Err(e) = lookup(attribute_type, &value)
-    {
-        errors.push(match attr_name {
-            Some(attr_name) => e.with_attribute(attr_name),
-            None => e,
-        });
-    }
 }
 
 pub type EnumParts<'a> = (
@@ -2117,26 +1823,25 @@ impl RootlessType {
         self.schema.validate(value)
     }
 
-    /// Validate a rootless value and bridge any callback-free identified
-    /// refinements through an owning provider lookup. Native callbacks run in
-    /// the structural pass and are skipped by the lookup walk.
+    /// Validate a rootless value with the same recursive local/provider walk
+    /// used by resource values. Rootless configuration retains only its primary
+    /// local error; resource validation also reports sibling provider findings.
     pub(crate) fn validate_with_lookup<P: PlaceholderKind, B: BindingAddress>(
         &self,
         value: &Value<P, B>,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
-        if let Err(error) = self.schema.validate(value) {
-            return Err(vec![error]);
-        }
-        let mut errors = Vec::new();
-        walk_custom_lookup(
+        let findings = value_validation::validate_value_with_lookup(
             &self.schema.root,
             value,
-            None,
-            lookup,
             &self.schema.defs,
-            &mut errors,
+            FieldAncestry::WRITABLE,
+            lookup,
         );
+        let errors = match findings.local_error() {
+            Some(error) => vec![error.clone()],
+            None => findings.into_errors(),
+        };
         if errors.is_empty() {
             Ok(())
         } else {
@@ -2364,346 +2069,13 @@ impl Schema {
         &self,
         value: &Value<P, B>,
     ) -> Vec<(FieldPath, TypeError)> {
-        let mut out = Vec::new();
-        Self::collect_attr_into(
+        value_validation::validate_value_locally(
             &self.root,
+            value,
             &self.defs,
-            &FieldPath::new(),
-            value,
             FieldAncestry::WRITABLE,
-            &mut out,
-        );
-        out
-    }
-
-    fn collect_attr_into<P: PlaceholderKind, B: BindingAddress>(
-        attr: &PatternAttributeType<Compiled>,
-        defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
-        path: &FieldPath,
-        value: &Value<P, B>,
-        ancestry: FieldAncestry,
-        out: &mut Vec<(FieldPath, TypeError)>,
-    ) {
-        if fit_value_to_type_on_path(
-            attr,
-            value,
-            defs,
-            ancestry,
-            CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
-            &mut Vec::new(),
         )
-        .is_some()
-        {
-            return;
-        }
-
-        let error_count = out.len();
-        let mut visited_refs = Vec::new();
-        Self::collect_attr_into_on_path(attr, defs, path, value, ancestry, out, &mut visited_refs);
-        if out.len() == error_count {
-            let error = validate_attr_with_defs_and_ancestry(attr, value, defs, ancestry)
-                .expect_err("a rejected fit must produce a validation diagnostic");
-            out.push((path.clone(), error));
-        }
-    }
-
-    fn collect_attr_into_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-        attr: &'a PatternAttributeType<Compiled>,
-        defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
-        path: &FieldPath,
-        value: &Value<P, B>,
-        ancestry: FieldAncestry,
-        out: &mut Vec<(FieldPath, TypeError)>,
-        visited_refs: &mut Vec<&'a str>,
-    ) {
-        if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-            let result = inner.try_inspect(|value| {
-                let mut secret_errors = Vec::new();
-                Self::collect_attr_into_on_path(
-                    attr,
-                    defs,
-                    path,
-                    value,
-                    ancestry.inside_secret(),
-                    &mut secret_errors,
-                    visited_refs,
-                );
-                Err::<(), _>(secret_errors)
-            });
-            out.extend(result.err().into_iter().flatten());
-            return;
-        }
-        // Peel Ref so the downstream arms never have to think about it.
-        if matches!(&attr.kind, AttrTypeKind::Ref(_)) {
-            match resolve_refs_on_path(attr, defs, visited_refs) {
-                Ok(resolution) => {
-                    Self::collect_attr_into_on_path(
-                        resolution.attr,
-                        defs,
-                        path,
-                        value,
-                        ancestry,
-                        out,
-                        visited_refs,
-                    );
-                    visited_refs.truncate(resolution.restore_len);
-                }
-                Err(failure) => {
-                    out.push((path.clone(), failure.into_validation_error()));
-                }
-            }
-            return;
-        }
-        let Some(concrete) = value.as_concrete() else {
-            return;
-        };
-        match &attr.kind {
-            AttrTypeKind::UnloadedSchemaType(_) => out.push((
-                path.clone(),
-                crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into(),
-            )),
-            AttrTypeKind::Struct {
-                name,
-                fields,
-                field_groups,
-            } => {
-                // Mirror the pre-#3345 standalone-validator collect_struct
-                // behavior, but route field walks through
-                // collect_attr_into so Ref-typed fields are resolved
-                // against self.defs.
-                if matches!(concrete, ConcreteValueRef::List(_)) {
-                    out.push((
-                        path.clone(),
-                        TypeError::BlockSyntaxNotAllowed {
-                            attribute: name.to_string(),
-                        },
-                    ));
-                    return;
-                }
-                let Some(map) = (match concrete {
-                    ConcreteValueRef::Map(m) => Some(m),
-                    _ => None,
-                }) else {
-                    out.push((
-                        path.clone(),
-                        TypeError::value_type_mismatch(
-                            attr.type_name(),
-                            concrete.type_name().to_string(),
-                        ),
-                    ));
-                    return;
-                };
-
-                let canonical_field_names: Vec<&str> =
-                    fields.iter().map(|f| f.name.as_str()).collect();
-
-                // Required-field check.
-                for f in fields {
-                    if ancestry.effective_input_mode(f).is_required()
-                        && !struct_field_is_present(fields, map, f, ancestry)
-                    {
-                        let field_path = path.push_field(f.name.clone());
-                        out.push((
-                            field_path,
-                            TypeError::MissingRequired {
-                                name: f.name.clone(),
-                            },
-                        ));
-                    }
-                }
-
-                for group in violated_struct_field_groups(fields, field_groups, map, ancestry) {
-                    out.push((
-                        path.clone(),
-                        TypeError::FieldGroupViolation {
-                            path: path.clone(),
-                            group: group.clone(),
-                        },
-                    ));
-                }
-
-                for (k, v) in map {
-                    match struct_field_for_key(fields, k, ancestry) {
-                        Some(field) => {
-                            let next_path = path.push_field(k.clone());
-                            if let Some(error) =
-                                validate_struct_field_assignment(field, k, ancestry)
-                            {
-                                out.push((next_path, error));
-                                continue;
-                            }
-                            Self::collect_attr_into(
-                                &field.field_type,
-                                defs,
-                                &next_path,
-                                v,
-                                ancestry.descend(field),
-                                out,
-                            );
-                        }
-                        None => {
-                            let suggestion = suggest_similar_name(k, &canonical_field_names);
-                            out.push((
-                                path.push_field(k.clone()),
-                                TypeError::UnknownStructField {
-                                    struct_name: name.to_string(),
-                                    field: k.clone(),
-                                    suggestion,
-                                },
-                            ));
-                        }
-                    }
-                }
-            }
-            AttrTypeKind::List {
-                element_type: inner,
-                constraints,
-                ordered: _ordered,
-            } => {
-                let Some(items) = (match concrete {
-                    ConcreteValueRef::List(items) => Some(Cow::Borrowed(items)),
-                    ConcreteValueRef::StringList(items) => Some(Cow::Owned(
-                        items
-                            .iter()
-                            .map(|item| Value::Concrete(ConcreteValue::String(item.clone())))
-                            .collect::<Vec<_>>(),
-                    )),
-                    _ => None,
-                }) else {
-                    out.push((
-                        path.clone(),
-                        TypeError::value_type_mismatch(
-                            attr.type_name(),
-                            concrete.type_name().to_string(),
-                        ),
-                    ));
-                    return;
-                };
-                for result in constraints.check(
-                    items.iter(),
-                    defs,
-                    ancestry,
-                    CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
-                    |item| {
-                        fit_value_to_type_on_path(
-                            inner,
-                            item,
-                            defs,
-                            ancestry,
-                            CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
-                            &mut Vec::new(),
-                        )
-                    },
-                ) {
-                    if let Err(ListConstraintError { index, error }) = result {
-                        let error_path = index.map_or_else(|| path.clone(), |i| path.push_index(i));
-                        out.push((error_path, *error));
-                    }
-                }
-                for (i, item) in items.iter().enumerate() {
-                    let next_path = path.push_index(i);
-                    Self::collect_attr_into(inner, defs, &next_path, item, ancestry, out);
-                }
-            }
-            AttrTypeKind::Map {
-                key,
-                value: value_type,
-                constraints,
-            } => {
-                let Some(map) = (match concrete {
-                    ConcreteValueRef::Map(map) => Some(map),
-                    _ => None,
-                }) else {
-                    out.push((
-                        path.clone(),
-                        TypeError::value_type_mismatch(
-                            attr.type_name(),
-                            concrete.type_name().to_string(),
-                        ),
-                    ));
-                    return;
-                };
-                if let Err(error) = constraints.check(map.len()) {
-                    out.push((path.clone(), error));
-                }
-                let mut first_value_error = None;
-                for (map_key, map_value) in map {
-                    let next_path = path.push_field(map_key.clone());
-                    let lifted_key: Value<P, B> = lift_map_key(key, map_key, defs);
-                    if let Err(inner) =
-                        validate_attr_with_defs_and_ancestry(key, &lifted_key, defs, ancestry)
-                    {
-                        out.push((
-                            next_path.clone(),
-                            TypeError::MapKeyError {
-                                key: map_key.clone(),
-                                inner: Box::new(inner),
-                            },
-                        ));
-                    }
-
-                    // Preserve the collector's established coarse Map-value
-                    // diagnostic for ordinary type/writability failures while
-                    // retaining the concrete entry path needed by field-group
-                    // errors. A Map has no source range for an arbitrary value
-                    // schema failure, but a group violation belongs to the
-                    // entry's Struct and can be anchored there.
-                    let mut entry_errors = Vec::new();
-                    Self::collect_attr_into(
-                        value_type,
-                        defs,
-                        &next_path,
-                        map_value,
-                        ancestry,
-                        &mut entry_errors,
-                    );
-                    let collected_value_error = entry_errors
-                        .iter()
-                        .find(|(_, error)| !matches!(error, TypeError::FieldGroupViolation { .. }))
-                        .map(|(_, error)| error.clone());
-                    out.extend(entry_errors.into_iter().filter(|(_, error)| {
-                        matches!(error, TypeError::FieldGroupViolation { .. })
-                    }));
-
-                    if let Some(collected_error) = collected_value_error
-                        && first_value_error.is_none()
-                    {
-                        let inner = validate_attr_with_defs_and_ancestry(
-                            value_type, map_value, defs, ancestry,
-                        )
-                        .err()
-                        .unwrap_or(collected_error);
-                        first_value_error = Some(TypeError::MapValueError {
-                            key: map_key.clone(),
-                            inner: Box::new(inner),
-                        });
-                    }
-                }
-                if let Some(error) = first_value_error {
-                    out.push((path.clone(), error));
-                }
-            }
-            // Keep Union membership and best-scoring failure selection
-            // single-sourced in `validate_attr`. This returns one error
-            // anchored at the current path; choosing and recursively
-            // collecting a failed Struct member would improve LSP path
-            // precision but would not change validation acceptance.
-            AttrTypeKind::Union(_) => {
-                if let Err(e) =
-                    validate_attr_with_defs_on_path(attr, value, defs, ancestry, visited_refs)
-                {
-                    out.push((path.clone(), e));
-                }
-            }
-            _ => {
-                // For non-recursive shapes the existing single-shot
-                // dispatcher is correct. Forward any error under the
-                // current path.
-                if let Err(e) = validate_attr_with_defs_and_ancestry(attr, value, defs, ancestry) {
-                    out.push((path.clone(), e));
-                }
-            }
-        }
+        .into_local_findings()
     }
 
     /// Validate one recursive child against this rootless schema's definitions.
@@ -2712,282 +2084,17 @@ impl Schema {
         attr: &PatternAttributeType<Compiled>,
         value: &Value<P, B>,
     ) -> Result<(), TypeError> {
-        validate_attr_with_defs(attr, value, &self.defs)
+        validate_attr_with_defs(attr, value, &self.defs, FieldAncestry::WRITABLE)
     }
 }
 
-fn validate_attr_with_defs<P: PlaceholderKind, B: BindingAddress>(
-    attr: &PatternAttributeType<Compiled>,
-    value: &Value<P, B>,
-    defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
-) -> Result<(), TypeError> {
-    validate_attr_with_defs_and_ancestry(attr, value, defs, FieldAncestry::WRITABLE)
-}
-
-pub(crate) fn validate_attr_with_defs_and_ancestry<P: PlaceholderKind, B: BindingAddress>(
+pub(crate) fn validate_attr_with_defs<P: PlaceholderKind, B: BindingAddress>(
     attr: &PatternAttributeType<Compiled>,
     value: &Value<P, B>,
     defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
 ) -> Result<(), TypeError> {
-    if fit_value_to_type_on_path(
-        attr,
-        value,
-        defs,
-        ancestry,
-        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
-        &mut Vec::new(),
-    )
-    .is_some()
-    {
-        return Ok(());
-    }
-
-    let mut visited_refs = Vec::new();
-    validation_error_with_defs_on_path(attr, value, defs, ancestry, &mut visited_refs).and_then(
-        |()| {
-            Err(TypeError::value_type_mismatch(
-                attr.type_name(),
-                value.type_name(),
-            ))
-        },
-    )
-}
-
-fn validate_attr_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-    attr: &'a PatternAttributeType<Compiled>,
-    value: &Value<P, B>,
-    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
-    ancestry: FieldAncestry,
-    visited_refs: &mut Vec<&'a str>,
-) -> Result<(), TypeError> {
-    if fit_value_to_type_on_path(
-        attr,
-        value,
-        defs,
-        ancestry,
-        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
-        visited_refs,
-    )
-    .is_some()
-    {
-        return Ok(());
-    }
-
-    validation_error_with_defs_on_path(attr, value, defs, ancestry, visited_refs).and_then(|()| {
-        Err(TypeError::value_type_mismatch(
-            attr.type_name(),
-            value.type_name(),
-        ))
-    })
-}
-
-/// Produce the existing path-rich diagnostic after the authoritative fit
-/// computation has rejected a value. This walker is deliberately off the
-/// success path: acceptance is exactly `fit.is_some()`, while the established
-/// shape-based Union error attribution remains unchanged.
-fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-    attr: &'a PatternAttributeType<Compiled>,
-    value: &Value<P, B>,
-    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
-    ancestry: FieldAncestry,
-    visited_refs: &mut Vec<&'a str>,
-) -> Result<(), TypeError> {
-    if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        return {
-            inner.try_inspect(|secret_value| {
-                validation_error_with_defs_on_path(
-                    attr,
-                    secret_value,
-                    defs,
-                    ancestry.inside_secret(),
-                    visited_refs,
-                )
-            })
-        };
-    }
-    if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
-        validate_attr_with_defs_and_ancestry(attr, value, defs, ancestry)?;
-        return validate_attr_with_defs_and_ancestry(attr, default, defs, ancestry);
-    }
-    match &attr.kind {
-        AttrTypeKind::UnloadedSchemaType(_) => {
-            Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into())
-        }
-        AttrTypeKind::Ref(_) => {
-            let resolution = resolve_refs_on_path(attr, defs, visited_refs)
-                .map_err(RefResolutionFailure::into_validation_error)?;
-            let result = validation_error_with_defs_on_path(
-                resolution.attr,
-                value,
-                defs,
-                ancestry,
-                visited_refs,
-            );
-            visited_refs.truncate(resolution.restore_len);
-            result
-        }
-        AttrTypeKind::List {
-            element_type: inner,
-            constraints,
-            ordered: _ordered,
-        } => {
-            let items: Cow<'_, [Value<P, B>]> = match value.as_concrete() {
-                Some(ConcreteValueRef::List(items)) => Cow::Borrowed(items),
-                Some(ConcreteValueRef::StringList(items)) => Cow::Owned(
-                    items
-                        .iter()
-                        .map(|item| Value::Concrete(ConcreteValue::String(item.clone())))
-                        .collect(),
-                ),
-                None => return Ok(()),
-                Some(_) => {
-                    return Err(TypeError::value_type_mismatch(
-                        attr.type_name(),
-                        value.type_name(),
-                    ));
-                }
-            };
-            for result in constraints.check(
-                items.iter(),
-                defs,
-                ancestry,
-                CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
-                |item| {
-                    fit_value_to_type_on_path(
-                        inner,
-                        item,
-                        defs,
-                        ancestry,
-                        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
-                        &mut Vec::new(),
-                    )
-                },
-            ) {
-                let (i, fit) = result.map_err(|failure| {
-                    let error = *failure.error;
-                    match failure.index {
-                        Some(_)
-                            if matches!(
-                                error,
-                                TypeError::DuplicateListElement {
-                                    value: _,
-                                    index: _,
-                                    first_index: _,
-                                    attribute: _
-                                }
-                            ) =>
-                        {
-                            error
-                        }
-                        Some(index) => error.at_list_index(index),
-                        None => error,
-                    }
-                })?;
-                if fit.is_none() {
-                    validate_attr_with_defs_and_ancestry(inner, &items[i], defs, ancestry)
-                        .map_err(|error| error.at_list_index(i))?;
-                }
-            }
-            Ok(())
-        }
-        AttrTypeKind::Map {
-            key,
-            value: val_ty,
-            constraints,
-        } => {
-            if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
-                constraints.check(map.len())?;
-                for (k, v) in map.iter() {
-                    let key_val: Value<P, B> = lift_map_key(key, k, defs);
-                    if let Err(inner_err) =
-                        validate_attr_with_defs_and_ancestry(key, &key_val, defs, ancestry)
-                    {
-                        return Err(TypeError::MapKeyError {
-                            key: k.clone(),
-                            inner: Box::new(inner_err),
-                        });
-                    }
-                    if let Err(inner_err) =
-                        validate_attr_with_defs_and_ancestry(val_ty, v, defs, ancestry)
-                    {
-                        return Err(inner_err.at_map_value(k));
-                    }
-                }
-                Ok(())
-            } else if value.as_concrete().is_none() {
-                Ok(())
-            } else {
-                Err(TypeError::value_type_mismatch(
-                    attr.type_name(),
-                    value.type_name(),
-                ))
-            }
-        }
-        AttrTypeKind::Struct {
-            name,
-            fields,
-            field_groups,
-        } => {
-            if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
-                validate_struct_fields(
-                    name,
-                    fields,
-                    map,
-                    ancestry,
-                    |field| TypeError::MissingRequired {
-                        name: field.name.clone(),
-                    },
-                    |input_name, field, field_value| {
-                        validate_attr_with_defs_and_ancestry(
-                            &field.field_type,
-                            field_value,
-                            defs,
-                            ancestry.descend(field),
-                        )
-                        .map_err(|inner_err| inner_err.at_struct_field(input_name))
-                    },
-                )?;
-                if let Some(group) =
-                    violated_struct_field_groups(fields, field_groups, map, ancestry).next()
-                {
-                    Err(TypeError::FieldGroupViolation {
-                        path: FieldPath::new(),
-                        group: group.clone(),
-                    })
-                } else {
-                    Ok(())
-                }
-            } else if matches!(value.as_concrete(), Some(ConcreteValueRef::List(_))) {
-                Err(TypeError::BlockSyntaxNotAllowed {
-                    attribute: name.clone(),
-                })
-            } else if value.as_concrete().is_none() {
-                Ok(())
-            } else {
-                Err(TypeError::value_type_mismatch(
-                    attr.type_name(),
-                    value.type_name(),
-                ))
-            }
-        }
-        AttrTypeKind::Union(members) => {
-            let Some(concrete) = value.as_concrete() else {
-                return Ok(());
-            };
-            select_union_member_on_path(
-                members.as_raw_slice(),
-                value,
-                concrete,
-                attr.type_name(),
-                defs,
-                ancestry,
-                visited_refs,
-            )
-            .map(|_| ())
-        }
-        _ => attr.validate_leaf_value(value),
-    }
+    value_validation::validate_value_locally(attr, value, defs, ancestry).into_local_result()
 }
 
 impl<R: PatternForm> fmt::Debug for AttrTypeKind<R> {
@@ -4105,7 +3212,12 @@ impl PatternAttributeType<Compiled> {
         &self,
         value: &Value<P, B>,
     ) -> Result<(), TypeError> {
-        validate_attr_with_defs(self, value, empty_defs_for_schema_walks())
+        validate_attr_with_defs(
+            self,
+            value,
+            empty_defs_for_schema_walks(),
+            FieldAncestry::WRITABLE,
+        )
     }
 
     /// Validate a non-container value after the ancestry-aware structural
@@ -4116,13 +3228,6 @@ impl PatternAttributeType<Compiled> {
         &self,
         value: &Value<P, B>,
     ) -> Result<(), TypeError> {
-        if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-            return inner.try_inspect(|secret_value| self.validate_leaf_value(secret_value));
-        }
-        if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
-            self.validate_leaf_value(value)?;
-            return self.validate_leaf_value(default);
-        }
         debug_assert!(!matches!(
             self.kind,
             AttrTypeKind::Ref(_)
@@ -4186,7 +3291,12 @@ impl PatternAttributeType<Compiled> {
                 | AttrTypeKind::Float { .. }
                 | AttrTypeKind::Enum { .. }
         ));
-        self.validate_leaf_value(value)
+        validate_attr_with_defs(
+            self,
+            value,
+            empty_defs_for_schema_walks(),
+            FieldAncestry::WRITABLE,
+        )
     }
 
     /// Validate a primitive (`String`/`Int`/`Float`/`Bool`/`Duration`) value.
@@ -6591,81 +5701,6 @@ pub(crate) fn closest_union_member_for_value_on_path<'a, P: PlaceholderKind, B: 
         .map(|resolution| resolution.attr)
 }
 
-/// Select one Union member from the set that accepts the complete value under
-/// the schema-aware validator.
-///
-/// Accepted candidates are ordered only by semantic exactness and then by
-/// declaration order. If every member rejects, the old structural failure
-/// rank is used solely to retain the most useful diagnostic tier. A unique
-/// best failure is returned verbatim; co-maximal non-Struct failures are
-/// retained in declaration order. Both Validation-only callers use this
-/// routine. Canonicalization consumes the richer [`Fit`] witness directly, so
-/// it never has to select the member again.
-pub(crate) fn select_union_member_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
-    members: &'a [PatternAttributeType<Compiled>],
-    original: &Value<P, B>,
-    value: ConcreteValueRef<'_, P, B>,
-    expected: String,
-    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
-    ancestry: FieldAncestry,
-    visited_refs: &mut Vec<&'a str>,
-) -> Result<&'a PatternAttributeType<Compiled>, TypeError> {
-    if let Some(selected) = inspect_union_structure_on_path(
-        members,
-        original,
-        defs,
-        ancestry,
-        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
-        visited_refs,
-    ) {
-        return Ok(selected.member);
-    }
-
-    // Only the failure path snapshots the incoming Ref path. Successful
-    // selection already carries the winning fit witness and never clones it.
-    let resolved_members =
-        UnionMembers::new_after_union_on_path(members, defs, visited_refs.clone());
-    let mut best_failure: Option<BestUnionMemberFailures> = None;
-
-    for member in members {
-        let Err(error) =
-            validate_attr_with_defs_on_path(member, original, defs, ancestry, visited_refs)
-        else {
-            // The authoritative whole-Union fit above proved that no member
-            // accepts. Reaching this branch would mean diagnostic validation
-            // had drifted from fit acceptance.
-            continue;
-        };
-        let judgement = union_member_judgement_on_path(member, value, defs, ancestry, visited_refs);
-        if !judgement.failure_rank.is_match() {
-            continue;
-        }
-        let failure = UnionMemberFailure {
-            error,
-            diagnostic_identity: judgement.diagnostic_identity,
-        };
-        match &mut best_failure {
-            Some(current) if judgement.failure_rank > current.failure_rank => {
-                *current = BestUnionMemberFailures::new(judgement.failure_rank, failure);
-            }
-            Some(current) if judgement.failure_rank == current.failure_rank => {
-                current.tied.push(failure);
-            }
-            Some(_) => {}
-            None => {
-                best_failure = Some(BestUnionMemberFailures::new(
-                    judgement.failure_rank,
-                    failure,
-                ));
-            }
-        }
-    }
-
-    Err(best_failure
-        .map(|best| best.into_error(value, resolved_members, ancestry))
-        .unwrap_or_else(|| TypeError::value_type_mismatch(expected, value.type_name().to_string())))
-}
-
 /// Resolve one host value-map key to its canonical [`StructField`].
 ///
 /// Host maps use the DSL/schema name or its `block_name` syntax alias.
@@ -6721,9 +5756,8 @@ fn violated_struct_field_groups<'a, P: crate::resource::ValueKind, B: BindingAdd
 
 /// Reject an assignment that targets provider-populated struct data.
 ///
-/// Both the single-error validator and the path-collecting LSP validator call
-/// this gate before type-checking the field value, keeping writability policy
-/// and diagnostic precedence identical across the two walkers.
+/// The value validator calls this gate before type-checking the field value,
+/// keeping writability precedence identical in its primary and collected errors.
 fn validate_struct_field_assignment(
     field: &CompiledStructField,
     input_name: &str,
@@ -6735,53 +5769,6 @@ fn validate_struct_field_assignment(
         .then(|| TypeError::ReadOnlyAttribute {
             name: input_name.to_string(),
         })
-}
-
-/// Validate the shared structural contract for a struct map, then route each
-/// accepted value through the caller's recursive validator.
-///
-/// Keeping required-field checks, canonical/`block_name` lookup, unknown-key
-/// rejection, and suggestions behind one function prevents the standalone and
-/// schema-aware validators from acquiring different notions of a valid struct.
-fn validate_struct_fields<P: PlaceholderKind, B: BindingAddress, M, V>(
-    struct_name: &str,
-    fields: &[CompiledStructField],
-    map: &IndexMap<String, Value<P, B>>,
-    ancestry: FieldAncestry,
-    missing_required: M,
-    mut validate_value: V,
-) -> Result<(), TypeError>
-where
-    M: Fn(&CompiledStructField) -> TypeError,
-    V: FnMut(&str, &CompiledStructField, &Value<P, B>) -> Result<(), TypeError>,
-{
-    for field in fields {
-        if ancestry.effective_input_mode(field).is_required()
-            && !struct_field_is_present(fields, map, field, ancestry)
-        {
-            return Err(missing_required(field));
-        }
-    }
-
-    let canonical_names: Vec<&str> = fields.iter().map(|field| field.name.as_str()).collect();
-    for (input_name, value) in map {
-        let Some(field) = struct_field_for_key(fields, input_name, ancestry) else {
-            return Err(TypeError::UnknownStructField {
-                struct_name: struct_name.to_string(),
-                field: input_name.clone(),
-                suggestion: suggest_similar_name(input_name, &canonical_names),
-            });
-        };
-        if let Some(inner) = validate_struct_field_assignment(field, input_name, ancestry) {
-            return Err(TypeError::StructFieldError {
-                field: input_name.clone(),
-                inner: Box::new(inner),
-            });
-        }
-        validate_value(input_name, field, value)?;
-    }
-
-    Ok(())
 }
 
 /// Source length is contained in sink length (narrow ⊆ wide).
@@ -9451,7 +8438,20 @@ impl<'a> EffectiveType<'a> {
         &self,
         value: &Value<P, B>,
     ) -> Result<(), TypeError> {
-        validate_attr_with_defs_and_ancestry(self.attr_type, value, self.defs, self.field_ancestry)
+        validate_attr_with_defs(self.attr_type, value, self.defs, self.field_ancestry)
+    }
+
+    /// Retain the primary error and all diagnostic paths for this exact value.
+    pub fn validate_findings<P: PlaceholderKind, B: BindingAddress>(
+        &self,
+        value: &Value<P, B>,
+    ) -> ValueValidationFindings {
+        value_validation::validate_value_locally(
+            self.attr_type,
+            value,
+            self.defs,
+            self.field_ancestry,
+        )
     }
 
     /// Validate an authored value and retain paths for every diagnostic.
@@ -9459,16 +8459,7 @@ impl<'a> EffectiveType<'a> {
         &self,
         value: &Value<P, B>,
     ) -> Vec<(FieldPath, TypeError)> {
-        let mut out = Vec::new();
-        Schema::collect_attr_into(
-            self.attr_type,
-            self.defs,
-            &FieldPath::new(),
-            value,
-            self.field_ancestry,
-            &mut out,
-        );
-        out
+        self.validate_findings(value).into_local_findings()
     }
 
     /// Canonicalize provider or persisted state without discarding the
@@ -14710,6 +13701,19 @@ impl<'a> OwnerBoundResourceSchema<'a> {
             .validate_with_origins_and_lookup(attributes, is_string_literal, &lookup)
     }
 
+    /// Validate once, retaining source paths for diagnostic renderers.
+    pub fn validate_values_with_resolver<P: PlaceholderKind, B: BindingAddress>(
+        self,
+        attributes: &HashMap<String, Value<P, B>>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        resolver: &dyn crate::parser::CustomTypeResolver,
+    ) -> ResourceValueValidation {
+        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
+        self.schema
+            .schema
+            .validate_report(attributes, is_string_literal, &lookup)
+    }
+
     /// Validate every concrete value known at the provider boundary, routing
     /// identified declarations through this schema's registered owner.
     pub fn validate_known_values_with_resolver(
@@ -15477,13 +14481,15 @@ impl PatternResourceSchema<Compiled> {
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
-        let mut errors = self.validate_value_entries(
-            attributes,
-            is_string_literal,
-            lookup,
-            ValueEntryValidation::KnownWritableOnly,
-            None,
-        );
+        let mut errors = self
+            .validate_value_entries(
+                attributes,
+                is_string_literal,
+                lookup,
+                ValueEntryValidation::KnownWritableOnly,
+                None,
+            )
+            .into_errors();
 
         if let Some(validator) = self.validator()
             && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
@@ -15513,13 +14519,15 @@ impl PatternResourceSchema<Compiled> {
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
-        let mut errors = self.validate_value_entries(
-            attributes,
-            is_string_literal,
-            lookup,
-            ValueEntryValidation::KnownWritableOnly,
-            Some(selected),
-        );
+        let mut errors = self
+            .validate_value_entries(
+                attributes,
+                is_string_literal,
+                lookup,
+                ValueEntryValidation::KnownWritableOnly,
+                Some(selected),
+            )
+            .into_errors();
 
         if !selected.is_empty()
             && let Some(validator) = self.validator()
@@ -15541,22 +14549,36 @@ impl PatternResourceSchema<Compiled> {
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
-        let mut errors = Vec::new();
+        self.validate_report(attributes, is_string_literal, lookup)
+            .into_result()
+    }
+
+    fn validate_report<P: PlaceholderKind, B: BindingAddress>(
+        &self,
+        attributes: &HashMap<String, Value<P, B>>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+    ) -> ResourceValueValidation {
+        let mut report = ResourceValueValidation::default();
 
         // Check required attributes
         for (name, schema) in &self.attributes {
             if schema.is_required() && !attributes.contains_key(name) && schema.default.is_none() {
-                errors.push(TypeError::MissingRequired { name: name.clone() });
+                report
+                    .errors
+                    .push(TypeError::MissingRequired { name: name.clone() });
             }
         }
 
-        errors.extend(self.validate_value_entries(
+        let values = self.validate_value_entries(
             attributes,
             is_string_literal,
             lookup,
             ValueEntryValidation::FullInput,
             None,
-        ));
+        );
+        report.errors.extend(values.errors);
+        report.attributes = values.attributes;
 
         for group in &self.field_groups {
             let present = group
@@ -15565,7 +14587,7 @@ impl PatternResourceSchema<Compiled> {
                 .filter(|name| attributes.contains_key(name.as_str()))
                 .count();
             if !group.is_satisfied_by_count(present) {
-                errors.push(TypeError::FieldGroupViolation {
+                report.errors.push(TypeError::FieldGroupViolation {
                     path: FieldPath::new(),
                     group: group.clone(),
                 });
@@ -15577,14 +14599,10 @@ impl PatternResourceSchema<Compiled> {
             && let Some(attributes) = attributes_without_placeholders(attributes)
             && let Err(mut validation_errors) = run_resource_validator(validator, &attributes)
         {
-            errors.append(&mut validation_errors);
+            report.errors.append(&mut validation_errors);
         }
 
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
+        report
     }
 
     fn validate_value_entries<P: PlaceholderKind, B: BindingAddress>(
@@ -15594,8 +14612,8 @@ impl PatternResourceSchema<Compiled> {
         lookup: CustomTypeLookup<'_>,
         mode: ValueEntryValidation,
         selected: Option<&HashSet<String>>,
-    ) -> Vec<TypeError> {
-        let mut errors = Vec::new();
+    ) -> ResourceValueValidation {
+        let mut report = ResourceValueValidation::default();
 
         // Build block_name -> canonical_name map for alias resolution
         let bn_map = self.block_name_map();
@@ -15625,18 +14643,21 @@ impl PatternResourceSchema<Compiled> {
                 // value would silently drop it. Reject before type checking so the
                 // diagnostic reports writability instead of a confusing type error.
                 if schema.is_read_only() && mode == ValueEntryValidation::FullInput {
-                    errors.push(TypeError::ReadOnlyAttribute { name: name.clone() });
+                    report
+                        .errors
+                        .push(TypeError::ReadOnlyAttribute { name: name.clone() });
                     continue;
                 }
 
-                if let Err(e) = effective_attribute.validate(value) {
-                    // Tag the error with the attribute name the user actually
-                    // wrote (which may be a block-name alias), so diagnostics
-                    // point back at a token that appears in their source.
-                    let tagged = e.with_attribute(name);
-                    // Other schema shapes may use custom validators that return
-                    // `InvalidEnumVariant`; quoted-form reshaping belongs only
-                    // to an Enum attribute.
+                let findings = value_validation::validate_value_with_lookup(
+                    &schema.attr_type,
+                    value,
+                    &self.defs,
+                    FieldAncestry::from_input_mode(effective_attribute.effective_input_mode()),
+                    lookup,
+                );
+                for error in findings.local_errors() {
+                    let tagged = error.clone().with_attribute(name);
                     let reshaped = if is_string_literal(name.as_str())
                         && matches!(effective_attribute.value_type().shape(), Shape::Enum { .. })
                     {
@@ -15644,16 +14665,15 @@ impl PatternResourceSchema<Compiled> {
                     } else {
                         tagged
                     };
-                    errors.push(reshaped);
+                    report.errors.push(reshaped);
                 }
-                walk_custom_lookup(
-                    &schema.attr_type,
-                    value,
-                    Some(name),
-                    lookup,
-                    &self.defs,
-                    &mut errors,
+                report.errors.extend(
+                    findings
+                        .provider
+                        .iter()
+                        .map(|(_, error)| error.clone().with_attribute(name)),
                 );
+                report.attributes.insert(name.clone(), findings);
             } else if mode == ValueEntryValidation::FullInput {
                 let id_attribute = format!("{name}_id");
                 let suggestion = if known.contains(&id_attribute.as_str()) {
@@ -15661,14 +14681,14 @@ impl PatternResourceSchema<Compiled> {
                 } else {
                     suggest_similar_name(name, &known)
                 };
-                errors.push(TypeError::UnknownAttribute {
+                report.errors.push(TypeError::UnknownAttribute {
                     name: name.clone(),
                     suggestion,
                 });
             }
         }
 
-        errors
+        report
     }
 }
 

@@ -1484,6 +1484,25 @@ impl DiagnosticRun<'_> {
                     let schema = validated_schema.as_schema();
                     // Build block_name -> canonical_name map for this schema
                     let bn_map = schema.block_name_map();
+                    let mut resolved_attrs = semantic_resource_attributes
+                        .as_ref()
+                        .map(carina_core::resource::attrs_to_hashmap)
+                        .unwrap_or_else(|| rref.resolved_attributes());
+                    for value in resolved_attrs.values_mut() {
+                        if let Some(evaluated) =
+                            carina_core::parser::evaluate_static_value_for_validation(
+                                value,
+                                self.provider_context.catalog(),
+                            )
+                        {
+                            *value = evaluated;
+                        }
+                    }
+                    let mut value_validation = validated_schema.validate_values_with_resolver(
+                        &resolved_attrs,
+                        &|attr| resource_quoted_string_attrs.contains(attr),
+                        self.provider_context.catalog().custom_type_resolver(),
+                    );
                     let mut reported_attribute_diagnostics = HashSet::new();
                     for (attr_name, authored_attr_value) in resource_attributes.iter() {
                         let location = rref.attribute_value_location(
@@ -1636,12 +1655,33 @@ impl DiagnosticRun<'_> {
                             // structured diagnostic path. Union attributes stay in
                             // the guarded match below so deferred values keep #2847's
                             // behavior and static values are validated only once.
+                            // Reuse a report only for the value it actually checked.
+                            // Authored containers and assignment expressions can
+                            // differ from the statically evaluated resource value.
+                            let mut cached_findings = value_validation.take_attribute(attr_name);
+                            let mut findings_for = |value: &Value| {
+                                if resolved_attrs.get(attr_name).is_some_and(|cached_value| {
+                                    validation::same_validation_input(cached_value, value)
+                                }) && let Some(findings) = cached_findings.take()
+                                {
+                                    findings
+                                } else {
+                                    effective_type.validate_findings(value)
+                                }
+                            };
+                            let attr_findings = findings_for(attr_value);
+                            let assignment_value =
+                                judged_expression.assignment_value(typecheck_value);
+                            let assignment_findings =
+                                (!validation::same_validation_input(assignment_value, attr_value))
+                                    .then(|| findings_for(assignment_value));
+                            let value_findings =
+                                assignment_findings.as_ref().unwrap_or(&attr_findings);
                             if matches!(
                                 effective_type.shape(),
                                 carina_core::schema::Shape::Enum { .. }
                             ) && let Some(diag) = build_enum_diagnostic(
-                                &effective_attribute,
-                                attr_value,
+                                attr_findings.local_error(),
                                 attr_name,
                                 resource_quoted_string_attrs.contains(attr_name),
                                 doc,
@@ -1701,10 +1741,10 @@ impl DiagnosticRun<'_> {
                                     Some(tagged.to_string())
                                 }
                             };
-                            let type_error = match (
-                                attr_shape,
-                                judged_expression.assignment_value(typecheck_value),
-                            ) {
+                            let type_error = match (attr_shape, assignment_value) {
+                                // Each undecided branch contributes its own
+                                // local/provider errors to the shared report.
+                                (_, Value::Deferred(DeferredValue::ModuleIf(_))) => None,
                                 // Bool type should not receive String
                                 (
                                     carina_core::schema::Shape::Bool,
@@ -1734,9 +1774,9 @@ impl DiagnosticRun<'_> {
                                 // for computed Access values. Callers do not
                                 // classify binding kinds independently.
                                 (_, value @ Value::Deferred(DeferredValue::Coalesce { .. })) => {
-                                    effective_attribute
-                                        .validate(value)
-                                        .err()
+                                    value_findings
+                                        .local_error()
+                                        .cloned()
                                         .map(|error| error.with_attribute(attr_name).to_string())
                                         .or_else(|| {
                                             carina_core::validation::check_deferred_access_type(
@@ -1827,8 +1867,8 @@ impl DiagnosticRun<'_> {
                                 // namespace-shape fallback) — surface the
                                 // plain message so the user still sees a
                                 // diagnostic, just without the quick-fix.
-                                (carina_core::schema::Shape::Enum { .. }, value) => {
-                                    effective_attribute.validate(value).err().map(|e| {
+                                (carina_core::schema::Shape::Enum { .. }, _value) => {
+                                    value_findings.local_error().cloned().map(|e| {
                                         let tagged = e.with_attribute(attr_name);
                                         let reshaped =
                                             if resource_quoted_string_attrs.contains(attr_name) {
@@ -1895,9 +1935,9 @@ impl DiagnosticRun<'_> {
                                                 | Value::Deferred(DeferredValue::Coalesce { .. })
                                         ) =>
                                 {
-                                    effective_attribute
-                                        .validate(value)
-                                        .err()
+                                    value_findings
+                                        .local_error()
+                                        .cloned()
                                         .and_then(&mut diagnose_schema_error)
                                 }
 
@@ -1945,13 +1985,13 @@ impl DiagnosticRun<'_> {
                                     )
                                 )
                             {
+                                let local_findings = attr_findings.into_local_findings();
                                 let (nested_diagnostics, reported_duplicate) = self
-                                    .validate_container_value(
+                                    .render_container_findings(
                                         doc,
                                         rref,
                                         attr_name,
-                                        attr_value,
-                                        &effective_type,
+                                        local_findings,
                                     );
                                 if reported_duplicate {
                                     reported_attribute_diagnostics
@@ -1962,29 +2002,10 @@ impl DiagnosticRun<'_> {
                         }
                     }
 
-                    // Run whole-resource validation, including top-level field groups.
-                    let mut resolved_attrs = semantic_resource_attributes
-                        .as_ref()
-                        .map(carina_core::resource::attrs_to_hashmap)
-                        .unwrap_or_else(|| rref.resolved_attributes());
-                    for value in resolved_attrs.values_mut() {
-                        if let Some(evaluated) =
-                            carina_core::parser::evaluate_static_value_for_validation(
-                                value,
-                                self.provider_context.catalog(),
-                            )
-                        {
-                            *value = evaluated;
-                        }
-                    }
-                    let is_string_literal =
-                        |attr: &str| resource_quoted_string_attrs.contains(attr);
-                    if let Err(errors) = validated_schema.validate_with_resolver(
-                        &resolved_attrs,
-                        &is_string_literal,
-                        self.provider_context.catalog().custom_type_resolver(),
-                    ) {
-                        for error in errors {
+                    // Render the report produced by the single owner-bound walk.
+                    {
+                        for error in value_validation.errors() {
+                            let error = error.clone();
                             if let carina_core::schema::TypeError::MissingRequired { name } = &error
                                 && pending_resource_sinks.iter().any(
                                     |(pending_resource, authored_name)| {
@@ -2468,15 +2489,13 @@ impl DiagnosticEngine {
 /// See #2309. The structured payload is consumed by
 /// [`crate::code_action::code_actions_for_diagnostic`].
 fn build_enum_diagnostic(
-    effective_attribute: &carina_core::schema::EffectiveAttribute<'_>,
-    attr_value: &Value,
+    error: Option<&TypeError>,
     attr_name: &str,
     is_quoted_literal: bool,
     doc: &Document,
     resource: &carina_core::parser::AnalysisResourceRef<'_>,
 ) -> Option<Diagnostic> {
-    let err = effective_attribute.validate(attr_value).err()?;
-    let tagged = err.with_attribute(attr_name);
+    let tagged = error?.clone().with_attribute(attr_name);
     // Reshape into the shape-mismatch diagnostic when the value came
     // from a quoted string literal — mirrors CLI behavior (#2094).
     let reshaped = if is_quoted_literal {
