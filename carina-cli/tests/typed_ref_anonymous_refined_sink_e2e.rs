@@ -758,3 +758,6 @@ fn typed_ref_secret_constraint_error_does_not_leak_value() {
         );
     }
 }
+
+#[path = "typed_ref_anonymous_refined_sink_e2e/review_round2_4282.rs"]
+mod review_round2_4282;

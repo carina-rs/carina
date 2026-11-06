@@ -637,8 +637,10 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
     let ValueCheckEvidence::Authored(expression) = inference else {
         return check_constraint_value(expected, value, config, inference, provider_custom_types);
     };
+    let expression = expression.for_sink(expected, config);
+    let inference = ValueCheckEvidence::Authored(&expression);
     let admission = crate::parser::retained::admit_with_context(
-        expression,
+        &expression,
         expected,
         crate::parser::retained::AdmissionContext::Assignment,
         config,
@@ -699,7 +701,7 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
             }
             if !value.is_fully_resolved()
                 && (expression.requires_declared_assignment()
-                    || (expression.is_string_construction()
+                    || (expression.is_single_string_construction()
                         && admission
                             == crate::parser::retained::ExpressionAdmission::DeferredInterpolation))
             {

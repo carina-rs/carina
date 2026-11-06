@@ -153,13 +153,21 @@ fn single_reference_interpolation_preserves_child_judgement_and_literal_folding(
             assert_eq!(wrapped.static_type(), direct.static_type(), "{definition}");
             assert_eq!(wrapped.check_owner(), direct.check_owner(), "{definition}");
             assert_eq!(
-                wrapped.requires_declared_assignment(),
-                direct.requires_declared_assignment(),
+                wrapped
+                    .for_sink(&TypeExpr::String, &config())
+                    .requires_declared_assignment(),
+                direct
+                    .for_sink(&TypeExpr::String, &config())
+                    .requires_declared_assignment(),
                 "{definition}"
             );
             assert_eq!(
-                wrapped.is_string_construction(),
-                direct.is_string_construction(),
+                wrapped
+                    .for_sink(&TypeExpr::String, &config())
+                    .is_single_string_construction(),
+                direct
+                    .for_sink(&TypeExpr::String, &config())
+                    .is_single_string_construction(),
                 "{definition}"
             );
             for sink in [TypeExpr::String, TypeExpr::Int, TypeExpr::Bool] {
@@ -193,7 +201,12 @@ fn single_reference_interpolation_stringifies_non_string_scalars() {
             .binding(&RelativeBindingName::new("wrapped"))
             .unwrap();
         assert_eq!(wrapped.static_type(), Ok(&TypeExpr::String), "{definition}");
-        assert!(wrapped.is_string_construction(), "{definition}");
+        assert!(
+            wrapped
+                .for_sink(&TypeExpr::String, &config())
+                .is_single_string_construction(),
+            "{definition}"
+        );
         assert!(admit_expression(wrapped, &TypeExpr::String).is_ok());
         assert!(admit_expression(wrapped, &TypeExpr::Int).is_err());
         if let Some(expected) = expected {
@@ -558,7 +571,9 @@ fn builtin_collection_shape_survives_missing_element_inference() {
             "{expression}"
         );
         assert_eq!(
-            result.collection_kind(),
+            result
+                .for_sink(&TypeExpr::List(Box::new(TypeExpr::String)), &config())
+                .collection_kind(),
             Some(CollectionKind::List),
             "{expression}"
         );
@@ -708,12 +723,20 @@ fn resolved_nominal_declarations_fail_closed_at_unrelated_scalars() {
     assert_eq!(result.static_type(), Ok(&named));
     assert_eq!(result.check_owner(), direct.check_owner());
     assert_eq!(
-        result.requires_declared_assignment(),
-        direct.requires_declared_assignment()
+        result
+            .for_sink(&TypeExpr::String, &config())
+            .requires_declared_assignment(),
+        direct
+            .for_sink(&TypeExpr::String, &config())
+            .requires_declared_assignment()
     );
     assert_eq!(
-        result.is_string_construction(),
-        direct.is_string_construction()
+        result
+            .for_sink(&TypeExpr::String, &config())
+            .is_single_string_construction(),
+        direct
+            .for_sink(&TypeExpr::String, &config())
+            .is_single_string_construction()
     );
     assert!(admit_expression(result, &TypeExpr::Int).is_err());
     assert!(admit_expression(result, &TypeExpr::Bool).is_err());
@@ -762,4 +785,99 @@ fn interpolated_conditional_waits_for_its_condition() {
         admit_expression(result, &TypeExpr::String),
         Ok(ExpressionAdmission::DeferredInterpolation)
     );
+}
+
+#[test]
+fn issue_4282_deferred_builtin_construction_matches_interpolation_admission() {
+    let sink = TypeExpr::SchemaType {
+        owned: crate::parser::OwnedTypeIdentity::provider(
+            "mock",
+            crate::schema::TypeIdentity::new(Some("mock"), ["test"], "Name"),
+            crate::schema::RefinedScalarKind::String,
+        )
+        .unbounded_witness_for_test(),
+    };
+    for expression in [
+        "join('', [src.name, '-suffix'])",
+        "upper(src.name)",
+        "lower(src.name)",
+        "replace('a', 'b', src.name)",
+        "trim(src.name)",
+        "cidr_subnet(src.name, 4, 1)",
+        "secret(join('', [src.name, '-suffix']))",
+        "split(',', src.name)[0]",
+    ] {
+        let (_, report) = source_schema_report(&format!(
+            "let src = mock.test.Source {{}}\nlet result = {expression}"
+        ));
+        let result = report.binding(&RelativeBindingName::new("result")).unwrap();
+        assert_eq!(result.static_type(), Ok(&TypeExpr::String), "{expression}");
+        assert!(
+            result
+                .for_sink(&sink, &config())
+                .is_single_string_construction(),
+            "{expression}"
+        );
+        assert_eq!(
+            admit_expression(result, &sink),
+            Ok(ExpressionAdmission::DeferredInterpolation),
+            "{expression}",
+        );
+        assert!(
+            admit_expression(result, &TypeExpr::Int).is_err(),
+            "{expression}"
+        );
+    }
+    let (_, report) =
+        source_schema_report("let src = mock.test.Source {}\nlet result = split(',', src.name)");
+    let result = report.binding(&RelativeBindingName::new("result")).unwrap();
+    assert_eq!(
+        admit_expression(result, &TypeExpr::List(Box::new(sink))),
+        Ok(ExpressionAdmission::DeferredInterpolation),
+    );
+    assert!(admit_expression(result, &TypeExpr::List(Box::new(TypeExpr::Int))).is_err());
+}
+
+#[test]
+fn issue_4282_round2_collection_members_never_become_a_single_construction() {
+    let config = config();
+    let strings = TypeExpr::List(Box::new(TypeExpr::String));
+    let ints = TypeExpr::List(Box::new(TypeExpr::Int));
+    for expression in [
+        r#"["${''}A", "${''}B"]"#,
+        r#"["${src.name}-a", "${''}B"]"#,
+        "[join('', [src.name, '-a']), upper('b')]",
+        "split(',', src.name)",
+    ] {
+        let (_, report) = source_schema_report(&format!(
+            "let src = mock.test.Source {{}}\nlet result = {expression}"
+        ));
+        let result = report.binding(&RelativeBindingName::new("result")).unwrap();
+        let judged = result.for_sink(&strings, &config);
+        assert!(!judged.is_single_string_construction(), "{expression}");
+        assert!(judged.has_constructed_members(), "{expression}");
+        assert_eq!(judged.collection_kind(), Some(CollectionKind::List));
+        assert!(
+            result
+                .element(0)
+                .unwrap()
+                .for_sink(&TypeExpr::String, &config)
+                .is_single_string_construction()
+        );
+        if expression.starts_with('[') && expression.contains("src.name") {
+            assert_eq!(
+                admit_expression(result.element(0).unwrap(), &TypeExpr::String),
+                Ok(ExpressionAdmission::DeferredInterpolation)
+            );
+            assert_eq!(
+                admit_expression(result.element(1).unwrap(), &TypeExpr::String),
+                Ok(ExpressionAdmission::ValueCheck)
+            );
+        }
+        if expression.contains("upper(") || expression.starts_with("split(") {
+            assert!(!result.for_sink(&ints, &config).has_constructed_members());
+            // Reading the same evidence at another sink cannot erase it.
+            assert!(result.for_sink(&strings, &config).has_constructed_members());
+        }
+    }
 }
