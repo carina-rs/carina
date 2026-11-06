@@ -1191,6 +1191,122 @@ fn authored_expression_module_string_interpolation_inline_let_agree() {
     }
 }
 
+// #4282: a string built by a builtin must enter a named string field through
+// the same admission and resolved-value checks as mixed interpolation.
+fn assert_module_constructed_string(
+    expression: &str,
+    attribute: &str,
+    expected_rule_error: Option<&str>,
+) {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider test {}\n"),
+        (
+            "main.crn",
+            "let template = use { source = './child' }\nlet child = template { n = 360 }\n",
+        ),
+    ]);
+    std::fs::create_dir(fixture.path().join("child")).unwrap();
+    std::fs::write(
+        fixture.path().join("child/arguments.crn"),
+        "arguments { n: Int }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.path().join("child/main.crn"),
+        format!("test.iam.Role {{ {attribute} = {expression} }}\n"),
+    )
+    .unwrap();
+    let schemas = single_schema_map(
+        ResourceSchema::new("iam.Role")
+            .attribute(
+                AttributeSchema::optional(
+                    "role_name",
+                    AttributeType::refined_string(
+                        Some(carina_core::schema::TypeIdentity::from_schema_type(
+                            "test", "iam.Role", "Name",
+                        )),
+                        Some("^carina-[0-9]+-role$".into()),
+                        Some((Some(1), Some(16))),
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .attribute(AttributeSchema::optional("plain", AttributeType::string()).build()),
+    );
+    // Collect both paths before asserting so a CLI failure also reports LSP.
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "child/main.crn");
+    let lsp_errors = lsp_error_multiset(&lsp);
+    eprintln!("{attribute} = {expression}\nCLI: {cli:#?}\nLSP: {lsp:#?}");
+    match expected_rule_error {
+        None => assert!(
+            cli.is_empty() && lsp_errors.is_empty(),
+            "{attribute} = {expression} must be accepted in CLI and LSP\nCLI: {cli:#?}\nLSP: {lsp:#?}"
+        ),
+        Some(expected) => assert!(
+            !cli.is_empty()
+                && !lsp_errors.is_empty()
+                && cli.iter().all(|message| message.contains(expected))
+                && lsp_errors
+                    .keys()
+                    .all(|diagnostic| diagnostic.message.contains(expected)),
+            "{attribute} = {expression} must fail with {expected:?} in CLI and LSP\nCLI: {cli:#?}\nLSP: {lsp:#?}"
+        ),
+    }
+}
+
+#[test]
+fn issue_4282_module_join_at_named_string_is_accepted() {
+    assert_module_constructed_string("join('', ['carina-', n, '-role'])", "role_name", None);
+}
+
+#[test]
+fn issue_4282_module_interpolation_at_named_string_is_accepted() {
+    assert_module_constructed_string(r#""carina-${n}-role""#, "role_name", None);
+}
+
+#[test]
+fn issue_4282_module_join_reports_named_string_pattern_rule() {
+    assert_module_constructed_string(
+        "join('', ['bad', 'x'])",
+        "role_name",
+        Some("does not match required pattern /^carina-[0-9]+-role$/"),
+    );
+}
+
+#[test]
+fn issue_4282_module_interpolation_reports_named_string_pattern_rule() {
+    assert_module_constructed_string(
+        r#""bad${'x'}""#,
+        "role_name",
+        Some("does not match required pattern /^carina-[0-9]+-role$/"),
+    );
+}
+
+#[test]
+fn issue_4282_module_join_reports_named_string_length_rule() {
+    assert_module_constructed_string(
+        "join('', ['carina-', '360000', '-role'])",
+        "role_name",
+        Some("length 18 is outside allowed range [1, 16]"),
+    );
+}
+
+#[test]
+fn issue_4282_module_interpolation_reports_named_string_length_rule() {
+    assert_module_constructed_string(
+        r#""carina-${'360000'}-role""#,
+        "role_name",
+        Some("length 18 is outside allowed range [1, 16]"),
+    );
+}
+
+#[test]
+fn issue_4282_module_join_at_plain_string_is_accepted() {
+    assert_module_constructed_string("join('', ['carina-', n, '-role'])", "plain", None);
+}
+
 fn engine_with_schemas(schemas: SchemaRegistry) -> DiagnosticEngine {
     let provider_names: Vec<String> = schemas
         .iter()
