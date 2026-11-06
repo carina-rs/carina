@@ -1361,6 +1361,48 @@ mod tests {
         registry
     }
 
+    #[test]
+    fn conflicting_replacement_orders_aliased_deposed_deletes_before_create() {
+        // Historical provider aliases must preserve delete-before-create ordering,
+        // both at the replacement's identity and at the source of a move.
+        let schemas = registry(UniqueNameSpec::Conflicting);
+        let mut unordered_cases = Vec::new();
+        for (case, moved) in [("ordinary", false), ("moved", true)] {
+            let request = fixture(false);
+            let mut old = request.deletes[0].clone();
+            let mut id = old.id.as_inner().clone();
+            id.provider_instance = Some("old-route".into());
+            if moved {
+                id.set_identity("source".into());
+            }
+            old.id = ResolvedResourceId::new(id);
+            old.generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+            let mut plan = crate::plan::Plan::new();
+            plan.add_delete(old);
+            plan.add(Effect::Create(request.target().clone()));
+            if moved {
+                plan.add(Effect::Move {
+                    from: ResolvedResourceId::with_identity("test.Record", "source"),
+                    to: request.target().resolved_id(),
+                    origin: None,
+                });
+            }
+            let admitted = plan
+                .admit_replacement_effects(&schemas)
+                .expect("the aliased deposed replacement plan must be admitted");
+            let graph = admitted
+                .dependency_analysis(std::iter::empty())
+                .expect("the replacement dependency graph must be acyclic");
+            if !graph.deps_of(1).unwrap().contains(&0) {
+                unordered_cases.push(case);
+            }
+        }
+        assert!(
+            unordered_cases.is_empty(),
+            "deposed Delete must precede replacement Create for aliased generations; unordered cases: {unordered_cases:?}"
+        );
+    }
+
     fn deferred_deposed_secret_round_trip(deposed_attribute: &str, nested: bool) {
         let secret = |text| {
             Value::Deferred(crate::resource::DeferredValue::Secret(

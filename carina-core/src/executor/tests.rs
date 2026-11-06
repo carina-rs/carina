@@ -558,7 +558,7 @@ struct MockProvider {
     delete_results: Mutex<Vec<ProviderResult<()>>>,
     update_results: Mutex<Vec<ProviderResult<crate::provider::UpdateOutcome>>>,
     read_results: Mutex<Vec<ProviderResult<State>>>,
-    /// Records calls in order: ("create"|"delete"|"update"|"read", resource_id_string)
+    /// Records calls in order: ("create"|"resend"|"delete"|"update"|"read", resource_id_string)
     call_log: Arc<Mutex<Vec<(String, String)>>>,
     /// Resources passed in to `create()` in call order — lets a test
     /// assert that the executor handed the provider a fully-resolved
@@ -581,6 +581,7 @@ enum ClassifiedCreateFixture {
 
 enum ResumeFixture {
     Resumed,
+    Resent,
     Partial,
     IdentifierReportedFound,
     IdentifierReportedNotFound,
@@ -808,6 +809,23 @@ impl Provider for MockProvider {
         };
         Box::pin(async move {
             match result.expect("unexpected resume_create") {
+                ResumeFixture::Resent => {
+                    let (resume, _) = request.into_parts();
+                    let crate::provider::Resume::Unissued(attempt) = resume else {
+                        panic!("resend fixture requires an identifier-less continuation");
+                    };
+                    self.call_log
+                        .lock()
+                        .unwrap()
+                        .push(("resend".into(), attempt.id().to_string()));
+                    Ok(attempt
+                        .resend()
+                        .issued(
+                            AppliedIdentifier::new("resent-id").unwrap(),
+                            crate::provider::Sent::AllRequestAttributes,
+                        )
+                        .succeeded(HashMap::new()))
+                }
                 ResumeFixture::Resumed => {
                     let (resume, _create_request) = request.into_parts();
                     let crate::provider::Resume::Issued(resumed) = resume else {
@@ -2874,6 +2892,81 @@ async fn resume_resumed_publishes_observed() {
         result.applied_states.get(&dependent_id),
         Some(Applied::Complete { .. })
     ));
+}
+
+#[tokio::test]
+async fn identifierless_conflicting_resume_deletes_old_generation_before_resend() {
+    // Regression for #4303: an identifier-less continuation can resend its Create request.
+    // A Conflicting replacement must delete its old generation before that resend.
+    let provider = MockProvider::new();
+    provider.push_resume(ResumeFixture::Resent);
+    provider.push_delete(Ok(()));
+    let target = resolved(make_resource("source", &[]));
+    let id = target.id.clone();
+    let pending = persisted_unissued_create_for_executor(&id);
+    let mut plan = Plan::new();
+    plan.add_resume_create(target.clone(), pending.started_at().clone());
+    plan.add(Effect::Delete {
+        id: target.resolved_id(),
+        identifier: AppliedIdentifier::new("old-id").unwrap(),
+        generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
+        directives: Default::default(),
+        binding: target.binding.clone(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: [target.resolved_id()].into_iter().collect(),
+    });
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .with_conflicting_replacement()
+            .validate()
+            .unwrap(),
+    );
+    let plan = plan.admit(&schemas).unwrap();
+    let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::from([(id.clone(), Current::CreateInFlight(pending))]),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::noop(),
+    };
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+    assert_eq!(
+        (
+            result.success_count,
+            result.failure_count(),
+            result.skip_count
+        ),
+        (2, 0, 0),
+        "the resend and old-generation delete must both complete"
+    );
+    let calls = provider.calls();
+    assert!(
+        call_position(&calls, "delete", &id.to_string())
+            < call_position(&calls, "resend", &id.to_string()),
+        "a resend-capable Conflicting continuation must delete its old generation first: {calls:?}"
+    );
 }
 
 #[tokio::test]
