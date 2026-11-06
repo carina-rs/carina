@@ -15370,8 +15370,7 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                     .unwrap();
                 let (create, cancellation) = carina_core::executor::dispatch_create(
                     &provider,
-                    carina_core::replacement::create_permit_for_test(&id),
-                    request,
+                    carina_core::replacement::create_permit_for_test(request),
                 );
                 create.await.unwrap();
                 drop(cancellation);

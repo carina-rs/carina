@@ -204,7 +204,7 @@ impl PendingCascadePlan {
             registry,
         } = self;
         complete(&mut plan);
-        add_deferred_create_effects_with_schemas(&mut plan, deferred, &registry);
+        add_deferred_create_effects(&mut plan, deferred);
         prepare_plan_replacements(&mut plan, &registry);
         plan
     }
@@ -1002,31 +1002,9 @@ pub fn create_plan_with_cascades(
 ///
 /// Matching orphan `Delete` effects are absorbed into `DeferredReplace`; targets
 /// with no matching deletes remain plain `DeferredCreate` effects.
-#[cfg(test)]
 fn add_deferred_create_effects(plan: &mut Plan, targets: ResolvedDeferredCreateTargets) {
-    add_deferred_create_effects_with_schemas(plan, targets, &SchemaRegistry::new());
-}
-fn add_deferred_create_effects_with_schemas(
-    plan: &mut Plan,
-    targets: ResolvedDeferredCreateTargets,
-    registry: &SchemaRegistry,
-) {
     let mut deletes_to_absorb: HashSet<ResourceId> = HashSet::new();
     let mut deferred_effects = Vec::new();
-    let effect_requirements = crate::replacement::create_first_requirements(plan.effects());
-    let deferred_dependents: HashMap<_, _> = targets
-        .0
-        .iter()
-        .flat_map(|compiled| {
-            compiled
-                .dependencies
-                .dependencies()
-                .into_iter()
-                .map(|dependency| (dependency, compiled.template.target().display_name()))
-                .collect::<Vec<_>>()
-        })
-        .collect();
-
     for CompiledDeferredCreate {
         template,
         dependencies,
@@ -1073,31 +1051,11 @@ fn add_deferred_create_effects_with_schemas(
             )));
         } else {
             deletes_to_absorb.extend(deletes.iter().map(|delete| delete.id.clone().into_inner()));
-            let mut payload = DeferredReplacePayload::new(
+            let payload = DeferredReplacePayload::new(
                 NonEmptyDeletes::try_new(deletes).expect("planner checked non-empty deletes"),
                 Box::new(template),
                 dependencies,
             );
-            payload.require_create_first_for_dependencies(&effect_requirements);
-            payload.require_create_first_for_dependencies(&deferred_dependents);
-            if let Err(error) = payload.preflight(registry) {
-                let kind = match payload.required_by().or_else(|| {
-                    payload
-                        .required_children()
-                        .first()
-                        .map(|(_, dependent)| dependent.as_str())
-                }) {
-                    Some(dependent) => PlanErrorKind::CreateBeforeDestroyRequiredByDependent {
-                        dependent: dependent.to_string(),
-                        cause: error,
-                    },
-                    None => error.into(),
-                };
-                plan.add_error(PlanError::new(
-                    payload.template.template_resource_id().clone(),
-                    kind,
-                ));
-            }
             deferred_effects.push(Effect::DeferredReplace(Box::new(payload)));
         }
     }

@@ -21,11 +21,12 @@ use crate::schema::{SchemaKind, SchemaRegistry, UniqueNameSpec};
 mod plan_scheduling_tests;
 #[path = "replacement/scheduling.rs"]
 mod scheduling;
+pub use crate::executor::scheduler::CreatePermit;
+pub(crate) use crate::executor::scheduler::ScheduledBasicEffect;
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
-pub use scheduling::create_permit_for_test;
-pub use scheduling::{CreatePermit, ScheduledEffect, ScheduledEffects, ScheduledPlan};
-pub(crate) use scheduling::{ScheduledBasicEffect, ScheduledResume};
+pub use crate::executor::scheduler::create_permit_for_test;
+pub use scheduling::{ScheduledEffect, ScheduledEffects, ScheduledPlan};
 
 /// State rows own all their provider generations. Routing aliases belong to
 /// the generations, not to the row's identity.
@@ -430,24 +431,8 @@ pub(crate) fn create_first_requirements<S, P: PlanValueKind>(
     effects: &[Effect<S, P>],
 ) -> HashMap<ResolvedResourceId, String> {
     let mut requirements = HashMap::new();
-    for (effect, dependencies) in effects.iter().zip(new_dependencies(effects)) {
-        for dependency in dependencies {
-            if dependency.as_inner() != effect.resource_id() {
-                requirements
-                    .entry(dependency)
-                    .or_insert_with(|| effect.resource_id().to_string());
-            }
-        }
-    }
-    requirements
-}
-
-fn new_dependencies<S, P: PlanValueKind>(
-    effects: &[Effect<S, P>],
-) -> Vec<crate::resource::ResolvedDependencies> {
-    effects
-        .iter()
-        .map(|effect| match effect {
+    for effect in effects {
+        let dependencies: crate::resource::ResolvedDependencies = match effect {
             Effect::Create(resource) | Effect::ResumeCreate { resource, .. } => {
                 resource.all_dependencies().cloned().collect()
             }
@@ -461,8 +446,16 @@ fn new_dependencies<S, P: PlanValueKind>(
             | Effect::Remove { .. }
             | Effect::Move { .. }
             | Effect::ReleaseListKeys { .. } => Default::default(),
-        })
-        .collect()
+        };
+        for dependency in dependencies {
+            if dependency.as_inner() != effect.resource_id() {
+                requirements
+                    .entry(dependency)
+                    .or_insert_with(|| effect.resource_id().to_string());
+            }
+        }
+    }
+    requirements
 }
 
 /// Candidate order changes for the current graph. A cycle can have several
@@ -544,6 +537,14 @@ impl ReplacementAdmissionError {
 
 /// Replacement endpoints and their scheduling proof are compiled together.
 /// Execution cannot retain a raw Create while using its prepared target's proof.
+/// A replacement fragment is graph input, not a complete executable plan:
+///
+/// ```compile_fail,E0599
+/// use carina_core::replacement::AdmittedReplacementEffects;
+/// fn draft_fragment_cannot_mint_a_permit(fragment: AdmittedReplacementEffects) {
+///     let _ = fragment.schedule(&Default::default()).effect(0).into_create_permit();
+/// }
+/// ```
 ///
 /// ```compile_fail,E0451
 /// use carina_core::replacement::AdmittedReplacementEffects;
@@ -1011,10 +1012,101 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
         }
     }
 
+    pub(crate) fn deferred_delete_candidates(&self, gate: usize) -> Vec<usize> {
+        self.graph().deferred_delete_candidates(gate)
+    }
+}
+
+impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
+    pub(crate) fn graph(&self) -> EffectGraph<'_, S, P> {
+        EffectGraph::new(&self.effects, &self.scheduling)
+    }
+    pub fn dependency_analysis<'a>(
+        &self,
+        unresolved: impl IntoIterator<Item = &'a ResolvedResourceId>,
+    ) -> Result<
+        crate::effect::deps::DependencyAnalysis,
+        crate::effect::deps::DependencyAnalysisFailure,
+    > {
+        self.graph().dependency_analysis(unresolved)
+    }
+    pub(crate) fn expand_deferred_replacements(self) -> (Self, HashSet<usize>, Vec<usize>) {
+        let mut effects = Vec::with_capacity(self.effects.len());
+        let mut deferred_replace_teardowns = HashSet::new();
+        let mut source_effect_indices = Vec::with_capacity(self.effects.len());
+        let mut remap = vec![None; self.effects.len()];
+        for (source, effect) in self.effects.into_iter().enumerate() {
+            if let Effect::DeferredReplace(payload) = &effect {
+                let first_delete = effects.len();
+                for old in payload.deletes.iter() {
+                    effects.push(old.to_delete_effect());
+                    source_effect_indices.push(source);
+                }
+                let gate = effects.len();
+                deferred_replace_teardowns.extend(first_delete..gate);
+            }
+            remap[source] = Some(effects.len());
+            effects.push(effect);
+            source_effect_indices.push(source);
+        }
+        let mut scheduling = self.scheduling;
+        scheduling.remap(&remap);
+        (
+            Self {
+                effects,
+                scheduling,
+                temporary_names: self.temporary_names,
+                writeback: self.writeback,
+            },
+            deferred_replace_teardowns,
+            source_effect_indices,
+        )
+    }
+}
+
+/// Graph-only projection. Borrowing draft endpoints never creates an execution owner.
+pub(crate) struct EffectGraph<'plan, S, P: PlanValueKind> {
+    effects: &'plan [Effect<S, P>],
+    scheduling: &'plan ReplacementScheduling,
+}
+impl<'plan, S: Clone, P: PlanValueKind> EffectGraph<'plan, S, P> {
+    pub(super) fn new(
+        effects: &'plan [Effect<S, P>],
+        scheduling: &'plan ReplacementScheduling,
+    ) -> Self {
+        Self {
+            effects,
+            scheduling,
+        }
+    }
+    pub(crate) fn effects(&self) -> &[Effect<S, P>] {
+        self.effects
+    }
+    pub(crate) fn dependency_analysis<'a>(
+        &self,
+        unresolved: impl IntoIterator<Item = &'a ResolvedResourceId>,
+    ) -> Result<
+        crate::effect::deps::DependencyAnalysis,
+        crate::effect::deps::DependencyAnalysisFailure,
+    > {
+        crate::effect::deps::build_effect_graph_dependency_analysis(self, unresolved)
+    }
+    pub(crate) fn order_edges(
+        &self,
+        deps: &mut HashMap<usize, HashSet<usize>>,
+    ) -> HashSet<(usize, usize)> {
+        let pairs = self.scheduling.order_edges(self.effects, deps);
+        for gate in 0..self.effects.len() {
+            for delete in self.deferred_delete_candidates(gate) {
+                deps.entry(delete).or_default().insert(gate);
+            }
+        }
+        pairs
+    }
     /// The same candidate set owns both the gate barrier and materialization's
     /// historical inputs. Deletes already owned by a concrete replacement
     /// cannot also belong to an unrelated deferred loop.
-    pub(crate) fn deferred_delete_candidates(&self, gate: usize) -> Vec<usize> {
+    fn deferred_delete_candidates(&self, gate: usize) -> Vec<usize> {
         let (template, absorbed) = match &self.effects[gate] {
             Effect::DeferredCreate(payload) => (payload.template.as_ref(), &[][..]),
             Effect::DeferredReplace(payload) => (payload.template.as_ref(), &payload.deletes[..]),
@@ -1069,62 +1161,6 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                 candidate.then_some(index)
             })
             .collect()
-    }
-}
-
-impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
-    pub fn dependency_analysis<'a>(
-        &self,
-        unresolved: impl IntoIterator<Item = &'a ResolvedResourceId>,
-    ) -> Result<
-        crate::effect::deps::DependencyAnalysis,
-        crate::effect::deps::DependencyAnalysisFailure,
-    > {
-        crate::effect::deps::build_admitted_effect_dependency_analysis(self, unresolved)
-    }
-    pub(crate) fn order_edges(
-        &self,
-        deps: &mut HashMap<usize, HashSet<usize>>,
-    ) -> HashSet<(usize, usize)> {
-        let pairs = self.scheduling.order_edges(&self.effects, deps);
-        for gate in 0..self.effects.len() {
-            for delete in self.deferred_delete_candidates(gate) {
-                deps.entry(delete).or_default().insert(gate);
-            }
-        }
-        pairs
-    }
-    pub(crate) fn expand_deferred_replacements(self) -> (Self, HashSet<usize>, Vec<usize>) {
-        let mut effects = Vec::with_capacity(self.effects.len());
-        let mut deferred_replace_teardowns = HashSet::new();
-        let mut source_effect_indices = Vec::with_capacity(self.effects.len());
-        let mut remap = vec![None; self.effects.len()];
-        for (source, effect) in self.effects.into_iter().enumerate() {
-            if let Effect::DeferredReplace(payload) = &effect {
-                let first_delete = effects.len();
-                for old in payload.deletes.iter() {
-                    effects.push(old.to_delete_effect());
-                    source_effect_indices.push(source);
-                }
-                let gate = effects.len();
-                deferred_replace_teardowns.extend(first_delete..gate);
-            }
-            remap[source] = Some(effects.len());
-            effects.push(effect);
-            source_effect_indices.push(source);
-        }
-        let mut scheduling = self.scheduling;
-        scheduling.remap(&remap);
-        (
-            Self {
-                effects,
-                scheduling,
-                temporary_names: self.temporary_names,
-                writeback: self.writeback,
-            },
-            deferred_replace_teardowns,
-            source_effect_indices,
-        )
     }
 }
 
@@ -2817,7 +2853,7 @@ mod tests {
             let admitted =
                 AdmittedReplacementEffects::resolve(&effects, &schemas, |_| HashMap::new())
                     .expect("resuming an issued create must retain its cleanup barrier")
-                    .schedule(&HashMap::from([(
+                    .specialize_for_test(&HashMap::from([(
                         request.target().id.clone(),
                         persisted_identified_create(request.target()),
                     )]));
@@ -3009,7 +3045,7 @@ mod tests {
                     |_| HashMap::new(),
                 )
                 .unwrap()
-                .schedule(&if resume {
+                .specialize_for_test(&if resume {
                     HashMap::from([(
                         request.target().id.clone(),
                         persisted_identified_create(request.target()),

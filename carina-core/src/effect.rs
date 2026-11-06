@@ -483,15 +483,6 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
         self.preview = None;
         &mut self.request
     }
-    pub(crate) fn require_create_first_for_dependencies(
-        &mut self,
-        requirements: &HashMap<ResolvedResourceId, String>,
-    ) {
-        self.require_create_first_with_lineage(
-            requirements,
-            &crate::replacement::ReplacementLineage::default(),
-        );
-    }
     pub(crate) fn require_create_first_with_lineage(
         &mut self,
         requirements: &HashMap<ResolvedResourceId, String>,
@@ -3315,14 +3306,14 @@ mod tests {
     #[test]
     fn deferred_create_as_basic_returns_none() {
         let effect = deferred_create_effect();
-        let scheduled = crate::replacement::AdmittedReplacementEffects::resolve(
-            &[effect],
-            &crate::schema::SchemaRegistry::new(),
-            |_| Default::default(),
-        )
-        .unwrap()
-        .schedule(&Default::default());
-        assert!(scheduled.effect(0).as_basic().is_none());
+        let mut plan = crate::plan::Plan::new();
+        plan.add(effect);
+        let plan = plan.admit(&crate::schema::SchemaRegistry::new()).unwrap();
+        let scheduled = plan.schedule(&Default::default());
+        assert!(
+            crate::executor::scheduler::release_basic_for_test(&scheduled, 0, &Default::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -3423,10 +3414,10 @@ mod tests {
             unreachable!();
         };
         assert_eq!(payload.display_glyph(), "-/+");
-        payload.require_create_first_for_dependencies(&HashMap::from([(
-            payload.deletes[0].id.clone(),
-            "dependent".to_owned(),
-        )]));
+        payload.require_create_first_with_lineage(
+            &HashMap::from([(payload.deletes[0].id.clone(), "dependent".to_owned())]),
+            &crate::replacement::ReplacementLineage::default(),
+        );
         assert_eq!(payload.display_glyph(), "~");
         let mut schemas = crate::schema::SchemaRegistry::new();
         schemas.insert(
@@ -3976,15 +3967,16 @@ mod tests {
     fn as_basic_narrows_to_create_update_and_delete_only() {
         use crate::resource::State as ResState;
 
-        use crate::replacement::{AdmittedReplacementEffects, ScheduledBasicEffect};
+        use crate::replacement::ScheduledBasicEffect;
         let schedule = |effect| {
-            AdmittedReplacementEffects::resolve(
-                &[effect],
-                &crate::schema::SchemaRegistry::new(),
-                |_| Default::default(),
+            let mut plan = crate::plan::Plan::new();
+            plan.add(effect);
+            let plan = plan.admit(&crate::schema::SchemaRegistry::new()).unwrap();
+            crate::executor::scheduler::release_basic_for_test(
+                &plan.schedule(&Default::default()),
+                0,
+                &Default::default(),
             )
-            .unwrap()
-            .schedule(&Default::default())
         };
         let rid = ResourceId::with_identity("test", "x");
 
@@ -3993,7 +3985,7 @@ mod tests {
             Resource::new("test", "x").into_value_snapshot(),
         ));
         assert!(matches!(
-            schedule(create).effect(0).as_basic(),
+            schedule(create),
             Some(ScheduledBasicEffect::Create { .. })
         ));
 
@@ -4006,7 +3998,7 @@ mod tests {
             changed_attributes: vec![],
         };
         assert!(matches!(
-            schedule(update).effect(0).as_basic(),
+            schedule(update),
             Some(ScheduledBasicEffect::Update { .. })
         ));
 
@@ -4021,7 +4013,7 @@ mod tests {
             blocked_by_updates: Default::default(),
         };
         assert!(matches!(
-            schedule(delete).effect(0).as_basic(),
+            schedule(delete),
             Some(ScheduledBasicEffect::Delete { .. })
         ));
 
@@ -4071,7 +4063,7 @@ mod tests {
             ("Wait", wait),
         ] {
             assert!(
-                schedule(e).effect(0).as_basic().is_none(),
+                schedule(e).is_none(),
                 "{label} must not narrow to ScheduledBasicEffect"
             );
         }

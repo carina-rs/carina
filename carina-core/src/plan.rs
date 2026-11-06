@@ -1782,15 +1782,8 @@ impl std::fmt::Display for PlanSummary {
 }
 
 impl<S: Clone, V: PlanValueKind> Plan<S, V> {
-    pub(crate) fn scheduling_effects(
-        &self,
-    ) -> crate::replacement::AdmittedReplacementEffects<S, V> {
-        crate::replacement::AdmittedReplacementEffects::from_compiled_parts(
-            self.effects.clone(),
-            self.replacements.clone(),
-            Vec::new(),
-            Vec::new(),
-        )
+    pub(crate) fn scheduling_effects(&self) -> crate::replacement::EffectGraph<'_, S, V> {
+        crate::replacement::EffectGraph::new(&self.effects, &self.replacements)
     }
 }
 impl<S: Clone> Plan<S> {

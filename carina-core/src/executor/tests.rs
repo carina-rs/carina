@@ -3119,8 +3119,8 @@ async fn resume_dispatch_validates_resent_sent_against_checked_request() {
             let request = crate::executor::prepare_create_request(resource, &preparation)
                 .await
                 .expect("fixture request passes provider preparation");
-            let permit = crate::replacement::create_permit_for_test(&id);
-            let request = crate::provider::ResumeCreateRequest::new(pending, request, permit)
+            let permit = crate::replacement::create_permit_for_test(request);
+            let request = crate::provider::ResumeCreateRequest::new(pending, permit)
                 .expect("fixture continuation and request share a route");
 
             let failure = crate::executor::dispatch_resume_create(&provider, request)

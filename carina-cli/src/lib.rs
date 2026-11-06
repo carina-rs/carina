@@ -472,8 +472,7 @@ fn dispatch_fixture_create(
             };
             let (create, _cancellation) = carina_core::executor::dispatch_create(
                 &provider,
-                carina_core::replacement::create_permit_for_test(id),
-                request,
+                carina_core::replacement::create_permit_for_test(request),
             );
             block_on_ready(create).expect_err("fixture create returns a classified failure")
         },

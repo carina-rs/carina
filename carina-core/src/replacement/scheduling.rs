@@ -1,207 +1,22 @@
-//! Execution capabilities minted from admitted endpoints, never raw effects.
+//! Read-only scheduling specialized from admitted plans and locked continuations.
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::Arc;
 
-use crate::effect::{DeletedInstanceKey, Effect};
-use crate::provider::{AppliedIdentifier, InFlightCreate};
-use crate::resource::{Current, Directives, ResolvedResource, ResourceId, SnapshotState};
+use crate::effect::Effect;
+use crate::provider::InFlightCreate;
+use crate::resource::{Current, ResourceId};
 
 use super::{AdmittedReplacementEffects, ContinuationOrder};
 
-/// Permission to send a create for one admitted target and generation set.
-/// Only admitted scheduling can construct it; it cannot be deserialized.
-///
-/// The permit exposes the target that dispatch needs; replacement history
-/// belongs to the admitted schedule rather than the dispatch capability.
-///
-/// ```compile_fail,E0599
-/// use carina_core::replacement::CreatePermit;
-/// fn history(permit: &CreatePermit) {
-///     permit.old_instances();
-/// }
-/// ```
-///
-/// ```compile_fail,E0451
-/// use carina_core::replacement::CreatePermit;
-/// let permit = CreatePermit {
-///     target: todo!(),
-/// };
-/// ```
-#[derive(Debug, Clone)]
-pub struct CreatePermit {
-    target: Arc<ResourceId>,
-}
-
-impl CreatePermit {
-    pub fn target(&self) -> &ResourceId {
-        &self.target
-    }
-}
-
-#[cfg(any(test, feature = "test-utils"))]
-#[doc(hidden)]
-pub fn create_permit_for_test(id: &ResourceId) -> CreatePermit {
-    let target = ResolvedResource::from_id(crate::resource::ResolvedResourceId::new(id.clone()));
-    AdmittedReplacementEffects::resolve(
-        &[Effect::Create(target)],
-        &crate::schema::SchemaRegistry::new(),
-        |_| Default::default(),
-    )
-    .unwrap()
-    .schedule(&Default::default())
-    .effect(0)
-    .into_create_permit()
-    .unwrap()
-}
-
-/// A Delete keeps its complete provider route and generation. It cannot be
-/// detached from the admitted schedule and retargeted to another instance.
-#[derive(Debug, Clone)]
-pub(crate) struct DeletePermit {
-    instance: DeletedInstanceKey,
-    identifier: AppliedIdentifier,
-}
-
-impl DeletePermit {
-    pub(crate) fn id(&self) -> &ResourceId {
-        self.instance.id()
-    }
-
-    pub(crate) fn identifier(&self) -> &AppliedIdentifier {
-        &self.identifier
-    }
-
-    pub(crate) fn instance(&self) -> &DeletedInstanceKey {
-        &self.instance
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum ScheduledResume {
-    Resend {
-        pending: Box<InFlightCreate>,
-        permit: CreatePermit,
-    },
-    Poll(Box<InFlightCreate>),
-    Missing,
-}
-
-#[derive(Debug, Clone)]
-enum Permission {
-    Create(CreatePermit),
-    Resume(ScheduledResume),
-    Delete(DeletePermit),
-    Other,
-}
-
-/// An immutable effect paired with its admission capability. Cloning the raw
-/// effect does not retain that capability.
+/// Read-only endpoint metadata. An index never carries dispatch authority.
 #[derive(Debug, Clone)]
 pub struct ScheduledEffect<S = crate::resource::ModuleSource> {
     effect: Effect<S>,
-    permission: Permission,
 }
 
 impl<S> ScheduledEffect<S> {
     pub fn effect(&self) -> &Effect<S> {
         &self.effect
-    }
-
-    pub fn into_create_permit(self) -> Option<CreatePermit> {
-        match self.permission {
-            Permission::Create(permit) => Some(permit),
-            Permission::Resume(_) | Permission::Delete(_) | Permission::Other => None,
-        }
-    }
-
-    pub(crate) fn as_basic(&self) -> Option<ScheduledBasicEffect<'_, S>> {
-        let effect = &self.effect;
-        match (&self.effect, &self.permission) {
-            (Effect::Create(resource), Permission::Create(permit)) => {
-                Some(ScheduledBasicEffect::Create {
-                    effect,
-                    resource,
-                    permit: permit.clone(),
-                })
-            }
-            (Effect::ResumeCreate { resource, .. }, Permission::Resume(resume)) => {
-                Some(ScheduledBasicEffect::ResumeCreate {
-                    effect,
-                    resource,
-                    resume: resume.clone(),
-                })
-            }
-            (
-                Effect::Update {
-                    from,
-                    identifier,
-                    to,
-                    changed_attributes,
-                },
-                Permission::Other,
-            ) => Some(ScheduledBasicEffect::Update {
-                effect,
-                from,
-                identifier,
-                to,
-                changed_attributes,
-            }),
-            (Effect::Delete { directives, .. }, Permission::Delete(permit)) => {
-                Some(ScheduledBasicEffect::Delete {
-                    effect,
-                    directives,
-                    permit: permit.clone(),
-                })
-            }
-            _ => None,
-        }
-    }
-}
-
-/// The basic executor accepts only these capability-bearing endpoints.
-///
-/// Raw effects cannot narrow into a provider-dispatch endpoint.
-///
-/// ```compile_fail,E0599
-/// use carina_core::effect::Effect;
-/// fn narrow(effect: &Effect) {
-///     effect.as_basic();
-/// }
-/// ```
-pub(crate) enum ScheduledBasicEffect<'a, S> {
-    Create {
-        effect: &'a Effect<S>,
-        resource: &'a ResolvedResource<S>,
-        permit: CreatePermit,
-    },
-    ResumeCreate {
-        effect: &'a Effect<S>,
-        resource: &'a ResolvedResource<S>,
-        resume: ScheduledResume,
-    },
-    Update {
-        effect: &'a Effect<S>,
-        from: &'a SnapshotState,
-        identifier: &'a AppliedIdentifier,
-        to: &'a ResolvedResource<S>,
-        changed_attributes: &'a [String],
-    },
-    Delete {
-        effect: &'a Effect<S>,
-        directives: &'a Directives,
-        permit: DeletePermit,
-    },
-}
-
-impl<'a, S> ScheduledBasicEffect<'a, S> {
-    pub(crate) fn as_effect(&self) -> &'a Effect<S> {
-        match self {
-            Self::Create { effect, .. }
-            | Self::ResumeCreate { effect, .. }
-            | Self::Update { effect, .. }
-            | Self::Delete { effect, .. } => effect,
-        }
     }
 }
 
@@ -238,51 +53,30 @@ impl<S: Clone> ScheduledEffects<S> {
     }
 
     pub(crate) fn with_materialized(&self, admitted: AdmittedReplacementEffects<S>) -> Self {
-        admitted.schedule(&self.continuations)
+        admitted.into_scheduled(&self.continuations)
     }
 
     pub fn effect(&self, index: usize) -> ScheduledEffect<S> {
-        let effect = self.admitted.effects[index].clone();
-        let create_permit = || CreatePermit {
-            target: Arc::new(effect.resource_id().clone()),
-        };
-        let permission = match &effect {
-            Effect::Create(_) => Permission::Create(create_permit()),
-            Effect::ResumeCreate { resource, .. } => {
-                let pending = self.continuations.get(&resource.id).cloned();
-                Permission::Resume(match pending {
-                    Some(pending) if pending.id() != &resource.id => ScheduledResume::Missing,
-                    Some(pending) if pending.identifier().is_some() => {
-                        ScheduledResume::Poll(Box::new(pending))
-                    }
-                    Some(pending) => ScheduledResume::Resend {
-                        pending: Box::new(pending),
-                        permit: create_permit(),
-                    },
-                    None => ScheduledResume::Missing,
-                })
-            }
-            Effect::Delete {
-                id,
-                generation,
-                identifier,
-                ..
-            } => Permission::Delete(DeletePermit {
-                instance: DeletedInstanceKey::new(
-                    id.as_inner().clone(),
-                    generation.clone(),
-                    identifier.as_str(),
-                ),
-                identifier: identifier.clone(),
-            }),
-            _ => Permission::Other,
-        };
-        ScheduledEffect { effect, permission }
+        ScheduledEffect {
+            effect: self.admitted.effects[index].clone(),
+        }
+    }
+
+    pub(crate) fn continuation(&self, id: &ResourceId) -> Option<&InFlightCreate> {
+        self.continuations.get(id)
     }
 }
 
 impl<S: Clone> AdmittedReplacementEffects<S> {
-    pub fn schedule(
+    #[cfg(test)]
+    pub(super) fn specialize_for_test(
+        self,
+        continuations: &HashMap<ResourceId, InFlightCreate>,
+    ) -> ScheduledEffects<S> {
+        self.into_scheduled(continuations)
+    }
+
+    fn into_scheduled(
         mut self,
         continuations: &HashMap<ResourceId, InFlightCreate>,
     ) -> ScheduledEffects<S> {
@@ -312,6 +106,14 @@ impl<S: Clone> AdmittedReplacementEffects<S> {
 /// Only [`crate::plan::AdmittedPlan::schedule`] can construct this value.
 /// Consumers obtain plan metadata through [`Self::plan`], so they cannot pair
 /// scheduling decisions with another plan's effects or display metadata.
+/// An indexed schedule view cannot authorize a create before prerequisites:
+///
+/// ```compile_fail,E0599
+/// use carina_core::replacement::ScheduledPlan;
+/// fn create_before_delete_finishes(scheduled: &ScheduledPlan<'_>) {
+///     let _ = scheduled.effect(0).into_create_permit();
+/// }
+/// ```
 ///
 /// The source plan cannot be replaced while keeping the schedule:
 ///
@@ -384,7 +186,7 @@ impl<S: Clone> crate::plan::AdmittedPlan<S> {
             .collect();
         ScheduledPlan {
             plan: self,
-            effects: self.admitted_effects().schedule(&continuations),
+            effects: self.admitted_effects().into_scheduled(&continuations),
         }
     }
 }
@@ -392,8 +194,13 @@ impl<S: Clone> crate::plan::AdmittedPlan<S> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::effect::EffectGeneration;
+    use crate::effect::{DeletedInstanceKey, EffectGeneration};
+    use crate::executor::scheduler::{
+        ScheduledBasicEffect, ScheduledResume, release_basic_for_test,
+    };
+    use crate::provider::AppliedIdentifier;
     use crate::provider::{CreateAttempt, PendingToken, Sent};
+    use crate::resource::ResolvedResource;
     use crate::resource::{DeposedKey, ResolvedResourceId};
     use crate::schema::{PatternResourceSchema, SchemaRegistry};
 
@@ -426,6 +233,14 @@ mod tests {
         }
     }
 
+    fn plan(effects: &[Effect], schemas: &SchemaRegistry) -> crate::plan::AdmittedPlan {
+        let mut plan = crate::plan::Plan::new();
+        for effect in effects {
+            plan.add(effect.clone());
+        }
+        plan.admit(schemas).unwrap()
+    }
+
     #[test]
     fn scheduled_create_binds_all_state_row_lineage_generations_and_delete_routes() {
         let target = id("target", "new-route");
@@ -455,12 +270,19 @@ mod tests {
                 origin: None,
             });
         }
-        let scheduled =
-            AdmittedReplacementEffects::resolve(&effects, &schemas(), |_| Default::default())
-                .unwrap()
-                .schedule(&HashMap::new());
-        let permit = scheduled.effect(0).into_create_permit().unwrap();
-        assert_eq!(permit.target(), target.as_inner());
+        let plan = plan(&effects, &schemas());
+        let scheduled = plan.schedule(&HashMap::new());
+        assert!(
+            release_basic_for_test(&scheduled, 0, &Default::default()).is_none(),
+            "a conflicting create cannot be released before its old generations finish"
+        );
+        let completed = (1..=old.len()).collect();
+        let Some(ScheduledBasicEffect::Create { create, .. }) =
+            release_basic_for_test(&scheduled, 0, &completed)
+        else {
+            panic!("the create must be released after all old generations finish");
+        };
+        assert_eq!(create.target(), target.as_inner());
         let graph = scheduled.dependency_analysis(std::iter::empty()).unwrap();
         assert_eq!(graph.deps_of(0).unwrap(), &(1..=old.len()).collect());
         for (index, (id, generation)) in old.iter().enumerate() {
@@ -470,8 +292,9 @@ mod tests {
                 "old-provider-id",
             );
             assert!(graph.deps_of(0).unwrap().contains(&(index + 1)));
-            let endpoint = scheduled.effect(index + 1);
-            let Some(ScheduledBasicEffect::Delete { permit, .. }) = endpoint.as_basic() else {
+            let Some(ScheduledBasicEffect::Delete { permit, .. }) =
+                release_basic_for_test(&scheduled, index + 1, &Default::default())
+            else {
                 panic!("old generation must have a scheduled Delete capability");
             };
             assert_eq!(permit.instance(), &key);
@@ -516,26 +339,30 @@ mod tests {
                 },
                 old,
             ];
-            let admitted =
-                AdmittedReplacementEffects::resolve(&effects, &schemas(), |_| Default::default())
-                    .unwrap();
-            let scheduled =
-                admitted.schedule(&HashMap::from([(target.as_inner().clone(), pending)]));
+            let admitted = plan(&effects, &schemas());
+            let scheduled = admitted.schedule(&HashMap::from([(
+                target.as_inner().clone(),
+                Current::CreateInFlight(pending),
+            )]));
             let graph = scheduled.dependency_analysis(std::iter::empty()).unwrap();
             assert_eq!(graph.deps_of(1).unwrap().contains(&0), identified);
             assert_eq!(graph.deps_of(0).unwrap().contains(&1), !identified);
-            let endpoint = scheduled.effect(0);
-            match endpoint.as_basic().unwrap() {
+            let completed = if identified {
+                Default::default()
+            } else {
+                std::collections::HashSet::from([1])
+            };
+            match release_basic_for_test(&scheduled, 0, &completed).unwrap() {
                 ScheduledBasicEffect::ResumeCreate {
                     resume: ScheduledResume::Poll(_),
                     ..
                 } => assert!(identified),
                 ScheduledBasicEffect::ResumeCreate {
-                    resume: ScheduledResume::Resend { permit, .. },
+                    resume: ScheduledResume::Resend { create, .. },
                     ..
                 } => {
                     assert!(!identified);
-                    assert_eq!(permit.target(), target.as_inner());
+                    assert_eq!(create.target(), target.as_inner());
                     assert_eq!(
                         graph.deps_of(0).unwrap(),
                         &std::collections::HashSet::from([1])
@@ -548,21 +375,117 @@ mod tests {
                 let unissued = attempt
                     .pending(PendingToken::new("unissued"), Sent::AllRequestAttributes, 1)
                     .persist(Default::default(), Default::default());
-                let rescheduled = scheduled
-                    .admitted
-                    .clone()
-                    .schedule(&HashMap::from([(target.as_inner().clone(), unissued)]));
+                let rescheduled = admitted.schedule(&HashMap::from([(
+                    target.as_inner().clone(),
+                    Current::CreateInFlight(unissued),
+                )]));
                 let graph = rescheduled.dependency_analysis(std::iter::empty()).unwrap();
                 assert!(graph.deps_of(0).unwrap().contains(&1));
                 assert!(!graph.deps_of(1).unwrap().contains(&0));
                 assert!(matches!(
-                    rescheduled.effect(0).as_basic(),
+                    release_basic_for_test(&rescheduled, 0, &std::collections::HashSet::from([1])),
                     Some(ScheduledBasicEffect::ResumeCreate {
                         resume: ScheduledResume::Resend { .. },
                         ..
                     })
                 ));
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn initial_create_release_preserves_prepared_name_and_waits_for_deletes() {
+        use crate::resource::{ConcreteValue, Resource, Value};
+        use crate::schema::{PatternAttributeSchema, PatternAttributeType};
+        for create_first in [false, true] {
+            let string = |value: &str| Value::Concrete(ConcreteValue::String(value.into()));
+            let mut resource =
+                Resource::new("Record", "target").with_attribute("name", string("stable"));
+            resource.directives.create_before_destroy = create_first;
+            let target = ResolvedResource::collect_resolved([resource])
+                .unwrap()
+                .remove(0);
+            let mut schemas = SchemaRegistry::new();
+            let schema = PatternResourceSchema::new("Record").attribute(
+                PatternAttributeSchema::optional("name", PatternAttributeType::string()).build(),
+            );
+            schemas.insert(
+                "",
+                if create_first {
+                    schema.with_unique_name_attribute("name")
+                } else {
+                    schema.with_conflicting_replacement()
+                }
+                .validate()
+                .unwrap(),
+            );
+            let mut draft = crate::plan::Plan::new();
+            draft.add(Effect::Create(target.clone()));
+            draft.add_delete(crate::effect::DeferredReplaceDelete {
+                id: target.resolved_id(),
+                identifier: AppliedIdentifier::new("old-id").unwrap(),
+                generation: EffectGeneration::Current,
+                directives: Default::default(),
+                binding: None,
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
+                previous_attributes: HashMap::from([(
+                    "name".into(),
+                    crate::resource::SnapshotValue::Concrete(ConcreteValue::String(
+                        "stable".into(),
+                    )),
+                )]),
+            });
+            let admitted = draft.admit(&schemas).unwrap();
+            let scheduled = admitted.schedule(&Default::default());
+            let mut configuration = crate::parser::ExpandedInferredFile::default();
+            configuration.resources.push(
+                target
+                    .as_inner()
+                    .clone()
+                    .with_dependency_phase(Default::default()),
+            );
+            let graph =
+                crate::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
+            let bindings = crate::binding_index::ResolvedBindings::default();
+            let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
+            crate::validation::deferred_types::with_session_for_test_async(
+                &crate::parser::LoadedProviderContext::empty_for_test(),
+                async |type_checks| {
+                    let context = crate::executor::ProviderPreparationContext::new(
+                        &bindings,
+                        &gate,
+                        &[],
+                        &crate::provider::NoopNormalizer,
+                        &[],
+                        &schemas,
+                        type_checks,
+                    );
+                    let permit =
+                        crate::executor::prepare_initial_create(&scheduled, &graph, &context)
+                            .await
+                            .unwrap();
+                    if create_first {
+                        let permit =
+                            permit.expect("a checked create-first endpoint is initially ready");
+                        let Effect::Create(prepared) = &scheduled.effects()[0] else {
+                            unreachable!()
+                        };
+                        assert_ne!(prepared.get_attr("name"), target.get_attr("name"));
+                        assert_eq!(
+                            permit.request().resource().as_resource().get_attr("name"),
+                            prepared.get_attr("name")
+                        );
+                    } else {
+                        assert!(
+                            permit.is_none(),
+                            "a conflicting create must wait for Delete completion"
+                        );
+                    }
+                },
+            )
+            .await;
         }
     }
 
@@ -579,15 +502,13 @@ mod tests {
                 EffectGeneration::Deposed(DeposedKey::new_unique()),
             ),
         ];
-        let scheduled =
-            AdmittedReplacementEffects::resolve(&effects, &schemas(), |_| Default::default())
-                .unwrap()
-                .schedule(&HashMap::new());
+        let plan = plan(&effects, &schemas());
+        let scheduled = plan.schedule(&HashMap::new());
         let graph = scheduled.dependency_analysis(std::iter::empty()).unwrap();
         assert!(graph.deps_of(1).unwrap().contains(&0));
         assert!(!graph.deps_of(0).unwrap().contains(&1));
         assert!(matches!(
-            scheduled.effect(0).as_basic(),
+            release_basic_for_test(&scheduled, 0, &Default::default()),
             Some(ScheduledBasicEffect::ResumeCreate {
                 resume: ScheduledResume::Missing,
                 ..

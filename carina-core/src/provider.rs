@@ -4690,7 +4690,7 @@ impl ResumeCreateRequest {
     /// A send-capable continuation needs the same admission permission as a
     /// fresh create; a persisted token alone grants no resend authority.
     ///
-    /// ```compile_fail,E0061
+    /// ```compile_fail,E0308
     /// use carina_core::provider::{CreateRequest, InFlightCreate, Resume, ResumeCreateRequest};
     /// fn bypass(pending: InFlightCreate, request: CreateRequest) {
     ///     let (resume, _) = ResumeCreateRequest::new(pending, request).unwrap().into_parts();
@@ -4701,19 +4701,13 @@ impl ResumeCreateRequest {
     /// ```
     pub fn new(
         pending: InFlightCreate,
-        request: CreateRequest,
         permit: crate::replacement::CreatePermit,
     ) -> Result<Self, ResumeRoutingMismatch> {
+        let request = permit.request().clone();
         let desired = request.resource().id.clone();
         if pending.id != desired {
             return Err(ResumeRoutingMismatch {
                 persisted: Box::new(pending.id),
-                desired: Box::new(desired),
-            });
-        }
-        if permit.target() != &desired {
-            return Err(ResumeRoutingMismatch {
-                persisted: Box::new(permit.target().clone()),
                 desired: Box::new(desired),
             });
         }
@@ -4731,8 +4725,8 @@ impl ResumeCreateRequest {
         pending: InFlightCreate,
         request: CreateRequest,
     ) -> Result<Self, ResumeRoutingMismatch> {
-        let permit = crate::replacement::create_permit_for_test(&request.resource().id);
-        Self::new(pending, request, permit)
+        let permit = crate::replacement::create_permit_for_test(request);
+        Self::new(pending, permit)
     }
 
     pub fn id(&self) -> &ResourceId {
@@ -11430,33 +11424,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_dispatch_rejects_a_permit_for_another_target() {
-        let provider = MockProvider;
-        let request = CreateRequest::checked(resolved_for_test(Resource::new("test", "desired")));
-        let other_id = ResourceId::with_identity("test", "other");
-        let permit = crate::replacement::create_permit_for_test(&other_id);
-        let (create, _cancellation) = crate::executor::dispatch_create(&provider, permit, request);
-        let failure = create
-            .await
-            .expect_err("another target's permission cannot send this create");
-        let CreateFailureKind::NoResource(error) = failure.into_kind() else {
-            panic!("rejected admission must not report an issued create");
-        };
-        assert_eq!(
-            error.detail().context(),
-            "create request does not match its admitted target"
-        );
-    }
-
-    #[tokio::test]
     async fn mock_provider_create_returns_existing() {
         let provider = MockProvider;
         let resource = Resource::new("test", "example");
-        let id = resource.id.clone();
         let (create, _cancellation) = crate::executor::dispatch_create(
             &provider,
-            crate::replacement::create_permit_for_test(&id),
-            CreateRequest::checked(resolved_for_test(resource)),
+            crate::replacement::create_permit_for_test(CreateRequest::checked(resolved_for_test(
+                resource,
+            ))),
         );
         let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
@@ -11524,11 +11499,11 @@ mod tests {
         router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let resource = Resource::with_provider("mock", "test", "example", None);
-        let id = resource.id.clone();
         let (create, _cancellation) = crate::executor::dispatch_create(
             &router,
-            crate::replacement::create_permit_for_test(&id),
-            CreateRequest::checked(resolved_for_test(resource)),
+            crate::replacement::create_permit_for_test(CreateRequest::checked(resolved_for_test(
+                resource,
+            ))),
         );
         let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);

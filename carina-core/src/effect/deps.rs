@@ -616,8 +616,8 @@ where
     )
 }
 
-pub(crate) fn build_admitted_effect_dependency_analysis<'a, S: Clone, P: PlanValueKind>(
-    admitted: &crate::replacement::AdmittedReplacementEffects<S, P>,
+pub(crate) fn build_effect_graph_dependency_analysis<'a, S: Clone, P: PlanValueKind>(
+    admitted: &crate::replacement::EffectGraph<'_, S, P>,
     unresolved_resource_ids: impl IntoIterator<Item = &'a ResolvedResourceId>,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
     let mut edges = HashMap::new();

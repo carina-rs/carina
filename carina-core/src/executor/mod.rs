@@ -26,6 +26,7 @@ pub(crate) mod wait;
 
 pub use deferred_dispatch::{AnonymousIdentityCollisionSource, DeferredCreateFailure};
 pub use parallel::classify_stalled_effects;
+pub use scheduler::prepare_initial_create;
 pub use wait::StartMarker;
 
 pub use crate::data_source_value::UnresolvedDataSourceInput;
@@ -147,26 +148,33 @@ pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 /// core. The supervising caller must retain the receiver until the returned
 /// future settles. Executor-owned abandonment paths drain it before saving
 /// the cancellation classification.
+/// A caller cannot replace the admitted request, even at the same identity:
+///
+/// ```compile_fail,E0061
+/// use carina_core::{executor::dispatch_create, provider::{CreateRequest, Provider}, replacement::CreatePermit};
+/// fn create_dispatch_rejects_a_permit_for_another_target(provider: &dyn Provider, permit: CreatePermit, other: CreateRequest) {
+///     let _ = dispatch_create(provider, permit, other);
+/// }
+/// ```
 ///
 /// Raw resource IDs cannot authorize a create, including a replacement:
 ///
 /// ```compile_fail,E0308
-/// use carina_core::{executor::dispatch_create, provider::{CreateRequest, Provider}, resource::ResourceId};
-/// fn bypass(provider: &dyn Provider, target: &ResourceId, request: CreateRequest) {
-///     let _ = dispatch_create(provider, target, request);
+/// use carina_core::{executor::dispatch_create, provider::Provider, resource::ResourceId};
+/// fn bypass(provider: &dyn Provider, target: &ResourceId) {
+///     let _ = dispatch_create(provider, target);
 /// }
 /// ```
 pub fn dispatch_create<'a, P: Provider + ?Sized>(
     provider: &'a P,
     permit: crate::replacement::CreatePermit,
-    request: CreateRequest,
 ) -> (
     impl std::future::Future<Output = Result<CreateOutcome, CreateFailure>> + 'a,
     crate::provider::CreateCallCancellationReceiver,
 ) {
     let (attempt, cancellation) = crate::provider::CreateAttempt::new(permit.target().clone());
     (
-        dispatch_create_with_attempt(provider, permit, request, attempt),
+        dispatch_create_with_attempt(provider, permit, attempt),
         cancellation,
     )
 }
@@ -174,16 +182,10 @@ pub fn dispatch_create<'a, P: Provider + ?Sized>(
 async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
     provider: &P,
     permit: crate::replacement::CreatePermit,
-    request: CreateRequest,
     attempt: crate::provider::CreateAttempt,
 ) -> Result<CreateOutcome, CreateFailure> {
-    let id = permit.target();
-    if &request.resource().id != id {
-        return Err(CreateFailure::not_created_at_dispatch(
-            ProviderError::internal("create request does not match its admitted target")
-                .for_resource(id.clone()),
-        ));
-    }
+    let request = permit.into_request();
+    let id = request.resource().id.clone();
     let request_attributes: BTreeSet<_> = request
         .resource()
         .as_resource()
@@ -191,7 +193,7 @@ async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
         .keys()
         .cloned()
         .collect();
-    match provider.create(id, request, attempt).await {
+    match provider.create(&id, request, attempt).await {
         Ok(outcome) => Ok(outcome),
         Err(failure) => match failure.into_kind() {
             CreateFailureKind::OutcomeUnknown { unknown, error } => {

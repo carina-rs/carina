@@ -561,32 +561,42 @@ pub(super) async fn execute_effects_sequential<
             dispatched.insert(idx);
             let effect = effects[idx].clone();
 
-            let failure_view = FailureView::new(effects, &deps_of, &failed_indices);
-            if let Some(failed_dep) = failure_view.find_failed_dependency(idx) {
-                let c = if effect.is_scheduler_meta() {
-                    completed.load(Ordering::Relaxed)
-                } else {
-                    completed.fetch_add(1, Ordering::Relaxed) + 1
-                };
-                let reason = if effect.is_wait() {
-                    wait_dependency_failed_reason(&failed_dep)
-                } else {
-                    dependency_failed_reason(&failed_dep)
-                };
-                observer.on_event(&ExecutionEvent::EffectSkipped {
-                    effect: &effect,
-                    reason: &reason,
-                    progress: ProgressInfo {
-                        completed: c,
-                        total,
-                    },
-                });
-                accumulated.mutate(|result| result.skip_count += 1);
-                failed_indices.insert(idx);
-                completed_indices.insert(idx);
-                completed_synchronous_dispatch = true;
-                continue;
-            }
+            let released = super::scheduler::release_ready_effect(
+                &admitted,
+                idx,
+                &deps_of,
+                &completed_indices,
+                &failed_indices,
+            )
+            .expect("newly ready endpoints have completed prerequisites");
+            let ready = match released {
+                Ok(ready) => ready,
+                Err(failed_dep) => {
+                    let c = if effect.is_scheduler_meta() {
+                        completed.load(Ordering::Relaxed)
+                    } else {
+                        completed.fetch_add(1, Ordering::Relaxed) + 1
+                    };
+                    let reason = if effect.is_wait() {
+                        wait_dependency_failed_reason(&failed_dep)
+                    } else {
+                        dependency_failed_reason(&failed_dep)
+                    };
+                    observer.on_event(&ExecutionEvent::EffectSkipped {
+                        effect: &effect,
+                        reason: &reason,
+                        progress: ProgressInfo {
+                            completed: c,
+                            total,
+                        },
+                    });
+                    accumulated.mutate(|result| result.skip_count += 1);
+                    failed_indices.insert(idx);
+                    completed_indices.insert(idx);
+                    completed_synchronous_dispatch = true;
+                    continue;
+                }
+            };
 
             let ordinary_old = admitted
                 .deferred_delete_candidates(idx)
@@ -746,7 +756,6 @@ pub(super) async fn execute_effects_sequential<
             let provider_configs = input.provider_configs;
             let factories = input.factories;
             let schemas = input.schemas;
-            let scheduled_effect = admitted.effect(idx);
             let completed_ref = &completed;
             let effect_for_future = effect.clone();
             let make_future = move |wait_cancel_rx: Option<
@@ -762,9 +771,8 @@ pub(super) async fn execute_effects_sequential<
                     schemas,
                     type_checks,
                 );
-                let result = match scheduled_effect.as_basic() {
-                    // Only the admitted schedule can supply the create,
-                    // resend, poll-only and Delete execution capabilities.
+                let result = match ready.into_basic() {
+                    // Only dependency-ready release supplies these operations.
                     Some(basic) => SingleEffectResult::Basic(Box::new(
                         execute_basic_effect(
                             basic,
@@ -787,10 +795,7 @@ pub(super) async fn execute_effects_sequential<
                         | Effect::ResumeCreate { .. }
                         | Effect::Update { .. }
                         | Effect::Delete { .. } => {
-                            // `as_basic()` returns `Some` for exactly these
-                            // three variants; they're handled by the `Some`
-                            // arm above.
-                            unreachable!("Create/Update/Delete are narrowed by as_basic()")
+                            unreachable!("basic operations were narrowed by ready release")
                         }
                         Effect::Read { resource } => {
                             let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;

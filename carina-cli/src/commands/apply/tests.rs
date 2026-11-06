@@ -12215,3 +12215,69 @@ fn saved_plan_reloaded_resolved_data_source_retains_folded_module_dependency() {
 
 #[path = "tests/issue_4283.rs"]
 pub(super) mod issue_4283;
+
+#[tokio::test]
+async fn bootstrap_unresolved_reference_returns_typed_preparation_error() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::Success,
+    };
+    let string = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let settings: Resource = Resource::with_provider("aws", "Settings", "settings", None)
+        .with_absolute_binding(absolute_binding("settings"))
+        .with_attribute("versioning", string("enabled"));
+    let bucket: Resource = Resource::with_provider("aws", "s3.Bucket", "state", None)
+        .with_attribute("bucket", string("state-bucket"))
+        .with_attribute(
+            "versioning",
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: carina_core::resource::AccessPath::new("settings", "versioning")
+                    .resolve_root_for_test(),
+            }),
+        );
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+    parsed.resources = vec![settings, bucket.clone()];
+    let mut schemas = SchemaRegistry::new();
+    for kind in ["Settings", "s3.Bucket"] {
+        schemas.insert(
+            "aws",
+            PatternResourceSchema::new(kind)
+                .attribute(
+                    PatternAttributeSchema::optional("bucket", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional("versioning", PatternAttributeType::string())
+                        .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+    }
+    let provider_configs = empty_resolved_provider_configs();
+    let (_temp, backend) = bootstrap_test_backend();
+    let error = create_checked_bootstrap_resource_for_test(
+        crate::output_style::ColorMode::Plain,
+        &provider,
+        bucket,
+        BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            backend: backend.as_ref(),
+            parsed: &parsed,
+            provider_configs: &provider_configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
+    )
+    .await
+    .expect_err("bootstrap retains its typed unresolved-reference rejection");
+    let AppError::StateBucketPreparation(preparation) = error else {
+        panic!("bootstrap must retain its typed preparation error: {error:?}");
+    };
+    assert!(matches!(
+        preparation.preparation_error(),
+        carina_core::executor::ProviderPreparationError::Serialization(_)
+    ));
+    assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
+}

@@ -431,6 +431,16 @@ fn rewrite_handle_output_refs<P: PlaceholderKind>(
 }
 
 impl ExpandedBindingIndex {
+    /// Declared inputs outside a subset plan remain known graph targets. This
+    /// catalog never removes edges to endpoints present in that plan.
+    pub(crate) fn scheduler_target_ids(&self) -> impl Iterator<Item = &ResolvedResourceId> {
+        self.targets
+            .bindings
+            .values()
+            .chain(self.targets.identities.values().flatten())
+            .map(ExpandedTarget::id)
+    }
+
     fn managed_target(
         &self,
         reference: &AbsoluteBindingAddress,
