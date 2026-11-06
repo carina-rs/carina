@@ -1718,21 +1718,19 @@ fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
             deterministic_value_string(access.base()),
             access.step().to_plaintext_dot_string()
         ),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut material = String::new();
-            inner.visit(|value| {
-                if secret_has_reference_expression(value) {
-                    material.push_str("FunctionCall(secret(");
-                    material.push_str(&deterministic_value_string(value));
-                    material.push_str("))");
+        Value::Deferred(DeferredValue::Secret(inner)) => inner
+            .try_project_plaintext(|value| {
+                let material = if secret_has_reference_expression(value) {
+                    format!(
+                        "FunctionCall(secret({}))",
+                        deterministic_value_string(value)
+                    )
                 } else {
-                    material.push_str("Secret(");
-                    material.push_str(&deterministic_value_string(value));
-                    material.push(')');
-                }
-            });
-            material
-        }
+                    format!("Secret({})", deterministic_value_string(value))
+                };
+                Ok::<_, std::convert::Infallible>(material)
+            })
+            .unwrap(),
 
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             use crate::resource::ApplyTimeUnknown;

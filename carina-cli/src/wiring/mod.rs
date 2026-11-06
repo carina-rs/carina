@@ -4151,15 +4151,11 @@ fn resolved_constraint_context(
         if !schema.attributes().contains_key(attribute) {
             continue;
         }
-        value.visit_resource_refs_with_scope(&mut |path, _usage, scope| {
+        value.visit_resource_refs_for_diagnostics(&mut |reference, _usage| {
             origins_by_attribute
                 .entry(attribute.clone())
                 .or_default()
-                .insert(
-                    scope
-                        .path(carina_core::resource::ReferencePath::Access(path.clone()))
-                        .to_dot_string(),
-                );
+                .insert(reference.diagnostic_path().to_dot_string());
         });
     }
 
@@ -10330,9 +10326,11 @@ fn deferred_data_source_inputs<S, D>(
     let inputs = unresolved_data_source_inputs(resource);
     let reference_requires_defer = inputs.iter().any(|input| {
         input.any_binding_matches(|binding| {
-            managed_by_binding.get(binding).is_some_and(|target| {
-                managed_resource_is_missing_from_state(target, managed_current)
-            })
+            binding
+                .lookup_borrowed(managed_by_binding)
+                .is_some_and(|target| {
+                    managed_resource_is_missing_from_state(target, managed_current)
+                })
         }) || input.has_unknowns()
     });
     (reference_requires_defer || recorded_dependency_requires_defer).then_some(inputs)
@@ -10389,8 +10387,8 @@ fn propagate_deferred_data_source_chains<S>(
             let refs = refs_by_id.get(&resource.id).cloned().unwrap_or_default();
             let reference_depends_on_deferred_read = refs.iter().any(|input| {
                 input.any_binding_matches(|binding| {
-                    data_source_id_by_binding
-                        .get(binding)
+                    binding
+                        .lookup_borrowed(&data_source_id_by_binding)
                         .is_some_and(|id| deferred.contains_key(*id))
                 })
             });

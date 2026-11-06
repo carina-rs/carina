@@ -567,9 +567,10 @@ fn unresolved_binding_message(
     let partial = match bindings.completeness(&referenced_binding) {
         Some(BindingCompleteness::PartialReadBack(partial)) => {
             let mut references_missing_attribute = false;
-            referenced_value.visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
-                references_missing_attribute |= path.binding() == referenced_binding
-                    && partial.attribute_is_missing(path.attribute());
+            referenced_value.visit_resource_refs(&mut |path, _usage| {
+                references_missing_attribute |=
+                    path.binding_key().matches_name(&referenced_binding)
+                        && partial.attribute_key_is_missing(&path.attribute_key());
             });
             references_missing_attribute.then_some(partial)
         }
@@ -620,7 +621,7 @@ fn collect_unresolved_bindings<'a>(
             scope.path(ReferencePath::Binding(binding.clone())),
         )),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit_reference_inventory(|value, scope| {
+            inner.visit_plaintext_reference_inventory(|value, scope| {
                 collect_unresolved_bindings(value, scope, out)
             })
         }

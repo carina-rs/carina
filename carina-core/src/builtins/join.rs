@@ -89,7 +89,7 @@ fn join_scalar<B: BindingAddress>(
             Ok((crate::value::render_duration(*value).into(), false))
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            let (text, _) = inner.try_inspect(join_scalar)?;
+            let (text, _) = inner.try_project_plaintext(join_scalar)?;
             Ok((text, true))
         }
         other => Err(format!(

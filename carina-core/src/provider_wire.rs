@@ -280,7 +280,9 @@ impl<T: ProviderWirePayload> fmt::Debug for WireReady<T> {
 // Every recursive secret conversion protects errors at its own payload boundary.
 fn project_plaintext(value: &Value) -> Result<protocol::Value, ProtocolConvertError> {
     match value {
-        Value::Deferred(DeferredValue::Secret(payload)) => payload.try_inspect(project_plaintext),
+        Value::Deferred(DeferredValue::Secret(payload)) => {
+            payload.try_project_plaintext(project_plaintext)
+        }
         Value::Concrete(ConcreteValue::List(values)) => values
             .iter()
             .enumerate()

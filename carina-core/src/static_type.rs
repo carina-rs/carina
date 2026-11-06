@@ -146,6 +146,10 @@ pub enum NotInferableReason {
 pub enum InferenceError {
     #[error("{}", crate::resource::INSIDE_SECRET_MESSAGE)]
     InsideSecret {},
+    #[error("Type mismatch: {types} (from {})", crate::schema::SECRET_VALUE_MASK)]
+    SecretAssignmentMismatch {
+        types: crate::schema::MismatchTypeNames,
+    },
     #[error(transparent)]
     MissingEvidence(#[from] crate::parser::retained::MissingEvidence),
     #[error("{reason}", reason = crate::provider_text::ProviderText::new(reason))]
@@ -183,6 +187,7 @@ impl crate::resource::InsideSecret for InferenceError {
     fn inside_secret(self) -> Self {
         match self {
             error @ (Self::InsideSecret {}
+            | Self::SecretAssignmentMismatch { .. }
             | Self::HeterogeneousCollection { .. }
             | Self::IncompatibleCoalesceTypes { .. }
             | Self::InvalidIntegerArithmeticOperand { .. }) => error,

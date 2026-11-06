@@ -1589,22 +1589,13 @@ fn resolve_directive_dependencies(
         })
     })?;
     let mut origins = Vec::new();
-    for (path, scope) in dependencies.reference_origins() {
-        let value = resolve_plain_module_value(
-            &Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
-            resolver,
-        )
-        .map_err(|error| scope.protect_error(error))?;
-        value.visit_resource_refs_with_scope(&mut |path, _usage, inner_scope| {
-            origins.push((
-                path.clone(),
-                if scope.is_secret() {
-                    scope
-                } else {
-                    inner_scope
-                },
-            ));
-        });
+    for origin in dependencies.reference_origins() {
+        origins.extend(origin.resolve(|path| {
+            resolve_plain_module_value(
+                &Value::Deferred(DeferredValue::ResourceRef { path: path.clone() }),
+                resolver,
+            )
+        })?);
     }
     resolved.set_reference_origins(origins);
     let mut binding_origins = Vec::new();
@@ -2873,6 +2864,9 @@ enum ExpandedIfDependency {
     Runtime,
 }
 
+impl crate::resource::SealedSecretReadResult for ExpandedIfDependency {}
+impl crate::resource::SecretReadResult for ExpandedIfDependency {}
+
 impl ExpandedIfDependency {
     fn combine(self, other: Self) -> Self {
         match (self, other) {
@@ -2938,11 +2932,7 @@ fn expanded_if_dependency(value: &ModuleResolvedValue) -> ExpandedIfDependency {
                 InterpolationPart::Expr(value) => dependency.combine(expanded_if_dependency(value)),
             },
         ),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut dependency = ExpandedIfDependency::Static;
-            inner.visit(|value| dependency = expanded_if_dependency(value));
-            dependency
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(expanded_if_dependency),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             expanded_if_dependency(value).combine(expanded_if_dependency(default))
         }

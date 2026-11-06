@@ -881,9 +881,9 @@ fn serialize_secret_payload<P: crate::resource::StateValueLeaf>(
     encoding: JsonEncoding,
 ) -> Result<serde_json::Value, SerializationError> {
     if persist_secrets {
-        secret.try_inspect(|value| persist_secret_json(value, previous))
+        secret.try_project_plaintext(|value| persist_secret_json(value, previous))
     } else {
-        secret.try_inspect(|value| value_to_json_inner(value, None, false, encoding))
+        secret.try_project_plaintext(|value| value_to_json_inner(value, None, false, encoding))
     }
 }
 
@@ -897,12 +897,8 @@ pub(crate) fn persist_secret_json<P: crate::resource::StateValueLeaf>(
 ) -> Result<serde_json::Value, SerializationError> {
     let previous = previous.and_then(PersistedView::redacted_secret_hash);
     crate::resource::SecretPayload::from(Box::new(crate::resource::state_value_snapshot(plaintext)))
-        .try_inspect(|value| {
-            Ok(persisted_secret_json(&hash_secret_value(
-                &value.to_value_at("secret")?,
-                previous.as_ref(),
-            )?))
-        })
+        .try_inspect(|value| hash_secret_value(&value.to_value_at("secret")?, previous.as_ref()))
+        .map(|hash| persisted_secret_json(&hash))
 }
 
 fn hash_secret_value<P: PlaceholderKind>(
@@ -2484,12 +2480,9 @@ fn redact_snapshot_secrets<P: PlaceholderKind>(
     value: &SnapshotValue<P>,
 ) -> Result<SnapshotValue<P>, SerializationError> {
     match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => inner.try_inspect(|value| {
-            Ok(SnapshotValue::redacted(hash_secret_value(
-                &value.to_value_at("secret")?,
-                None,
-            )?))
-        }),
+        Value::Deferred(DeferredValue::Secret(inner)) => inner
+            .try_inspect(|value| hash_secret_value(&value.to_value_at("secret")?, None))
+            .map(SnapshotValue::redacted),
         Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { .. })) => {
             Ok(value.clone())
         }
@@ -2760,7 +2753,7 @@ fn canonical_secret_template<P: PlaceholderKind>(
             tagged("access", JsonValue::Object(encoded))
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.try_inspect(canonical_secret_template)?
+            inner.try_project_plaintext(canonical_secret_template)?
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => tagged(
             "unknown",
@@ -3176,7 +3169,9 @@ fn redact_snapshot_with_guide(
             return redact_with_guide(value, guide);
         }
         return crate::resource::SecretPayload::from(Box::new(source.clone()))
-            .try_inspect(|source| redact_with_guide(&source.to_value_at("state")?, guide));
+            .try_project_plaintext(|source| {
+                redact_with_guide(&source.to_value_at("state")?, guide)
+            });
     }
     match source {
         Value::Concrete(ConcreteValue::Map(values)) => {
@@ -3497,6 +3492,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                 value,
                 SecretRehydrationInput::EvaluatedHashMaterial,
             )
+            .map(|_| ())
         })?;
         return Ok(candidate.clone());
     }
@@ -3513,6 +3509,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                         value,
                         SecretRehydrationInput::EvaluatedHashMaterial,
                     )
+                    .map(|_| ())
                 })?;
                 return Ok(candidate.clone());
             }
@@ -6523,7 +6520,7 @@ fn first_enum_identifier_inner<H: ValueKind, B: BindingAddress>(
             .values()
             .find_map(|value| first_enum_identifier_inner(value, scope)),
         Value::Deferred(DeferredValue::Secret(inner)) => inner
-            .try_inspect(|value| {
+            .try_project_plaintext(|value| {
                 first_enum_identifier_inner(value, DiagnosticScope::Secret).ok_or(())
             })
             .ok(),

@@ -18,8 +18,12 @@ fn secret_origin_4275_directory_diagnostics_are_redacted() {
         analyze_with_buffer(&engine, dir.path(), "main.crn", secret_origin_fixture::MAIN);
     let mismatch = diagnostics
         .iter()
-        .find(|d| d.message.contains("expected Int") && d.message.contains("String"))
-        .expect("the mismatch must survive redaction");
+        .find(|d| d.message.contains("expected Int"))
+        .unwrap_or_else(|| panic!("the mismatch must survive redaction: {diagnostics:?}"));
+    assert_eq!(
+        mismatch.message,
+        "Type mismatch: expected Int, got String (from (secret))"
+    );
     assert_eq!(mismatch.range.start.line, 0);
     assert!(
         !serde_json::to_string(&diagnostics)

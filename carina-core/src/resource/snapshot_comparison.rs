@@ -893,7 +893,15 @@ pub(super) fn pairing_hashes<R: ReferenceEquality>(
             // hashes cover plaintext (including schema normalizations); the
             // fixed tag deliberately admits every state-secret spelling for
             // exact verification by `similarity_score`.
-            inner.visit(|value| hashes.extend(pairing_hashes(value, attr_type, defs, context)));
+            hashes.extend(
+                inner
+                    .try_project_plaintext(|value| {
+                        Ok::<_, std::convert::Infallible>(pairing_hashes(
+                            value, attr_type, defs, context,
+                        ))
+                    })
+                    .unwrap(),
+            );
             hashes.push(secret_state_pairing_hash());
         }
         // Arithmetic has its own canonical hash above. A nested Secret is

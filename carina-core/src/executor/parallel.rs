@@ -1495,15 +1495,21 @@ mod tests {
         let mut value_dependencies = crate::resource::ResolvedDependencies::default();
         let mut reads = crate::resource::ResolvedDependencyReads::default();
         for value in resource.attributes.values() {
-            value.visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
-                let id = fixture_id(path.binding());
-                value_dependencies.insert(id.clone());
-                reads.insert_known(id, path.attribute());
+            value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                let _: Result<(), std::convert::Infallible> = reference.check(|path| {
+                    let id = fixture_id(path.binding());
+                    value_dependencies.insert(id.clone());
+                    reads.insert_known(id, path.attribute());
+                    Ok(())
+                });
             });
-            value.visit_binding_refs(&mut |binding, _| {
-                let id = fixture_id(binding.as_str());
-                value_dependencies.insert(id.clone());
-                reads.insert_unknown(id);
+            value.visit_binding_refs_for_diagnostics(&mut |reference| {
+                let _: Result<(), std::convert::Infallible> = reference.check(|binding| {
+                    let id = fixture_id(binding.as_str());
+                    value_dependencies.insert(id.clone());
+                    reads.insert_unknown(id);
+                    Ok(())
+                });
             });
         }
         for binding in &resource.dependencies.value_bindings {

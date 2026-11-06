@@ -65,8 +65,14 @@ fn secret_origin_4275_cli_directory_diagnostics_are_redacted() {
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("\n");
+    let mismatch = diagnostics
+        .errors
+        .iter()
+        .map(ToString::to_string)
+        .find(|message| message.contains("expected Int"))
+        .unwrap_or_else(|| panic!("the mismatch must survive redaction: {messages}"));
     assert!(
-        messages.contains("expected Int") && messages.contains("String"),
+        mismatch.ends_with("Type mismatch: expected Int, got String (from (secret))"),
         "{messages}"
     );
     assert!(messages.contains("main.crn"), "{messages}");

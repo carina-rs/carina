@@ -601,7 +601,7 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
 ) -> TypeExprValueCheck<'s> {
     use TypeExprValueCheck::{Assignable, Mismatch};
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        let checked = inner.try_inspect(|value| {
+        let checked = inner.try_project_plaintext(|value| {
             match check_type_expr_value_inner_with_mode(
                 expected,
                 value,

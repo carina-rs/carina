@@ -5817,7 +5817,7 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
     }
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
         let inner = inner
-            .try_inspect(|value| {
+            .try_project_plaintext(|value| {
                 inspect_value_structure_on_path(
                     attr,
                     value,
@@ -11853,9 +11853,12 @@ fn project_write_only_leaves<'schema, R: PatternForm, P: crate::resource::ValueK
     leaves: &mut Vec<(LeafPath, Value<P>, &'schema PatternAttributeType<R>)>,
 ) {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        inner.visit(|value| {
-            project_write_only_leaves(attr_type, value, defs, path, ref_chain, true, leaves)
-        });
+        inner
+            .try_project_plaintext(|value| {
+                project_write_only_leaves(attr_type, value, defs, path, ref_chain, true, leaves);
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .unwrap();
         return;
     }
 

@@ -2644,7 +2644,7 @@ pub fn resolve_import_identifier(
         Value::Concrete(ConcreteValue::String(s)) => Ok(s.expose_plaintext()),
         Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Ok(s.as_str()),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.try_inspect(resolve_import_identifier)
+            inner.try_project_plaintext(resolve_import_identifier)
         }
         other => Err(ImportIdentifierError {
             got: crate::value::format_value_with_key(other, Some("id")),

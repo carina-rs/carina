@@ -580,7 +580,7 @@ fn element_provenance_survives_module_expansion_and_deferred_phase_changes()
     );
     let reference = &consumer.references()[0];
     assert_location(reference.location(), &child_path, child, "target.status");
-    assert!(reference.binding_matches(|binding| binding.as_str().ends_with(".target")));
+    assert!(reference.binding_matches(|binding| binding.ends_with(".target")));
     let wait = tree.waits().next().unwrap();
     assert_eq!(wait.dependencies().len(), 2);
     assert_eq!(wait.target_location().file().path(), child_path);

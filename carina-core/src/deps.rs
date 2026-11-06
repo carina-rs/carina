@@ -99,11 +99,11 @@ pub(crate) fn collect_dependencies<P: crate::resource::ValueKind, B: BindingAddr
     value: &Value<P, B>,
     deps: &mut HashSet<B>,
 ) {
-    value.visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
-        deps.insert(path.binding_address().clone());
+    value.visit_resource_refs(&mut |path, _usage| {
+        path.binding_key().record_graph_key(deps);
     });
-    value.visit_binding_refs(&mut |binding, _| {
-        deps.insert(binding.clone());
+    value.visit_binding_refs(&mut |binding| {
+        binding.record_graph_key(deps);
     });
 }
 

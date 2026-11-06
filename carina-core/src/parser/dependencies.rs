@@ -43,20 +43,6 @@ impl<B: BindingAddress> UnexpandedDependencyOperand<B> {
     }
 }
 
-#[derive(Clone)]
-struct ReferenceOrigin<B: BindingAddress> {
-    path: crate::resource::AccessPath<B>,
-    scope: crate::resource::DiagnosticScope,
-}
-
-impl<B: BindingAddress> std::fmt::Debug for ReferenceOrigin<B> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.scope
-            .path(crate::resource::ReferencePath::Access(self.path.clone()))
-            .fmt(f)
-    }
-}
-
 /// Authored operands never enter saved JSON:
 ///
 /// ```compile_fail,E0277
@@ -98,7 +84,7 @@ pub struct UnexpandedDependencies<B: BindingAddress = RelativeBindingName> {
     operands: Vec<super::Located<UnexpandedDependencyOperand<B>>>,
     // Value-reference origins survive eager value resolution alongside the
     // explicit operands. They do not contribute to len/is_empty or semantics.
-    reference_origins: Vec<ReferenceOrigin<B>>,
+    reference_origins: Vec<crate::resource::ScopedResourceOrigin<B>>,
     binding_reference_origins: Vec<super::Located<B>>,
 }
 
@@ -139,29 +125,14 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
         )
     }
 
-    pub(crate) fn reference_origins(
-        &self,
-    ) -> impl Iterator<
-        Item = (
-            &crate::resource::AccessPath<B>,
-            crate::resource::DiagnosticScope,
-        ),
-    > {
-        self.reference_origins
-            .iter()
-            .map(|origin| (&origin.path, origin.scope))
+    pub(crate) fn reference_origins(&self) -> &[crate::resource::ScopedResourceOrigin<B>] {
+        &self.reference_origins
     }
     pub(crate) fn set_reference_origins(
         &mut self,
-        origins: Vec<(
-            crate::resource::AccessPath<B>,
-            crate::resource::DiagnosticScope,
-        )>,
+        origins: Vec<crate::resource::ScopedResourceOrigin<B>>,
     ) {
-        self.reference_origins = origins
-            .into_iter()
-            .map(|(path, scope)| ReferenceOrigin { path, scope })
-            .collect();
+        self.reference_origins = origins;
     }
     pub(crate) fn binding_reference_origins(&self) -> &[super::Located<B>] {
         &self.binding_reference_origins
@@ -174,11 +145,8 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
         attributes: &indexmap::IndexMap<String, crate::resource::Value<P, B>>,
     ) {
         for value in attributes.values() {
-            value.visit_resource_refs_with_scope(&mut |path, _usage, scope| {
-                self.reference_origins.push(ReferenceOrigin {
-                    path: path.clone(),
-                    scope,
-                })
+            value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                self.reference_origins.push(reference.to_origin());
             });
         }
     }
@@ -249,10 +217,7 @@ impl<B: BindingAddress> UnexpandedDependencies<B> {
             reference_origins: self
                 .reference_origins
                 .into_iter()
-                .map(|origin| ReferenceOrigin {
-                    path: origin.path.map_bindings(map),
-                    scope: origin.scope,
-                })
+                .map(|origin| origin.map_bindings(map))
                 .collect(),
             binding_reference_origins: self
                 .binding_reference_origins
@@ -277,7 +242,7 @@ impl UnexpandedDependencies<RelativeBindingName> {
         use crate::resource::{PathSegment, Subscript, binding_address};
         let mut bindings = std::collections::HashSet::new();
         for value in attributes.values() {
-            value.visit_binding_refs(&mut |binding, _| {
+            value.visit_binding_refs(&mut |binding| {
                 bindings.insert(binding.clone());
             });
         }
@@ -304,10 +269,10 @@ impl UnexpandedDependencies<RelativeBindingName> {
                 }
             };
             let selected_prefix = format!("{}[", binding.as_str());
-            if !bindings.contains(&binding)
+            if !bindings.contains(&crate::resource::DependencyKey::new(binding.clone()))
                 && !bindings
                     .iter()
-                    .any(|binding| binding.as_str().starts_with(&selected_prefix))
+                    .any(|binding| binding.starts_with(&selected_prefix))
             {
                 continue;
             }
@@ -325,7 +290,7 @@ impl UnexpandedDependencies<RelativeBindingName> {
                         }
                     };
             }
-            if bindings.contains(&binding) {
+            if bindings.contains(&crate::resource::DependencyKey::new(binding.clone())) {
                 self.binding_reference_origins.push(super::Located::new(
                     super::DeclarationLocation::from_pair(&reference, file, source),
                     binding,

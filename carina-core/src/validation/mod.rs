@@ -2193,7 +2193,7 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
             }
         }
         GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => inner
-            .visit_reference_inventory(|value, scope| {
+            .visit_plaintext_reference_inventory(|value, scope| {
                 visit_refs_with_sink_inner(value, sink, usage, scope, f)
             }),
         GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) => {
@@ -2741,6 +2741,7 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
         }
         Err(crate::static_type::InferenceIssue::Failed(
             error @ (inference::InferenceError::InsideSecret { .. }
+            | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::InvalidIntegerArithmeticOperand { .. }
             | inference::InferenceError::HeterogeneousCollection { .. }
             | inference::InferenceError::UnknownType { .. }),
@@ -5555,26 +5556,30 @@ where
         .filter(|deferred| deferred.checks_scope())
     {
         let mut roots = std::collections::BTreeMap::new();
-        let mut record = |binding: &B, scope: crate::resource::DiagnosticScope| {
-            let existing = roots.entry(binding.clone()).or_insert(scope);
-            if scope.is_secret() {
-                *existing = scope;
+        let mut record = |key, path: crate::resource::DiagnosticPath<B>| {
+            let existing = roots.entry(key).or_insert_with(|| path.clone());
+            if path.is_secret() {
+                *existing = path;
             }
         };
         deferred
             .iterable()
-            .visit_resource_refs_with_scope(&mut |path, _, scope| {
-                record(path.binding_address(), scope)
+            .visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                record(reference.identity().binding_key(), reference.binding_path());
             });
-        deferred.iterable().visit_binding_refs(&mut record);
-        for (root, scope) in roots {
-            if tree.binding_names().contains(root.as_str()) {
+        deferred
+            .iterable()
+            .visit_binding_refs_for_diagnostics(&mut |reference| {
+                record(reference.identity(), reference.diagnostic_path());
+            });
+        for (root, diagnostic_path) in roots {
+            if root.is_in_names(tree.binding_names()) {
                 continue;
             }
             let occurrences: Vec<_> = deferred
                 .references()
                 .iter()
-                .filter(|reference| reference.binding_matches(|binding| binding == &root))
+                .filter(|reference| reference.binding_matches(|binding| binding == root))
                 .map(|reference| reference.prefix_location())
                 .collect();
             let locations = if occurrences.is_empty() {
@@ -5586,9 +5591,7 @@ where
                 findings.push(crate::parser::Located::new(
                     location.clone(),
                     crate::parser::ParseError::undefined_identifier(
-                        scope
-                            .path(ReferencePath::Binding(root.clone()))
-                            .to_dot_string(),
+                        diagnostic_path.to_dot_string(),
                         location.span().start_line(),
                         in_scope.clone(),
                     ),
@@ -5640,6 +5643,7 @@ fn validate_deferred_iterable_operand<B: BindingAddress>(
         Ok(inferred) => Some(inferred),
         Err(crate::static_type::InferenceIssue::Failed(
             error @ (inference::InferenceError::InsideSecret { .. }
+            | inference::InferenceError::SecretAssignmentMismatch { .. }
             | inference::InferenceError::MissingEvidence(_)
             | inference::InferenceError::IncompatibleCoalesceTypes { .. }
             | inference::InferenceError::HeterogeneousCollection { .. }),
@@ -9580,9 +9584,9 @@ where
         let mut resolved_param = param.clone();
         if let Some(value) = param.value() {
             let mut references_removed_secret = false;
-            value.visit_resource_refs_with_scope(&mut |path, usage, _scope| {
+            value.visit_resource_refs(&mut |path, usage| {
                 if usage == crate::resource::ResourceRefUsage::Required
-                    && bindings.removed_attribute_was_sensitive(path.binding(), path.attribute())
+                    && path.removed_attribute_was_sensitive(bindings)
                 {
                     references_removed_secret = true;
                 }

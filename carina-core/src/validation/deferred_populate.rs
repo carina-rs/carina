@@ -33,7 +33,7 @@
 //! after a multi-minute apply.
 
 use crate::parser::{AnalysisTree, DeclarationLocation, Located};
-use crate::resource::{AccessPath, BindingAddress, ParserPlaceholder, PathSegment};
+use crate::resource::{BindingAddress, ParserPlaceholder, PathSegment};
 use crate::schema::{EffectiveAttribute, SchemaKind, SchemaRegistry, Shape};
 use std::collections::{HashMap, HashSet};
 
@@ -80,9 +80,9 @@ where
     for resource in tree.resources() {
         for attribute in resource.located_attributes() {
             let (key, value) = attribute.detail();
-            value.visit_resource_refs_with_scope(&mut |path, _usage, scope| {
+            value.visit_resource_refs_for_diagnostics(&mut |reference, _usage| {
                 check_ref(
-                    (path, scope),
+                    reference,
                     key,
                     attribute.location(),
                     &by_binding,
@@ -97,7 +97,7 @@ where
 }
 
 fn check_ref<B: BindingAddress>(
-    (path, scope): (&AccessPath<B>, crate::resource::DiagnosticScope),
+    reference: crate::resource::ScopedResourceRef<'_, B>,
     key: &str,
     location: &DeclarationLocation,
     bindings: &HashMap<B, (&String, &String)>,
@@ -105,31 +105,30 @@ fn check_ref<B: BindingAddress>(
     schemas: &SchemaRegistry,
     out: &mut Vec<Located<DeferredPopulateDiagnostic>>,
 ) {
+    let _: Result<(), std::convert::Infallible> = reference.check(|path| {
     let target = path.binding_address();
     if synchronized.contains(target) {
-        return;
+        return Ok(());
     }
     let Some((provider, resource_type)) = bindings.get(target) else {
-        return;
+        return Ok(());
     };
     let Some(schema) = schemas.get(provider, resource_type, SchemaKind::Resource) else {
-        return;
+        return Ok(());
     };
     let Some(attribute) = schema.effective_attribute_by_authored_name(path.attribute()) else {
-        return;
+        return Ok(());
     };
     if path_traverses_deferred(attribute, path.segments()) {
-        let diagnostic_path = scope
-            .path(crate::resource::ReferencePath::Access(path.clone()))
-            .to_dot_string();
-        let target = scope
-            .path(crate::resource::ReferencePath::Binding(target.clone()))
-            .to_dot_string();
+        let diagnostic_path = reference.diagnostic_path().to_dot_string();
+        let target = reference.binding_path().to_dot_string();
         out.push(Located::new(location.clone(), DeferredPopulateDiagnostic {
             message: format!("attribute `{key}` references `{}`, which is populated asynchronously by the provider after Create. Add a `wait {target} {{ until = ... }}` block in this directory before downstream resources read this attribute.", diagnostic_path.clone()),
             attribute_key: key.to_string(), unresolved_path: diagnostic_path.clone(), target_binding: target.to_string(),
         }));
     }
+        Ok(())
+    });
 }
 
 /// Walk `(top_attr, segments)` over the schema graph; return true if

@@ -36,17 +36,20 @@ impl UnresolvedDataSourceInput {
             unknowns: Vec::new(),
             diagnostic_scope: DiagnosticScope::Public,
         };
-        value.visit_resource_refs_with_scope(&mut |path, _, scope| {
-            if scope.is_secret() {
-                input.diagnostic_scope = scope;
+        value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+            if reference.is_secret() {
+                input.diagnostic_scope = DiagnosticScope::Secret;
             }
-            input.paths.push(path.clone());
+            let _: Result<(), std::convert::Infallible> = reference.check(|path| {
+                input.paths.push(path.clone());
+                Ok(())
+            });
         });
-        value.visit_binding_refs(&mut |binding, scope| {
-            if scope.is_secret() {
-                input.diagnostic_scope = scope;
+        value.visit_binding_refs_for_diagnostics(&mut |reference| {
+            if reference.is_secret() {
+                input.diagnostic_scope = DiagnosticScope::Secret;
             }
-            input.bindings.push(binding.clone());
+            reference.identity().record_graph_key(&mut input.bindings);
         });
         visit_unknowns(value, DiagnosticScope::Public, &mut |reason, scope| {
             if scope.is_secret() {
@@ -61,13 +64,13 @@ impl UnresolvedDataSourceInput {
     /// Compare scheduler identities without returning raw diagnostic data.
     pub fn any_binding_matches(
         &self,
-        mut matches: impl FnMut(&AbsoluteBindingAddress) -> bool,
+        mut matches: impl FnMut(crate::resource::DependencyKey<AbsoluteBindingAddress>) -> bool,
     ) -> bool {
         self.paths
             .iter()
             .map(AccessPath::binding_address)
             .chain(&self.bindings)
-            .any(&mut matches)
+            .any(|binding| matches(crate::resource::DependencyKey::new(binding.clone())))
     }
 
     pub fn has_unknowns(&self) -> bool {
@@ -150,9 +153,8 @@ fn visit_unknowns(
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => visit_unknowns(access.base(), scope, f),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit_reference_inventory(|value, scope| visit_unknowns(value, scope, f))
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner
+            .visit_plaintext_reference_inventory(|value, scope| visit_unknowns(value, scope, f)),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             visit_unknowns(value, scope, f);
             visit_unknowns(default, scope, f);

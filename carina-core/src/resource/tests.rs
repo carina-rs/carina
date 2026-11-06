@@ -3557,12 +3557,15 @@ fn visit_resource_refs_collects_from_all_nested_variants() {
         Value::Concrete(ConcreteValue::String("plain".into())),
     ]));
 
-    let mut collected: Vec<String> = Vec::new();
-    value.visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
-        collected.push(path.binding().to_string());
+    let mut collected: Vec<AbsoluteBindingAddress> = Vec::new();
+    value.visit_resource_refs(&mut |path, _usage| {
+        path.binding_key().record_graph_key(&mut collected);
     });
     collected.sort();
-    assert_eq!(collected, vec!["a", "b", "c", "d", "e", "f", "g"]);
+    assert_eq!(
+        collected,
+        ["a", "b", "c", "d", "e", "f", "g"].map(absolute_binding)
+    );
 }
 
 #[test]
@@ -3575,19 +3578,25 @@ fn resource_ref_usage_marks_only_the_coalesce_value_optional() {
         })),
     });
     let mut collected = Vec::new();
-    value.visit_resource_refs_with_scope(&mut |path, usage, _scope| {
-        collected.push((path.binding().to_string(), usage));
+    value.visit_resource_refs(&mut |path, usage| {
+        collected.push((path.binding_key(), usage));
     });
 
     assert_eq!(
         collected,
         vec![
-            ("optional".to_string(), ResourceRefUsage::CoalesceValue),
             (
-                "nested_optional".to_string(),
+                super::DependencyKey::new(absolute_binding("optional")),
+                ResourceRefUsage::CoalesceValue
+            ),
+            (
+                super::DependencyKey::new(absolute_binding("nested_optional")),
                 ResourceRefUsage::CoalesceValue,
             ),
-            ("required".to_string(), ResourceRefUsage::Required),
+            (
+                super::DependencyKey::new(absolute_binding("required")),
+                ResourceRefUsage::Required
+            ),
         ],
     );
 }
@@ -3637,12 +3646,15 @@ fn visit_binding_refs_collects_from_all_nested_variants() {
     ]));
 
     let mut collected = Vec::new();
-    value.visit_binding_refs(&mut |binding, _| {
-        collected.push(binding.to_string());
+    value.visit_binding_refs(&mut |binding| {
+        binding.record_graph_key(&mut collected);
     });
     collected.sort();
 
-    assert_eq!(collected, vec!["a", "b", "c", "d", "e", "f", "g"]);
+    assert_eq!(
+        collected,
+        ["a", "b", "c", "d", "e", "f", "g"].map(absolute_binding)
+    );
 }
 
 #[test]
@@ -3654,7 +3666,7 @@ fn visit_resource_refs_on_leaf_variants_calls_nothing() {
         Value::Concrete(ConcreteValue::Bool(true)),
     ] {
         let mut count = 0;
-        v.visit_resource_refs_with_scope(&mut |_, _usage, _scope| count += 1);
+        v.visit_resource_refs(&mut |_, _usage| count += 1);
         assert_eq!(count, 0);
     }
 }
@@ -4576,12 +4588,93 @@ fn review2_f8_binding_inventory_callbacks_keep_public_and_secret_scopes() {
         )),
     ]));
     let mut findings = Vec::new();
-    value.visit_binding_refs(&mut |binding, scope| {
-        findings.push(scope.path(super::ReferencePath::Binding(binding.clone())))
+    value.visit_binding_refs_for_diagnostics(&mut |reference| {
+        findings.push(reference.diagnostic_path())
     });
     assert_eq!(findings[0].to_dot_string(), "public");
     assert_eq!(findings[1], super::DiagnosticScope::Secret.path(None));
     assert!(!format!("{findings:?}").contains("private_binding"));
+}
+
+#[test]
+fn secret_origin_4275_reference_visitors_separate_keys_from_diagnostic_paths() {
+    let public = Value::root_resource_ref("public", "config", vec!["field".into()]);
+    let private = Value::root_resource_ref(
+        "private-binding",
+        "private-attribute",
+        vec!["private-field".into()],
+    );
+    let value = Value::Concrete(ConcreteValue::List(vec![
+        public,
+        Value::Deferred(DeferredValue::Secret(Box::new(private).into())),
+    ]));
+    let mut dependencies = Vec::new();
+    value.visit_resource_refs(&mut |identity, usage| {
+        dependencies.push((identity.binding_key(), identity.attribute_key(), usage));
+    });
+    assert_eq!(
+        dependencies,
+        vec![
+            (
+                super::DependencyKey::new(absolute_binding("public")),
+                super::DependencyKey::new("config".to_string()),
+                ResourceRefUsage::Required
+            ),
+            (
+                super::DependencyKey::new(absolute_binding("private-binding")),
+                super::DependencyKey::new("private-attribute".to_string()),
+                ResourceRefUsage::Required
+            ),
+        ]
+    );
+    assert!(!format!("{dependencies:?}").contains("private-"));
+    let mut paths = Vec::new();
+    let mut errors = Vec::new();
+    value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+        paths.push((
+            reference.diagnostic_path(),
+            reference.binding_path(),
+            reference.head_path(),
+        ));
+        errors.push(
+            reference
+                .check(|path| Err::<(), _>(format!("bad {}", path.to_dot_string())))
+                .unwrap_err(),
+        );
+    });
+    assert_eq!(paths[0].0.to_dot_string(), "public.config.field");
+    assert_eq!(paths[0].1.to_dot_string(), "public");
+    assert_eq!(paths[0].2.to_dot_string(), "public.config");
+    for path in [&paths[1].0, &paths[1].1, &paths[1].2] {
+        assert_eq!(path.to_dot_string(), "(secret)");
+    }
+    assert!(!format!("{paths:?}").contains("private-"));
+    assert_eq!(
+        errors,
+        ["bad public.config.field", super::INSIDE_SECRET_MESSAGE]
+    );
+}
+
+#[test]
+fn secret_origin_4275_scoped_lookup_protects_shared_public_reference_origin() {
+    let parsed = crate::parser::parse_file(
+        "let producer = mock.test.Resource {}\nlet shared = producer.private_attribute\nmock.test.Resource { public = shared protected = secret(shared) }\n",
+        std::path::Path::new("shared.crn"),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).unwrap();
+    let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+    let mut checked = 0;
+    for resource in tree.resources() {
+        for value in resource.attributes().values() {
+            value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                let expected = reference.diagnostic_path();
+                let analyzed = tree.reference_for_scoped(reference);
+                assert_eq!(analyzed.diagnostic_path(), expected);
+                checked += 1;
+            });
+        }
+    }
+    assert_eq!(checked, 2);
 }
 
 #[test]

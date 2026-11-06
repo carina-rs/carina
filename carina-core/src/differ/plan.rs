@@ -646,33 +646,22 @@ fn cascade_ref_hint(value: &Value, target_binding: &str) -> Option<String> {
     let mut hit: Option<String> = None;
 
     // Multi-ref attributes report the first target-binding ref in list/IndexMap/source order.
-    value.visit_resource_refs_with_scope(&mut |path, _usage, scope| {
-        if hit.is_none() && path.binding() == target_binding {
-            hit = Some(
-                scope
-                    .path(crate::resource::ReferencePath::Access(
-                        crate::resource::AccessPath::from_binding(
-                            path.binding_address().clone(),
-                            path.attribute(),
-                            Vec::new(),
-                        ),
-                    ))
-                    .to_dot_string(),
-            );
+    value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+        if hit.is_none()
+            && reference
+                .identity()
+                .binding_key()
+                .matches_name(target_binding)
+        {
+            hit = Some(reference.head_path().to_dot_string());
         }
     });
-
     if hit.is_some() {
         return hit;
     }
-
-    value.visit_binding_refs(&mut |binding, scope| {
-        if hit.is_none() && binding.as_str() == target_binding {
-            hit = Some(
-                scope
-                    .path(crate::resource::ReferencePath::Binding(binding.clone()))
-                    .to_dot_string(),
-            );
+    value.visit_binding_refs_for_diagnostics(&mut |reference| {
+        if hit.is_none() && reference.identity().matches_name(target_binding) {
+            hit = Some(reference.diagnostic_path().to_dot_string());
         }
     });
 

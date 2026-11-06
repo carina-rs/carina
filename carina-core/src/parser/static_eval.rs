@@ -23,6 +23,9 @@ pub(crate) enum IfConditionDependency {
     Runtime,
 }
 
+impl crate::resource::SealedSecretReadResult for IfConditionDependency {}
+impl crate::resource::SecretReadResult for IfConditionDependency {}
+
 impl IfConditionDependency {
     fn combine(self, other: Self) -> Self {
         match (self, other) {
@@ -128,9 +131,7 @@ fn classify_non_static_if_condition(
             },
         ),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            let mut dependency = IfConditionDependency::Static;
-            inner.visit(|value| dependency = classify(value, visiting_functions));
-            dependency
+            inner.visit(|value| classify(value, visiting_functions))
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             classify(value, visiting_functions).combine(classify(default, visiting_functions))

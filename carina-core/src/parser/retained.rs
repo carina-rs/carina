@@ -2243,6 +2243,13 @@ mod judgement {
         if kind == Some(&InferredKind::StringConstruction(Knowledge::Deferred)) {
             return if sink.is_string_shaped() || matches!(sink, TypeExpr::Ref(_)) {
                 Ok(DeferredInterpolation)
+            } else if expression.diagnostic_scope.is_secret() {
+                Err(InferenceError::SecretAssignmentMismatch {
+                    types: crate::schema::MismatchTypeNames::for_type_exprs(
+                        sink,
+                        &TypeExpr::String,
+                    ),
+                })
             } else {
                 Err(InferenceError::UnknownType {
                     reason: format!(

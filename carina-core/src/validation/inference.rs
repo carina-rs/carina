@@ -366,9 +366,11 @@ fn infer_projected_type_with_visiting<P: PlaceholderKind, B: BindingAddress>(
         Value::Concrete(ConcreteValue::Bool(_)) => Ok(TypeExpr::Bool),
         Value::Concrete(ConcreteValue::Duration(_)) => Ok(TypeExpr::Duration),
         Value::Deferred(DeferredValue::Interpolation(_)) => Ok(TypeExpr::String),
-        Value::Deferred(DeferredValue::Secret(inner)) => inner.try_inspect(|secret_value| {
-            infer_projected_type_with_visiting(secret_value, bindings, context, visiting)
-        }),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            inner.try_project_plaintext(|secret_value| {
+                infer_projected_type_with_visiting(secret_value, bindings, context, visiting)
+            })
+        }
 
         Value::Concrete(ConcreteValue::List(items)) => {
             infer_collection(items, bindings, context, visiting, TypeExpr::List)

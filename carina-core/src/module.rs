@@ -723,7 +723,7 @@ impl RootConfigSignature {
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 // Mirror deps::collect_dependencies for secret-wrapped values.
-                inner.visit_reference_inventory(|value, scope| {
+                inner.visit_plaintext_reference_inventory(|value, scope| {
                     Self::collect_typed_dependencies_in_scope(
                         from,
                         attr_key,
@@ -1386,7 +1386,7 @@ impl ModuleSignature {
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 // Mirror deps::collect_dependencies for secret-wrapped values.
-                inner.visit_reference_inventory(|value, scope| {
+                inner.visit_plaintext_reference_inventory(|value, scope| {
                     Self::collect_typed_dependencies_in_scope(
                         from,
                         attr_key,

@@ -1678,10 +1678,9 @@ impl DiagnosticRun<'_> {
             // independent export obligation, including removed attributes.
             let value = param.value()?;
             let mut removed_secret = false;
-            value.visit_resource_refs_with_scope(&mut |path, usage, _scope| {
+            value.visit_resource_refs(&mut |path, usage| {
                 if usage == carina_core::resource::ResourceRefUsage::Required
-                    && value_bindings
-                        .removed_attribute_was_sensitive(path.binding(), path.attribute())
+                    && path.removed_attribute_was_sensitive(value_bindings)
                 {
                     removed_secret = true;
                 }
@@ -1808,11 +1807,13 @@ impl DiagnosticRun<'_> {
             .filter_map(|value| {
                 let reference = value.reference();
                 if reference.binding_matches(|binding| {
-                    let identifier = binding.as_str();
-                    defined_bindings.contains(identifier)
-                        || declared_providers.contains(identifier)
-                        || self.provider_names.iter().any(|name| name == identifier)
-                        || enum_namespaces.contains(identifier)
+                    binding.is_in_names(defined_bindings)
+                        || binding.is_in_names(declared_providers)
+                        || self
+                            .provider_names
+                            .iter()
+                            .any(|name| binding.matches_name(name))
+                        || binding.is_in_names(&enum_namespaces)
                 }) || !emitted.insert(reference.location().clone())
                 {
                     return None;
@@ -1853,10 +1854,9 @@ impl DiagnosticRun<'_> {
         let mut diagnostics = Vec::new();
         for resource in tree.resources() {
             for value in resource.attributes().values() {
-                value.visit_resource_refs_with_scope(&mut |path, usage, _scope| {
-                    let reference = tree.reference_for_path(path);
-                    let mut location =
-                        reference.attribute_location(path.binding(), path.attribute());
+                value.visit_resource_refs_for_diagnostics(&mut |scoped, usage| {
+                    let reference = tree.reference_for_scoped(scoped);
+                    let mut location = reference.own_attribute_location();
                     let Some(error) = reference.attribute_error(binding_index, usage) else {
                         return;
                     };

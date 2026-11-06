@@ -6613,50 +6613,44 @@ async fn load_provider_referenced_upstream_states<E>(
 fn provider_referenced_upstream_states<E>(
     parsed: &carina_core::parser::ExpandedFile<E>,
 ) -> Vec<ProviderReferencedUpstream> {
+    type ProviderReference = (
+        carina_core::resource::DependencyKey<AbsoluteBindingAddress>,
+        Option<carina_core::resource::DependencyKey<String>>,
+        ProviderAttributeRequirement,
+    );
     fn enqueue_value(
         value: &Value,
         required_by: &ProviderAttributeRequirement,
-        pending: &mut VecDeque<(
-            AbsoluteBindingAddress,
-            Option<String>,
-            ProviderAttributeRequirement,
-        )>,
+        pending: &mut VecDeque<ProviderReference>,
     ) {
-        let scoped_requirement =
-            |path: carina_core::resource::ReferencePath,
-             scope: carina_core::resource::DiagnosticScope| {
-                let mut requirement = required_by.clone();
-                requirement.diagnostic_path = Some(
-                    if requirement
-                        .diagnostic_path
-                        .as_ref()
-                        .is_some_and(carina_core::resource::DiagnosticPath::is_secret)
-                    {
-                        carina_core::resource::DiagnosticScope::Secret.path(None)
-                    } else {
-                        scope.path(path)
-                    },
-                );
-                requirement
-            };
-        value.visit_resource_refs_with_scope(&mut |path, _, scope| {
+        let scoped_requirement = |path: carina_core::resource::DiagnosticPath| {
+            let mut requirement = required_by.clone();
+            requirement.diagnostic_path = Some(
+                if requirement
+                    .diagnostic_path
+                    .as_ref()
+                    .is_some_and(carina_core::resource::DiagnosticPath::is_secret)
+                {
+                    carina_core::resource::DiagnosticScope::Secret.path(None)
+                } else {
+                    path
+                },
+            );
+            requirement
+        };
+        value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+            let identity = reference.identity();
             pending.push_back((
-                path.binding_address().clone(),
-                Some(path.attribute().to_string()),
-                scoped_requirement(
-                    carina_core::resource::ReferencePath::Access(path.clone()),
-                    scope,
-                ),
+                identity.binding_key(),
+                Some(identity.attribute_key()),
+                scoped_requirement(reference.diagnostic_path()),
             ));
         });
-        value.visit_binding_refs(&mut |binding, scope| {
+        value.visit_binding_refs_for_diagnostics(&mut |reference| {
             pending.push_back((
-                binding.clone(),
+                reference.identity(),
                 None,
-                scoped_requirement(
-                    carina_core::resource::ReferencePath::Binding(binding.clone()),
-                    scope,
-                ),
+                scoped_requirement(reference.diagnostic_path()),
             ));
         });
     }
@@ -6694,7 +6688,7 @@ fn provider_referenced_upstream_states<E>(
         )) {
             continue;
         }
-        if upstream_bindings.contains(&binding) {
+        if upstream_bindings.iter().any(|key| binding.matches(key)) {
             referenced_upstreams
                 .entry(binding)
                 .and_modify(|previous: &mut ProviderAttributeRequirement| {
@@ -6711,10 +6705,11 @@ fn provider_referenced_upstream_states<E>(
             continue;
         }
 
-        let Some(resource) = parsed
-            .iter_top_level_resources()
-            .find(|resource| resource.binding_address() == Some(&binding))
-        else {
+        let Some(resource) = parsed.iter_top_level_resources().find(|resource| {
+            resource
+                .binding_address()
+                .is_some_and(|key| binding.matches(key))
+        }) else {
             continue;
         };
         let attributes = match resource {
@@ -6738,7 +6733,7 @@ fn provider_referenced_upstream_states<E>(
             }
         };
         if let Some(attribute) = attribute {
-            if let Some(value) = attributes.get(&attribute) {
+            if let Some(value) = attribute.lookup_indexmap(&attributes) {
                 enqueue_value(value, &required_by, &mut pending);
             }
         } else {
@@ -6753,7 +6748,9 @@ fn provider_referenced_upstream_states<E>(
         .iter()
         .filter_map(|upstream| {
             referenced_upstreams
-                .get(&upstream.binding)
+                .get(&carina_core::resource::DependencyKey::new(
+                    upstream.binding.clone(),
+                ))
                 .cloned()
                 .map(|required_by| ProviderReferencedUpstream {
                     upstream: upstream.clone(),

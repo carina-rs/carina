@@ -25,11 +25,17 @@ pub(crate) use directive_expr::Substituted;
 mod enum_value;
 mod ignore_changes;
 mod loop_origin;
+mod reference_visit;
 mod secret_diagnostic;
 mod secret_payload;
+pub(crate) use reference_visit::ScopedResourceOrigin;
+pub use reference_visit::{
+    DependencyKey, DependencyResourceRef, ScopedBindingRef, ScopedResourceRef,
+};
 pub use secret_diagnostic::{
     DiagnosticPath, DiagnosticScope, INSIDE_SECRET_MESSAGE, InsideSecret, SecretDiagnosticError,
 };
+pub(crate) use secret_payload::SealedSecretReadResult;
 pub use secret_payload::{SecretPayload, SecretReadResult};
 
 use std::borrow::Borrow;
@@ -4202,11 +4208,11 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
     /// so dependency and diagnostic callers cannot drift.
     pub fn root_bindings(&self) -> std::collections::BTreeSet<B> {
         let mut roots = std::collections::BTreeSet::new();
-        self.visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
-            roots.insert(path.binding_address().clone());
+        self.visit_resource_refs(&mut |path, _usage| {
+            path.binding_key().record_graph_key(&mut roots);
         });
-        self.visit_binding_refs(&mut |binding, _| {
-            roots.insert(binding.clone());
+        self.visit_binding_refs(&mut |binding| {
+            binding.record_graph_key(&mut roots);
         });
         roots
     }
@@ -4219,9 +4225,9 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         binding: &B,
     ) -> Option<(Option<std::path::PathBuf>, usize)> {
         let mut source = None;
-        self.visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
-            if source.is_none() && path.binding_address() == binding {
-                source = path.diagnostic_source_owned();
+        self.visit_resource_refs(&mut |path, _usage| {
+            if source.is_none() && path.binding_key().matches(binding) {
+                source = path.source();
             }
         });
         source
@@ -6629,7 +6635,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 expression.rhs().visit_placeholders_in_scope(scope, visitor);
             }
             Value::Deferred(DeferredValue::Secret(value)) => {
-                value.visit_reference_inventory(|value, scope| {
+                value.visit_plaintext_reference_inventory(|value, scope| {
                     value.visit_placeholders_in_scope(scope, visitor)
                 });
             }
@@ -7388,7 +7394,7 @@ fn value_into_literal<P: ValueKind, B: BindingAddress>(
                 unreachable!()
             };
             let literal = payload
-                .try_inspect(|value| {
+                .try_project_plaintext(|value| {
                     value_into_literal(value.clone())
                         .map(|(text, _)| text)
                         .map_err(|_| ())
@@ -7544,13 +7550,50 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         }
     }
 
-    /// Walk references with both coalesce usage and diagnostic scope.
-    /// Every diagnostic consumer must render the identity through that scope.
-    pub fn visit_resource_refs_with_scope(
+    /// Walk resource dependency keys, preserving coalesce usage and traversal order.
+    /// Companion: [`Self::visit_binding_refs`] for bare binding dependencies.
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::Value;
+    /// fn render(value: &Value) {
+    ///     value.visit_resource_refs(&mut |identity, _| { let _ = identity.to_dot_string(); });
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::Value;
+    /// fn render(value: &Value) {
+    ///     value.visit_resource_refs(&mut |identity, _| { let _ = format!("{}", identity.attribute_key()); });
+    /// }
+    /// ```
+    pub fn visit_resource_refs(
         &self,
-        f: &mut impl FnMut(&AccessPath<B>, ResourceRefUsage, DiagnosticScope),
+        f: &mut impl FnMut(DependencyResourceRef<'_, B>, ResourceRefUsage),
     ) {
-        self.visit_resource_refs_in_scope(ResourceRefUsage::Required, DiagnosticScope::Public, f);
+        self.visit_resource_refs_in_scope(
+            ResourceRefUsage::Required,
+            DiagnosticScope::Public,
+            &mut |path, usage, _| f(DependencyResourceRef::new(path), usage),
+        );
+    }
+
+    /// Walk references whose diagnostic spelling is available only through `DiagnosticPath`.
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::Value;
+    /// fn render(value: &Value) {
+    ///     value.visit_resource_refs_for_diagnostics(&mut |reference, _| { let _ = reference.binding_address(); });
+    /// }
+    /// ```
+    pub fn visit_resource_refs_for_diagnostics(
+        &self,
+        f: &mut impl FnMut(ScopedResourceRef<'_, B>, ResourceRefUsage),
+    ) {
+        self.visit_resource_refs_in_scope(
+            ResourceRefUsage::Required,
+            DiagnosticScope::Public,
+            &mut |path, usage, scope| f(ScopedResourceRef::new(path, scope), usage),
+        );
     }
 
     fn visit_resource_refs_in_scope(
@@ -7623,11 +7666,10 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                     .rhs()
                     .visit_resource_refs_in_scope(usage, scope, f);
             }
-            Value::Deferred(DeferredValue::Secret(inner)) => {
-                inner.visit_reference_inventory(|value, scope| {
+            Value::Deferred(DeferredValue::Secret(inner)) => inner
+                .visit_plaintext_reference_inventory(|value, scope| {
                     value.visit_resource_refs_in_scope(usage, scope, f)
-                })
-            }
+                }),
             Value::Concrete(ConcreteValue::String(_))
             | Value::Concrete(ConcreteValue::EnumIdentifier(_))
             | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -7647,12 +7689,29 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         }
     }
 
-    /// Recursively walk this value, invoking `f` on each bare `BindingRef` name.
+    /// Recursively walk bare binding dependency keys.
     ///
-    /// Companion: `visit_resource_refs` for `ResourceRef` access paths. A consumer
+    /// Companion: [`Self::visit_resource_refs`] for resource dependency keys. A consumer
     /// that needs both must call both — drift is visible at the call site.
-    pub fn visit_binding_refs(&self, f: &mut impl FnMut(&B, DiagnosticScope)) {
-        self.visit_binding_refs_in_scope(DiagnosticScope::Public, f);
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::Value;
+    /// fn render(value: &Value) {
+    ///     value.visit_binding_refs(&mut |identity| { let _ = identity.to_string(); });
+    /// }
+    /// ```
+    pub fn visit_binding_refs(&self, f: &mut impl FnMut(DependencyKey<B>)) {
+        self.visit_binding_refs_in_scope(DiagnosticScope::Public, &mut |binding, _| {
+            f(DependencyKey::new(binding.clone()))
+        });
+    }
+
+    /// Walk bare references with inseparable diagnostic protection.
+    /// Companion: [`Self::visit_resource_refs_for_diagnostics`] for access paths.
+    pub fn visit_binding_refs_for_diagnostics(&self, f: &mut impl FnMut(ScopedBindingRef<'_, B>)) {
+        self.visit_binding_refs_in_scope(DiagnosticScope::Public, &mut |binding, scope| {
+            f(ScopedBindingRef::new(binding, scope))
+        });
     }
 
     fn visit_binding_refs_in_scope(
@@ -7706,11 +7765,10 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 expression.lhs().visit_binding_refs_in_scope(scope, f);
                 expression.rhs().visit_binding_refs_in_scope(scope, f);
             }
-            Value::Deferred(DeferredValue::Secret(inner)) => {
-                inner.visit_reference_inventory(|value, scope| {
+            Value::Deferred(DeferredValue::Secret(inner)) => inner
+                .visit_plaintext_reference_inventory(|value, scope| {
                     value.visit_binding_refs_in_scope(scope, f)
-                })
-            }
+                }),
             Value::Concrete(ConcreteValue::String(_))
             | Value::Concrete(ConcreteValue::EnumIdentifier(_))
             | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -7753,7 +7811,7 @@ pub fn attrs_to_hashmap<P: ValueKind, B: BindingAddress>(
 /// Check if a Value contains any ResourceRef (possibly nested)
 pub fn contains_resource_ref<P: ValueKind, B: BindingAddress>(value: &Value<P, B>) -> bool {
     let mut found = false;
-    value.visit_resource_refs_with_scope(&mut |_, _usage, _scope| found = true);
+    value.visit_resource_refs(&mut |_, _usage| found = true);
     found
 }
 
@@ -7876,7 +7934,7 @@ pub(crate) fn find_unavailable_evaluation<P: ValueKind, B: BindingAddress>(
             Value::Deferred(DeferredValue::Secret(inner)) => match secret_policy {
                 UnavailableSecretPolicy::Exclude => None,
                 UnavailableSecretPolicy::Include | UnavailableSecretPolicy::OnlyInside => inner
-                    .try_inspect(|value| {
+                    .try_project_plaintext(|value| {
                         find(
                             value,
                             coalesce_policy,
@@ -8065,7 +8123,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 access.step().hash(hasher);
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
-                inner.visit(|value| value.hash_into(hasher));
+                inner.hash_plaintext_into(hasher);
             }
 
             Value::Deferred(DeferredValue::Unknown(reason)) => {

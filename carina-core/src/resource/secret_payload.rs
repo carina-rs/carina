@@ -8,16 +8,21 @@ mod scalar_read {
     impl Sealed for usize {}
     impl Sealed for i64 {}
     impl<T: Sealed> Sealed for Option<T> {}
+    impl<P: super::ValueKind, B: super::BindingAddress> Sealed for super::SecretPayload<P, B> {}
+    impl Sealed for super::super::RedactedSecretHash {}
 }
+pub(crate) use scalar_read::Sealed as SealedSecretReadResult;
 
-/// Infallible scalar results permitted by [`SecretPayload::visit`].
-/// Error-bearing and value-bearing results must use the protected accessors.
+/// Scalar and protected results permitted by [`SecretPayload::visit`] and
+/// [`SecretPayload::try_inspect`]. Plaintext requires a named projection.
 pub trait SecretReadResult: scalar_read::Sealed {}
 impl SecretReadResult for () {}
 impl SecretReadResult for bool {}
 impl SecretReadResult for usize {}
 impl SecretReadResult for i64 {}
 impl<T: SecretReadResult> SecretReadResult for Option<T> {}
+impl<P: ValueKind, B: BindingAddress> SecretReadResult for SecretPayload<P, B> {}
+impl SecretReadResult for super::RedactedSecretHash {}
 
 /// A value walker cannot implicitly read or discard the secret wrapper.
 ///
@@ -168,6 +173,36 @@ impl<P: ValueKind, B: BindingAddress> SecretPayload<P, B> {
 
     /// Inspect a value, protecting every error at the boundary.
     ///
+    /// Plaintext cannot leave through the success channel, either borrowed or owned.
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::{SecretPayload, NoPlaceholder, AbsoluteBindingAddress};
+    /// fn extract(payload: &SecretPayload<NoPlaceholder, AbsoluteBindingAddress>) {
+    ///     let _ = payload.try_inspect(|value| Ok::<_, std::convert::Infallible>(value));
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::{SecretPayload, NoPlaceholder, AbsoluteBindingAddress};
+    /// fn extract(payload: &SecretPayload<NoPlaceholder, AbsoluteBindingAddress>) {
+    ///     let _ = payload.try_inspect(|value| Ok::<_, std::convert::Infallible>(value.clone()));
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::{SecretPayload, NoPlaceholder, AbsoluteBindingAddress};
+    /// fn extract(payload: &SecretPayload<NoPlaceholder, AbsoluteBindingAddress>) {
+    ///     let _ = payload.try_inspect(|_| Ok::<_, std::convert::Infallible>("plaintext".to_owned()));
+    /// }
+    /// ```
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::{SecretPayload, NoPlaceholder, AbsoluteBindingAddress};
+    /// fn extract(payload: &SecretPayload<NoPlaceholder, AbsoluteBindingAddress>) {
+    ///     let _ = payload.try_inspect(|_| Ok::<_, std::convert::Infallible>(serde_json::json!("plaintext")));
+    /// }
+    /// ```
+    ///
     /// ```compile_fail
     /// use carina_core::resource::{SecretPayload, NoPlaceholder, AbsoluteBindingAddress};
     /// struct UnprotectedError(String);
@@ -175,11 +210,29 @@ impl<P: ValueKind, B: BindingAddress> SecretPayload<P, B> {
     ///     let _ = payload.try_inspect(|value| Err::<(), _>(UnprotectedError(format!("{value:?}"))));
     /// }
     /// ```
-    pub fn try_inspect<'a, R, E: InsideSecret>(
+    pub fn try_inspect<'a, R: SecretReadResult, E: InsideSecret>(
         &'a self,
         inspect: impl FnOnce(&'a Value<P, B>) -> Result<R, E>,
     ) -> Result<R, E> {
         inspect(&self.value).map_err(InsideSecret::inside_secret)
+    }
+
+    /// Project plaintext JSON for a transport boundary, protecting conversion errors.
+    /// The returned JSON contains secret material and must go only to that transport.
+    pub fn project_plaintext_json_for_transport<E: InsideSecret>(
+        &self,
+        project: impl FnOnce(&Value<P, B>) -> Result<serde_json::Value, E>,
+    ) -> Result<serde_json::Value, E> {
+        self.try_project_plaintext(project)
+    }
+
+    /// Explicit plaintext boundary for core serialization, evaluation and schema proofs.
+    /// Each caller owns the resulting material and its protection or rewrapping.
+    pub(crate) fn try_project_plaintext<'a, R, E: InsideSecret>(
+        &'a self,
+        project: impl FnOnce(&'a Value<P, B>) -> Result<R, E>,
+    ) -> Result<R, E> {
+        project(&self.value).map_err(InsideSecret::inside_secret)
     }
 
     /// Read a scalar without exposing an error channel.
@@ -195,11 +248,16 @@ impl<P: ValueKind, B: BindingAddress> SecretPayload<P, B> {
     }
 
     /// Populate a reference inventory with the scope required by each finding.
-    pub(crate) fn visit_reference_inventory<'a>(
+    pub(crate) fn visit_plaintext_reference_inventory<'a>(
         &'a self,
         visit: impl FnOnce(&'a Value<P, B>, DiagnosticScope),
     ) {
         visit(&self.value, DiagnosticScope::Secret);
+    }
+
+    /// Feed plaintext into the internal comparison hasher without exposing a value.
+    pub(crate) fn hash_plaintext_into(&self, hasher: &mut impl std::hash::Hasher) {
+        self.value.hash_into(hasher);
     }
 
     /// Explicit escape hatch for transport and persistence.
@@ -255,6 +313,41 @@ impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for SecretPayload<P, B> {
 mod tests {
     use super::*;
     use crate::resource::{AbsoluteBindingAddress, ConcreteValue, DeferredValue, NoPlaceholder};
+    #[test]
+    fn secret_origin_4275_inspection_returns_only_scalars_or_protected_values() {
+        let payload: SecretPayload<NoPlaceholder, AbsoluteBindingAddress> = Box::new(
+            Value::Concrete(ConcreteValue::String("private-transport".into())),
+        )
+        .into();
+        let protected: SecretPayload<NoPlaceholder, AbsoluteBindingAddress> = payload
+            .try_inspect(|value| Ok::<_, std::convert::Infallible>(Box::new(value.clone()).into()))
+            .unwrap();
+        assert_eq!(protected, payload);
+        assert_eq!(format!("{protected:?}"), "(secret)");
+        assert!(
+            payload
+                .try_inspect(|value| Ok::<_, String>(value.is_fully_resolved()))
+                .unwrap()
+        );
+        assert_eq!(
+            payload
+                .try_inspect(|_| Ok::<_, String>(Some(2_usize)))
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            payload
+                .project_plaintext_json_for_transport(crate::value::value_to_json)
+                .unwrap(),
+            serde_json::json!("private-transport")
+        );
+        let error = payload
+            .project_plaintext_json_for_transport(|_| {
+                Err::<serde_json::Value, _>("private-error".to_string())
+            })
+            .unwrap_err();
+        assert_eq!(error, super::super::INSIDE_SECRET_MESSAGE);
+    }
     #[test]
     fn review3_payload_marking_preserves_equality_hash_material_and_wire() {
         use std::hash::{Hash, Hasher};
@@ -371,12 +464,17 @@ mod tests {
             mapped.expose_plaintext(),
             Value::Concrete(ConcreteValue::String(_))
         ));
-        payload.visit_reference_inventory(|_, scope| assert_eq!(scope, DiagnosticScope::Secret));
+        payload.visit_plaintext_reference_inventory(|_, scope| {
+            assert_eq!(scope, DiagnosticScope::Secret)
+        });
         let error = payload
             .try_inspect(|value| Err::<(), _>(format!("{value:?} private-error")))
             .unwrap_err();
         assert_eq!(error, crate::resource::INSIDE_SECRET_MESSAGE);
         assert!(payload.visit(|value| matches!(value, Value::Concrete(ConcreteValue::String(_)))));
-        assert_eq!(payload.try_inspect(|_| Ok::<_, String>(42)).unwrap(), 42);
+        assert_eq!(
+            payload.try_inspect(|_| Ok::<_, String>(42_i64)).unwrap(),
+            42
+        );
     }
 }

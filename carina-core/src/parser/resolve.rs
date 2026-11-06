@@ -1466,7 +1466,7 @@ fn collect_reference_roots(
             }
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit_reference_inventory(|value, scope| {
+            inner.visit_plaintext_reference_inventory(|value, scope| {
                 collect_reference_roots(value, variables, structural, scope, roots)
             });
         }
@@ -1564,19 +1564,17 @@ fn accumulate_undefined_reference_errors(
     known: &std::collections::HashSet<&str>,
     errors: &mut Vec<ParseError>,
 ) {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
 
     let mut check = |value: &Value| {
-        value.visit_resource_refs_with_scope(&mut |path, _usage, scope| {
-            let root = path.binding();
-            let root_ident = root.split(['[', ']']).next().unwrap_or(root);
-            if !known.contains(root_ident) && seen.insert(root_ident.to_string()) {
-                let name = scope
-                    .path(ReferencePath::<RelativeBindingName>::Binding(
-                        root_ident.into(),
-                    ))
-                    .to_dot_string();
-                errors.push(undefined_identifier_error(known, name, 0));
+        value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+            let root = reference.root_identifier_key();
+            if !root.is_in_strings(known) && seen.insert(root) {
+                errors.push(undefined_identifier_error(
+                    known,
+                    reference.root_identifier_path().to_dot_string(),
+                    0,
+                ));
             }
         });
     };

@@ -353,13 +353,11 @@ fn exports_consuming_sibling_let_keep_the_reference_owners_file() {
     export
         .value()
         .unwrap()
-        .visit_resource_refs_with_scope(&mut |path, _usage, _scope| {
-            let source = path.reference_locations().unwrap();
-            assert_eq!(
-                source.occurrence().file().path(),
-                directory.path().join("main.crn")
-            );
-            assert_eq!(slice(main, source.occurrence()), "target.items[0].name");
+        .visit_resource_refs_for_diagnostics(&mut |reference, _usage| {
+            let reference = reference.analysis_reference().unwrap();
+            let source = reference.location();
+            assert_eq!(source.file().path(), directory.path().join("main.crn"));
+            assert_eq!(slice(main, source), "target.items[0].name");
             count += 1;
         });
     assert_eq!(count, 1);

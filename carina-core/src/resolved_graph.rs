@@ -630,40 +630,41 @@ impl ExpandedBindingIndex {
         let mut reads = ResolvedDependencyReads::default();
 
         for value in values {
-            let mut paths = Vec::new();
-            value.visit_resource_refs_with_scope(&mut |path, _, scope| {
-                paths.push((path.clone(), scope))
+            let mut result: Result<(), ExpandedGraphResolutionError> = Ok(());
+            value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                if result.is_err() {
+                    return;
+                }
+                result = reference.check(|path| {
+                    let binding = path.binding_address();
+                    let direct = self.targets.contains_key(binding)
+                        || self.handle_outputs.contains_key(binding);
+                    for id in self.resolve_implicit_binding(binding, owner)? {
+                        dependencies.insert(id.clone());
+                        if direct {
+                            reads.insert_known(id, path.attribute());
+                        } else {
+                            reads.insert_unknown(id);
+                        }
+                    }
+                    Ok(())
+                });
             });
-            for (path, scope) in paths {
-                let binding = path.binding_address();
-                let direct =
-                    self.targets.contains_key(binding) || self.handle_outputs.contains_key(binding);
-                for id in self
-                    .resolve_implicit_binding(binding, owner)
-                    .map_err(|error| scope.protect_error(error))?
-                {
-                    dependencies.insert(id.clone());
-                    if direct {
-                        reads.insert_known(id, path.attribute());
-                    } else {
+            result?;
+            let mut result: Result<(), ExpandedGraphResolutionError> = Ok(());
+            value.visit_binding_refs_for_diagnostics(&mut |reference| {
+                if result.is_err() {
+                    return;
+                }
+                result = reference.check(|binding| {
+                    for id in self.resolve_implicit_binding(binding, owner)? {
+                        dependencies.insert(id.clone());
                         reads.insert_unknown(id);
                     }
-                }
-            }
-
-            let mut bare_bindings = Vec::new();
-            value.visit_binding_refs(&mut |binding, scope| {
-                bare_bindings.push((binding.clone(), scope))
+                    Ok(())
+                });
             });
-            for (binding, scope) in bare_bindings {
-                for id in self
-                    .resolve_implicit_binding(&binding, owner)
-                    .map_err(|error| scope.protect_error(error))?
-                {
-                    dependencies.insert(id.clone());
-                    reads.insert_unknown(id);
-                }
-            }
+            result?;
         }
 
         // A snapshot may retain an edge after evaluation rewrites its source
