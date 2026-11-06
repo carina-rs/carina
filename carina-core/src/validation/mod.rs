@@ -194,6 +194,19 @@ pub(crate) enum RefSink<'a> {
 }
 
 impl<'a> RefSink<'a> {
+    fn expression_type(self) -> TypeExpr {
+        match self {
+            Self::EffectiveType {
+                attr_type,
+                defs,
+                owner: crate::parser::SchemaTypeOwner::Provider(provider),
+                ..
+            } => expression_sink_type(attr_type, provider, defs),
+            Self::Interpolation => INTERPOLATION_REF_SINK.clone(),
+            Self::TypeExpr(ty) => ty.clone(),
+        }
+    }
+
     fn from_effective_type(
         effective: crate::schema::EffectiveType<'a>,
         owner: &'a crate::parser::SchemaTypeOwner,
@@ -763,6 +776,7 @@ impl std::error::Error for BindingUseFinding {
 #[derive(Debug, Clone, PartialEq)]
 pub struct BindingUseReport {
     findings: Vec<BindingUseFinding>,
+    expression_owned_uses: Vec<crate::parser::BareBindingUse>,
 }
 
 impl std::fmt::Display for BindingUseReport {
@@ -1332,16 +1346,7 @@ fn precheck_value_source<B: BindingAddress>(
             )));
         }
     };
-    let expected = match sink {
-        RefSink::EffectiveType {
-            attr_type,
-            defs,
-            owner: crate::parser::SchemaTypeOwner::Provider(provider),
-            ..
-        } => expression_sink_type(attr_type, provider, defs),
-        RefSink::Interpolation => INTERPOLATION_REF_SINK.clone(),
-        RefSink::TypeExpr(ty) => ty.clone(),
-    };
+    let expected = sink.expression_type();
     let admission =
         crate::parser::retained::admit_expression(expression, &expected).map_err(|error| {
             BindingResolutionError::DeferredAccess(Box::new(
@@ -1777,26 +1782,21 @@ pub fn binding_use_authority_owns_module_argument<E, D, B: BindingAddress>(
                 argument: owner_argument,
                 value_span: _,
             } if owner == call && owner_argument == argument
-        ) && binding_use_authority_owns_use(file, report, use_site)
+        ) && binding_use_authority_owns_use(report, use_site)
     })
 }
 
-/// Whether binding-use validation owns this sink. Constructed values retain
-/// their enclosing expression's value checks, including collection members.
-pub fn binding_use_authority_owns_use<E, D, B: BindingAddress>(
-    file: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+/// Whether binding-use validation owns this sink. Builtin and collection
+/// construction transfer ownership only after admission against the actual
+/// sink. Native interpolation retains its established ownership.
+pub fn binding_use_authority_owns_use(
     report: &BindingUseReport,
     use_site: &crate::parser::BareBindingUse,
 ) -> bool {
-    let expression_report = match &use_site.owner {
-        crate::parser::BindingUseOwner::Resource(address) => {
-            file.expression_report().for_resource(address.resource_id())
-        }
-        crate::parser::BindingUseOwner::ModuleArgument { .. } => Ok(file.expression_report()),
-    };
-    !expression_report
-        .and_then(|report| report.expression_in(&use_site.expression_instance, use_site.location()))
-        .is_ok_and(crate::parser::retained::JudgedExpr::is_string_construction)
+    !report
+        .expression_owned_uses
+        .iter()
+        .any(|owned| same_authored_use(owned, use_site))
         && (use_site.path.segments().len() == 1
             || report
                 .findings()
@@ -1861,6 +1861,7 @@ where
 {
     let mut report = BindingUseReport {
         findings: Vec::new(),
+        expression_owned_uses: Vec::new(),
     };
 
     for record in file.bare_binding_uses().records() {
@@ -1876,10 +1877,48 @@ where
                 record.authored.location(),
             )
         });
-        if evidence.is_ok_and(crate::parser::retained::JudgedExpr::is_string_construction) {
-            // The complete construction owns its string or collection-member
-            // constraints; its operands are not assigned to those sinks.
+        if evidence
+            .as_ref()
+            .is_ok_and(|expression| expression.is_interpolation())
+        {
+            // Preserve interpolation's existing ownership. The LSP resource
+            // walk must still suppress checks of its individual operands.
+            if matches!(
+                record.authored.owner,
+                crate::parser::BindingUseOwner::ModuleArgument { .. }
+            ) {
+                report.expression_owned_uses.push(record.authored.clone());
+            }
             continue;
+        }
+        if let Ok(expression) = evidence
+            && expression.is_string_construction()
+        {
+            let expected = match &record.authored.owner {
+                crate::parser::BindingUseOwner::Resource(address) => {
+                    resource_sink(file, address, &record.authored.path, context.schemas)
+                        .map(RefSink::expression_type)
+                }
+                crate::parser::BindingUseOwner::ModuleArgument { call, argument, .. } => {
+                    module_argument_type(file, call, argument, context.module_signatures)
+                        .and_then(|expected| {
+                            resolve_module_argument_path_type(
+                                &expected,
+                                &record.authored.path,
+                                context.raw_provider_context(),
+                            )
+                            .ok()
+                            .flatten()
+                        })
+                        .map(|expected| expected.as_type_expr())
+                }
+            };
+            if expected.is_some_and(|expected| {
+                crate::parser::retained::admit_expression(expression, &expected).is_ok()
+            }) {
+                report.expression_owned_uses.push(record.authored.clone());
+                continue;
+            }
         }
         let mut result = match &record.authored.owner {
             crate::parser::BindingUseOwner::Resource(address) => {

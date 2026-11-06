@@ -1519,6 +1519,8 @@ mod judgement {
         Literal,
         EnumIdentifier,
         StringConstruction(Knowledge),
+        // Builtins keep ordinary assignment diagnostics outside string sinks.
+        BuiltinConstruction(Knowledge),
         List(Knowledge),
         Map(Knowledge),
         // Loop slots are inferred from the iterable, never annotated sources.
@@ -1531,6 +1533,7 @@ mod judgement {
                 Self::Ordinary(knowledge)
                 | Self::Reference(knowledge)
                 | Self::StringConstruction(knowledge)
+                | Self::BuiltinConstruction(knowledge)
                 | Self::List(knowledge)
                 | Self::Map(knowledge) => knowledge,
                 Self::Literal | Self::EnumIdentifier => Knowledge::Known,
@@ -1774,12 +1777,16 @@ mod judgement {
             }
         }
         fn materialize_output(&mut self) {
-            if let ExprJudgement::Typed {
-                kind: kind @ InferredKind::StringConstruction(_),
-                ..
-            } = &mut self.data_mut().judgement
-            {
-                *kind = InferredKind::StringConstruction(Knowledge::Known);
+            if let ExprJudgement::Typed { kind, .. } = &mut self.data_mut().judgement {
+                *kind = match *kind {
+                    InferredKind::StringConstruction(_) => {
+                        InferredKind::StringConstruction(Knowledge::Known)
+                    }
+                    InferredKind::BuiltinConstruction(_) => {
+                        InferredKind::BuiltinConstruction(Knowledge::Known)
+                    }
+                    other => other,
+                };
             }
         }
         fn concrete(&self) -> bool {
@@ -1888,15 +1895,99 @@ mod judgement {
                 _ => None,
             }
         }
-        /// Construction evidence on this expression or its collection member.
+        /// Construction evidence on this expression or every list member.
         /// Alternatives keep their own admission and value-check obligations.
         pub fn is_string_construction(&self) -> bool {
             self.alternatives.is_empty()
-                && (matches!(self.kind(), Some(InferredKind::StringConstruction(_)))
-                    || self
-                        .member
-                        .as_deref()
-                        .is_some_and(Self::is_string_construction))
+                && (matches!(
+                    self.kind(),
+                    Some(
+                        InferredKind::StringConstruction(_) | InferredKind::BuiltinConstruction(_)
+                    )
+                ) || self
+                    .member
+                    .as_deref()
+                    .is_some_and(Self::is_string_construction)
+                    || (self.collection_kind() == Some(CollectionKind::List)
+                        && !self.elements.is_empty()
+                        && self.elements.iter().all(Self::is_string_construction)))
+        }
+        pub(crate) fn is_interpolation(&self) -> bool {
+            self.alternatives.is_empty()
+                && matches!(self.kind(), Some(InferredKind::StringConstruction(_)))
+        }
+        fn without_builtin_construction(&self) -> Self {
+            let mut ordinary = self.clone();
+            if matches!(self.kind(), Some(InferredKind::BuiltinConstruction(_))) {
+                ordinary.set_kind(InferredKind::Ordinary);
+                ordinary.data_mut().member = None;
+                return ordinary;
+            }
+            if !self.elements.is_empty() {
+                ordinary.data_mut().elements = Arc::new(
+                    self.elements
+                        .iter()
+                        .map(Self::without_builtin_construction)
+                        .collect(),
+                );
+            }
+            if !self.fields.is_empty() {
+                ordinary.data_mut().fields = Arc::new(
+                    self.fields
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.without_builtin_construction()))
+                        .collect(),
+                );
+            }
+            if !self.alternatives.is_empty() {
+                ordinary.data_mut().alternatives = Arc::new(
+                    self.alternatives
+                        .iter()
+                        .map(Self::without_builtin_construction)
+                        .collect(),
+                );
+            }
+            if let Some(member) = &self.member {
+                ordinary.data_mut().member = Some(Arc::new(member.without_builtin_construction()));
+            }
+            if let Some(operands) = &self.coalesce {
+                ordinary.data_mut().coalesce = Some(Arc::new([
+                    operands[0].without_builtin_construction(),
+                    operands[1].without_builtin_construction(),
+                ]));
+            }
+            ordinary
+        }
+        /// Interpret builtin evidence as an ordinary result at other sinks.
+        /// This also preserves the original collection diagnostic granularity.
+        pub(crate) fn for_sink(
+            &self,
+            sink: &TypeExpr,
+            config: &super::super::ProviderContext,
+        ) -> std::borrow::Cow<'_, Self> {
+            fn string_sink(actual: &TypeExpr, sink: &TypeExpr) -> bool {
+                match sink {
+                    TypeExpr::Union(members) => {
+                        members.iter().any(|sink| string_sink(actual, sink))
+                    }
+                    TypeExpr::List(inner) => match actual {
+                        TypeExpr::List(member) => string_sink(member, inner),
+                        _ => false,
+                    },
+                    _ => actual == &TypeExpr::String && sink.is_string_shaped(),
+                }
+            }
+            if matches!(self.kind(), Some(InferredKind::BuiltinConstruction(_)))
+                && let (Ok(actual), Ok(sink)) = (
+                    self.static_type(),
+                    crate::validation::resolve_type_expr(sink, config),
+                )
+                && !string_sink(actual, &sink)
+            {
+                std::borrow::Cow::Owned(self.without_builtin_construction())
+            } else {
+                std::borrow::Cow::Borrowed(self)
+            }
         }
         /// Borrow the assigned reference for diagnostics when the judgement
         /// preserves it through interpolation. Evaluation keeps the stored value.
@@ -1958,6 +2049,11 @@ mod judgement {
         pub fn collection_kind(&self) -> Option<CollectionKind> {
             match self.kind() {
                 Some(InferredKind::List(_)) => Some(CollectionKind::List),
+                Some(InferredKind::BuiltinConstruction(_))
+                    if matches!(self.static_type(), Ok(TypeExpr::List(_))) =>
+                {
+                    Some(CollectionKind::List)
+                }
                 Some(InferredKind::Map(_)) => Some(CollectionKind::Map),
                 _ => None,
             }
@@ -2078,6 +2174,8 @@ mod judgement {
         config: &super::super::ProviderContext,
     ) -> Result<ExpressionAdmission, InferenceError> {
         use ExpressionAdmission::{DeferredInterpolation, ProviderPending, ValueCheck};
+        let expression = expression.for_sink(sink, config);
+        let expression = expression.as_ref();
         let (ty, kind, concrete) = match &expression.judgement {
             ExprJudgement::Failed { error, .. } | ExprJudgement::Rejected { error, .. } => {
                 return Err(error.clone());
@@ -2246,7 +2344,13 @@ mod judgement {
                 Err(assignment_error(expression, sink))
             };
         }
-        if kind == Some(&InferredKind::StringConstruction(Knowledge::Deferred)) {
+        if matches!(
+            kind,
+            Some(
+                InferredKind::StringConstruction(Knowledge::Deferred)
+                    | InferredKind::BuiltinConstruction(Knowledge::Deferred)
+            )
+        ) {
             return if sink.is_string_shaped() || matches!(sink, TypeExpr::Ref(_)) {
                 Ok(DeferredInterpolation)
             } else if expression.diagnostic_scope.is_secret() {
@@ -3432,7 +3536,21 @@ mod judgement {
                     };
                     result.data_mut().member = None;
                     match &root.kind {
-                        ExprKind::List => result.data_mut().elements = Arc::new(children.to_vec()),
+                        ExprKind::List => {
+                            // Only a uniformly constructed list acquires member
+                            // construction evidence. Mixed lists retain the
+                            // ordinary builtin admission they had before #4282.
+                            result.data_mut().elements = Arc::new(
+                                if children.iter().all(JudgedExpr::is_string_construction) {
+                                    children.to_vec()
+                                } else {
+                                    children
+                                        .iter()
+                                        .map(JudgedExpr::without_builtin_construction)
+                                        .collect()
+                                },
+                            );
+                        }
                         ExprKind::Map(keys) => {
                             result.data_mut().fields = Arc::new(
                                 keys.iter().cloned().zip(children.iter().cloned()).collect(),
@@ -3898,9 +4016,8 @@ mod judgement {
                 .cloned()
                 .unwrap_or_else(|| incomplete("builtin argument")),
             R::String | R::SecretString => declared(Ok(TypeExpr::String), concrete),
-            R::ConstructedString => {
-                declared(Ok(TypeExpr::String), concrete).with_kind(InferredKind::StringConstruction)
-            }
+            R::ConstructedString => declared(Ok(TypeExpr::String), concrete)
+                .with_kind(InferredKind::BuiltinConstruction),
             R::Int => declared(Ok(TypeExpr::Int), concrete),
             R::StringList => declared(Ok(TypeExpr::List(Box::new(TypeExpr::String))), concrete),
             R::ConstructedStringList => {
@@ -3911,9 +4028,9 @@ mod judgement {
                 );
                 result.data_mut().member = Some(Arc::new(
                     declared(Ok(TypeExpr::String), concrete)
-                        .with_kind(InferredKind::StringConstruction),
+                        .with_kind(InferredKind::BuiltinConstruction),
                 ));
-                result
+                result.with_kind(InferredKind::BuiltinConstruction)
             }
             R::List => builtin_collection(CollectionKind::List, concrete),
             R::Map => builtin_collection(CollectionKind::Map, concrete),

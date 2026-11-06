@@ -1388,6 +1388,7 @@ fn issue_4282_split_at_named_string_list_checks_values_in_cli_and_lsp() {
     let engine = engine_with_schemas(schemas.clone());
     for (input, expected_rule) in [
         ("abc,def", None),
+        ("A,b", Some("does not match required pattern /^[a-z]+$/")),
         ("abc,abcd", Some("length 4 is outside allowed range [1, 3]")),
         (
             "abc,123",
@@ -1401,11 +1402,17 @@ fn issue_4282_split_at_named_string_list_checks_values_in_cli_and_lsp() {
                 .collect::<Vec<_>>()
                 .join(", ");
             let mut expected = None;
-            for expression in [format!("split(',', '{input}')"), format!("[{elements}]")] {
-                // Constructed builtin collections use the enclosing schema walk,
-                // as an inline list of interpolated strings does. A literal list
-                // bound to a let keeps main's separate binding-use diagnostics.
-                let source = if bound && expression.starts_with("split(") {
+            let calls = input
+                .split(',')
+                .map(|value| format!("join('', ['{value}'])"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            for expression in [
+                format!("split(',', '{input}')"),
+                format!("[{elements}]"),
+                format!("[{calls}]"),
+            ] {
+                let source = if bound {
                     format!("let names = {expression}\ntest.Names {{ names = names }}\n")
                 } else {
                     format!("test.Names {{ names = {expression} }}\n")
@@ -8210,3 +8217,6 @@ fn integer_arithmetic_directory_maps_errors_on_both_sides_of_heredoc() {
 
 #[path = "e2e_typecheck_parity/review_4282.rs"]
 mod review_4282;
+
+#[path = "e2e_typecheck_parity/review_round1_4282.rs"]
+mod review_round1_4282;

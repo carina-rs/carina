@@ -1209,8 +1209,10 @@ impl DiagnosticRun<'_> {
                 }
             }
             // The shared authority owns ordinary direct bare-binding sinks
-            // even when they succeed. Constructed expressions retain their
-            // enclosing schema value checks. An enum-typed argument must not
+            // even when they succeed. Admitted builtin and collection
+            // constructions retain their enclosing schema value checks.
+            // Native interpolation keeps its existing operand suppression.
+            // An enum-typed argument must not
             // be reinterpreted by the LSP's legacy BindingIndex pass using a
             // differently enriched bootstrap identity. Nested uses keep the
             // surrounding schema walk to validate unrelated sibling leaves.
@@ -1219,7 +1221,6 @@ impl DiagnosticRun<'_> {
                 .uses()
                 .filter(|use_site| {
                     carina_core::validation::binding_use_authority_owns_use(
-                        parsed,
                         &binding_use_report,
                         use_site,
                     )

@@ -637,6 +637,9 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
     let ValueCheckEvidence::Authored(expression) = inference else {
         return check_constraint_value(expected, value, config, inference, provider_custom_types);
     };
+    let expression = expression.for_sink(expected, config);
+    let expression = expression.as_ref();
+    let inference = ValueCheckEvidence::Authored(expression);
     let admission = crate::parser::retained::admit_with_context(
         expression,
         expected,
