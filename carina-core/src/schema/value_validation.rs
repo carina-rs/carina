@@ -8,7 +8,6 @@ pub struct LocallyValidatedCustomType<'a> {
     declaration: crate::parser::IdentifiedCustomTypeDeclaration<'a>,
     value: Value,
     canonical: crate::provider::CanonicalCustomTypeValue,
-    requires_provider: bool,
 }
 
 impl LocallyValidatedCustomType<'_> {
@@ -18,10 +17,6 @@ impl LocallyValidatedCustomType<'_> {
 
     pub fn value(&self) -> &Value {
         &self.value
-    }
-
-    pub fn requires_provider(&self) -> bool {
-        self.requires_provider
     }
 
     pub fn canonical(&self) -> &crate::provider::CanonicalCustomTypeValue {
@@ -60,6 +55,7 @@ where
 #[derive(Default)]
 pub struct ValueValidationFindings {
     local_error: Option<TypeError>,
+    additional_local_errors: Vec<TypeError>,
     local: Vec<(FieldPath, TypeError)>,
     pub(super) provider: Vec<(FieldPath, TypeError)>,
 }
@@ -77,9 +73,18 @@ impl ValueValidationFindings {
         self.local_error.as_ref()
     }
 
+    pub fn has_provider_findings(&self) -> bool {
+        !self.provider.is_empty()
+    }
+
+    pub(super) fn local_errors(&self) -> impl Iterator<Item = &TypeError> {
+        self.local_error.iter().chain(&self.additional_local_errors)
+    }
+
     pub(super) fn into_errors(self) -> Vec<TypeError> {
         self.local_error
             .into_iter()
+            .chain(self.additional_local_errors)
             .chain(self.provider.into_iter().map(|(_, error)| error))
             .collect()
     }
@@ -89,6 +94,7 @@ impl InsideSecret for ValueValidationFindings {
     fn inside_secret(self) -> Self {
         Self {
             local_error: self.local_error.map(InsideSecret::inside_secret),
+            additional_local_errors: self.additional_local_errors.inside_secret(),
             local: self.local.inside_secret(),
             provider: self.provider.inside_secret(),
         }
@@ -98,7 +104,7 @@ impl InsideSecret for ValueValidationFindings {
 /// One validation report, usable by both CLI and LSP without revalidation.
 #[derive(Default)]
 pub struct ResourceValueValidation {
-    pub(super) errors: Vec<(bool, TypeError)>,
+    pub(super) errors: Vec<TypeError>,
     pub(super) attributes: HashMap<String, ValueValidationFindings>,
 }
 
@@ -107,16 +113,12 @@ impl ResourceValueValidation {
         self.attributes.remove(name)
     }
 
-    /// The boolean identifies provider findings. Renderers apply their usual
-    /// diagnostic deduplication to both local and provider errors.
-    pub fn errors(&self) -> impl Iterator<Item = (bool, &TypeError)> {
-        self.errors
-            .iter()
-            .map(|(provider, error)| (*provider, error))
+    pub fn errors(&self) -> impl Iterator<Item = &TypeError> {
+        self.errors.iter()
     }
 
     pub(super) fn into_errors(self) -> Vec<TypeError> {
-        self.errors.into_iter().map(|(_, error)| error).collect()
+        self.errors
     }
 
     pub(super) fn into_result(self) -> Result<(), Vec<TypeError>> {
@@ -133,35 +135,37 @@ impl ResourceValueValidation {
 /// cannot carry a fit that an enclosing Union could mistake for acceptance.
 enum LocalOutcome<F> {
     Accepted(F),
-    Rejected(TypeError),
+    Rejected { primary: (FieldPath, TypeError) },
 }
 
 impl<F> LocalOutcome<F> {
     fn error(&self) -> Option<&TypeError> {
         match self {
             Self::Accepted(_) => None,
-            Self::Rejected(error) => Some(error),
+            Self::Rejected {
+                primary: (_, error),
+            } => Some(error),
         }
     }
 
     fn fit(&self) -> Option<&F> {
         match self {
             Self::Accepted(fit) => Some(fit),
-            Self::Rejected(_) => None,
+            Self::Rejected { .. } => None,
         }
     }
 
     fn into_fit(self) -> Option<F> {
         match self {
             Self::Accepted(fit) => Some(fit),
-            Self::Rejected(_) => None,
+            Self::Rejected { .. } => None,
         }
     }
 
     fn map<G>(self, f: impl FnOnce(F) -> G) -> LocalOutcome<G> {
         match self {
             Self::Accepted(fit) => LocalOutcome::Accepted(f(fit)),
-            Self::Rejected(error) => LocalOutcome::Rejected(error),
+            Self::Rejected { primary } => LocalOutcome::Rejected { primary },
         }
     }
 }
@@ -169,6 +173,9 @@ impl<F> LocalOutcome<F> {
 #[derive(Default)]
 struct CheckedFindings {
     local: Vec<(FieldPath, TypeError)>,
+    // Other undecided branches have independent primary local errors. Ordinary
+    // containers still retain their established first-error CLI precedence.
+    additional_local_errors: Vec<TypeError>,
     provider: Vec<(FieldPath, TypeError)>,
 }
 
@@ -176,6 +183,7 @@ impl InsideSecret for CheckedFindings {
     fn inside_secret(self) -> Self {
         Self {
             local: self.local.inside_secret(),
+            additional_local_errors: self.additional_local_errors.inside_secret(),
             provider: self.provider.inside_secret(),
         }
     }
@@ -191,7 +199,9 @@ impl InsideSecret for CheckedValue<'_> {
         Self {
             local: match self.local {
                 LocalOutcome::Accepted(fit) => LocalOutcome::Accepted(fit),
-                LocalOutcome::Rejected(error) => LocalOutcome::Rejected(error.inside_secret()),
+                LocalOutcome::Rejected { primary } => LocalOutcome::Rejected {
+                    primary: primary.inside_secret(),
+                },
             },
             findings: self.findings.inside_secret(),
         }
@@ -205,7 +215,6 @@ struct UnionFailure<'a> {
 
 struct UnionProviderFailure<'a> {
     local_fit: UnionFit<'a>,
-    diagnostic_rank: UnionFailureRank,
     provider: Vec<(FieldPath, TypeError)>,
 }
 
@@ -223,11 +232,10 @@ impl<'a> CheckedValue<'a> {
 
     fn rejected(path: &FieldPath, error: TypeError) -> Self {
         Self {
-            local: LocalOutcome::Rejected(error.clone()),
-            findings: CheckedFindings {
-                local: vec![(path.clone(), error)],
-                provider: Vec::new(),
+            local: LocalOutcome::Rejected {
+                primary: (path.clone(), error),
             },
+            findings: Default::default(),
         }
     }
 
@@ -235,9 +243,22 @@ impl<'a> CheckedValue<'a> {
         matches!(self.local, LocalOutcome::Accepted(_)) && self.findings.provider.is_empty()
     }
 
-    fn reject(&mut self, error: TypeError) {
+    fn reject(&mut self, path: &FieldPath, error: TypeError) {
         if matches!(self.local, LocalOutcome::Accepted(_)) {
-            self.local = LocalOutcome::Rejected(error);
+            self.local = LocalOutcome::Rejected {
+                primary: (path.clone(), error),
+            };
+        }
+    }
+
+    fn retain_primary_finding(&mut self) {
+        if let LocalOutcome::Rejected { primary } = &self.local
+            && self.findings.local.is_empty()
+        {
+            // Containers may supply a more precise rendering than their
+            // aggregate primary error. A bare rejection already owns a
+            // finding; callers never have to push a matching one separately.
+            self.findings.local.push(primary.clone());
         }
     }
 
@@ -247,13 +268,17 @@ impl<'a> CheckedValue<'a> {
             .or_else(|| self.findings.provider.first().map(|(_, error)| error))
     }
 
-    fn into_findings(self) -> ValueValidationFindings {
+    fn into_findings(mut self) -> ValueValidationFindings {
+        self.retain_primary_finding();
         ValueValidationFindings {
             local_error: match self.local {
                 LocalOutcome::Accepted(_) => None,
-                LocalOutcome::Rejected(error) => Some(error),
+                LocalOutcome::Rejected {
+                    primary: (_, error),
+                } => Some(error),
             },
             local: self.findings.local,
+            additional_local_errors: self.findings.additional_local_errors,
             provider: self.findings.provider,
         }
     }
@@ -332,12 +357,7 @@ pub(crate) fn validate_custom_type_leaf<'a, R>(
         return Err(error.clone());
     }
     let proof = validator
-        .canonical_leaf(
-            declaration.declared_type(),
-            value,
-            checked.local.fit(),
-            !has_native_validator(declaration.declared_type()),
-        )
+        .canonical_leaf(declaration.declared_type(), value, checked.local.fit())
         .map_err(|failure| *failure.error)?;
     Ok(validated(proof))
 }
@@ -349,6 +369,19 @@ struct CanonicalLeafError<'a> {
 
 impl<'a> ValueValidator<'a> {
     fn walk<P: PlaceholderKind, B: BindingAddress>(
+        &self,
+        attr: &'a CompiledAttributeType,
+        value: &Value<P, B>,
+        path: &FieldPath,
+        ancestry: FieldAncestry,
+        visited: &mut Vec<&'a str>,
+    ) -> CheckedValue<'a> {
+        let mut checked = self.walk_value(attr, value, path, ancestry, visited);
+        checked.retain_primary_finding();
+        checked
+    }
+
+    fn walk_value<P: PlaceholderKind, B: BindingAddress>(
         &self,
         attr: &'a CompiledAttributeType,
         value: &Value<P, B>,
@@ -387,6 +420,9 @@ impl<'a> ValueValidator<'a> {
                 .map(|error| vec![(path.clone(), error.clone())])
                 .unwrap_or_default();
             left.findings.provider.extend(right.findings.provider);
+            left.findings
+                .additional_local_errors
+                .extend(right.findings.additional_local_errors);
             left.local = match (left.local, right.local) {
                 (LocalOutcome::Accepted(value), LocalOutcome::Accepted(default)) => {
                     let mut exactness = value.exactness;
@@ -400,9 +436,8 @@ impl<'a> ValueValidator<'a> {
                         },
                     ))
                 }
-                (LocalOutcome::Rejected(error), _) | (_, LocalOutcome::Rejected(error)) => {
-                    LocalOutcome::Rejected(error)
-                }
+                (LocalOutcome::Rejected { primary }, _)
+                | (_, LocalOutcome::Rejected { primary }) => LocalOutcome::Rejected { primary },
             };
             return left;
         }
@@ -410,9 +445,20 @@ impl<'a> ValueValidator<'a> {
             let mut checked = CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Deferred);
             for branch in &branches.values()[1..] {
                 let branch = self.walk(attr, branch, path, ancestry, &mut Vec::new());
-                // The selected branch is checked after expansion. Until then,
-                // preserve main's deferred local outcome while requiring each
-                // concrete leaf's local proof before any provider dispatch.
+                // Expansion removes decided ModuleIf values. Every branch
+                // still present here is independently checked in both stages.
+                if let Some(error) = branch.local.error() {
+                    if checked.local.error().is_some() {
+                        checked.findings.additional_local_errors.push(error.clone());
+                    } else {
+                        checked.reject(path, error.clone());
+                    }
+                }
+                checked.findings.local.extend(branch.findings.local);
+                checked
+                    .findings
+                    .additional_local_errors
+                    .extend(branch.findings.additional_local_errors);
                 checked.findings.provider.extend(branch.findings.provider);
             }
             return checked;
@@ -439,6 +485,13 @@ impl<'a> ValueValidator<'a> {
                 path,
                 crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into(),
             );
+        }
+        if value.as_concrete().is_none()
+            && !matches!(value, Value::Deferred(DeferredValue::IntegerArithmetic(_)))
+        {
+            // An unresolved value has no arm to select yet. In particular,
+            // unavailable member schemas cannot reject a deferred Union.
+            return CheckedValue::accepted(attr, FitExactness::EXACT, FitKind::Deferred);
         }
         if let AttrTypeKind::Union(members) = &attr.kind {
             return match self.union(members.as_raw_slice(), value, path, ancestry, visited) {
@@ -511,6 +564,9 @@ impl<'a> ValueValidator<'a> {
                 },
                 ConcreteValueRef::StringList(items),
             ) => {
+                // Defaults are not injected here, and provider normalization
+                // runs after authored validation. Supplied items share the
+                // same local guards and dispatch as ordinary List elements.
                 let items = items
                     .iter()
                     .map(|item| Value::Concrete(ConcreteValue::String(item.clone())))
@@ -542,7 +598,7 @@ impl<'a> ValueValidator<'a> {
                         let error = TypeError::MissingRequired {
                             name: field.name.clone(),
                         };
-                        checked.reject(error.clone());
+                        checked.reject(path, error.clone());
                         checked
                             .findings
                             .local
@@ -594,9 +650,13 @@ impl<'a> ValueValidator<'a> {
                         } else {
                             error.at_struct_field(key)
                         };
-                        checked.reject(error);
+                        checked.reject(path, error);
                     }
                     checked.findings.local.extend(child.findings.local);
+                    checked
+                        .findings
+                        .additional_local_errors
+                        .extend(child.findings.additional_local_errors);
                     checked.findings.provider.extend(child.findings.provider);
                     if let Some(fit) = child.local.into_fit() {
                         exactness.combine(fit.exactness);
@@ -604,10 +664,13 @@ impl<'a> ValueValidator<'a> {
                     }
                 }
                 if let Some(group) = groups.first() {
-                    checked.reject(TypeError::FieldGroupViolation {
-                        path: FieldPath::new(),
-                        group: (*group).clone(),
-                    });
+                    checked.reject(
+                        path,
+                        TypeError::FieldGroupViolation {
+                            path: FieldPath::new(),
+                            group: (*group).clone(),
+                        },
+                    );
                 }
                 checked.local = checked
                     .local
@@ -628,7 +691,7 @@ impl<'a> ValueValidator<'a> {
                     FitKind::Map(Vec::new()),
                 );
                 if let Err(error) = constraints.check(map.len()) {
-                    checked.reject(error.clone());
+                    checked.reject(path, error.clone());
                     checked.findings.local.push((path.clone(), error));
                 }
                 let mut fits = Vec::new();
@@ -654,7 +717,7 @@ impl<'a> ValueValidator<'a> {
                             key: map_key.clone(),
                             inner: Box::new(error),
                         };
-                        checked.reject(error.clone());
+                        checked.reject(path, error.clone());
                         checked.findings.local.push((next_path.clone(), error));
                     }
                     let child =
@@ -664,7 +727,7 @@ impl<'a> ValueValidator<'a> {
                             !matches!(error, TypeError::FieldGroupViolation { .. })
                         });
                     if let Some(error) = child.local.error().cloned() {
-                        checked.reject(error.clone().at_map_value(map_key));
+                        checked.reject(path, error.clone().at_map_value(map_key));
                         if has_coarse_error {
                             // The collector's coarse diagnostic always uses
                             // MapValueError, even when the primary inner error
@@ -682,6 +745,10 @@ impl<'a> ValueValidator<'a> {
                             matches!(error, TypeError::FieldGroupViolation { .. })
                         }));
                     checked.findings.provider.extend(child.findings.provider);
+                    checked
+                        .findings
+                        .additional_local_errors
+                        .extend(child.findings.additional_local_errors);
                     if let (Some(key_fit), Some(value_fit)) =
                         (key_checked.local.into_fit(), child.local.into_fit())
                     {
@@ -737,7 +804,9 @@ impl<'a> ValueValidator<'a> {
             let child = self.walk(inner, value, &path.push_index(i), ancestry, &mut Vec::new());
             let (fit, error) = match child.local {
                 LocalOutcome::Accepted(fit) => (Some(fit), None),
-                LocalOutcome::Rejected(error) => (None, Some(error)),
+                LocalOutcome::Rejected {
+                    primary: (_, error),
+                } => (None, Some(error)),
             };
             child_fits.push(fit);
             children.push((error, child.findings));
@@ -772,7 +841,7 @@ impl<'a> ValueValidator<'a> {
         // duplicate and element findings from this same traversal.
         for (index, error) in constraints_errors {
             if let Some(error) = error {
-                checked.reject(error.clone());
+                checked.reject(path, error.clone());
                 checked.findings.local.push((
                     index.map_or_else(|| path.clone(), |i| path.push_index(i)),
                     error,
@@ -780,11 +849,15 @@ impl<'a> ValueValidator<'a> {
             } else if let Some(i) = index
                 && let Some(error) = &children[i].0
             {
-                checked.reject(error.clone().at_list_index(i));
+                checked.reject(path, error.clone().at_list_index(i));
             }
         }
         for (_, findings) in children {
             checked.findings.local.extend(findings.local);
+            checked
+                .findings
+                .additional_local_errors
+                .extend(findings.additional_local_errors);
             checked.findings.provider.extend(findings.provider);
         }
         checked.local = checked.local.map(|_| {
@@ -813,6 +886,7 @@ impl<'a> ValueValidator<'a> {
         let mut failure: Option<BestUnionMemberFailures> = None;
         let mut provider_failure: Option<UnionProviderFailure<'a>> = None;
         let mut sibling_provider_errors = Vec::new();
+        let mut sibling_local_errors = Vec::new();
         for member in members {
             let checked = self.walk(member, value, path, ancestry, visited);
             let accepts = checked.accepts();
@@ -840,31 +914,29 @@ impl<'a> ValueValidator<'a> {
                 LocalOutcome::Accepted(fit) => {
                     // This is a local fit only. It supports list uniqueness
                     // when every provider rejects, but never Union acceptance.
-                    let rank = judgement.failure_rank;
                     match &mut provider_failure {
                         Some(best) => {
                             if fit > best.local_fit.fit {
                                 best.local_fit = UnionFit { member, fit };
                             }
-                            if rank > best.diagnostic_rank
-                                || (rank == best.diagnostic_rank
-                                    && checked.findings.provider.len() < best.provider.len())
-                            {
-                                best.diagnostic_rank = rank;
+                            // Provider-only failures use count and declaration
+                            // order, independently of structural/local fit.
+                            if checked.findings.provider.len() < best.provider.len() {
                                 best.provider = checked.findings.provider;
                             }
                         }
                         None => {
                             provider_failure = Some(UnionProviderFailure {
                                 local_fit: UnionFit { member, fit },
-                                diagnostic_rank: rank,
                                 provider: checked.findings.provider,
                             })
                         }
                     }
                     continue;
                 }
-                LocalOutcome::Rejected(error) => error,
+                LocalOutcome::Rejected {
+                    primary: (_, error),
+                } => error,
             };
             if !judgement.failure_rank.is_match() {
                 continue;
@@ -877,14 +949,12 @@ impl<'a> ValueValidator<'a> {
                 Some(current) if judgement.failure_rank > current.failure_rank => {
                     *current = BestUnionMemberFailures::new(judgement.failure_rank, candidate);
                     sibling_provider_errors = checked.findings.provider;
+                    sibling_local_errors = checked.findings.additional_local_errors;
                 }
                 Some(current) if judgement.failure_rank == current.failure_rank => {
                     current.tied.push(candidate);
-                    for finding in checked.findings.provider {
-                        if !sibling_provider_errors.contains(&finding) {
-                            sibling_provider_errors.push(finding);
-                        }
-                    }
+                    // Local diagnostics may describe all tied forms, but the
+                    // provider findings belong only to the first tied arm.
                 }
                 Some(_) => {}
                 None => {
@@ -893,6 +963,7 @@ impl<'a> ValueValidator<'a> {
                         candidate,
                     ));
                     sibling_provider_errors = checked.findings.provider;
+                    sibling_local_errors = checked.findings.additional_local_errors;
                 }
             }
         }
@@ -926,10 +997,13 @@ impl<'a> ValueValidator<'a> {
             ),
         };
         Err(Box::new(UnionFailure {
-            local: LocalOutcome::Rejected(error.clone()),
+            local: LocalOutcome::Rejected {
+                primary: (path.clone(), error),
+            },
             findings: CheckedFindings {
-                local: vec![(path.clone(), error)],
+                additional_local_errors: sibling_local_errors,
                 provider: sibling_provider_errors,
+                ..Default::default()
             },
         }))
     }
@@ -979,15 +1053,12 @@ impl<'a> ValueValidator<'a> {
             local: LocalOutcome::Accepted(fit),
             findings: Default::default(),
         };
-        let requires_provider = self.lookup.is_some() && !has_native_validator(attr);
         if let Some(lookup) = self.lookup
-            && requires_provider
+            && !has_native_validator(attr)
         {
-            match self.canonical_leaf(attr, value, checked.local.fit(), requires_provider) {
+            match self.canonical_leaf(attr, value, checked.local.fit()) {
                 Ok(Some(proof)) => {
-                    if proof.requires_provider()
-                        && let Err(error) = lookup.validate(proof)
-                    {
+                    if let Err(error) = lookup.validate(proof) {
                         checked.findings.provider.push((path.clone(), error));
                     }
                 }
@@ -1008,11 +1079,10 @@ impl<'a> ValueValidator<'a> {
         attr: &'a CompiledAttributeType,
         value: &Value<P, B>,
         fit: Option<&Fit<'a>>,
-        requires_provider: bool,
     ) -> Result<Option<LocallyValidatedCustomType<'a>>, CanonicalLeafError<'a>> {
         // Native validation already ran. No dispatch means no value expansion
         // or canonical spelling is needed, including for standalone annotations.
-        if !requires_provider {
+        if has_native_validator(attr) {
             return Ok(None);
         }
         let Some(declaration) = crate::parser::IdentifiedCustomTypeDeclaration::new(attr) else {
@@ -1049,7 +1119,6 @@ impl<'a> ValueValidator<'a> {
             declaration,
             value,
             canonical,
-            requires_provider,
         }))
     }
 }
@@ -1071,6 +1140,254 @@ mod tests {
 
     fn text(value: &str) -> Value {
         Value::Concrete(ConcreteValue::String(value.into()))
+    }
+
+    #[test]
+    fn issue_4276_round2_a_local_union_keeps_selected_provider_findings() {
+        let remote = |name| AT::refined_string(Some(TypeIdentity::bare(name)), None, None, None);
+        let lookup = |declaration: &AT, _: &Value| {
+            let identity = crate::provider::identified_custom_type_identity(declaration).unwrap();
+            Err(TypeError::ValidationFailed {
+                message: format!("{} rejects bad", identity.kind).into(),
+            })
+        };
+        let cases = [
+            (
+                AT::union(vec![
+                    AT::struct_(
+                        "Named",
+                        vec![
+                            CompiledStructField::optional("name", remote("VpcId")).build(),
+                            CompiledStructField::required("size", AT::int()).build(),
+                        ],
+                    ),
+                    AT::bool(),
+                ]),
+                "name",
+                "Required attribute 'size' is missing",
+            ),
+            (
+                AT::union(vec![
+                    AT::struct_(
+                        "First",
+                        vec![
+                            CompiledStructField::required("v", remote("VpcId")).build(),
+                            CompiledStructField::required("x", AT::int()).build(),
+                        ],
+                    ),
+                    AT::struct_(
+                        "Second",
+                        vec![
+                            CompiledStructField::required("v", remote("SubnetId")).build(),
+                            CompiledStructField::required("y", AT::int()).build(),
+                        ],
+                    ),
+                ]),
+                "v",
+                "Expected one of these forms: ('v' and 'x') or ('v' and 'y')",
+            ),
+        ];
+        for (ty, field, local_message) in cases {
+            let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                field.into(),
+                text("bad"),
+            )])));
+            let errors = validate_value_with_lookup(
+                &ty,
+                &value,
+                &BTreeMap::new(),
+                FieldAncestry::WRITABLE,
+                &lookup,
+            )
+            .into_errors();
+            assert_eq!(
+                errors.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                vec![local_message, "Validation failed: VpcId rejects bad",]
+            );
+        }
+    }
+
+    #[test]
+    fn issue_4276_round2_b_provider_only_union_uses_count_then_declaration_order() {
+        let remote = |name| AT::refined_string(Some(TypeIdentity::bare(name)), None, None, None);
+        let lookup = |declaration: &AT, value: &Value| {
+            let identity = crate::provider::identified_custom_type_identity(declaration).unwrap();
+            if identity.kind == "SubnetId" && value == &text("subnet-1") {
+                return Ok(());
+            }
+            Err(TypeError::ValidationFailed {
+                message: format!(
+                    "{} rejects {}",
+                    identity.kind,
+                    if value == &text("bad") {
+                        "bad"
+                    } else {
+                        "subnet-1"
+                    }
+                )
+                .into(),
+            })
+        };
+        let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+            ("a".into(), text("bad")),
+            ("b".into(), text("subnet-1")),
+        ])));
+        for tie in [false, true] {
+            for reverse in [false, true] {
+                let mut arms = vec![
+                    AT::map(remote("SubnetId")),
+                    AT::struct_(
+                        "Named",
+                        vec![
+                            CompiledStructField::required("a", remote("VpcId")).build(),
+                            CompiledStructField::required(
+                                "b",
+                                if tie { AT::string() } else { remote("VpcId") },
+                            )
+                            .build(),
+                        ],
+                    ),
+                ];
+                if reverse {
+                    arms.reverse();
+                }
+                let errors = validate_value_with_lookup(
+                    &AT::union(arms),
+                    &value,
+                    &BTreeMap::new(),
+                    FieldAncestry::WRITABLE,
+                    &lookup,
+                )
+                .into_errors();
+                assert_eq!(
+                    errors.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    vec![if tie && reverse {
+                        "Validation failed: VpcId rejects bad"
+                    } else {
+                        "Validation failed: SubnetId rejects bad"
+                    }],
+                    "tie={tie}, reverse={reverse}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_4276_round2_e_deferred_union_does_not_expand_unloaded_arms() {
+        let unloaded = |name| AT {
+            kind: AttrTypeKind::UnloadedSchemaType(
+                crate::parser::UnloadedSchemaType::try_from(TypeIdentity::bare(name)).unwrap(),
+            ),
+        };
+        let members = vec![unloaded("VpcId"), unloaded("SubnetId")];
+        let ty = AT::union(members.clone());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let lookup = |_: &AT, _: &Value| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+        let defs = BTreeMap::new();
+        for value in [
+            Value::root_resource_ref("source", "id", Vec::new()),
+            Value::Deferred(DeferredValue::FunctionCall {
+                name: crate::builtins::BuiltinFunction::upper,
+                args: Vec::new(),
+                source_line: 1.into(),
+            }),
+            Value::Deferred(DeferredValue::Unknown(
+                crate::resource::ApplyTimeUnknown::UpstreamAllExports {
+                    binding: crate::resource::RootScope::new()
+                        .resolve(crate::resource::RelativeBindingName::new("upstream")),
+                },
+            )),
+        ] {
+            let checked = ValueValidator {
+                defs: &defs,
+                lookup: Some(&lookup),
+            }
+            .walk(
+                &ty,
+                &value,
+                &FieldPath::new(),
+                FieldAncestry::WRITABLE,
+                &mut Vec::new(),
+            );
+            let deferred = matches!(
+                checked.local,
+                LocalOutcome::Accepted(Fit {
+                    kind: FitKind::Deferred,
+                    ..
+                })
+            );
+            assert_eq!(checked.into_findings().into_errors(), Vec::new());
+            assert!(deferred);
+        }
+        for member in members {
+            let errors = validate_value_with_lookup(
+                &member,
+                &text("bad"),
+                &defs,
+                FieldAncestry::WRITABLE,
+                &lookup,
+            )
+            .into_errors();
+            assert_eq!(
+                errors.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                vec!["provider custom types are not loaded"]
+            );
+            assert!(
+                matches!(&errors[0], TypeError::CustomTypeValidation { error, .. } if matches!(error.as_ref(), crate::parser::CustomTypeValidationError::ProvidersNotLoaded))
+            );
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn issue_4276_round2_f_rejection_retains_a_primary_finding_without_manual_push() {
+        let ty = AT::bool();
+        let path = FieldPath::new().push_field("params").push_index(2);
+        let checked = CheckedValue::rejected(
+            &path,
+            TypeError::MissingRequired {
+                name: "size".into(),
+            },
+        );
+        assert_eq!(
+            checked
+                .into_findings()
+                .local
+                .iter()
+                .map(|(path, error)| (path.to_string(), error.to_string()))
+                .collect::<Vec<_>>(),
+            vec![(
+                "params[2]".into(),
+                "Required attribute 'size' is missing".into()
+            ),]
+        );
+        let mut checked = CheckedValue::accepted(&ty, FitExactness::EXACT, FitKind::Deferred);
+        checked.reject(
+            &FieldPath::new(),
+            TypeError::MissingRequired {
+                name: "size".into(),
+            },
+        );
+        let findings = checked.into_findings();
+        assert_eq!(
+            findings
+                .local
+                .iter()
+                .map(|(path, error)| (path.to_string(), error.to_string()))
+                .collect::<Vec<_>>(),
+            vec![(String::new(), "Required attribute 'size' is missing".into()),]
+        );
+        assert_eq!(
+            findings
+                .into_errors()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["Required attribute 'size' is missing"]
+        );
     }
 
     #[test]
@@ -1191,7 +1508,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_4276_round1_module_if_defers_local_errors_and_guards_provider_dispatch() {
+    fn issue_4276_round1_module_if_reports_local_errors_and_guards_provider_dispatch() {
         let ty = AT::refined_string(
             Some(TypeIdentity::bare("Short")),
             None,
@@ -1226,12 +1543,81 @@ mod tests {
             vec![text("ok")],
             "a locally invalid branch must never reach a provider"
         );
-        assert!(
-            findings.local.is_empty(),
-            "undecided branches must not produce local findings: {:?}",
-            findings.local
+        assert_eq!(
+            findings
+                .local
+                .iter()
+                .map(|(path, error)| (path.to_string(), error.to_string()))
+                .collect::<Vec<_>>(),
+            vec![(
+                String::new(),
+                "Invalid Short value 'too long': length 8 is outside allowed range [, 3]".into()
+            ),]
         );
-        assert!(findings.into_errors().is_empty());
+        assert_eq!(
+            findings
+                .into_errors()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["Invalid Short value 'too long': length 8 is outside allowed range [, 3]",]
+        );
+    }
+
+    #[test]
+    fn issue_4276_round2_c_module_if_reports_each_branchs_local_and_provider_errors() {
+        let ty = AT::refined_string(
+            Some(TypeIdentity::bare("VpcId")),
+            None,
+            Some((None, Some(5))),
+            None,
+        );
+        let lookup = |_: &AT, _: &Value| {
+            Err(TypeError::ValidationFailed {
+                message: "VpcId rejects bad".into(),
+            })
+        };
+        for both_local in [false, true] {
+            let value = Value::Deferred(DeferredValue::ModuleIf(Box::new(
+                crate::parser::DeferredValueIf::new(
+                    crate::parser::DeferredIfCondition::new(
+                        Value::Concrete(ConcreteValue::Bool(true)),
+                        "child/main.crn".into(),
+                        2,
+                    ),
+                    Value::Concrete(ConcreteValue::String(
+                        if both_local { "bad-long" } else { "bad" }.into(),
+                    )),
+                    Value::Concrete(ConcreteValue::String("vpc-123".into())),
+                ),
+            )));
+            let findings = validate_value_with_lookup(
+                &ty,
+                &value,
+                &BTreeMap::new(),
+                FieldAncestry::WRITABLE,
+                &lookup,
+            );
+            assert_eq!(findings.local.len(), if both_local { 2 } else { 1 });
+            assert_eq!(
+                findings
+                    .into_errors()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                if both_local {
+                    vec![
+                        "Invalid VpcId value 'bad-long': length 8 is outside allowed range [, 5]",
+                        "Invalid VpcId value 'vpc-123': length 7 is outside allowed range [, 5]",
+                    ]
+                } else {
+                    vec![
+                        "Invalid VpcId value 'vpc-123': length 7 is outside allowed range [, 5]",
+                        "Validation failed: VpcId rejects bad",
+                    ]
+                }
+            );
+        }
     }
 
     #[test]
@@ -1357,6 +1743,71 @@ mod tests {
 mod rootless_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn issue_4276_round2_d_string_list_defaults_stay_outside_authored_validation() {
+        let wire = carina_provider_protocol::types::Value::StringList(vec!["bad".into()]);
+        let decoded = crate::protocol_convert::protocol_schema_default_to_core(&wire).unwrap();
+        assert!(matches!(decoded, Value::Concrete(ConcreteValue::List(_))));
+        for default in [
+            Value::Concrete(ConcreteValue::StringList(vec!["bad".into()])),
+            decoded,
+        ] {
+            let schema = PatternResourceSchema::new("test.Sink")
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "params",
+                        PatternAttributeType::list(PatternAttributeType::refined_string(
+                            Some(TypeIdentity::bare("VpcId")),
+                            None,
+                            None,
+                            None,
+                        )),
+                    )
+                    .with_default(default)
+                    .build(),
+                )
+                .validate()
+                .unwrap();
+            let calls = AtomicUsize::new(0);
+            let lookup = |_: &CompiledAttributeType, _: &Value| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err(TypeError::ValidationFailed {
+                    message: "VpcId rejects bad".into(),
+                })
+            };
+            assert_eq!(schema.validate_with_origins_and_lookup::<crate::resource::NoPlaceholder, AbsoluteBindingAddress>(&HashMap::new(), &|_| false, &lookup), Ok(()));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "omitted defaults are not injected"
+            );
+            let values: [Value; 2] = [
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("bad".into()),
+                )])),
+                Value::Concrete(ConcreteValue::StringList(vec!["bad".into()])),
+            ];
+            for value in values {
+                let errors = schema
+                    .validate_with_origins_and_lookup(
+                        &HashMap::from([("params".into(), value)]),
+                        &|_| false,
+                        &lookup,
+                    )
+                    .unwrap_err();
+                assert_eq!(
+                    errors.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    vec!["Resource validation failed: VpcId rejects bad"]
+                );
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "present List and StringList elements share dispatch"
+            );
+        }
+    }
 
     #[test]
     fn issue_4276_round1_rootless_returns_only_primary_local_error() {

@@ -14564,7 +14564,7 @@ impl PatternResourceSchema<Compiled> {
             if schema.is_required() && !attributes.contains_key(name) && schema.default.is_none() {
                 report
                     .errors
-                    .push((false, TypeError::MissingRequired { name: name.clone() }));
+                    .push(TypeError::MissingRequired { name: name.clone() });
             }
         }
 
@@ -14585,13 +14585,10 @@ impl PatternResourceSchema<Compiled> {
                 .filter(|name| attributes.contains_key(name.as_str()))
                 .count();
             if !group.is_satisfied_by_count(present) {
-                report.errors.push((
-                    false,
-                    TypeError::FieldGroupViolation {
-                        path: FieldPath::new(),
-                        group: group.clone(),
-                    },
-                ));
+                report.errors.push(TypeError::FieldGroupViolation {
+                    path: FieldPath::new(),
+                    group: group.clone(),
+                });
             }
         }
 
@@ -14600,9 +14597,7 @@ impl PatternResourceSchema<Compiled> {
             && let Some(attributes) = attributes_without_placeholders(attributes)
             && let Err(mut validation_errors) = run_resource_validator(validator, &attributes)
         {
-            report
-                .errors
-                .extend(validation_errors.drain(..).map(|error| (false, error)));
+            report.errors.append(&mut validation_errors);
         }
 
         report
@@ -14648,7 +14643,7 @@ impl PatternResourceSchema<Compiled> {
                 if schema.is_read_only() && mode == ValueEntryValidation::FullInput {
                     report
                         .errors
-                        .push((false, TypeError::ReadOnlyAttribute { name: name.clone() }));
+                        .push(TypeError::ReadOnlyAttribute { name: name.clone() });
                     continue;
                 }
 
@@ -14659,7 +14654,7 @@ impl PatternResourceSchema<Compiled> {
                     FieldAncestry::from_input_mode(effective_attribute.effective_input_mode()),
                     lookup,
                 );
-                if let Some(error) = findings.local_error() {
+                for error in findings.local_errors() {
                     let tagged = error.clone().with_attribute(name);
                     let reshaped = if is_string_literal(name.as_str())
                         && matches!(effective_attribute.value_type().shape(), Shape::Enum { .. })
@@ -14668,13 +14663,13 @@ impl PatternResourceSchema<Compiled> {
                     } else {
                         tagged
                     };
-                    report.errors.push((false, reshaped));
+                    report.errors.push(reshaped);
                 }
                 report.errors.extend(
                     findings
                         .provider
                         .iter()
-                        .map(|(_, error)| (true, error.clone().with_attribute(name))),
+                        .map(|(_, error)| error.clone().with_attribute(name)),
                 );
                 report.attributes.insert(name.clone(), findings);
             } else if mode == ValueEntryValidation::FullInput {
@@ -14684,13 +14679,10 @@ impl PatternResourceSchema<Compiled> {
                 } else {
                     suggest_similar_name(name, &known)
                 };
-                report.errors.push((
-                    false,
-                    TypeError::UnknownAttribute {
-                        name: name.clone(),
-                        suggestion,
-                    },
-                ));
+                report.errors.push(TypeError::UnknownAttribute {
+                    name: name.clone(),
+                    suggestion,
+                });
             }
         }
 

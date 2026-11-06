@@ -7413,9 +7413,6 @@ fn dispatch_validated_custom_type(
     factory: &dyn ProviderFactory,
     proof: crate::schema::LocallyValidatedCustomType<'_>,
 ) -> Result<(), CustomTypeFactoryValidationError> {
-    if !proof.requires_provider() {
-        return Ok(());
-    }
     factory
         .validate_custom_type(proof.declaration().identity(), proof.canonical())
         .map_err(CustomTypeFactoryValidationError::ProviderRejected)

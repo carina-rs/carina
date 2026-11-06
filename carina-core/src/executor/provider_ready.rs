@@ -1396,6 +1396,104 @@ mod provider_config_tests {
         seen_values: Option<Arc<Mutex<Vec<String>>>>,
     }
 
+    #[tokio::test]
+    async fn issue_4276_round2_d_provider_normalized_string_list_is_not_revalidated() {
+        struct DefaultingNormalizer;
+        impl ProviderNormalizer for DefaultingNormalizer {
+            fn normalize_desired<'a>(
+                &'a self,
+                resources: &'a mut [ProviderResource],
+            ) -> BoxFuture<'a, ProviderResult<()>> {
+                Box::pin(async move {
+                    resources[0].set_attr(
+                        "value",
+                        Value::Concrete(ConcreteValue::StringList(vec!["bad".into()])),
+                    );
+                    Ok(())
+                })
+            }
+            fn normalize_state<'a>(
+                &'a self,
+                _: &'a mut crate::provider::StateTransformMap,
+            ) -> BoxFuture<'a, ProviderResult<()>> {
+                crate::provider::ready_noop()
+            }
+            fn hydrate_read_state<'a>(
+                &'a self,
+                _: &'a mut crate::provider::StateTransformMap,
+                _: &'a crate::provider::SavedAttrs,
+            ) -> BoxFuture<'a, ProviderResult<()>> {
+                crate::provider::ready_noop()
+            }
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(RoutingFactory {
+            name: "owner",
+            declaration: PatternAttributeType::list(PatternAttributeType::refined_string(
+                Some(TypeIdentity::bare("VpcId")),
+                None,
+                None,
+                None,
+            )),
+            sibling_declaration: None,
+            accepted: Some("vpc-good"),
+            validate_calls: Arc::clone(&calls),
+            seen_values: None,
+        })];
+        let schemas = test_schema_registry(&factories);
+        let bindings = ResolvedBindings::default();
+        let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |type_checks| {
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &DefaultingNormalizer,
+                    &factories,
+                    &schemas,
+                    type_checks,
+                );
+                let resource = Resource::with_provider("owner", "test.owner", "example", None);
+                let ready = prepare_provider_ready_resource(resource, &context)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    ready.as_resource().resolved_attributes().get("value"),
+                    Some(&Value::Concrete(ConcreteValue::StringList(vec![
+                        "bad".into()
+                    ])))
+                );
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "normalizer-introduced values bypass authored validation"
+                );
+
+                let authored = Resource::with_provider("owner", "test.owner", "example", None)
+                    .with_attribute(
+                        "value",
+                        Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                            ConcreteValue::String("bad".into()),
+                        )])),
+                    );
+                let error = prepare_provider_ready_resource(authored, &context)
+                    .await
+                    .unwrap_err();
+                let ProviderPreparationError::ValueConstraint { errors, .. } = error else {
+                    panic!("expected authored value constraint, got {error:?}")
+                };
+                assert_eq!(
+                    errors.0.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    vec!["owner rejected `VpcId`: owner accepts `vpc-good`, not `bad`"]
+                );
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            },
+        )
+        .await;
+    }
+
     impl ProviderFactory for RoutingFactory {
         fn name(&self) -> &str {
             self.name

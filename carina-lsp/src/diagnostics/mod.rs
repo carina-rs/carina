@@ -1504,6 +1504,7 @@ impl DiagnosticRun<'_> {
                         self.provider_context.catalog().custom_type_resolver(),
                     );
                     let mut reported_attribute_diagnostics = HashSet::new();
+                    let mut reported_union_local_errors = Vec::new();
                     for (attr_name, authored_attr_value) in resource_attributes.iter() {
                         let location = rref.attribute_value_location(
                             attr_name,
@@ -1742,6 +1743,9 @@ impl DiagnosticRun<'_> {
                                 }
                             };
                             let type_error = match (attr_shape, assignment_value) {
+                                // Each undecided branch contributes its own
+                                // local/provider errors to the shared report.
+                                (_, Value::Deferred(DeferredValue::ModuleIf(_))) => None,
                                 // Bool type should not receive String
                                 (
                                     carina_core::schema::Shape::Bool,
@@ -1982,13 +1986,32 @@ impl DiagnosticRun<'_> {
                                     )
                                 )
                             {
+                                let primary = attr_findings.local_error().cloned();
+                                let has_provider_findings = attr_findings.has_provider_findings();
+                                let local_findings = attr_findings.into_local_findings();
+                                let rendered_union_primary = matches!(
+                                    effective_type.shape(),
+                                    carina_core::schema::Shape::Union
+                                ) && has_provider_findings
+                                    && primary.as_ref().is_some_and(|primary| {
+                                        local_findings.iter().any(|(_, error)| error == primary)
+                                    });
                                 let (nested_diagnostics, reported_duplicate) = self
                                     .render_container_findings(
                                         doc,
                                         rref,
                                         attr_name,
-                                        attr_findings.into_local_findings(),
+                                        local_findings,
                                     );
+                                if let Some(primary) = primary.filter(|_| rendered_union_primary) {
+                                    let primary = primary.with_attribute(attr_name);
+                                    if nested_diagnostics
+                                        .iter()
+                                        .any(|diagnostic| diagnostic.message == primary.to_string())
+                                    {
+                                        reported_union_local_errors.push(primary);
+                                    }
+                                }
                                 if reported_duplicate {
                                     reported_attribute_diagnostics
                                         .insert(canonical_name.to_string());
@@ -2000,8 +2023,15 @@ impl DiagnosticRun<'_> {
 
                     // Render the report produced by the single owner-bound walk.
                     {
-                        for (_, error) in value_validation.errors() {
+                        for error in value_validation.errors() {
                             let error = error.clone();
+                            if let Some(index) = reported_union_local_errors
+                                .iter()
+                                .position(|reported| reported == &error)
+                            {
+                                reported_union_local_errors.remove(index);
+                                continue;
+                            }
                             if let carina_core::schema::TypeError::MissingRequired { name } = &error
                                 && pending_resource_sinks.iter().any(
                                     |(pending_resource, authored_name)| {
