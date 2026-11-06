@@ -154,9 +154,11 @@ pub(crate) async fn execute_import_effects<S: Clone>(
                 }
             };
             let identifier_display = if carina_core::value::contains_secret(identifier) {
-                "(secret)"
+                carina_core::resource::DiagnosticScope::Secret
+                    .path::<carina_core::resource::AbsoluteBindingAddress>(None)
+                    .to_dot_string()
             } else {
-                identifier_str.as_str()
+                identifier_str
             };
             println!(
                 "  {} Importing {} (id: {})...",

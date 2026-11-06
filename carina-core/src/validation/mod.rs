@@ -468,7 +468,7 @@ enum ModuleCallDiagnosticPath {
 impl ModuleCallDiagnosticPath {
     fn to_dot_string(&self) -> String {
         match self {
-            Self::Protected => "(secret)".into(),
+            Self::Protected => crate::schema::SECRET_VALUE_MASK.into(),
             Self::Authored(path) => path.to_dot_string(),
             Self::Expanded(path) => path.to_dot_string(),
         }
@@ -483,7 +483,11 @@ impl ModuleCallDiagnosticPath {
     ) -> std::fmt::Result {
         match self {
             Self::Protected => format_module_call_ref_error_with_path(
-                formatter, call_label, argument, "(secret)", kind,
+                formatter,
+                call_label,
+                argument,
+                crate::schema::SECRET_VALUE_MASK,
+                kind,
             ),
             Self::Authored(path) => format_module_call_ref_error_with_path(
                 formatter,
@@ -2520,7 +2524,7 @@ impl InsideSecret for DeferredAccessTypeError {
             },
             Self::TypeMismatch { types, .. } => Self::TypeMismatch {
                 types,
-                origin: "from (secret)".into(),
+                origin: format!("from {}", crate::schema::SECRET_VALUE_MASK),
             },
         }
     }

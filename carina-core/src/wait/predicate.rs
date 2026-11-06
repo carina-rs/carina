@@ -155,7 +155,7 @@ impl WaitResolutionError {
             Self::UnresolvedEnumIdentifier {
                 identifier: crate::resource::SecretDiagnosticError::InsideSecret,
                 ..
-            } => Some("(secret)"),
+            } => Some(crate::schema::SECRET_VALUE_MASK),
             Self::InvalidPath(_)
             | Self::UnknownAttribute { .. }
             | Self::UnknownStructField { .. }

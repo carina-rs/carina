@@ -109,7 +109,7 @@ impl crate::resource::InsideSecret for ReferencePlanError {
         };
         Self {
             path: self.path.inside_secret(),
-            raw: ValueString::diagnostic_sensitive("(secret)"),
+            raw: ValueString::diagnostic_sensitive(crate::schema::SECRET_VALUE_MASK),
             source,
             ..self
         }

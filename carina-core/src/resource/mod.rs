@@ -4741,7 +4741,7 @@ impl<P: ValueKind + fmt::Debug, B: BindingAddress> fmt::Debug for DeferredValue<
                 .field("source_line", &access.source_line())
                 .field("display_root", &access.display_root())
                 .finish(),
-            Self::Secret(_) => f.write_str("Secret((secret))"),
+            Self::Secret(_) => write!(f, "Secret({})", crate::schema::SECRET_VALUE_MASK),
             Self::Unknown(reason) => f.debug_tuple("Unknown").field(reason).finish(),
             Self::Placeholder(placeholder) => {
                 f.debug_tuple("Placeholder").field(placeholder).finish()

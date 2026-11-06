@@ -247,7 +247,7 @@ impl<P: super::PlaceholderKind> SecretPayload<P, super::AbsoluteBindingAddress> 
 
 impl<P: ValueKind, B: BindingAddress> std::fmt::Debug for SecretPayload<P, B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("(secret)")
+        f.write_str(crate::schema::SECRET_VALUE_MASK)
     }
 }
 

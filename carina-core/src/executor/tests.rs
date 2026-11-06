@@ -51,25 +51,13 @@ fn secret_origin_4275_round2_reported_error_keeps_safe_outer_context() {
         path: "private_producer.private_attr".into(),
         context: crate::value::SerializationContext::WasmBoundary,
     })
-    .with_public_context(PublicReportContext::ProviderDispatchAttribute {
+    .with_public_context(PublicReportContext::SecretAttribute {
         attribute: "password".into(),
-    })
-    .with_public_context(PublicReportContext::Creating {
-        resource: ResourceId::with_provider_identity(
-            "test",
-            "widget",
-            ResourceIdentity::new("example"),
-            None,
-        ),
     })
     .inside_secret();
     let rendered = render_error_chain(error.as_error());
     assert!(
-        rendered.contains("Creating test.widget.example"),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains("Attribute 'password': provider dispatch failed"),
+        rendered.contains("Attribute 'password': invalid value inside secret(...)"),
         "{rendered}"
     );
     assert!(

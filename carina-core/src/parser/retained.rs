@@ -1705,7 +1705,7 @@ mod judgement {
     impl std::fmt::Debug for JudgedExprData {
         fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             if self.diagnostic_scope.is_secret() {
-                return formatter.write_str("(secret)");
+                return formatter.write_str(crate::schema::SECRET_VALUE_MASK);
             }
             formatter
                 .debug_struct("JudgedExprData")

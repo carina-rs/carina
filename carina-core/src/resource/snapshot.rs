@@ -15,7 +15,7 @@ impl<P: PlaceholderKind> fmt::Display for SnapshotLeaf<P> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Expression(p) => fmt::Display::fmt(p, f),
-            Self::RedactedSecret { .. } => f.write_str("(secret)"),
+            Self::RedactedSecret { .. } => f.write_str(crate::schema::SECRET_VALUE_MASK),
         }
     }
 }
@@ -66,7 +66,7 @@ impl<P: PlaceholderKind> ValueKind for SnapshotLeaf<P> {
     fn render(&self) -> String {
         match self {
             Self::Expression(leaf) => leaf.render(),
-            Self::RedactedSecret { .. } => "(secret)".to_string(),
+            Self::RedactedSecret { .. } => crate::schema::SECRET_VALUE_MASK.to_string(),
         }
     }
 
@@ -170,7 +170,9 @@ pub struct UnavailableSecretError {
 
 impl UnavailableSecretError {
     pub fn path(&self) -> &str {
-        self.path.as_deref().unwrap_or("(secret)")
+        self.path
+            .as_deref()
+            .unwrap_or(crate::schema::SECRET_VALUE_MASK)
     }
 }
 

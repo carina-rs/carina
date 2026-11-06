@@ -112,7 +112,7 @@ impl ProviderWireError {
                 WirePathSegment::Index(index) => {
                     let _ = write!(path, "[{index}]");
                 }
-                WirePathSegment::Secret => path.push_str("(secret)"),
+                WirePathSegment::Secret => path.push_str(crate::schema::SECRET_VALUE_MASK),
             }
         }
         crate::provider_text::ProviderText::new(path)

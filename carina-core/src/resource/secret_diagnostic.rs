@@ -133,7 +133,9 @@ impl<B: super::BindingAddress> DiagnosticPath<B> {
     }
 
     pub fn to_dot_string(&self) -> String {
-        self.render(super::ReferencePath::to_dot_string, || "(secret)".into())
+        self.render(super::ReferencePath::to_dot_string, || {
+            crate::schema::SECRET_VALUE_MASK.into()
+        })
     }
 }
 

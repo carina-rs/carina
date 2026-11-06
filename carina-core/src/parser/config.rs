@@ -626,7 +626,8 @@ impl std::fmt::Display for CustomTypeValidationError {
                 if *masked {
                     write!(
                         formatter,
-                        "{owner} rejected `{identity}`: (secret) failed validation",
+                        "{owner} rejected `{identity}`: {} failed validation",
+                        crate::schema::SECRET_VALUE_MASK,
                         owner = ProviderText::new(owner),
                         identity = ProviderText::new(identity.to_string())
                     )
@@ -1576,8 +1577,6 @@ pub fn unavailable_provider_kinds<
 
 impl crate::resource::InsideSecret for CustomTypeValidationError {
     fn inside_secret(self) -> Self {
-        const MASKED_MESSAGE: &str = "(secret) failed validation";
-
         match self {
             Self::Rejected {
                 owner,
@@ -1586,7 +1585,7 @@ impl crate::resource::InsideSecret for CustomTypeValidationError {
             } => Self::Rejected {
                 owner,
                 identity,
-                message: MASKED_MESSAGE.into(),
+                message: format!("{} failed validation", crate::schema::SECRET_VALUE_MASK).into(),
             },
             Self::ProviderRejected {
                 owner,

@@ -1170,7 +1170,9 @@ impl DecodedPersistedJson {
             Self::Number(value) => serde_json::Value::Number(value),
             Self::String(value) => serde_json::Value::String(value),
             Self::Enum(value) => serde_json::Value::String(value.api_value().to_string()),
-            Self::Secret(_) => serde_json::Value::String("(secret)".to_string()),
+            Self::Secret(_) => {
+                serde_json::Value::String(crate::schema::SECRET_VALUE_MASK.to_string())
+            }
             Self::Array(values) => {
                 serde_json::Value::Array(values.into_iter().map(Self::into_ordinary_json).collect())
             }
@@ -1856,7 +1858,7 @@ fn format_value_into_context<P: ValueKind, B: BindingAddress>(
             }
         }
         Value::Deferred(DeferredValue::Secret(_)) => {
-            sink.write_token(ValueSpanKind::Other, "(secret)")
+            sink.write_token(ValueSpanKind::Other, crate::schema::SECRET_VALUE_MASK)
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => write_unknown(reason, sink, context),
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
@@ -1945,7 +1947,9 @@ fn format_decoded_persisted_json_into(
         DecodedPersistedJson::Enum(value) => {
             sink.write_token(ValueSpanKind::Enum, value.api_value())
         }
-        DecodedPersistedJson::Secret(_) => sink.write_token(ValueSpanKind::Other, "(secret)"),
+        DecodedPersistedJson::Secret(_) => {
+            sink.write_token(ValueSpanKind::Other, crate::schema::SECRET_VALUE_MASK)
+        }
         DecodedPersistedJson::Array(values) => {
             sink.write_token(ValueSpanKind::Structure, "[")?;
             for (index, value) in values.iter().enumerate() {

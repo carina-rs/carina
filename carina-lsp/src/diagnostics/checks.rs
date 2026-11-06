@@ -18,6 +18,7 @@ use carina_core::resource::{
     Value as GenericValue,
 };
 use carina_core::schema::suggest_similar_name;
+use carina_core::upstream_exports::UpstreamRefDiagnostic;
 use carina_core::validation::typecheck;
 
 use super::{

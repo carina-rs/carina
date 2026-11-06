@@ -6959,7 +6959,7 @@ fn join_expected(expected: &[ExpectedEnumVariant]) -> String {
         .join(", ")
 }
 
-const SECRET_VALUE_MASK: &str = "(secret)";
+pub(crate) const SECRET_VALUE_MASK: &str = "(secret)";
 
 fn format_string_literal_expected_enum(
     user_typed: &DiagnosticValue,
@@ -15700,8 +15700,6 @@ impl crate::resource::InsideSecret for FieldPath {
 
 impl crate::resource::InsideSecret for TypeError {
     fn inside_secret(self) -> Self {
-        const MASKED_MESSAGE: &str = "(secret) failed validation";
-
         match self {
             TypeError::InvalidEnumVariant {
                 value_kind,
@@ -15764,10 +15762,11 @@ impl crate::resource::InsideSecret for TypeError {
                 attribute,
                 type_name,
                 expected,
-                extra_message: extra_message.map(|_| MASKED_MESSAGE.into()),
+                extra_message: extra_message
+                    .map(|_| format!("{SECRET_VALUE_MASK} failed validation").into()),
             },
             TypeError::ValidationFailed { .. } => TypeError::ValidationFailed {
-                message: MASKED_MESSAGE.into(),
+                message: format!("{SECRET_VALUE_MASK} failed validation").into(),
             },
             TypeError::CustomTypeValidation { error, attribute } => {
                 TypeError::CustomTypeValidation {
@@ -15777,7 +15776,7 @@ impl crate::resource::InsideSecret for TypeError {
             }
             TypeError::ResourceValidationFailed { attribute, .. } => {
                 TypeError::ResourceValidationFailed {
-                    message: MASKED_MESSAGE.into(),
+                    message: format!("{SECRET_VALUE_MASK} failed validation").into(),
                     attribute,
                 }
             }

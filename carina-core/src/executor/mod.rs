@@ -850,8 +850,6 @@ impl<S> std::fmt::Debug for ExecutionCheckpointSink<S> {
 #[derive(Debug, Clone)]
 pub enum PublicReportContext {
     SecretAttribute { attribute: String },
-    ProviderDispatchAttribute { attribute: String },
-    Creating { resource: ResourceId },
 }
 
 impl std::fmt::Display for PublicReportContext {
@@ -861,10 +859,6 @@ impl std::fmt::Display for PublicReportContext {
                 "Attribute '{attribute}': {}",
                 crate::resource::INSIDE_SECRET_MESSAGE
             ),
-            Self::ProviderDispatchAttribute { attribute } => {
-                format!("Attribute '{attribute}': provider dispatch failed")
-            }
-            Self::Creating { resource } => format!("Creating {resource}"),
         };
         crate::provider_text::ProviderText::new(message).fmt(f)
     }

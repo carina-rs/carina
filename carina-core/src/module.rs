@@ -236,7 +236,7 @@ fn format_value(value: &Value) -> String {
                 }
             }
         }
-        Value::Deferred(DeferredValue::Secret(_)) => "(secret)".to_string(),
+        Value::Deferred(DeferredValue::Secret(_)) => crate::schema::SECRET_VALUE_MASK.to_string(),
         Value::Deferred(DeferredValue::Unknown(reason)) => crate::value::render_unknown(reason),
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => placeholder.to_string(),
     }
@@ -298,19 +298,30 @@ impl std::fmt::Debug for TypedDependency {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let protected = self.diagnostic_path.is_secret();
         f.debug_struct("TypedDependency")
-            .field("target", &if protected { "(secret)" } else { &self.target })
+            .field(
+                "target",
+                &if protected {
+                    crate::schema::SECRET_VALUE_MASK
+                } else {
+                    &self.target
+                },
+            )
             .field("target_type", &self.target_type)
             .field(
                 "attribute",
                 &if protected {
-                    "(secret)"
+                    crate::schema::SECRET_VALUE_MASK
                 } else {
                     &self.attribute
                 },
             )
             .field(
                 "used_in",
-                &if protected { "(secret)" } else { &self.used_in },
+                &if protected {
+                    crate::schema::SECRET_VALUE_MASK
+                } else {
+                    &self.used_in
+                },
             )
             .finish()
     }
@@ -348,7 +359,11 @@ impl TypedDependencyGraph {
                 return target;
             }
         }
-        if protected { "(secret)" } else { target }
+        if protected {
+            crate::schema::SECRET_VALUE_MASK
+        } else {
+            target
+        }
     }
 
     /// Get dependencies for a resource

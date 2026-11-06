@@ -1937,10 +1937,11 @@ impl DiagnosticRun<'_> {
                                         carina_core::schema::Shape::List { .. },
                                         Value::Concrete(
                                             ConcreteValue::List(_) | ConcreteValue::StringList(_)
-                                        )
+                                        ) | Value::Deferred(DeferredValue::Secret(_))
                                     ) | (
                                         carina_core::schema::Shape::Map { .. },
                                         Value::Concrete(ConcreteValue::Map(_))
+                                            | Value::Deferred(DeferredValue::Secret(_))
                                     )
                                 )
                             {
