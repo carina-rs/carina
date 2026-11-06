@@ -6097,7 +6097,7 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
 
 #[test]
 fn deposed_delete_waits_for_the_rows_in_flight_create() {
-    use carina_core::effect::{Effect, EffectGeneration};
+    use carina_core::effect::EffectGeneration;
     use carina_core::provider::Sent;
     use carina_state::state::{DeposedInstance, DeposedKey, ResourceState};
     use std::collections::HashMap;
@@ -6132,7 +6132,7 @@ fn deposed_delete_waits_for_the_rows_in_flight_create() {
 
     assert!(errors.is_empty());
     let [
-        Effect::Delete {
+        carina_core::effect::DeferredReplaceDelete {
             generation: EffectGeneration::Deposed(actual_key),
             blocked_by_updates,
             ..
@@ -9426,7 +9426,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         provider_context: carina_core::parser::ProviderContext::clone(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan_ctx.plan,
+        plan: &plan_ctx.plan.clone().admit(ctx.schemas()).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &data_source_origins,
@@ -15368,8 +15368,10 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                 let request = carina_core::executor::prepare_create_request(resource, &preparation)
                     .await
                     .unwrap();
-                let (create, cancellation) =
-                    carina_core::executor::dispatch_create(&provider, &id, request);
+                let (create, cancellation) = carina_core::executor::dispatch_create(
+                    &provider,
+                    carina_core::replacement::create_permit_for_test(request),
+                );
                 create.await.unwrap();
                 drop(cancellation);
                 let identifier = carina_core::provider::AppliedIdentifier::new("mock-id").unwrap();

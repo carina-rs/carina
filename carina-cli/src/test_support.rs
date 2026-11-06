@@ -7,6 +7,38 @@ use carina_core::{EnvironmentSnapshot, TestUserDirs};
 use carina_provider_mock::{ConfiguredBuiltinMock, MockBehavior, MockScope};
 use std::sync::{Arc, OnceLock};
 
+/// Presentation fixtures often omit provider schemas. Give those resource
+/// types an explicit coexistence policy; keep any schema supplied by the test.
+#[cfg(test)]
+pub(crate) fn admit_fixture_plan<S: Clone>(
+    plan: &carina_core::plan::Plan<S>,
+    schemas: Option<&carina_core::schema::SchemaRegistry>,
+) -> carina_core::plan::AdmittedPlan<S> {
+    let mut schemas = schemas.cloned().unwrap_or_default();
+    for effect in plan.effects() {
+        let id = effect.resource_id();
+        if schemas
+            .get(
+                &id.provider,
+                &id.resource_type,
+                carina_core::schema::SchemaKind::Resource,
+            )
+            .is_none()
+        {
+            schemas.insert(
+                &id.provider,
+                carina_core::schema::PatternResourceSchema::new(&id.resource_type)
+                    .with_coexisting_replacement()
+                    .validate()
+                    .unwrap(),
+            );
+        }
+    }
+    plan.clone()
+        .admit(&schemas)
+        .expect("fixture replacement admission")
+}
+
 /// Fixtures that cross analysis boundaries must originate in real syntax.
 #[cfg(test)]
 pub(crate) fn parsed_fixture(source: &str) -> carina_core::parser::ParsedFile {
@@ -204,11 +236,7 @@ mod graph_fixtures {
         template: Box<ExpandedDeferredForExpression>,
     ) -> DeferredReplacePayload {
         let payload = compiled_loop(template);
-        DeferredReplacePayload {
-            deletes,
-            template: payload.template,
-            dependency_template: payload.dependency_template,
-        }
+        DeferredReplacePayload::new(deletes, payload.template, payload.dependency_template)
     }
     pub fn persisted(
         rows: impl IntoIterator<Item = ResolvedResourceId>,

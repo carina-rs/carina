@@ -74,7 +74,11 @@ mod tests {
                 .expect("fixture mock inputs must be valid");
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         let model = build_model(PlanImageInput {
-            plan: &fixture.plan,
+            scheduled: &crate::test_support::admit_fixture_plan(
+                &fixture.plan,
+                Some(&fixture.schemas),
+            )
+            .schedule(&Default::default()),
             desired_resources: &fixture.desired_resources,
             unresolved_resources: &fixture.unresolved_resources,
             compositions: &fixture.compositions,

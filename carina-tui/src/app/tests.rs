@@ -281,7 +281,7 @@ fn whole_value_list_uses_whole_value_detail_row() {
         carina_core::provider::comparison_fixture_for_test(&schemas, std::iter::once(&id));
     let historical_display = HistoricalDisplayAttributes::for_plan(&plan);
     let app = App::new(
-        &plan,
+        &plan.clone().admit(&schemas).unwrap(),
         &schemas,
         &historical_display,
         Some(&prev_explicit),

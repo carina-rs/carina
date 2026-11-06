@@ -631,7 +631,7 @@ impl ReferencePreparation {
     #[allow(clippy::too_many_arguments)]
     pub async fn display(
         &mut self,
-        plan: crate::plan::Plan,
+        plan: crate::plan::AdmittedPlan,
         planning: &ResolvedReferences,
         historical: crate::detail_rows::HistoricalDisplayAttributes,
         detail: crate::detail_rows::DetailLevel,
@@ -762,11 +762,21 @@ impl ReferencePreparation {
             )
             .await?;
         let plan = prepared.value;
+        if plan.has_errors() {
+            return Ok(PreparedComparison {
+                value: plan,
+                references: prepared.references,
+            });
+        }
+        let admitted = plan
+            .clone()
+            .admit(registry)
+            .expect("successful fixture plan admits");
         let historical =
             crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, saved);
         let display = self
             .display(
-                plan.clone(),
+                admitted,
                 &prepared.references,
                 historical,
                 crate::detail_rows::DetailLevel::Full,
@@ -890,7 +900,7 @@ impl<'run> RecordingSession<'run> {
     #[allow(clippy::too_many_arguments)]
     fn render(
         self,
-        plan: Arc<crate::plan::Plan>,
+        plan: Arc<crate::plan::AdmittedPlan>,
         planning: &ResolvedReferences,
         historical: crate::detail_rows::HistoricalDisplayAttributes,
         detail: crate::detail_rows::DetailLevel,

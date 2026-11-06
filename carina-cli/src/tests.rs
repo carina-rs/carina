@@ -94,8 +94,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_41_for_typed_secrets_and_pinned_source_identity() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 41);
+fn saved_plan_version_is_42_for_replacement_admission_requests() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 42);
 }
 
 #[test]
@@ -564,7 +564,7 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
             provider_context: carina_core::parser::ProviderContext::clone(
                 &carina_core::parser::LoadedProviderContext::empty_for_test(),
             ),
-            plan: &plan,
+            plan: &plan.clone().admit(&schemas).unwrap(),
             provider_check_inputs: ProviderCheckInputs::Authored,
             compositions: &[],
             bindings: Default::default(),
@@ -4199,6 +4199,8 @@ fn plan_file_with_bound_deferred_template() -> PlanFile {
 
 fn plan_file_with_bound_deferred_replace_template() -> PlanFile {
     let delete = DeferredReplaceDelete {
+        generation: carina_core::effect::EffectGeneration::Current,
+        previous_attributes: Default::default(),
         id: carina_core::resource::ResolvedResourceId::with_provider_identity(
             "mock",
             "test.resource",

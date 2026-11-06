@@ -5,13 +5,378 @@ use crate::effect::{Effect, SchedulerKey};
 use crate::parser::CompiledDeferredForExpression as DeferredForExpression;
 use crate::resource::ResolvedResourceId;
 
-use super::UnresolvedResource;
-use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
-use super::parallel::apply_deferred_replace_delete_deps;
-use crate::effect::deps::{
-    DependencyAnalysis, DependencyAnalysisFailure, ScheduleInputs, UnresolvedRequiredDependency,
-    build_effect_dependency_analysis, relax_update_update_edges,
-};
+use super::deferred_dispatch::{PureMetaCtx, dispatch_deferred_create};
+use crate::effect::deps::UnresolvedRequiredDependency;
+
+/// Permission to send exactly one admitted, dependency-ready prepared request.
+/// The request is immutable and owned by the permit; dispatch accepts no substitute.
+///
+/// ```compile_fail,E0599
+/// use carina_core::replacement::CreatePermit;
+/// fn history(permit: &CreatePermit) { permit.old_instances(); }
+/// ```
+///
+/// ```compile_fail,E0451
+/// use carina_core::replacement::CreatePermit;
+/// let permit = CreatePermit { request: todo!() };
+/// ```
+pub struct CreatePermit {
+    request: Box<crate::provider::CreateRequest>,
+}
+
+impl std::fmt::Debug for CreatePermit {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CreatePermit")
+            .field("target", self.target())
+            .finish_non_exhaustive()
+    }
+}
+
+impl CreatePermit {
+    pub fn target(&self) -> &crate::resource::ResourceId {
+        &self.request.resource().id
+    }
+    pub fn request(&self) -> &crate::provider::CreateRequest {
+        &self.request
+    }
+    pub(crate) fn into_request(self) -> crate::provider::CreateRequest {
+        *self.request
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn create_permit_for_test(request: crate::provider::CreateRequest) -> CreatePermit {
+    CreatePermit {
+        request: Box::new(request),
+    }
+}
+
+pub(crate) struct DeletePermit {
+    instance: crate::effect::DeletedInstanceKey,
+    identifier: crate::provider::AppliedIdentifier,
+}
+impl DeletePermit {
+    pub(crate) fn id(&self) -> &crate::resource::ResourceId {
+        self.instance.id()
+    }
+    pub(crate) fn identifier(&self) -> &crate::provider::AppliedIdentifier {
+        &self.identifier
+    }
+    pub(crate) fn instance(&self) -> &crate::effect::DeletedInstanceKey {
+        &self.instance
+    }
+}
+
+/// Only dependency-ready release can construct this token or its sealed resource.
+pub(crate) struct ReadyCreate<S> {
+    resource: Box<crate::resource::ResolvedResource<S>>,
+}
+impl<S: Clone> ReadyCreate<S> {
+    #[cfg(test)]
+    pub(crate) fn target(&self) -> &crate::resource::ResourceId {
+        &self.resource.id
+    }
+
+    pub(super) async fn prepare(
+        self,
+        inputs: &super::ProviderCheckInputs<'_, S>,
+        runtime_authored: bool,
+        context: &super::ProviderPreparationContext<'_>,
+    ) -> Result<
+        (
+            CreatePermit,
+            crate::binding_index::SecretPreservingAttributes,
+        ),
+        super::EffectFailureKind,
+    > {
+        let input = inputs.resource_input(self.resource.as_inner(), runtime_authored);
+        let (resolved, attributes) = super::basic::resolve_resource(input, context).await?;
+        Ok((
+            CreatePermit {
+                request: Box::new(crate::provider::CreateRequest::checked(resolved)),
+            },
+            attributes,
+        ))
+    }
+}
+
+pub(crate) enum ScheduledResume<S> {
+    Resend {
+        pending: Box<crate::provider::InFlightCreate>,
+        create: ReadyCreate<S>,
+    },
+    Poll(Box<crate::provider::InFlightCreate>),
+    Missing,
+}
+
+pub(super) enum PreparedResume {
+    Resend(crate::provider::ResumeCreateRequest),
+    Poll(crate::provider::PollCreateRequest),
+}
+impl<S: Clone> ScheduledResume<S> {
+    pub(super) async fn prepare(
+        self,
+        resource: &crate::resource::ResolvedResource<S>,
+        inputs: &super::ProviderCheckInputs<'_, S>,
+        runtime_authored: bool,
+        context: &super::ProviderPreparationContext<'_>,
+    ) -> Result<
+        (
+            PreparedResume,
+            crate::binding_index::SecretPreservingAttributes,
+            super::AcceptedRequest,
+        ),
+        super::EffectFailureKind,
+    > {
+        let (request, attributes, pending) = match self {
+            Self::Resend { pending, create } => {
+                let (permit, attributes) =
+                    create.prepare(inputs, runtime_authored, context).await?;
+                let accepted = super::AcceptedRequest::from_create_request(permit.request())
+                    .with_resolved_desired_attributes(attributes.clone());
+                let request = crate::provider::ResumeCreateRequest::new(*pending, permit)
+                    .map_err(super::EffectFailureKind::execution)?;
+                return Ok((PreparedResume::Resend(request), attributes, accepted));
+            }
+            Self::Poll(pending) => {
+                let input = inputs.resource_input(resource.as_inner(), runtime_authored);
+                let (resolved, attributes) = super::basic::resolve_resource(input, context).await?;
+                (
+                    crate::provider::CreateRequest::checked(resolved),
+                    attributes,
+                    pending,
+                )
+            }
+            Self::Missing => {
+                let input = inputs.resource_input(resource.as_inner(), runtime_authored);
+                super::basic::resolve_resource(input, context).await?;
+                return Err(super::EffectFailureKind::message(format!(
+                    "saved create continuation for {} changed before dispatch",
+                    resource.id
+                )));
+            }
+        };
+        let accepted = super::AcceptedRequest::from_create_request(&request)
+            .with_resolved_desired_attributes(attributes.clone());
+        let request = crate::provider::PollCreateRequest::new(*pending, request)
+            .map_err(super::EffectFailureKind::execution)?;
+        Ok((PreparedResume::Poll(request), attributes, accepted))
+    }
+}
+
+/// Basic provider operations released by the dependency scheduler.
+///
+/// ```compile_fail,E0599
+/// use carina_core::effect::Effect;
+/// fn narrow(effect: &Effect) { effect.as_basic(); }
+/// ```
+pub(crate) enum ScheduledBasicEffect<S> {
+    Create {
+        effect: Effect<S>,
+        resource: crate::resource::ResolvedResource<S>,
+        create: ReadyCreate<S>,
+    },
+    ResumeCreate {
+        effect: Effect<S>,
+        resource: crate::resource::ResolvedResource<S>,
+        resume: ScheduledResume<S>,
+    },
+    Update {
+        effect: Effect<S>,
+        from: Box<crate::resource::SnapshotState>,
+        identifier: crate::provider::AppliedIdentifier,
+        to: crate::resource::ResolvedResource<S>,
+        changed_attributes: Vec<String>,
+    },
+    Delete {
+        effect: Effect<S>,
+        directives: crate::resource::Directives,
+        permit: DeletePermit,
+    },
+}
+impl<S> ScheduledBasicEffect<S> {
+    pub(crate) fn as_effect(&self) -> &Effect<S> {
+        match self {
+            Self::Create { effect, .. }
+            | Self::ResumeCreate { effect, .. }
+            | Self::Update { effect, .. }
+            | Self::Delete { effect, .. } => effect,
+        }
+    }
+}
+
+pub(super) struct ReadyEffect<S> {
+    effect: Effect<S>,
+    continuation: Option<crate::provider::InFlightCreate>,
+}
+impl<S: Clone> ReadyEffect<S> {
+    pub(super) fn into_basic(self) -> Option<ScheduledBasicEffect<S>> {
+        let effect = self.effect;
+        Some(match effect.clone() {
+            Effect::Create(resource) => ScheduledBasicEffect::Create {
+                effect,
+                create: ReadyCreate {
+                    resource: Box::new(resource.clone()),
+                },
+                resource,
+            },
+            Effect::ResumeCreate { resource, .. } => {
+                let resume = match self.continuation {
+                    Some(pending) if pending.id() != &resource.id => ScheduledResume::Missing,
+                    Some(pending) if pending.identifier().is_some() => {
+                        ScheduledResume::Poll(Box::new(pending))
+                    }
+                    Some(pending) => ScheduledResume::Resend {
+                        pending: Box::new(pending),
+                        create: ReadyCreate {
+                            resource: Box::new(resource.clone()),
+                        },
+                    },
+                    None => ScheduledResume::Missing,
+                };
+                ScheduledBasicEffect::ResumeCreate {
+                    effect,
+                    resource,
+                    resume,
+                }
+            }
+            Effect::Update {
+                from,
+                identifier,
+                to,
+                changed_attributes,
+            } => ScheduledBasicEffect::Update {
+                effect,
+                from,
+                identifier,
+                to,
+                changed_attributes,
+            },
+            Effect::Delete {
+                id,
+                generation,
+                identifier,
+                directives,
+                ..
+            } => {
+                let instance = crate::effect::DeletedInstanceKey::new(
+                    id.as_inner().clone(),
+                    generation,
+                    identifier.as_str(),
+                );
+                ScheduledBasicEffect::Delete {
+                    effect,
+                    directives,
+                    permit: DeletePermit {
+                        instance,
+                        identifier,
+                    },
+                }
+            }
+            Effect::Read { .. }
+            | Effect::Wait { .. }
+            | Effect::DeferredCreate(_)
+            | Effect::DeferredReplace(_)
+            | Effect::Import { .. }
+            | Effect::Remove { .. }
+            | Effect::Move { .. }
+            | Effect::ReleaseListKeys { .. } => return None,
+        })
+    }
+}
+
+/// This is the only production constructor for dispatch-capable endpoints.
+/// The schedule owns both the prepared targets and the continuation choice;
+/// completion and failure state come from the executor, never a public index API.
+pub(super) fn release_ready_effect<S: Clone>(
+    scheduled: &crate::replacement::ScheduledPlan<'_, S>,
+    index: usize,
+    dependencies: &HashMap<usize, HashSet<usize>>,
+    completed: &HashSet<usize>,
+    failed: &HashSet<usize>,
+) -> Option<Result<ReadyEffect<S>, FailedDependency>> {
+    if !dependencies
+        .get(&index)?
+        .iter()
+        .all(|dependency| completed.contains(dependency))
+    {
+        return None;
+    }
+    if let Some(failed) =
+        FailureView::new(scheduled.effects(), dependencies, failed).find_failed_dependency(index)
+    {
+        return Some(Err(failed));
+    }
+    let effect = scheduled.effects().get(index)?.clone();
+    let continuation = scheduled.continuation(effect.resource_id()).cloned();
+    Some(Ok(ReadyEffect {
+        effect,
+        continuation,
+    }))
+}
+
+/// Prepare an initially ready create without starting a full apply, for
+/// bootstrap callers. This uses the executor's release and the sealed target;
+/// an endpoint with pending prerequisites yields no permission.
+pub async fn prepare_initial_create(
+    scheduled: &crate::replacement::ScheduledPlan<'_>,
+    graph: &crate::resolved_graph::ExpandedBindingIndex,
+    context: &super::ProviderPreparationContext<'_>,
+) -> Result<Option<CreatePermit>, super::ProviderPreparationError> {
+    let (scheduled, _, _) = scheduled.clone().expand_deferred_replacements();
+    let dependencies = build_scheduler_deps(&scheduled, graph.scheduler_target_ids());
+    let completed = HashSet::new();
+    for index in 0..scheduled.effects().len() {
+        if dependencies
+            .unresolved
+            .iter()
+            .any(|dependency| dependency.effect_index() == index)
+        {
+            continue;
+        }
+        let Some(Ok(ready)) = release_ready_effect(
+            &scheduled,
+            index,
+            &dependencies.deps_of,
+            &completed,
+            &HashSet::new(),
+        ) else {
+            continue;
+        };
+        if let Some(ScheduledBasicEffect::Create { create, .. }) = ready.into_basic() {
+            let resource = super::provider_ready::prepare_provider_ready_resource(
+                (*create.resource).into_inner(),
+                context,
+            )
+            .await?;
+            let request = crate::provider::CreateRequest::checked(resource);
+            return Ok(Some(CreatePermit {
+                request: Box::new(request),
+            }));
+        }
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+pub(crate) fn release_basic_for_test<S: Clone>(
+    scheduled: &crate::replacement::ScheduledPlan<'_, S>,
+    index: usize,
+    completed: &HashSet<usize>,
+) -> Option<ScheduledBasicEffect<S>> {
+    let dependencies = build_scheduler_deps(scheduled, std::iter::empty());
+    release_ready_effect(
+        scheduled,
+        index,
+        &dependencies.deps_of,
+        completed,
+        &HashSet::new(),
+    )?
+    .ok()?
+    .into_basic()
+}
 
 pub(super) struct SchedulerDeps {
     pub(super) deps_of: HashMap<usize, HashSet<usize>>,
@@ -35,7 +400,7 @@ impl<'a, S> PureMetaStep<'a, S> {
             Effect::DeferredReplace(payload) => Some(Self {
                 effect,
                 template: payload.template.as_ref(),
-                dependencies: &payload.dependency_template,
+                dependencies: payload.dependency_template(),
             }),
             Effect::Create(_)
             | Effect::ResumeCreate { .. }
@@ -53,22 +418,22 @@ impl<'a, S> PureMetaStep<'a, S> {
 
 pub(super) enum PureMetaOutcome<S> {
     NotPureMeta,
-    Materialized(Vec<Effect<S>>),
+    Materialized(crate::replacement::AdmittedReplacementEffects<S>),
     Failed(super::DeferredCreateFailure),
 }
 
 pub(super) fn try_dispatch_pure_meta<S: Clone + crate::resource::AnonymousIdentityModuleSource>(
     effect: &Effect<S>,
     bindings: &ResolvedBindings,
-    ctx: &PureMetaCtx<'_>,
+    ctx: &PureMetaCtx<'_, S>,
 ) -> PureMetaOutcome<S> {
     let Some(step) = PureMetaStep::from_effect(effect) else {
         return PureMetaOutcome::NotPureMeta;
     };
 
     match dispatch_deferred_create(step.effect, step.template, step.dependencies, bindings, ctx) {
-        DeferredDispatchResult::Materialized(children) => PureMetaOutcome::Materialized(children),
-        DeferredDispatchResult::MaterializeFailed(failure) => PureMetaOutcome::Failed(failure),
+        Ok(children) => PureMetaOutcome::Materialized(children),
+        Err(failure) => PureMetaOutcome::Failed(failure),
     }
 }
 
@@ -97,51 +462,15 @@ pub(super) fn failure_display_name<S>(effect: &Effect<S>) -> Option<String> {
     }
 }
 
-pub(super) fn build_scheduler_deps<S>(
-    effects: &[Effect<S>],
-    unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
-    deferred_replace_delete_deps: &[(usize, usize)],
+pub(super) fn build_scheduler_deps<'a, S: Clone>(
+    admitted: &crate::replacement::AdmittedReplacementEffects<S>,
+    unresolved_resources: impl IntoIterator<Item = &'a ResolvedResourceId>,
 ) -> SchedulerDeps {
-    finish_scheduler_deps(
-        effects,
-        build_effect_dependency_analysis(
-            effects,
-            unresolved_resources.keys(),
-            ScheduleInputs::Apply,
-        ),
-        deferred_replace_delete_deps,
-    )
-}
-
-pub(super) fn build_scheduler_deps_from_resources(
-    effects: &[Effect],
-    unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
-    deferred_replace_delete_deps: &[(usize, usize)],
-) -> SchedulerDeps {
-    let effect_refs: Vec<_> = effects.iter().collect();
-    finish_scheduler_deps(
-        effects,
-        build_effect_dependency_analysis(
-            &effect_refs,
-            unresolved_resources.keys(),
-            ScheduleInputs::Apply,
-        ),
-        deferred_replace_delete_deps,
-    )
-}
-
-fn finish_scheduler_deps<S>(
-    effects: &[Effect<S>],
-    analysis: Result<DependencyAnalysis, DependencyAnalysisFailure>,
-    deferred_replace_delete_deps: &[(usize, usize)],
-) -> SchedulerDeps {
-    let (mut analysis, unresolved) = match analysis {
+    let (analysis, unresolved) = match admitted.dependency_analysis(unresolved_resources) {
         Ok(analysis) => (analysis, Vec::new()),
         Err(failure) => failure.into_parts(),
     };
-    relax_update_update_edges(effects, &mut analysis);
-    let mut deps_of = analysis.into_deps_of();
-    apply_deferred_replace_delete_deps(effects, &mut deps_of, deferred_replace_delete_deps);
+    let deps_of = analysis.into_deps_of();
     SchedulerDeps {
         deps_of,
         unresolved,

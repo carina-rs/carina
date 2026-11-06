@@ -5,22 +5,23 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use super::scheduler::PreparedResume;
 use crate::binding_index::{
     AppliedOperation, BindingCompleteness, PartialReadBack, ResolvedBindings,
     SecretPreservingAttributes,
 };
 use crate::differ::secret_grafted_comparison_view;
-use crate::effect::{BasicEffect, DeletedInstanceKey, Effect, EffectGeneration};
+use crate::effect::{DeletedInstanceKey, Effect, EffectGeneration};
 use crate::executor::provider_ready::{
     CheckInput, DataSourceCheckInput, ProviderPreparationContext, ResolvedCheckInput,
     ResourceCheckInput, managed_update_schema, prepare_provider_ready_resource_after_resolution,
 };
 use crate::provider::{
-    AppliedIdentifier, CompletedResume, CreateFailureKind, CreateRequest, DeleteRequest,
-    PartialReadDiagnostic, PartialResume, Provider, ProviderReadyResource, ProviderRouter,
-    ReadBackEnd, ReadRequest, ResumeCreateRequest, ResumeFailureKind, ResumeOutcomeKind,
-    UpdateRequest,
+    AppliedIdentifier, CompletedResume, CreateFailureKind, DeleteRequest, PartialReadDiagnostic,
+    PartialResume, Provider, ProviderReadyResource, ProviderRouter, ReadBackEnd, ReadRequest,
+    ResumeFailureKind, ResumeOutcomeKind, UpdateRequest,
 };
+use crate::replacement::ScheduledBasicEffect;
 use crate::resolver::resolve_ref_value;
 #[cfg(test)]
 use crate::resource::Resource;
@@ -894,26 +895,20 @@ pub(super) struct BasicEffectCtx<'a, S> {
     pub(super) provider_check_inputs: &'a super::ProviderCheckInputs<'a, S>,
     pub(super) runtime_authored: bool,
     pub(super) preparation: &'a ProviderPreparationContext<'a>,
-    pub(super) resume_create: Option<crate::provider::InFlightCreate>,
     pub(super) completed: &'a AtomicUsize,
     pub(super) total: usize,
 }
 
 /// Execute a single Create, Update, or Delete effect.
 ///
-/// Takes a [`BasicEffect`] — a type-level narrowing of `Effect` to the
-/// three variants this function actually handles. Non-basic variants
-/// (`Replace`/`Read`/`Import`/`Remove`/`Move`/`Wait`) cannot reach this
-/// function because [`Effect::as_basic`] is the only constructor and
-/// returns `None` for them. This contract used to live in caller-side
-/// filters with an `unreachable!()` backstop; a missed filter
-/// (carina#3164) panicked apply with `execute_basic_effect called
-/// with non-basic effect`. The type now enforces it.
+/// Takes an admitted scheduling endpoint. Raw effects
+/// cannot enter this boundary: creates, resends and old-generation Deletes
+/// must carry the capabilities minted by replacement admission.
 ///
 /// Returns a started result whose token must be consumed to emit the terminal
 /// event before callers process its state changes.
-pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
-    basic: BasicEffect<'effect, S>,
+pub(super) async fn execute_basic_effect<'observer, S: Clone>(
+    basic: ScheduledBasicEffect<S>,
     ctx: &BasicEffectCtx<'_, S>,
     in_flight_start: InFlightStart<S>,
     observer: &'observer dyn ExecutionObserver<S>,
@@ -932,13 +927,14 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
     let mut started_effect = in_flight_start.emit_started(observer, effect, progress);
 
     let outcome = match basic {
-        BasicEffect::Create { resource, .. } => {
-            let check_input = ctx
-                .provider_check_inputs
-                .resource_input(resource.as_inner(), ctx.runtime_authored);
-            let (resolved, resolved_attrs) = match resolve_resource(check_input, preparation).await
+        ScheduledBasicEffect::Create {
+            resource, create, ..
+        } => {
+            let (permit, resolved_attrs) = match create
+                .prepare(ctx.provider_check_inputs, ctx.runtime_authored, preparation)
+                .await
             {
-                Ok(r) => r,
+                Ok(prepared) => prepared,
                 Err(failure) => {
                     return StartedBasicEffectResult::new(
                         started_effect,
@@ -950,10 +946,9 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     );
                 }
             };
-            let request = CreateRequest::checked(resolved);
-            let accepted_request = AcceptedRequest::from_create_request(&request)
+            let accepted_request = AcceptedRequest::from_create_request(permit.request())
                 .with_resolved_desired_attributes(resolved_attrs.clone());
-            let (create, cancellation) = super::dispatch_create(provider, &resource.id, request);
+            let (create, cancellation) = super::dispatch_create(provider, permit);
             started_effect.track_create_cancellation(cancellation);
             match create.await {
                 Ok(outcome) => {
@@ -1023,13 +1018,19 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 },
             }
         }
-        BasicEffect::ResumeCreate { resource, .. } => {
-            let check_input = ctx
-                .provider_check_inputs
-                .resource_input(resource.as_inner(), ctx.runtime_authored);
-            let (resolved, resolved_attrs) = match resolve_resource(check_input, preparation).await
+        ScheduledBasicEffect::ResumeCreate {
+            resource, resume, ..
+        } => {
+            let (request, resolved_attrs, accepted_request) = match resume
+                .prepare(
+                    &resource,
+                    ctx.provider_check_inputs,
+                    ctx.runtime_authored,
+                    preparation,
+                )
+                .await
             {
-                Ok(resolved) => resolved,
+                Ok(prepared) => prepared,
                 Err(failure) => {
                     return StartedBasicEffectResult::new(
                         started_effect,
@@ -1041,43 +1042,15 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     );
                 }
             };
-            let pending = match &ctx.resume_create {
-                Some(pending) => pending.clone(),
-                None => {
-                    let error = format!(
-                        "saved create continuation for {} changed before dispatch",
-                        resource.id
-                    );
-                    return StartedBasicEffectResult::new(
-                        started_effect,
-                        started,
-                        BasicEffectResult::Failure {
-                            failure: EffectFailureKind::message(error),
-                            refresh: None,
-                        },
-                    );
+            let outcome = match request {
+                PreparedResume::Resend(request) => {
+                    super::dispatch_resume_create(provider, request).await
+                }
+                PreparedResume::Poll(request) => {
+                    super::dispatch_poll_create(provider, request).await
                 }
             };
-            let create_request = CreateRequest::checked(resolved);
-            let accepted_request = AcceptedRequest::from_create_request(&create_request)
-                .with_resolved_desired_attributes(resolved_attrs.clone());
-            let request = match ResumeCreateRequest::new(pending, create_request) {
-                Ok(request) => request,
-                Err(error) => {
-                    return StartedBasicEffectResult::new(
-                        started_effect,
-                        started,
-                        BasicEffectResult::Failure {
-                            failure: EffectFailureKind::execution(error),
-                            refresh: None,
-                        },
-                    );
-                }
-            };
-            match super::dispatch_resume_create(provider, request)
-                .await
-                .map(crate::provider::ResumeOutcome::into_kind)
-            {
+            match outcome.map(crate::provider::ResumeOutcome::into_kind) {
                 Ok(ResumeOutcomeKind::Resumed(completed)) => {
                     let completed =
                         completed.with_resolved_desired_attributes(resolved_attrs.clone());
@@ -1157,7 +1130,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 },
             }
         }
-        BasicEffect::Update {
+        ScheduledBasicEffect::Update {
             from,
             identifier,
             to,
@@ -1288,7 +1261,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 }
             }
             let request = match UpdateRequest::checked(
-                from.clone(),
+                *from.clone(),
                 &effective_changed,
                 &resolved_to,
                 schema,
@@ -1307,7 +1280,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             };
             let accepted_request =
                 AcceptedRequest::from_update_request(&request, resolved_desired_attributes.clone());
-            match provider.update(id, identifier, request).await {
+            match provider.update(id, &identifier, request).await {
                 Ok(outcome) => {
                     let diagnostic = outcome.diagnostic().cloned();
                     let read_back_end = outcome.read_back_end();
@@ -1342,25 +1315,20 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 },
             }
         }
-        BasicEffect::Delete {
-            id,
-            identifier,
-            generation,
-            directives,
-            ..
+        ScheduledBasicEffect::Delete {
+            directives, permit, ..
         } => {
+            let id = permit.id();
+            let identifier = permit.identifier();
+            let generation = permit.instance().generation();
             let resolved_directives =
                 preparation
                     .schemas()
-                    .resolve_directives(id, SchemaKind::Resource, directives);
+                    .resolve_directives(id, SchemaKind::Resource, &directives);
             let request = DeleteRequest::from_resolved(resolved_directives);
             match provider.delete(id, identifier, request).await {
                 Ok(()) => BasicEffectResult::Deleted {
-                    instance_key: DeletedInstanceKey::new(
-                        id.clone(),
-                        generation.clone(),
-                        identifier.to_string(),
-                    ),
+                    instance_key: permit.instance().clone(),
                 },
                 Err(error) => BasicEffectResult::Failure {
                     failure: EffectFailureKind::provider(error),
@@ -1414,6 +1382,7 @@ mod process_basic_result_tests {
             interrupted_count: 0,
             applied_states: HashMap::new(),
             runtime_synthesized_resources: Vec::new(),
+            replacement_writeback: Vec::new(),
             successfully_deleted: HashSet::new(),
             permanent_name_overrides: HashMap::new(),
             managed_current: HashMap::new(),

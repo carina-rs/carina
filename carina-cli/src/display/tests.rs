@@ -25,7 +25,7 @@ fn concrete(value: ConcreteValue) -> Value {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn format_plan_for_test<S, D: HistoricalDisplaySource<S> + ?Sized>(
+fn format_plan_for_test<S: Clone, D: HistoricalDisplaySource<S> + ?Sized>(
     color_mode: crate::output_style::ColorMode,
     plan: &Plan<S>,
     summary: &PlanChangeSummary,
@@ -41,9 +41,10 @@ fn format_plan_for_test<S, D: HistoricalDisplaySource<S> + ?Sized>(
         plan,
     )
     .expect("fixture mock inputs must be valid");
+    let plan = crate::test_support::admit_fixture_plan(plan, schemas);
     format_plan_with_delete_instances(
         color_mode,
-        plan,
+        &plan,
         summary,
         detail,
         historical_display,
@@ -153,7 +154,7 @@ fn test_print_plan_with_external_dependency_does_not_panic() {
     // Should not panic
     print_plan(
         color_mode,
-        &plan,
+        &crate::test_support::admit_fixture_plan(&plan, None),
         &PlanChangeSummary::new(
             &plan,
             &[],
@@ -240,7 +241,7 @@ fn test_print_plan_with_internal_dependency_does_not_panic() {
     // Should not panic
     print_plan(
         color_mode,
-        &plan,
+        &crate::test_support::admit_fixture_plan(&plan, None),
         &PlanChangeSummary::new(
             &plan,
             &[],
@@ -788,7 +789,7 @@ fn test_print_plan_compact_does_not_panic() {
     // Should not panic
     print_plan(
         color_mode,
-        &plan,
+        &crate::test_support::admit_fixture_plan(&plan, None),
         &PlanChangeSummary::new(
             &plan,
             &[],
@@ -834,7 +835,7 @@ fn test_print_plan_compact_with_anonymous_resources() {
     // Should not panic; anonymous resources should show hints
     print_plan(
         color_mode,
-        &plan,
+        &crate::test_support::admit_fixture_plan(&plan, None),
         &PlanChangeSummary::new(
             &plan,
             &[],
@@ -1120,8 +1121,10 @@ fn deferred_replace_validation_records_effect() -> Effect {
         unreachable!("helper constructs Delete")
     };
 
-    Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+    Effect::DeferredReplace(Box::new(DeferredReplacePayload::new(
+        NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+            generation: carina_core::effect::EffectGeneration::Current,
+            previous_attributes: Default::default(),
             id: delete_id,
             identifier,
             directives,
@@ -1131,9 +1134,9 @@ fn deferred_replace_validation_records_effect() -> Effect {
             blocked_by_updates,
         }])
         .expect("fixture has one delete"),
-        template: payload.template,
-        dependency_template: payload.dependency_template,
-    }))
+        payload.template,
+        payload.dependency_template,
+    )))
 }
 
 #[test]
@@ -1162,7 +1165,7 @@ fn test_deferred_replace_renders_top_level() {
     insta::assert_snapshot!(output, @"
     Execution Plan:
 
-      +/- aws.route53.Record validation_records[*] (N records after cert resolves)
+      -/+ aws.route53.Record validation_records[*] (N records after cert resolves)
           <- for opt in cert.domain_validation_options
           name: (known after cert resolves)
 
@@ -1181,6 +1184,8 @@ fn test_deferred_replace_renders_dependent_children() {
         root_resource_ref("validation_records", "id"),
     );
 
+    // This schematic child is Coexisting (the presentation fixture default).
+    // Its new dependent requires checked create-first replacement.
     let mut plan = Plan::new();
     let gate = deferred_replace_validation_records_effect();
     let gate_id = gate.scheduler_id();
@@ -1252,7 +1257,7 @@ fn test_deferred_replace_keeps_unrelated_same_type_delete() {
     Execution Plan:
 
       + acm.Certificate cert
-            ├─ +/- aws.route53.Record validation_records[*] (N records after cert applies)
+            ├─ -/+ aws.route53.Record validation_records[*] (N records after cert applies)
             │     <- for opt in cert.domain_validation_options
             │     name: (known after cert applies)
             │
@@ -2396,6 +2401,7 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
         &plan,
     )
     .expect("fixture mock inputs must be valid");
+    let admitted_plan = crate::test_support::admit_fixture_plan(&plan, None);
     let mut ctx = TreeRenderContext {
         out: format!(
             "{}\n",
@@ -2407,7 +2413,7 @@ fn module_group_with_only_suppressed_move_does_not_emit_orphan_gutter() {
         ),
         printed: HashSet::new(),
         display: PlanDisplay::unprepared(
-            &plan,
+            &admitted_plan,
             &historical_display,
             carina_core::detail_rows::DetailComparisons::RecordedEffects,
         ),
@@ -2495,11 +2501,12 @@ fn resource_with_only_suppressed_move_dependent_does_not_emit_orphan_gutter() {
         &plan,
     )
     .expect("fixture mock inputs must be valid");
+    let admitted_plan = crate::test_support::admit_fixture_plan(&plan, None);
     let mut ctx = TreeRenderContext {
         out: String::new(),
         printed: HashSet::new(),
         display: PlanDisplay::unprepared(
-            &plan,
+            &admitted_plan,
             &historical_display,
             carina_core::detail_rows::DetailComparisons::RecordedEffects,
         ),

@@ -7,8 +7,8 @@ use carina_core::parser::{
     ExpandedBackendConfig as BackendConfig, ExpandedInferredExportParam as InferredExportParam,
     SavedProviderConfigs,
 };
-use carina_core::plan::Plan;
-type ExecutableSavedPlan = Plan<SavedModuleSource>;
+use carina_core::plan::{AdmittedPlan, Plan};
+type ExecutableSavedPlan = AdmittedPlan<SavedModuleSource>;
 use carina_core::provider::{PersistedAttributes, Provider, ProviderRouter, ReadRequest};
 use carina_core::resource::{
     Current, DataSource, NoPlaceholder, ResolvedResourceId, Resource, ResourceId, SavedComposition,
@@ -799,6 +799,7 @@ impl ValidatedDesiredPlan {
                 verified_planned_states,
                 historical_addresses,
                 apply_target,
+                config.context().schemas(),
             )
             .await?;
         Ok(ValidatedExecutablePlan { plan, config })
@@ -939,6 +940,7 @@ impl DesiredPlanFile {
         verified_planned_states: &mut HashMap<ResourceId, State>,
         historical_addresses: &HistoricalResourceAddresses,
         apply_target: ApplyTarget<'_>,
+        schemas: &carina_core::schema::SchemaRegistry,
     ) -> Result<ExecutablePlanFile, AppError> {
         let mut plan = match self {
             Self::Verified(plan) => plan,
@@ -956,7 +958,17 @@ impl DesiredPlanFile {
         plan.plan_file
             .plan_mut()
             .rebase_ignored_update_sources(actual_states);
-        Ok(ExecutablePlanFile { plan })
+        let RehydratedPlanFile {
+            plan_file,
+            planned_secret_hashes,
+        } = plan;
+        let plan_file = plan_file.try_map_plan(|draft| draft.admit(schemas))?;
+        Ok(ExecutablePlanFile {
+            plan: RehydratedPlanFile {
+                plan_file,
+                planned_secret_hashes,
+            },
+        })
     }
 }
 
@@ -1077,13 +1089,13 @@ impl DesiredVerifiedPlanFile {
 ///
 /// This is still not executable: the schema-checked [`DesiredPlanFile`]
 /// transition is the only path that can wrap it in [`ExecutablePlanFile`].
-pub(crate) struct RehydratedPlanFile {
-    plan_file: ReloadedPlanFile,
+pub(crate) struct RehydratedPlanFile<P = Plan<SavedModuleSource>> {
+    plan_file: ReloadedPlanFile<NoPlaceholder, P>,
     planned_secret_hashes: PlannedSecretHashes,
 }
 
-impl RehydratedPlanFile {
-    fn plan(&self) -> &ExecutableSavedPlan {
+impl<P> RehydratedPlanFile<P> {
+    fn plan(&self) -> &P {
         self.plan_file.plan()
     }
 
@@ -1140,11 +1152,13 @@ impl RehydratedPlanFile {
 /// private to [`DesiredPlanFile::verify_historical`], so a deserialized
 /// plan cannot execute without the provider-schema comparison.
 pub(super) struct ExecutablePlanFile {
-    plan: RehydratedPlanFile,
+    plan: RehydratedPlanFile<ExecutableSavedPlan>,
 }
 
 impl ExecutablePlanFile {
-    pub(super) fn reloaded_plan_file(&self) -> &ReloadedPlanFile {
+    pub(super) fn reloaded_plan_file(
+        &self,
+    ) -> &ReloadedPlanFile<NoPlaceholder, ExecutableSavedPlan> {
         &self.plan.plan_file
     }
 
@@ -1935,6 +1949,49 @@ mod tests {
             mismatch.providers.keys().collect::<Vec<_>>(),
             vec!["mock", "other"]
         );
+    }
+
+    #[tokio::test]
+    async fn review6_4283_secret_saved_plan_approval_after_historical_verification() {
+        for create_first in [false, true] {
+            let (plan_file, schemas, provider) = Box::pin(
+                crate::commands::apply::tests::issue_4283::saved_plan_conversion_fixture(
+                    create_first,
+                    true,
+                ),
+            )
+            .await;
+            let origins = HistoricalResourceAddresses::from_plan(plan_file.plan());
+            let pending =
+                super::DesiredPlanFile::NeedsHistoricalVerification(DesiredVerifiedPlanFile {
+                    plan_file,
+                    planned_secret_hashes: HashMap::new(),
+                });
+            let executable = Box::pin(pending.verify_historical(
+                provider.as_ref(),
+                &mut HashMap::new(),
+                &mut HashMap::new(),
+                &origins,
+                apply_target(),
+                &schemas,
+            ))
+            .await
+            .expect("secret restoration and final admission succeed");
+            let glyph = executable
+                .plan()
+                .effects()
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::DeferredReplace(payload) => Some(payload.display_glyph()),
+                    _ => None,
+                })
+                .expect("fixture retains a deferred replacement");
+            assert_eq!(
+                glyph,
+                if create_first { "+/-" } else { "-/+" },
+                "approval must use the admission after all secret transformations"
+            );
+        }
     }
 
     #[tokio::test]

@@ -14,9 +14,6 @@ macro_rules! unexpected_resume_create {
     };
 }
 use crate::data_source_value::{DataSourceValue, DataSourceValues, ExecutableDataSourceValues};
-use crate::effect::deps::{
-    ScheduleInputs, build_effect_dependency_analysis as build_dependency_analysis,
-};
 use crate::effect::{
     DeferredReplaceDelete, DeletedInstanceKey, EffectGeneration, NonEmptyDeletes, ReleasedListKey,
     ReleasedListKeys,
@@ -267,6 +264,24 @@ fn validation_deferred_for_expression() -> crate::parser::ExpandedDeferredForExp
     )
 }
 
+fn coexisting_validation_deferred_for_expression() -> crate::parser::ExpandedDeferredForExpression {
+    let mut template = validation_deferred_for_expression();
+    template.template_directives_mut().create_before_destroy =
+        crate::resource::LoopDirective::Resolved(true);
+    template
+}
+static COEXISTING_TEST_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
+    let mut registry = SchemaRegistry::new();
+    registry.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .with_coexisting_replacement()
+            .validate()
+            .unwrap(),
+    );
+    registry
+});
+
 fn anonymous_deferred_collision_fixture() -> (
     crate::parser::ExpandedDeferredForExpression,
     ResolvedBindings,
@@ -379,7 +394,18 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
             .iter()
             .map(|(id, resource)| (id.clone(), resource))
             .collect();
-        let actual = build_plan_scheduler_dependency_edges(&effects, &borrowed);
+        let mut plan = Plan::new();
+        for effect in effects {
+            plan.add(effect);
+        }
+        plan.prepare_replacements(&COEXISTING_TEST_SCHEMAS).unwrap();
+        let actual = build_plan_scheduler_dependency_edges(
+            &plan
+                .admit(&COEXISTING_TEST_SCHEMAS)
+                .unwrap()
+                .schedule(&Default::default()),
+            &borrowed,
+        );
 
         assert_eq!(actual, expected, "scheduler-edge export drifted for {case}");
         actual
@@ -432,7 +458,8 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
         BTreeSet::from([(primary(0), primary(1))]),
     );
 
-    let replacement = make_resource("replacement", &[]);
+    let mut replacement = make_resource("replacement", &[]);
+    replacement.directives.create_before_destroy = true;
     assert_matches_executor(
         "replacement pair",
         vec![
@@ -459,6 +486,8 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
             create_effect(cert.clone()),
             Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
                 NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
+                    previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "test",
                         "validation_records[0]",
@@ -532,7 +561,7 @@ struct MockProvider {
     delete_results: Mutex<Vec<ProviderResult<()>>>,
     update_results: Mutex<Vec<ProviderResult<crate::provider::UpdateOutcome>>>,
     read_results: Mutex<Vec<ProviderResult<State>>>,
-    /// Records calls in order: ("create"|"delete"|"update"|"read", resource_id_string)
+    /// Records calls in order: ("create"|"resend"|"delete"|"update"|"read", resource_id_string)
     call_log: Arc<Mutex<Vec<(String, String)>>>,
     /// Resources passed in to `create()` in call order — lets a test
     /// assert that the executor handed the provider a fully-resolved
@@ -555,6 +584,7 @@ enum ClassifiedCreateFixture {
 
 enum ResumeFixture {
     Resumed,
+    Resent,
     Partial,
     IdentifierReportedFound,
     IdentifierReportedNotFound,
@@ -782,6 +812,23 @@ impl Provider for MockProvider {
         };
         Box::pin(async move {
             match result.expect("unexpected resume_create") {
+                ResumeFixture::Resent => {
+                    let (resume, _) = request.into_parts();
+                    let crate::provider::Resume::Unissued(attempt) = resume else {
+                        panic!("resend fixture requires an identifier-less continuation");
+                    };
+                    self.call_log
+                        .lock()
+                        .unwrap()
+                        .push(("resend".into(), attempt.id().to_string()));
+                    Ok(attempt
+                        .resend()
+                        .issued(
+                            AppliedIdentifier::new("resent-id").unwrap(),
+                            crate::provider::Sent::AllRequestAttributes,
+                        )
+                        .succeeded(HashMap::new()))
+                }
                 ResumeFixture::Resumed => {
                     let (resume, _create_request) = request.into_parts();
                     let crate::provider::Resume::Issued(resumed) = resume else {
@@ -1510,6 +1557,7 @@ fn empty_execution_result() -> ExecutionResult {
         interrupted_count: 0,
         applied_states: Default::default(),
         runtime_synthesized_resources: Vec::new(),
+        replacement_writeback: Vec::new(),
         successfully_deleted: HashSet::new(),
         permanent_name_overrides: HashMap::new(),
         managed_current: HashMap::new(),
@@ -2254,7 +2302,7 @@ async fn unsettled_loaded_type_check_blocks_create_dispatch() {
             );
             let input = ExecutionInput {
                 provider_context: catalog.as_provider_context().clone(),
-                plan: &plan,
+                plan: &plan.clone().admit(&schemas).unwrap(),
                 provider_check_inputs: ProviderCheckInputs::Authored,
                 compositions: &[],
                 bindings: ResolvedBindings::default(),
@@ -2306,7 +2354,7 @@ async fn execute_plan_returns_completed_when_not_cancelled() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -2358,7 +2406,7 @@ async fn checkpoint_sink_receives_each_completed_effect_before_execution_ends() 
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -2414,7 +2462,7 @@ async fn precompleted_state_only_result_is_checkpointed_before_provider_completi
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -2498,7 +2546,7 @@ async fn execute_lifecycle_fixture_with_observer(
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan,
+        plan: &plan.clone().admit(&COEXISTING_TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -2507,7 +2555,7 @@ async fn execute_lifecycle_fixture_with_observer(
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
-        schemas: &TEST_SCHEMAS,
+        schemas: &COEXISTING_TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
         precompleted_success_count: 0,
         checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
@@ -2850,6 +2898,123 @@ async fn resume_resumed_publishes_observed() {
 }
 
 #[tokio::test]
+async fn identifierless_conflicting_resume_deletes_old_generation_before_resend() {
+    // Regression for #4303: an identifier-less continuation can resend its Create request.
+    // A Conflicting replacement must delete its old generation before that resend.
+    let provider = MockProvider::new();
+    provider.push_resume(ResumeFixture::Resent);
+    provider.push_delete(Ok(()));
+    let target = resolved(make_resource("source", &[]));
+    let id = target.id.clone();
+    let pending = persisted_unissued_create_for_executor(&id);
+    let mut plan = Plan::new();
+    plan.add_resume_create(target.clone(), pending.started_at().clone());
+    plan.add(Effect::Delete {
+        id: target.resolved_id(),
+        identifier: AppliedIdentifier::new("old-id").unwrap(),
+        generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
+        directives: Default::default(),
+        binding: target.binding.clone(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: [target.resolved_id()].into_iter().collect(),
+    });
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .with_conflicting_replacement()
+            .validate()
+            .unwrap(),
+    );
+    let plan = plan.admit(&schemas).unwrap();
+    let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::from([(id.clone(), Current::CreateInFlight(pending))]),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::noop(),
+    };
+    let result = completed_result(
+        execute_plan(
+            &provider,
+            input,
+            &MockObserver::new(),
+            uncancelled_shutdown(),
+        )
+        .await,
+    );
+    assert_eq!(
+        (
+            result.success_count,
+            result.failure_count(),
+            result.skip_count
+        ),
+        (2, 0, 0),
+        "the resend and old-generation delete must both complete"
+    );
+    let calls = provider.calls();
+    assert!(
+        call_position(&calls, "delete", &id.to_string())
+            < call_position(&calls, "resend", &id.to_string()),
+        "a resend-capable Conflicting continuation must delete its old generation first: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn identifierless_resume_delete_failure_blocks_resend() {
+    let provider = MockProvider::new();
+    provider.push_delete(Err(ProviderError::api_error(
+        "old generation is still live",
+    )));
+    let target = resolved(make_resource("source", &[]));
+    let id = target.id.clone();
+    let pending = persisted_unissued_create_for_executor(&id);
+    let mut plan = Plan::new();
+    plan.add_resume_create(target.clone(), pending.started_at().clone());
+    plan.add(Effect::Delete {
+        id: target.resolved_id(),
+        identifier: AppliedIdentifier::new("old-id").unwrap(),
+        generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
+        directives: Default::default(),
+        binding: target.binding.clone(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: [target.resolved_id()].into_iter().collect(),
+    });
+    let result = execute_lifecycle_fixture(
+        &provider,
+        &plan,
+        HashMap::from([(id.clone(), Current::CreateInFlight(pending))]),
+    )
+    .await;
+    assert_eq!(
+        (
+            result.success_count,
+            result.failure_count(),
+            result.skip_count
+        ),
+        (0, 1, 1)
+    );
+    assert_eq!(provider.calls(), vec![("delete".into(), id.to_string())]);
+    assert!(matches!(
+        result.managed_current.get(&id),
+        Some(Current::CreateInFlight(_))
+    ));
+}
+
+#[tokio::test]
 async fn resumed_partial_success_reports_once_and_preserves_partial_binding() {
     let provider = MockProvider::new();
     let source = make_resource("source", &[]);
@@ -2954,7 +3119,8 @@ async fn resume_dispatch_validates_resent_sent_against_checked_request() {
             let request = crate::executor::prepare_create_request(resource, &preparation)
                 .await
                 .expect("fixture request passes provider preparation");
-            let request = crate::provider::ResumeCreateRequest::new(pending, request)
+            let permit = crate::replacement::create_permit_for_test(request);
+            let request = crate::provider::ResumeCreateRequest::new(pending, permit)
                 .expect("fixture continuation and request share a route");
 
             let failure = crate::executor::dispatch_resume_create(&provider, request)
@@ -3015,7 +3181,8 @@ async fn create_not_created_skips_dependents_and_writes_nothing() {
 #[tokio::test]
 async fn create_before_destroy_outcome_unknown_records_replacement_create_state() {
     let provider = MockProvider::new();
-    let source = make_resource("source", &[]);
+    let mut source = make_resource("source", &[]);
+    source.directives.create_before_destroy = true;
     let source_id = source.id.clone();
     let directives = Directives::default().with_create_before_destroy(true);
     let mut plan = Plan::new();
@@ -3492,7 +3659,7 @@ async fn invalid_resolved_create_value_never_reaches_provider() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -3561,7 +3728,7 @@ async fn invalid_secret_create_value_is_masked_and_never_reaches_provider() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
             data_source_origins: &[],
@@ -3634,7 +3801,7 @@ async fn invalid_resolved_value_is_rejected_before_provider_normalization() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -3732,7 +3899,7 @@ async fn runtime_integer_arithmetic_failures_abort_before_dependent_provider_cal
             provider_context: crate::parser::ProviderContext::clone(
                 &crate::parser::LoadedProviderContext::empty_for_test(),
             ),
-            plan: &plan,
+            plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
             provider_check_inputs: ProviderCheckInputs::Authored,
             compositions: &[],
             bindings,
@@ -3799,7 +3966,7 @@ async fn invalid_resolved_update_value_never_reaches_provider() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -3863,7 +4030,7 @@ async fn execute_plan_missing_update_schema_fails_before_provider_update() {
                 provider_context: crate::parser::ProviderContext::clone(
                     &crate::parser::LoadedProviderContext::empty_for_test(),
                 ),
-                plan: &plan,
+                plan: &plan.clone().admit(&schemas).unwrap(),
                 provider_check_inputs: ProviderCheckInputs::Authored,
                 compositions: &[],
                 bindings: ResolvedBindings::default(),
@@ -3988,7 +4155,7 @@ async fn valid_checked_values_preserve_create_payload_and_update_patch() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -4131,7 +4298,7 @@ async fn absent_entirely_write_only_struct_stays_reassert_during_apply_augmentat
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -4222,7 +4389,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_create() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
             data_source_origins: &[],
@@ -4333,7 +4500,7 @@ async fn invalid_value_published_by_upstream_create_blocks_dependent_update() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
             data_source_origins: &[],
@@ -4408,7 +4575,7 @@ async fn invalid_apply_time_value_blocks_deferred_dispatch_child() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -4493,7 +4660,7 @@ async fn invalid_deferred_data_source_input_never_reaches_provider() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -4582,7 +4749,7 @@ async fn plan_normalized_apply_resolved_data_source_schema_violation_blocks_read
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
             data_source_origins: std::slice::from_ref(&data_source_origin),
@@ -4777,7 +4944,7 @@ async fn plan_normalized_apply_resolved_data_source_module_violation_blocks_read
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
             data_source_origins: std::slice::from_ref(&data_source_origin),
@@ -4890,7 +5057,7 @@ async fn pending_module_validation_and_require_block_first_consuming_effect() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -4963,7 +5130,7 @@ async fn nested_forwarded_module_constraint_blocks_provider_dispatch() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings,
@@ -5029,7 +5196,7 @@ async fn outer_module_constraint_blocks_nested_inner_consumer_provider_dispatch(
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&outer),
         bindings,
@@ -5104,7 +5271,7 @@ async fn module_export_constraint_blocks_top_level_consumer_provider_dispatch() 
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings,
@@ -5161,7 +5328,7 @@ async fn repeated_module_violation_blocks_every_dispatch_but_reports_once() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -5239,7 +5406,7 @@ async fn module_constraint_rechecks_after_binding_changes_in_same_apply() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings,
@@ -5297,7 +5464,7 @@ async fn unresolved_instance_constraint_waits_for_terminal_sweep() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -5363,7 +5530,7 @@ async fn unapplied_module_argument_reference_stays_pending_at_early_gate() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -5425,7 +5592,7 @@ async fn terminal_module_constraint_sweep_rejects_unconsumed_violation() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings,
@@ -5473,7 +5640,7 @@ async fn terminal_module_constraint_sweep_rejects_still_pending_input() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -5525,7 +5692,7 @@ async fn terminal_pending_constraint_is_silent_after_failed_and_skipped_effects(
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -5580,7 +5747,7 @@ async fn terminal_pending_constraint_is_silent_after_failure_without_skips() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: std::slice::from_ref(&composition),
         bindings: ResolvedBindings::default(),
@@ -5662,7 +5829,7 @@ async fn terminal_pending_constraint_is_silent_after_skip_without_failure() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
             data_source_origins: &[],
@@ -5811,7 +5978,7 @@ async fn execute_plan_with_pre_cancelled_token_returns_cancelled_at_t4_or_later(
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -5852,7 +6019,7 @@ async fn cancelled_skip_batch_publishes_one_cumulative_checkpoint() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -5892,7 +6059,7 @@ async fn execute_plan_with_empty_plan_and_pre_cancelled_token_returns_completed(
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -5931,7 +6098,7 @@ async fn execute_plan_cancelled_after_three_completed_keeps_in_flight_and_drops_
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -5993,7 +6160,7 @@ async fn execute_plan_cancels_in_flight_wait_effect_promptly() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6063,7 +6230,7 @@ async fn execute_plan_cancelled_wait_emits_cancelled_skip_not_unsatisfiable() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6127,7 +6294,7 @@ async fn execute_plan_cancelled_while_effect_in_flight_records_that_effect() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6168,7 +6335,7 @@ async fn execute_plan_cleanup_priority_abandons_in_flight_and_keeps_completed_ef
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6232,7 +6399,7 @@ async fn cleanup_abandonment_checkpoints_unknown_outcome_after_guest_egress() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6272,7 +6439,7 @@ async fn execute_plan_harvests_ready_effect_before_cleanup_priority() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6336,7 +6503,7 @@ async fn execute_plan_cleanup_priority_abandons_a_pending_failure_refresh() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6376,7 +6543,7 @@ async fn test_simple_create() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6429,7 +6596,7 @@ async fn partial_create_records_state_and_diagnostic() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6486,7 +6653,7 @@ async fn test_apply_renormalizes_after_resolution() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6587,7 +6754,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
             data_source_origins: &[],
@@ -6670,7 +6837,7 @@ async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error(
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
             data_source_origins: &[],
@@ -6797,7 +6964,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &resource_origins,
             data_source_origins: &data_source_origins
@@ -6857,7 +7024,7 @@ async fn test_apply_reapplies_host_enum_canonicalization() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&ALIAS_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6931,7 +7098,7 @@ async fn test_apply_reapplies_host_enum_canonicalization_update_path() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&ALIAS_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -6995,7 +7162,7 @@ async fn test_apply_reapplies_canonicalize_stage() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&CANON_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7066,7 +7233,7 @@ async fn test_apply_renormalizes_update_path() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7161,7 +7328,7 @@ async fn test_apply_update_patch_preserves_provider_default_tags() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&DEFAULT_TAG_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7265,7 +7432,7 @@ async fn wire_boundary_executor_never_dispatches_non_wire_desired_values() {
             provider_context: crate::parser::ProviderContext::clone(
                 &crate::parser::LoadedProviderContext::empty_for_test(),
             ),
-            plan: &plan,
+            plan: &plan.clone().admit(&DEFAULT_TAG_SCHEMAS).unwrap(),
             provider_check_inputs: ProviderCheckInputs::Authored,
             compositions: &[],
             bindings: ResolvedBindings::default(),
@@ -7388,7 +7555,7 @@ async fn test_apply_effective_changed_uses_plan_time_comparison_semantics() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&AUGMENT_COMPARISON_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7465,7 +7632,7 @@ async fn test_apply_effective_changed_includes_resource_ref_changed_during_resol
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&AUGMENT_COMPARISON_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -7547,7 +7714,7 @@ async fn test_apply_effective_changed_includes_updatable_and_skips_create_only_w
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&AUGMENT_COMPARISON_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7616,7 +7783,7 @@ async fn test_apply_effective_changed_skips_matching_unwrapped_secret_hash() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&AUGMENT_COMPARISON_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7682,7 +7849,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&AUGMENT_COMPARISON_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7743,7 +7910,7 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -7877,7 +8044,7 @@ async fn apply_resolves_field_access_through_aliased_for_expanded_address() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8003,7 +8170,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8078,7 +8245,7 @@ async fn test_simple_delete() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8121,7 +8288,7 @@ async fn test_failed_effect_propagates_to_dependent() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8166,7 +8333,7 @@ async fn test_observer_events_emitted_correctly() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8205,7 +8372,7 @@ async fn test_read_effect_is_no_op() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8275,7 +8442,7 @@ async fn release_list_keys_never_reaches_provider_executor() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8328,7 +8495,7 @@ async fn test_independent_effects_run_in_parallel() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8384,7 +8551,7 @@ async fn test_parallel_failure_skips_dependents() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8438,7 +8605,7 @@ async fn test_dependency_levels_sequential_chain() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8670,7 +8837,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -8908,7 +9075,7 @@ async fn run_tag_sweep(parallelism: NonZeroUsize) -> usize {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &[],
@@ -8994,7 +9161,7 @@ async fn run_provider_contract_case(unknown_read: bool) -> usize {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &[],
@@ -9070,7 +9237,7 @@ async fn test_waiting_events_emitted_for_dependent_effects() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -9293,10 +9460,10 @@ fn test_build_dependency_levels_consistent_with_dependency_map() {
     let plan = create_plan_from_fixture_resources(vec![a, b, c, d]);
 
     let levels = build_dependency_levels(plan.effects(), &HashMap::new());
-    let dep_map =
-        build_dependency_analysis(plan.effects(), std::iter::empty(), ScheduleInputs::Apply)
-            .expect("dependency analysis must resolve")
-            .into_deps_of();
+    let dep_map = plan
+        .dependency_analysis(std::iter::empty())
+        .expect("dependency analysis must resolve")
+        .into_deps_of();
 
     // Verify levels are consistent with the dependency map:
     // For every effect, its level must be greater than all its dependencies' levels.
@@ -9349,7 +9516,7 @@ async fn test_update_effect_binding_map_propagation() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -9405,7 +9572,7 @@ async fn update_protocol_violation_preserves_identifier_for_recovery_refresh() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -9482,7 +9649,8 @@ fn test_dependency_analysis_respects_delete_dependencies() {
         blocked_by_updates: Default::default(),
     });
 
-    let deps = build_dependency_analysis(plan.effects(), std::iter::empty(), ScheduleInputs::Apply)
+    let deps = plan
+        .dependency_analysis(std::iter::empty())
         .expect("dependency analysis must resolve")
         .into_deps_of();
 
@@ -9564,7 +9732,7 @@ async fn test_resource_ref_resolved_from_predecessor_state() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -10000,13 +10168,10 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
     .finish(|_| {});
     assert_eq!(plan.replace_display_info().count(), 2);
 
-    let deps = build_dependency_analysis(
-        plan.effects(),
-        unresolved_resources.keys(),
-        ScheduleInputs::Apply,
-    )
-    .expect("dependency analysis must resolve")
-    .into_deps_of();
+    let deps = plan
+        .dependency_analysis(unresolved_resources.keys())
+        .expect("dependency analysis must resolve")
+        .into_deps_of();
     let vpc_create_idx = plan
         .effects()
         .iter()
@@ -10035,7 +10200,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &[],
@@ -10162,7 +10327,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -10336,7 +10501,7 @@ async fn test_wait_downstream_nested_map_ref_resolves_at_apply() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -10429,7 +10594,7 @@ async fn test_wait_state_writeback_skips_synthetic_wait_id() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -10553,7 +10718,7 @@ async fn test_chained_index_then_field_unresolved_at_apply_fails_with_clear_erro
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -10669,7 +10834,7 @@ async fn test_apply_rejects_wrong_shape_access_without_wait_guidance() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -10837,7 +11002,7 @@ async fn test_chained_index_then_nested_field_resolves_from_post_create_state() 
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -11071,7 +11236,7 @@ async fn wait_resolves_target_identifier_from_just_created_state() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -11126,7 +11291,7 @@ async fn deferred_materialization_failure_retains_reason_in_result_and_event() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &origins,
             data_source_origins: &[],
@@ -11201,7 +11366,7 @@ async fn apply_time_unbound_child_collision_with_another_desired_id_is_typed_err
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -11251,7 +11416,7 @@ async fn apply_time_unbound_child_collision_with_unabsorbed_state_row_is_typed_e
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -11288,6 +11453,8 @@ fn legacy_unbound_deferred_replace(
 ) -> Effect {
     Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
         NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+            generation: crate::effect::EffectGeneration::Current,
+            previous_attributes: Default::default(),
             id: crate::resource::ResolvedResourceId::new(legacy_id.clone()),
             identifier: crate::effect::fixture_applied_identifier("existing"),
             directives: Directives::default(),
@@ -11302,7 +11469,7 @@ fn legacy_unbound_deferred_replace(
 }
 
 #[tokio::test]
-async fn unbound_deferred_replace_creates_children_before_deleting_legacy_rows() {
+async fn unbound_deferred_replace_deletes_conflicting_legacy_rows_before_creating_children() {
     let (template, bindings, schemas, child) = anonymous_deferred_collision_fixture();
     let child_id = child.id.clone();
     let legacy_id = ResourceId::with_provider_identity("mock", "test.Child", "_values[0]", None);
@@ -11321,7 +11488,7 @@ async fn unbound_deferred_replace_creates_children_before_deleting_legacy_rows()
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -11343,9 +11510,9 @@ async fn unbound_deferred_replace_creates_children_before_deleting_legacy_rows()
 
     let calls = provider.calls();
     assert!(
-        call_position(&calls, "create", &child_id.to_string())
-            < call_position(&calls, "delete", &legacy_id.to_string()),
-        "anonymous children must exist before their legacy rows are deleted; calls: {calls:?}",
+        call_position(&calls, "delete", &legacy_id.to_string())
+            < call_position(&calls, "create", &child_id.to_string()),
+        "Conflicting anonymous children must delete their legacy rows before creation; calls: {calls:?}",
     );
 }
 
@@ -11363,7 +11530,7 @@ async fn unbound_deferred_replace_keeps_legacy_rows_when_gate_fails() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -11429,7 +11596,7 @@ async fn completed_plain_anonymous_delete_releases_id_for_unbound_deferred_child
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -11482,7 +11649,7 @@ async fn deferred_create_returns_error_when_iterable_attr_missing() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -11537,7 +11704,7 @@ async fn apply_time_deferred_create_emits_failed_on_shape_mismatch() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -11605,6 +11772,8 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
         crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![
                 DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
+                    previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "test",
                         "validation_records[0]",
@@ -11617,6 +11786,8 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
                     blocked_by_updates: Default::default(),
                 },
                 DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
+                    previous_attributes: Default::default(),
                     id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                         "test",
                         "validation_records[1]",
@@ -11630,7 +11801,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
                 },
             ])
             .expect("fixture has deletes"),
-            Box::new(validation_deferred_for_expression()),
+            Box::new(coexisting_validation_deferred_for_expression()),
         ),
     )));
 
@@ -11638,7 +11809,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&COEXISTING_TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -11647,7 +11818,7 @@ async fn dispatch_deferred_replace_orders_matching_delete_after_materialized_cre
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
-        schemas: &TEST_SCHEMAS,
+        schemas: &COEXISTING_TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
         precompleted_success_count: 0,
         checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
@@ -11715,6 +11886,8 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
     plan.add(Effect::DeferredReplace(Box::new(
         crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: crate::effect::EffectGeneration::Current,
+                previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "test",
                     "validation_records[0]",
@@ -11727,7 +11900,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
                 blocked_by_updates: Default::default(),
             }])
             .expect("fixture has one delete"),
-            Box::new(validation_deferred_for_expression()),
+            Box::new(coexisting_validation_deferred_for_expression()),
         ),
     )));
 
@@ -11735,7 +11908,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&COEXISTING_TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
@@ -11744,7 +11917,7 @@ async fn dispatch_deferred_replace_skips_delete_when_materialized_create_fails()
         normalizer: &NoopNormalizer,
         provider_configs: &[],
         factories: &[],
-        schemas: &TEST_SCHEMAS,
+        schemas: &COEXISTING_TEST_SCHEMAS,
         parallelism: crate::executor::TEST_UNCAPPED,
         precompleted_success_count: 0,
         checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
@@ -11975,6 +12148,8 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
     plan.add(Effect::DeferredReplace(Box::new(
         crate::test_support::compiled_replace(
             NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: crate::effect::EffectGeneration::Current,
+                previous_attributes: Default::default(),
                 id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
                     "test",
                     "validation_records[0]",
@@ -12007,7 +12182,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved,
             data_source_origins: &[],
@@ -12204,7 +12379,7 @@ async fn test_data_source_read_state_resolves_for_downstream_resource() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -12357,7 +12532,7 @@ async fn test_apply_time_data_source_read_publishes_for_downstream_resource() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -12502,7 +12677,7 @@ async fn test_apply_time_data_source_read_failure_skips_downstream_resource() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -12592,7 +12767,7 @@ async fn test_apply_time_data_source_read_retries_throttling_errors() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -12704,7 +12879,7 @@ async fn test_pre_apply_data_source_read_remains_noop_in_executor() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings,
@@ -12758,7 +12933,7 @@ async fn deferred_create_reports_iterable_reference_when_binding_missing() {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan,
+        plan: &plan.clone().admit(&TEST_SCHEMAS).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &origins,
             data_source_origins: &[],
@@ -12787,6 +12962,1406 @@ async fn deferred_create_reports_iterable_reference_when_binding_missing() {
         }),
         "events: {:?}",
         observer.events(),
+    );
+}
+
+async fn conflicting_deferred_case(
+    fail_delete: bool,
+    fail_expansion: bool,
+    map: bool,
+) -> (ExecutionResult, Vec<(String, String)>) {
+    let cert_id = ResourceId::with_identity("test", "cert");
+    let mut cert_state = State::existing(
+        cert_id.clone(),
+        crate::test_support::snapshot_attributes(HashMap::from([(
+            "domain_validation_options".to_string(),
+            Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                ConcreteValue::Map(indexmap::IndexMap::from([(
+                    "resource_record".to_string(),
+                    Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                        (
+                            "name".to_string(),
+                            Value::Concrete(ConcreteValue::String("_name".into())),
+                        ),
+                        (
+                            "value".to_string(),
+                            Value::Concrete(ConcreteValue::String("_value".into())),
+                        ),
+                    ]))),
+                )])),
+            )])),
+        )])),
+    )
+    .with_identifier("cert-id");
+    if map {
+        let crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(mut options)) =
+            cert_state
+                .attributes
+                .remove("domain_validation_options")
+                .unwrap()
+        else {
+            unreachable!()
+        };
+        cert_state.attributes.insert(
+            "domain_validation_options".into(),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::Map(
+                indexmap::IndexMap::from([("stable".into(), options.remove(0))]),
+            )),
+        );
+    }
+    let validation_id = ResourceId::with_identity(
+        "test",
+        if map {
+            "validation_records.stable"
+        } else {
+            "validation_records[0]"
+        },
+    );
+    let validation_state =
+        State::existing(validation_id.clone(), HashMap::new()).with_identifier("new-validation");
+    let provider = MockProvider::new();
+    if fail_expansion {
+        cert_state.attributes.clear();
+    }
+    provider.push_create(Ok(cert_state));
+    provider.push_create(Ok(validation_state));
+    provider
+        .push_read(Ok(State::existing(validation_id.clone(), HashMap::new())
+            .with_identifier("old-validation-0")));
+    provider.push_delete(if fail_delete {
+        Err(ProviderError::api_error("old child delete failed"))
+    } else {
+        Ok(())
+    });
+    provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
+
+    let mut cert = Resource::new("test", "cert");
+    cert.binding = Some(absolute_binding("cert"));
+    let mut plan = Plan::new();
+    plan.add(create_effect(cert));
+    plan.add(Effect::DeferredReplace(Box::new(
+        crate::test_support::compiled_replace(
+            NonEmptyDeletes::try_new(vec![
+                DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
+                    previous_attributes: Default::default(),
+                    id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                        "test",
+                        "validation_records[0]",
+                    )),
+                    identifier: crate::effect::fixture_applied_identifier("old-validation-0"),
+                    directives: Directives::default(),
+                    binding: Some(absolute_binding("validation_records[0]")),
+                    dependencies: Default::default(),
+                    explicit_dependencies: Default::default(),
+                    blocked_by_updates: Default::default(),
+                },
+                DeferredReplaceDelete {
+                    generation: crate::effect::EffectGeneration::Current,
+                    previous_attributes: Default::default(),
+                    id: crate::resource::ResolvedResourceId::new(ResourceId::with_identity(
+                        "test",
+                        "validation_records[1]",
+                    )),
+                    identifier: crate::effect::fixture_applied_identifier("old-validation-1"),
+                    directives: Directives::default(),
+                    binding: Some(absolute_binding("validation_records[1]")),
+                    dependencies: Default::default(),
+                    explicit_dependencies: Default::default(),
+                    blocked_by_updates: Default::default(),
+                },
+            ])
+            .expect("fixture has deletes"),
+            Box::new(validation_deferred_for_expression()),
+        ),
+    )));
+
+    if map {
+        for effect in plan.effects_mut() {
+            if let Effect::DeferredReplace(payload) = effect {
+                let template = validation_deferred_for_expression();
+                let mapped = crate::parser::DeferredForExpression::new(
+                    Some("main.crn".into()),
+                    1,
+                    "for _, opt in cert.domain_validation_options".into(),
+                    template.target().clone(),
+                    template.iterable.clone(),
+                    crate::parser::ForBinding::Map("_".into(), "opt".into()),
+                    template.template_resource().as_resource().clone(),
+                );
+                let mut old = payload.deletes[0].clone();
+                old.id = ResolvedResourceId::new(validation_id.clone());
+                old.binding = Some(absolute_binding("validation_records.stable"));
+                **payload = crate::test_support::compiled_replace(
+                    NonEmptyDeletes::try_new(vec![old]).unwrap(),
+                    Box::new(mapped),
+                );
+            }
+        }
+    }
+    if fail_delete {
+        for effect in plan.effects_mut() {
+            if let Effect::DeferredReplace(payload) = effect {
+                payload.unadmitted_request_mut().deletes =
+                    NonEmptyDeletes::try_new(vec![payload.deletes[0].clone()]).unwrap();
+            }
+        }
+    }
+    // A top-level historical generation must obey the same expansion, admission,
+    // and failed-delete barriers as the current generation absorbed above.
+    plan.add(Effect::Delete {
+        id: ResolvedResourceId::new(validation_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("deposed-validation"),
+        generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
+        directives: Default::default(),
+        binding: Some(absolute_binding(if map {
+            "validation_records.stable"
+        } else {
+            "validation_records[0]"
+        })),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+    });
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .with_conflicting_replacement()
+            .validate()
+            .unwrap(),
+    );
+    let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
+        plan: &plan.clone().admit(&schemas).unwrap(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::new(),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    (result, provider.calls())
+}
+
+#[tokio::test]
+async fn issue_4283_conflicting_deferred_child_is_delete_first() {
+    let (result, calls) = conflicting_deferred_case(false, false, false).await;
+    assert_eq!(result.failure_count(), 0, "calls: {calls:?}");
+    assert!(
+        call_position(&calls, "delete", "test.validation_records[0]")
+            < call_position(&calls, "create", "test.validation_records[0]"),
+        "calls: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(op, id)| op == "delete" && id == "test.validation_records[1]"),
+        "a removed iteration remains an ordinary delete: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn issue_4283_failed_old_delete_blocks_conflicting_child_create() {
+    let (result, calls) = conflicting_deferred_case(true, false, false).await;
+    assert_eq!(result.failure_count(), 1, "calls: {calls:?}");
+    assert!(
+        calls
+            .iter()
+            .any(|(op, id)| op == "delete" && id == "test.validation_records[0]")
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|(op, id)| op == "create" && id == "test.validation_records[0]")
+    );
+}
+
+#[tokio::test]
+async fn issue_4283_failed_expansion_preserves_absorbed_old_children() {
+    let (result, calls) = conflicting_deferred_case(false, true, false).await;
+    assert_eq!(result.failure_count(), 1, "calls: {calls:?}");
+    assert!(
+        calls
+            .iter()
+            .all(|(_, id)| !id.starts_with("test.validation_records[")),
+        "calls: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn issue_4283_conflicting_map_child_is_delete_first() {
+    let (result, calls) = conflicting_deferred_case(false, false, true).await;
+    assert_eq!(result.failure_count(), 0, "calls: {calls:?}");
+    assert!(
+        call_position(&calls, "delete", "test.validation_records.stable")
+            < call_position(&calls, "create", "test.validation_records.stable"),
+        "calls: {calls:?}"
+    );
+}
+
+#[test]
+fn issue_4283_deferred_prior_snapshot_redacts_secrets() {
+    let old = DeferredReplaceDelete {
+        generation: crate::effect::EffectGeneration::Current,
+        id: test_resolved_id("test", "validation_records[0]"),
+        identifier: crate::effect::fixture_applied_identifier("old-child"),
+        directives: Default::default(),
+        binding: Some(absolute_binding("validation_records[0]")),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: HashMap::from([(
+            "secret".into(),
+            crate::resource::SnapshotValue::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(crate::resource::SnapshotValue::Concrete(
+                    crate::resource::ConcreteValue::String("OLD_CHILD_SECRET_PLAINTEXT".into()),
+                ))
+                .into(),
+            )),
+        )]),
+    };
+    let effect = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
+        NonEmptyDeletes::try_new(vec![old]).unwrap(),
+        Box::new(validation_deferred_for_expression()),
+    )));
+    let redacted = crate::value::redact_secrets_in_effect(&effect).unwrap();
+    let json = serde_json::to_string(&redacted).unwrap();
+    assert!(
+        !json.contains("OLD_CHILD_SECRET_PLAINTEXT"),
+        "historical child snapshots must not leak into saved plans"
+    );
+    let Effect::DeferredReplace(payload) = redacted else {
+        unreachable!()
+    };
+    assert!(
+        payload.deletes[0]
+            .previous_attributes
+            .values()
+            .any(crate::value::contains_redacted_secret)
+    );
+}
+
+#[test]
+fn issue_4283_deferred_prior_snapshot_uses_persisted_secret_shape() {
+    let id = test_resolved_id("test", "validation_records[0]");
+    let secret: crate::resource::SnapshotValue =
+        crate::resource::Value::Deferred(crate::resource::DeferredValue::Secret(
+            Box::new(crate::resource::Value::Concrete(
+                crate::resource::ConcreteValue::String("OLD_CHILD_SECRET_PLAINTEXT".into()),
+            ))
+            .into(),
+        ));
+    let guide = crate::value::redact_secrets_in_state(&State::existing(
+        id.as_inner().clone(),
+        HashMap::from([("secret".into(), secret)]),
+    ))
+    .unwrap();
+    let old = DeferredReplaceDelete {
+        generation: crate::effect::EffectGeneration::Current,
+        id: id.clone(),
+        identifier: crate::effect::fixture_applied_identifier("old-child"),
+        directives: Default::default(),
+        binding: Some(absolute_binding("validation_records[0]")),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: HashMap::from([(
+            "secret".into(),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                "OLD_CHILD_SECRET_PLAINTEXT".into(),
+            )),
+        )]),
+    };
+    let mut plan = Plan::new();
+    plan.add(Effect::DeferredReplace(Box::new(
+        crate::test_support::compiled_replace(
+            NonEmptyDeletes::try_new(vec![old]).unwrap(),
+            Box::new(validation_deferred_for_expression()),
+        ),
+    )));
+    let redacted = crate::value::redact_secrets_in_plan_with_desired_and_historical(
+        &plan,
+        &HashMap::<
+            ResourceId,
+            crate::resource::Resource<
+                ModuleSource,
+                crate::resource::SnapshotLeaf,
+                AbsoluteBindingAddress,
+                (),
+            >,
+        >::new(),
+        &HashMap::from([(id.into_inner(), guide)]),
+    )
+    .unwrap();
+    let Effect::DeferredReplace(payload) = &redacted.effects()[0] else {
+        unreachable!()
+    };
+    assert!(
+        payload.deletes[0]
+            .previous_attributes
+            .values()
+            .any(crate::value::contains_redacted_secret)
+    );
+    assert!(
+        !serde_json::to_string(&redacted)
+            .unwrap()
+            .contains("OLD_CHILD_SECRET_PLAINTEXT")
+    );
+}
+
+#[tokio::test]
+async fn fresh_conflicting_deferred_children_allow_cbd_with_unrelated_anonymous_deletes() {
+    for generation in [
+        EffectGeneration::Current,
+        EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
+    ] {
+        let (mut template, bindings, schemas, child) = anonymous_deferred_collision_fixture();
+        template.template_directives_mut().create_before_destroy =
+            crate::resource::LoopDirective::Resolved(true);
+        let old_id = ResolvedResourceId::with_provider_identity(
+            child.id.provider.clone(),
+            child.id.resource_type.clone(),
+            "unrelated",
+            child.id.provider_instance.clone(),
+        );
+        let mut plan = Plan::new();
+        plan.add_delete(DeferredReplaceDelete {
+            id: old_id.clone(),
+            identifier: crate::effect::fixture_applied_identifier("unrelated-old"),
+            generation,
+            directives: Default::default(),
+            binding: None,
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+            previous_attributes: Default::default(),
+        });
+        plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+            Box::new(template),
+        )));
+        let plan = plan
+            .admit(&schemas)
+            .expect("an unrelated anonymous Delete does not make a fresh child a replacement");
+        let provider = MockProvider::new();
+        provider.push_delete(Ok(()));
+        provider.push_create(Ok(
+            State::existing(child.id.clone(), HashMap::new()).with_identifier("fresh-child")
+        ));
+        let input = ExecutionInput {
+            provider_context: crate::parser::LoadedProviderContext::empty_for_test()
+                .as_provider_context()
+                .clone(),
+            plan: &plan,
+            provider_check_inputs: ProviderCheckInputs::Authored,
+            compositions: &[],
+            bindings,
+            managed_current: HashMap::new(),
+            data_source_values: ExecutableDataSourceValues::empty(),
+            normalizer: &NoopNormalizer,
+            provider_configs: &[],
+            factories: &[],
+            schemas: &schemas,
+            parallelism: NonZeroUsize::new(1).unwrap(),
+            precompleted_success_count: 0,
+            checkpoint_sink: ExecutionCheckpointSink::noop(),
+        };
+        let observer = MockObserver::new();
+        let result = completed_result(
+            execute_plan(&provider, input, &observer, uncancelled_shutdown()).await,
+        );
+        assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
+        assert_eq!(result.success_count, 2);
+        assert!(result.replacement_writeback.is_empty());
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2, "calls: {calls:?}");
+        assert!(calls.contains(&("delete".into(), old_id.to_string())));
+        assert!(calls.contains(&("create".into(), child.id.to_string())));
+    }
+}
+
+#[tokio::test]
+async fn review_4283_anonymous_delete_waits_for_forbidden_cbd_admission() {
+    forbidden_anonymous_deferred_admission(false).await;
+}
+
+async fn forbidden_anonymous_deferred_admission(deposed: bool) {
+    let (mut template, bindings, schemas, child) = anonymous_deferred_collision_fixture();
+    template.template_directives_mut().create_before_destroy =
+        crate::resource::LoopDirective::Resolved(true);
+    let child_id = child.id.clone();
+    let mut plan = Plan::new();
+    let old = DeferredReplaceDelete {
+        id: ResolvedResourceId::new(child_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("existing"),
+        generation: EffectGeneration::Current,
+        directives: Directives::default(),
+        binding: None,
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: Default::default(),
+    };
+    plan.add_delete(old.clone());
+    if deposed {
+        plan.add_delete(DeferredReplaceDelete {
+            generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
+            identifier: crate::effect::fixture_applied_identifier("old-deposed"),
+            ..old
+        });
+    }
+    plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+        Box::new(template),
+    )));
+    let plan = plan
+        .admit(&schemas)
+        .expect("an anonymous replacement is only confirmed after expansion");
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
+    let input = ExecutionInput {
+        provider_context: crate::parser::LoadedProviderContext::empty_for_test()
+            .as_provider_context()
+            .clone(),
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings,
+        managed_current: HashMap::new(),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    assert_eq!(result.failure_count(), 1, "events: {:?}", observer.events());
+    assert!(result.successfully_deleted.is_empty());
+    assert!(
+        provider.calls().is_empty(),
+        "runtime admission must preserve every old generation"
+    );
+}
+
+#[tokio::test]
+async fn review5_4283_unbound_loop_after_read_does_not_block_unrelated_replacement() {
+    let (mut template, _, schemas, child) = anonymous_deferred_collision_fixture();
+    template.iterable = Value::root_resource_ref("lookup", "values", Vec::new());
+    let parent = Resource::with_provider("mock", "test.Child", "producer", None)
+        .with_root_binding("producer")
+        .with_attribute(
+            "identity_input",
+            Value::Concrete(ConcreteValue::String("static".into())),
+        );
+    let parent_id = parent.id.clone();
+    let mut data_source = DataSource::with_provider("mock", "test.Lookup", "lookup", None);
+    data_source.binding = Some(absolute_binding("lookup"));
+    data_source.attributes.insert(
+        "filter".into(),
+        Value::root_resource_ref("producer", "identity_input", Vec::new()),
+    );
+    let graph = crate::resolved_graph::resolve_expanded_graph(
+        crate::parser::ExpandedParsedFile {
+            resources: vec![parent.clone()],
+            data_sources: vec![data_source.clone()],
+            ..Default::default()
+        }
+        .into(),
+    )
+    .unwrap();
+    let (template, dependencies) = graph.compile_deferred_for(template).unwrap();
+    let mut plan = Plan::new();
+    plan.add_delete(DeferredReplaceDelete {
+        generation: EffectGeneration::Current,
+        previous_attributes: HashMap::new(),
+        id: ResolvedResourceId::new(parent_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("old-producer"),
+        directives: Default::default(),
+        binding: parent.binding.clone(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+    });
+    plan.add(Effect::Create(
+        graph.resolve_resource(parent, &schemas).unwrap(),
+    ));
+    plan.add(Effect::Read {
+        resource: graph.resolve_data_source(data_source.clone()).unwrap(),
+    });
+    plan.add(Effect::DeferredCreate(
+        crate::effect::DeferredCreatePayload::new(Box::new(template), dependencies),
+    ));
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(
+        crate::resource::State::<crate::resource::NoPlaceholder>::existing(
+            parent_id.clone(),
+            HashMap::from([(
+                "identity_input".into(),
+                Value::Concrete(ConcreteValue::String("static".into())),
+            )]),
+        )
+        .with_identifier("new-producer")
+        .to_snapshot(),
+    ));
+    provider.push_read(Ok(
+        crate::resource::State::<crate::resource::NoPlaceholder>::existing(
+            data_source.id.clone(),
+            HashMap::from([(
+                "values".into(),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::String("stable".into()),
+                )])),
+            )]),
+        )
+        .with_identifier("lookup")
+        .to_snapshot(),
+    ));
+    provider.push_create(Ok(
+        State::existing(child.id.clone(), HashMap::new()).with_identifier("child")
+    ));
+    let input = ExecutionInput {
+        provider_context: crate::parser::LoadedProviderContext::empty_for_test()
+            .as_provider_context()
+            .clone(),
+        plan: &plan.clone().admit(&schemas).unwrap(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: ResolvedBindings::default(),
+        managed_current: HashMap::from([(
+            parent_id.clone(),
+            Current::from_snapshot(
+                State::existing(parent_id.clone(), HashMap::new()).with_identifier("old-producer"),
+            ),
+        )]),
+        data_source_values: executable_deferred_data_source_values(std::slice::from_ref(
+            &data_source,
+        )),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(2).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+    // wall-clock-ok: Bounds executor hangs while provider calls establish the actual operation order.
+    let result = completed_result(
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            execute_plan(&provider, input, &observer, uncancelled_shutdown()),
+        )
+        .await
+        .expect("the read/deferred graph must finish"),
+    );
+    assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
+    assert_eq!(result.success_count, 4);
+    let calls = provider.calls();
+    assert!(
+        call_position(&calls, "delete", &parent_id.to_string())
+            < call_position(&calls, "create", &parent_id.to_string())
+    );
+    assert!(
+        call_position(&calls, "create", &parent_id.to_string())
+            < call_position(&calls, "read", &data_source.id.to_string())
+    );
+    assert!(
+        call_position(&calls, "read", &data_source.id.to_string())
+            < call_position(&calls, "create", &child.id.to_string())
+    );
+}
+
+#[tokio::test]
+async fn review4_4283_deposed_delete_waits_for_forbidden_deferred_admission() {
+    forbidden_anonymous_deferred_admission(true).await;
+}
+
+#[tokio::test]
+async fn review4_4283_deposed_delete_waits_for_admitted_deferred_create_first() {
+    deposed_deferred_admission(true, true, false).await;
+}
+
+#[tokio::test]
+async fn review4_4283_bound_deposed_deletes_wait_for_both_deferred_gate_variants() {
+    for coexisting in [false, true] {
+        for absorbed in [false, true] {
+            deposed_deferred_admission(coexisting, absorbed, true).await;
+        }
+    }
+}
+
+async fn deposed_deferred_admission(coexisting: bool, absorbed: bool, bound: bool) {
+    let (mut template, bindings, mut schemas, child) = if bound {
+        let mut bindings = ResolvedBindings::default();
+        let state =
+            cert_state_for_deferred_replace_deadlock(&ResourceId::with_identity("test", "cert"));
+        bindings.set_with_completeness(
+            "cert",
+            state
+                .attributes
+                .into_iter()
+                .map(|(key, value)| (key, value.to_value_at("fixture").unwrap()))
+                .collect(),
+            crate::binding_index::BindingValueSource::Upstream,
+            crate::binding_index::BindingCompleteness::Complete,
+        );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("test")
+                .with_conflicting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        (
+            validation_deferred_for_expression(),
+            bindings,
+            schemas,
+            Resource::new("test", "validation_records[0]")
+                .with_root_binding("validation_records[0]"),
+        )
+    } else {
+        anonymous_deferred_collision_fixture()
+    };
+    template.template_directives_mut().create_before_destroy =
+        crate::resource::LoopDirective::Resolved(true);
+    if coexisting {
+        schemas.insert(
+            &child.id.provider,
+            PatternResourceSchema::new(child.id.resource_type.clone())
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "identity_input",
+                        PatternAttributeType::string(),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .with_coexisting_replacement()
+                .validate()
+                .unwrap(),
+        );
+    }
+    let child_id = child.id.clone();
+    let old = DeferredReplaceDelete {
+        generation: EffectGeneration::Current,
+        id: ResolvedResourceId::new(child_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("old-current"),
+        directives: Default::default(),
+        binding: child.binding.clone(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: HashMap::new(),
+    };
+    let mut deposed = old.clone();
+    deposed.generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+    deposed.identifier = crate::effect::fixture_applied_identifier("old-deposed");
+    let mut plan = Plan::new();
+    plan.add(deposed.to_delete_effect());
+    let compiled = if bound {
+        let configuration = crate::parser::ExpandedParsedFile {
+            upstream_states: vec![crate::parser::UpstreamState {
+                binding: absolute_binding("cert"),
+                source: "../cert".into(),
+            }],
+            ..Default::default()
+        };
+        let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
+        let (template, dependencies) = graph.compile_deferred_for(template).unwrap();
+        crate::effect::DeferredCreatePayload::new(Box::new(template), dependencies)
+    } else {
+        crate::test_support::compiled_loop(Box::new(template))
+    };
+    if absorbed {
+        plan.add(Effect::DeferredReplace(Box::new(
+            crate::effect::DeferredReplacePayload::new(
+                NonEmptyDeletes::try_new(vec![old]).unwrap(),
+                compiled.template,
+                compiled.dependency_template,
+            ),
+        )));
+    } else {
+        plan.add(old.to_delete_effect());
+        plan.add(Effect::DeferredCreate(compiled));
+    }
+    let plan = match plan.admit(&schemas) {
+        Ok(plan) => {
+            assert!(
+                coexisting,
+                "known Conflicting replacements must fail admission"
+            );
+            plan
+        }
+        Err(error) => {
+            assert!(
+                !coexisting,
+                "a Coexisting child must pass admission: {error:?}"
+            );
+            assert!(matches!(
+                error.cause,
+                crate::plan::CreateBeforeDestroyError::ReplacementCannotCoexist(_)
+            ));
+            return;
+        }
+    };
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(
+        State::existing(child_id.clone(), HashMap::new()).with_identifier("new-child")
+    ));
+    let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings,
+        managed_current: HashMap::new(),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let calls = provider.calls();
+    assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
+    assert_eq!(calls.len(), 3, "calls: {calls:?}");
+    assert_eq!(
+        calls[0],
+        ("create".into(), child_id.to_string()),
+        "every old generation must wait for the admitted Create: {calls:?}"
+    );
+    assert_eq!(result.replacement_writeback[0].old_instances().len(), 2);
+}
+
+#[test]
+fn review_4283_deferred_requirements_apply_to_one_concrete_sibling() {
+    let mut bindings = ResolvedBindings::default();
+    let option = |name: &str| {
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "resource_record".into(),
+            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
+                (
+                    "name".into(),
+                    Value::Concrete(ConcreteValue::String(name.into())),
+                ),
+                (
+                    "value".into(),
+                    Value::Concrete(ConcreteValue::String("value".into())),
+                ),
+            ]))),
+        )])))
+    };
+    bindings.set_with_completeness(
+        "cert",
+        HashMap::from([(
+            "domain_validation_options".into(),
+            Value::Concrete(ConcreteValue::List(vec![option("first"), option("second")])),
+        )]),
+        crate::binding_index::BindingValueSource::Upstream,
+        crate::binding_index::BindingCompleteness::Complete,
+    );
+    let old = |index: usize| DeferredReplaceDelete {
+        generation: crate::effect::EffectGeneration::Current,
+        id: test_resolved_id("test", &format!("validation_records[{index}]")),
+        identifier: crate::effect::fixture_applied_identifier(format!("old-{index}")),
+        directives: Default::default(),
+        binding: Some(absolute_binding(&format!("validation_records[{index}]"))),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: Default::default(),
+    };
+    let first = old(0).id;
+    let configuration = crate::parser::ExpandedParsedFile {
+        upstream_states: vec![crate::parser::UpstreamState {
+            binding: absolute_binding("cert"),
+            source: std::path::PathBuf::from("../cert"),
+        }],
+        ..Default::default()
+    };
+    let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
+    let (template, dependencies) = graph
+        .compile_deferred_for(validation_deferred_for_expression())
+        .unwrap();
+    let deferred = Effect::DeferredReplace(Box::new(crate::effect::DeferredReplacePayload::new(
+        NonEmptyDeletes::try_new(vec![old(0), old(1)]).unwrap(),
+        Box::new(template),
+        dependencies,
+    )));
+    let consumer = ResolvedResource::from_resolved_parts(
+        Resource::new("test", "consumer")
+            .with_root_binding("consumer")
+            .with_dependency_phase(()),
+        std::iter::once(first).collect(),
+        Default::default(),
+    );
+    let admitted = crate::replacement::AdmittedReplacementEffects::resolve(
+        &[deferred, Effect::Create(consumer)],
+        &COEXISTING_TEST_SCHEMAS,
+        |_| HashMap::new(),
+    )
+    .unwrap();
+    let effects = admitted.effects();
+    crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            let saved_effects: Vec<Effect<crate::resource::SavedModuleSource>> =
+                admitted.effects().iter().cloned().map(Into::into).collect();
+            let (existing, _, _) = crate::replacement::AdmittedReplacementEffects::resolve(
+                &saved_effects,
+                &COEXISTING_TEST_SCHEMAS,
+                |_| HashMap::new(),
+            )
+            .unwrap()
+            .expand_deferred_replacements();
+            let ctx = deferred_dispatch::PureMetaCtx {
+                existing: &existing,
+                ordinary_old: &[],
+                requirements: &HashMap::new(),
+                identity_inputs: deferred_dispatch::DeferredIdentityInputs {
+                    provider_configs: &[],
+                    type_checks: session,
+                    factories: &[],
+                    schemas: &COEXISTING_TEST_SCHEMAS,
+                },
+            };
+            let saved: Effect<crate::resource::SavedModuleSource> = effects[0].clone().into();
+            let decoded: Effect<crate::resource::SavedModuleSource> =
+                serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
+            for gate in [&saved, &decoded] {
+                let scheduler::PureMetaOutcome::Materialized(materialized) =
+                    scheduler::try_dispatch_pure_meta(gate, &bindings, &ctx)
+                else {
+                    panic!("children must materialize");
+                };
+                let children = &materialized.effects()[existing.effects().len()..];
+                assert_eq!(children.len(), 2);
+                let graph = materialized
+                    .dependency_analysis(std::iter::empty())
+                    .unwrap();
+                for (index, effect) in children.iter().enumerate() {
+                    let Effect::Create(child) = effect else {
+                        panic!("expected a materialized child Create");
+                    };
+                    assert!(!child.directives.create_before_destroy);
+                    let create = existing.effects().len() + index;
+                    let delete = materialized.effects().iter().position(|effect| {
+                        matches!(effect, Effect::Delete { id, .. } if **id == child.id)
+                    }).unwrap();
+                    let (after, before) = if index == 0 {
+                        (delete, create)
+                    } else {
+                        (create, delete)
+                    };
+                    assert!(
+                        graph.deps_of(after).unwrap().contains(&before),
+                        "only iteration 0 must be promoted to create-first"
+                    );
+                    assert!(!graph.deps_of(before).unwrap().contains(&after));
+                }
+            }
+        },
+    );
+}
+
+#[test]
+fn review_4283_redacted_deferred_debug_drops_preview_snapshots() {
+    let old = DeferredReplaceDelete {
+        generation: crate::effect::EffectGeneration::Current,
+        id: test_resolved_id("test", "validation_records[0]"),
+        identifier: crate::effect::fixture_applied_identifier("old-child"),
+        directives: Default::default(),
+        binding: Some(absolute_binding("validation_records[0]")),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: HashMap::from([(
+            "secret".into(),
+            crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::String(
+                "REVIEW_DEFERRED_SECRET_PLAINTEXT".into(),
+            )),
+        )]),
+    };
+    let id = old.id.as_inner().clone();
+    let guide = crate::value::redact_secrets_in_state(&State::existing(
+        id.clone(),
+        HashMap::from([(
+            "secret".into(),
+            crate::resource::SnapshotValue::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(crate::resource::SnapshotValue::Concrete(
+                    crate::resource::ConcreteValue::String(
+                        "REVIEW_DEFERRED_SECRET_PLAINTEXT".into(),
+                    ),
+                ))
+                .into(),
+            )),
+        )]),
+    ))
+    .unwrap();
+    let effect = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
+        NonEmptyDeletes::try_new(vec![old]).unwrap(),
+        Box::new(validation_deferred_for_expression()),
+    )));
+    let mut plan = Plan::new();
+    plan.add(effect);
+    let redacted = crate::value::redact_secrets_in_plan_with_desired_and_historical(
+        &plan,
+        &HashMap::<
+            ResourceId,
+            crate::resource::Resource<ModuleSource, crate::resource::SnapshotLeaf>,
+        >::new(),
+        &HashMap::from([(id, guide)]),
+    )
+    .unwrap();
+    assert!(
+        !serde_json::to_string(&redacted)
+            .unwrap()
+            .contains("REVIEW_DEFERRED_SECRET_PLAINTEXT")
+    );
+    assert!(
+        !format!("{redacted:?}").contains("REVIEW_DEFERRED_SECRET_PLAINTEXT"),
+        "redacted deferred Debug retained a plaintext preview snapshot"
+    );
+}
+
+#[tokio::test]
+async fn review_4283_runtime_attribute_name_override_reaches_checkpoints() {
+    let (mut template, bindings, _, child) = anonymous_deferred_collision_fixture();
+    template.template_directives_mut().create_before_destroy =
+        crate::resource::LoopDirective::Resolved(true);
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Child")
+            .attribute(
+                PatternAttributeSchema::optional("identity_input", PatternAttributeType::string())
+                    .create_only()
+                    .build(),
+            )
+            .with_unique_name_attribute("identity_input")
+            .validate()
+            .unwrap(),
+    );
+    let child_id = child.id.clone();
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(
+        State::existing(child_id.clone(), HashMap::new()).with_identifier("new-child")
+    ));
+    let mut plan = Plan::new();
+    plan.add(Effect::Delete {
+        id: ResolvedResourceId::new(child_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("old-child"),
+        generation: EffectGeneration::Current,
+        directives: Directives::default(),
+        binding: None,
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+    });
+    plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+        Box::new(template),
+    )));
+    let snapshots = Arc::new(Mutex::new(Vec::new()));
+    let published = Arc::clone(&snapshots);
+    let old = State::existing(
+        child_id.clone(),
+        HashMap::from([(
+            "identity_input".into(),
+            crate::resource::SnapshotValue::Concrete(crate::resource::ConcreteValue::String(
+                "stable".into(),
+            )),
+        )]),
+    )
+    .with_identifier("old-child");
+    let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
+        plan: &plan.clone().admit(&schemas).unwrap(),
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings,
+        managed_current: HashMap::from([(child_id.clone(), Current::from_snapshot(old))]),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::new(move |result| {
+            published.lock().unwrap().push(result)
+        }),
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
+    let override_ = &result.permanent_name_overrides[&child_id]["identity_input"];
+    assert_eq!(override_.original_value.as_deref(), Some("stable"));
+    assert_ne!(override_.temp_value, "stable");
+    let creates = provider.captured_create_resources();
+    assert_eq!(
+        creates[0].get_attr("identity_input"),
+        Some(&crate::resource::Value::Concrete(
+            crate::resource::ConcreteValue::String(override_.temp_value.clone().into())
+        ))
+    );
+    let snapshots = snapshots.lock().unwrap();
+    let checkpoint = snapshots
+        .iter()
+        .find(|snapshot| snapshot.applied_states.contains_key(&child_id))
+        .expect("created child must be checkpointed");
+    assert_eq!(
+        checkpoint.permanent_name_overrides[&child_id]["identity_input"],
+        *override_
+    );
+    for saved in [&result, checkpoint] {
+        let replacement = saved
+            .replacement_writeback
+            .iter()
+            .find(|replacement| replacement.target().as_inner() == &child_id)
+            .expect("checkpoint and final result retain the admitted association");
+        assert_eq!(replacement.old_instances()[0].id.as_inner(), &child_id);
+        assert_eq!(
+            replacement.old_instances()[0].identifier.as_str(),
+            "old-child"
+        );
+    }
+
+    let calls = provider.calls();
+    assert!(
+        call_position(&calls, "create", &child_id.to_string())
+            < call_position(&calls, "delete", &child_id.to_string()),
+        "prepared Attribute replacement should be create-first: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn review2_4283_deferred_reversed_history_resolves_combined_graph() {
+    deferred_reversed_history(true).await;
+}
+
+#[tokio::test]
+async fn review2_4283_deferred_reversed_history_rejects_conflicting_combined_graph() {
+    deferred_reversed_history(false).await;
+}
+
+async fn deferred_reversed_history(coexisting_child: bool) {
+    let mut parent = Resource::new("test", "cert").with_root_binding("cert");
+    parent.directives.create_before_destroy = true;
+    let parent_id = parent.id.clone();
+    let child_id = test_resolved_id("test.Child", "validation_records[0]");
+    let mut schemas = COEXISTING_TEST_SCHEMAS.clone();
+    let schema = PatternResourceSchema::new("test.Child");
+    schemas.insert(
+        "",
+        if coexisting_child {
+            schema.with_coexisting_replacement()
+        } else {
+            schema.with_conflicting_replacement()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let mut resource =
+        crate::resource::Resource::<ModuleSource, LoopSlot, AbsoluteBindingAddress>::new(
+            "test.Child",
+            "validation_records",
+        );
+    resource.binding = Some(absolute_binding("validation_records"));
+    resource
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("cert"));
+    resource.set_attr("name", for_value_access(&["resource_record", "name"]));
+    resource.set_attr("value", for_value_access(&["resource_record", "value"]));
+    let template = crate::parser::DeferredForExpression::new(
+        None,
+        1,
+        "for opt in cert.domain_validation_options".into(),
+        crate::parser::DeferredForTarget::bound(absolute_binding("validation_records")).unwrap(),
+        Value::root_resource_ref("cert", "domain_validation_options", Vec::new()),
+        crate::parser::ForBinding::Simple("opt".into()),
+        resource,
+    );
+    let gate = Effect::DeferredReplace(Box::new(crate::test_support::compiled_replace(
+        NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+            generation: crate::effect::EffectGeneration::Current,
+            id: child_id.clone(),
+            identifier: crate::effect::fixture_applied_identifier("old-child"),
+            directives: Default::default(),
+            binding: Some(absolute_binding("validation_records[0]")),
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+            previous_attributes: Default::default(),
+        }])
+        .unwrap(),
+        Box::new(template),
+    )));
+    let mut plan = Plan::new();
+    plan.add(create_effect(parent));
+    plan.add(Effect::Delete {
+        id: ResolvedResourceId::new(parent_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("old-parent"),
+        generation: EffectGeneration::Current,
+        directives: Default::default(),
+        binding: Some(absolute_binding("cert")),
+        dependencies: crate::test_support::persisted([child_id.clone()]),
+        explicit_dependencies: std::iter::once(child_id.clone()).collect(),
+        blocked_by_updates: std::iter::once(ResolvedResourceId::new(gate.resource_id().clone()))
+            .collect(),
+    });
+    plan.add(gate);
+    let plan = match plan.admit(&schemas) {
+        Ok(plan) => {
+            assert!(
+                coexisting_child,
+                "a known Conflicting cycle must fail preflight"
+            );
+            plan
+        }
+        Err(error) => {
+            assert!(
+                !coexisting_child,
+                "a Coexisting cycle must be admitted: {error:?}"
+            );
+            assert!(matches!(
+                error.cause,
+                crate::plan::CreateBeforeDestroyError::ReplacementCannotCoexist(_)
+            ));
+            assert_eq!(error.required_by.as_deref(), Some("test.cert"));
+            return;
+        }
+    };
+    let provider = MockProvider::new();
+    provider.push_create(Ok(cert_state_for_deferred_replace_deadlock(&parent_id)));
+    provider.push_create(Ok(State::existing(
+        child_id.as_inner().clone(),
+        HashMap::new(),
+    )
+    .with_identifier("new-child")));
+    provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
+    let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings: Default::default(),
+        managed_current: Default::default(),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    assert_eq!(
+        result.failure_count(),
+        0,
+        "combined admission must promote the child: {:?}",
+        observer.events()
+    );
+    assert_eq!(result.success_count, 4);
+    let calls = provider.calls();
+    assert!(
+        call_position(&calls, "create", &child_id.to_string())
+            < call_position(&calls, "delete", &child_id.to_string()),
+        "historical inversion requires child coexistence: {calls:?}"
+    );
+}
+
+#[test]
+fn review6_4283_historical_secret_rehydration_preserves_approval_order() {
+    for create_first in [false, true] {
+        let id = test_resolved_id("test", "validation_records[0]");
+        let verified = State::existing(
+            id.as_inner().clone(),
+            HashMap::from([(
+                "secret".into(),
+                crate::resource::SnapshotValue::Deferred(crate::resource::DeferredValue::Secret(
+                    Box::new(crate::resource::SnapshotValue::Concrete(
+                        crate::resource::ConcreteValue::String("historical-secret".into()),
+                    ))
+                    .into(),
+                )),
+            )]),
+        );
+        let guide = crate::value::redact_secrets_in_state(&verified).unwrap();
+        let template = if create_first {
+            coexisting_validation_deferred_for_expression()
+        } else {
+            validation_deferred_for_expression()
+        };
+        let mut plan = Plan::new();
+        plan.add(Effect::DeferredReplace(Box::new(
+            crate::test_support::compiled_replace(
+                NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                    generation: EffectGeneration::Current,
+                    id: id.clone(),
+                    identifier: crate::effect::fixture_applied_identifier("old-child"),
+                    directives: Default::default(),
+                    binding: Some(absolute_binding("validation_records[0]")),
+                    dependencies: Default::default(),
+                    explicit_dependencies: Default::default(),
+                    blocked_by_updates: Default::default(),
+                    previous_attributes: guide.attributes.clone(),
+                }])
+                .unwrap(),
+                Box::new(template),
+            ),
+        )));
+        plan.prepare_replacements(&COEXISTING_TEST_SCHEMAS).unwrap();
+        let restored = crate::value::rehydrate_plan_historical_secrets_from_verified_states(
+            &plan,
+            &HashMap::from([(id.as_inner().clone(), guide)]),
+            &HashMap::from([(id.as_inner().clone(), verified.clone())]),
+        )
+        .unwrap();
+        // Restoration produces a draft. The display boundary accepts only
+        // the capability returned by admission of that final draft.
+        let restored = restored.admit(&COEXISTING_TEST_SCHEMAS).unwrap();
+        let Effect::DeferredReplace(payload) = &restored.effects()[0] else {
+            panic!("historical restoration changed the deferred endpoint");
+        };
+        assert_eq!(payload.deletes[0].previous_attributes, verified.attributes);
+        assert_eq!(
+            payload.display_glyph(),
+            if create_first { "+/-" } else { "-/+" },
+            "approval must retain the checked replacement order after historical restoration"
+        );
+    }
+}
+
+#[test]
+fn review2_4283_secret_wrapped_deferred_history_uses_shared_hashes() {
+    use crate::resource::{SnapshotLeaf, SnapshotValue};
+    let id = test_resolved_id("test", "validation_records[0]");
+    let previous = HashMap::from([(
+        "secret".into(),
+        SnapshotValue::Deferred(crate::resource::DeferredValue::Secret(
+            Box::new(SnapshotValue::Concrete(
+                crate::resource::ConcreteValue::String("old-secret".into()),
+            ))
+            .into(),
+        )),
+    )]);
+    let verified = State::existing(id.as_inner().clone(), previous.clone());
+    let guide = crate::value::redact_secrets_in_state(&verified).unwrap();
+    let mut plan = Plan::new();
+    plan.add(Effect::DeferredReplace(Box::new(
+        crate::test_support::compiled_replace(
+            NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: crate::effect::EffectGeneration::Current,
+                id: id.clone(),
+                identifier: crate::effect::fixture_applied_identifier("old-child"),
+                directives: Default::default(),
+                binding: Some(absolute_binding("validation_records[0]")),
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
+                previous_attributes: previous,
+            }])
+            .unwrap(),
+            Box::new(validation_deferred_for_expression()),
+        ),
+    )));
+    let redacted = crate::value::redact_secrets_in_plan_with_desired_and_historical(
+        &plan,
+        &HashMap::<ResourceId, crate::resource::Resource<ModuleSource, SnapshotLeaf>>::new(),
+        &HashMap::from([(id.as_inner().clone(), guide.clone())]),
+    )
+    .unwrap();
+    let restored = crate::value::rehydrate_plan_historical_secrets_from_verified_states(
+        &redacted,
+        &HashMap::from([(id.as_inner().clone(), guide)]),
+        &HashMap::from([(id.as_inner().clone(), verified)]),
+    );
+    assert!(
+        restored.is_ok(),
+        "historical rehydration must use the shared salt: {restored:?}"
+    );
+}
+
+#[test]
+fn review2_4283_secret_wrapped_update_history_uses_shared_hashes() {
+    let id = ResourceId::with_identity("test", "updated");
+    let old = State::existing(
+        id.clone(),
+        HashMap::from([(
+            "secret".into(),
+            crate::resource::SnapshotValue::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(crate::resource::SnapshotValue::Concrete(
+                    crate::resource::ConcreteValue::String("historical-secret".into()),
+                ))
+                .into(),
+            )),
+        )]),
+    );
+    let guide = crate::value::redact_secrets_in_state(&old).unwrap();
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(old.clone()),
+        identifier: crate::effect::fixture_applied_identifier("existing"),
+        to: resolved(Resource::new("test", "updated")),
+        changed_attributes: vec!["secret".into()],
+    });
+    let redacted = crate::value::redact_secrets_in_plan_with_desired_and_historical(
+        &plan,
+        &HashMap::<
+            ResourceId,
+            crate::resource::Resource<ModuleSource, crate::resource::SnapshotLeaf>,
+        >::new(),
+        &HashMap::from([(id.clone(), guide.clone())]),
+    )
+    .unwrap();
+    let restored = crate::value::rehydrate_plan_historical_secrets_from_verified_states(
+        &redacted,
+        &HashMap::from([(id.clone(), guide)]),
+        &HashMap::from([(id, old)]),
+    );
+    assert!(
+        restored.is_ok(),
+        "shared historical guide was applied after hashing: {restored:?}"
     );
 }
 

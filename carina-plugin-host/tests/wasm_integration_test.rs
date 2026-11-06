@@ -436,7 +436,11 @@ where
         id: &'a ResourceId,
         request: CreateRequest,
     ) -> BoxFuture<'a, Result<CreateOutcome, CreateFailure>> {
-        let (create, cancellation) = carina_core::executor::dispatch_create(self, id, request);
+        assert_eq!(id, &request.resource().id, "fixture request target");
+        let (create, cancellation) = carina_core::executor::dispatch_create(
+            self,
+            carina_core::replacement::create_permit_for_test(request),
+        );
         Box::pin(async move {
             let _cancellation = cancellation;
             create.await

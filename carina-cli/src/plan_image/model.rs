@@ -5,7 +5,7 @@ use carina_core::executor::{
     PlanSchedulerPhase, UnresolvedResource, build_plan_scheduler_dependency_edges,
 };
 use carina_core::identifier::anonymous_identity_discriminator;
-use carina_core::plan::{Plan, ReplaceDisplayInfo};
+use carina_core::plan::ReplaceDisplayInfo;
 use carina_core::plan_tree::build_dependency_graph_from_effects;
 use carina_core::resource::{
     EphemeralId, ExpansionTrace, LiveComposition, ModuleSource, PersistentId, ResolvedResource,
@@ -22,7 +22,7 @@ pub struct StateMetadata<'a> {
 
 #[derive(Clone, Copy)]
 pub struct PlanImageInput<'a> {
-    pub plan: &'a Plan,
+    pub scheduled: &'a carina_core::replacement::ScheduledPlan<'a>,
     pub desired_resources: &'a [ResolvedResource],
     /// Identity-resolved snapshots from before value/reference resolution.
     /// The executor scheduler uses these to reconstruct apply-order edges.
@@ -196,8 +196,8 @@ struct ModuleInfo {
 }
 
 pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
-    let replacements: HashMap<usize, ReplaceDisplayInfo<'_>> = input
-        .plan
+    let plan = input.scheduled.plan();
+    let replacements: HashMap<usize, ReplaceDisplayInfo<'_>> = plan
         .replace_display_info()
         .map(|replacement| (replacement.create_idx, replacement))
         .collect();
@@ -206,8 +206,7 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
         .map(|(create_idx, replacement)| (replacement.delete_idx, *create_idx))
         .collect();
 
-    let changed_resource_ids: HashSet<ResourceId> = input
-        .plan
+    let changed_resource_ids: HashSet<ResourceId> = plan
         .effects()
         .iter()
         .filter_map(effect_owned_resource_id)
@@ -218,7 +217,7 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
     // dependency analysis. Real effects stay borrowed from the plan, while
     // the shells retain just identity, binding, dependency metadata, and
     // directives. Attribute values are never cloned into this analysis view.
-    let original_effect_count = input.plan.effects().len();
+    let original_effect_count = plan.effects().len();
     let mut synthetic_effects = Vec::new();
     let mut synthetic_nodes = HashMap::new();
     for (resource_idx, resource) in input.desired_resources.iter().enumerate() {
@@ -230,8 +229,7 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
         synthetic_effects.push(dependency_only_create(resource));
         synthetic_nodes.insert(effect_idx, (GraphNodeId::Unchanged(id), resource_idx));
     }
-    let analysis_effects: Vec<&Effect> = input
-        .plan
+    let analysis_effects: Vec<&Effect> = plan
         .effects()
         .iter()
         .chain(synthetic_effects.iter())
@@ -259,7 +257,7 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
         }
     }
     let mut nodes = Vec::new();
-    for (idx, effect) in input.plan.effects().iter().enumerate() {
+    for (idx, effect) in plan.effects().iter().enumerate() {
         if replacement_deletes.contains_key(&idx) {
             continue;
         }
@@ -314,7 +312,7 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
     }
 
     let dependency_graph =
-        build_dependency_graph_from_effects(&analysis_effects, input.plan.replace_display_info());
+        build_dependency_graph_from_effects(&analysis_effects, plan.replace_display_info());
     let mut logical_edge_set = HashSet::new();
     for (dependency_idx, dependent_idx) in dependency_graph.dependency_edges() {
         let (Some(dependency), Some(dependent)) = (
@@ -343,7 +341,7 @@ pub(crate) fn build_model(input: PlanImageInput<'_>) -> GraphModel {
         .map(|(resolved, unresolved)| (resolved.resolved_id(), unresolved))
         .collect();
     let executor_edges =
-        build_plan_scheduler_dependency_edges(input.plan.effects(), &unresolved_resources);
+        build_plan_scheduler_dependency_edges(input.scheduled, &unresolved_resources);
     let mut ordering_edge_set = HashSet::new();
     for (parent, child) in executor_edges {
         if parent.phase == PlanSchedulerPhase::DeferredReplaceTeardown
@@ -1171,20 +1169,35 @@ mod tests {
         .resolve_root_for_test()
     }
 
+    fn model_from_plan(
+        plan: &Plan,
+        desired_resources: &[ResolvedResource],
+        unresolved_resources: &[UnresolvedResource],
+        summary: &PlanChangeSummary,
+    ) -> GraphModel {
+        let plan = crate::test_support::admit_fixture_plan(plan, None);
+        build_model(input(
+            &plan.schedule(&Default::default()),
+            desired_resources,
+            unresolved_resources,
+            summary,
+        ))
+    }
+
     fn input<'a>(
-        plan: &'a Plan,
+        scheduled: &'a carina_core::replacement::ScheduledPlan<'a>,
         desired_resources: &'a [ResolvedResource],
         unresolved_resources: &'a [UnresolvedResource],
         summary: &'a PlanChangeSummary,
     ) -> PlanImageInput<'a> {
         PlanImageInput {
-            plan,
+            scheduled,
             desired_resources,
             unresolved_resources,
+            summary,
             compositions: &[],
             expansion_trace: None,
             state: None,
-            summary,
         }
     }
 
@@ -1292,6 +1305,59 @@ mod tests {
     }
 
     #[test]
+    fn continuation_order_uses_the_supplied_schedule() {
+        use carina_core::provider::{CreateAttempt, PendingToken, Sent};
+        use carina_core::resource::{Current, DeposedKey};
+        use carina_core::schema::{PatternResourceSchema, SchemaRegistry};
+
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("test.Widget")
+                .with_conflicting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        for identified in [true, false] {
+            let resource = resolved_one(named_resource("pending", &[]));
+            let id = resource.id.clone();
+            let attempt = CreateAttempt::for_test(id.clone());
+            let pending = if identified {
+                attempt
+                    .issued(
+                        AppliedIdentifier::new("new-id").unwrap(),
+                        Sent::AllRequestAttributes,
+                    )
+                    .pending(PendingToken::new("poll"), 1)
+            } else {
+                attempt.pending(PendingToken::new("resend"), Sent::AllRequestAttributes, 1)
+            }
+            .persist(Default::default(), Default::default());
+            let mut plan = Plan::new();
+            plan.add_resume_create(resource, pending.started_at().clone());
+            let mut cleanup = delete("pending", &[]);
+            if let Effect::Delete { generation, .. } = &mut cleanup {
+                *generation = EffectGeneration::Deposed(DeposedKey::new_unique());
+            }
+            plan.add(cleanup);
+            let summary = PlanChangeSummary::new(
+                &plan,
+                &[],
+                &crate::plan_summary::resolved_deferred_for_for_test([]),
+                &[],
+            );
+            let admitted = plan.admit(&schemas).unwrap();
+            let scheduled =
+                admitted.schedule(&HashMap::from([(id, Current::CreateInFlight(pending))]));
+            let model = build_model(input(&scheduled, &[], &[], &summary));
+            let (from, to) = if identified { (0, 1) } else { (1, 0) };
+            assert_eq!(model.ordering_edges.len(), 1);
+            assert_eq!(model.ordering_edges[0].from, GraphNodeId::Effect(from));
+            assert_eq!(model.ordering_edges[0].to, GraphNodeId::Effect(to));
+        }
+    }
+
+    #[test]
     fn anonymous_same_type_resources_with_unresolved_names_remain_distinct() {
         let mut first = Resource::new("test.Widget", "anonymous-system-id-1");
         first.set_attr("name", root_resource_ref("future", "name"));
@@ -1323,7 +1389,7 @@ mod tests {
             .collect::<Vec<_>>();
         let unresolved = unresolved(&desired);
 
-        let model = build_model(input(
+        let model = model_from_plan(
             &plan,
             &desired,
             &unresolved,
@@ -1333,7 +1399,7 @@ mod tests {
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
                 &[],
             ),
-        ));
+        );
 
         assert_eq!(model.nodes.len(), 2);
         assert!(model.node(&GraphNodeId::Effect(0)).is_some());
@@ -1353,7 +1419,7 @@ mod tests {
 
         let desired = resolved([resource]);
         let unresolved = unresolved(&desired);
-        let model = build_model(input(
+        let model = model_from_plan(
             &plan,
             &desired,
             &unresolved,
@@ -1363,7 +1429,7 @@ mod tests {
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
                 &[],
             ),
-        ));
+        );
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
 
         assert_eq!(node.label, "SecurityGroup");
@@ -1387,7 +1453,7 @@ mod tests {
 
         let desired = resolved([resource]);
         let unresolved = unresolved(&desired);
-        let model = build_model(input(
+        let model = model_from_plan(
             &plan,
             &desired,
             &unresolved,
@@ -1397,7 +1463,7 @@ mod tests {
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
                 &[],
             ),
-        ));
+        );
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
 
         assert_eq!(node.label, "production_security_group");
@@ -1511,7 +1577,7 @@ mod tests {
 
         let desired = resolved([resource]);
         let unresolved = unresolved(&desired);
-        let model = build_model(input(
+        let model = model_from_plan(
             &plan,
             &desired,
             &unresolved,
@@ -1521,7 +1587,7 @@ mod tests {
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
                 &[],
             ),
-        ));
+        );
         let node = model.node(&GraphNodeId::Effect(0)).unwrap();
 
         assert_eq!(node.kind, EffectKind::Update);
@@ -1536,7 +1602,7 @@ mod tests {
         plan.add(delete("middle", &["base"]));
         plan.add(delete("leaf", &["middle"]));
 
-        let model = build_model(input(
+        let model = model_from_plan(
             &plan,
             &[],
             &[],
@@ -1546,7 +1612,7 @@ mod tests {
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
                 &[],
             ),
-        ));
+        );
         let leaf = model.node(&GraphNodeId::Effect(2)).unwrap();
         let affected_by: HashSet<_> = leaf
             .affected_by
@@ -1572,7 +1638,7 @@ mod tests {
         plan.add(Effect::Create(desired[2].clone()));
         let unresolved = unresolved(&desired);
 
-        let model = build_model(input(
+        let model = model_from_plan(
             &plan,
             &desired,
             &unresolved,
@@ -1582,7 +1648,7 @@ mod tests {
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
                 &[],
             ),
-        ));
+        );
         let connector_id = GraphNodeId::Unchanged(ResolvedResourceId::new(connector.id));
         let unrelated_id = GraphNodeId::Unchanged(ResolvedResourceId::new(unrelated.id));
 
@@ -1598,7 +1664,11 @@ mod tests {
             crate::fixture_plan::build_plan_from_fixture_name(&runtime, "replace_create_only")
                 .expect("fixture mock inputs must be valid");
         let model = build_model(PlanImageInput {
-            plan: &fixture.plan,
+            scheduled: &crate::test_support::admit_fixture_plan(
+                &fixture.plan,
+                Some(&fixture.schemas),
+            )
+            .schedule(&Default::default()),
             desired_resources: &[],
             unresolved_resources: &[],
             compositions: &[],
@@ -1648,7 +1718,7 @@ mod tests {
             Default::default(),
         )));
 
-        let model = build_model(input(
+        let model = model_from_plan(
             &plan,
             &[],
             &[],
@@ -1658,7 +1728,7 @@ mod tests {
                 &crate::plan_summary::resolved_deferred_for_for_test([]),
                 &[],
             ),
-        ));
+        );
         let source = model
             .nodes
             .iter()
@@ -1701,7 +1771,7 @@ mod tests {
         let model = build_model(PlanImageInput {
             expansion_trace: Some(&trace),
             ..input(
-                &plan,
+                &crate::test_support::admit_fixture_plan(&plan, None).schedule(&Default::default()),
                 &desired,
                 &unresolved,
                 &PlanChangeSummary::new(
@@ -1758,7 +1828,7 @@ mod tests {
         let model = build_model(PlanImageInput {
             expansion_trace: Some(&trace),
             ..input(
-                &plan,
+                &crate::test_support::admit_fixture_plan(&plan, None).schedule(&Default::default()),
                 &desired,
                 &unresolved,
                 &PlanChangeSummary::new(
@@ -1791,7 +1861,11 @@ mod tests {
         )
         .expect("fixture mock inputs must be valid");
         let model = build_model(PlanImageInput {
-            plan: &fixture.plan,
+            scheduled: &crate::test_support::admit_fixture_plan(
+                &fixture.plan,
+                Some(&fixture.schemas),
+            )
+            .schedule(&Default::default()),
             desired_resources: &fixture.desired_resources,
             unresolved_resources: &fixture.unresolved_resources,
             compositions: &fixture.compositions,

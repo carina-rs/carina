@@ -540,7 +540,7 @@ fn identity_edges_apply_checks_unknown_value_before_consumer_create() {
         creates: Mutex::new(Vec::new()),
     };
     let input = LiveExecutionInput {
-        plan: &fixture.plan,
+        plan: &fixture.plan.clone().admit(&fixture.schemas).unwrap(),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &origins,
             data_source_origins: &[],

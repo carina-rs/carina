@@ -300,28 +300,33 @@ fn deferred_replace_plan_file(project: &Path, state: &StateFile) -> PlanFile {
     plan.add(Effect::Create(resolved(lb.clone())));
     plan.add(Effect::Create(resolved(cert.clone())));
 
-    plan.add(Effect::DeferredReplace(Box::new(DeferredReplacePayload {
-        dependency_template,
-        deletes: NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
-            id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
-            identifier: AppliedIdentifier::new("old-validation-id")
-                .expect("fixture identifier is non-empty"),
-            directives: Directives::default(),
-            binding: Some(absolute_binding("validation_records[0]")),
-            dependencies: carina_core::resource::PersistedDestroyDependencies::decode_persisted(
-                [carina_core::resource::ResolvedResourceId::new(
-                    cert.id.clone(),
-                )]
-                .into_iter()
-                .collect(),
-            )
-            .unwrap(),
-            explicit_dependencies: Default::default(),
-            blocked_by_updates: Default::default(),
-        }])
-        .expect("fixture has one delete"),
-        template: Box::new(template),
-    })));
+    plan.add(Effect::DeferredReplace(Box::new(
+        DeferredReplacePayload::new(
+            NonEmptyDeletes::try_new(vec![DeferredReplaceDelete {
+                generation: carina_core::effect::EffectGeneration::Current,
+                previous_attributes: Default::default(),
+                id: carina_core::resource::ResolvedResourceId::new(validation_id.clone()),
+                identifier: AppliedIdentifier::new("old-validation-id")
+                    .expect("fixture identifier is non-empty"),
+                directives: Directives::default(),
+                binding: Some(absolute_binding("validation_records[0]")),
+                dependencies:
+                    carina_core::resource::PersistedDestroyDependencies::decode_persisted(
+                        [carina_core::resource::ResolvedResourceId::new(
+                            cert.id.clone(),
+                        )]
+                        .into_iter()
+                        .collect(),
+                    )
+                    .unwrap(),
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
+            }])
+            .expect("fixture has one delete"),
+            Box::new(template),
+            dependency_template,
+        ),
+    )));
     plan.add(Effect::Create(resolved(alias.clone())));
 
     let sorted_resources = vec![lb.clone(), cert.clone(), alias.clone()];

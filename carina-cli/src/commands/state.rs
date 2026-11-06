@@ -1464,7 +1464,8 @@ async fn run_state_show(
                 );
             }
         }
-        let plan = build_plan_from_state(&state);
+        let plan =
+            build_plan_from_state(&state).admit(&carina_core::schema::SchemaRegistry::new())?;
         let historical_display =
             carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan);
         let prev_explicit = state.build_explicit();

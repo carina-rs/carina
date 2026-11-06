@@ -19,7 +19,7 @@ use crate::differ::{
 use crate::effect::{DeletedInstanceKey, Effect, EffectGeneration};
 use crate::explicit::{ExplicitProjection, ProjectedAuthoring};
 use crate::non_empty::NonEmptyVec;
-use crate::plan::{Plan, ReplaceDisplayInfo};
+use crate::plan::{AdmittedPlan, Plan, ReplaceDisplayInfo};
 use crate::provider::{ComparisonResolutionError, ProviderResult, ProviderRouter};
 use crate::provider::{NestedWriteOnlyRecord, PersistedAttributes};
 use crate::resource::{
@@ -703,7 +703,7 @@ pub enum ListOfMapsDiffField {
 /// ```
 #[derive(Debug)]
 pub struct PreparedPlanDisplay {
-    plan: std::sync::Arc<Plan>,
+    plan: std::sync::Arc<AdmittedPlan>,
     historical: HistoricalDisplayAttributes,
     detail: DetailLevel,
     rows: Vec<Vec<DetailRow>>,
@@ -712,7 +712,7 @@ pub struct PreparedPlanDisplay {
 impl PreparedPlanDisplay {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
-        plan: std::sync::Arc<Plan>,
+        plan: std::sync::Arc<AdmittedPlan>,
         historical: HistoricalDisplayAttributes,
         detail: DetailLevel,
         registry: &SchemaRegistry,
@@ -765,7 +765,7 @@ impl PreparedPlanDisplay {
         })
     }
 
-    pub fn plan(&self) -> &Plan {
+    pub fn plan(&self) -> &AdmittedPlan {
         &self.plan
     }
 
@@ -801,7 +801,7 @@ pub struct PlanDisplay<
     S = crate::resource::ModuleSource,
     V: crate::resource::PlanValueKind = crate::resource::NoPlaceholder,
 > {
-    plan: &'a Plan<S, V>,
+    plan: &'a AdmittedPlan<S, V>,
     historical: &'a HistoricalDisplayAttributes,
     rows: DisplayRows<'a>,
 }
@@ -818,7 +818,7 @@ impl<'a, S, V: crate::resource::PlanValueKind> PlanDisplay<'a, S, V> {
     /// A saved plan or a test comparison that builds its rows on demand.
     /// This constructor cannot accept prepared rows.
     pub fn unprepared(
-        plan: &'a Plan<S, V>,
+        plan: &'a AdmittedPlan<S, V>,
         historical: &'a HistoricalDisplayAttributes,
         comparisons: DetailComparisons<'a>,
     ) -> Self {
@@ -829,7 +829,7 @@ impl<'a, S, V: crate::resource::PlanValueKind> PlanDisplay<'a, S, V> {
         }
     }
 
-    pub fn plan(&self) -> &'a Plan<S, V> {
+    pub fn plan(&self) -> &'a AdmittedPlan<S, V> {
         self.plan
     }
 
@@ -4514,7 +4514,10 @@ mod tests {
         // default-tag provenance survives serialization without being copied
         // into ReplaceDisplayMetadata.
         let plan =
-            serde_json::from_str::<SavedPlan>(&serde_json::to_string(&plan).unwrap()).unwrap();
+            serde_json::from_str::<UnresolvedSavedPlan>(&serde_json::to_string(&plan).unwrap())
+                .unwrap()
+                .resolve_with_schemas(&SchemaRegistry::new())
+                .unwrap();
         let Effect::Create(saved_to) = &plan.effects()[0] else {
             panic!("replacement create effect must survive saved-plan round trip");
         };

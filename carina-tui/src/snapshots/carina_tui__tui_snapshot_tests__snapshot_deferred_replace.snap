@@ -4,7 +4,7 @@ expression: output
 ---
 ┌ Plan (Plan: 1 to create, 0 to update, 0 to delete; N to replace after cert applies.) ────────────────────────────────┐
 │+ acm.Certificate cert                                                                                                │
-│    └── +/- aws.route53.Record validation_records[*] (N records after cert applies)                                   │
+│    └── -/+ aws.route53.Record validation_records[*] (N records after cert applies)                                   │
 │                                                                                                                      │
 │                                                                                                                      │
 │                                                                                                                      │
@@ -24,7 +24,7 @@ expression: output
 │                                                                                                                      │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ┌ Details ─────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
-│+/- aws.route53.Record validation_records[*] (N records after cert applies)                                           │
+│-/+ aws.route53.Record validation_records[*] (N records after cert applies)                                           │
 │                                                                                                                      │
 │  <- for opt in cert.domain_validation_options                                                                        │
 │  hosted_zone_id: 'Z123'                                                                                              │

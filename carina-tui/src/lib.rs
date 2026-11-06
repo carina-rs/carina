@@ -251,7 +251,7 @@ fn app_for_run(
     comparisons: carina_core::detail_rows::DetailComparisons<'_>,
 ) -> Result<App, TuiError> {
     App::new(
-        plan,
+        &plan.clone().admit(schemas).unwrap(),
         schemas,
         historical_display,
         prev_explicit,
@@ -314,11 +314,11 @@ fn compiled_replace_fixture(
     template: Box<carina_core::parser::ExpandedDeferredForExpression>,
 ) -> carina_core::effect::DeferredReplacePayload {
     let payload = compiled_loop_fixture(template);
-    carina_core::effect::DeferredReplacePayload {
+    carina_core::effect::DeferredReplacePayload::new(
         deletes,
-        template: payload.template,
-        dependency_template: payload.dependency_template,
-    }
+        payload.template,
+        payload.dependency_template,
+    )
 }
 
 #[cfg(test)]

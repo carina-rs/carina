@@ -949,7 +949,10 @@ mod tests {
             "previous_attributes": previous_attributes,
         }]);
         let saved: carina_core::plan::SavedPlan =
-            serde_json::from_value(encoded).expect("replacement plan must deserialize");
+            serde_json::from_value::<carina_core::plan::UnresolvedSavedPlan>(encoded)
+                .expect("replacement plan must deserialize")
+                .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
+                .expect("replacement plan must be admitted");
         let plan = carina_core::value::rehydrate_plan_desired_secrets(
             &saved,
             &HashMap::new(),

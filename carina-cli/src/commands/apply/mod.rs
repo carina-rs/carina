@@ -22,6 +22,7 @@ use carina_core::executor::{
     LiveExecutionInput, ProviderCheckInputs, SavedExecutionInput, UnresolvedResource,
 };
 use carina_core::paths::ResolvedPath;
+#[cfg(any(test, feature = "test-utils"))]
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
 use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ProviderRouter};
@@ -242,6 +243,13 @@ async fn create_checked_bootstrap_resource(
                     schemas,
                 } = context;
                 let id = resource.id.clone();
+                let graph =
+                    carina_core::resolved_graph::resolve_expanded_graph(parsed.clone().into())?;
+                let target = graph.resolve_resource(resource.clone(), schemas)?;
+                let mut bootstrap_plan = carina_core::plan::Plan::new();
+                bootstrap_plan.add(carina_core::effect::Effect::Create(target));
+                let bootstrap_plan = bootstrap_plan.admit(schemas)?;
+                let scheduled = bootstrap_plan.schedule(&HashMap::new());
                 let bindings = bootstrap_resolved_bindings(parsed);
                 let module_gate =
                     carina_core::executor::ModuleConstraintGate::from_live_compositions(
@@ -256,17 +264,19 @@ async fn create_checked_bootstrap_resource(
                     schemas,
                     session,
                 );
-                let request = carina_core::executor::prepare_create_request(resource, &preparation)
-                    .await
-                    .map_err(AppError::from_state_bucket_preparation)?;
-                let resolved = request.resource().as_inner().clone();
+                let permit =
+                    carina_core::executor::prepare_initial_create(&scheduled, &graph, &preparation)
+                        .await
+                        .map_err(AppError::from_state_bucket_preparation)?
+                        .expect("bootstrap plan contains one initially ready create");
+                let resolved = permit.request().resource().as_inner().clone();
                 let resolved_comparison =
                     comparison_provider.comparison_for(schemas, &resolved.id)?;
                 let owner_schema = resolved_comparison.owner_schema();
                 let schema = Some(owner_schema.schema().as_schema());
-                let accepted_request = AcceptedRequest::from_create_request(&request);
+                let accepted_request = AcceptedRequest::from_create_request(permit.request());
                 let (create, create_cancellation) =
-                    carina_core::executor::dispatch_create(operation_provider, &id, request);
+                    carina_core::executor::dispatch_create(operation_provider, permit);
                 let outcome = create.await;
                 // Bootstrap creates are not part of the parallel executor, but they still
                 // retain the reporter until the guest call has settled.
@@ -741,7 +751,7 @@ struct ApplyExecutionState<
 }
 
 async fn execute_effects_with_observer(
-    plan: &Plan,
+    plan: &carina_core::plan::AdmittedPlan,
     compositions: &[carina_core::resource::LiveComposition],
     context: ApplyExecutionContext<'_>,
     state: ApplyExecutionState<'_>,
@@ -2682,7 +2692,7 @@ async fn run_apply_locked_owned(
             let state_save_inputs = Arc::new(
                 ApplyStateSaveInputs::new(
                     resolved_resources.clone(),
-                    plan.clone(),
+                    plan.clone().into_unadmitted(),
                     ctx.schemas().clone(),
                     None,
                     provider.as_ref(),
@@ -3475,7 +3485,9 @@ async fn run_apply_from_plan_with_observer_factory(
         .and_then(serde_json::Value::as_str)
         .map(|source_path| saved_plan_replan_command(plan_path, Path::new(source_path)));
 
-    // Validate version compatibility before decoding the payload. Format 40
+    // Validate version compatibility before decoding the payload. Format 42
+    // retains replacement history and create-first dependency requirements;
+    // format 41 uses typed Secret nodes exclusively. Format 40
     // requires an absolute source locator and its planned canonical identity.
     // Format 39 stores resolved dependency addresses and legacy migration
     // classifications.
@@ -4288,7 +4300,7 @@ async fn run_apply_from_plan_locked_owned(
             let provider = Arc::new(provider);
             let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
                 resolved_sorted_resources.clone(),
-                (*plan).clone(),
+                plan.clone().into_unadmitted(),
                 wiring.schemas().clone(),
                 Some(rehydrated_plan_file.planned_secret_hashes().clone()),
                 provider.as_ref(),

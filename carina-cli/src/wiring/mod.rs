@@ -226,7 +226,7 @@ pub enum PlannedPlan {
         references: carina_core::references::ResolvedReferences,
     },
     Unrendered {
-        plan: Plan,
+        plan: Box<carina_core::plan::AdmittedPlan>,
         references: carina_core::references::ResolvedReferences,
     },
 }
@@ -240,9 +240,9 @@ impl PlannedPlan {
 }
 
 impl std::ops::Deref for PlannedPlan {
-    type Target = Plan;
+    type Target = carina_core::plan::AdmittedPlan;
 
-    fn deref(&self) -> &Plan {
+    fn deref(&self) -> &carina_core::plan::AdmittedPlan {
         match self {
             Self::Rendered { display, .. } => display.plan(),
             Self::Unrendered { plan, .. } => plan,
@@ -298,6 +298,7 @@ pub(crate) async fn prepare_plan_outcome(
     if let Ok(errors) = NonEmptyPlanErrors::try_from(plan.errors().to_vec()) {
         return Ok(PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }));
     }
+    let plan = plan.admit(schemas)?;
     let planned = match row_request {
         RowRequest::Render(detail) => {
             let historical = crate::commands::plan::collect_historical_display_attributes(
@@ -316,7 +317,7 @@ pub(crate) async fn prepare_plan_outcome(
             }
         }
         RowRequest::None => PlannedPlan::Unrendered {
-            plan,
+            plan: Box::new(plan),
             references: planning,
         },
     };
@@ -7077,11 +7078,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                 });
                 state_block_result?;
 
-                let analysis = carina_core::effect::deps::build_effect_dependency_analysis(
-                    plan.effects(),
-                    resolved_desired_ids.ids.iter(),
-                    carina_core::effect::deps::ScheduleInputs::Apply,
-                );
+                let analysis = plan.dependency_analysis(resolved_desired_ids.ids.iter());
                 let analysis = match analysis {
                     Ok(analysis) => analysis,
                     Err(failure) => failure.into_parts().0,
@@ -9283,7 +9280,7 @@ pub fn add_deposed_delete_effects(
     for row in state_file.resources() {
         let (effects, errors) = deposed_delete_effects_for_row(row, moved_pairs);
         for effect in effects {
-            plan.add(effect);
+            plan.add_delete(effect);
         }
         for error in errors {
             plan.add_error(error);
@@ -9298,7 +9295,10 @@ pub fn add_deposed_delete_effects(
 pub(crate) fn deposed_delete_effects_for_row(
     row: &carina_state::ResourceState,
     moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
-) -> (Vec<Effect>, Vec<PlanError>) {
+) -> (
+    Vec<carina_core::effect::DeferredReplaceDelete>,
+    Vec<PlanError>,
+) {
     let mut effects = Vec::with_capacity(row.deposed.len());
     let mut errors = Vec::new();
     let row_id = resolved_state_row_id(row, row.directives.provider_instance.clone());
@@ -9325,7 +9325,7 @@ pub(crate) fn deposed_delete_effects_for_row(
             deposed.identifier.as_str(),
             row.identifier().map(AppliedIdentifier::as_str),
         ) {
-            Ok(identifier) => effects.push(Effect::Delete {
+            Ok(identifier) => effects.push(carina_core::effect::DeferredReplaceDelete {
                 id,
                 identifier,
                 generation: EffectGeneration::Deposed(deposed.key.clone()),
@@ -9334,6 +9334,7 @@ pub(crate) fn deposed_delete_effects_for_row(
                 dependencies: deposed.dependency_bindings.clone(),
                 explicit_dependencies: ResolvedDependencies::default(),
                 blocked_by_updates: blocked_by_current_resume.clone(),
+                previous_attributes: deposed.persisted_attributes().to_values(),
             }),
             Err(error) => errors.push(*error),
         }

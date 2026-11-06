@@ -21,8 +21,8 @@ use super::deferred_dispatch::{DeferredAnonymousIdentityGuard, PureMetaCtx};
 use super::provider_ready::ProviderPreparationContext;
 use super::replace::SingleEffectResult;
 use super::scheduler::{
-    FailureView, PureMetaOutcome, SchedulerDeps, dependency_failed_reason, failure_display_name,
-    try_dispatch_pure_meta, wait_dependency_failed_reason,
+    self, FailureView, PureMetaOutcome, SchedulerDeps, dependency_failed_reason,
+    failure_display_name, try_dispatch_pure_meta, wait_dependency_failed_reason,
 };
 use super::wait::{
     SKIP_REASON_CANCELLED, WaitAwareInFlight, WaitEffectRef, WaitOutcome, WaitSignal,
@@ -36,139 +36,6 @@ use super::{
 };
 #[cfg(test)]
 use super::{ExecutionInput, ProviderCheckInputs};
-
-pub(super) struct ExpandedEffects<S> {
-    pub(super) effects: Vec<Effect<S>>,
-    pub(super) deferred_replace_delete_deps: Vec<(usize, usize)>,
-    pub(super) source_effect_indices: Vec<usize>,
-}
-
-pub(super) fn expand_deferred_replace_effects<S: Clone>(
-    plan_effects: &[Effect<S>],
-) -> ExpandedEffects<S> {
-    let mut effects = Vec::with_capacity(plan_effects.len());
-    let mut deferred_replace_delete_deps = Vec::new();
-    let mut source_effect_indices = Vec::with_capacity(plan_effects.len());
-
-    for (source_effect_idx, effect) in plan_effects.iter().enumerate() {
-        if let Effect::DeferredReplace(payload) = effect {
-            let mut delete_indices = Vec::with_capacity(payload.deletes.len());
-            for delete in payload.deletes.iter() {
-                let delete_idx = effects.len();
-                effects.push(delete.to_delete_effect());
-                source_effect_indices.push(source_effect_idx);
-                delete_indices.push(delete_idx);
-            }
-            let gate_idx = effects.len();
-            effects.push(effect.clone());
-            source_effect_indices.push(source_effect_idx);
-            deferred_replace_delete_deps.extend(
-                delete_indices
-                    .into_iter()
-                    .map(|delete_idx| (gate_idx, delete_idx)),
-            );
-        } else {
-            effects.push(effect.clone());
-            source_effect_indices.push(source_effect_idx);
-        }
-    }
-
-    ExpandedEffects {
-        effects,
-        deferred_replace_delete_deps,
-        source_effect_indices,
-    }
-}
-
-pub(super) fn apply_deferred_replace_delete_deps<S>(
-    effects: &[Effect<S>],
-    deps_of: &mut HashMap<usize, HashSet<usize>>,
-    deferred_replace_delete_deps: &[(usize, usize)],
-) {
-    // An unrelated anonymous state row remains a normal Delete rather than
-    // being claimed by one arbitrary unbound loop. Every same-kind unbound
-    // runtime gate must nevertheless wait for that row to be removed, because
-    // any gate may materialize a child with the persisted generated address.
-    for (delete_idx, effect) in effects.iter().enumerate() {
-        let Effect::Delete {
-            id,
-            generation: crate::effect::EffectGeneration::Current,
-            binding: None,
-            ..
-        } = effect
-        else {
-            continue;
-        };
-        if !deps_of.contains_key(&delete_idx) {
-            continue;
-        }
-        for (gate_idx, candidate) in effects.iter().enumerate() {
-            let template = match candidate {
-                Effect::DeferredCreate(payload) => payload.template.as_ref(),
-                Effect::DeferredReplace(payload) => payload.template.as_ref(),
-                _ => continue,
-            };
-            if matches!(
-                template.target(),
-                crate::parser::DeferredForTarget::Unbound { .. }
-            ) && template.template_resource_id().provider == id.provider
-                && template.template_resource_id().resource_type == id.resource_type
-                && template.template_resource_id().provider_instance == id.provider_instance
-            {
-                deps_of.entry(gate_idx).or_default().insert(delete_idx);
-            }
-        }
-    }
-
-    for &(gate_idx, delete_idx) in deferred_replace_delete_deps {
-        let Some(Effect::DeferredReplace(payload)) = effects.get(gate_idx) else {
-            continue;
-        };
-
-        if deps_of.contains_key(&delete_idx) {
-            // The gate owns its absorbed rows. A failed or skipped gate must
-            // therefore skip the deletes instead of destroying live state
-            // before the replacement shape is known.
-            deps_of.entry(delete_idx).or_default().insert(gate_idx);
-        }
-
-        let is_unbound = matches!(
-            payload.template.target(),
-            crate::parser::DeferredForTarget::Unbound { .. }
-        );
-
-        let Some(delete_id) = effects.get(delete_idx).map(Effect::resource_id) else {
-            continue;
-        };
-        for (create_idx, effect) in effects.iter().enumerate() {
-            let Effect::Create(resource) = effect else {
-                continue;
-            };
-            let same_live_id = resource.id == *delete_id;
-            let replaces_legacy_loop_row = is_unbound
-                && resource.id.provider == delete_id.provider
-                && resource.id.resource_type == delete_id.resource_type
-                && resource.id.provider_instance == delete_id.provider_instance
-                && resource.id.identity().is_some_and(|identity| {
-                    resource
-                        .loop_provenance
-                        .legacy_candidates(identity)
-                        .iter()
-                        .any(|legacy| delete_id.identity_str() == Some(legacy.exact_state_name()))
-                });
-            if !same_live_id && !replaces_legacy_loop_row {
-                continue;
-            }
-            // DeferredReplace materializes the replacement create after the
-            // delete placeholder is already in the scheduler. The generic
-            // same-identity rule would otherwise order create after delete.
-            if same_live_id && let Some(create_deps) = deps_of.get_mut(&create_idx) {
-                create_deps.remove(&delete_idx);
-            }
-            deps_of.entry(delete_idx).or_default().insert(create_idx);
-        }
-    }
-}
 
 pub(super) fn is_runtime_dispatchable<S: Clone>(
     effect: &Effect<S>,
@@ -489,6 +356,7 @@ pub(super) async fn execute_effects_sequential<
         interrupted_count: 0,
         applied_states: HashMap::new(),
         runtime_synthesized_resources: Vec::new(),
+        replacement_writeback: Vec::new(),
         successfully_deleted: HashSet::new(),
         permanent_name_overrides: HashMap::new(),
         managed_current: std::mem::take(&mut input.managed_current),
@@ -505,13 +373,12 @@ pub(super) async fn execute_effects_sequential<
     let module_gate = input.compositions.module_constraint_gate();
     let type_checks = input.type_checks;
 
-    let ExpandedEffects {
-        effects: expanded_effects,
-        deferred_replace_delete_deps,
-        source_effect_indices: _,
-    } = expand_deferred_replace_effects(input.plan.effects());
-    let mut effects = expanded_effects;
-    let mut total = count_runtime_effects(&effects, &input.data_source_values);
+    let admitted = input.plan.schedule(&accumulated.result().managed_current);
+    accumulated.record_replacement_metadata(&admitted);
+    let (mut admitted, _, _) = admitted.expand_deferred_replacements();
+    let mut effects = admitted.effects();
+    let mut materialization_requirements = crate::replacement::create_first_requirements(effects);
+    let mut total = count_runtime_effects(effects, &input.data_source_values);
     let completed = AtomicUsize::new(0);
 
     let empty_resource_origins = HashMap::new();
@@ -523,7 +390,7 @@ pub(super) async fn execute_effects_sequential<
         .keys()
         .map(|id| id.as_inner().clone())
         .collect::<HashSet<_>>();
-    for effect in &effects {
+    for effect in effects {
         if matches!(
             effect,
             Effect::Read { .. }
@@ -564,11 +431,7 @@ pub(super) async fn execute_effects_sequential<
     let SchedulerDeps {
         mut deps_of,
         unresolved: scheduler_dependency_errors,
-    } = input.compositions.scheduler_dependencies(
-        &effects,
-        resource_origins,
-        &deferred_replace_delete_deps,
-    );
+    } = scheduler::build_scheduler_deps(&admitted, resource_origins.keys());
 
     // Build effect index -> binding name mapping for resolving dependency names
     let mut idx_to_binding: HashMap<usize, String> = effects
@@ -698,34 +561,77 @@ pub(super) async fn execute_effects_sequential<
             dispatched.insert(idx);
             let effect = effects[idx].clone();
 
-            let failure_view = FailureView::new(&effects, &deps_of, &failed_indices);
-            if let Some(failed_dep) = failure_view.find_failed_dependency(idx) {
-                let c = if effect.is_scheduler_meta() {
-                    completed.load(Ordering::Relaxed)
-                } else {
-                    completed.fetch_add(1, Ordering::Relaxed) + 1
-                };
-                let reason = if effect.is_wait() {
-                    wait_dependency_failed_reason(&failed_dep)
-                } else {
-                    dependency_failed_reason(&failed_dep)
-                };
-                observer.on_event(&ExecutionEvent::EffectSkipped {
-                    effect: &effect,
-                    reason: &reason,
-                    progress: ProgressInfo {
-                        completed: c,
-                        total,
-                    },
-                });
-                accumulated.mutate(|result| result.skip_count += 1);
-                failed_indices.insert(idx);
-                completed_indices.insert(idx);
-                completed_synchronous_dispatch = true;
-                continue;
-            }
+            let released = super::scheduler::release_ready_effect(
+                &admitted,
+                idx,
+                &deps_of,
+                &completed_indices,
+                &failed_indices,
+            )
+            .expect("newly ready endpoints have completed prerequisites");
+            let ready = match released {
+                Ok(ready) => ready,
+                Err(failed_dep) => {
+                    let c = if effect.is_scheduler_meta() {
+                        completed.load(Ordering::Relaxed)
+                    } else {
+                        completed.fetch_add(1, Ordering::Relaxed) + 1
+                    };
+                    let reason = if effect.is_wait() {
+                        wait_dependency_failed_reason(&failed_dep)
+                    } else {
+                        dependency_failed_reason(&failed_dep)
+                    };
+                    observer.on_event(&ExecutionEvent::EffectSkipped {
+                        effect: &effect,
+                        reason: &reason,
+                        progress: ProgressInfo {
+                            completed: c,
+                            total,
+                        },
+                    });
+                    accumulated.mutate(|result| result.skip_count += 1);
+                    failed_indices.insert(idx);
+                    completed_indices.insert(idx);
+                    completed_synchronous_dispatch = true;
+                    continue;
+                }
+            };
 
+            let ordinary_old = admitted
+                .deferred_delete_candidates(idx)
+                .into_iter()
+                .filter_map(|index| {
+                    effects[index].to_delete_payload(|instance| {
+                        input
+                            .plan
+                            .previous_delete_attributes(instance)
+                            .or_else(|| {
+                                if !instance.generation().is_current() {
+                                    return None;
+                                }
+                                accumulated
+                                    .result()
+                                    .managed_current
+                                    .get(instance.id())
+                                    .and_then(|current| match current {
+                                        crate::resource::Current::Present(present)
+                                            if present.identifier().as_str()
+                                                == instance.identifier() =>
+                                        {
+                                            Some(present.state().to_snapshot().attributes)
+                                        }
+                                        _ => None,
+                                    })
+                            })
+                            .unwrap_or_default()
+                    })
+                })
+                .collect::<Vec<_>>();
             let dispatch_ctx = PureMetaCtx {
+                existing: &admitted,
+                ordinary_old: &ordinary_old,
+                requirements: &materialization_requirements,
                 identity_inputs: super::deferred_dispatch::DeferredIdentityInputs {
                     provider_configs: input.provider_configs,
                     factories: input.factories,
@@ -755,13 +661,16 @@ pub(super) async fn execute_effects_sequential<
                     completed_synchronous_dispatch = true;
                     break;
                 }
-                PureMetaOutcome::Materialized(children) => {
+                PureMetaOutcome::Materialized(combined) => {
+                    let child_offset = effects.len();
                     let template = match &effect {
                         Effect::DeferredCreate(payload) => payload.template.as_ref(),
                         Effect::DeferredReplace(payload) => payload.template.as_ref(),
                         _ => unreachable!("pure meta materialization has a deferred template"),
                     };
-                    if let Err(error) = anonymous_identity_guard.admit(template, &children) {
+                    if let Err(error) =
+                        anonymous_identity_guard.admit(template, &combined, child_offset)
+                    {
                         record_effect_failure(
                             &mut accumulated,
                             observer,
@@ -781,27 +690,29 @@ pub(super) async fn execute_effects_sequential<
                         completed_synchronous_dispatch = true;
                         break;
                     }
-                    if !children.is_empty() {
-                        total += count_actionable_effects(&children);
-                        for child in children {
-                            let child_idx = effects.len();
-                            if let Effect::Create(resource) = &child {
+                    accumulated.record_replacement_metadata(&combined);
+                    if combined.effects().len() > child_offset {
+                        total += count_actionable_effects(&combined.effects()[child_offset..]);
+                        for (offset, child) in combined.effects()[child_offset..].iter().enumerate()
+                        {
+                            let child_idx = effects.len() + offset;
+                            if let Effect::Create(resource) = child {
                                 runtime_authored_resource_ids.insert(resource.id.clone());
                                 accumulated.mutate(|result| {
                                     result.runtime_synthesized_resources.push(resource.clone());
                                 });
                             }
-                            if let Some(binding) = failure_display_name(&child) {
+                            if let Some(binding) = failure_display_name(child) {
                                 idx_to_binding.insert(child_idx, binding);
                             }
-                            effects.push(child);
                             actionable_indices.push(child_idx);
                         }
-                        let rebuilt = input.compositions.scheduler_dependencies(
-                            &effects,
-                            resource_origins,
-                            &deferred_replace_delete_deps,
-                        );
+                        admitted = admitted.with_materialized(combined);
+                        effects = admitted.effects();
+                        materialization_requirements =
+                            crate::replacement::create_first_requirements(effects);
+                        let rebuilt =
+                            scheduler::build_scheduler_deps(&admitted, resource_origins.keys());
                         deps_of = rebuilt.deps_of;
                         for dependency in rebuilt.unresolved {
                             let failed_idx = dependency.effect_index();
@@ -845,30 +756,6 @@ pub(super) async fn execute_effects_sequential<
             let provider_configs = input.provider_configs;
             let factories = input.factories;
             let schemas = input.schemas;
-            let resume_create = match &effect {
-                Effect::ResumeCreate { resource, .. } => accumulated
-                    .result()
-                    .managed_current
-                    .get(&resource.id)
-                    .and_then(|current| match current {
-                        crate::resource::Current::CreateInFlight(pending) => Some(pending.clone()),
-                        crate::resource::Current::Absent(_)
-                        | crate::resource::Current::Present(_)
-                        | crate::resource::Current::CreateOutcomeUnknown(_)
-                        | crate::resource::Current::MissingIdentifier(_) => None,
-                    }),
-                Effect::Read { .. }
-                | Effect::Create(_)
-                | Effect::Update { .. }
-                | Effect::Delete { .. }
-                | Effect::Import { .. }
-                | Effect::Remove { .. }
-                | Effect::Move { .. }
-                | Effect::ReleaseListKeys { .. }
-                | Effect::Wait { .. }
-                | Effect::DeferredCreate(_)
-                | Effect::DeferredReplace(_) => None,
-            };
             let completed_ref = &completed;
             let effect_for_future = effect.clone();
             let make_future = move |wait_cancel_rx: Option<
@@ -884,14 +771,8 @@ pub(super) async fn execute_effects_sequential<
                     schemas,
                     type_checks,
                 );
-                let result = match effect_for_future.as_basic() {
-                    // `BasicEffect` is the type-level contract for
-                    // `execute_basic_effect`: any Create/Update/Delete
-                    // narrows here, and any non-basic variant falls
-                    // through to the `None` arm so it can't accidentally
-                    // be dispatched (carina#3164). The compiler enforces
-                    // exhaustiveness on the outer `match effect { ... }`
-                    // below.
+                let result = match ready.into_basic() {
+                    // Only dependency-ready release supplies these operations.
                     Some(basic) => SingleEffectResult::Basic(Box::new(
                         execute_basic_effect(
                             basic,
@@ -901,7 +782,6 @@ pub(super) async fn execute_effects_sequential<
                                 provider_check_inputs,
                                 runtime_authored,
                                 preparation: &preparation,
-                                resume_create,
                                 completed: completed_ref,
                                 total,
                             },
@@ -915,10 +795,7 @@ pub(super) async fn execute_effects_sequential<
                         | Effect::ResumeCreate { .. }
                         | Effect::Update { .. }
                         | Effect::Delete { .. } => {
-                            // `as_basic()` returns `Some` for exactly these
-                            // three variants; they're handled by the `Some`
-                            // arm above.
-                            unreachable!("Create/Update/Delete are narrowed by as_basic()")
+                            unreachable!("basic operations were narrowed by ready release")
                         }
                         Effect::Read { resource } => {
                             let c = completed_ref.fetch_add(1, Ordering::Relaxed) + 1;
@@ -1087,7 +964,7 @@ pub(super) async fn execute_effects_sequential<
         }
 
         let count_undispatched = |dispatched: &HashSet<usize>, failed_indices: &HashSet<usize>| {
-            let failure_view = FailureView::new(&effects, &deps_of, failed_indices);
+            let failure_view = FailureView::new(effects, &deps_of, failed_indices);
             count_effectively_undispatched(&actionable_indices, dispatched, &failure_view)
         };
         in_flight
@@ -1127,7 +1004,7 @@ pub(super) async fn execute_effects_sequential<
                     .copied()
                     .collect::<HashSet<_>>();
                 for (idx, kind) in classify_stalled_effects(
-                    &effects,
+                    effects,
                     &deps_of,
                     &remaining_indices,
                     &completed_indices,
@@ -1446,7 +1323,57 @@ mod tests {
     }
 
     #[test]
-    fn all_same_kind_unbound_deferred_gates_wait_for_anonymous_delete() {
+    fn review5_4283_bound_gate_recognizes_a_child_address_without_binding_metadata() {
+        let template = crate::parser::DeferredForExpression::new(
+            None,
+            0,
+            "for value in []".into(),
+            crate::parser::DeferredForTarget::bound(absolute("children")).unwrap(),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(Vec::new())),
+            crate::parser::ForBinding::Simple("value".into()),
+            crate::resource::Resource::<crate::resource::ModuleSource, crate::resource::LoopSlot>::with_provider(
+                "mock", "test.Child", "children", None,
+            ),
+        );
+        let delete = |identity| Effect::Delete {
+            id: crate::resource::ResolvedResourceId::with_provider_identity(
+                "mock",
+                "test.Child",
+                identity,
+                None,
+            ),
+            identifier: crate::effect::fixture_applied_identifier("old-child"),
+            generation: crate::effect::EffectGeneration::Current,
+            directives: Directives::default(),
+            binding: None,
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+        };
+        let effects = vec![
+            delete("children[0]"),
+            Effect::DeferredCreate(crate::test_support::compiled_loop(Box::new(template))),
+            delete("unrelated"),
+        ];
+        let admitted = crate::replacement::AdmittedReplacementEffects::resolve(
+            &effects,
+            &SchemaRegistry::new(),
+            |_| HashMap::new(),
+        )
+        .unwrap();
+        let deps_of = admitted
+            .dependency_analysis(std::iter::empty())
+            .unwrap()
+            .into_deps_of();
+        assert_eq!(deps_of[&0], HashSet::from([1]));
+        assert!(
+            deps_of[&2].is_empty(),
+            "a bound gate cannot claim unrelated deletes with missing metadata"
+        );
+    }
+
+    #[test]
+    fn anonymous_delete_waits_for_all_same_kind_unbound_deferred_gates() {
         let deleted_id = crate::resource::ResolvedResourceId::with_provider_identity(
             "mock",
             "test.Child",
@@ -1471,16 +1398,20 @@ mod tests {
                 unbound_deferred_template_in("b.crn"),
             ))),
         ];
-        let mut deps_of = HashMap::from([
-            (0usize, HashSet::new()),
-            (1usize, HashSet::new()),
-            (2usize, HashSet::new()),
-        ]);
+        let admitted = crate::replacement::AdmittedReplacementEffects::resolve(
+            &effects,
+            &SchemaRegistry::new(),
+            |_| HashMap::new(),
+        )
+        .unwrap();
+        let deps_of = admitted
+            .dependency_analysis(std::iter::empty())
+            .unwrap()
+            .into_deps_of();
 
-        apply_deferred_replace_delete_deps(&effects, &mut deps_of, &[]);
-
-        assert_eq!(deps_of.get(&1), Some(&HashSet::from([0])));
-        assert_eq!(deps_of.get(&2), Some(&HashSet::from([0])));
+        assert_eq!(deps_of.get(&0), Some(&HashSet::from([1, 2])));
+        assert_eq!(deps_of.get(&1), Some(&HashSet::new()));
+        assert_eq!(deps_of.get(&2), Some(&HashSet::new()));
     }
 
     fn fixture_id(binding: &str) -> crate::resource::ResolvedResourceId {
@@ -1806,11 +1737,12 @@ mod tests {
                     &SchemaRegistry::new(),
                     plan.effects().iter().map(Effect::resource_id),
                 );
+                let admitted_plan = plan.clone().admit(&schemas).unwrap();
                 let mut input: RuntimeExecutionInput = ExecutionInput {
                     provider_context: crate::parser::ProviderContext::clone(
                         &crate::parser::LoadedProviderContext::empty_for_test(),
                     ),
-                    plan: &plan,
+                    plan: &admitted_plan,
                     provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                         resource_origins: &unresolved,
                         data_source_origins: &[],
@@ -1972,11 +1904,12 @@ mod tests {
                     &SchemaRegistry::new(),
                     plan.effects().iter().map(Effect::resource_id),
                 );
+                let admitted_plan = plan.clone().admit(&schemas).unwrap();
                 let mut input: RuntimeExecutionInput = ExecutionInput {
                     provider_context: crate::parser::ProviderContext::clone(
                         &crate::parser::LoadedProviderContext::empty_for_test(),
                     ),
-                    plan: &plan,
+                    plan: &admitted_plan,
                     provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                         resource_origins: &unresolved,
                         data_source_origins: &[],

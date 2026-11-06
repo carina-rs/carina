@@ -467,7 +467,7 @@ async fn execute_mock_http_plan(
             provider_context: carina_core::parser::ProviderContext::clone(
                 &carina_core::parser::LoadedProviderContext::empty_for_test(),
             ),
-            plan,
+            plan: &plan.clone().admit(schemas).unwrap(),
             provider_check_inputs: carina_core::executor::ProviderCheckInputs::Authored,
             compositions: &[],
             bindings: Default::default(),
@@ -10666,7 +10666,7 @@ mod saved_plan_version_tests {
                 &error,
                 crate::error::AppError::UnsupportedPlanVersion {
                     found: 40,
-                    expected: 41,
+                    expected: 42,
                     ..
                 }
             ),
@@ -10723,8 +10723,8 @@ mod saved_plan_version_tests {
     }
 
     #[test]
-    fn typed_secret_nodes_require_plan_format_41() {
-        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 41);
+    fn replacement_admission_requests_require_plan_format_42() {
+        assert_eq!(crate::commands::plan::PlanFile::CURRENT_VERSION, 42);
     }
 
     #[tokio::test]
@@ -10780,7 +10780,7 @@ mod saved_plan_version_tests {
             rejected_saved_plan_message(&plan_path, &json, "format 38 must require replanning")
                 .await;
         assert!(
-            message.contains("Unsupported plan file version: 38 (expected 41)"),
+            message.contains("Unsupported plan file version: 38 (expected 42)"),
             "{message}"
         );
         assert!(!message.contains("corrupted"), "{message}");
@@ -10870,7 +10870,7 @@ mod saved_plan_version_tests {
         );
     }
 
-    /// Format 40 and older predate typed-only secret nodes; reject their
+    /// Format 41 and older predate replacement admission requests; reject their
     /// headers before attempting to decode any format-specific payload.
     #[tokio::test]
     async fn previous_emitted_and_older_plan_versions_are_rejected_before_payload_decoding() {
@@ -10878,12 +10878,12 @@ mod saved_plan_version_tests {
         let dir = TempDir::new().expect("tempdir");
         assert_eq!(
             crate::commands::plan::PlanFile::CURRENT_VERSION,
-            41,
-            "carina#4275 requires format 41 for typed secret nodes on top of carina#4202 format 40",
+            42,
+            "carina#4283 requires format 42 for replacement admission requests",
         );
-        let previous = 40;
+        let previous = 41;
 
-        for older_version in [previous, 39, 38, 37, 36, 35, 34, 33, 32] {
+        for older_version in [previous, 40, 39, 38, 37, 36, 35, 34, 33, 32] {
             let plan_path = dir.path().join(format!("format-{older_version}-plan.json"));
             let old_plan = serde_json::json!({
                 "version": older_version,
@@ -12211,4 +12211,73 @@ fn saved_plan_reloaded_resolved_data_source_retains_folded_module_dependency() {
         classified.contains_key(&id),
         "a folded module data-source input must remain deferred after saved-plan reload",
     );
+}
+
+#[path = "tests/issue_4283.rs"]
+pub(super) mod issue_4283;
+
+#[tokio::test]
+async fn bootstrap_unresolved_reference_returns_typed_preparation_error() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::Success,
+    };
+    let string = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
+    let settings: Resource = Resource::with_provider("aws", "Settings", "settings", None)
+        .with_absolute_binding(absolute_binding("settings"))
+        .with_attribute("versioning", string("enabled"));
+    let bucket: Resource = Resource::with_provider("aws", "s3.Bucket", "state", None)
+        .with_attribute("bucket", string("state-bucket"))
+        .with_attribute(
+            "versioning",
+            Value::Deferred(DeferredValue::ResourceRef {
+                path: carina_core::resource::AccessPath::new("settings", "versioning")
+                    .resolve_root_for_test(),
+            }),
+        );
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+    parsed.resources = vec![settings, bucket.clone()];
+    let mut schemas = SchemaRegistry::new();
+    for kind in ["Settings", "s3.Bucket"] {
+        schemas.insert(
+            "aws",
+            PatternResourceSchema::new(kind)
+                .attribute(
+                    PatternAttributeSchema::optional("bucket", PatternAttributeType::string())
+                        .build(),
+                )
+                .attribute(
+                    PatternAttributeSchema::optional("versioning", PatternAttributeType::string())
+                        .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+    }
+    let provider_configs = empty_resolved_provider_configs();
+    let (_temp, backend) = bootstrap_test_backend();
+    let error = create_checked_bootstrap_resource_for_test(
+        crate::output_style::ColorMode::Plain,
+        &provider,
+        bucket,
+        BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            backend: backend.as_ref(),
+            parsed: &parsed,
+            provider_configs: &provider_configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
+    )
+    .await
+    .expect_err("bootstrap retains its typed unresolved-reference rejection");
+    let AppError::StateBucketPreparation(preparation) = error else {
+        panic!("bootstrap must retain its typed preparation error: {error:?}");
+    };
+    assert!(matches!(
+        preparation.preparation_error(),
+        carina_core::executor::ProviderPreparationError::Serialization(_)
+    ));
+    assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
 }
