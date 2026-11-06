@@ -4679,7 +4679,8 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
     let mut redacted = plan.clone().with_value_stage(redacted_effects);
 
     for old in &mut redacted.replacement_inputs.old_instances {
-        // Only current-generation snapshots can use current-row evidence.
+        // Only current-generation snapshots can use current-row evidence or
+        // the desired secret shape when historical evidence is absent.
         // Deposed values already carry their own persisted secret shape.
         let historical = old
             .instance
@@ -4687,8 +4688,16 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
             .is_current()
             .then(|| historical.get(old.instance.id()))
             .flatten();
+        let desired = old
+            .instance
+            .generation()
+            .is_current()
+            .then(|| planned_resources.get(old.instance.id()))
+            .flatten();
         old.attributes = redact_historical_attributes(&old.attributes, |key| {
-            historical.and_then(|state| state.attributes.get(key))
+            historical
+                .and_then(|state| state.attributes.get(key))
+                .or_else(|| desired.and_then(|resource| resource.attributes.get(key)))
         })?;
     }
 
@@ -15432,6 +15441,67 @@ mod tests {
                 crate::resource::SnapshotLeaf::RedactedSecret { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn saved_plan_replacement_history_uses_desired_secret_shape_without_history() {
+        use crate::resource::ExpandedResource as Resource;
+
+        let previous = Value::Concrete(ConcreteValue::String("previous-private-token".into()));
+        let desired = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "desired-private-token".into(),
+            )))
+            .into(),
+        ));
+        let public = Value::Concrete(ConcreteValue::String("public-value".into()));
+        for (plaintext, secret_shape) in [
+            (previous.clone(), desired.clone()),
+            (
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("token".into(), previous.clone()),
+                    ("public".into(), public.clone()),
+                ]))),
+                Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    ("token".into(), desired.clone()),
+                    ("public".into(), public.clone()),
+                ]))),
+            ),
+            (
+                Value::Concrete(ConcreteValue::List(vec![previous, public.clone()])),
+                Value::Concrete(ConcreteValue::List(vec![desired, public.clone()])),
+            ),
+        ] {
+            let plan = replacement_plan_with_previous_attributes(
+                HashMap::from([
+                    ("settings".into(), plaintext),
+                    ("ordinary".into(), public.clone()),
+                ]),
+                None,
+            );
+            let guide = Resource::new("aws.s3.Bucket", "bucket")
+                .with_attribute("settings", secret_shape)
+                .to_snapshot();
+            let saved = redact_secrets_in_plan_with_desired_and_historical(
+                &plan,
+                &HashMap::from([(guide.id.clone(), guide)]),
+                &HashMap::new(),
+            )
+            .expect("desired secret shapes protect replacement history");
+
+            for rendered in [serde_json::to_string(&saved).unwrap(), format!("{saved:?}")] {
+                assert!(!rendered.contains("previous-private-token"), "{rendered}");
+                assert!(!rendered.contains("desired-private-token"), "{rendered}");
+            }
+            assert!(!saved.replacement_inputs.old_instances.is_empty());
+            for old in &saved.replacement_inputs.old_instances {
+                assert!(contains_redacted_secret(&old.attributes["settings"]));
+                assert_eq!(old.attributes["ordinary"], public.to_snapshot());
+            }
+            assert!(contains_redacted_secret(
+                &saved.replace_display[0].previous_attributes["settings"]
+            ));
+        }
     }
 }
 

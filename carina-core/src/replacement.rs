@@ -723,10 +723,52 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                 checked_replacements.push((index, admit(request)?));
             }
         }
+
+        // Project known deferred rows into the same cycle graph as concrete
+        // replacements. These value-free endpoints are only preflight inputs;
+        // materialization still admits the actual children before execution.
+        let mut known = Self {
+            effects: effects.clone(),
+            scheduling: ReplacementScheduling::default(),
+            temporary_names: Vec::new(),
+            writeback: Vec::new(),
+        };
+        for (index, checked) in &checked_replacements {
+            known
+                .scheduling
+                .insert(checked.clone().into_scheduling(), &effects, *index);
+        }
+        let mut known_effects = effects.clone();
+        for gate in 0..effects.len() {
+            let Some(mut preview) = known.deferred_preflight_preview(gate, &previous) else {
+                continue;
+            };
+            preview.require_create_first_for_dependencies(&requirements);
+            for request in preview.preflight_requests() {
+                if checked_replacements.iter().any(|(_, checked)| {
+                    checked.target().resolved_id() == request.target().resolved_id()
+                }) {
+                    continue;
+                }
+                for old in request.deletes.iter() {
+                    let delete = old.to_delete_effect();
+                    if !known_effects.iter().any(|effect| {
+                        matches!(effect, Effect::Delete { .. })
+                            && effect.instance_key() == delete.instance_key()
+                    }) {
+                        known_effects.push(delete);
+                    }
+                }
+                let checked = admit(request)?;
+                let index = known_effects.len();
+                known_effects.push(Effect::Create(checked.target().clone()));
+                checked_replacements.push((index, checked));
+            }
+        }
         // Each successful iteration permanently promotes one distinct pair.
         // Rejected candidates never change the graph or consume a retry.
         for _ in 0..checked_replacements.len() {
-            let promotions = cycle_promotions(&effects, &associations, &requirements);
+            let promotions = cycle_promotions(&known_effects, &associations, &requirements);
             if promotions.is_empty() {
                 break;
             }
@@ -759,6 +801,9 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
             }
         }
         for (index, checked) in checked_replacements {
+            if index >= effects.len() {
+                continue;
+            }
             if let Some(name) = checked.temporary_name() {
                 temporary_names.push((checked.target().id.clone(), name.clone()));
             }
@@ -779,26 +824,8 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
             writeback,
         };
         for gate in 0..admitted.effects.len() {
-            // Use the same historical candidates as the runtime gate. A plain
-            // DeferredCreate can replace deposed-only generations too.
-            let candidates = admitted.deferred_delete_candidates(gate);
-            let mut preview = match &admitted.effects[gate] {
-                Effect::DeferredCreate(payload) => {
-                    let deletes = candidates
-                        .into_iter()
-                        .filter_map(|index| admitted.effects[index].to_delete_payload(&previous))
-                        .collect();
-                    let Ok(deletes) = NonEmptyDeletes::try_new(deletes) else {
-                        continue;
-                    };
-                    crate::effect::DeferredReplacePayload::new(
-                        deletes,
-                        payload.template.clone(),
-                        payload.dependency_template.clone(),
-                    )
-                }
-                Effect::DeferredReplace(payload) => (**payload).clone(),
-                _ => continue,
+            let Some(mut preview) = admitted.deferred_preflight_preview(gate, &previous) else {
+                continue;
             };
             preview.require_create_first_for_dependencies(&requirements);
             preview
@@ -916,6 +943,44 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
 }
 
 impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
+    fn deferred_preflight_preview(
+        &self,
+        gate: usize,
+        previous: &impl Fn(&DeletedInstanceKey) -> HashMap<String, SnapshotValue>,
+    ) -> Option<crate::effect::DeferredReplacePayload<S, P>> {
+        match &self.effects[gate] {
+            Effect::DeferredCreate(payload) => {
+                let deletes = self
+                    .deferred_delete_candidates(gate)
+                    .into_iter()
+                    // Anonymous candidates remain protected by the runtime
+                    // gate, but their identity is unknown until expansion.
+                    // Only confirmed members may reject the plan here.
+                    .filter(|&index| match &self.effects[index] {
+                        Effect::Delete { id, binding, .. } => {
+                            payload.template.contains_managed_member(id)
+                                || binding.as_ref().is_some_and(|binding| {
+                                    crate::differ::binding_matches_deferred_template(
+                                        binding,
+                                        payload.template.target(),
+                                    )
+                                })
+                        }
+                        _ => false,
+                    })
+                    .filter_map(|index| self.effects[index].to_delete_payload(previous))
+                    .collect();
+                Some(crate::effect::DeferredReplacePayload::new(
+                    NonEmptyDeletes::try_new(deletes).ok()?,
+                    payload.template.clone(),
+                    payload.dependency_template.clone(),
+                ))
+            }
+            Effect::DeferredReplace(payload) => Some((**payload).clone()),
+            _ => None,
+        }
+    }
+
     /// The same candidate set owns both the gate barrier and materialization's
     /// historical inputs. Deletes already owned by a concrete replacement
     /// cannot also belong to an unrelated deferred loop.
@@ -995,9 +1060,9 @@ impl<S: Clone> AdmittedReplacementEffects<S> {
     ) -> HashSet<(usize, usize)> {
         self.scheduling.order_edges(&self.effects, deps)
     }
-    pub(crate) fn expand_deferred_replacements(self) -> (Self, Vec<(usize, usize)>, Vec<usize>) {
+    pub(crate) fn expand_deferred_replacements(self) -> (Self, HashSet<usize>, Vec<usize>) {
         let mut effects = Vec::with_capacity(self.effects.len());
-        let mut deferred_replace_delete_deps = Vec::new();
+        let mut deferred_replace_teardowns = HashSet::new();
         let mut source_effect_indices = Vec::with_capacity(self.effects.len());
         let mut remap = vec![None; self.effects.len()];
         for (source, effect) in self.effects.into_iter().enumerate() {
@@ -1008,8 +1073,7 @@ impl<S: Clone> AdmittedReplacementEffects<S> {
                     source_effect_indices.push(source);
                 }
                 let gate = effects.len();
-                deferred_replace_delete_deps
-                    .extend((first_delete..gate).map(|delete| (gate, delete)));
+                deferred_replace_teardowns.extend(first_delete..gate);
             }
             remap[source] = Some(effects.len());
             effects.push(effect);
@@ -1024,7 +1088,7 @@ impl<S: Clone> AdmittedReplacementEffects<S> {
                 temporary_names: self.temporary_names,
                 writeback: self.writeback,
             },
-            deferred_replace_delete_deps,
+            deferred_replace_teardowns,
             source_effect_indices,
         )
     }
@@ -2123,6 +2187,135 @@ mod tests {
             plan.dependency_analysis(std::iter::empty()).is_err(),
             "retaining an old Delete cannot transfer admission to a raw Create"
         );
+    }
+
+    #[test]
+    fn deferred_preflight_checks_reversed_historical_dependencies() {
+        fn preview<S, P: PlanValueKind>(
+            plan: crate::plan::AdmittedPlan<S, P>,
+        ) -> Option<&'static str> {
+            plan.effects().iter().find_map(|effect| match effect {
+                Effect::DeferredReplace(payload) => Some(payload.display_glyph()),
+                _ => None,
+            })
+        }
+
+        for class in [UniqueNameSpec::Conflicting, UniqueNameSpec::Coexisting] {
+            for reversed in [false, true] {
+                for absorbed in [false, true] {
+                    let mut schemas = registry(class.clone());
+                    schemas.insert(
+                        "",
+                        PatternResourceSchema::new("test.Parent")
+                            .with_coexisting_replacement()
+                            .validate()
+                            .unwrap(),
+                    );
+                    let mut parent = fixture(true).map_target(|target| {
+                        let mut resource = target.as_resource().clone();
+                        resource.id =
+                            crate::resource::ResourceId::with_identity("test.Parent", "parent");
+                        resource.binding = Some(RootScope::new().resolve("parent".into()));
+                        ResolvedResource::new(resource)
+                    });
+                    let parent_id = parent.target().resolved_id();
+                    parent.deletes.iter_mut().next().unwrap().id = parent_id.clone();
+                    let mut old = fixture(false).deletes[0].clone();
+                    old.id = ResolvedResourceId::with_provider_identity(
+                        "",
+                        "test.Record",
+                        "records[0]",
+                        None,
+                    );
+                    old.binding = Some(RootScope::new().resolve("records[0]".into()));
+                    if reversed {
+                        parent
+                            .deletes
+                            .iter_mut()
+                            .next()
+                            .unwrap()
+                            .explicit_dependencies = std::iter::once(old.id.clone()).collect();
+                    } else {
+                        old.explicit_dependencies = std::iter::once(parent_id.clone()).collect();
+                    }
+                    let template = crate::parser::DeferredForExpression::new(
+                        None,
+                        1,
+                        "for item in parent.values".into(),
+                        crate::parser::DeferredForTarget::bound(
+                            RootScope::new().resolve("records".into()),
+                        )
+                        .unwrap(),
+                        Value::root_resource_ref("parent", "values", Vec::new()),
+                        crate::parser::ForBinding::Simple("item".into()),
+                        Resource::<_, crate::resource::LoopSlot>::new("test.Record", "records"),
+                    )
+                    .into_compiled();
+                    let dependencies = crate::resource::DeferredDependencyTemplate::from_graph(
+                        std::iter::once(parent_id.clone()).collect(),
+                        Default::default(),
+                        Default::default(),
+                        Default::default(),
+                        Default::default(),
+                    );
+                    let mut plan = crate::plan::Plan::new();
+                    plan.add(Effect::Create(parent.target().clone()));
+                    plan.add_delete(parent.deletes[0].clone());
+                    let mut deposed = old.clone();
+                    deposed.generation =
+                        EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+                    deposed.identifier = crate::effect::fixture_applied_identifier("old-deposed");
+                    if absorbed {
+                        plan.add(Effect::DeferredReplace(Box::new(
+                            crate::effect::DeferredReplacePayload::new(
+                                NonEmptyDeletes::try_new(vec![old, deposed]).unwrap(),
+                                Box::new(template),
+                                dependencies,
+                            ),
+                        )));
+                    } else {
+                        plan.add_delete(old);
+                        plan.add_delete(deposed);
+                        plan.add(Effect::DeferredCreate(
+                            crate::effect::DeferredCreatePayload::new(
+                                Box::new(template),
+                                dependencies,
+                            ),
+                        ));
+                    }
+                    for _ in 0..2 {
+                        let wire: crate::plan::UnresolvedSavedPlan = serde_json::from_value(
+                            serde_json::to_value(plan.to_snapshot()).unwrap(),
+                        )
+                        .unwrap();
+                        for admission in [
+                            plan.clone().admit(&schemas).map(preview),
+                            wire.resolve_with_schemas(&schemas)
+                                .unwrap()
+                                .admit(&schemas)
+                                .map(preview),
+                        ] {
+                            if reversed && matches!(class, UniqueNameSpec::Conflicting) {
+                                let error = admission.expect_err(
+                                    "known deferred cycles must fail before the parent can execute",
+                                );
+                                assert!(matches!(
+                                    error.cause,
+                                    CreateBeforeDestroyError::ReplacementCannotCoexist(_)
+                                ));
+                                assert!(error.required_by.is_some());
+                            } else {
+                                let glyph = admission.expect("an admissible deferred graph");
+                                if absorbed {
+                                    assert_eq!(glyph, Some(if reversed { "+/-" } else { "-/+" }));
+                                }
+                            }
+                        }
+                        plan.effects_mut().reverse();
+                    }
+                }
+            }
+        }
     }
 
     #[test]

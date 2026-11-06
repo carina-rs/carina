@@ -451,7 +451,10 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
         deletes: NonEmptyDeletes,
         template: Box<DeferredForExpression<S, V, V::Template>>,
         dependency_template: crate::resource::DeferredDependencyTemplate,
-    ) -> Self {
+    ) -> Self
+    where
+        S: Clone,
+    {
         let mut payload = Self {
             dependency_template,
             request: crate::replacement::ReplacementRequest::new(template, deletes),
@@ -514,40 +517,21 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
     pub fn preflight(
         &mut self,
         registry: &crate::schema::SchemaRegistry,
-    ) -> Result<(), crate::plan::CreateBeforeDestroyError> {
-        let requested = match self
-            .template
-            .template_resource()
-            .directives()
-            .create_before_destroy
-        {
-            crate::resource::LoopDirective::Resolved(requested) => Some(requested),
-            crate::resource::LoopDirective::PerElement(_) => None,
-        };
+    ) -> Result<(), crate::plan::CreateBeforeDestroyError>
+    where
+        S: Clone,
+    {
+        let per_element = matches!(
+            self.template
+                .template_resource()
+                .directives()
+                .create_before_destroy,
+            crate::resource::LoopDirective::PerElement(_)
+        );
         self.preview = None;
-        for old in self.request.deletes.iter() {
-            let required_by = self.required_by_child(&old.id);
-            if requested.is_none() && required_by.is_none() {
+        for request in self.preflight_requests() {
+            if per_element && request.required_by().is_none() {
                 continue;
-            }
-            let template_id = self.template.template_resource_id();
-            let target_id = ResolvedResourceId::with_provider_identity(
-                template_id.provider.clone(),
-                template_id.resource_type.clone(),
-                old.id.identity().clone(),
-                template_id.provider_instance.clone(),
-            );
-            let target: crate::resource::ResolvedResource =
-                crate::resource::ResolvedResource::from_id(target_id);
-            let mut resource = target.as_resource().clone();
-            resource.directives.create_before_destroy = requested.unwrap_or_default();
-            resource.binding = old.binding.clone();
-            let mut request = crate::replacement::ReplacementRequest::new(
-                target.replace_inner(resource),
-                NonEmptyDeletes::try_new(vec![old.clone()]).expect("one old instance"),
-            );
-            if let Some(dependent) = required_by {
-                request = request.require_create_first(dependent);
             }
             let checked =
                 crate::replacement::resolve_replacement(request, registry)?.into_scheduling();
@@ -560,6 +544,71 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
             }
         }
         Ok(())
+    }
+
+    /// Value-free targets for admission of the known replacement graph.
+    /// Their declared dependencies survive even before the iterable expands.
+    pub(crate) fn preflight_requests(
+        &self,
+    ) -> Vec<crate::replacement::ReplacementRequest<crate::resource::ResolvedResource<S, V>>>
+    where
+        S: Clone,
+    {
+        let requested = match self
+            .template
+            .template_resource()
+            .directives()
+            .create_before_destroy
+        {
+            crate::resource::LoopDirective::Resolved(requested) => requested,
+            crate::resource::LoopDirective::PerElement(_) => false,
+        };
+        let mut requests: Vec<
+            crate::replacement::ReplacementRequest<crate::resource::ResolvedResource<S, V>>,
+        > = Vec::new();
+        for old in self.request.deletes.iter() {
+            let required_by = self.required_by_child(&old.id);
+            let template_id = self.template.template_resource_id();
+            let target_id = ResolvedResourceId::with_provider_identity(
+                template_id.provider.clone(),
+                template_id.resource_type.clone(),
+                old.id.identity().clone(),
+                template_id.provider_instance.clone(),
+            );
+            if let Some(request) = requests
+                .iter_mut()
+                .find(|request| request.target().resolved_id() == target_id)
+            {
+                let mut deletes = request.deletes.to_vec();
+                deletes.push(old.clone());
+                request.deletes = NonEmptyDeletes::try_new(deletes).expect("existing old instance");
+                continue;
+            }
+            let template = self.template.template_resource().as_resource();
+            let mut directives = crate::resource::Directives::default();
+            directives.create_before_destroy = requested;
+            directives.ignore_changes = template.directives.ignore_changes.clone();
+            let mut resource = template
+                .clone()
+                .with_value_stage(Default::default(), directives)
+                .with_dependency_phase(());
+            resource.id = target_id.into_inner();
+            resource.binding = old.binding.clone();
+            let target = crate::resource::ResolvedResource::from_resolved_parts(
+                resource,
+                self.dependency_template.dependencies(),
+                Default::default(),
+            );
+            let mut request = crate::replacement::ReplacementRequest::new(
+                target,
+                NonEmptyDeletes::try_new(vec![old.clone()]).expect("one old instance"),
+            );
+            if let Some(dependent) = required_by {
+                request = request.require_create_first(dependent);
+            }
+            requests.push(request);
+        }
+        requests
     }
     pub fn display_glyph(&self) -> &'static str {
         match &self.preview {

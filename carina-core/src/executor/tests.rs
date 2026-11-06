@@ -13185,15 +13185,87 @@ fn issue_4283_deferred_prior_snapshot_uses_persisted_secret_shape() {
 }
 
 #[tokio::test]
+async fn fresh_conflicting_deferred_children_allow_cbd_with_unrelated_anonymous_deletes() {
+    for generation in [
+        EffectGeneration::Current,
+        EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
+    ] {
+        let (mut template, bindings, schemas, child) = anonymous_deferred_collision_fixture();
+        template.template_directives_mut().create_before_destroy =
+            crate::resource::LoopDirective::Resolved(true);
+        let old_id = ResolvedResourceId::with_provider_identity(
+            child.id.provider.clone(),
+            child.id.resource_type.clone(),
+            "unrelated",
+            child.id.provider_instance.clone(),
+        );
+        let mut plan = Plan::new();
+        plan.add_delete(DeferredReplaceDelete {
+            id: old_id.clone(),
+            identifier: crate::effect::fixture_applied_identifier("unrelated-old"),
+            generation,
+            directives: Default::default(),
+            binding: None,
+            dependencies: Default::default(),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+            previous_attributes: Default::default(),
+        });
+        plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
+            Box::new(template),
+        )));
+        let plan = plan
+            .admit(&schemas)
+            .expect("an unrelated anonymous Delete does not make a fresh child a replacement");
+        let provider = MockProvider::new();
+        provider.push_delete(Ok(()));
+        provider.push_create(Ok(
+            State::existing(child.id.clone(), HashMap::new()).with_identifier("fresh-child")
+        ));
+        let input = ExecutionInput {
+            provider_context: crate::parser::LoadedProviderContext::empty_for_test()
+                .as_provider_context()
+                .clone(),
+            plan: &plan,
+            provider_check_inputs: ProviderCheckInputs::Authored,
+            compositions: &[],
+            bindings,
+            managed_current: HashMap::new(),
+            data_source_values: ExecutableDataSourceValues::empty(),
+            normalizer: &NoopNormalizer,
+            provider_configs: &[],
+            factories: &[],
+            schemas: &schemas,
+            parallelism: NonZeroUsize::new(1).unwrap(),
+            precompleted_success_count: 0,
+            checkpoint_sink: ExecutionCheckpointSink::noop(),
+        };
+        let observer = MockObserver::new();
+        let result = completed_result(
+            execute_plan(&provider, input, &observer, uncancelled_shutdown()).await,
+        );
+        assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
+        assert_eq!(result.success_count, 2);
+        assert!(result.replacement_writeback.is_empty());
+        let calls = provider.calls();
+        assert_eq!(calls.len(), 2, "calls: {calls:?}");
+        assert!(calls.contains(&("delete".into(), old_id.to_string())));
+        assert!(calls.contains(&("create".into(), child.id.to_string())));
+    }
+}
+
+#[tokio::test]
 async fn review_4283_anonymous_delete_waits_for_forbidden_cbd_admission() {
-    let (mut template, _bindings, schemas, child) = anonymous_deferred_collision_fixture();
+    forbidden_anonymous_deferred_admission(false).await;
+}
+
+async fn forbidden_anonymous_deferred_admission(deposed: bool) {
+    let (mut template, bindings, schemas, child) = anonymous_deferred_collision_fixture();
     template.template_directives_mut().create_before_destroy =
         crate::resource::LoopDirective::Resolved(true);
     let child_id = child.id.clone();
-    let provider = MockProvider::new();
-    provider.push_delete(Ok(()));
     let mut plan = Plan::new();
-    plan.add(Effect::Delete {
+    let old = DeferredReplaceDelete {
         id: ResolvedResourceId::new(child_id.clone()),
         identifier: crate::effect::fixture_applied_identifier("existing"),
         generation: EffectGeneration::Current,
@@ -13202,20 +13274,51 @@ async fn review_4283_anonymous_delete_waits_for_forbidden_cbd_admission() {
         dependencies: Default::default(),
         explicit_dependencies: Default::default(),
         blocked_by_updates: Default::default(),
-    });
+        previous_attributes: Default::default(),
+    };
+    plan.add_delete(old.clone());
+    if deposed {
+        plan.add_delete(DeferredReplaceDelete {
+            generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
+            identifier: crate::effect::fixture_applied_identifier("old-deposed"),
+            ..old
+        });
+    }
     plan.add(Effect::DeferredCreate(crate::test_support::compiled_loop(
         Box::new(template),
     )));
-    let error = plan
+    let plan = plan
         .admit(&schemas)
-        .expect_err("known forbidden CBD must fail admission");
-    assert!(matches!(
-        error.cause,
-        crate::plan::CreateBeforeDestroyError::ReplacementCannotCoexist(_)
-    ));
+        .expect("an anonymous replacement is only confirmed after expansion");
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
+    let input = ExecutionInput {
+        provider_context: crate::parser::LoadedProviderContext::empty_for_test()
+            .as_provider_context()
+            .clone(),
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings,
+        managed_current: HashMap::new(),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    assert_eq!(result.failure_count(), 1, "events: {:?}", observer.events());
+    assert!(result.successfully_deleted.is_empty());
     assert!(
         provider.calls().is_empty(),
-        "admission must precede every provider call"
+        "runtime admission must preserve every old generation"
     );
 }
 
@@ -13350,7 +13453,7 @@ async fn review5_4283_unbound_loop_after_read_does_not_block_unrelated_replaceme
 
 #[tokio::test]
 async fn review4_4283_deposed_delete_waits_for_forbidden_deferred_admission() {
-    deposed_deferred_admission(false, false, false).await;
+    forbidden_anonymous_deferred_admission(true).await;
 }
 
 #[tokio::test]
@@ -13462,14 +13565,14 @@ async fn deposed_deferred_admission(coexisting: bool, absorbed: bool, bound: boo
         plan.add(old.to_delete_effect());
         plan.add(Effect::DeferredCreate(compiled));
     }
-    let provider = MockProvider::new();
-    provider.push_delete(Ok(()));
-    provider.push_delete(Ok(()));
-    provider.push_create(Ok(
-        State::existing(child_id.clone(), HashMap::new()).with_identifier("new-child")
-    ));
     let plan = match plan.admit(&schemas) {
-        Ok(plan) => plan,
+        Ok(plan) => {
+            assert!(
+                coexisting,
+                "known Conflicting replacements must fail admission"
+            );
+            plan
+        }
         Err(error) => {
             assert!(
                 !coexisting,
@@ -13479,13 +13582,15 @@ async fn deposed_deferred_admission(coexisting: bool, absorbed: bool, bound: boo
                 error.cause,
                 crate::plan::CreateBeforeDestroyError::ReplacementCannotCoexist(_)
             ));
-            assert!(
-                provider.calls().is_empty(),
-                "preflight must preserve every old generation"
-            );
             return;
         }
     };
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(
+        State::existing(child_id.clone(), HashMap::new()).with_identifier("new-child")
+    ));
     let input = ExecutionInput {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
@@ -13508,23 +13613,14 @@ async fn deposed_deferred_admission(coexisting: bool, absorbed: bool, bound: boo
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
     let calls = provider.calls();
-    if !coexisting {
-        assert_eq!(result.failure_count(), 1, "events: {:?}", observer.events());
-        assert!(
-            calls.is_empty(),
-            "deposed child was deleted before admission: {calls:?}"
-        );
-        assert!(result.successfully_deleted.is_empty());
-    } else {
-        assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
-        assert_eq!(calls.len(), 3, "calls: {calls:?}");
-        assert_eq!(
-            calls[0],
-            ("create".into(), child_id.to_string()),
-            "every old generation must wait for the admitted Create: {calls:?}"
-        );
-        assert_eq!(result.replacement_writeback[0].old_instances().len(), 2);
-    }
+    assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
+    assert_eq!(calls.len(), 3, "calls: {calls:?}");
+    assert_eq!(
+        calls[0],
+        ("create".into(), child_id.to_string()),
+        "every old generation must wait for the admitted Create: {calls:?}"
+    );
+    assert_eq!(result.replacement_writeback[0].old_instances().len(), 2);
 }
 
 #[test]
@@ -13827,19 +13923,10 @@ async fn review2_4283_deferred_reversed_history_rejects_conflicting_combined_gra
 }
 
 async fn deferred_reversed_history(coexisting_child: bool) {
-    let provider = MockProvider::new();
     let mut parent = Resource::new("test", "cert").with_root_binding("cert");
     parent.directives.create_before_destroy = true;
     let parent_id = parent.id.clone();
     let child_id = test_resolved_id("test.Child", "validation_records[0]");
-    provider.push_create(Ok(cert_state_for_deferred_replace_deadlock(&parent_id)));
-    provider.push_create(Ok(State::existing(
-        child_id.as_inner().clone(),
-        HashMap::new(),
-    )
-    .with_identifier("new-child")));
-    provider.push_delete(Ok(()));
-    provider.push_delete(Ok(()));
     let mut schemas = COEXISTING_TEST_SCHEMAS.clone();
     let schema = PatternResourceSchema::new("test.Child");
     schemas.insert(
@@ -13902,11 +13989,41 @@ async fn deferred_reversed_history(coexisting_child: bool) {
             .collect(),
     });
     plan.add(gate);
+    let plan = match plan.admit(&schemas) {
+        Ok(plan) => {
+            assert!(
+                coexisting_child,
+                "a known Conflicting cycle must fail preflight"
+            );
+            plan
+        }
+        Err(error) => {
+            assert!(
+                !coexisting_child,
+                "a Coexisting cycle must be admitted: {error:?}"
+            );
+            assert!(matches!(
+                error.cause,
+                crate::plan::CreateBeforeDestroyError::ReplacementCannotCoexist(_)
+            ));
+            assert_eq!(error.required_by.as_deref(), Some("test.cert"));
+            return;
+        }
+    };
+    let provider = MockProvider::new();
+    provider.push_create(Ok(cert_state_for_deferred_replace_deadlock(&parent_id)));
+    provider.push_create(Ok(State::existing(
+        child_id.as_inner().clone(),
+        HashMap::new(),
+    )
+    .with_identifier("new-child")));
+    provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
     let input = ExecutionInput {
         provider_context: crate::parser::ProviderContext::clone(
             &crate::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan.clone().admit(&schemas).unwrap(),
+        plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: Default::default(),
@@ -13923,22 +14040,6 @@ async fn deferred_reversed_history(coexisting_child: bool) {
     let observer = MockObserver::new();
     let result =
         completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
-    if !coexisting_child {
-        assert_eq!(result.failure_count(), 1, "events: {:?}", observer.events());
-        assert_eq!(
-            provider.calls(),
-            vec![("create".into(), parent_id.to_string())],
-            "rejection must precede either child endpoint"
-        );
-        assert!(result.successfully_deleted.is_empty());
-        assert!(
-            observer
-                .events()
-                .iter()
-                .any(|event| event.contains("cannot coexist"))
-        );
-        return;
-    }
     assert_eq!(
         result.failure_count(),
         0,

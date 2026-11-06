@@ -66,12 +66,8 @@ pub fn build_plan_scheduler_dependency_edges(
     plan: &crate::plan::AdmittedPlan,
     unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
 ) -> BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)> {
-    let (admitted, deferred_replace_delete_deps, source_effect_indices) =
+    let (admitted, deferred_replace_teardowns, source_effect_indices) =
         plan.admitted_effects().expand_deferred_replacements();
-    let deferred_replace_teardowns: HashSet<_> = deferred_replace_delete_deps
-        .iter()
-        .map(|(_, delete_idx)| *delete_idx)
-        .collect();
     let scheduler::SchedulerDeps { deps_of, .. } =
         scheduler::build_scheduler_deps(&admitted, unresolved_resources.keys());
 
