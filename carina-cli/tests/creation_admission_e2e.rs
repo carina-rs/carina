@@ -343,6 +343,347 @@ fn saved_plan_without_input_rules_still_applies() {
     assert!(output.status.success(), "{}", text(&output));
 }
 
+fn save_pending_input_plan(fixture: &Fixture, producer_name: &str, replacement: bool) {
+    fs::write(fixture.0.path().join("values.crn"), "").unwrap();
+    let generation = if replacement { "generation = 2" } else { "" };
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        format!(
+            "let producer = mock.test.resource {{ name = '{producer_name}' }}\n\
+             let consumer = mock.test.estimated_input {{ name = producer.identifier {generation} }}\n"
+        ),
+    )
+    .unwrap();
+    let output = fixture.run(&["plan", "--refresh=false", "--out", "plan.json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("input check pending until apply"),
+        "{}",
+        text(&output)
+    );
+    let saved = fs::read_to_string(fixture.0.path().join("plan.json")).unwrap();
+    let json: serde_json::Value = serde_json::from_str(&saved).unwrap();
+    assert_eq!(json["version"], 41);
+    for field in [
+        "pending_inputs",
+        "PendingInputObligation",
+        "InputCheckedPlan",
+        "paired_delete",
+        "certificate",
+        "witness",
+    ] {
+        assert!(!saved.contains(field), "unexpected persisted {field}");
+    }
+}
+
+#[test]
+fn saved_input_readmission_rejects_tampered_create_before_effects_or_state_write() {
+    tampered_saved_create_is_rejected(false);
+}
+
+#[test]
+fn saved_input_readmission_rejection_precedes_legacy_state_migration_write() {
+    tampered_saved_create_is_rejected(true);
+}
+
+fn tampered_saved_create_is_rejected(legacy_state: bool) {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        "let seed = mock.test.resource { name = 'seed' }\n",
+    )
+    .unwrap();
+    let output = fixture.run(&["apply", "--auto-approve"]);
+    assert!(output.status.success(), "{}", text(&output));
+    if legacy_state {
+        let path = fixture.0.path().join("carina.state.json");
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        state["version"] = serde_json::json!(20);
+        fs::write(&path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    }
+    let before = fs::read(fixture.0.path().join("carina.state.json")).unwrap();
+    let provider_before = fs::read(fixture.0.path().join("mock-state.json")).unwrap();
+    save_pending_input_plan(&fixture, "short", false);
+    fs::write(fixture.0.path().join("op.log"), "").unwrap();
+    let path = fixture.0.path().join("plan.json");
+    let mut plan: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let create = plan["plan"]["effects"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .filter_map(|effect| effect.get_mut("Create"))
+        .find(|create| create["id"]["resource_type"] == "test.estimated_input")
+        .expect("pending create");
+    let violating_value = "tampered-private-value-too-long-for-name";
+    create["attributes"]["name"] = serde_json::json!({"String": violating_value});
+    fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+    let plan_before = fs::read(&path).unwrap();
+
+    let output = fixture.run(&["apply", "--auto-approve", "plan.json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(text(&output).contains("cannot create"), "{}", text(&output));
+    assert!(
+        text(&output).contains("mock.name.length"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        !text(&output).contains(violating_value),
+        "{}",
+        text(&output)
+    );
+    let operations = fs::read_to_string(fixture.0.path().join("op.log")).unwrap();
+    assert!(
+        operations.lines().all(|line| line.starts_with("read ")),
+        "{operations}"
+    );
+    assert_eq!(
+        fs::read(fixture.0.path().join("carina.state.json")).unwrap(),
+        before
+    );
+    assert_eq!(
+        fs::read(fixture.0.path().join("mock-state.json")).unwrap(),
+        provider_before
+    );
+    assert_eq!(fs::read(&path).unwrap(), plan_before);
+}
+
+#[test]
+fn saved_input_discharge_applies_valid_runtime_value() {
+    let fixture = Fixture::new();
+    save_pending_input_plan(&fixture, "short", false);
+    let plan_before = fs::read(fixture.0.path().join("plan.json")).unwrap();
+    let output = fixture.run(&["apply", "--auto-approve", "plan.json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let operations = fs::read_to_string(fixture.0.path().join("op.log")).unwrap();
+    assert_eq!(
+        operations
+            .lines()
+            .filter(|line| line.starts_with("create "))
+            .collect::<Vec<_>>(),
+        [
+            "create test.resource.producer",
+            "create test.estimated_input.consumer"
+        ],
+        "{operations}"
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.0.path().join("mock-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        state["states"]["test.estimated_input.consumer"]["name"],
+        "short-id"
+    );
+    assert_eq!(
+        fs::read(fixture.0.path().join("plan.json")).unwrap(),
+        plan_before
+    );
+}
+
+#[test]
+fn saved_input_discharge_rejects_invalid_runtime_value_before_consumer_create() {
+    let fixture = Fixture::new();
+    save_pending_input_plan(&fixture, "long-apply-only-identifier", false);
+    let plan_before = fs::read(fixture.0.path().join("plan.json")).unwrap();
+    let output = fixture.run(&["apply", "--auto-approve", "plan.json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        text(&output).contains("mock.name.length"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        !text(&output).contains("long-apply-only-identifier-id"),
+        "{}",
+        text(&output)
+    );
+    let operations = fs::read_to_string(fixture.0.path().join("op.log")).unwrap();
+    assert_eq!(
+        operations
+            .lines()
+            .filter(|line| line.starts_with("create "))
+            .collect::<Vec<_>>(),
+        ["create test.resource.producer"],
+        "{operations}"
+    );
+    assert_eq!(
+        fs::read(fixture.0.path().join("plan.json")).unwrap(),
+        plan_before
+    );
+}
+
+#[test]
+fn saved_input_discharge_runtime_violation_preserves_replaced_resource() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        "let consumer = mock.test.estimated_input { name = 'valid-name' generation = 1 }\n",
+    )
+    .unwrap();
+    let output = fixture.run(&["apply", "--auto-approve"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let before: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.0.path().join("mock-state.json")).unwrap())
+            .unwrap();
+    save_pending_input_plan(&fixture, "long-apply-only-identifier", true);
+    fs::write(fixture.0.path().join("op.log"), "").unwrap();
+
+    let output = fixture.run(&["apply", "--auto-approve", "plan.json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        text(&output).contains("mock.name.length"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        !text(&output).contains("long-apply-only-identifier-id"),
+        "{}",
+        text(&output)
+    );
+    let operations = fs::read_to_string(fixture.0.path().join("op.log")).unwrap();
+    assert_eq!(
+        operations
+            .lines()
+            .filter(|line| line.starts_with("create "))
+            .collect::<Vec<_>>(),
+        ["create test.resource.producer"],
+        "{operations}"
+    );
+    assert!(
+        !operations.lines().any(|line| line.starts_with("delete ")),
+        "{operations}"
+    );
+    let after: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.0.path().join("mock-state.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        after["states"]["test.estimated_input.consumer"],
+        before["states"]["test.estimated_input.consumer"]
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.0.path().join("carina.state.json")).unwrap())
+            .unwrap();
+    let consumer = state["resources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|resource| resource["resource_type"] == "test.estimated_input")
+        .unwrap();
+    assert_eq!(consumer["current"]["attributes"]["name"], "valid-name");
+}
+
+#[test]
+fn saved_input_readmission_checks_default_tags_before_pending_prerequisites() {
+    let fixture = Fixture::new();
+    fs::write(fixture.0.path().join("values.crn"), "").unwrap();
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        "let producer = mock.test.resource { name = 'producer' }\n\
+         let consumer = mock.test.input_constrained { name = 'valid-name' tags = producer.tags }\n",
+    )
+    .unwrap();
+    let output = fixture.run(&["plan", "--refresh=false", "--out", "plan.json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("input check pending until apply"),
+        "{}",
+        text(&output)
+    );
+    let path = fixture.0.path().join("plan.json");
+    let mut plan: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    plan["provider_configs"][0]["default_tags"] =
+        serde_json::json!({"aWs:private-default-key": {"String": "private-default-value"}});
+    fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+    let before = fs::read(&path).unwrap();
+
+    let output = fixture.run(&["apply", "--auto-approve", "plan.json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        text(&output).contains("mock.tags.reserved_prefix"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        !text(&output).contains("aWs:private-default-key"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        !text(&output).contains("private-default-value"),
+        "{}",
+        text(&output)
+    );
+    assert!(!fixture.0.path().join("op.log").exists());
+    assert!(!fixture.0.path().join("carina.state.json").exists());
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn saved_input_readmission_rejects_tampered_update_without_state_write() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        "let consumer = mock.test.input_constrained { name = 'valid-name' tags = { owner = 'old' } }\n",
+    ).unwrap();
+    let output = fixture.run(&["apply", "--auto-approve"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let before = fs::read(fixture.0.path().join("carina.state.json")).unwrap();
+    let provider_before = fs::read(fixture.0.path().join("mock-state.json")).unwrap();
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        "let consumer = mock.test.input_constrained { name = 'valid-name' tags = { owner = 'new' } }\n",
+    ).unwrap();
+    let output = fixture.run(&["plan", "--refresh=false", "--out", "plan.json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    fs::write(fixture.0.path().join("op.log"), "").unwrap();
+    let path = fixture.0.path().join("plan.json");
+    let mut plan: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let update = plan["plan"]["effects"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find_map(|effect| effect.get_mut("Update"))
+        .expect("saved update");
+    update["to"]["attributes"]["tags"] =
+        serde_json::json!({"Map": {"AWS:private-update-key": {"String": "private-update-value"}}});
+    fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+    let plan_before = fs::read(&path).unwrap();
+
+    let output = fixture.run(&["apply", "--auto-approve", "plan.json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(text(&output).contains("cannot update"), "{}", text(&output));
+    assert!(
+        text(&output).contains("mock.tags.reserved_prefix"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        !text(&output).contains("AWS:private-update-key"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        !text(&output).contains("private-update-value"),
+        "{}",
+        text(&output)
+    );
+    let operations = fs::read_to_string(fixture.0.path().join("op.log")).unwrap();
+    assert!(
+        operations.lines().all(|line| line.starts_with("read ")),
+        "{operations}"
+    );
+    assert_eq!(
+        fs::read(fixture.0.path().join("carina.state.json")).unwrap(),
+        before
+    );
+    assert_eq!(
+        fs::read(fixture.0.path().join("mock-state.json")).unwrap(),
+        provider_before
+    );
+    assert_eq!(fs::read(&path).unwrap(), plan_before);
+}
+
 #[test]
 fn input_default_tags_reserved_prefix_is_rejected_before_plan_output() {
     let fixture = Fixture::new();

@@ -515,11 +515,7 @@ pub(super) async fn execute_effects_sequential<
     } = expand_deferred_replace_effects(input.plan.effects());
     let mut effects = expanded_effects;
     let mut input_checks = ExecutionInputChecks::new(
-        match &mut input.input_admission {
-            super::RuntimeInputAdmission::Checked { checks } => std::mem::take(checks),
-            // TODO(#4267 phase 5): saved-plan re-admission stays a named legacy path.
-            super::RuntimeInputAdmission::SavedPlanRecheckRequired => Vec::new(),
-        },
+        std::mem::take(&mut input.input_checks),
         &effects,
         &source_effect_indices,
     );

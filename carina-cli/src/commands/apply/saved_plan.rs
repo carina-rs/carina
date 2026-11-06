@@ -3,6 +3,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
+use carina_core::input_rules::{
+    FinalizedPlan, InputAdmissionFailure, InputCheckedPlan, InputTypeContext,
+};
 use carina_core::parser::{
     ExpandedBackendConfig as BackendConfig, ExpandedInferredExportParam as InferredExportParam,
     SavedProviderConfigs,
@@ -1136,14 +1139,27 @@ impl RehydratedPlanFile {
     }
 }
 
-/// The only saved-plan type accepted by the executor gateway. Construction is
-/// private to [`DesiredPlanFile::verify_historical`], so a deserialized
-/// plan cannot execute without the provider-schema comparison.
+/// Provider- and secret-verified effects awaiting input re-admission.
+/// Construction is private to [`DesiredPlanFile::verify_historical`].
 pub(super) struct ExecutablePlanFile {
     plan: RehydratedPlanFile,
 }
 
 impl ExecutablePlanFile {
+    pub(super) fn check_inputs(
+        &self,
+        schemas: &carina_core::schema::SchemaRegistry,
+        current: &HashMap<ResourceId, Current>,
+        types: &InputTypeContext<SavedModuleSource>,
+    ) -> Result<InputCheckedExecutablePlanFile<'_>, InputAdmissionFailure<SavedModuleSource>> {
+        let plan = FinalizedPlan::from_saved_plan(self.plan().clone())
+            .check_inputs_with_types(schemas, current, types)?;
+        Ok(InputCheckedExecutablePlanFile {
+            plan_file: self,
+            plan,
+        })
+    }
+
     pub(super) fn reloaded_plan_file(&self) -> &ReloadedPlanFile {
         &self.plan.plan_file
     }
@@ -1194,6 +1210,27 @@ impl ExecutablePlanFile {
 
     pub(super) fn wait_bindings(&self) -> &[PlanWaitBinding] {
         self.plan.wait_bindings()
+    }
+}
+
+/// Executor capability retaining both verification of this exact saved file
+/// and the non-serializable input witness rebuilt under the apply lock.
+pub(super) struct InputCheckedExecutablePlanFile<'a> {
+    plan_file: &'a ExecutablePlanFile,
+    plan: InputCheckedPlan<SavedModuleSource>,
+}
+
+impl InputCheckedExecutablePlanFile<'_> {
+    pub(super) fn plan(&self) -> &InputCheckedPlan<SavedModuleSource> {
+        &self.plan
+    }
+}
+
+impl std::ops::Deref for InputCheckedExecutablePlanFile<'_> {
+    type Target = ExecutablePlanFile;
+
+    fn deref(&self) -> &Self::Target {
+        self.plan_file
     }
 }
 

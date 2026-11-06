@@ -72,18 +72,7 @@ impl<S> InputTypeContext<S> {
                 );
             }
         }
-        for source in data_sources {
-            if let Some((binding, schema)) = source
-                .binding
-                .as_ref()
-                .zip(schemas.get_for_data_source(source))
-            {
-                context.facts.bindings.insert(
-                    binding.clone(),
-                    Declaration::Schema(Arc::new(schema.schema().clone())),
-                );
-            }
-        }
+        context = context.with_data_sources(data_sources, schemas);
         for (binding, outputs) in composition_outputs {
             context
                 .facts
@@ -96,6 +85,28 @@ impl<S> InputTypeContext<S> {
                 .map(|alias| (alias.binding.clone(), alias.target.clone())),
         );
         context
+    }
+
+    /// Declaration lookup is independent of data-source dependency phase;
+    /// saved origins retain the same schema types with erased dependencies.
+    pub fn with_data_sources<D>(
+        mut self,
+        data_sources: &[DataSource<S, crate::resource::NoPlaceholder, AbsoluteBindingAddress, D>],
+        schemas: &SchemaRegistry,
+    ) -> Self {
+        for source in data_sources {
+            if let Some((binding, schema)) = source
+                .binding
+                .as_ref()
+                .zip(schemas.get_for_data_source(source))
+            {
+                self.facts.bindings.insert(
+                    binding.clone(),
+                    Declaration::Schema(Arc::new(schema.schema().clone())),
+                );
+            }
+        }
+        self
     }
 
     /// Project mandatory and possible default tag keys through the same host

@@ -91,8 +91,9 @@ use crate::wiring::{
 use crate::wiring::{ValidatedWiring, WiringContext, read_with_retry};
 use carina_core::hint::ProjectCommand;
 use saved_plan::{
-    ExecutablePlanFile, HistoricalResourceAddresses, InspectedPlanFile, ProviderBoundPlanFile,
-    ReloadedProviderBoundPlanFile, SavedPlanSecretCandidates, SchemaCheckedPendingPlanFile,
+    HistoricalResourceAddresses, InputCheckedExecutablePlanFile, InspectedPlanFile,
+    ProviderBoundPlanFile, ReloadedProviderBoundPlanFile, SavedPlanSecretCandidates,
+    SchemaCheckedPendingPlanFile,
 };
 
 /// Re-export ExecutionResult as the public API for apply results.
@@ -857,11 +858,10 @@ async fn execute_effects_with_observer(
     outcome
 }
 
-/// Saved-plan executor gateway. Requiring [`ExecutablePlanFile`] here makes it
-/// impossible for the deserialized `PlanFile` path to dispatch effects before
-/// schema compatibility and all typed secret placeholders have been verified.
+/// Saved-plan executor gateway. Its input retains provider/schema and secret
+/// verification together with input admission of the same saved effects.
 async fn execute_rehydrated_saved_plan(
-    plan_file: &ExecutablePlanFile,
+    plan_file: &InputCheckedExecutablePlanFile<'_>,
     compositions: &[carina_core::resource::SavedComposition<NoPlaceholder>],
     context: ApplyExecutionContext<'_, SavedModuleSource>,
     state: ApplyExecutionState<'_, SavedModuleSource, ()>,
@@ -1440,20 +1440,36 @@ pub(crate) struct DriftCheckResult {
     verified_planned_states: HashMap<ResourceId, SnapshotState>,
 }
 
+#[cfg(test)]
 impl DriftCheckResult {
     pub(crate) fn drift_messages(&self) -> Option<&[String]> {
         self.drift_messages.as_deref()
     }
+}
 
-    fn into_verified_states(
-        self,
-    ) -> (
-        HashMap<ResourceId, SnapshotState>,
-        HashMap<ResourceId, SnapshotState>,
-    ) {
-        debug_assert!(self.drift_messages.is_none());
-        (self.actual_states, self.verified_planned_states)
+fn render_saved_plan_drift(
+    color_mode: crate::output_style::ColorMode,
+    drift_messages: &[String],
+    apply_target: ApplyTarget<'_>,
+) -> AppError {
+    println!();
+    println!(
+        "{}",
+        "Error: Infrastructure drift detected!"
+            .red(color_mode)
+            .bold(color_mode)
+    );
+    println!(
+        "{}",
+        "The following resources have changed since the plan was created:".red(color_mode)
+    );
+    println!();
+    for msg in drift_messages {
+        println!("{}", msg);
     }
+    println!();
+    println!("{}", drift_replan_hint(apply_target).yellow(color_mode));
+    AppError::Config("Apply aborted due to infrastructure drift.".to_string())
 }
 
 /// Detect infrastructure drift and retain the single historical-secret
@@ -3892,9 +3908,8 @@ async fn run_apply_from_plan_locked_owned(
     let legacy_data_source_ids = inspected_plan.legacy_data_source_ids();
     // Read current state and validate lineage. carina#3315: a
     // pending in-memory schema migration must be persisted under
-    // the apply lock so the carina#3283 warning text matches
-    // reality — but we run that *after* the saved-plan
-    // lineage/serial check below, so the operator sees the original
+    // the apply lock, after input re-admission. Run the saved-plan
+    // lineage/serial check first, so the operator sees the original
     // on-disk serial (the one the saved plan was diffed against)
     // rather than a +1 bump caused by our own migration persist.
     let (mut state_file, pending_migration) =
@@ -3949,8 +3964,8 @@ async fn run_apply_from_plan_locked_owned(
     // historical pre-#3181 data-source rows without erasing an identifier-
     // bearing managed orphan at the same address. Normalize those artifacts
     // only after checking the saved plan against the original
-    // on-disk serial, then persist that cleanup together with any schema
-    // migration before drift detection can return early.
+    // on-disk serial. Persist that cleanup together with any schema migration
+    // only after the rehydrated effects have passed input re-admission.
     let removed_legacy_data_source_rows = state_file.as_mut().is_some_and(|state| {
         state.remove_legacy_data_source_rows_by_ids(&legacy_data_source_ids) > 0
     });
@@ -3973,20 +3988,6 @@ async fn run_apply_from_plan_locked_owned(
         }
         state_file = Some(state);
     }
-    if (pending_migration.is_some() || removed_legacy_data_source_rows)
-        && let Some(state) = state_file.as_mut()
-        && !state.requires_legacy_dependency_migration()
-    {
-        match lock.as_ref() {
-            StateLockRef::Held(held) => {
-                try_with_lock!(save_state_locked(backend.as_ref(), held, state).await);
-            }
-            StateLockRef::Disabled(disabled) => {
-                try_with_lock!(save_state_unlocked(backend.as_ref(), disabled, state).await);
-            }
-        }
-    }
-
     let heartbeat_outcome = with_lock_heartbeat(
         Arc::clone(&backend),
         lock,
@@ -4065,34 +4066,13 @@ async fn run_apply_from_plan_locked_owned(
             )
             .await?;
 
-            if let Some(drift_messages) = drift_check.drift_messages() {
-                println!();
-                println!(
-                    "{}",
-                    "Error: Infrastructure drift detected!"
-                        .red(color_mode)
-                        .bold(color_mode)
-                );
-                println!(
-                    "{}",
-                    "The following resources have changed since the plan was created:"
-                        .red(color_mode)
-                );
-                println!();
-                for msg in drift_messages {
-                    println!("{}", msg);
-                }
-                println!();
-                println!("{}", drift_replan_hint(apply_target).yellow(color_mode));
-                return Err(AppError::Config(
-                    "Apply aborted due to infrastructure drift.".to_string(),
-                ));
-            }
-
-            println!("  {} No drift detected.", "✓".green(color_mode));
-
-            let (mut actual_states, mut verified_planned_states) =
-                drift_check.into_verified_states();
+            // Retain the drift report while historical values are rehydrated.
+            // Admission must precede even the migration write on drift abort.
+            let DriftCheckResult {
+                drift_messages,
+                mut actual_states,
+                mut verified_planned_states,
+            } = drift_check;
 
             let scope_checked_plan = validated_plan
                 .verify_historical(
@@ -4101,11 +4081,19 @@ async fn run_apply_from_plan_locked_owned(
                     &historical_addresses,
                     apply_target,
                 )
-                .await?;
+                .await
+                .map_err(|error| {
+                    // Drift still owns the abort when a vanished historical
+                    // value cannot be rehydrated. No admission or migration
+                    // write is possible on this error path.
+                    match &drift_messages {
+                        Some(messages) => render_saved_plan_drift(color_mode, messages, apply_target),
+                        None => error,
+                    }
+                })?;
             let (rehydrated_plan_file, provider) = scope_checked_plan.into_parts();
             let wiring = rehydrated_plan_file.context();
 
-            let plan = rehydrated_plan_file.plan();
             let sorted_resources = rehydrated_plan_file.sorted_resources();
             let saved_value_destroy_dependencies = rehydrated_plan_file
                 .reloaded_plan_file()
@@ -4152,11 +4140,94 @@ async fn run_apply_from_plan_locked_owned(
                 plan_data_sources,
                 rehydrated_plan_file.data_source_values(),
             )?;
-            render_plan_errors_and_abort(color_mode, plan, project_dir)?;
+            let wait_aliases: Vec<WaitAliasSpec> = rehydrated_plan_file
+                .wait_bindings()
+                .iter()
+                .map(|wb| WaitAliasSpec {
+                    binding: wb.binding.clone(),
+                    target: wb.target.clone(),
+                })
+                .collect();
+            let unresolved_resources = saved_plan_unresolved_by_resolved_id(
+                sorted_resources,
+                rehydrated_plan_file.unresolved_resources(),
+                apply_target,
+            )?;
+            let input_sources = sorted_resources
+                .iter()
+                .map(|resource| {
+                    unresolved_resources[&ResolvedResourceId::new(resource.id.clone())].clone()
+                })
+                .collect::<Vec<_>>();
+            let input_types = carina_core::input_rules::InputTypeContext::from_sources(
+                &input_sources,
+                &[],
+                plan_compositions.iter().filter_map(|composition| {
+                    let binding = composition.binding.clone()?;
+                    let outputs = composition.signature.attributes
+                        .iter()
+                        .map(|(name, output)| (name.clone(), output.to_value()))
+                        .collect();
+                    Some((binding, outputs))
+                }),
+                &wait_aliases,
+                wiring.schemas(),
+            ).with_data_sources(
+                plan_data_source_origins,
+                wiring.schemas(),
+            ).with_default_tags(
+                raw_provider_configs,
+                wiring.schemas(),
+                rehydrated_plan_file.plan().effects().iter().map(|effect| effect.resource_id()),
+            )?;
+            let checked_plan_file = rehydrated_plan_file
+                .check_inputs(wiring.schemas(), &managed_current, &input_types)
+                .map_err(|failure| {
+                    render_plan_errors_and_abort(color_mode, &failure, project_dir)
+                        .expect_err("input rejection contains diagnostics")
+                })?;
+            let plan = checked_plan_file.plan();
+
+            // Keep the historical migration-on-drift behavior, but only after
+            // input admission, using the heartbeat's serialized lock owner.
+            if (pending_migration.is_some() || removed_legacy_data_source_rows)
+                && let Some(state) = state_file.as_mut()
+                && !state.requires_legacy_dependency_migration()
+            {
+                mid_run_writer.write_schema_migration(state).await?;
+            }
+
+            if let Some(drift_messages) = drift_messages {
+                return Err(render_saved_plan_drift(color_mode, &drift_messages, apply_target));
+            }
+
+            println!("  {} No drift detected.", "✓".green(color_mode));
             let executable_data_source_values = data_source_values
                 .clone()
                 .into_executable()
                 .map_err(|error| AppError::Config(error.to_string()))?;
+            // Use the same saved binding view for the state-only fast path
+            // and executor, including compositions, reads and wait aliases.
+            let upstream_snapshot = rehydrated_plan_file.upstream_snapshot().clone();
+            let pre_apply_input_current = carina_core::resource::into_plan_input_current_map(
+                managed_current.clone(),
+                wiring.schemas(),
+                sorted_resources,
+            );
+            let mut bindings = ResolvedBindings::pre_apply_saved(SavedPreApplyInputs {
+                managed: sorted_resources,
+                compositions: plan_compositions,
+                managed_current: &pre_apply_input_current,
+                data_source_values: &data_source_values,
+                remote_bindings: &upstream_snapshot,
+                wait_aliases: &wait_aliases,
+            });
+            bindings.apply_plan_stability(
+                sorted_resources,
+                &pre_apply_input_current,
+                plan,
+                wiring.schemas(),
+            );
             let directive_changes =
                 persisted_directive_changes(state_file.as_ref(), &resolved_sorted_resources, plan);
             let recorded_directive_changes = rehydrated_plan_file
@@ -4180,30 +4251,9 @@ async fn run_apply_from_plan_locked_owned(
                 // resource-apply pipeline. Mirrors the source-driven apply
                 // path's gate (carina#3270 → run_apply_locked).
                 // carina#3275.
-                let terminal_wait_aliases: Vec<WaitAliasSpec> = rehydrated_plan_file
-                    .wait_bindings()
-                    .iter()
-                    .map(|wb| WaitAliasSpec {
-                        binding: wb.binding.clone(),
-                        target: wb.target.clone(),
-                    })
-                    .collect();
-                let terminal_input_current = carina_core::resource::into_plan_input_current_map(
-                    managed_current.clone(),
-                    wiring.schemas(),
-                    sorted_resources,
-                );
-                let terminal_bindings = ResolvedBindings::pre_apply_saved(SavedPreApplyInputs {
-                    managed: sorted_resources,
-                    compositions: plan_compositions,
-                    managed_current: &terminal_input_current,
-                    data_source_values: &data_source_values,
-                    remote_bindings: rehydrated_plan_file.upstream_snapshot(),
-                    wait_aliases: &terminal_wait_aliases,
-                });
                 finalize_saved_module_constraints(
                     plan_compositions,
-                    &terminal_bindings,
+                    &bindings,
                     wiring.provider_context(),
                 )?;
                 let directive_change_count = directive_changes.len();
@@ -4300,7 +4350,6 @@ async fn run_apply_from_plan_locked_owned(
             // compare against the persisted snapshot; if any binding's
             // attribute map disagrees, fail rather than silently mixing
             // plan-time and apply-time values during cascade re-resolution.
-            let upstream_snapshot = rehydrated_plan_file.upstream_snapshot().clone();
             if !rehydrated_plan_file.upstream_sources().is_empty() {
                 verify_upstream_snapshot(
                     wiring.runtime(),
@@ -4311,49 +4360,6 @@ async fn run_apply_from_plan_locked_owned(
                 )
                 .await?;
             }
-            // Rebuild the wait passthrough aliases from the persisted
-            // `(binding, target)` pairs so `apply --plan`'s cascade
-            // re-resolution resolves `<wait-binding>.<attr>` exactly as the
-            // plan path did (carina#3085). `PlanWaitBinding` and
-            // `WaitAliasSpec<AbsoluteBindingAddress>` both retain absolute
-            // binding addresses; the parser `WaitBinding`
-            // is not serializable so it is reconstructed here, not deserialized.
-            let wait_aliases: Vec<WaitAliasSpec> = rehydrated_plan_file
-                .wait_bindings()
-                .iter()
-                .map(|wb| WaitAliasSpec {
-                    binding: wb.binding.clone(),
-                    target: wb.target.clone(),
-                })
-                .collect();
-            // carina#3248: saved plans (version 4) persist both
-            // `compositions` and `data_sources`, so the saved-plan apply
-            // path builds the same unified pre-apply bindings view as the
-            // live-apply path. The view includes compositions so a managed
-            // attribute referencing `<module_instance>.<attr>` chains through
-            // to the managed sibling literal (carina#3246), and includes data
-            // sources so a managed attribute referencing `<read_binding>.<attr>`
-            // resolves through the data source's attribute map.
-            let pre_apply_input_current = carina_core::resource::into_plan_input_current_map(
-                managed_current.clone(),
-                wiring.schemas(),
-                sorted_resources,
-            );
-            let mut bindings = ResolvedBindings::pre_apply_saved(SavedPreApplyInputs {
-                managed: sorted_resources,
-                compositions: plan_compositions,
-                managed_current: &pre_apply_input_current,
-                data_source_values: &data_source_values,
-                remote_bindings: &upstream_snapshot,
-                wait_aliases: &wait_aliases,
-            });
-            bindings.apply_plan_stability(
-                sorted_resources,
-                &pre_apply_input_current,
-                plan,
-                wiring.schemas(),
-            );
-
             let apply_phase_started = Instant::now();
             println!(
                 "{}",
@@ -4361,14 +4367,6 @@ async fn run_apply_from_plan_locked_owned(
             );
             println!();
 
-            // Build unresolved resource map for re-resolution at apply time from
-            // the saved pre-resolution snapshot, keyed by the paired sorted
-            // resource IDs rather than the unresolved snapshot's own identity.
-            let unresolved_resources = saved_plan_unresolved_by_resolved_id(
-                sorted_resources,
-                rehydrated_plan_file.unresolved_resources(),
-                apply_target,
-            )?;
             // Same object in both positions: `ProviderRouter` is both the
             // `Provider` and the `ProviderNormalizer`, so apply re-normalizes
             // with the plan-time normalizer (carina#3060).
@@ -4376,7 +4374,7 @@ async fn run_apply_from_plan_locked_owned(
             let provider = Arc::new(provider);
             let state_save_inputs = Arc::new(ApplyStateSaveInputs::new(
                 resolved_sorted_resources.clone(),
-                (*plan).clone(),
+                plan.plan().clone(),
                 wiring.schemas().clone(),
                 Some(rehydrated_plan_file.planned_secret_hashes().clone()),
                 provider.as_ref(),
@@ -4392,7 +4390,7 @@ async fn run_apply_from_plan_locked_owned(
             // them from the plan.
             let state_only_success_count = execute_state_only_effects(color_mode, plan);
             let outcome = execute_rehydrated_saved_plan(
-                &rehydrated_plan_file,
+                &checked_plan_file,
                 plan_compositions,
                 ApplyExecutionContext {
                     provider: provider.as_ref(),

@@ -540,8 +540,15 @@ pub struct LiveExecutionInput<'a> {
 ///
 /// Keeping the composition slice in a distinct input type prevents a
 /// deserialized plan from entering the live validation/expansion lifecycle.
+///
+/// ```compile_fail
+/// use carina_core::{executor::SavedExecutionInput, plan::Plan, resource::SavedModuleSource};
+/// fn bypass<'a>(input: &mut SavedExecutionInput<'a>, raw: &'a Plan<SavedModuleSource>) {
+///     input.plan = raw;
+/// }
+/// ```
 pub struct SavedExecutionInput<'a> {
-    pub plan: &'a crate::plan::Plan<SavedModuleSource>,
+    pub plan: &'a crate::input_rules::InputCheckedPlan<SavedModuleSource>,
     pub provider_check_inputs: ProviderCheckInputs<'a, SavedModuleSource>,
     pub compositions: &'a [crate::resource::SavedComposition<crate::resource::NoPlaceholder>],
     pub bindings: ResolvedBindings,
@@ -587,17 +594,8 @@ impl RuntimeCompositions<'_> {
     }
 }
 
-enum RuntimeInputAdmission {
-    Checked {
-        checks: Vec<crate::input_rules::PendingInputObligation>,
-    },
-    /// TODO(#4267 phase 5): re-admit the saved effects under the apply lock.
-    /// Only SavedExecutionInput can produce this explicit legacy disposition.
-    SavedPlanRecheckRequired,
-}
-
 pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
-    input_admission: RuntimeInputAdmission,
+    input_checks: Vec<crate::input_rules::PendingInputObligation>,
     pub(super) plan: &'a crate::plan::Plan<S>,
     pub(super) provider_check_inputs: ProviderCheckInputs<'a, S>,
     pub(super) compositions: RuntimeCompositions<'a>,
@@ -642,9 +640,7 @@ impl<'a> LiveExecutionInput<'a> {
             checkpoint_sink,
         } = self;
         RuntimeExecutionInput {
-            input_admission: RuntimeInputAdmission::Checked {
-                checks: plan.execution_input_checks(),
-            },
+            input_checks: plan.execution_input_checks(),
             plan,
             provider_check_inputs,
             compositions: RuntimeCompositions::Live(compositions),
@@ -688,7 +684,7 @@ impl<'a> SavedExecutionInput<'a> {
             checkpoint_sink,
         } = self;
         RuntimeExecutionInput {
-            input_admission: RuntimeInputAdmission::SavedPlanRecheckRequired,
+            input_checks: plan.execution_input_checks(),
             plan,
             provider_check_inputs,
             compositions: RuntimeCompositions::Saved(compositions),

@@ -535,6 +535,15 @@ impl<S> Deref for FinalizedPlan<S> {
     }
 }
 
+impl FinalizedPlan<crate::resource::SavedModuleSource> {
+    /// Seal the saved effects after the caller has verified and rehydrated
+    /// them. This performs no diff or effect rewrite and grants no execution
+    /// authority until the ordinary input-admission transition succeeds.
+    pub fn from_saved_plan(plan: Plan<crate::resource::SavedModuleSource>) -> Self {
+        Self::new(plan)
+    }
+}
+
 impl<S> FinalizedPlan<S> {
     pub(crate) fn new(plan: Plan<S>) -> Self {
         let replacement_creates = plan
