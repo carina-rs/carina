@@ -6128,7 +6128,8 @@ fn provider_custom_type_validation_gets_api_spelling_at_every_type_expr_boundary
                     .push(canonical.to_string());
                 Ok(())
             }),
-        ),
+        )
+        .with_declarations_for_test(BTreeMap::from([("test".into(), vec![enum_type.clone()])])),
         resource_types: HashSet::from([("test".to_string(), "widget".to_string())]),
         ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
     });

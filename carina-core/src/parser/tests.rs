@@ -12591,7 +12591,19 @@ fn schema_custom_type_validation_preserves_bridge_decode_error_chain() {
         custom_types: crate::parser::ProviderCustomTypes::loaded(
             HashSet::from([(*owned).clone()]),
             Box::new(|_, _| Ok(())),
-        ),
+        )
+        // This fixture accepts enum text so the resolved Int witness below
+        // exercises bridge decoding after the declaration's local check.
+        .with_declarations_for_test(std::collections::BTreeMap::from([(
+            "test".into(),
+            vec![crate::schema::CompiledAttributeType::enum_(
+                owned.identity().clone(),
+                None,
+                Vec::new(),
+                None,
+                None,
+            )],
+        )])),
         ..ProviderContext::new(crate::EnvironmentSnapshot::empty())
     };
     let value = ExpandedValue::Concrete(ExpandedConcreteValue::EnumIdentifier(

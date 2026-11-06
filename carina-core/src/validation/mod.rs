@@ -993,7 +993,7 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
             | crate::resource::DeferredValue::Secret(_)
             | crate::resource::DeferredValue::Unknown(_)
             | crate::resource::DeferredValue::Placeholder(_),
-        ) => crate::schema::validate_attr_with_defs_and_ancestry(
+        ) => crate::schema::validate_attr_with_defs(
             target.attr_type,
             value,
             target.defs,
@@ -1484,9 +1484,9 @@ fn binding_value_constraints<B: BindingAddress>(
             defs,
             ancestry,
             owner: _,
-        } => crate::schema::validate_attr_with_defs_and_ancestry(attr_type, value, defs, ancestry)
+        } => crate::schema::validate_attr_with_defs(attr_type, value, defs, ancestry)
             .map_err(BindingResolutionError::Type),
-        RefSink::Interpolation => crate::schema::validate_attr_with_defs_and_ancestry(
+        RefSink::Interpolation => crate::schema::validate_attr_with_defs(
             &lift_type_expr(&INTERPOLATION_REF_SINK)
                 .expect("built-in interpolation operand types lift"),
             value,

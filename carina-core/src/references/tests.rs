@@ -2636,8 +2636,8 @@ impl ProviderFactory for ReferenceValidationFactory {
 #[test]
 fn round2_reference_validation_is_offline_for_declarations_and_annotations() {
     use crate::parser::{
-        CustomTypeResolver, CustomTypeValidationTarget, IdentifiedCustomTypeDeclaration,
-        OwnedTypeIdentity,
+        CustomTypeValidationTarget, IdentifiedCustomTypeDeclaration, OwnedTypeIdentity,
+        validate_custom_type_value,
     };
     let calls = Arc::new(Mutex::new(0));
     let factory = ReferenceValidationFactory {
@@ -2648,24 +2648,24 @@ fn round2_reference_validation_is_offline_for_declarations_and_annotations() {
     let custom_types = provider_custom_types_from_factories(factories);
     let owned =
         OwnedTypeIdentity::provider("test", identity(), crate::schema::RefinedScalarKind::String);
-    custom_types
-        .validate(
-            CustomTypeValidationTarget::Annotation(&owned),
-            &string("alias/valid"),
-        )
-        .unwrap();
+    validate_custom_type_value(
+        &custom_types,
+        CustomTypeValidationTarget::Annotation(&owned),
+        &string("alias/valid"),
+    )
+    .unwrap();
     assert_eq!(
         *calls.lock().unwrap(),
         0,
         "reference annotations only run local string constraints"
     );
     assert!(
-        custom_types
-            .validate(
-                CustomTypeValidationTarget::Annotation(&owned),
-                &string("bad")
-            )
-            .is_err()
+        validate_custom_type_value(
+            &custom_types,
+            CustomTypeValidationTarget::Annotation(&owned),
+            &string("bad")
+        )
+        .is_err()
     );
     assert_eq!(*calls.lock().unwrap(), 0);
     let attribute = schemas[0].effective_attribute("key").unwrap();

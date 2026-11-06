@@ -114,7 +114,7 @@ pub use config::{
     CustomTypeResolver, CustomTypeValidationError, CustomTypeValidationTarget,
     CustomTypeValidatorFn, DecryptorFn, IdentifiedCustomTypeDeclaration, LoadedProviderContext,
     NonEmptySchemaTypeOwners, OwnedTypeIdentity, ProviderContext, ProviderCustomTypes,
-    ResolvedSchemaType, SchemaTypeOwner, unavailable_provider_kinds,
+    ResolvedSchemaType, SchemaTypeOwner, unavailable_provider_kinds, validate_custom_type_value,
 };
 #[cfg(test)]
 pub(crate) use config::{fixture_custom_type_rejection, fixture_invalid_custom_type_value};

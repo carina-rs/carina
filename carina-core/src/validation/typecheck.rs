@@ -2069,7 +2069,17 @@ mod tests {
                         )
                     })
                 }),
-            ),
+            )
+            .with_declarations_for_test(std::collections::BTreeMap::from([(
+                "test".into(),
+                vec![crate::schema::CompiledAttributeType::enum_(
+                    identity.clone(),
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                )],
+            )])),
             ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
 
@@ -2163,7 +2173,11 @@ mod tests {
                         .push(canonical.to_string());
                     Ok(())
                 }),
-            ),
+            )
+            .with_declarations_for_test(std::collections::BTreeMap::from([(
+                "test".into(),
+                vec![declared_type.clone()],
+            )])),
             ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
         let schema_type = TypeExpr::SchemaType {

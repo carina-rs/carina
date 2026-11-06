@@ -886,10 +886,11 @@ type CustomTypeProjectionLookupFn = Box<
 /// trait, so every schema walk is adapted through one owner-bound lookup
 /// constructor.
 pub trait CustomTypeResolver: Send + Sync {
-    fn validate<'a>(
+    /// Dispatch an already checked declaration using its sealed canonical proof.
+    fn validate_validated(
         &self,
-        target: CustomTypeValidationTarget<'a>,
-        value: &'a Value,
+        owner: &str,
+        value: crate::schema::LocallyValidatedCustomType<'_>,
     ) -> Result<(), CustomTypeValidationError>;
 
     /// Resolve every declaration of every requested owner from the same
@@ -899,6 +900,23 @@ pub trait CustomTypeResolver: Send + Sync {
         &self,
         owned: &OwnedTypeIdentity,
     ) -> Result<ResolvedSchemaType, CustomTypeValidationError> {
+        Err(CustomTypeValidationError::MissingDeclaration {
+            owner: owned
+                .provider_names()
+                .next()
+                .expect("nonempty owners")
+                .into(),
+            identity: owned.identity().clone(),
+        })
+    }
+
+    /// Return the exact declarations checked by an authored annotation,
+    /// including native callbacks. This supplies data to the local validator;
+    /// only `validate_validated` can dispatch a value to a provider.
+    fn annotation_declarations(
+        &self,
+        owned: &OwnedTypeIdentity,
+    ) -> Result<BTreeMap<String, Vec<AttributeType>>, CustomTypeValidationError> {
         Err(CustomTypeValidationError::MissingDeclaration {
             owner: owned
                 .provider_names()
@@ -937,6 +955,30 @@ pub trait CustomTypeResolver: Send + Sync {
     }
 }
 
+/// Validate raw custom-type values locally before dispatching their sealed
+/// proofs. Resolver implementations cannot override this entry point.
+pub fn validate_custom_type_value(
+    resolver: &dyn CustomTypeResolver,
+    target: CustomTypeValidationTarget<'_>,
+    value: &Value,
+) -> Result<(), CustomTypeValidationError> {
+    match target {
+        CustomTypeValidationTarget::Declaration { owner, declaration } => {
+            crate::schema::validate_custom_type_leaf(declaration, value, |proof| {
+                proof.map_or(Ok(()), |proof| resolver.validate_validated(owner, proof))
+            })
+            .map_err(|error| CustomTypeValidationError::InvalidDeclarationValue {
+                owner: owner.to_string(),
+                identity: declaration.identity().clone(),
+                error: Box::new(error),
+            })?
+        }
+        CustomTypeValidationTarget::Annotation(owned) => {
+            crate::provider::validate_custom_type_annotation(resolver, owned, value)
+        }
+    }
+}
+
 /// A provider-derived resolver whose recognition keys come from the same
 /// indexed schema snapshot as its validation implementation.
 pub(crate) trait ProviderCustomTypeSource: CustomTypeResolver + 'static {
@@ -946,6 +988,9 @@ pub(crate) trait ProviderCustomTypeSource: CustomTypeResolver + 'static {
     ) -> BTreeMap<SchemaTypeOwner, crate::schema::AssignabilityClosure>;
 }
 
+// Closure resolvers support fixture catalogs only. Production dispatch keeps
+// the canonical proof through FactoryCustomTypeResolver.
+#[cfg(any(test, feature = "test-utils"))]
 impl<F> CustomTypeResolver for F
 where
     F: for<'a> Fn(
@@ -955,12 +1000,31 @@ where
         + Send
         + Sync,
 {
-    fn validate<'a>(
+    fn annotation_declarations(
         &self,
-        target: CustomTypeValidationTarget<'a>,
-        value: &'a Value,
+        owned: &OwnedTypeIdentity,
+    ) -> Result<BTreeMap<String, Vec<AttributeType>>, CustomTypeValidationError> {
+        let declaration = owned
+            .scalar_kind()
+            .identified_type(owned.identity().clone());
+        Ok(owned
+            .provider_names()
+            .map(|owner| (owner.to_string(), vec![declaration.clone()]))
+            .collect())
+    }
+
+    fn validate_validated(
+        &self,
+        owner: &str,
+        value: crate::schema::LocallyValidatedCustomType<'_>,
     ) -> Result<(), CustomTypeValidationError> {
-        self(target, value)
+        self(
+            CustomTypeValidationTarget::Declaration {
+                owner,
+                declaration: value.declaration(),
+            },
+            value.value(),
+        )
     }
 }
 
@@ -989,7 +1053,7 @@ enum ProviderCustomTypeState {
     },
     Loaded {
         known: BTreeSet<OwnedTypeIdentity>,
-        resolver: CustomTypeValidatorFn,
+        resolver: std::sync::Arc<dyn CustomTypeResolver>,
         enum_lookup: CustomTypeEnumLookupFn,
         annotation_lookup: CustomTypeDeclarationLookupFn,
         projection_lookup: CustomTypeProjectionLookupFn,
@@ -1006,6 +1070,71 @@ impl Default for ProviderCustomTypes {
 }
 
 impl ProviderCustomTypes {
+    /// Supply exact enum declarations to legacy callback-based fixtures so
+    /// local validation and canonicalization use the same declaration.
+    #[cfg(test)]
+    pub(crate) fn with_declarations_for_test(
+        mut self,
+        declarations: BTreeMap<String, Vec<AttributeType>>,
+    ) -> Self {
+        struct FixtureDeclarations {
+            resolver: std::sync::Arc<dyn CustomTypeResolver>,
+            declarations: BTreeMap<String, Vec<AttributeType>>,
+        }
+
+        impl CustomTypeResolver for FixtureDeclarations {
+            fn validate_validated(
+                &self,
+                owner: &str,
+                value: crate::schema::LocallyValidatedCustomType<'_>,
+            ) -> Result<(), CustomTypeValidationError> {
+                self.resolver.validate_validated(owner, value)
+            }
+
+            fn annotation_declarations(
+                &self,
+                owned: &OwnedTypeIdentity,
+            ) -> Result<BTreeMap<String, Vec<AttributeType>>, CustomTypeValidationError>
+            {
+                owned
+                    .provider_names()
+                    .map(|owner| {
+                        let declarations = self
+                            .declarations
+                            .get(owner)
+                            .into_iter()
+                            .flatten()
+                            .filter(|declaration| {
+                                crate::provider::identified_custom_type_identity(declaration)
+                                    == Some(owned.identity())
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if declarations.is_empty() {
+                            return Err(CustomTypeValidationError::MissingDeclaration {
+                                owner: owner.to_string(),
+                                identity: owned.identity().clone(),
+                            });
+                        }
+                        Ok((owner.to_string(), declarations))
+                    })
+                    .collect()
+            }
+        }
+
+        let ProviderCustomTypeState::Loaded { resolver, .. } =
+            std::sync::Arc::get_mut(&mut self.state)
+                .expect("fixture catalog must be uniquely owned")
+        else {
+            panic!("fixture catalog must be loaded");
+        };
+        *resolver = std::sync::Arc::new(FixtureDeclarations {
+            resolver: std::sync::Arc::clone(resolver),
+            declarations,
+        });
+        self
+    }
+
     // Unit tests can inject deliberately malformed routing fixtures. Like every
     // loaded catalog, this declares no edges for owners absent from the map.
     // Production construction is single-source through `from_source` below.
@@ -1015,10 +1144,19 @@ impl ProviderCustomTypes {
         resolver: CustomTypeValidatorFn,
     ) -> Self {
         let declarations = known.clone();
+        // These fixtures model annotation callbacks. The public resolver still
+        // receives only a locally checked proof before invoking the callback.
+        let resolver = move |target: CustomTypeValidationTarget<'_>, value: &Value| match target {
+            CustomTypeValidationTarget::Declaration { owner, declaration } => {
+                let owned = OwnedTypeIdentity::from_declaration(owner, declaration);
+                resolver(CustomTypeValidationTarget::Annotation(&owned), value)
+            }
+            target => resolver(target, value),
+        };
         Self {
             state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known: known.into_iter().collect(),
-                resolver,
+                resolver: std::sync::Arc::new(resolver),
                 enum_lookup: Box::new(|_| Ok(None)),
                 projection_lookup: Box::new(|projection| {
                     Err(CustomTypeValidationError::MissingDeclaration {
@@ -1061,7 +1199,7 @@ impl ProviderCustomTypes {
         Self {
             state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                 known,
-                resolver: Box::new(move |target, value| validation_source.validate(target, value)),
+                resolver: validation_source,
                 enum_lookup: Box::new(move |owned| source.enum_declaration(owned)),
                 annotation_lookup: Box::new(move |owned| {
                     declaration_source.annotation_declaration(owned)
@@ -1262,39 +1400,51 @@ impl CustomTypeResolver for ProviderCustomTypes {
         }
     }
 
-    fn validate<'a>(
+    fn annotation_declarations(
         &self,
-        target: CustomTypeValidationTarget<'a>,
-        value: &'a Value,
-    ) -> Result<(), CustomTypeValidationError> {
+        owned: &OwnedTypeIdentity,
+    ) -> Result<BTreeMap<String, Vec<AttributeType>>, CustomTypeValidationError> {
         match self.state.as_ref() {
             ProviderCustomTypeState::Partial {
                 loaded,
                 failed_providers,
             } => {
-                let unavailable = match target {
-                    CustomTypeValidationTarget::Annotation(owned) => owned
-                        .provider_names()
-                        .any(|owner| failed_providers.contains(owner)),
-                    CustomTypeValidationTarget::Declaration { owner, .. } => {
-                        failed_providers.contains(owner)
-                    }
-                };
-                if unavailable {
+                if owned
+                    .provider_names()
+                    .any(|owner| failed_providers.contains(owner))
+                {
                     Err(CustomTypeValidationError::ProvidersNotLoaded)
                 } else {
-                    loaded.validate(target, value)
+                    loaded.annotation_declarations(owned)
                 }
             }
-            ProviderCustomTypeState::Loaded {
-                known: _known,
-                resolver,
-                enum_lookup: _enum_lookup,
-                annotation_lookup: _annotation_lookup,
-                projection_lookup: _,
-                assignability_closures: _assignability_closures,
-            } => resolver(target, value),
+            ProviderCustomTypeState::Loaded { resolver, .. } => {
+                resolver.annotation_declarations(owned)
+            }
             ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
+        }
+    }
+
+    fn validate_validated(
+        &self,
+        owner: &str,
+        value: crate::schema::LocallyValidatedCustomType<'_>,
+    ) -> Result<(), CustomTypeValidationError> {
+        match self.state.as_ref() {
+            ProviderCustomTypeState::Unloaded => Err(CustomTypeValidationError::ProvidersNotLoaded),
+            ProviderCustomTypeState::Partial {
+                loaded,
+                failed_providers,
+            } => {
+                if failed_providers.contains(owner) {
+                    Err(CustomTypeValidationError::ProvidersNotLoaded)
+                } else {
+                    loaded.validate_validated(owner, value)
+                }
+            }
+            ProviderCustomTypeState::Loaded { resolver, .. } => {
+                resolver.validate_validated(owner, value)
+            }
         }
     }
 
@@ -1461,7 +1611,9 @@ impl LoadedProviderContext {
             custom_types: ProviderCustomTypes {
                 state: std::sync::Arc::new(ProviderCustomTypeState::Loaded {
                     known: BTreeSet::new(),
-                    resolver: Box::new(|_target, _value| Ok(())),
+                    resolver: std::sync::Arc::new(
+                        |_target: CustomTypeValidationTarget<'_>, _value: &Value| Ok(()),
+                    ),
                     enum_lookup: Box::new(|_owned| Ok(None)),
                     projection_lookup: Box::new(|projection| {
                         Err(CustomTypeValidationError::MissingDeclaration {

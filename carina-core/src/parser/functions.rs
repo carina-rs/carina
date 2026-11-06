@@ -552,56 +552,72 @@ pub(crate) fn contains_module_argument_matching<B: BindingAddress>(
 pub(crate) fn custom_type_lookup_for_schema<'resolver, 'schema>(
     resolver: &'resolver dyn crate::parser::CustomTypeResolver,
     schema: crate::schema::OwnerBoundResourceSchema<'schema>,
-) -> impl Fn(
-    &crate::schema::CompiledAttributeType,
-    &GenericValue,
-) -> Result<(), crate::schema::TypeError>
-+ use<'resolver, 'schema> {
-    let owner = schema.owner();
-    move |declared_type, value| {
-        validate_identified_declaration(declared_type, |declaration| {
-            resolver
-                .validate(
-                    crate::parser::CustomTypeValidationTarget::Declaration { owner, declaration },
-                    value,
-                )
-                .map_err(crate::schema::TypeError::from)
-        })
+) -> impl crate::schema::ValidatedCustomTypeLookup + use<'resolver, 'schema> {
+    struct Lookup<'a, 'b> {
+        resolver: &'a dyn crate::parser::CustomTypeResolver,
+        owner: &'b str,
+    }
+    impl crate::schema::ValidatedCustomTypeLookup for Lookup<'_, '_> {
+        fn validate(
+            &self,
+            value: crate::schema::LocallyValidatedCustomType<'_>,
+        ) -> Result<(), crate::schema::TypeError> {
+            self.resolver
+                .validate_validated(self.owner, value)
+                .map_err(Into::into)
+        }
+
+        fn canonicalization_error(
+            &self,
+            declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
+            error: crate::schema::TypeError,
+        ) -> crate::schema::TypeError {
+            custom_type_canonicalization_error(self.owner, declaration, error)
+        }
+    }
+    Lookup {
+        resolver,
+        owner: schema.owner(),
     }
 }
 
-/// Bind a provider-config schema walk directly to the factory already selected
-/// for that config. No provider-name comparison or owner lookup is involved.
-pub fn custom_type_lookup_for_factory<'a>(
-    factory: &'a dyn crate::provider::ProviderFactory,
-) -> impl Fn(
-    &crate::schema::CompiledAttributeType,
-    &GenericValue,
-) -> Result<(), crate::schema::TypeError>
-+ use<'a> {
-    move |declared_type, value| {
-        validate_identified_declaration(declared_type, |declaration| {
-            crate::provider::validate_custom_type_declaration_with_factory(
-                factory,
-                declaration,
-                value,
-            )
-            .map_err(crate::schema::TypeError::from)
-        })
+/// Bind a provider-config value validator to its selected factory. Dispatch
+/// consumes the proof produced by the combined walk, never a raw value.
+pub fn custom_type_lookup_for_factory(
+    factory: &dyn crate::provider::ProviderFactory,
+) -> impl crate::schema::ValidatedCustomTypeLookup + '_ {
+    struct Lookup<'a>(&'a dyn crate::provider::ProviderFactory);
+    impl crate::schema::ValidatedCustomTypeLookup for Lookup<'_> {
+        fn validate(
+            &self,
+            value: crate::schema::LocallyValidatedCustomType<'_>,
+        ) -> Result<(), crate::schema::TypeError> {
+            crate::provider::validate_validated_custom_type_with_factory(self.0, value)
+                .map_err(Into::into)
+        }
+
+        fn canonicalization_error(
+            &self,
+            declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
+            error: crate::schema::TypeError,
+        ) -> crate::schema::TypeError {
+            custom_type_canonicalization_error(self.0.name(), declaration, error)
+        }
     }
+    Lookup(factory)
 }
 
-fn validate_identified_declaration(
-    declared_type: &crate::schema::CompiledAttributeType,
-    validate: impl FnOnce(
-        crate::parser::IdentifiedCustomTypeDeclaration<'_>,
-    ) -> Result<(), crate::schema::TypeError>,
-) -> Result<(), crate::schema::TypeError> {
-    let Some(declaration) = crate::parser::IdentifiedCustomTypeDeclaration::new(declared_type)
-    else {
-        return Ok(());
-    };
-    validate(declaration)
+fn custom_type_canonicalization_error(
+    owner: &str,
+    declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
+    error: crate::schema::TypeError,
+) -> crate::schema::TypeError {
+    crate::parser::CustomTypeValidationError::InvalidDeclarationValue {
+        owner: owner.to_string(),
+        identity: declaration.identity().clone(),
+        error: Box::new(error),
+    }
+    .into()
 }
 
 /// Validate a value against a custom type (`Ipv4Cidr`, `Ipv4Address`, …).
@@ -745,7 +761,8 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
         .flatten();
     if let Some(projection) = projection.as_ref() {
         if let Some(declaration) = super::IdentifiedCustomTypeDeclaration::new(projection) {
-            config.custom_type_resolver().validate(
+            super::validate_custom_type_value(
+                config.custom_type_resolver(),
                 super::CustomTypeValidationTarget::Declaration {
                     owner: owned.provider_names().next().expect("nonempty owners"),
                     declaration,
@@ -768,9 +785,11 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
                 )?;
         }
     } else {
-        config
-            .custom_type_resolver()
-            .validate(super::CustomTypeValidationTarget::Annotation(owned), &value)?;
+        super::validate_custom_type_value(
+            config.custom_type_resolver(),
+            super::CustomTypeValidationTarget::Annotation(owned),
+            &value,
+        )?;
     }
     // The resolved witness can cross a catalog boundary (including serde).
     // Retain its constraints even when the current catalog is less restrictive.
