@@ -135,13 +135,7 @@ pub(crate) fn parse_validate_expr(
         Rule::null_literal => Ok(ValidateExpr::Null),
         Rule::boolean => Ok(ValidateExpr::Bool(pair.as_str() == "true")),
         Rule::float => {
-            let f: f64 = pair
-                .as_str()
-                .parse()
-                .map_err(|e| ParseError::InvalidExpression {
-                    line: 0,
-                    message: format!("Invalid float: {}", e),
-                })?;
+            let f = super::super::error::parse_float_literal(pair.as_str(), pair.line_col().0)?;
             Ok(ValidateExpr::Float(f))
         }
         Rule::number => {

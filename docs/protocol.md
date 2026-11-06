@@ -30,6 +30,18 @@ assignability does not compare collection count bounds for either lists or maps
 host would ignore the new field and silently drop the bound, so hosts and
 providers must rebuild together.
 
+Later within version 22, the Rust protocol types carry floats as
+`FiniteF64`, whose only constructor rejects NaN and infinities
+(carina-rs/carina#4257). This covers `Value::Float`, `PersistedValue::Float`,
+normalization values, and float range bounds in schema records. The WIT
+`float-val(f64)` layout and the JSON numbers are unchanged, and a finite float
+always meant the same thing on the wire. Only receiving-side admission is
+stricter: the host and SDK guest now reject a non-finite `float-val` or JSON
+number with a typed decode error instead of letting it through. The SDK
+already refused to encode non-finite floats, so a compliant provider never
+sent one, and the protocol version stays 22. Providers must update their Rust
+source when they move to this SDK revision.
+
 ## Version 21
 
 Protocol v21 requires `assignability_edges` in `ProviderSchemaEnvelope`, including

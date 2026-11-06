@@ -442,7 +442,7 @@ mod tests {
                     provider: "test".into(),
                 },
                 &raw,
-                ProtocolConvertError::NonFiniteFloat,
+                ProtocolConvertError::DurationOutOfRange,
             );
             let path = error.attribute_path();
             assert!(!path.contains('\u{9b}'));
@@ -466,7 +466,9 @@ mod tests {
                 "input".into(),
                 Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                     "only_once_in_debug".into(),
-                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                    Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                        u64::MAX,
+                    ))),
                 )]))),
             )]),
             ProviderWireTarget::Configuration {
@@ -482,7 +484,7 @@ mod tests {
         );
         assert!(matches!(
             error.error.as_ref(),
-            ProtocolConvertError::NonFiniteFloat
+            ProtocolConvertError::DurationOutOfRange
         ));
         assert!(error.error.value_path().is_empty());
     }
@@ -494,7 +496,9 @@ mod tests {
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                 ConcreteValue::Map(IndexMap::from([(
                     "private.key".into(),
-                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                    Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                        u64::MAX,
+                    ))),
                 )])),
             )))),
         )])));
@@ -518,7 +522,9 @@ mod tests {
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                 ConcreteValue::Map(IndexMap::from([(
                     "private.secret.key".into(),
-                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                    Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                        u64::MAX,
+                    ))),
                 )])),
             ))))
         };
@@ -542,7 +548,7 @@ mod tests {
             assert_eq!(error.attribute_path(), expected_path);
             assert!(matches!(
                 error.conversion_error(),
-                ProtocolConvertError::NonFiniteFloat
+                ProtocolConvertError::DurationOutOfRange
             ));
             for rendered in [
                 error.to_string(),

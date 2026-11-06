@@ -523,6 +523,10 @@ impl<'de> Deserialize<'de> for ReferenceScope {
 /// `ResourceRef`, `Interpolation`, `FunctionCall`, `Closure` are resolved
 /// before reaching the provider, so they are excluded.
 ///
+/// Float payloads prove finiteness in Rust; JSON numeric scalars and the WIT
+/// `float-val(f64)` layout are unchanged. Providers adopting this Rust API
+/// construct floats with [`crate::FiniteF64::new`].
+///
 /// Custom Serialize/Deserialize to produce untagged JSON (strings as `"hello"`,
 /// ints as `42`, etc.) without hitting serde's recursive monomorphization limit.
 ///
@@ -533,11 +537,14 @@ impl<'de> Deserialize<'de> for ReferenceScope {
 ///
 /// let _ = Value::RedactedSecret("digest".to_string());
 /// ```
+/// ```compile_fail,E0308
+/// let _ = carina_provider_protocol::types::Value::Float(f64::NAN);
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Bool(bool),
     Int(i64),
-    Float(f64),
+    Float(crate::FiniteF64),
     String(String),
     StringList(Vec<String>),
     List(Vec<Value>),
@@ -549,7 +556,7 @@ impl Serialize for Value {
         match self {
             Value::Bool(b) => serializer.serialize_bool(*b),
             Value::Int(i) => serializer.serialize_i64(*i),
-            Value::Float(f) => serializer.serialize_f64(*f),
+            Value::Float(f) => f.serialize(serializer),
             Value::String(s) => serializer.serialize_str(s),
             Value::StringList(l) => {
                 use serde::ser::SerializeSeq;
@@ -581,34 +588,213 @@ impl Serialize for Value {
 
 impl<'de> Deserialize<'de> for Value {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let json = serde_json::Value::deserialize(deserializer)?;
-        Ok(Value::from_json(json))
+        DecodedJson::deserialize(deserializer).map(DecodedJson::into_value)
+    }
+}
+
+/// A JSON value could not be admitted to the protocol value tree.
+#[derive(Debug)]
+pub enum ValueDecodeError {
+    UnsupportedNumber,
+    InvalidFloat(crate::NonFiniteFloatError),
+    MalformedPersistedSecret,
+    ReservedPersistedKey,
+}
+
+impl std::fmt::Display for ValueDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedNumber => {
+                f.write_str("JSON number cannot be represented by the value protocol")
+            }
+            Self::InvalidFloat(_) => f.write_str("failed to decode protocol JSON float"),
+            Self::MalformedPersistedSecret => {
+                write!(f, "malformed {PERSISTED_SECRET_KEY} protocol value")
+            }
+            Self::ReservedPersistedKey => f.write_str("invalid host-reserved protocol value"),
+        }
+    }
+}
+
+impl std::error::Error for ValueDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidFloat(source) => Some(source),
+            Self::UnsupportedNumber
+            | Self::MalformedPersistedSecret
+            | Self::ReservedPersistedKey => None,
+        }
     }
 }
 
 impl Value {
-    fn from_json(json: serde_json::Value) -> Self {
+    pub fn from_json(json: serde_json::Value) -> Result<Self, ValueDecodeError> {
+        DecodedJson::from_json(json).map(DecodedJson::into_value)
+    }
+}
+
+// Unlike serde_json::Value, this intermediate cannot turn a raw non-finite
+// serde float into JSON null. It also retains null until persisted tags have
+// been validated, so {"$secret": null} cannot become an empty-string digest.
+enum DecodedJson {
+    Null,
+    Bool(bool),
+    Int(i64),
+    Float(crate::FiniteF64),
+    String(String),
+    List(Vec<Self>),
+    Map(BTreeMap<String, Self>),
+}
+
+impl DecodedJson {
+    fn number(value: serde_json::Number) -> Result<Self, ValueDecodeError> {
+        if let Some(value) = value.as_i64() {
+            Ok(Self::Int(value))
+        } else {
+            let raw = value.as_f64().ok_or(ValueDecodeError::UnsupportedNumber)?;
+            crate::FiniteF64::new(raw)
+                .map(Self::Float)
+                .map_err(ValueDecodeError::InvalidFloat)
+        }
+    }
+
+    fn from_json(json: serde_json::Value) -> Result<Self, ValueDecodeError> {
         match json {
-            serde_json::Value::Bool(b) => Value::Bool(b),
-            serde_json::Value::Number(n) => {
-                if let Some(i) = n.as_i64() {
-                    Value::Int(i)
-                } else {
-                    Value::Float(n.as_f64().unwrap_or(0.0))
-                }
-            }
-            serde_json::Value::String(s) => Value::String(s),
-            serde_json::Value::Array(a) => {
-                Value::List(a.into_iter().map(Value::from_json).collect())
-            }
-            serde_json::Value::Object(values) => Value::Map(
+            serde_json::Value::Null => Ok(Self::Null),
+            serde_json::Value::Bool(value) => Ok(Self::Bool(value)),
+            serde_json::Value::Number(value) => Self::number(value),
+            serde_json::Value::String(value) => Ok(Self::String(value)),
+            serde_json::Value::Array(values) => values
+                .into_iter()
+                .map(Self::from_json)
+                .collect::<Result<_, _>>()
+                .map(Self::List),
+            serde_json::Value::Object(values) => values
+                .into_iter()
+                .map(|(key, value)| Self::from_json(value).map(|value| (key, value)))
+                .collect::<Result<_, _>>()
+                .map(Self::Map),
+        }
+    }
+
+    fn into_value(self) -> Value {
+        match self {
+            Self::Null => Value::String(String::new()),
+            Self::Bool(value) => Value::Bool(value),
+            Self::Int(value) => Value::Int(value),
+            Self::Float(value) => Value::Float(value),
+            Self::String(value) => Value::String(value),
+            Self::List(values) => Value::List(values.into_iter().map(Self::into_value).collect()),
+            Self::Map(values) => Value::Map(
                 values
                     .into_iter()
-                    .map(|(key, value)| (key, Value::from_json(value)))
+                    .map(|(key, value)| (key, value.into_value()))
                     .collect(),
             ),
-            serde_json::Value::Null => Value::String(String::new()),
         }
+    }
+
+    fn into_persisted(self) -> Result<PersistedValue, ValueDecodeError> {
+        Ok(match self {
+            Self::Null => PersistedValue::String(String::new()),
+            Self::Bool(value) => PersistedValue::Bool(value),
+            Self::Int(value) => PersistedValue::Int(value),
+            Self::Float(value) => PersistedValue::Float(value),
+            Self::String(value) => PersistedValue::String(value),
+            Self::List(values) => PersistedValue::List(
+                values
+                    .into_iter()
+                    .map(Self::into_persisted)
+                    .collect::<Result<_, _>>()?,
+            ),
+            Self::Map(mut values) => {
+                if values.len() == 1 && values.contains_key(PERSISTED_SECRET_KEY) {
+                    return match values.remove(PERSISTED_SECRET_KEY) {
+                        Some(Self::String(digest)) => Ok(PersistedValue::RedactedSecret(digest)),
+                        Some(
+                            Self::Null
+                            | Self::Bool(_)
+                            | Self::Int(_)
+                            | Self::Float(_)
+                            | Self::List(_)
+                            | Self::Map(_),
+                        )
+                        | None => Err(ValueDecodeError::MalformedPersistedSecret),
+                    };
+                }
+                if values
+                    .keys()
+                    .any(|key| key.starts_with('$') && !key.starts_with("$$"))
+                {
+                    return Err(ValueDecodeError::ReservedPersistedKey);
+                }
+                PersistedValue::Map(
+                    values
+                        .into_iter()
+                        .map(|(key, value)| {
+                            let key = key.strip_prefix('$').unwrap_or(&key).to_string();
+                            value.into_persisted().map(|value| (key, value))
+                        })
+                        .collect::<Result<_, _>>()?,
+                )
+            }
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for DecodedJson {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = DecodedJson;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a protocol JSON value")
+            }
+            fn visit_unit<E: DeError>(self) -> Result<Self::Value, E> {
+                Ok(DecodedJson::Null)
+            }
+            fn visit_bool<E: DeError>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(DecodedJson::Bool(value))
+            }
+            fn visit_i64<E: DeError>(self, value: i64) -> Result<Self::Value, E> {
+                Ok(DecodedJson::Int(value))
+            }
+            fn visit_u64<E: DeError>(self, value: u64) -> Result<Self::Value, E> {
+                DecodedJson::number(value.into()).map_err(E::custom)
+            }
+            fn visit_f64<E: DeError>(self, value: f64) -> Result<Self::Value, E> {
+                crate::FiniteF64::new(value)
+                    .map(DecodedJson::Float)
+                    .map_err(E::custom)
+            }
+            fn visit_str<E: DeError>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(DecodedJson::String(value.into()))
+            }
+            fn visit_string<E: DeError>(self, value: String) -> Result<Self::Value, E> {
+                Ok(DecodedJson::String(value))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element()? {
+                    values.push(value);
+                }
+                Ok(DecodedJson::List(values))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = BTreeMap::new();
+                while let Some((key, value)) = map.next_entry()? {
+                    values.insert(key, value);
+                }
+                Ok(DecodedJson::Map(values))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
     }
 }
 
@@ -617,11 +803,14 @@ impl Value {
 /// This is deliberately distinct from [`Value`]: only persisted positions can
 /// carry an opaque redacted-secret digest or interpret the reserved
 /// [`PERSISTED_SECRET_KEY`] JSON object.
+/// ```compile_fail,E0308
+/// let _ = carina_provider_protocol::types::PersistedValue::Float(f64::INFINITY);
+/// ```
 #[derive(Debug, Clone, PartialEq)]
 pub enum PersistedValue {
     Bool(bool),
     Int(i64),
-    Float(f64),
+    Float(crate::FiniteF64),
     String(String),
     RedactedSecret(String),
     StringList(Vec<String>),
@@ -634,7 +823,7 @@ impl Serialize for PersistedValue {
         match self {
             Self::Bool(value) => serializer.serialize_bool(*value),
             Self::Int(value) => serializer.serialize_i64(*value),
-            Self::Float(value) => serializer.serialize_f64(*value),
+            Self::Float(value) => value.serialize(serializer),
             Self::String(value) => serializer.serialize_str(value),
             Self::RedactedSecret(digest) => {
                 let mut map = serializer.serialize_map(Some(1))?;
@@ -675,52 +864,15 @@ impl Serialize for PersistedValue {
 
 impl<'de> Deserialize<'de> for PersistedValue {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let json = serde_json::Value::deserialize(deserializer)?;
-        Self::from_json(json).map_err(D::Error::custom)
+        DecodedJson::deserialize(deserializer)?
+            .into_persisted()
+            .map_err(D::Error::custom)
     }
 }
 
 impl PersistedValue {
-    fn from_json(json: serde_json::Value) -> Result<Self, String> {
-        match json {
-            serde_json::Value::Bool(value) => Ok(Self::Bool(value)),
-            serde_json::Value::Number(value) => {
-                if let Some(value) = value.as_i64() {
-                    Ok(Self::Int(value))
-                } else {
-                    Ok(Self::Float(value.as_f64().unwrap_or(0.0)))
-                }
-            }
-            serde_json::Value::String(value) => Ok(Self::String(value)),
-            serde_json::Value::Array(values) => values
-                .into_iter()
-                .map(Self::from_json)
-                .collect::<Result<Vec<_>, _>>()
-                .map(Self::List),
-            serde_json::Value::Object(mut values) => {
-                if values.len() == 1 && values.contains_key(PERSISTED_SECRET_KEY) {
-                    return match values.remove(PERSISTED_SECRET_KEY) {
-                        Some(serde_json::Value::String(digest)) => Ok(Self::RedactedSecret(digest)),
-                        _ => Err(format!("malformed {PERSISTED_SECRET_KEY} protocol value")),
-                    };
-                }
-                if values
-                    .keys()
-                    .any(|key| key.starts_with('$') && !key.starts_with("$$"))
-                {
-                    return Err("invalid host-reserved protocol value".to_string());
-                }
-                values
-                    .into_iter()
-                    .map(|(key, value)| {
-                        let key = key.strip_prefix('$').unwrap_or(&key).to_string();
-                        Self::from_json(value).map(|value| (key, value))
-                    })
-                    .collect::<Result<BTreeMap<_, _>, _>>()
-                    .map(Self::Map)
-            }
-            serde_json::Value::Null => Ok(Self::String(String::new())),
-        }
+    pub fn from_json(json: serde_json::Value) -> Result<Self, ValueDecodeError> {
+        DecodedJson::from_json(json)?.into_persisted()
     }
 
     /// Convert a persisted value into an ordinary provider value.
@@ -1876,7 +2028,7 @@ pub enum AttributeType {
     },
     Float {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        range: Option<(Option<f64>, Option<f64>)>,
+        range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         identity: Option<String>,
     },
@@ -2113,6 +2265,47 @@ pub struct StructField {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_serde_float_admission_does_not_coerce_non_finite_numbers_to_null() {
+        use serde::de::value::{Error, F64Deserializer};
+        for raw in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(Value::deserialize(F64Deserializer::<Error>::new(raw)).is_err());
+            assert!(PersistedValue::deserialize(F64Deserializer::<Error>::new(raw)).is_err());
+            assert!(
+                Value::deserialize(serde::de::value::SeqDeserializer::<_, Error>::new(
+                    [raw].into_iter()
+                ))
+                .is_err()
+            );
+            assert!(
+                PersistedValue::deserialize(serde::de::value::MapDeserializer::<_, Error>::new(
+                    [("ratio", raw)].into_iter()
+                ))
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn float_codecs_reject_overflow_and_preserve_signed_zero() {
+        for json in ["1e999", "-1e999", "[1e999]", r#"{"nested":-1e999}"#] {
+            assert!(serde_json::from_str::<Value>(json).is_err());
+            assert!(serde_json::from_str::<PersistedValue>(json).is_err());
+        }
+        for raw in [f64::MIN, -0.0, 0.0, f64::from_bits(1), f64::MAX] {
+            let json = serde_json::to_string(&Value::Float(crate::finite(raw))).unwrap();
+            let Value::Float(decoded) = serde_json::from_str(&json).unwrap() else {
+                panic!("expected float")
+            };
+            assert_eq!(decoded.get().to_bits(), raw.to_bits());
+            let json = serde_json::to_string(&PersistedValue::Float(crate::finite(raw))).unwrap();
+            let PersistedValue::Float(decoded) = serde_json::from_str(&json).unwrap() else {
+                panic!("expected float")
+            };
+            assert_eq!(decoded.get().to_bits(), raw.to_bits());
+        }
+    }
 
     #[test]
     fn protocol_v16_requires_field_groups_on_resources_and_structs() {
@@ -2373,7 +2566,7 @@ mod tests {
         let values = vec![
             Value::String("hello".into()),
             Value::Int(42),
-            Value::Float(2.71),
+            Value::Float(crate::finite(2.71)),
             Value::Bool(true),
             Value::List(vec![Value::Int(1), Value::Int(2)]),
             Value::Map(BTreeMap::from([(
@@ -2462,10 +2655,10 @@ mod tests {
         );
 
         let number = serde_json::Number::from(u64::MAX);
-        let expected = number.as_f64().unwrap_or(0.0);
+        let expected = number.as_f64().unwrap();
         assert_eq!(
-            Value::from_json(serde_json::Value::Number(number)),
-            Value::Float(expected)
+            Value::from_json(serde_json::Value::Number(number)).unwrap(),
+            Value::Float(crate::finite(expected))
         );
     }
 
@@ -2972,7 +3165,7 @@ mod tests {
                 identity: Some("aws.ec2.Port".to_string()),
             },
             AttributeType::Float {
-                range: Some((Some(0.0), Some(1.0))),
+                range: Some((Some(crate::finite(0.0)), Some(crate::finite(1.0)))),
                 identity: Some("awscc.wafv2.Rate".to_string()),
             },
             AttributeType::List {
@@ -2988,6 +3181,33 @@ mod tests {
             let json = serde_json::to_string(&attr).unwrap();
             let back: AttributeType = serde_json::from_str(&json).unwrap();
             assert_eq!(json, serde_json::to_string(&back).unwrap());
+        }
+    }
+
+    #[test]
+    fn float_range_schema_json_admits_finite_number_bounds() {
+        let json = r#"{"type":"Float","range":[-0.0,1.0]}"#;
+        let attr: AttributeType = serde_json::from_str(json).unwrap();
+        assert_eq!(serde_json::to_string(&attr).unwrap(), json);
+        let AttributeType::Float {
+            range: Some((Some(min), Some(max))),
+            ..
+        } = attr
+        else {
+            panic!("expected bounded float schema")
+        };
+        assert_eq!(min.get().to_bits(), (-0.0_f64).to_bits());
+        assert_eq!(max.get(), 1.0);
+        for raw in ["1e999", "-1e999", "NaN", "Infinity", "-Infinity", "\"NaN\""] {
+            for json in [
+                format!(r#"{{"type":"Float","range":[{raw},1.0]}}"#),
+                format!(r#"{{"type":"Float","range":[0.0,{raw}]}}"#),
+            ] {
+                assert!(
+                    serde_json::from_str::<AttributeType>(&json).is_err(),
+                    "{json}"
+                );
+            }
         }
     }
 

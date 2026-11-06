@@ -435,7 +435,9 @@ fn native_factory_rejects_non_wire_config_before_semantic_validation() {
     let mut config = config(duration(1));
     config.attributes.insert(
         "extra".into(),
-        tags(Value::Concrete(ConcreteValue::Float(f64::NAN))),
+        tags(Value::Concrete(ConcreteValue::Duration(
+            std::time::Duration::from_secs(u64::MAX),
+        ))),
     );
     let configs = ResolvedProviderConfigs::from_test_configs(vec![config]).unwrap();
     let error = prepare_provider_ready_config(&factory, configs.iter().next().unwrap())
@@ -443,8 +445,8 @@ fn native_factory_rejects_non_wire_config_before_semantic_validation() {
     assert_eq!(factory.0.load(Ordering::SeqCst), 0);
     let rendered = error.to_string();
     assert!(rendered.contains("extra.unrelated"), "{rendered}");
-    assert!(rendered.contains("non-finite float"), "{rendered}");
-    assert!(!rendered.contains("NaN"), "{rendered}");
+    assert!(rendered.contains("duration"), "{rendered}");
+    assert!(!rendered.contains(&u64::MAX.to_string()), "{rendered}");
     let ProviderConfigPreparationError::Wire(error) = error else {
         panic!("expected typed config wire failure")
     };
@@ -456,7 +458,7 @@ fn native_factory_rejects_non_wire_config_before_semantic_validation() {
     );
     assert!(matches!(
         error.conversion_error(),
-        crate::protocol_convert::ProtocolConvertError::NonFiniteFloat
+        crate::protocol_convert::ProtocolConvertError::DurationOutOfRange
     ));
 }
 

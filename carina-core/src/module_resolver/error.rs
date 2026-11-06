@@ -594,6 +594,7 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         }
         | ParseError::Syntax(_)
         | ParseError::UnavailableSecret(_)
+        | ParseError::InvalidFloatLiteral { .. }
         | ParseError::InvalidExpression { .. }
         | ParseError::IntegerArithmetic { .. }
         | ParseError::UnboundLoopRead { .. }
@@ -634,7 +635,7 @@ fn display_parse_error_relative_to(error: &ParseError, root: &Path) -> String {
             display_source_path_relative_to(path, root),
             display_parse_error_relative_to(error, root),
         ),
-        _ => error.to_string(),
+        _ => crate::executor::render_error_chain(error),
     }
 }
 

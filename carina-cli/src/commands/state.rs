@@ -5890,6 +5890,7 @@ mod tests {
                 .expect("row has applied attributes")
                 .get("vpc_id"),
             carina_core::value::json_to_dsl_value(&json!("vpc-current"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(row.deposed.len(), 1);
@@ -5899,11 +5900,13 @@ mod tests {
         assert_eq!(
             row.deposed[0].persisted_attributes().get("vpc_id"),
             carina_core::value::json_to_dsl_value(&json!("vpc-alive"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
             row.deposed[0].persisted_attributes().get("cidr_block"),
             carina_core::value::json_to_dsl_value(&json!("10.0.1.0/16"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
@@ -6035,11 +6038,13 @@ mod tests {
         assert_eq!(
             attributes.get("password"),
             carina_core::value::json_to_dsl_value(&json!("previous-password"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
             attributes.get("endpoint"),
             carina_core::value::json_to_dsl_value(&json!("new.example"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
     }
@@ -6110,6 +6115,7 @@ mod tests {
         assert_eq!(
             attributes.get("password"),
             carina_core::value::json_to_dsl_value(&json!("previous-password"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
     }
@@ -6242,11 +6248,13 @@ mod tests {
         assert_eq!(
             attributes.get("endpoint"),
             carina_core::value::json_to_dsl_value(&json!("db.example"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
             attributes.get("password"),
             carina_core::value::json_to_dsl_value(&json!("old-hash"))
+                .unwrap()
                 .map(|value| value.to_snapshot()),
             "deposed refresh must carry its persisted value instead of a provider echo"
         );
@@ -6550,6 +6558,7 @@ mod tests {
                 .expect("refreshed orphan has attributes")
                 .get("token"),
             carina_core::value::json_to_dsl_value(&json!("old-token"))
+                .unwrap()
                 .map(|value| value.to_snapshot()),
             "orphan refresh must carry the previous write-only value even if the provider echoes it"
         );
@@ -7364,7 +7373,9 @@ mod tests {
             row.persisted_attributes()
                 .expect("row has applied attributes")
                 .get("password"),
-            carina_core::value::json_to_dsl_value(&json!("old")).map(|value| value.to_snapshot()),
+            carina_core::value::json_to_dsl_value(&json!("old"))
+                .unwrap()
+                .map(|value| value.to_snapshot()),
         );
         assert_eq!(row.write_only_attributes(), ["password"]);
     }
@@ -7422,7 +7433,9 @@ mod tests {
             row.persisted_attributes()
                 .expect("row has applied attributes")
                 .get("password"),
-            carina_core::value::json_to_dsl_value(&json!(marker)).map(|value| value.to_snapshot())
+            carina_core::value::json_to_dsl_value(&json!(marker))
+                .unwrap()
+                .map(|value| value.to_snapshot())
         );
     }
 
@@ -7481,11 +7494,13 @@ mod tests {
         assert_eq!(
             attrs.get("endpoint"),
             carina_core::value::json_to_dsl_value(&json!("new.example"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
             attrs.get("description"),
             carina_core::value::json_to_dsl_value(&json!("kept from state"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
@@ -7728,6 +7743,7 @@ mod tests {
         assert_eq!(
             row.deposed[0].persisted_attributes().get("vpc_id"),
             carina_core::value::json_to_dsl_value(&json!("vpc-old"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(

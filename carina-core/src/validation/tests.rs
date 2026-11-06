@@ -4463,7 +4463,7 @@ fn empty_arguments_in_root_ok() {
 fn bare_builtin_custom_types_report_scalar_kind_mismatches() {
     for (name, value) in [
         ("positive_int", ConcreteValue::String("5".into())),
-        ("positive_int", ConcreteValue::Float(5.0)),
+        ("positive_int", ConcreteValue::Float(crate::finite(5.0))),
         ("positive_int", ConcreteValue::Bool(true)),
         ("domain_name", ConcreteValue::Int(5)),
         ("email", ConcreteValue::Int(5)),
@@ -4754,7 +4754,7 @@ fn rendered_typecheck_result_string_got_int() {
 fn rendered_typecheck_result_string_got_float() {
     let result = rendered_typecheck_result(
         &TypeExpr::String,
-        &Value::Concrete(ConcreteValue::Float(1.5)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
@@ -4799,7 +4799,7 @@ fn rendered_typecheck_result_bool_got_float_is_rejected() {
     // Regression for #2864: Float must not silently coerce into Bool.
     let result = rendered_typecheck_result(
         &TypeExpr::Bool,
-        &Value::Concrete(ConcreteValue::Float(1.5)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
@@ -4811,7 +4811,7 @@ fn rendered_typecheck_result_int_got_float_is_rejected() {
     // Regression for #2864: Float must not silently coerce into Int.
     let result = rendered_typecheck_result(
         &TypeExpr::Int,
-        &Value::Concrete(ConcreteValue::Float(1.5)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
@@ -4836,7 +4836,7 @@ fn rendered_typecheck_result_escapes_string_literal_value() {
 fn rendered_typecheck_result_preserves_float_fraction() {
     let result = rendered_typecheck_result(
         &TypeExpr::Int,
-        &Value::Concrete(ConcreteValue::Float(1.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(1.0))),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 

@@ -825,9 +825,9 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
                 };
                 let text = ValueString::derived_from(text, source);
                 crate::provider::bridge_text_to_typed_value(owned.scalar_kind(), text).map_err(
-                    |message| {
+                    |error| {
                         invalid_value(crate::schema::TypeError::ValidationFailed {
-                            message: message.into(),
+                            message: crate::executor::render_error_chain(&error).into(),
                         })
                     },
                 )?

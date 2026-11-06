@@ -1567,7 +1567,7 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     /// Floating-point number
     Float {
         binding: RefinementBinding,
-        range: Option<(Option<f64>, Option<f64>)>,
+        range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
     },
     /// Boolean
     Bool,
@@ -1680,7 +1680,7 @@ pub enum Shape<'a, R: PatternForm = Draft> {
     /// Floating-point — see [`AttrTypeKind::Float { .. }`].
     Float {
         identity: Option<&'a TypeIdentity>,
-        range: Option<(Option<f64>, Option<f64>)>,
+        range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
         validate: Option<&'a CustomValidator>,
     },
     /// Boolean — see [`AttrTypeKind::Bool`].
@@ -1880,7 +1880,7 @@ pub enum RawShape<'a, R: PatternForm = Draft> {
     /// Floating-point — see [`AttrTypeKind::Float { .. }`].
     Float {
         identity: Option<&'a TypeIdentity>,
-        range: Option<(Option<f64>, Option<f64>)>,
+        range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
         validate: Option<&'a CustomValidator>,
     },
     /// Boolean — see [`AttrTypeKind::Bool`].
@@ -3754,9 +3754,17 @@ impl<R: PatternForm> PatternAttributeType<R> {
     }
 
     /// Create a Float type with protocol-carried refinement metadata.
+    ///
+    /// Range endpoints must be admitted finite numbers:
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::schema::AttributeType;
+    ///
+    /// let _ = AttributeType::refined_float(None, Some((Some(f64::NAN), None)));
+    /// ```
     pub fn refined_float(
         identity: Option<TypeIdentity>,
-        range: Option<(Option<f64>, Option<f64>)>,
+        range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
     ) -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::Float {
@@ -3769,7 +3777,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
     /// Create a Float type with refinement metadata and a custom validator.
     pub fn refined_float_with_validator(
         identity: TypeIdentity,
-        range: Option<(Option<f64>, Option<f64>)>,
+        range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
         validate: CustomValidator,
     ) -> Self {
         PatternAttributeType {
@@ -4191,8 +4199,8 @@ impl PatternAttributeType<Compiled> {
     }
 
     /// Validate a primitive (`String`/`Int`/`Float`/`Bool`/`Duration`) value.
-    /// `Float` accepts integers as valid numbers and rejects non-finite
-    /// floats explicitly.
+    /// `Float` accepts integers as valid numbers; its float payloads already
+    /// prove finiteness.
     ///
     /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`], so deferred
     /// values (`ResourceRef`, `Interpolation`, ...) cannot reach this
@@ -4262,18 +4270,11 @@ impl PatternAttributeType<Compiled> {
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
             }
-            (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Float(f))
-                if f.is_finite() =>
-            {
+            (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Float(f)) => {
                 validate_float_range(*range, f)?;
                 binding
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
-            }
-            (AttrTypeKind::Float { .. }, ConcreteValueRef::Float(f)) => {
-                Err(TypeError::ValidationFailed {
-                    message: format!("non-finite float value: {f}").into(),
-                })
             }
             (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Int(i)) => {
                 validate_int_in_float_range(*range, i)?;
@@ -5435,8 +5436,8 @@ fn validate_int_range(
 }
 
 fn validate_float_range(
-    range: Option<(Option<f64>, Option<f64>)>,
-    value: f64,
+    range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
+    value: crate::FiniteF64,
 ) -> Result<(), TypeError> {
     if let Some((min, max)) = range
         && (min.is_some_and(|min| value < min) || max.is_some_and(|max| value > max))
@@ -5447,19 +5448,23 @@ fn validate_float_range(
 }
 
 fn validate_int_in_float_range(
-    range: Option<(Option<f64>, Option<f64>)>,
+    range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
     value: i64,
 ) -> Result<(), TypeError> {
     if let Some((min, max)) = range
-        && (min.is_some_and(|min| compare_int_float(value, min) == Some(Ordering::Less))
-            || max.is_some_and(|max| compare_int_float(value, max) == Some(Ordering::Greater)))
+        && (min.is_some_and(|min| compare_int_float(value, min) == Ordering::Less)
+            || max.is_some_and(|max| compare_int_float(value, max) == Ordering::Greater))
     {
         return Err(float_range_error(value, min, max));
     }
     Ok(())
 }
 
-fn float_range_error(value: impl fmt::Display, min: Option<f64>, max: Option<f64>) -> TypeError {
+fn float_range_error(
+    value: impl fmt::Display,
+    min: Option<crate::FiniteF64>,
+    max: Option<crate::FiniteF64>,
+) -> TypeError {
     TypeError::ValidationFailed {
         message: format!("value {value} is outside allowed range {min:?}..={max:?}").into(),
     }
@@ -6829,8 +6834,8 @@ fn i64_range_contains(
 }
 
 fn f64_range_contains(
-    source: Option<&(Option<f64>, Option<f64>)>,
-    sink: Option<&(Option<f64>, Option<f64>)>,
+    source: Option<&(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
+    sink: Option<&(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
 ) -> bool {
     let Some((s_min, s_max)) = source else {
         return matches!(sink, None | Some((None, None)));
@@ -6838,16 +6843,14 @@ fn f64_range_contains(
     let Some((k_min, k_max)) = sink else {
         return true;
     };
-    let s_min = s_min.unwrap_or(f64::NEG_INFINITY);
-    let s_max = s_max.unwrap_or(f64::INFINITY);
-    let k_min = k_min.unwrap_or(f64::NEG_INFINITY);
-    let k_max = k_max.unwrap_or(f64::INFINITY);
-    k_min <= s_min && s_max <= k_max
+    let min_contained = k_min.is_none_or(|min| s_min.is_some_and(|source| min <= source));
+    let max_contained = k_max.is_none_or(|max| s_max.is_some_and(|source| source <= max));
+    min_contained && max_contained
 }
 
 fn i64_range_assignable_to_f64(
     source: Option<&(Option<i64>, Option<i64>)>,
-    sink: Option<&(Option<f64>, Option<f64>)>,
+    sink: Option<&(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
 ) -> bool {
     let Some((source_min, source_max)) = source else {
         return matches!(sink, None | Some((None, None)));
@@ -6857,16 +6860,18 @@ fn i64_range_assignable_to_f64(
     };
     let source_min = source_min.unwrap_or(i64::MIN);
     let source_max = source_max.unwrap_or(i64::MAX);
-    let sink_min = sink_min.unwrap_or(f64::NEG_INFINITY);
-    let sink_max = sink_max.unwrap_or(f64::INFINITY);
-    let min_contained = matches!(
-        compare_int_float(source_min, sink_min),
-        Some(Ordering::Greater | Ordering::Equal)
-    );
-    let max_contained = matches!(
-        compare_int_float(source_max, sink_max),
-        Some(Ordering::Less | Ordering::Equal)
-    );
+    let min_contained = sink_min.is_none_or(|bound| {
+        matches!(
+            compare_int_float(source_min, bound),
+            Ordering::Greater | Ordering::Equal
+        )
+    });
+    let max_contained = sink_max.is_none_or(|bound| {
+        matches!(
+            compare_int_float(source_max, bound),
+            Ordering::Less | Ordering::Equal
+        )
+    });
     min_contained && max_contained
 }
 
@@ -11641,9 +11646,6 @@ fn validate_portable_default(
             &location,
             "schema default is not a portable wire value",
         ),
-        Value::Concrete(ConcreteValue::Float(value)) if !value.is_finite() => {
-            push_schema_issue(issues, &location, "schema default float must be finite");
-        }
         Value::Concrete(ConcreteValue::List(values)) => {
             for (index, value) in values.iter().enumerate() {
                 validate_portable_default(

@@ -151,12 +151,7 @@ fn assert_structure(left: &Value, right: &Value) {
 fn roundtrip(resource: &mut NormalizationResource) {
     for (name, value) in &mut resource.attributes {
         if matches!(value, Wire::List(_) | Wire::Map(_)) {
-            *value = Wire::from_json(
-                &value.to_json(&resource.id, name).unwrap(),
-                &resource.id,
-                name,
-            )
-            .unwrap();
+            *value = Wire::from_json(&value.to_json(), &resource.id, name).unwrap();
         }
     }
 }
@@ -809,32 +804,20 @@ fn string_list_kinds_survive_appends_on_both_routes() {
 }
 
 #[test]
-fn conversion_errors_preserve_context_and_typed_source_chain() {
-    let original = Resource::new("test", "example")
-        .with_attribute("settings", map([("known", string("value"))]));
+fn desired_float_values_preserve_finite_negative_zero() {
+    let original = Resource::new("test", "example").with_attribute(
+        "ratio",
+        Value::Concrete(ConcreteValue::Float(crate::finite(-0.0))),
+    );
     let batch = NormalizationBatch::new(std::slice::from_ref(&original)).unwrap();
-    let mut owner = DesiredResource::from_wire(batch.resources()[0].clone())
+    let owner = DesiredResource::from_wire(batch.resources()[0].clone())
         .into_normalization()
         .unwrap();
-    let mut view = owner.view();
-    let Some(DesiredValueMut::Map(map)) = view.attribute_mut("settings") else {
-        panic!()
+    let normalized = owner.finish().unwrap();
+    let Wire::Float(value) = normalized.resource.attributes["ratio"] else {
+        panic!("expected float")
     };
-    map.insert_absent(
-        "invalid",
-        DesiredValue::Known(DesiredScalar::Float(f64::NAN)),
-    )
-    .unwrap();
-    let error = owner.finish().unwrap_err();
-    assert_eq!(error.attribute, "settings");
-    assert_eq!(error.path, vec![Segment::Key("invalid".into())]);
-    assert!(matches!(
-        error
-            .source()
-            .unwrap()
-            .downcast_ref::<ProtocolConvertError>(),
-        Some(ProtocolConvertError::NonFiniteFloat)
-    ));
+    assert_eq!(value.get().to_bits(), (-0.0_f64).to_bits());
 }
 
 #[test]
@@ -843,13 +826,15 @@ fn native_decode_errors_preserve_nested_context_and_leave_input_unchanged() {
         "settings",
         map([(
             "nested",
-            list(vec![Value::Concrete(ConcreteValue::Float(f64::INFINITY))]),
+            list(vec![Value::Concrete(ConcreteValue::Duration(
+                std::time::Duration::from_secs(u64::MAX),
+            ))]),
         )]),
     );
     let snapshot = original.clone();
     let error = match NativeDesiredNormalization::from_core(&mut original) {
         Err(error) => error,
-        Ok(_) => panic!("non-finite known input must fail conversion"),
+        Ok(_) => panic!("out-of-range duration input must fail conversion"),
     };
     let error = native_cause(&error);
     assert_eq!(error.resource_id.identity, "bad-input");
@@ -874,30 +859,22 @@ fn native_question_mark_errors_keep_the_original_provider_instance() {
             return Ok(());
         }
         let mut owner = NativeDesiredNormalization::from_core(resource)?;
-        if stage == 1 {
-            let mut view = owner.view();
-            let Some(DesiredValueMut::Known(DesiredScalar::Float(value))) =
-                view.attribute_mut("value")
-            else {
-                panic!()
-            };
-            *value = f64::NAN;
-        } else if stage == 2 {
+        if stage == 2 {
             drop(owner.view().remove("pending"));
         }
         owner.finish()?;
         Ok(())
     }
-    for stage in 0..4 {
+    for stage in [0, 2, 3] {
         let mut resource =
             Resource::with_provider("mock", "example", "native-error", Some("west".into()))
                 .with_attribute(
                     "value",
-                    Value::Concrete(ConcreteValue::Float(if stage == 0 || stage == 3 {
-                        f64::NAN
+                    Value::Concrete(if stage == 0 || stage == 3 {
+                        ConcreteValue::Duration(std::time::Duration::from_secs(u64::MAX))
                     } else {
-                        1.0
-                    })),
+                        ConcreteValue::Float(crate::finite(1.0))
+                    }),
                 )
                 .with_attribute("pending", secret("private"));
         let id = resource.id.clone();

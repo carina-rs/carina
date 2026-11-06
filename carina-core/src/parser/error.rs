@@ -69,6 +69,39 @@ impl UnresolvedTypeToken {
     }
 }
 
+/// Why a float literal could not be admitted into the value tree.
+#[derive(Debug)]
+pub enum FloatLiteralError {
+    Syntax(std::num::ParseFloatError),
+    NonFinite(crate::NonFiniteFloatError),
+}
+
+impl std::fmt::Display for FloatLiteralError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Syntax(_) => f.write_str("failed to parse float literal"),
+            Self::NonFinite(_) => f.write_str("failed to admit float literal"),
+        }
+    }
+}
+
+impl std::error::Error for FloatLiteralError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Syntax(source) => Some(source),
+            Self::NonFinite(source) => Some(source),
+        }
+    }
+}
+
+pub(crate) fn parse_float_literal(text: &str, line: usize) -> Result<crate::FiniteF64, ParseError> {
+    let admit = || {
+        let raw = text.parse::<f64>().map_err(FloatLiteralError::Syntax)?;
+        crate::FiniteF64::new(raw).map_err(FloatLiteralError::NonFinite)
+    };
+    admit().map_err(|source| ParseError::InvalidFloatLiteral { line, source })
+}
+
 /// Parse error.
 ///
 /// Consumers cannot convert hand-built line numbers into a scoped finding:
@@ -123,6 +156,13 @@ pub enum ParseError {
 
     #[error("Invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
+
+    #[error("Invalid float literal at line {line}")] // error-chain: caller-renders-sources
+    InvalidFloatLiteral {
+        line: usize,
+        #[source]
+        source: FloatLiteralError,
+    },
 
     /// Operator-local arithmetic diagnostic. Columns are one-based and the
     /// end column is exclusive so LSP can highlight the authored operator.

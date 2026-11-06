@@ -76,13 +76,6 @@ pub enum SerializationError {
         reason: Box<ApplyTimeUnknown>,
         context: SerializationContext,
     },
-    /// A non-finite float (`NaN`, `±∞`) reached JSON serialization.
-    /// JSON has no representation for these.
-    #[error("cannot serialize at {context}: non-finite float {value}")]
-    NonFiniteFloat {
-        value: f64,
-        context: SerializationContext,
-    },
     /// A `Value::Deferred(DeferredValue::ResourceRef)` reached a serialization boundary that
     /// expected a concrete value. Resolvers must substitute the
     /// reference before this point. Reaching this arm at apply-time
@@ -326,9 +319,67 @@ impl JsonEncoding {
     }
 }
 
+/// A JSON numeric scalar could not be admitted to a value tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonNumberDecodeError {
+    UnsupportedNumber,
+    InvalidFloat(crate::NonFiniteFloatError),
+}
+
+impl std::fmt::Display for JsonNumberDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedNumber => f.write_str("JSON number cannot be represented as a float"),
+            Self::InvalidFloat(_) => f.write_str("failed to decode JSON float"),
+        }
+    }
+}
+
+impl std::error::Error for JsonNumberDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UnsupportedNumber => None,
+            Self::InvalidFloat(source) => Some(source),
+        }
+    }
+}
+
+impl From<crate::NonFiniteFloatError> for JsonNumberDecodeError {
+    fn from(source: crate::NonFiniteFloatError) -> Self {
+        Self::InvalidFloat(source)
+    }
+}
+
+enum DecodedNumber {
+    Int(i64),
+    Float(crate::FiniteF64),
+}
+
+impl DecodedNumber {
+    fn decode(value: &serde_json::Number) -> Result<Self, JsonNumberDecodeError> {
+        if let Some(value) = value.as_i64() {
+            Ok(Self::Int(value))
+        } else {
+            let value = value
+                .as_f64()
+                .ok_or(JsonNumberDecodeError::UnsupportedNumber)?;
+            Ok(Self::Float(crate::FiniteF64::new(value)?))
+        }
+    }
+
+    fn into_concrete<P: ValueKind>(self) -> ConcreteValue<P> {
+        match self {
+            Self::Int(value) => ConcreteValue::Int(value),
+            Self::Float(value) => ConcreteValue::Float(value),
+        }
+    }
+}
+
 /// A persisted JSON object used the host-reserved `$` namespace incorrectly.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PersistedValueDecodeError {
+    #[error(transparent)]
+    Number(#[from] JsonNumberDecodeError),
     #[error("invalid host-reserved persisted JSON object with keys {}", crate::provider_text::ProviderText::new(format!("{keys:?}")))]
     InvalidHostObject { keys: Vec<String> },
     #[error("malformed {PERSISTED_ENUM_KEY} persisted enum payload")]
@@ -690,8 +741,7 @@ impl<'a> PersistedListView<'a> {
 /// their provider API string and user map keys are left unchanged. State
 /// writers use [`PersistedValue`]; export writers use [`PersistedExportValue`].
 ///
-/// Returns an error if `value` contains a non-finite float (NaN or infinity)
-/// because JSON cannot represent these values.
+/// Unresolved or unavailable values retain their serialization errors.
 ///
 #[cfg(any(test, feature = "test-utils"))]
 pub fn value_to_json(value: &Value) -> Result<serde_json::Value, SerializationError> {
@@ -729,12 +779,7 @@ fn value_to_json_inner<P: crate::resource::StateValueLeaf>(
             Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
         }
         Value::Concrete(ConcreteValue::Float(f)) => {
-            let num =
-                serde_json::Number::from_f64(*f).ok_or(SerializationError::NonFiniteFloat {
-                    value: *f,
-                    context: ctx,
-                })?;
-            Ok(serde_json::Value::Number(num))
+            Ok(serde_json::Value::Number(f.to_json_number()))
         }
         Value::Concrete(ConcreteValue::Bool(b)) => Ok(serde_json::Value::Bool(*b)),
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -1011,7 +1056,7 @@ pub fn migrate_legacy_persisted_json(value: &mut serde_json::Value) {
 /// entries when building attribute maps. `$` keys are ordinary user data here;
 /// only [`PersistedValue`] interprets the persisted host namespace.
 #[cfg(any(test, feature = "test-utils"))]
-pub fn json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
+pub fn json_to_dsl_value(json: &serde_json::Value) -> Result<Option<Value>, JsonNumberDecodeError> {
     json_to_dsl_value_inner(json)
 }
 
@@ -1026,33 +1071,38 @@ fn persisted_json_to_dsl_value(
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-fn json_to_dsl_value_inner(json: &serde_json::Value) -> Option<Value> {
-    match json {
+fn json_to_dsl_value_inner(
+    json: &serde_json::Value,
+) -> Result<Option<Value>, JsonNumberDecodeError> {
+    Ok(match json {
         serde_json::Value::String(s) => {
             Some(Value::Concrete(ConcreteValue::String(s.clone().into())))
         }
         serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Some(Value::Concrete(ConcreteValue::Int(i)))
-            } else {
-                Some(Value::Concrete(ConcreteValue::Float(
-                    n.as_f64().unwrap_or(0.0),
-                )))
-            }
+            Some(Value::Concrete(DecodedNumber::decode(n)?.into_concrete()))
         }
         serde_json::Value::Bool(b) => Some(Value::Concrete(ConcreteValue::Bool(*b))),
         serde_json::Value::Array(items) => Some(Value::Concrete(ConcreteValue::List(
-            items.iter().filter_map(json_to_dsl_value_inner).collect(),
-        ))),
-        serde_json::Value::Object(map) => {
-            let m: IndexMap<_, _> = map
+            items
                 .iter()
-                .filter_map(|(k, v)| json_to_dsl_value_inner(v).map(|val| (k.clone(), val)))
-                .collect();
-            Some(Value::Concrete(ConcreteValue::Map(m)))
-        }
+                .map(json_to_dsl_value_inner)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+        ))),
+        serde_json::Value::Object(map) => Some(Value::Concrete(ConcreteValue::Map(
+            map.iter()
+                .map(|(k, v)| {
+                    json_to_dsl_value_inner(v).map(|value| value.map(|value| (k.clone(), value)))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+        ))),
         serde_json::Value::Null => None,
-    }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1064,7 +1114,10 @@ enum PersistedPurpose {
 enum DecodedPersistedJson {
     Null,
     Bool(bool),
-    Number(serde_json::Number),
+    Number {
+        original: serde_json::Number,
+        value: DecodedNumber,
+    },
     String(String),
     Enum(CanonicalEnumValue),
     Secret(RedactedSecretHash),
@@ -1077,14 +1130,7 @@ impl DecodedPersistedJson {
         match self {
             Self::Null => None,
             Self::Bool(value) => Some(Value::Concrete(ConcreteValue::Bool(value))),
-            Self::Number(value) => {
-                let value = if let Some(value) = value.as_i64() {
-                    ConcreteValue::Int(value)
-                } else {
-                    ConcreteValue::Float(value.as_f64().unwrap_or(0.0))
-                };
-                Some(Value::Concrete(value))
-            }
+            Self::Number { original: _, value } => Some(Value::Concrete(value.into_concrete())),
             Self::String(value) => Some(Value::Concrete(ConcreteValue::String(value.into()))),
             Self::Enum(value) => Some(Value::Concrete(ConcreteValue::CanonicalEnum(value))),
             Self::Secret(hash) => Some(SnapshotValue::redacted(hash)),
@@ -1104,7 +1150,7 @@ impl DecodedPersistedJson {
         match self {
             Self::Null => serde_json::Value::Null,
             Self::Bool(value) => serde_json::Value::Bool(value),
-            Self::Number(value) => serde_json::Value::Number(value),
+            Self::Number { original, value: _ } => serde_json::Value::Number(original),
             Self::String(value) => serde_json::Value::String(value),
             Self::Enum(value) => serde_json::Value::String(value.api_value().to_string()),
             Self::Secret(_) => serde_json::Value::String("(secret)".to_string()),
@@ -1128,7 +1174,10 @@ fn decode_persisted_json(
     match json {
         serde_json::Value::Null => Ok(DecodedPersistedJson::Null),
         serde_json::Value::Bool(value) => Ok(DecodedPersistedJson::Bool(*value)),
-        serde_json::Value::Number(value) => Ok(DecodedPersistedJson::Number(value.clone())),
+        serde_json::Value::Number(value) => Ok(DecodedPersistedJson::Number {
+            original: value.clone(),
+            value: DecodedNumber::decode(value)?,
+        }),
         serde_json::Value::String(value) => Ok(DecodedPersistedJson::String(value.clone())),
         serde_json::Value::Array(values) => values
             .iter()
@@ -1656,7 +1705,7 @@ fn format_value_into_context<P: ValueKind, B: BindingAddress>(
             // canonical value formatter.
             sink.write_token(ValueSpanKind::Other, &render_duration(*d))
         }
-        Value::Concrete(ConcreteValue::Float(f)) => write_float(*f, sink),
+        Value::Concrete(ConcreteValue::Float(f)) => write_float(f.get(), sink),
         Value::Concrete(ConcreteValue::Bool(b)) => {
             sink.write_token(ValueSpanKind::Bool, if *b { "true" } else { "false" })
         }
@@ -1867,13 +1916,18 @@ fn format_decoded_persisted_json_into(
         DecodedPersistedJson::Bool(value) => {
             sink.write_token(ValueSpanKind::Bool, if *value { "true" } else { "false" })
         }
-        DecodedPersistedJson::Number(value) => {
-            if let Some(value) = value.as_i64() {
+        DecodedPersistedJson::Number { original, value } => {
+            if let Some(value) = original.as_i64() {
                 sink.write_token(ValueSpanKind::Number, &value.to_string())
-            } else if let Some(value) = value.as_u64() {
+            } else if let Some(value) = original.as_u64() {
                 sink.write_token(ValueSpanKind::Number, &value.to_string())
             } else {
-                write_float(value.as_f64().unwrap_or(0.0), sink)
+                match value {
+                    DecodedNumber::Int(value) => {
+                        sink.write_token(ValueSpanKind::Number, &value.to_string())
+                    }
+                    DecodedNumber::Float(value) => write_float(value.get(), sink),
+                }
             }
         }
         DecodedPersistedJson::String(value) => {
@@ -2571,15 +2625,9 @@ fn canonical_secret_template<P: PlaceholderKind>(
         Value::Concrete(ConcreteValue::Int(value)) => {
             tagged("int", JsonValue::Number((*value).into()))
         }
-        Value::Concrete(ConcreteValue::Float(value)) => tagged(
-            "float",
-            JsonValue::Number(serde_json::Number::from_f64(*value).ok_or(
-                SerializationError::NonFiniteFloat {
-                    value: *value,
-                    context: SerializationContext::SecretRedaction,
-                },
-            )?),
-        ),
+        Value::Concrete(ConcreteValue::Float(value)) => {
+            tagged("float", JsonValue::Number(value.to_json_number()))
+        }
         Value::Concrete(ConcreteValue::Bool(value)) => tagged("bool", JsonValue::Bool(*value)),
         Value::Concrete(ConcreteValue::Duration(value)) => tagged(
             "duration_seconds",
@@ -8314,56 +8362,20 @@ mod tests {
 
     #[test]
     fn test_value_to_json_float() {
-        let v = Value::Concrete(ConcreteValue::Float(1.5));
+        let v = Value::Concrete(ConcreteValue::Float(crate::finite(1.5)));
         assert_eq!(value_to_json(&v).unwrap(), serde_json::json!(1.5));
     }
 
     #[test]
-    fn test_value_to_json_nan_returns_error() {
-        let v = Value::Concrete(ConcreteValue::Float(f64::NAN));
-        let result = value_to_json(&v);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("NaN"));
+    fn test_overflow_admission_in_list_returns_error() {
+        assert!(serde_json::from_str::<PersistedValue>(r#"[1,1e999]"#).is_err());
+        assert!(serde_json::from_str::<PersistedExportValue>(r#"[1,1e999]"#).is_err());
     }
 
     #[test]
-    fn test_value_to_json_infinity_returns_error() {
-        let v = Value::Concrete(ConcreteValue::Float(f64::INFINITY));
-        let result = value_to_json(&v);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("inf"));
-    }
-
-    #[test]
-    fn test_value_to_json_neg_infinity_returns_error() {
-        let v = Value::Concrete(ConcreteValue::Float(f64::NEG_INFINITY));
-        let result = value_to_json(&v);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("-inf"));
-    }
-
-    #[test]
-    fn test_value_to_json_nan_in_list_returns_error() {
-        let v = Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::Int(1)),
-            Value::Concrete(ConcreteValue::Float(f64::NAN)),
-        ]));
-        let result = value_to_json(&v);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("NaN"));
-    }
-
-    #[test]
-    fn test_value_to_json_nan_in_map_returns_error() {
-        let mut map = IndexMap::new();
-        map.insert(
-            "key".to_string(),
-            Value::Concrete(ConcreteValue::Float(f64::INFINITY)),
-        );
-        let v = Value::Concrete(ConcreteValue::Map(map));
-        let result = value_to_json(&v);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("inf"));
+    fn test_overflow_admission_in_map_returns_error() {
+        assert!(serde_json::from_str::<PersistedValue>(r#"{"key":-1e999}"#).is_err());
+        assert!(serde_json::from_str::<PersistedExportValue>(r#"{"key":-1e999}"#).is_err());
     }
 
     #[test]
@@ -8549,7 +8561,7 @@ mod tests {
     fn test_json_to_dsl_value_string() {
         let j = serde_json::json!("hello");
         assert_eq!(
-            json_to_dsl_value(&j),
+            json_to_dsl_value(&j).unwrap(),
             Some(Value::Concrete(ConcreteValue::String("hello".into())))
         );
     }
@@ -8560,7 +8572,9 @@ mod tests {
         let marker = format!("_secret:argon2:{hash}");
         let mut json = serde_json::json!({ "nested": [marker.clone()] });
 
-        let ordinary = json_to_dsl_value(&json).expect("ordinary JSON value");
+        let ordinary = json_to_dsl_value(&json)
+            .unwrap()
+            .expect("ordinary JSON value");
         assert!(!contains_redacted_secret(&ordinary));
 
         let context_free = persisted_json_to_dsl_value(&json, PersistedPurpose::State)
@@ -8679,7 +8693,7 @@ mod tests {
     fn test_json_to_dsl_value_int() {
         let j = serde_json::json!(42);
         assert_eq!(
-            json_to_dsl_value(&j),
+            json_to_dsl_value(&j).unwrap(),
             Some(Value::Concrete(ConcreteValue::Int(42)))
         );
     }
@@ -8688,8 +8702,8 @@ mod tests {
     fn test_json_to_dsl_value_float() {
         let j = serde_json::json!(1.5);
         assert_eq!(
-            json_to_dsl_value(&j),
-            Some(Value::Concrete(ConcreteValue::Float(1.5)))
+            json_to_dsl_value(&j).unwrap(),
+            Some(Value::Concrete(ConcreteValue::Float(crate::finite(1.5))))
         );
     }
 
@@ -8697,7 +8711,7 @@ mod tests {
     fn test_json_to_dsl_value_bool() {
         let j = serde_json::json!(true);
         assert_eq!(
-            json_to_dsl_value(&j),
+            json_to_dsl_value(&j).unwrap(),
             Some(Value::Concrete(ConcreteValue::Bool(true)))
         );
     }
@@ -8706,7 +8720,7 @@ mod tests {
     fn test_json_to_dsl_value_array() {
         let j = serde_json::json!([1, 2]);
         assert_eq!(
-            json_to_dsl_value(&j),
+            json_to_dsl_value(&j).unwrap(),
             Some(Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::Int(1)),
                 Value::Concrete(ConcreteValue::Int(2))
@@ -8717,14 +8731,14 @@ mod tests {
     #[test]
     fn test_json_to_dsl_value_null() {
         let j = serde_json::Value::Null;
-        assert_eq!(json_to_dsl_value(&j), None);
+        assert_eq!(json_to_dsl_value(&j).unwrap(), None);
     }
 
     #[test]
     fn test_json_to_dsl_value_null_in_array() {
         let j = serde_json::json!([1, null, 2]);
         assert_eq!(
-            json_to_dsl_value(&j),
+            json_to_dsl_value(&j).unwrap(),
             Some(Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::Int(1)),
                 Value::Concrete(ConcreteValue::Int(2))
@@ -8735,7 +8749,7 @@ mod tests {
     #[test]
     fn test_json_to_dsl_value_null_in_object() {
         let j = serde_json::json!({"a": 1, "b": null, "c": "hello"});
-        let result = json_to_dsl_value(&j).unwrap();
+        let result = json_to_dsl_value(&j).unwrap().unwrap();
         if let Value::Concrete(ConcreteValue::Map(map)) = result {
             assert_eq!(map.len(), 2);
             assert_eq!(map.get("a"), Some(&Value::Concrete(ConcreteValue::Int(1))));
@@ -8757,7 +8771,7 @@ mod tests {
             Value::Concrete(ConcreteValue::Bool(false)),
         ]));
         let json = value_to_json(&original).unwrap();
-        let back = json_to_dsl_value(&json).unwrap();
+        let back = json_to_dsl_value(&json).unwrap().unwrap();
         assert_eq!(back, original);
     }
 
@@ -9074,7 +9088,7 @@ mod tests {
 
         assert_eq!(json.decode(), Some((v).to_snapshot()));
         assert!(matches!(
-            json_to_dsl_value(json.as_json()),
+            json_to_dsl_value(json.as_json()).unwrap(),
             Some(Value::Concrete(ConcreteValue::Map(map))) if map.contains_key("$enum")
         ));
     }
@@ -9084,7 +9098,7 @@ mod tests {
         let json = serde_json::json!({"$$x": "user value"});
 
         assert!(matches!(
-            json_to_dsl_value(&json),
+            json_to_dsl_value(&json).unwrap(),
             Some(Value::Concrete(ConcreteValue::Map(map)))
                 if map.contains_key("$$x") && !map.contains_key("$x")
         ));
@@ -10535,7 +10549,7 @@ mod tests {
 
     #[test]
     fn test_format_value_float() {
-        let v = Value::Concrete(ConcreteValue::Float(1.5));
+        let v = Value::Concrete(ConcreteValue::Float(crate::finite(1.5)));
         assert_eq!(format_value(&v), "1.5");
     }
 
@@ -12513,7 +12527,7 @@ mod tests {
     #[test]
     fn pretty_value_renders_only_through_the_core_formatter() {
         let key = RenderedKey::from_raw("a-b");
-        let value = PrettyValue::new(Value::Concrete(ConcreteValue::Float(1.0)));
+        let value = PrettyValue::new(Value::Concrete(ConcreteValue::Float(crate::finite(1.0))));
 
         assert_eq!(
             value.render(PrettyLayout::for_map_key(0, &key)).plain(),
@@ -13198,7 +13212,7 @@ mod tests {
         let cases = vec![
             Value::Concrete(ConcreteValue::String("hello".into())),
             Value::Concrete(ConcreteValue::Int(42)),
-            Value::Concrete(ConcreteValue::Float(2.5)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(2.5))),
             Value::Concrete(ConcreteValue::Bool(false)),
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                 ConcreteValue::String("pw".into()),
@@ -14013,8 +14027,8 @@ mod tests {
             Value::Concrete(ConcreteValue::String("(empty)".into())),
             Value::Concrete(ConcreteValue::Int(42)),
             Value::Concrete(ConcreteValue::Int(-7)),
-            Value::Concrete(ConcreteValue::Float(1.5)),
-            Value::Concrete(ConcreteValue::Float(2.0)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
+            Value::Concrete(ConcreteValue::Float(crate::finite(2.0))),
             Value::Concrete(ConcreteValue::Bool(true)),
             Value::Concrete(ConcreteValue::Bool(false)),
             Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(

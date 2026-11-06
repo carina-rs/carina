@@ -350,8 +350,8 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             encoder.tag(4);
             encoder.option(binding.identity(), encode_type_identity);
             encoder.option(*range, |encoder, (min, max)| {
-                encoder.option(min, |encoder, value| encoder.u64(value.to_bits()));
-                encoder.option(max, |encoder, value| encoder.u64(value.to_bits()));
+                encoder.option(min, |encoder, value| encoder.u64(value.get().to_bits()));
+                encoder.option(max, |encoder, value| encoder.u64(value.get().to_bits()));
             });
             encode_callback_presence(encoder, binding.callback().is_some());
         }
