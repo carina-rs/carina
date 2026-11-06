@@ -2571,32 +2571,44 @@ fn return_type_fits(
     budget: &mut carina_core::schema::ShapeWalkBudget,
 ) -> bool {
     use builtins::BuiltinResultTyping as R;
-    // Resolve Ref before inspecting shape; this helper has no owning defs.
+    // Reject unresolved Ref; this helper has no owning definitions.
     let Ok(shape) = attr_type.shape_ref_free() else {
         return false;
     };
-    if matches!(shape, Shape::Union) {
-        let Ok(Some(members)) = attr_type.union_members_ref_free_with_budget(budget) else {
-            return false;
-        };
-        return members
-            .iter()
-            .flatten()
-            .any(|member| return_type_fits(ret, member.as_attr(), budget));
-    }
-    let plain_string = matches!(
-        shape,
-        Shape::String {
-            identity: None,
-            pattern: None,
-            length: None,
-            to_dsl: None,
-            ..
+    let (plain_string, constructed_string) = match shape {
+        Shape::Union => {
+            let Ok(Some(members)) = attr_type.union_members_ref_free_with_budget(budget) else {
+                return false;
+            };
+            return members
+                .iter()
+                .flatten()
+                .any(|member| return_type_fits(ret, member.as_attr(), budget));
         }
-    );
+        Shape::String {
+            identity,
+            pattern,
+            length,
+            to_dsl,
+            ..
+        } => (
+            identity.is_none() && pattern.is_none() && length.is_none() && to_dsl.is_none(),
+            to_dsl.is_none(),
+        ),
+        Shape::UnloadedSchemaType(_)
+        | Shape::Reference { .. }
+        | Shape::Int { .. }
+        | Shape::Float { .. }
+        | Shape::Bool
+        | Shape::Duration
+        | Shape::List { .. }
+        | Shape::Map { .. }
+        | Shape::Enum { .. }
+        | Shape::Struct { .. } => (false, false),
+    };
     match ret {
-        R::String { secret: false } => plain_string,
-        R::ConstructedString => matches!(shape, Shape::String { .. }),
+        R::String => plain_string,
+        R::ConstructedString => constructed_string,
         R::Int => matches!(shape, Shape::Int { .. }),
         R::List | R::StringList | R::ConstructedStringList => matches!(shape, Shape::List { .. }),
         R::Map => matches!(shape, Shape::Map { .. }),
@@ -2607,7 +2619,7 @@ fn return_type_fits(
                     Shape::Int { .. } | Shape::List { .. } | Shape::Map { .. }
                 )
         }
-        R::Argument(_) | R::String { secret: true } => false,
+        R::Argument(_) | R::SecretString => false,
     }
 }
 
@@ -2743,6 +2755,33 @@ fn collect_named_provider_instance_bindings(
 mod return_type_fits_tests {
     use super::*;
 
+    #[test]
+    fn issue_4282_review_transformed_string_has_no_builtin_completions() {
+        for identity in [
+            None,
+            Some(TypeIdentity::new(Some("test"), ["Names"], "Name")),
+        ] {
+            let transformed = AttributeType::refined_string(
+                identity,
+                None,
+                None,
+                Some(carina_core::schema::DslTransform::HyphenToUnderscore),
+            );
+            for sink in [
+                transformed.clone(),
+                AttributeType::union(vec![AttributeType::bool(), transformed]),
+            ] {
+                let items = CompletionProvider::builtin_function_completions_for_type(&sink);
+                assert_eq!(
+                    items
+                        .iter()
+                        .map(|item| item.label.as_str())
+                        .collect::<Vec<_>>(),
+                    Vec::<&str>::new()
+                );
+            }
+        }
+    }
     #[test]
     fn unloaded_module_export_candidates_defer_mismatches_because_edges_are_unknown() {
         let context =
@@ -2952,7 +2991,7 @@ mod return_type_fits_tests {
         let mut budget = carina_core::schema::ShapeWalkBudget::new(8);
 
         assert!(return_type_fits(
-            builtins::BuiltinResultTyping::String { secret: false },
+            builtins::BuiltinResultTyping::String,
             &attr_type,
             &mut budget,
         ));

@@ -15,7 +15,7 @@
 
 use std::collections::HashMap;
 
-use crate::builtins::{BuiltinResultTyping, builtin_functions};
+use crate::builtins::{Builtin, BuiltinResultTyping};
 use crate::parser::{ExportParamLike, TypeExpr};
 use crate::provider::ProviderLoadedSchemaRegistry;
 use crate::resource::{
@@ -1045,10 +1045,7 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
     context: InferenceSchemaContext<'_>,
     visiting: &mut indexmap::IndexSet<String>,
 ) -> Result<TypeExpr, InferenceIssue> {
-    let return_type = builtin_functions()
-        .iter()
-        .find(|f| f.name == name)
-        .map(|f| f.result_typing);
+    let return_type = Builtin::from_name(name).map(Builtin::result_typing);
     let Some(return_type) = return_type else {
         return match bindings.get(name) {
             Some(InferenceBinding::UserFunction {
@@ -1067,9 +1064,9 @@ fn infer_function_call<P: PlaceholderKind, B: BindingAddress>(
         };
     };
     match return_type {
-        BuiltinResultTyping::String { .. } | BuiltinResultTyping::ConstructedString => {
-            Ok(TypeExpr::String)
-        }
+        BuiltinResultTyping::String
+        | BuiltinResultTyping::SecretString
+        | BuiltinResultTyping::ConstructedString => Ok(TypeExpr::String),
         BuiltinResultTyping::Int => Ok(TypeExpr::Int),
         BuiltinResultTyping::List => Err(InferenceError::UnknownType {
             reason: format!(

@@ -1208,22 +1208,21 @@ impl DiagnosticRun<'_> {
                     diagnostics.push(diagnostic);
                 }
             }
-            // A direct bare binding occupies the complete attribute value, so
-            // the shared authority owns that sink even when it succeeds. In
-            // particular, an enum-typed argument must not be reinterpreted by
-            // the LSP's legacy BindingIndex pass using a differently enriched
-            // bootstrap identity. Nested uses keep the surrounding schema
-            // walk so unrelated sibling leaves are still validated.
+            // The shared authority owns ordinary direct bare-binding sinks
+            // even when they succeed. Constructed expressions retain their
+            // enclosing schema value checks. An enum-typed argument must not
+            // be reinterpreted by the LSP's legacy BindingIndex pass using a
+            // differently enriched bootstrap identity. Nested uses keep the
+            // surrounding schema walk to validate unrelated sibling leaves.
             let binding_error_sinks = parsed
                 .bare_binding_uses()
                 .uses()
                 .filter(|use_site| {
-                    use_site.path.segments().len() == 1
-                        || binding_use_report.resource_findings().any(|finding| {
-                            finding.use_site.source_file == use_site.source_file
-                                && finding.use_site.span == use_site.span
-                                && finding.use_site.name == use_site.name
-                        })
+                    carina_core::validation::binding_use_authority_owns_use(
+                        parsed,
+                        &binding_use_report,
+                        use_site,
+                    )
                 })
                 .filter_map(|use_site| match &use_site.owner {
                     carina_core::parser::BindingUseOwner::Resource(address) => Some((
@@ -1524,10 +1523,18 @@ impl DiagnosticRun<'_> {
                                 continue;
                             }
                         };
+                        // Constructed results use the directory's evaluated
+                        // values; the buffer copy cannot resolve sibling lets.
                         let attr_value = if contains_function_call(authored_attr_value) {
-                            resolved_resource_attributes
+                            semantic_resource_attributes
                                 .as_ref()
+                                .filter(|_| judged_expression.is_string_construction())
                                 .and_then(|attributes| attributes.get(attr_name))
+                                .or_else(|| {
+                                    resolved_resource_attributes
+                                        .as_ref()
+                                        .and_then(|attributes| attributes.get(attr_name))
+                                })
                                 .unwrap_or(authored_attr_value)
                         } else {
                             authored_attr_value

@@ -126,9 +126,10 @@ fn evaluate_secret_arguments<B: BindingAddress>(
 pub enum BuiltinResultTyping {
     /// Preserves the authored type and construction kind of this argument.
     Argument(usize),
-    /// Returns an existing string, without construction evidence. Secret
-    /// external strings retain their existing completion suppression.
-    String { secret: bool },
+    /// Returns an existing string, without construction evidence.
+    String,
+    /// Returns a secret external string, without construction evidence.
+    SecretString,
     /// Constructs a string, with the same evidence as mixed interpolation.
     ConstructedString,
     /// Returns a `Value::Concrete(ConcreteValue::Int)`.
@@ -352,12 +353,12 @@ register_builtins! {
     decrypt(decrypt::builtin_decrypt_with_config, arity: 1) {
         signature: "decrypt(ciphertext: String, key?: String) -> Secret",
         description: "Decrypts ciphertext using the configured provider's encryption service (e.g., AWS KMS) and marks the result as secret. Key is optional when embedded in ciphertext.",
-        result_typing: BuiltinResultTyping::String { secret: true },
+        result_typing: BuiltinResultTyping::SecretString,
     },
     env(env::builtin_env, arity: 1) {
         signature: "env(name: String) -> String",
         description: "Reads an environment variable. Errors if the variable is not set.",
-        result_typing: BuiltinResultTyping::String { secret: false },
+        result_typing: BuiltinResultTyping::String,
     },
     flatten(flatten::builtin_flatten, arity: 1) {
         signature: "flatten(list: list) -> list",

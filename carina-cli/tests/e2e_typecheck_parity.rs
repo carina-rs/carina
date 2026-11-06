@@ -1402,7 +1402,10 @@ fn issue_4282_split_at_named_string_list_checks_values_in_cli_and_lsp() {
                 .join(", ");
             let mut expected = None;
             for expression in [format!("split(',', '{input}')"), format!("[{elements}]")] {
-                let source = if bound {
+                // Constructed builtin collections use the enclosing schema walk,
+                // as an inline list of interpolated strings does. A literal list
+                // bound to a let keeps main's separate binding-use diagnostics.
+                let source = if bound && expression.starts_with("split(") {
                     format!("let names = {expression}\ntest.Names {{ names = names }}\n")
                 } else {
                     format!("test.Names {{ names = {expression} }}\n")
@@ -8204,3 +8207,6 @@ fn integer_arithmetic_directory_maps_errors_on_both_sides_of_heredoc() {
         "LSP must underline both authored operators: {lsp:#?}",
     );
 }
+
+#[path = "e2e_typecheck_parity/review_4282.rs"]
+mod review_4282;

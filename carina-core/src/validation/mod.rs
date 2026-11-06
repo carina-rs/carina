@@ -1354,30 +1354,6 @@ fn precheck_value_source<B: BindingAddress>(
     ) {
         return None;
     }
-    if admission.is_ok() && expression.owns_constructed_value_checks() {
-        // A constructed collection is admitted by its member judgements, not
-        // by assigning its coarse List<String> projection to the named sink.
-        // Use the existing constraint checker on any statically known result.
-        let evaluated = crate::resolver::project_ref_value_status(
-            value,
-            &crate::binding_index::ResolvedBindings::default(),
-            context.raw_provider_context(),
-        )
-        .ok()
-        .and_then(|resolved| match resolved {
-            crate::resolver::ValueResolution::Present(value) => Some(value),
-            crate::resolver::ValueResolution::Absent
-            | crate::resolver::ValueResolution::Unknown(_) => None,
-        });
-        return binding_value_constraints(
-            use_site,
-            evaluated.as_ref().unwrap_or(value),
-            declared_type,
-            sink,
-            context,
-        )
-        .err();
-    }
     let interpolation_sink =
         lift_type_expr(&INTERPOLATION_REF_SINK).expect("built-in interpolation operand types lift");
     let lifted_sink;
@@ -1801,16 +1777,31 @@ pub fn binding_use_authority_owns_module_argument<E, D, B: BindingAddress>(
                 argument: owner_argument,
                 value_span: _,
             } if owner == call && owner_argument == argument
-        ) && !file
-            .expression_report()
-            .expression_in(&use_site.expression_instance, use_site.location())
-            .is_ok_and(crate::parser::retained::JudgedExpr::is_string_construction)
-            && (use_site.path.segments().len() == 1
-                || report
-                    .findings()
-                    .iter()
-                    .any(|finding| same_authored_use(&finding.use_site, use_site)))
+        ) && binding_use_authority_owns_use(file, report, use_site)
     })
+}
+
+/// Whether binding-use validation owns this sink. Constructed values retain
+/// their enclosing expression's value checks, including collection members.
+pub fn binding_use_authority_owns_use<E, D, B: BindingAddress>(
+    file: &crate::parser::File<E, ParserPlaceholder, ParserPlaceholder, D, B>,
+    report: &BindingUseReport,
+    use_site: &crate::parser::BareBindingUse,
+) -> bool {
+    let expression_report = match &use_site.owner {
+        crate::parser::BindingUseOwner::Resource(address) => {
+            file.expression_report().for_resource(address.resource_id())
+        }
+        crate::parser::BindingUseOwner::ModuleArgument { .. } => Ok(file.expression_report()),
+    };
+    !expression_report
+        .and_then(|report| report.expression_in(&use_site.expression_instance, use_site.location()))
+        .is_ok_and(crate::parser::retained::JudgedExpr::is_string_construction)
+        && (use_site.path.segments().len() == 1
+            || report
+                .findings()
+                .iter()
+                .any(|finding| same_authored_use(&finding.use_site, use_site)))
 }
 
 /// Whether parsing reserved this entire module argument because a structural
@@ -1886,8 +1877,8 @@ where
             )
         });
         if evidence.is_ok_and(crate::parser::retained::JudgedExpr::is_string_construction) {
-            // The complete string construction owns its sink constraints;
-            // its reference operands are rendered, not assigned to that sink.
+            // The complete construction owns its string or collection-member
+            // constraints; its operands are not assigned to those sinks.
             continue;
         }
         let mut result = match &record.authored.owner {

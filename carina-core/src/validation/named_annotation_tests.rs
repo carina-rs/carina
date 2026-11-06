@@ -1860,3 +1860,90 @@ fn issue_4282_secret_join_preserves_construction_and_masks_errors() {
         }
     }
 }
+
+#[test]
+fn issue_4282_review_split_coalesce_checks_literal_alternative() {
+    let loaded = snapshot(vec![(
+        "p",
+        vec![
+            DraftType::string(),
+            DraftType::list(string(1, 32, Some("^[a-z]+$"))),
+        ],
+    )]);
+    let context = loaded.provider_context();
+    let parsed = crate::parser::parse(
+        "let src = p.Values {}\nlet r = split(',', src.value0) ?? ['UPPER']\n",
+        context.as_provider_context(),
+    )
+    .unwrap();
+    let configuration = crate::config_loader::load_buffer_configuration(
+        &parsed,
+        loaded.schema_registry(),
+        context.as_provider_context(),
+    );
+    let expected = inference::attribute_type_to_type_expr(declaration(&loaded, "p", 1), "p");
+    let checked = typecheck::check_type_expr_value(
+        &expected,
+        &parsed.variables["r"],
+        context,
+        configuration
+            .judged()
+            .report()
+            .binding(&crate::resource::RelativeBindingName::new("r"))
+            .unwrap(),
+    )
+    .require_provider_schemas();
+    let error = checked.expect_err("the literal alternative must retain its value check");
+    assert_eq!(
+        error.to_string(),
+        "at list element 0: expected aws.iam.Role.Name, got string 'UPPER': p rejected `aws.iam.Role.Name`: Invalid Name value 'UPPER': does not match required pattern /^[a-z]+$/"
+    );
+}
+
+#[test]
+fn issue_4282_review_split_precheck_preserves_binding_origin() {
+    let loaded = snapshot(vec![(
+        "p",
+        vec![DraftType::list(string(1, 32, Some("^[a-z]+$")))],
+    )]);
+    let provider = loaded.provider_context();
+    let parsed = crate::parser::parse(
+        "let r = split(',', 'A,B')\nlet target = p.Values { value0 = r }",
+        provider.as_provider_context(),
+    )
+    .unwrap();
+    let configuration = crate::config_loader::load_buffer_configuration(
+        &parsed,
+        loaded.schema_registry(),
+        provider.as_provider_context(),
+    );
+    let signatures = HashMap::new();
+    let context = ValidationTypeContext::new(configuration.judged(), provider, &signatures);
+    let record = parsed
+        .bare_binding_uses()
+        .records()
+        .iter()
+        .find(|record| record.authored.name == "r")
+        .unwrap();
+    let crate::parser::BareBindingSource::Value {
+        value,
+        declared_type,
+    } = &record.source
+    else {
+        panic!("a value binding was expected");
+    };
+    let expected = inference::attribute_type_to_type_expr(declaration(&loaded, "p", 0), "p");
+    let error = precheck_value_source(
+        &record.authored,
+        value,
+        declared_type.as_deref(),
+        RefSink::TypeExpr(&expected),
+        &context,
+        &|path| ModuleCallDiagnosticPath::Authored(path.to_owned()),
+    )
+    .unwrap();
+    assert_eq!(
+        error.to_string(),
+        "Type mismatch: expected List<aws.iam.Role.Name>, got List<String> (from r)",
+    );
+}

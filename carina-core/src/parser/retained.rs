@@ -1888,16 +1888,15 @@ mod judgement {
                 _ => None,
             }
         }
-        pub(crate) fn is_string_construction(&self) -> bool {
-            matches!(self.kind(), Some(InferredKind::StringConstruction(_)))
-                && self.alternatives.is_empty()
-        }
-        pub(crate) fn owns_constructed_value_checks(&self) -> bool {
-            self.is_string_construction()
-                || self
-                    .member
-                    .as_deref()
-                    .is_some_and(Self::owns_constructed_value_checks)
+        /// Construction evidence on this expression or its collection member.
+        /// Alternatives keep their own admission and value-check obligations.
+        pub fn is_string_construction(&self) -> bool {
+            self.alternatives.is_empty()
+                && (matches!(self.kind(), Some(InferredKind::StringConstruction(_)))
+                    || self
+                        .member
+                        .as_deref()
+                        .is_some_and(Self::is_string_construction))
         }
         /// Borrow the assigned reference for diagnostics when the judgement
         /// preserves it through interpolation. Evaluation keeps the stored value.
@@ -3898,7 +3897,7 @@ mod judgement {
                 .get(index)
                 .cloned()
                 .unwrap_or_else(|| incomplete("builtin argument")),
-            R::String { .. } => declared(Ok(TypeExpr::String), concrete),
+            R::String | R::SecretString => declared(Ok(TypeExpr::String), concrete),
             R::ConstructedString => {
                 declared(Ok(TypeExpr::String), concrete).with_kind(InferredKind::StringConstruction)
             }
