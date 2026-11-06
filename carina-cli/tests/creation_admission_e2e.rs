@@ -55,6 +55,59 @@ fn text(output: &Output) -> String {
 }
 
 #[test]
+fn refined_multifile_template_is_proven_during_plan() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.path().join("values.crn"),
+        "let producer = mock.test.estimated_input {}\nlet var = producer.short_part\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        "let consumer = mock.test.estimated_input { name = \"${var}-suffix\" }\n",
+    )
+    .unwrap();
+    let output = fixture.run(&["plan", "--refresh=false", "--out", "plan.json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        !text(&output).contains("input check pending"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        !text(&output).contains("mock.name.length"),
+        "{}",
+        text(&output)
+    );
+    assert!(fixture.0.path().join("plan.json").exists());
+}
+
+#[test]
+fn refined_multifile_template_violation_is_a_value_free_plan_error() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.path().join("values.crn"),
+        "let producer = mock.test.estimated_input {}\nlet var = producer.long_part\n",
+    )
+    .unwrap();
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        "let consumer = mock.test.estimated_input { name = \"${var}-suffix\" }\n",
+    )
+    .unwrap();
+    let output = fixture.run(&["plan", "--refresh=false", "--out", "plan.json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        text(&output).contains("mock.name.length"),
+        "{}",
+        text(&output)
+    );
+    assert!(!text(&output).contains("-suffix"), "{}", text(&output));
+    assert!(!fixture.0.path().join("plan.json").exists());
+    assert!(!fixture.0.path().join("op.log").exists());
+}
+
+#[test]
 fn creation_rejection_exits_one_and_never_creates_or_overwrites_plan() {
     let fixture = Fixture::new();
     for existing in [false, true] {

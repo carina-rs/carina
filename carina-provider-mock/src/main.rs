@@ -707,6 +707,9 @@ impl CarinaProvider for MockProcessProvider {
             carina_provider_mock::desired_input_rule_schema()
                 .validate()
                 .expect("mock desired-input schema must be valid"),
+            carina_provider_mock::estimated_input_rule_schema()
+                .validate()
+                .expect("mock estimated-input schema must be valid"),
             CoreResourceSchema::new("test.read_back")
                 .attribute(
                     CoreAttributeSchema::optional(

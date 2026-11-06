@@ -1,6 +1,7 @@
 use super::*;
 use crate::input_rules::{InputCheckedPlan, InputWriteContext};
 use crate::provider::{AppliedIdentifier, CreateAttempt, InFlightCreate, PendingToken, Sent};
+use crate::resource::{DeferredValue, LoopSlot};
 use crate::schema::{AttributeSchema, InputPath, InputPredicate, InputRule, InputRuleCode};
 
 fn schemas() -> SchemaRegistry {
@@ -279,6 +280,20 @@ fn creation_admission_deferred_template_retains_exact_slot_obligation() {
     assert!(checked.ensure_inputs_ready().is_err());
 }
 
+#[test]
+fn creation_admission_deferred_template_literal_name_leaves_no_obligation() {
+    let mut payload = deferred_payload();
+    payload.template.template_attributes_mut().insert(
+        "name".into(),
+        Value::Concrete(ConcreteValue::String("valid-template".into())),
+    );
+    let mut plan = Plan::new();
+    plan.add(Effect::DeferredCreate(payload));
+    let checked = checked(plan, &HashMap::new()).unwrap();
+    assert!(checked.pending_inputs().is_empty());
+    assert!(checked.ensure_inputs_ready().is_ok());
+}
+
 fn deferred_payload() -> DeferredCreatePayload {
     let template: crate::parser::DeferredForExpression = crate::parser::DeferredForExpression::new(
         None,
@@ -292,7 +307,8 @@ fn deferred_payload() -> DeferredCreatePayload {
         crate::parser::ForBinding::Simple("item".into()),
         Resource::with_provider("mock", "Bucket", "children", None).with_attribute(
             "name",
-            Value::Concrete(ConcreteValue::String("valid-template".into())),
+            // The loop's item has no known element type.
+            Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value)),
         ),
     );
     crate::test_support::compiled_loop(Box::new(template))

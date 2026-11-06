@@ -3569,6 +3569,7 @@ mod historical_display_tests {
                 &self.managed,
                 None,
                 &self.schemas,
+                &carina_core::input_rules::InputTypeContext::empty(),
                 &HashMap::new(),
                 &self.provider,
             )

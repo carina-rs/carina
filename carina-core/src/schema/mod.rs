@@ -194,6 +194,8 @@
 
 mod compile_schema;
 mod compiled_pattern;
+pub(crate) mod length_interval;
+use length_interval::length_contains;
 mod input_rules;
 pub use compiled_pattern::{
     Compiled, CompiledPattern, Draft, PatternCompileError, PatternCompileErrorSource, PatternForm,
@@ -5774,26 +5776,6 @@ fn validate_struct_field_assignment(
         .then(|| TypeError::ReadOnlyAttribute {
             name: input_name.to_string(),
         })
-}
-
-/// Source length is contained in sink length (narrow ⊆ wide).
-/// Missing bounds are treated as unbounded on that side.
-fn length_contains(
-    source: Option<&(Option<u64>, Option<u64>)>,
-    sink: Option<&(Option<u64>, Option<u64>)>,
-) -> bool {
-    // Both representations describe the same unbounded interval.
-    let Some((s_min, s_max)) = source else {
-        return matches!(sink, None | Some((None, None)));
-    };
-    let Some((k_min, k_max)) = sink else {
-        return true;
-    };
-    let s_min = s_min.unwrap_or(0);
-    let s_max = s_max.unwrap_or(u64::MAX);
-    let k_min = k_min.unwrap_or(0);
-    let k_max = k_max.unwrap_or(u64::MAX);
-    k_min <= s_min && s_max <= k_max
 }
 
 fn pattern_compatible(source: Option<&str>, sink: Option<&str>) -> bool {

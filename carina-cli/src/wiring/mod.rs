@@ -298,10 +298,11 @@ pub(crate) async fn prepare_plan_outcome(
     managed_current: &HashMap<ResourceId, Current>,
     state_file: Option<&StateFile>,
     schemas: &SchemaRegistry,
+    input_types: &carina_core::input_rules::InputTypeContext,
     explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     provider: &ProviderRouter,
 ) -> Result<PlanOutcome, AppError> {
-    let plan = match plan.check_inputs(schemas, managed_current) {
+    let plan = match plan.check_inputs_with_types(schemas, managed_current, input_types) {
         Ok(plan) => plan,
         Err(plan) => {
             let plan = plan.into_plan();
@@ -7097,6 +7098,31 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                 let prev_explicit = addressed.prev_explicit;
                 let managed_current =
                     into_all_prior_states(addressed.orphans, addressed.managed_current);
+                let input_sources = paired_unresolved_resources
+                    .iter()
+                    .cloned()
+                    .map(UnresolvedResource::from_pre_resolve)
+                    .collect::<Vec<_>>();
+                let input_types = carina_core::input_rules::InputTypeContext::from_sources(
+                    &input_sources,
+                    &data_sources_for_plan,
+                    compositions.iter().filter_map(|composition| {
+                        let binding = composition.binding.clone()?;
+                        let outputs = composition.signature.attributes
+                            .iter()
+                            .filter_map(|(name, output)| {
+                                output.value().map(|value| (name.clone(), value))
+                            })
+                            .collect();
+                        Some((binding, outputs))
+                    }),
+                    &wait_aliases,
+                    context.schemas(),
+                ).with_default_tags(
+                    provider_configs,
+                    context.schemas(),
+                    plan.effects().iter().map(|effect| effect.resource_id()),
+                )?;
                 let outcome = prepare_plan_outcome(
                     plan,
                     prepared.references,
@@ -7105,6 +7131,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     &managed_current,
                     state_file.as_ref(),
                     context.schemas(),
+                    &input_types,
                     &prev_explicit,
                     provider,
                 )

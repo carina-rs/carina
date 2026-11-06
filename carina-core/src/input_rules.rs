@@ -10,6 +10,14 @@ use std::{
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+mod estimator;
+mod type_context;
+pub use type_context::InputTypeContext;
+use type_context::TypeFacts;
+
+#[cfg(test)]
+mod estimator_tests;
+
 use crate::{
     effect::{Effect, EffectGeneration, EffectInstanceKey},
     plan::{Plan, PlanError, PlanErrorKind},
@@ -132,10 +140,17 @@ pub struct WriteSite<'a> {
     target: Option<InputEffectTarget>,
     resource_id: &'a ResourceId,
     attributes: Option<&'a IndexMap<String, Value>>,
+    authored: Option<AuthoredAttributes<'a>>,
+    types: Option<&'a TypeFacts>,
     context: InputWriteContext,
     schema: &'a ValidatedResourceSchema,
     rules: Vec<&'a InputRule<Compiled>>,
     paired_deletes: Vec<PairedInputDelete>,
+}
+
+enum AuthoredAttributes<'a> {
+    Resource(&'a IndexMap<String, Value>),
+    Template(&'a IndexMap<String, Value<crate::resource::LoopSlot>>),
 }
 
 impl WriteSite<'_> {
@@ -173,6 +188,7 @@ enum WriteSiteSource<'a, S> {
         plan: &'a FinalizedPlan<S>,
         index: usize,
         current: &'a HashMap<ResourceId, Current>,
+        types: Option<&'a TypeFacts>,
     },
     Authored(&'a crate::resource::Resource),
 }
@@ -184,6 +200,29 @@ fn classify_write_site<'a, S>(
     source: WriteSiteSource<'a, S>,
     schemas: &'a SchemaRegistry,
 ) -> Option<WriteSite<'a>> {
+    let (types, authored) = match &source {
+        WriteSiteSource::Authored(resource) => (
+            None,
+            Some(AuthoredAttributes::Resource(&resource.attributes)),
+        ),
+        WriteSiteSource::Finalized {
+            plan, index, types, ..
+        } => {
+            let effect = &plan.plan.effects()[*index];
+            let authored = match effect {
+                Effect::DeferredCreate(payload) => Some(AuthoredAttributes::Template(
+                    payload.template.template_resource().attributes(),
+                )),
+                Effect::DeferredReplace(payload) => Some(AuthoredAttributes::Template(
+                    payload.template.template_resource().attributes(),
+                )),
+                _ => types
+                    .and_then(|types| types.authored.get(effect.resource_id()))
+                    .map(AuthoredAttributes::Resource),
+            };
+            (*types, authored)
+        }
+    };
     let (target, resource_id, attributes, context, paired_deletes) = match source {
         WriteSiteSource::Authored(resource) => (
             None,
@@ -196,6 +235,7 @@ fn classify_write_site<'a, S>(
             plan,
             index,
             current,
+            types: _,
         } => {
             let effect = &plan.plan.effects()[index];
             let (resource_id, attributes, context, template, deletes) = match effect {
@@ -345,6 +385,8 @@ fn classify_write_site<'a, S>(
         target,
         resource_id,
         attributes,
+        authored,
+        types,
         context,
         schema,
         rules,
@@ -479,6 +521,7 @@ impl<S> FinalizedPlan<S> {
                     plan: self,
                     index,
                     current,
+                    types: None,
                 },
                 schemas,
             )
@@ -489,9 +532,19 @@ impl<S> FinalizedPlan<S> {
     /// diagnostics are retained; new diagnostics are sorted by routed address,
     /// path and code independently of declaration order.
     pub fn check_inputs(
+        self,
+        schemas: &SchemaRegistry,
+        current: &HashMap<ResourceId, Current>,
+    ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>> {
+        self.check_inputs_with_types(schemas, current, &InputTypeContext::empty())
+    }
+
+    /// Admit using the one immutable declaration context retained for this plan.
+    pub fn check_inputs_with_types(
         mut self,
         schemas: &SchemaRegistry,
         current: &HashMap<ResourceId, Current>,
+        types: &InputTypeContext<S>,
     ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>> {
         let mut diagnostics = Vec::new();
         let mut pending = Vec::new();
@@ -501,6 +554,7 @@ impl<S> FinalizedPlan<S> {
                     plan: &self,
                     index,
                     current,
+                    types: Some(&types.facts),
                 },
                 schemas,
             ) else {
@@ -595,6 +649,28 @@ pub enum InputVerdict {
 }
 
 fn verdict(view: &WriteSite<'_>, rule: &InputRule<Compiled>) -> InputVerdict {
+    let mut verdict = projected_verdict(view, rule);
+    if matches!(verdict, InputVerdict::Violation(_)) {
+        return verdict;
+    }
+    if matches!(rule.target(), InputRuleTarget::MapKeys(path) if path.as_str() == "tags")
+        && let Some(keys) = view
+            .types
+            .and_then(|types| types.default_keys.get(view.resource_id))
+    {
+        for (key, mandatory) in keys {
+            if let Err(violation) = evaluate_string(rule, key) {
+                if *mandatory {
+                    return InputVerdict::Violation(violation);
+                }
+                verdict = InputVerdict::Undecided;
+            }
+        }
+    }
+    verdict
+}
+
+fn projected_verdict(view: &WriteSite<'_>, rule: &InputRule<Compiled>) -> InputVerdict {
     let Some(attributes) = view.attributes else {
         return estimate_unknown(view, rule);
     };
@@ -658,10 +734,10 @@ fn peel_secret<P: ValueKind>(mut value: &Value<P>) -> &Value<P> {
     value
 }
 
-/// Phase 3 replaces this one seam with estimation from authored expressions and
-/// their immutable type context. Erased unknowns never manufacture proof.
-fn estimate_unknown(_view: &WriteSite<'_>, _rule: &InputRule<Compiled>) -> InputVerdict {
-    InputVerdict::Undecided
+/// Estimate only the classifier-selected source expression. Erased unknowns
+/// provide no type evidence.
+fn estimate_unknown(view: &WriteSite<'_>, rule: &InputRule<Compiled>) -> InputVerdict {
+    estimator::estimate(view, rule)
 }
 
 /// A value-free diagnostic on authored input, shared by validate and the LSP.

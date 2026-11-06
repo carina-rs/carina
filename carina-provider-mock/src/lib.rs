@@ -115,6 +115,7 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
     let schemas = vec![
         input_rule_schema(),
         desired_input_rule_schema(),
+        estimated_input_rule_schema(),
         input_rule_schema_for("test.creation_conflicting").with_conflicting_replacement(),
         ResourceSchema::new("test.resource")
             .attribute(
@@ -413,6 +414,45 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
 /// Portable creation-declaration fixture shared by native and WASM schemas.
 pub fn input_rule_schema() -> ResourceSchema {
     input_rule_schema_for("test.creation_constrained").with_coexisting_replacement()
+}
+
+/// Refined output declarations for static admission of unresolved templates.
+pub fn estimated_input_rule_schema() -> ResourceSchema {
+    ResourceSchema::new("test.estimated_input")
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::provider_populated(
+                "short_part",
+                AttributeType::refined_string(
+                    None,
+                    Some("^[a-z]+$".into()),
+                    Some((Some(3), Some(5))),
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::provider_populated(
+                "long_part",
+                AttributeType::refined_string(
+                    None,
+                    Some("^[a-z]+$".into()),
+                    Some((Some(20), Some(30))),
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .input_rule(carina_core::schema::InputRule::value(
+            carina_core::schema::InputRuleScope::CreateOnly,
+            carina_core::schema::InputPath::new("name").unwrap(),
+            carina_core::schema::InputRuleCode::new("mock.name.length").unwrap(),
+            carina_core::schema::InputPredicate::Length {
+                min: Some(3),
+                max: Some(16),
+            },
+        ))
 }
 
 fn input_rule_schema_for(resource_type: &str) -> ResourceSchema {
