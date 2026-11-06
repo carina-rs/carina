@@ -32,6 +32,7 @@ use carina_core::schema::{
 use carina_lsp::diagnostics::DiagnosticEngine;
 use carina_lsp::document::Document;
 use tempfile::TempDir;
+use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
 
 // ============================================================================
 // Fixture + helpers (mirror carina-lsp/tests/e2e_typecheck.rs)
@@ -6091,20 +6092,436 @@ fn single_value_walk_m01_factories(params: AttributeType) -> Vec<Box<dyn Provide
     })]
 }
 
-type SingleValueDiagnostics = fn(Vec<Box<dyn ProviderFactory>>, &TempDir) -> Vec<String>;
+fn round1_union_schema(nested: bool) -> ResourceSchema {
+    let params = if nested {
+        AttributeType::union(vec![AttributeType::ref_("Inner"), AttributeType::bool()])
+    } else {
+        AttributeType::union(vec![
+            single_value_walk_m01_vpc_id_type(),
+            AttributeType::refined_string(None, Some("^x".into()), None, None),
+        ])
+    };
+    ResourceSchema::new("test.Sink")
+        .attribute(AttributeSchema::optional("params", params).build())
+        .with_def(
+            "Inner",
+            AttributeType::union(vec![
+                AttributeType::map(single_value_walk_m01_vpc_id_type()),
+                AttributeType::struct_(
+                    "Named",
+                    vec![StructField::required("name", AttributeType::string()).build()],
+                ),
+            ]),
+        )
+}
 
-fn single_value_walk_m01_rejects_union(diagnostics: SingleValueDiagnostics) {
+fn round1_union_factories(nested: bool) -> Vec<Box<dyn ProviderFactory>> {
+    vec![Box::new(WasmStyleProviderFactory {
+        name: "awsccmock".into(),
+        schemas: vec![round1_union_schema(nested).validate().unwrap()],
+    })]
+}
+
+fn round1_union_rejection(cli: bool, nested: bool) {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider awsccmock {}\n"),
+        (
+            "main.crn",
+            if nested {
+                "awsccmock.test.Sink {\n  params = { foo = \"bad\" }\n}\n"
+            } else {
+                "awsccmock.test.Sink {\n  params = \"bad\"\n}\n"
+            },
+        ),
+    ]);
+    let message = "awsccmock rejected `VpcId`: Invalid vpc_id 'bad': must start with 'vpc-'";
+    let (errors, expected) = if cli {
+        (
+            single_value_walk_cli_errors(round1_union_factories(nested), &fixture),
+            format!("awsccmock.test.Sink.<pending>: {message}"),
+        )
+    } else {
+        let diagnostics =
+            single_value_walk_lsp_diagnostics(round1_union_factories(nested), &fixture);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(
+            diagnostics[0].severity,
+            Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+        );
+        assert_eq!(
+            diagnostics[0].range,
+            tower_lsp::lsp_types::Range::new(
+                tower_lsp::lsp_types::Position::new(1, 2),
+                tower_lsp::lsp_types::Position::new(1, 8)
+            )
+        );
+        (
+            diagnostics.into_iter().map(|d| d.message).collect(),
+            message.to_string(),
+        )
+    };
+    assert_eq!(
+        errors,
+        vec![expected],
+        "one provider rejection from the locally accepted arm"
+    );
+}
+
+#[test]
+fn issue_4276_round1_nested_union_cli_rejects() {
+    round1_union_rejection(true, true);
+}
+
+#[test]
+fn issue_4276_round1_nested_union_lsp_rejects() {
+    round1_union_rejection(false, true);
+}
+
+#[test]
+fn issue_4276_round1_union_tie_cli_rejects_once() {
+    round1_union_rejection(true, false);
+}
+
+#[test]
+fn issue_4276_round1_union_tie_lsp_rejects_once() {
+    round1_union_rejection(false, false);
+}
+
+#[test]
+fn issue_4276_round1_union_without_provider_constraint_accepts() {
+    let fixture = single_value_walk_m01_fixture();
+    for nested in [false, true] {
+        if nested {
+            std::fs::write(
+                fixture.path().join("main.crn"),
+                "awsccmock.test.Sink { params = { foo = \"bad\" } }\n",
+            )
+            .unwrap();
+        }
+        let factories = || {
+            vec![Box::new(TestProviderFactory {
+                name: "awsccmock".into(),
+                schemas: vec![round1_union_schema(nested).validate().unwrap()],
+            }) as Box<dyn ProviderFactory>]
+        };
+        assert!(single_value_walk_cli_errors(factories(), &fixture).is_empty());
+        assert!(single_value_walk_lsp_value_findings(factories(), &fixture).is_empty());
+    }
+}
+
+fn round1_short_factories() -> Vec<Box<dyn ProviderFactory>> {
+    single_value_walk_m01_factories(AttributeType::refined_string(
+        None,
+        None,
+        Some((None, Some(3))),
+        None,
+    ))
+}
+
+#[test]
+fn issue_4276_round1_module_if_defers_branch_constraints() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider awsccmock {}\n"),
+        (
+            "main.crn",
+            "let child = use { source = './child' }\nchild { flag = true }\n",
+        ),
+    ]);
+    std::fs::create_dir(fixture.path().join("child")).unwrap();
+    std::fs::write(
+        fixture.path().join("child/arguments.crn"),
+        "arguments { flag: Bool }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        fixture.path().join("child/main.crn"),
+        "awsccmock.test.Sink {\n  params = if flag { \"ok\" } else { \"too long\" }\n}\n",
+    )
+    .unwrap();
+    assert!(single_value_walk_cli_errors(round1_short_factories(), &fixture).is_empty());
+    let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(round1_short_factories()),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let engine = DiagnosticEngine::new(Arc::new(loaded), vec!["awsccmock".into()]);
+    let diagnostics = lsp_diagnostics(&engine, &fixture, "child/main.crn");
+    assert!(
+        diagnostics.is_empty(),
+        "an undecided module branch must remain deferred: {diagnostics:#?}"
+    );
+}
+
+#[test]
+fn issue_4276_round1_module_if_expansion_reports_chosen_branch_once() {
+    for (flag, expected) in [(true, 0), (false, 1)] {
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider awsccmock {}\n"),
+            (
+                "main.crn",
+                &format!("let child = use {{ source = './child' }}\nchild {{ flag = {flag} }}\n"),
+            ),
+        ]);
+        std::fs::create_dir(fixture.path().join("child")).unwrap();
+        std::fs::write(
+            fixture.path().join("child/arguments.crn"),
+            "arguments { flag: Bool }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            fixture.path().join("child/main.crn"),
+            "awsccmock.test.Sink {\n  params = if flag { \"ok\" } else { \"too long\" }\n}\n",
+        )
+        .unwrap();
+        let cli = single_value_walk_cli_errors(round1_short_factories(), &fixture);
+        assert_eq!(cli.len(), expected, "flag={flag}: {cli:#?}");
+        if !flag {
+            assert_eq!(
+                cli[0],
+                "awsccmock.test.Sink.<pending>: Invalid value 'too long' for 'params': length 8 is outside allowed range [, 3]"
+            );
+        }
+    }
+}
+
+fn round1_group_map_type() -> AttributeType {
+    use carina_core::schema::FieldGroup;
+    AttributeType::map(AttributeType::struct_(
+        "Entry",
+        vec![
+            StructField::optional(
+                "a",
+                AttributeType::struct_with_field_groups(
+                    "Choice",
+                    vec![
+                        StructField::optional("first", AttributeType::string()).build(),
+                        StructField::optional("second", AttributeType::string()).build(),
+                    ],
+                    vec![FieldGroup::exactly_one(["first", "second"]).unwrap()],
+                ),
+            )
+            .build(),
+            StructField::optional("b", AttributeType::int()).build(),
+        ],
+    ))
+}
+
+#[test]
+fn issue_4276_round1_map_field_group_keeps_main_lsp_message() {
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider awsccmock {}\n"),
+        (
+            "main.crn",
+            "awsccmock.test.Sink {\n  params = { entry = { a = {}, b = \"bad\" } }\n}\n",
+        ),
+    ]);
+    let cli = single_value_walk_cli_errors(
+        single_value_walk_m01_factories(round1_group_map_type()),
+        &fixture,
+    );
+    assert_eq!(
+        cli,
+        vec![
+            "awsccmock.test.Sink.<pending>: params.entry.a: exactly one of [first, second] must be set"
+        ]
+    );
+    let diagnostics = single_value_walk_lsp_diagnostics(
+        single_value_walk_m01_factories(round1_group_map_type()),
+        &fixture,
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|d| d.message.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "params.entry.a: exactly one of [first, second] must be set",
+            "Map value for key 'entry': params.a: exactly one of [first, second] must be set",
+        ]
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .all(|d| d.severity == Some(DiagnosticSeverity::ERROR)),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(1, 23), Position::new(1, 24))
+    );
+    assert_eq!(
+        diagnostics[1].range,
+        Range::new(Position::new(1, 2), Position::new(1, 8))
+    );
+}
+
+#[test]
+fn issue_4276_round1_provider_checks_struct_block_alias() {
+    let params = AttributeType::struct_(
+        "Settings",
+        vec![
+            StructField::optional(
+                "entries",
+                AttributeType::list(single_value_walk_m01_vpc_id_type()),
+            )
+            .with_block_name("entry")
+            .build(),
+        ],
+    );
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider awsccmock {}\n"),
+        (
+            "main.crn",
+            "awsccmock.test.Sink {\n  params = { entry = [\"bad\"] }\n}\n",
+        ),
+    ]);
+    let cli =
+        single_value_walk_cli_errors(single_value_walk_m01_factories(params.clone()), &fixture);
+    assert_eq!(
+        cli,
+        vec![
+            "awsccmock.test.Sink.<pending>: awsccmock rejected `VpcId`: Invalid vpc_id 'bad': must start with 'vpc-'"
+        ]
+    );
+    let diagnostics =
+        single_value_walk_lsp_diagnostics(single_value_walk_m01_factories(params), &fixture);
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "awsccmock rejected `VpcId`: Invalid vpc_id 'bad': must start with 'vpc-'"
+    );
+    assert_eq!(
+        diagnostics[0].severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+    assert_eq!(
+        diagnostics[0].range,
+        tower_lsp::lsp_types::Range::new(
+            tower_lsp::lsp_types::Position::new(1, 2),
+            tower_lsp::lsp_types::Position::new(1, 8)
+        )
+    );
+}
+
+struct Round1ConfigFactory;
+
+impl ProviderFactory for Round1ConfigFactory {
+    fn name(&self) -> &str {
+        "awsccmock"
+    }
+    fn display_name(&self) -> &str {
+        "round 1 config provider"
+    }
+    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+        carina_core::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+            "params".into(),
+            AttributeType::list(AttributeType::refined_string(
+                Some(carina_core::schema::TypeIdentity::bare("VpcId")),
+                None,
+                Some((None, Some(3))),
+                None,
+            )),
+        )]))
+        .unwrap()
+    }
+    fn validate_config(
+        &self,
+        _: &carina_core::provider::CanonicalProviderConfigAttributes,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+    fn validate_custom_type(
+        &self,
+        _: &carina_core::schema::TypeIdentity,
+        _: &carina_core::provider::CanonicalCustomTypeValue,
+    ) -> ProviderResult<()> {
+        Err(carina_core::provider::ProviderError::invalid_input(
+            "provider rejected sibling",
+        ))
+    }
+    fn create_provider(
+        &self,
+        _: Option<&str>,
+        _: &carina_core::provider::ProviderReadyConfig,
+        _: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+        unreachable!("validation does not create providers")
+    }
+    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        Vec::new()
+    }
+    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+        carina_core::schema::ValidatedProviderSchemaWitness::new(
+            Vec::new(),
+            self.provider_config_attribute_types(),
+            Default::default(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+}
+
+#[test]
+fn issue_4276_round1_provider_config_keeps_main_local_error_text() {
+    let fixture = write_fixture(&[
+        (
+            "providers.crn",
+            "provider awsccmock { params = [\"abcd\", \"bad\"] }\n",
+        ),
+        ("main.crn", ""),
+    ]);
+    let cli = single_value_walk_cli_errors(vec![Box::new(Round1ConfigFactory)], &fixture);
+    assert_eq!(
+        cli,
+        vec![
+            "provider awsccmock: params: List item at index 0: Invalid VpcId value 'abcd': length 4 is outside allowed range [, 3]"
+        ]
+    );
+    let diagnostics =
+        single_value_walk_lsp_diagnostics(vec![Box::new(Round1ConfigFactory)], &fixture);
+    assert!(
+        diagnostics.is_empty(),
+        "the provider diagnostic belongs to providers.crn: {diagnostics:#?}"
+    );
+    let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(Round1ConfigFactory)];
+    let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+        Arc::new(factories),
+        SchemaRegistry::new(),
+        carina_core::EnvironmentSnapshot::empty(),
+    );
+    let engine = DiagnosticEngine::new(Arc::new(loaded), vec!["awsccmock".into()]);
+    let diagnostics = lsp_diagnostics(&engine, &fixture, "providers.crn");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].message,
+        "provider awsccmock: params: List item at index 0: Invalid VpcId value 'abcd': length 4 is outside allowed range [, 3]"
+    );
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(
+        diagnostics[0].range,
+        Range::new(Position::new(0, 30), Position::new(0, 45))
+    );
+}
+
+fn single_value_walk_m01_rejects_union(cli: bool) {
+    let diagnostics = if cli {
+        single_value_walk_cli_errors
+    } else {
+        single_value_walk_lsp_errors
+    };
     let fixture = single_value_walk_m01_fixture();
     eprintln!("M01 CONTROL scalar provider rejection");
     let control = diagnostics(
         single_value_walk_m01_factories(single_value_walk_m01_vpc_id_type()),
         &fixture,
     );
-    assert_eq!(control.len(), 1, "M01 scalar control: {control:#?}");
-    assert!(
-        control[0].contains("must start with 'vpc-'"),
-        "M01 control must exercise the provider validator: {control:#?}",
-    );
+    let message = "awsccmock rejected `VpcId`: Invalid vpc_id 'bad': must start with 'vpc-'";
+    let expected = if cli {
+        format!("awsccmock.test.Sink.<pending>: {message}")
+    } else {
+        message.to_string()
+    };
+    assert_eq!(control, vec![expected], "M01 scalar control");
 
     eprintln!("M01 TARGET Union<Int,VpcId>");
     let errors = diagnostics(
@@ -6114,20 +6531,20 @@ fn single_value_walk_m01_rejects_union(diagnostics: SingleValueDiagnostics) {
         ])),
         &fixture,
     );
-    assert!(
-        !errors.is_empty(),
-        "M01 must reject 'bad': Int rejects a String and VpcId rejects its prefix",
+    assert_eq!(
+        errors, control,
+        "M01 must retain exactly the scalar provider rejection"
     );
 }
 
 #[test]
 fn single_value_walk_m01_cli_rejects_union_without_valid_arm() {
-    single_value_walk_m01_rejects_union(single_value_walk_cli_errors);
+    single_value_walk_m01_rejects_union(true);
 }
 
 #[test]
 fn single_value_walk_m01_lsp_rejects_union_without_valid_arm() {
-    single_value_walk_m01_rejects_union(single_value_walk_lsp_errors);
+    single_value_walk_m01_rejects_union(false);
 }
 
 #[test]

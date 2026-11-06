@@ -142,9 +142,9 @@ fn issue_4276_provider_failure_keeps_union_child_fit_for_unique_lists() {
     let errors = ty.validate_with_lookup(&value, &lookup).unwrap_err();
     assert_eq!(errors.first(), Some(&local), "{errors:?}");
     assert_eq!(
-        errors.len(),
-        3,
-        "the duplicate and both provider failures must survive: {errors:?}"
+        errors,
+        vec![local],
+        "rootless values retain main's primary local error"
     );
 }
 

@@ -2022,6 +2022,46 @@ mod provider_config_tests {
     }
 
     #[test]
+    fn issue_4276_round1_provider_config_invalid_attribute_keeps_main_text() {
+        let declaration = PatternAttributeType::refined_string(
+            Some(TypeIdentity::bare("Short")),
+            None,
+            Some((None, Some(3))),
+            None,
+        );
+        let factory = RoutingFactory {
+            name: "owner",
+            declaration: declaration.clone(),
+            sibling_declaration: None,
+            accepted: Some("valid"),
+            validate_calls: Arc::default(),
+            seen_values: None,
+        };
+        let schema = crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
+            "values".into(),
+            PatternAttributeType::list(declaration),
+        )]))
+        .unwrap();
+        let attributes: IndexMap<String, Value> = IndexMap::from([(
+            "values".into(),
+            Value::Concrete(ConcreteValue::List(vec![
+                Value::Concrete(ConcreteValue::String("abcd".into())),
+                Value::Concrete(ConcreteValue::String("bad".into())),
+            ])),
+        )]);
+        let error = validate_provider_config_attributes(&factory, "owner", &attributes, &schema)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ProviderConfigPreparationError::InvalidAttribute { .. }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "provider owner: values: List item at index 0: Invalid Short value 'abcd': length 4 is outside allowed range [, 3]"
+        );
+    }
+
+    #[test]
     fn combined_walk_canonicalization_errors_keep_owner_attribution_at_every_entry() {
         let calls = Arc::new(AtomicUsize::new(0));
         let declaration = PatternAttributeType::refined_float(

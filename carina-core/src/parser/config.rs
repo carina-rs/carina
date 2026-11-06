@@ -953,6 +953,9 @@ pub(crate) trait ProviderCustomTypeSource: CustomTypeResolver + 'static {
     ) -> BTreeMap<SchemaTypeOwner, crate::schema::AssignabilityClosure>;
 }
 
+// Closure resolvers support fixture catalogs only. Production dispatch keeps
+// the canonical proof through FactoryCustomTypeResolver.
+#[cfg(any(test, feature = "test-utils"))]
 impl<F> CustomTypeResolver for F
 where
     F: for<'a> Fn(

@@ -1822,21 +1822,24 @@ impl RootlessType {
     }
 
     /// Validate a rootless value with the same recursive local/provider walk
-    /// used by resource values. A failed leaf leaves its siblings eligible for
-    /// validation; native callbacks and factory dispatch are mutually exclusive.
+    /// used by resource values. Rootless configuration retains only its primary
+    /// local error; resource validation also reports sibling provider findings.
     pub(crate) fn validate_with_lookup<P: PlaceholderKind, B: BindingAddress>(
         &self,
         value: &Value<P, B>,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
-        let errors = value_validation::validate_value_with_lookup(
+        let findings = value_validation::validate_value_with_lookup(
             &self.schema.root,
             value,
             &self.schema.defs,
             FieldAncestry::WRITABLE,
             lookup,
-        )
-        .into_errors();
+        );
+        let errors = match findings.local_error() {
+            Some(error) => vec![error.clone()],
+            None => findings.into_errors(),
+        };
         if errors.is_empty() {
             Ok(())
         } else {

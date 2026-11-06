@@ -6753,7 +6753,7 @@ fn scalar_kind_from_base(attribute_type: &AttributeType) -> Option<RefinedScalar
 /// project by convention: enum spelling always resolves through the exact
 /// owning schema type, while refined strings may still accept their raw
 /// identifier-shaped DSL literal.
-pub fn canonicalize_custom_type_value(
+pub(crate) fn canonicalize_custom_type_value(
     declared_type: &AttributeType,
     value: &Value,
 ) -> Result<Option<CanonicalCustomTypeValue>, CustomTypeCanonicalizationError> {
@@ -8311,6 +8311,64 @@ impl Provider for Box<dyn Provider> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn issue_4276_round1_external_canonicalization_cannot_bypass_local_validation() {
+        // Compile as an external crate: unit tests themselves can access
+        // crate-private constructors and would miss a public API escape hatch.
+        let executable = std::env::current_exe().unwrap();
+        let dependencies = executable.parent().unwrap();
+        let library = std::fs::read_dir(dependencies)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with("libcarina_core-") && name.ends_with(".rlib")
+                })
+            })
+            .max_by_key(|entry| entry.metadata().unwrap().modified().unwrap())
+            .expect("the core test binary has a matching library dependency")
+            .path();
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("bypass.rs");
+        std::fs::write(&source, r#"
+use carina_core::provider::{ProviderFactory, canonicalize_custom_type_value, identified_custom_type_identity};
+use carina_core::resource::Value;
+use carina_core::schema::CompiledAttributeType;
+
+pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType, raw: &Value) {
+    let canonical = canonicalize_custom_type_value(declaration, raw).unwrap().unwrap();
+    factory.validate_custom_type(identified_custom_type_identity(declaration).unwrap(), &canonical).unwrap();
+}
+"#).unwrap();
+        let output = std::process::Command::new("rustc")
+            .args([
+                "--edition=2024",
+                "--crate-type=lib",
+                "--emit=metadata",
+                "--crate-name=carina_4276_bypass",
+            ])
+            .arg("--extern")
+            .arg(format!("carina_core={}", library.display()))
+            .arg("-L")
+            .arg(format!("dependency={}", dependencies.display()))
+            .arg(&source)
+            .arg("-o")
+            .arg(directory.path().join("bypass.rmeta"))
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            !output.status.success(),
+            "an external caller can manufacture a factory input without local validation"
+        );
+        assert!(
+            stderr.contains("E0603")
+                && stderr.contains("canonicalize_custom_type_value")
+                && stderr.contains("private"),
+            "{stderr}"
+        );
+    }
+
     mod assignability_edges_stage_a {
         use std::sync::{
             Arc,
