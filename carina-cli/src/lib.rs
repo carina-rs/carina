@@ -617,3 +617,8 @@ impl DetailLevel {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) fn finite(value: f64) -> carina_core::FiniteF64 {
+    carina_core::FiniteF64::new(value).unwrap()
+}

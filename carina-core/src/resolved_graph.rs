@@ -22,6 +22,8 @@ use crate::wait::{ManagedWaitTarget, ResolvedWaitBinding};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ExpandedGraphResolutionError {
+    #[error("{}", crate::resource::INSIDE_SECRET_MESSAGE)]
+    InsideSecret,
     #[error("expanded binding '{binding}' resolves to more than one graph address")]
     AmbiguousBinding { binding: String },
     #[error("{owner}: dependency target '{reference}' does not exist")]
@@ -387,9 +389,11 @@ fn rewrite_handle_output_refs<P: PlaceholderKind>(
                 default: Box::new(rewrite_handle_output_refs(default, outputs, owner)?),
             }))
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => Ok(Value::Deferred(
-            DeferredValue::Secret(Box::new(rewrite_handle_output_refs(inner, outputs, owner)?)),
-        )),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            Ok(Value::Deferred(DeferredValue::Secret(inner.try_map(
+                |value| rewrite_handle_output_refs(value, outputs, owner),
+            )?)))
+        }
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             Ok(Value::Deferred(DeferredValue::ModuleIf(Box::new(
                 deferred.try_map(|value| rewrite_handle_output_refs(value, outputs, owner))?,
@@ -626,30 +630,41 @@ impl ExpandedBindingIndex {
         let mut reads = ResolvedDependencyReads::default();
 
         for value in values {
-            let mut paths = Vec::new();
-            value.visit_resource_refs(&mut |path| paths.push(path.clone()));
-            for path in paths {
-                let binding = path.binding_address();
-                let direct =
-                    self.targets.contains_key(binding) || self.handle_outputs.contains_key(binding);
-                for id in self.resolve_implicit_binding(binding, owner)? {
-                    dependencies.insert(id.clone());
-                    if direct {
-                        reads.insert_known(id, path.attribute());
-                    } else {
+            let mut result: Result<(), ExpandedGraphResolutionError> = Ok(());
+            value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                if result.is_err() {
+                    return;
+                }
+                result = reference.check(|path| {
+                    let binding = path.binding_address();
+                    let direct = self.targets.contains_key(binding)
+                        || self.handle_outputs.contains_key(binding);
+                    for id in self.resolve_implicit_binding(binding, owner)? {
+                        dependencies.insert(id.clone());
+                        if direct {
+                            reads.insert_known(id, path.attribute());
+                        } else {
+                            reads.insert_unknown(id);
+                        }
+                    }
+                    Ok(())
+                });
+            });
+            result?;
+            let mut result: Result<(), ExpandedGraphResolutionError> = Ok(());
+            value.visit_binding_refs_for_diagnostics(&mut |reference| {
+                if result.is_err() {
+                    return;
+                }
+                result = reference.check(|binding| {
+                    for id in self.resolve_implicit_binding(binding, owner)? {
+                        dependencies.insert(id.clone());
                         reads.insert_unknown(id);
                     }
-                }
-            }
-
-            let mut bare_bindings = Vec::new();
-            value.visit_binding_refs(&mut |binding| bare_bindings.push(binding.clone()));
-            for binding in bare_bindings {
-                for id in self.resolve_implicit_binding(&binding, owner)? {
-                    dependencies.insert(id.clone());
-                    reads.insert_unknown(id);
-                }
-            }
+                    Ok(())
+                });
+            });
+            result?;
         }
 
         // A snapshot may retain an edge after evaluation rewrites its source
@@ -1621,9 +1636,36 @@ impl ExpandedBindingIndex {
     }
 }
 
+impl crate::resource::InsideSecret for ExpandedGraphResolutionError {
+    fn inside_secret(self) -> Self {
+        Self::InsideSecret
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review2_f8_dependency_resolution_inventory_protects_secret_binding_errors() {
+        let index =
+            ExpandedBindingIndex::for_test_resources::<crate::resource::ModuleSource>(&[]).unwrap();
+        let reference: Value = Value::Deferred(DeferredValue::BindingRef {
+            binding: crate::resource::RootScope::new().resolve("private_producer".into()),
+        });
+        let error = index
+            .resolve_value_dependencies(std::iter::once(&reference), std::iter::empty(), "consumer")
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "consumer: dependency target 'private_producer' does not exist"
+        );
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(reference).into()));
+        let error = index
+            .resolve_value_dependencies(std::iter::once(&secret), std::iter::empty(), "consumer")
+            .unwrap_err();
+        assert!(!format!("{error} {error:?}").contains("private_producer"));
+    }
 
     #[test]
     fn value_access_error_retains_typed_cause_without_duplicate_source() {

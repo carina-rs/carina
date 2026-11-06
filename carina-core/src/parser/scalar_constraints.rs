@@ -67,43 +67,6 @@ impl<T: Copy + Ord> Bounds<T> {
     }
 }
 
-/// A finite float with stable equality and ordering for scalar bounds.
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(transparent)]
-struct FiniteFloat(f64);
-
-impl FiniteFloat {
-    fn new(value: f64) -> Option<Self> {
-        value
-            .is_finite()
-            .then_some(Self(if value == 0.0 { 0.0 } else { value }))
-    }
-}
-
-impl<'de> Deserialize<'de> for FiniteFloat {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        Self::new(f64::deserialize(deserializer)?)
-            .ok_or_else(|| serde::de::Error::custom("scalar range endpoints must be finite"))
-    }
-}
-
-impl PartialEq for FiniteFloat {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-impl Eq for FiniteFloat {}
-impl PartialOrd for FiniteFloat {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for FiniteFloat {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.total_cmp(&other.0)
-    }
-}
-
 #[derive(Debug, Clone)]
 struct DeclarationPattern(CompiledPattern);
 
@@ -154,8 +117,27 @@ enum ScalarConstraintKind {
         range: Bounds<i64>,
     },
     Float {
-        range: Bounds<FiniteFloat>,
+        range: Bounds<crate::FiniteF64>,
     },
+}
+
+fn normalize_float_bounds(bounds: Bounds<crate::FiniteF64>) -> Bounds<crate::FiniteF64> {
+    let endpoint = |value: Endpoint<crate::FiniteF64>| {
+        value
+            .value()
+            .map(|value| {
+                if value.get() == 0.0 {
+                    crate::FiniteF64::new(0.0).expect("zero is finite")
+                } else {
+                    value
+                }
+            })
+            .into()
+    };
+    Bounds {
+        min: endpoint(bounds.min),
+        max: endpoint(bounds.max),
+    }
 }
 
 impl ScalarConstraints {
@@ -173,16 +155,9 @@ impl ScalarConstraints {
             AttrTypeKind::Int { range, .. } => ScalarConstraintKind::Int {
                 range: Bounds::new(*range),
             },
-            AttrTypeKind::Float { range, .. } => {
-                let (min, max) = range.unwrap_or((None, None));
-                let endpoint = |value: Option<f64>| match value {
-                    Some(value) => FiniteFloat::new(value).map(Some),
-                    None => Some(None),
-                };
-                ScalarConstraintKind::Float {
-                    range: Bounds::new(Some((endpoint(min)?, endpoint(max)?))),
-                }
-            }
+            AttrTypeKind::Float { range, .. } => ScalarConstraintKind::Float {
+                range: normalize_float_bounds(Bounds::new(*range)),
+            },
             AttrTypeKind::Enum { base, .. } => return Self::from_declaration(base),
             _ => return None,
         };
@@ -217,6 +192,9 @@ impl ScalarConstraints {
     pub(super) fn validate_record(&mut self) -> Result<(), &'static str> {
         if self.empty_intersection != self.bounds_are_empty() {
             return Err("scalar bounds and empty-intersection marker disagree");
+        }
+        if let ScalarConstraintKind::Float { range } = &mut self.scalar {
+            *range = normalize_float_bounds(*range);
         }
         if let ScalarConstraintKind::String { patterns, .. } = &mut self.scalar {
             patterns.sort();
@@ -273,9 +251,7 @@ impl ScalarConstraints {
             },
             ScalarConstraintKind::Float { range } => AttrTypeKind::Float {
                 binding,
-                range: range
-                    .pair()
-                    .map(|(min, max)| (min.map(|v| v.0), max.map(|v| v.0))),
+                range: range.pair(),
             },
         };
         CompiledAttributeType { kind }
@@ -287,5 +263,31 @@ impl ScalarConstraints {
             _ => None,
         };
         patterns.into_iter().flatten().map(|pattern| &pattern.0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialized_declaration_bounds_normalize_both_zero_signs() {
+        let json = r#"{"scalar":{"Float":{"range":{"min":{"Inclusive":-0.0},"max":{"Inclusive":0.0}}}},"empty_intersection":false}"#;
+        let mut constraints: ScalarConstraints = serde_json::from_str(json).unwrap();
+        constraints.validate_record().unwrap();
+        let ScalarConstraintKind::Float { range } = constraints.scalar else {
+            panic!("expected float bounds")
+        };
+        assert_eq!(
+            range.min.value().unwrap().get().to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            range.max.value().unwrap().get().to_bits(),
+            0.0_f64.to_bits()
+        );
+        for raw in ["1e999", "-1e999"] {
+            assert!(serde_json::from_str::<ScalarConstraints>(&json.replace("-0.0", raw)).is_err());
+        }
     }
 }

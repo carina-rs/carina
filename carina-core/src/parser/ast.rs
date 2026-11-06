@@ -1666,28 +1666,32 @@ impl<S, P: ValueKind, T: ValueKind, B: BindingAddress, D> DeferredForExpression<
     /// Every direct reference spelling that may contribute the iterable.
     pub fn reference_candidates(&self) -> std::collections::BTreeSet<String> {
         let mut candidates = std::collections::BTreeSet::new();
-        self.iterable.visit_resource_refs(&mut |path| {
-            candidates.insert(path.to_string());
-        });
-        self.iterable.visit_binding_refs(&mut |binding| {
-            candidates.insert(binding.to_string());
-        });
+        self.iterable
+            .visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                candidates.insert(reference.diagnostic_path().to_dot_string());
+            });
+        self.iterable
+            .visit_binding_refs_for_diagnostics(&mut |reference| {
+                candidates.insert(reference.diagnostic_path().to_dot_string());
+            });
         candidates
     }
 
     /// Compact description of the binding roots that must become available.
-    /// The full iterable spelling remains available through `format_value` for
-    /// unresolved expressions whose display should name the accessed value.
     pub fn binding_description(&self) -> String {
-        let roots = self.root_bindings();
+        let mut roots = std::collections::BTreeSet::new();
+        self.iterable
+            .visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                roots.insert(reference.binding_path().to_dot_string());
+            });
+        self.iterable
+            .visit_binding_refs_for_diagnostics(&mut |reference| {
+                roots.insert(reference.diagnostic_path().to_dot_string());
+            });
         if roots.is_empty() {
             crate::value::format_value(&self.iterable)
         } else {
-            roots
-                .into_iter()
-                .map(|binding| binding.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
+            roots.into_iter().collect::<Vec<_>>().join(", ")
         }
     }
 }
@@ -1777,6 +1781,11 @@ impl DeferredForExpansionError {
                 line,
                 expression,
                 message,
+            },
+            error @ crate::resolver::ResolutionError::InsideSecret { .. } => Self::Resolution {
+                line,
+                expression,
+                message: error.to_string(),
             },
         }
     }
@@ -2473,6 +2482,9 @@ impl<B: BindingAddress> ValidationBlock<ParserPlaceholder, B> {
 // `CompareOp` lives in `expressions::validate_expr` (re-exported above).
 
 /// Validate expression AST node
+/// ```compile_fail,E0308
+/// let _: carina_core::parser::ValidateExpr = carina_core::parser::ValidateExpr::Float(f64::NAN);
+/// ```
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ValidateExpr<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     /// Boolean literal
@@ -2480,7 +2492,7 @@ pub enum ValidateExpr<P: ValueKind = NoPlaceholder, B: BindingAddress = Absolute
     /// Integer literal
     Int(i64),
     /// Float literal
-    Float(f64),
+    Float(carina_provider_protocol::FiniteF64),
     /// Duration literal (`75min`, `1h`, `30s`).
     Duration(std::time::Duration),
     /// String literal
@@ -9195,7 +9207,11 @@ fn normalize_substituted_value<B: BindingAddress>(
                 })?;
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            normalize_substituted_value(inner, miss_policy)?;
+            *inner = inner.try_map(|value| {
+                let mut value = value.clone();
+                normalize_substituted_value(&mut value, miss_policy)?;
+                Ok::<_, PlaceholderAccessError>(value)
+            })?;
         }
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         Value::Concrete(
@@ -9296,7 +9312,11 @@ fn normalize_substituted_lazily<B: BindingAddress>(
                 })?;
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            normalize_substituted_lazily(inner)?;
+            *inner = inner.try_map(|value| {
+                let mut value = value.clone();
+                normalize_substituted_lazily(&mut value)?;
+                Ok::<_, PlaceholderAccessError>(value)
+            })?;
         }
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
         Value::Concrete(
@@ -10877,5 +10897,12 @@ impl<P: ValueKind, B: BindingAddress> ValidateExpr<P, B> {
             }
             None
         })
+    }
+}
+
+impl crate::resource::InsideSecret for PlaceholderAccessError {
+    fn inside_secret(mut self) -> Self {
+        self.message = crate::resource::INSIDE_SECRET_MESSAGE.into();
+        self
     }
 }

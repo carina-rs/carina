@@ -79,7 +79,8 @@ impl PreprocessedFile {
         let mut range = crate::parser::SourceSpan::preprocessed_range(pair);
         range.end -= pair.as_str().len() - pair.as_str().trim_end().len();
         let span = crate::parser::SourceSpan::from_preprocessed_range(range.start, range.end, self);
-        crate::resource::LoopSource::authored(source_file, span, self.original_slice(range), kind)
+        let text = super::retained::diagnostic_source_text(pair.clone(), self, source_file);
+        crate::resource::LoopSource::authored(source_file, span, text, kind)
     }
 }
 

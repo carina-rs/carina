@@ -242,12 +242,30 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
                 format!("{}", pest_error),
             )
         }
+        error @ (ParseError::InsideSecret { line, .. }
+        | ParseError::SecretInConstraint { line }) => carina_diagnostic(
+            line.saturating_sub(1) as u32,
+            0,
+            100,
+            DiagnosticSeverity::ERROR,
+            error.to_string(),
+        ),
         ParseError::InvalidExpression { line, message } => carina_diagnostic(
             (*line as u32).saturating_sub(1),
             0,
             100,
             DiagnosticSeverity::ERROR,
             message.clone(),
+        ),
+        ParseError::InvalidFloatLiteral { line, source } => carina_diagnostic(
+            (*line as u32).saturating_sub(1),
+            0,
+            100,
+            DiagnosticSeverity::ERROR,
+            format!(
+                "Invalid float literal: {}",
+                carina_core::executor::render_error_chain(source)
+            ),
         ),
         ParseError::IntegerArithmetic {
             line,
@@ -491,6 +509,45 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn overflowing_float_diagnostics_point_at_the_literal_token() {
+        let literal = format!("1{}.0", "0".repeat(400));
+        let context =
+            carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        for sign in ["", "-"] {
+            for (source, line) in [
+                (format!("\n\nlet ratio = {sign}{literal}\n"), 2),
+                (
+                    format!(
+                        "arguments {{\nratio: Float {{\nvalidation {{\ncondition = ratio < {sign}{literal}\nerror_message = \"too large\"\n}}\n}}\n}}\n"
+                    ),
+                    3,
+                ),
+                (
+                    format!(
+                        "let source = mock.test.Thing {{ name = 'source' }}\nlet ready = wait source {{\nuntil = source.ratio ==\n{sign}{literal}\n}}\n"
+                    ),
+                    3,
+                ),
+            ] {
+                let error = carina_core::parser::parse_file(
+                    &source,
+                    std::path::Path::new("overflow.crn"),
+                    &context,
+                )
+                .unwrap_err();
+                let diagnostic = super::parse_error_to_diagnostic(&error);
+                assert_eq!(diagnostic.range.start.line, line);
+                assert!(
+                    diagnostic.message.contains("float"),
+                    "{}",
+                    diagnostic.message
+                );
+                assert!(diagnostic.message.contains("inf"), "{}", diagnostic.message);
+            }
+        }
+    }
+
     #[test]
     fn carina_diagnostic_helper_produces_correct_fields() {
         use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};

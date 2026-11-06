@@ -1871,20 +1871,16 @@ impl DiagnosticRun<'_> {
                                     },
                                     _value,
                                 ) => None,
-                                // Lists use the path-tagged collector below, including
-                                // nested lists whose leaf error needs every index.
+                                // Collections use the path-tagged collector below,
+                                // including count bounds and nested leaf errors.
                                 (
                                     carina_core::schema::Shape::List { .. },
                                     Value::Concrete(ConcreteValue::List(_)),
-                                ) => None,
-                                // Validate Map value types
-                                (
+                                )
+                                | (
                                     carina_core::schema::Shape::Map { .. },
                                     Value::Concrete(ConcreteValue::Map(_)),
-                                ) if !contains_struct => effective_attribute
-                                    .validate(attr_value)
-                                    .err()
-                                    .map(|e| e.with_attribute(attr_name).to_string()),
+                                ) => None,
                                 // Validate Union static values (non-ResourceRef, non-BindingRef).
                                 // Ref-shaped values are unresolved at this
                                 // checkpoint and must not be type-checked
@@ -1935,19 +1931,19 @@ impl DiagnosticRun<'_> {
                             // carina#3349 — a raw match arm would silently
                             // drop `Ref` and skip the entire pass.
                             if contains_struct
-                                || (matches!(
-                                    effective_type.shape(),
-                                    carina_core::schema::Shape::List {
-                                        element_type: _,
-                                        ordered: _,
-                                        constraints: _
-                                    }
-                                ) && matches!(
-                                    attr_value,
-                                    Value::Concrete(
-                                        ConcreteValue::List(_) | ConcreteValue::StringList(_)
+                                || matches!(
+                                    (effective_type.shape(), attr_value),
+                                    (
+                                        carina_core::schema::Shape::List { .. },
+                                        Value::Concrete(
+                                            ConcreteValue::List(_) | ConcreteValue::StringList(_)
+                                        ) | Value::Deferred(DeferredValue::Secret(_))
+                                    ) | (
+                                        carina_core::schema::Shape::Map { .. },
+                                        Value::Concrete(ConcreteValue::Map(_))
+                                            | Value::Deferred(DeferredValue::Secret(_))
                                     )
-                                ))
+                                )
                             {
                                 let (nested_diagnostics, reported_duplicate) = self
                                     .validate_container_value(
@@ -2027,10 +2023,7 @@ impl DiagnosticRun<'_> {
                                 continue;
                             }
                             // Skip errors that are already reported with precise positions
-                            // by the attribute-level checks above. Static `secret(...)`
-                            // calls are materialized only for this shared schema pass,
-                            // so retain their masked nested errors: the authored AST
-                            // seen by the attribute pass was still a FunctionCall.
+                            // by the attribute-level checks above, including intrinsic secrets.
                             if matches!(
                                 &error,
                                 carina_core::schema::TypeError::FieldGroupViolation { path, .. }
@@ -2038,7 +2031,6 @@ impl DiagnosticRun<'_> {
                             ) {
                                 continue;
                             }
-                            let is_masked_secret_error = error.to_string().contains("(secret)");
                             // Statically evaluated expressions may first become known
                             // in this pass. Suppress list refinements only when
                             // the attribute pass emitted them.
@@ -2053,8 +2045,7 @@ impl DiagnosticRun<'_> {
                             {
                                 continue;
                             }
-                            if !is_masked_secret_error
-                                && !is_duplicate_list_error(&error)
+                            if !is_duplicate_list_error(&error)
                                 && matches!(
                                     &error,
                                     carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
@@ -2071,10 +2062,9 @@ impl DiagnosticRun<'_> {
                             {
                                 continue;
                             }
-                            if !is_masked_secret_error
-                                && error.attribute_name().is_some_and(|name| {
-                                    reported_attribute_diagnostics.contains(name)
-                                })
+                            if error
+                                .attribute_name()
+                                .is_some_and(|name| reported_attribute_diagnostics.contains(name))
                             {
                                 continue;
                             }

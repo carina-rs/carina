@@ -593,7 +593,7 @@ mod tests {
             Value::Concrete(ConcreteValue::List(vec![
                 Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
                     ConcreteValue::String("never-in-wire".into()),
-                )))),
+                )).into())),
                 Value::Concrete(ConcreteValue::String("known".into())),
             ])),
         )]
@@ -1083,7 +1083,7 @@ mod tests {
             let resource = Resource::new("test", "native-error").with_attribute(
                 "value",
                 Value::Concrete(if invalid_scalar {
-                    ConcreteValue::Float(f64::NAN)
+                    ConcreteValue::Duration(std::time::Duration::from_secs(u64::MAX))
                 } else {
                     ConcreteValue::Int(42)
                 }),
@@ -1127,19 +1127,23 @@ mod tests {
     #[test]
     fn normalization_conversion_cause_is_rendered_exactly_once() {
         use crate::protocol_convert::ProtocolConvertError;
-        let resource = Resource::new("test", "float-error")
-            .with_attribute("value", Value::Concrete(ConcreteValue::Float(f64::NAN)));
+        let resource = Resource::new("test", "duration-error").with_attribute(
+            "value",
+            Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                u64::MAX,
+            ))),
+        );
         let error = || {
             NormalizationBatch::new(std::slice::from_ref(&resource))
                 .err()
                 .unwrap()
         };
         let rendered = crate::provider::ProviderError::from(error()).to_string();
-        let float_message = ProtocolConvertError::NonFiniteFloat.to_string();
-        assert_eq!(rendered.matches(&float_message).count(), 1, "{rendered}");
+        let cause_message = ProtocolConvertError::DurationOutOfRange.to_string();
+        assert_eq!(rendered.matches(&cause_message).count(), 1, "{rendered}");
         let wire: carina_provider_protocol::types::ProviderError = error().into();
         let rendered = format!("{}: {}", wire.message, wire.cause.unwrap());
-        assert_eq!(rendered.matches(&float_message).count(), 1, "{rendered}");
+        assert_eq!(rendered.matches(&cause_message).count(), 1, "{rendered}");
     }
 
     #[test]
@@ -1216,12 +1220,13 @@ mod tests {
 
     #[test]
     fn secret_containers_and_other_deferred_expressions_remain_single_opaque_leaves() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::Map(IndexMap::from([(
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "private-key".into(),
                 Value::Concrete(ConcreteValue::String("private-content".into())),
-            )])),
-        ))));
+            )]))))
+            .into(),
+        ));
         let expression = Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(Value::Concrete(ConcreteValue::String(
                 "private-expression".into(),

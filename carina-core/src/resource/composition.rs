@@ -2412,9 +2412,12 @@ mod tests {
                                 args: vec![ValidateExpr::BoundArgument {
                                     argument: "password".into(),
                                     operand: "password".into(),
-                                    value: Value::Deferred(DeferredValue::Secret(Box::new(
-                                        Value::Concrete(ConcreteValue::String(password.into())),
-                                    ))),
+                                    value: Value::Deferred(DeferredValue::Secret(
+                                        Box::new(Value::Concrete(ConcreteValue::String(
+                                            password.into(),
+                                        )))
+                                        .into(),
+                                    )),
                                 }],
                             }),
                             op: CompareOp::Gte,
@@ -2486,9 +2489,12 @@ mod tests {
                 arguments: IndexMap::from([(
                     "password".to_string(),
                     LiveCompositionArgument::from_value(
-                        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                            ConcreteValue::String("plaintext-secret".into()),
-                        )))),
+                        Value::Deferred(DeferredValue::Secret(
+                            Box::new(Value::Concrete(ConcreteValue::String(
+                                "plaintext-secret".into(),
+                            )))
+                            .into(),
+                        )),
                         resolved_type(TypeExpr::String),
                         crate::parser::ArgumentOrigin::Defaulted,
                     ),

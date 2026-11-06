@@ -1,5 +1,7 @@
 //! Value conversion and formatting utilities
 
+use crate::resource::DiagnosticScope;
+use crate::resource::InsideSecret;
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
@@ -55,8 +57,11 @@ impl std::fmt::Display for SerializationContext {
 /// it can mention the specific upstream path or the for-binding kind
 /// that produced the placeholder, without re-parsing a flattened
 /// message string.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum SerializationError {
+    #[error("cannot serialize: {}", crate::resource::INSIDE_SECRET_MESSAGE)]
+    InsideSecret { kind: SecretSerializationErrorKind },
+
     #[error("cannot hash null provider secret")]
     NullProviderSecret,
 
@@ -74,13 +79,6 @@ pub enum SerializationError {
     #[error("cannot serialize at {context}: value is not yet known ({reason})", reason = crate::provider_text::ProviderText::new(reason.to_string()))]
     UnknownNotAllowed {
         reason: Box<ApplyTimeUnknown>,
-        context: SerializationContext,
-    },
-    /// A non-finite float (`NaN`, `±∞`) reached JSON serialization.
-    /// JSON has no representation for these.
-    #[error("cannot serialize at {context}: non-finite float {value}")]
-    NonFiniteFloat {
-        value: f64,
         context: SerializationContext,
     },
     /// A `Value::Deferred(DeferredValue::ResourceRef)` reached a serialization boundary that
@@ -148,37 +146,56 @@ pub enum SerializationError {
     SavedPlanFieldSecretNotAllowed { location: String },
 }
 
-impl SerializationError {
-    /// Mask user-derived payload text when an error originated below a
-    /// [`DeferredValue::Secret`] wrapper.
-    #[must_use]
-    pub fn masked_for_secret(self) -> Self {
-        const MASKED: &str = "(secret)";
+/// Payload-free identities retained for serialization failures under Secret.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretSerializationErrorKind {
+    NullProviderSecret,
+    UnexpandedModuleIf,
+    UnresolvedResourceRef,
+    UnresolvedInterpolation,
+    UnresolvedFunctionCall,
+    UnresolvedAccess,
+    UnresolvedCoalesce,
+    UnresolvedIntegerArithmetic,
+    UnresolvedEnumIdentifier,
+    SecretNotAllowed,
+    SavedPlanFieldSecretNotAllowed,
+}
 
-        match self {
-            Self::UnexpandedModuleIf { context } => Self::UnexpandedModuleIf { context },
-            Self::UnresolvedEnumIdentifier { context, .. } => Self::UnresolvedEnumIdentifier {
-                value: MASKED.to_string(),
-                context,
-            },
-            Self::UnresolvedResourceRef { context, .. } => Self::UnresolvedResourceRef {
-                path: MASKED.to_string(),
-                context,
-            },
-            Self::UnresolvedFunctionCall { context, .. } => Self::UnresolvedFunctionCall {
-                name: MASKED.to_string(),
-                context,
-            },
-            Self::UnresolvedAccess { context, .. } => Self::UnresolvedAccess {
-                expression: MASKED.to_string(),
-                context,
-            },
-            Self::UnresolvedCoalesce { context } => Self::UnresolvedCoalesce { context },
-            Self::UnresolvedIntegerArithmetic { context } => {
-                Self::UnresolvedIntegerArithmetic { context }
+impl crate::resource::InsideSecret for SerializationError {
+    /// Protect value-bearing diagnostics while preserving public upstream reasons.
+    fn inside_secret(self) -> Self {
+        let kind = match self {
+            Self::InsideSecret { kind } => kind,
+            Self::NullProviderSecret => SecretSerializationErrorKind::NullProviderSecret,
+            Self::UnavailableSecret(error) => {
+                return Self::UnavailableSecret(error.inside_secret());
             }
-            other => other,
-        }
+            Self::UnexpandedModuleIf { .. } => SecretSerializationErrorKind::UnexpandedModuleIf,
+            error @ Self::UnknownNotAllowed { .. } => return error,
+            Self::UnresolvedResourceRef { .. } => {
+                SecretSerializationErrorKind::UnresolvedResourceRef
+            }
+            Self::UnresolvedInterpolation { .. } => {
+                SecretSerializationErrorKind::UnresolvedInterpolation
+            }
+            Self::UnresolvedFunctionCall { .. } => {
+                SecretSerializationErrorKind::UnresolvedFunctionCall
+            }
+            Self::UnresolvedAccess { .. } => SecretSerializationErrorKind::UnresolvedAccess,
+            Self::UnresolvedCoalesce { .. } => SecretSerializationErrorKind::UnresolvedCoalesce,
+            Self::UnresolvedIntegerArithmetic { .. } => {
+                SecretSerializationErrorKind::UnresolvedIntegerArithmetic
+            }
+            Self::UnresolvedEnumIdentifier { .. } => {
+                SecretSerializationErrorKind::UnresolvedEnumIdentifier
+            }
+            Self::SecretNotAllowed { .. } => SecretSerializationErrorKind::SecretNotAllowed,
+            Self::SavedPlanFieldSecretNotAllowed { .. } => {
+                SecretSerializationErrorKind::SavedPlanFieldSecretNotAllowed
+            }
+        };
+        Self::InsideSecret { kind }
     }
 }
 
@@ -211,6 +228,16 @@ pub enum SecretRehydrationError {
     /// Hashing the candidate failed because it was not serializable.
     #[error(transparent)]
     Serialization(#[from] SerializationError),
+}
+
+impl InsideSecret for SecretRehydrationError {
+    fn inside_secret(self) -> Self {
+        match self {
+            Self::UnavailableSecret(error) => Self::UnavailableSecret(error.inside_secret()),
+            Self::Serialization(error) => Self::Serialization(error.inside_secret()),
+            error => error,
+        }
+    }
 }
 
 /// A rehydration failure annotated with its saved-plan location.
@@ -326,9 +353,67 @@ impl JsonEncoding {
     }
 }
 
+/// A JSON numeric scalar could not be admitted to a value tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonNumberDecodeError {
+    UnsupportedNumber,
+    InvalidFloat(crate::NonFiniteFloatError),
+}
+
+impl std::fmt::Display for JsonNumberDecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedNumber => f.write_str("JSON number cannot be represented as a float"),
+            Self::InvalidFloat(_) => f.write_str("failed to decode JSON float"),
+        }
+    }
+}
+
+impl std::error::Error for JsonNumberDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::UnsupportedNumber => None,
+            Self::InvalidFloat(source) => Some(source),
+        }
+    }
+}
+
+impl From<crate::NonFiniteFloatError> for JsonNumberDecodeError {
+    fn from(source: crate::NonFiniteFloatError) -> Self {
+        Self::InvalidFloat(source)
+    }
+}
+
+enum DecodedNumber {
+    Int(i64),
+    Float(crate::FiniteF64),
+}
+
+impl DecodedNumber {
+    fn decode(value: &serde_json::Number) -> Result<Self, JsonNumberDecodeError> {
+        if let Some(value) = value.as_i64() {
+            Ok(Self::Int(value))
+        } else {
+            let value = value
+                .as_f64()
+                .ok_or(JsonNumberDecodeError::UnsupportedNumber)?;
+            Ok(Self::Float(crate::FiniteF64::new(value)?))
+        }
+    }
+
+    fn into_concrete<P: ValueKind>(self) -> ConcreteValue<P> {
+        match self {
+            Self::Int(value) => ConcreteValue::Int(value),
+            Self::Float(value) => ConcreteValue::Float(value),
+        }
+    }
+}
+
 /// A persisted JSON object used the host-reserved `$` namespace incorrectly.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum PersistedValueDecodeError {
+    #[error(transparent)]
+    Number(#[from] JsonNumberDecodeError),
     #[error("invalid host-reserved persisted JSON object with keys {}", crate::provider_text::ProviderText::new(format!("{keys:?}")))]
     InvalidHostObject { keys: Vec<String> },
     #[error("malformed {PERSISTED_ENUM_KEY} persisted enum payload")]
@@ -690,8 +775,7 @@ impl<'a> PersistedListView<'a> {
 /// their provider API string and user map keys are left unchanged. State
 /// writers use [`PersistedValue`]; export writers use [`PersistedExportValue`].
 ///
-/// Returns an error if `value` contains a non-finite float (NaN or infinity)
-/// because JSON cannot represent these values.
+/// Unresolved or unavailable values retain their serialization errors.
 ///
 #[cfg(any(test, feature = "test-utils"))]
 pub fn value_to_json(value: &Value) -> Result<serde_json::Value, SerializationError> {
@@ -729,12 +813,7 @@ fn value_to_json_inner<P: crate::resource::StateValueLeaf>(
             Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
         }
         Value::Concrete(ConcreteValue::Float(f)) => {
-            let num =
-                serde_json::Number::from_f64(*f).ok_or(SerializationError::NonFiniteFloat {
-                    value: *f,
-                    context: ctx,
-                })?;
-            Ok(serde_json::Value::Number(num))
+            Ok(serde_json::Value::Number(f.to_json_number()))
         }
         Value::Concrete(ConcreteValue::Bool(b)) => Ok(serde_json::Value::Bool(*b)),
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -823,16 +902,7 @@ fn value_to_json_inner<P: crate::resource::StateValueLeaf>(
             context: ctx,
         }),
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            if persist_secrets {
-                let plaintext =
-                    crate::resource::state_value_snapshot(inner).to_value_at("secret")?;
-                let previous = previous.and_then(PersistedView::redacted_secret_hash);
-                Ok(persisted_secret_json(
-                    &RedactedSecretHash::reuse_or_generate(&plaintext, previous.as_ref())?,
-                ))
-            } else {
-                value_to_json_inner(inner, None, false, encoding)
-            }
+            serialize_secret_payload(inner, previous, persist_secrets, encoding)
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             Err(SerializationError::UnknownNotAllowed {
@@ -847,18 +917,41 @@ fn value_to_json_inner<P: crate::resource::StateValueLeaf>(
     }
 }
 
+fn serialize_secret_payload<P: crate::resource::StateValueLeaf>(
+    secret: &crate::resource::SecretPayload<P, crate::resource::AbsoluteBindingAddress>,
+    previous: Option<PersistedView<'_>>,
+    persist_secrets: bool,
+    encoding: JsonEncoding,
+) -> Result<serde_json::Value, SerializationError> {
+    if persist_secrets {
+        secret.try_project_plaintext(|value| persist_secret_json(value, previous))
+    } else {
+        secret.try_project_plaintext(|value| value_to_json_inner(value, None, false, encoding))
+    }
+}
+
 /// Encode one materialized secret, reusing a matching v2 digest when present.
 ///
 /// This is the single digest-selection point for state writeback. Callers walk
 /// containers and pass the previous value at the same path.
-pub(crate) fn persist_secret_json(
-    plaintext: &Value,
+pub(crate) fn persist_secret_json<P: crate::resource::StateValueLeaf>(
+    plaintext: &Value<P>,
     previous: Option<PersistedView<'_>>,
 ) -> Result<serde_json::Value, SerializationError> {
     let previous = previous.and_then(PersistedView::redacted_secret_hash);
-    Ok(persisted_secret_json(
-        &RedactedSecretHash::reuse_or_generate(plaintext, previous.as_ref())?,
-    ))
+    crate::resource::SecretPayload::from(Box::new(crate::resource::state_value_snapshot(plaintext)))
+        .try_inspect(|value| hash_secret_value(&value.to_value_at("secret")?, previous.as_ref()))
+        .map(|hash| persisted_secret_json(&hash))
+}
+
+fn hash_secret_value<P: PlaceholderKind>(
+    value: &Value<P>,
+    previous: Option<&RedactedSecretHash>,
+) -> Result<RedactedSecretHash, SerializationError> {
+    match value {
+        Value::Deferred(DeferredValue::Secret(payload)) => payload.hash(previous),
+        value => crate::resource::SecretPayload::from(Box::new(value.clone())).hash(previous),
+    }
 }
 
 fn persisted_secret_json(hash: &RedactedSecretHash) -> serde_json::Value {
@@ -934,7 +1027,16 @@ pub(crate) fn canonical_secret_hash_material<P: PlaceholderKind>(
                 | SerializationError::UnresolvedFunctionCall { .. }
                 | SerializationError::UnresolvedAccess { .. }
                 | SerializationError::UnresolvedCoalesce { .. }
-                | SerializationError::SecretNotAllowed { .. },
+                | SerializationError::SecretNotAllowed { .. }
+                | SerializationError::InsideSecret {
+                    kind:
+                        SecretSerializationErrorKind::UnresolvedResourceRef
+                        | SecretSerializationErrorKind::UnresolvedInterpolation
+                        | SecretSerializationErrorKind::UnresolvedFunctionCall
+                        | SecretSerializationErrorKind::UnresolvedAccess
+                        | SecretSerializationErrorKind::UnresolvedCoalesce
+                        | SecretSerializationErrorKind::SecretNotAllowed,
+                },
             ) => canonical_secret_template(value)?,
             Err(error) => return Err(error),
         },
@@ -1011,7 +1113,7 @@ pub fn migrate_legacy_persisted_json(value: &mut serde_json::Value) {
 /// entries when building attribute maps. `$` keys are ordinary user data here;
 /// only [`PersistedValue`] interprets the persisted host namespace.
 #[cfg(any(test, feature = "test-utils"))]
-pub fn json_to_dsl_value(json: &serde_json::Value) -> Option<Value> {
+pub fn json_to_dsl_value(json: &serde_json::Value) -> Result<Option<Value>, JsonNumberDecodeError> {
     json_to_dsl_value_inner(json)
 }
 
@@ -1026,33 +1128,38 @@ fn persisted_json_to_dsl_value(
 }
 
 #[cfg(any(test, feature = "test-utils"))]
-fn json_to_dsl_value_inner(json: &serde_json::Value) -> Option<Value> {
-    match json {
+fn json_to_dsl_value_inner(
+    json: &serde_json::Value,
+) -> Result<Option<Value>, JsonNumberDecodeError> {
+    Ok(match json {
         serde_json::Value::String(s) => {
             Some(Value::Concrete(ConcreteValue::String(s.clone().into())))
         }
         serde_json::Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Some(Value::Concrete(ConcreteValue::Int(i)))
-            } else {
-                Some(Value::Concrete(ConcreteValue::Float(
-                    n.as_f64().unwrap_or(0.0),
-                )))
-            }
+            Some(Value::Concrete(DecodedNumber::decode(n)?.into_concrete()))
         }
         serde_json::Value::Bool(b) => Some(Value::Concrete(ConcreteValue::Bool(*b))),
         serde_json::Value::Array(items) => Some(Value::Concrete(ConcreteValue::List(
-            items.iter().filter_map(json_to_dsl_value_inner).collect(),
-        ))),
-        serde_json::Value::Object(map) => {
-            let m: IndexMap<_, _> = map
+            items
                 .iter()
-                .filter_map(|(k, v)| json_to_dsl_value_inner(v).map(|val| (k.clone(), val)))
-                .collect();
-            Some(Value::Concrete(ConcreteValue::Map(m)))
-        }
+                .map(json_to_dsl_value_inner)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+        ))),
+        serde_json::Value::Object(map) => Some(Value::Concrete(ConcreteValue::Map(
+            map.iter()
+                .map(|(k, v)| {
+                    json_to_dsl_value_inner(v).map(|value| value.map(|value| (k.clone(), value)))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect(),
+        ))),
         serde_json::Value::Null => None,
-    }
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1064,7 +1171,10 @@ enum PersistedPurpose {
 enum DecodedPersistedJson {
     Null,
     Bool(bool),
-    Number(serde_json::Number),
+    Number {
+        original: serde_json::Number,
+        value: DecodedNumber,
+    },
     String(String),
     Enum(CanonicalEnumValue),
     Secret(RedactedSecretHash),
@@ -1077,14 +1187,7 @@ impl DecodedPersistedJson {
         match self {
             Self::Null => None,
             Self::Bool(value) => Some(Value::Concrete(ConcreteValue::Bool(value))),
-            Self::Number(value) => {
-                let value = if let Some(value) = value.as_i64() {
-                    ConcreteValue::Int(value)
-                } else {
-                    ConcreteValue::Float(value.as_f64().unwrap_or(0.0))
-                };
-                Some(Value::Concrete(value))
-            }
+            Self::Number { original: _, value } => Some(Value::Concrete(value.into_concrete())),
             Self::String(value) => Some(Value::Concrete(ConcreteValue::String(value.into()))),
             Self::Enum(value) => Some(Value::Concrete(ConcreteValue::CanonicalEnum(value))),
             Self::Secret(hash) => Some(SnapshotValue::redacted(hash)),
@@ -1104,10 +1207,12 @@ impl DecodedPersistedJson {
         match self {
             Self::Null => serde_json::Value::Null,
             Self::Bool(value) => serde_json::Value::Bool(value),
-            Self::Number(value) => serde_json::Value::Number(value),
+            Self::Number { original, value: _ } => serde_json::Value::Number(original),
             Self::String(value) => serde_json::Value::String(value),
             Self::Enum(value) => serde_json::Value::String(value.api_value().to_string()),
-            Self::Secret(_) => serde_json::Value::String("(secret)".to_string()),
+            Self::Secret(_) => {
+                serde_json::Value::String(crate::schema::SECRET_VALUE_MASK.to_string())
+            }
             Self::Array(values) => {
                 serde_json::Value::Array(values.into_iter().map(Self::into_ordinary_json).collect())
             }
@@ -1128,7 +1233,10 @@ fn decode_persisted_json(
     match json {
         serde_json::Value::Null => Ok(DecodedPersistedJson::Null),
         serde_json::Value::Bool(value) => Ok(DecodedPersistedJson::Bool(*value)),
-        serde_json::Value::Number(value) => Ok(DecodedPersistedJson::Number(value.clone())),
+        serde_json::Value::Number(value) => Ok(DecodedPersistedJson::Number {
+            original: value.clone(),
+            value: DecodedNumber::decode(value)?,
+        }),
         serde_json::Value::String(value) => Ok(DecodedPersistedJson::String(value.clone())),
         serde_json::Value::Array(values) => values
             .iter()
@@ -1656,7 +1764,7 @@ fn format_value_into_context<P: ValueKind, B: BindingAddress>(
             // canonical value formatter.
             sink.write_token(ValueSpanKind::Other, &render_duration(*d))
         }
-        Value::Concrete(ConcreteValue::Float(f)) => write_float(*f, sink),
+        Value::Concrete(ConcreteValue::Float(f)) => write_float(f.get(), sink),
         Value::Concrete(ConcreteValue::Bool(b)) => {
             sink.write_token(ValueSpanKind::Bool, if *b { "true" } else { "false" })
         }
@@ -1793,7 +1901,7 @@ fn format_value_into_context<P: ValueKind, B: BindingAddress>(
             }
         }
         Value::Deferred(DeferredValue::Secret(_)) => {
-            sink.write_token(ValueSpanKind::Other, "(secret)")
+            sink.write_token(ValueSpanKind::Other, crate::schema::SECRET_VALUE_MASK)
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => write_unknown(reason, sink, context),
         Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
@@ -1867,13 +1975,18 @@ fn format_decoded_persisted_json_into(
         DecodedPersistedJson::Bool(value) => {
             sink.write_token(ValueSpanKind::Bool, if *value { "true" } else { "false" })
         }
-        DecodedPersistedJson::Number(value) => {
-            if let Some(value) = value.as_i64() {
+        DecodedPersistedJson::Number { original, value } => {
+            if let Some(value) = original.as_i64() {
                 sink.write_token(ValueSpanKind::Number, &value.to_string())
-            } else if let Some(value) = value.as_u64() {
+            } else if let Some(value) = original.as_u64() {
                 sink.write_token(ValueSpanKind::Number, &value.to_string())
             } else {
-                write_float(value.as_f64().unwrap_or(0.0), sink)
+                match value {
+                    DecodedNumber::Int(value) => {
+                        sink.write_token(ValueSpanKind::Number, &value.to_string())
+                    }
+                    DecodedNumber::Float(value) => write_float(value.get(), sink),
+                }
             }
         }
         DecodedPersistedJson::String(value) => {
@@ -1882,7 +1995,9 @@ fn format_decoded_persisted_json_into(
         DecodedPersistedJson::Enum(value) => {
             sink.write_token(ValueSpanKind::Enum, value.api_value())
         }
-        DecodedPersistedJson::Secret(_) => sink.write_token(ValueSpanKind::Other, "(secret)"),
+        DecodedPersistedJson::Secret(_) => {
+            sink.write_token(ValueSpanKind::Other, crate::schema::SECRET_VALUE_MASK)
+        }
         DecodedPersistedJson::Array(values) => {
             sink.write_token(ValueSpanKind::Structure, "[")?;
             for (index, value) in values.iter().enumerate() {
@@ -2202,10 +2317,7 @@ fn merge_secrets_into_observation_json_inner(
                     .ok_or(SerializationError::SecretNotAllowed {
                         context: SerializationContext::StateWriteback,
                     })?;
-            persist_secret_json(
-                &observed_value.to_value_at("provider observation")?,
-                previous,
-            )
+            persist_secret_json(&observed_value, previous)
         }
         Value::Concrete(ConcreteValue::Map(desired_map)) => {
             let Some(observed_map) = observed.as_map() else {
@@ -2275,10 +2387,7 @@ fn mask_mismatched_observation_shape(
         .ok_or(SerializationError::SecretNotAllowed {
             context: SerializationContext::StateWriteback,
         })?;
-    persist_secret_json(
-        &observed_value.to_value_at("provider observation")?,
-        previous,
-    )
+    persist_secret_json(&observed_value, previous)
 }
 
 fn merge_secrets_into_provider_json_inner(
@@ -2288,8 +2397,9 @@ fn merge_secrets_into_provider_json_inner(
 ) -> Result<serde_json::Value, SerializationError> {
     match desired {
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            if !secret_value_requires_provider_material(inner) {
-                return persist_secret_json(inner, previous);
+            if !inner.visit(secret_value_requires_provider_material) {
+                let previous = previous.and_then(PersistedView::redacted_secret_hash);
+                return Ok(persisted_secret_json(&inner.hash(previous.as_ref())?));
             }
             if provider.is_redacted_secret() {
                 return Ok(provider.to_owned_json());
@@ -2300,7 +2410,7 @@ fn merge_secrets_into_provider_json_inner(
                     .ok_or(SerializationError::SecretNotAllowed {
                         context: SerializationContext::StateWriteback,
                     })?;
-            persist_secret_json(&provider_value.to_value_at("provider response")?, previous)
+            persist_secret_json(&provider_value, previous)
         }
         Value::Concrete(ConcreteValue::Map(desired_map)) => {
             if let Some(provider_map) = provider.as_map() {
@@ -2390,7 +2500,7 @@ fn secret_value_requires_provider_material(value: &Value) -> bool {
                 || secret_value_requires_provider_material(default)
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            secret_value_requires_provider_material(inner)
+            inner.visit(secret_value_requires_provider_material)
         }
         Value::Concrete(ConcreteValue::List(values)) => {
             values.iter().any(secret_value_requires_provider_material)
@@ -2422,9 +2532,9 @@ fn redact_snapshot_secrets<P: PlaceholderKind>(
     value: &SnapshotValue<P>,
 ) -> Result<SnapshotValue<P>, SerializationError> {
     match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            redact_secret_leaf(&inner.to_value_at("secret")?)
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner
+            .try_inspect(|value| hash_secret_value(&value.to_value_at("secret")?, None))
+            .map(SnapshotValue::redacted),
         Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { .. })) => {
             Ok(value.clone())
         }
@@ -2527,14 +2637,6 @@ fn redact_secrets_only<P: PlaceholderKind>(
     redact_snapshot_secrets(&value.to_snapshot())
 }
 
-fn redact_secret_leaf<P: PlaceholderKind>(
-    inner: &Value<P>,
-) -> Result<SnapshotValue<P>, SerializationError> {
-    Ok(SnapshotValue::redacted(
-        RedactedSecretHash::reuse_or_generate(inner, None)?,
-    ))
-}
-
 /// Canonical hash material for a secret that is still deferred. Tags keep
 /// expression nodes disjoint from user-authored maps while deliberately
 /// retaining only stable resolver inputs (paths, bindings, literals, and
@@ -2571,15 +2673,9 @@ fn canonical_secret_template<P: PlaceholderKind>(
         Value::Concrete(ConcreteValue::Int(value)) => {
             tagged("int", JsonValue::Number((*value).into()))
         }
-        Value::Concrete(ConcreteValue::Float(value)) => tagged(
-            "float",
-            JsonValue::Number(serde_json::Number::from_f64(*value).ok_or(
-                SerializationError::NonFiniteFloat {
-                    value: *value,
-                    context: SerializationContext::SecretRedaction,
-                },
-            )?),
-        ),
+        Value::Concrete(ConcreteValue::Float(value)) => {
+            tagged("float", JsonValue::Number(value.to_json_number()))
+        }
         Value::Concrete(ConcreteValue::Bool(value)) => tagged("bool", JsonValue::Bool(*value)),
         Value::Concrete(ConcreteValue::Duration(value)) => tagged(
             "duration_seconds",
@@ -2702,7 +2798,9 @@ fn canonical_secret_template<P: PlaceholderKind>(
             );
             tagged("access", JsonValue::Object(encoded))
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => canonical_secret_template(inner)?,
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            inner.try_project_plaintext(canonical_secret_template)?
+        }
         Value::Deferred(DeferredValue::Unknown(reason)) => tagged(
             "unknown",
             serde_json::to_value(reason).expect("ApplyTimeUnknown is serializable"),
@@ -2968,11 +3066,8 @@ impl<'a> SecretRedactionGuide<'a> {
             return None;
         }
         match self {
-            Self::Evaluated(Value::Deferred(DeferredValue::Secret(inner))) => Some(inner),
-            _ => Some(match source {
-                Value::Deferred(DeferredValue::Secret(inner)) => inner.as_ref(),
-                _ => source,
-            }),
+            Self::Evaluated(value @ Value::Deferred(DeferredValue::Secret(_))) => Some(value),
+            _ => Some(source),
         }
     }
 
@@ -3038,9 +3133,10 @@ fn redact_with_guide(
 ) -> Result<SnapshotValue, SerializationError> {
     if let Some(secret_value) = guide.secret_value(source) {
         let previous = guide.previous_hash();
-        return Ok(SnapshotValue::redacted(
-            RedactedSecretHash::reuse_or_generate(secret_value, previous.as_ref())?,
-        ));
+        return Ok(SnapshotValue::redacted(hash_secret_value(
+            secret_value,
+            previous.as_ref(),
+        )?));
     }
 
     match source {
@@ -3118,12 +3214,15 @@ fn redact_snapshot_with_guide(
     if guide.protects_whole_value(matches!(source, Value::Deferred(DeferredValue::Secret(_)))) {
         // Sensitivity covers the complete value, including plaintext siblings
         // of existing hashes. Only an evaluated guide can supply missing material.
-        if let SecretRedactionGuide::Evaluated(Value::Deferred(DeferredValue::Secret(inner))) =
+        if let SecretRedactionGuide::Evaluated(value @ Value::Deferred(DeferredValue::Secret(_))) =
             guide
         {
-            return redact_with_guide(inner, guide);
+            return redact_with_guide(value, guide);
         }
-        return redact_with_guide(&source.to_value_at("state")?, guide);
+        return crate::resource::SecretPayload::from(Box::new(source.clone()))
+            .try_project_plaintext(|source| {
+                redact_with_guide(&source.to_value_at("state")?, guide)
+            });
     }
     match source {
         Value::Concrete(ConcreteValue::Map(values)) => {
@@ -3226,7 +3325,7 @@ impl SecretShapeProjectionMode {
         if matches!(shape, Value::Deferred(DeferredValue::Secret(_)))
             || matches!(shape, Value::Deferred(DeferredValue::Placeholder(leaf)) if leaf.redacted_secret_hash().is_some())
         {
-            return Value::Deferred(DeferredValue::Secret(Box::new(value.clone())));
+            return Value::Deferred(DeferredValue::Secret(Box::new(value.clone()).into()));
         }
 
         match self {
@@ -3246,7 +3345,7 @@ impl SecretShapeProjectionMode {
 }
 
 fn mark_secret<P: ValueKind>(value: &Value<P>) -> Value<P> {
-    Value::Deferred(DeferredValue::Secret(Box::new(value.clone())))
+    Value::Deferred(DeferredValue::Secret(Box::new(value.clone()).into()))
 }
 
 fn project_secret_shape<P: ValueKind, Q: ValueKind>(
@@ -3351,7 +3450,7 @@ fn mask_plaintext_using_persisted_json_shape<P: ValueKind>(
     persisted: PersistedView<'_>,
 ) -> Value<P> {
     if persisted.is_redacted_secret() {
-        return Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone())));
+        return Value::Deferred(DeferredValue::Secret(Box::new(plaintext.clone()).into()));
     }
     match plaintext {
         Value::Concrete(ConcreteValue::Map(values)) => persisted.as_map().map_or_else(
@@ -3438,26 +3537,35 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
         )
         && let Value::Deferred(DeferredValue::Secret(inner)) = candidate
     {
-        rehydrate_redacted_secrets_impl(
-            saved,
-            inner,
-            SecretRehydrationInput::EvaluatedHashMaterial,
-        )?;
+        inner.try_inspect(|value| {
+            rehydrate_redacted_secrets_impl(
+                saved,
+                value,
+                SecretRehydrationInput::EvaluatedHashMaterial,
+            )
+            .map(|_| ())
+        })?;
         return Ok(candidate.clone());
     }
 
     match saved {
         Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { .. })) => {
-            let hash_material = match input {
-                SecretRehydrationInput::Evaluated => match candidate {
-                    Value::Deferred(DeferredValue::Secret(inner)) => inner.as_ref(),
-                    _ => return Err(SecretRehydrationError::ExpectedSecret),
-                },
-                SecretRehydrationInput::EvaluatedHashMaterial
-                | SecretRehydrationInput::Plaintext => candidate,
-            };
+            if input == SecretRehydrationInput::Evaluated {
+                let Value::Deferred(DeferredValue::Secret(inner)) = candidate else {
+                    return Err(SecretRehydrationError::ExpectedSecret);
+                };
+                inner.try_inspect(|value| {
+                    rehydrate_redacted_secrets_impl(
+                        saved,
+                        value,
+                        SecretRehydrationInput::EvaluatedHashMaterial,
+                    )
+                    .map(|_| ())
+                })?;
+                return Ok(candidate.clone());
+            }
             if find_unavailable_evaluation(
-                hash_material,
+                candidate,
                 UnavailableCoalescePolicy::IncludeDefault,
                 UnavailableSecretPolicy::Include,
             )
@@ -3465,7 +3573,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
             {
                 return Err(SecretRehydrationError::EvaluationUnavailable);
             }
-            if !saved.verify_secret(hash_material)? {
+            if !saved.verify_secret(candidate)? {
                 return Err(SecretRehydrationError::HashMismatch);
             }
             Ok(candidate.clone())
@@ -5451,15 +5559,13 @@ impl CanonicalizationLeaf for SnapshotLeaf {
 }
 
 trait CanonicalizationErrorPolicy: Copy {
-    type Error;
+    type Error: crate::resource::InsideSecret;
 
     fn canonicalization_failed<H: ValueKind, B: BindingAddress>(
         self,
         original: Value<H, B>,
         source: crate::schema::TypeError,
     ) -> Result<Value<H, B>, Self::Error>;
-
-    fn mask_secret(self, error: Self::Error) -> Self::Error;
 
     fn at_list_index(self, index: usize, error: Self::Error) -> Self::Error;
 
@@ -5484,10 +5590,6 @@ impl CanonicalizationErrorPolicy for RejectEnumResolutionErrors {
         source: crate::schema::TypeError,
     ) -> Result<Value<H, B>, Self::Error> {
         Err(source)
-    }
-
-    fn mask_secret(self, error: Self::Error) -> Self::Error {
-        error.masked_for_secret()
     }
 
     fn at_list_index(self, index: usize, error: Self::Error) -> Self::Error {
@@ -5543,10 +5645,6 @@ impl CanonicalizationErrorPolicy for PreserveEnumResolutionErrors {
         _source: crate::schema::TypeError,
     ) -> Result<Value<H, B>, Self::Error> {
         Ok(original)
-    }
-
-    fn mask_secret(self, error: Self::Error) -> Self::Error {
-        match error {}
     }
 
     fn at_list_index(self, _index: usize, error: Self::Error) -> Self::Error {
@@ -5856,9 +5954,11 @@ fn canonicalize_with_fit<H: ValueKind, B: BindingAddress, P: CanonicalizationErr
 
     match (value, &fit.kind) {
         (Value::Deferred(DeferredValue::Secret(value)), crate::schema::FitKind::Secret(fit)) => {
-            canonicalize_with_fit(*value, fit, defs, purpose, error_policy)
-                .map(|value| Value::Deferred(DeferredValue::Secret(Box::new(value))))
-                .map_err(|error| error_policy.mask_secret(error))
+            value
+                .try_map(|value| {
+                    canonicalize_with_fit(value.clone(), fit, defs, purpose, error_policy)
+                })
+                .map(|value| Value::Deferred(DeferredValue::Secret(value)))
         }
         (
             Value::Deferred(DeferredValue::Coalesce { value, default }),
@@ -6080,9 +6180,11 @@ fn type_contains_enum(
             AttrTypeKind::UnloadedSchemaType(_) => false,
             AttrTypeKind::Enum { .. } => true,
             AttrTypeKind::List { element_type, .. } => walk(element_type, defs, visited),
-            AttrTypeKind::Map { key, value } => {
-                walk(key, defs, visited) || walk(value, defs, visited)
-            }
+            AttrTypeKind::Map {
+                key,
+                value,
+                constraints: _,
+            } => walk(key, defs, visited) || walk(value, defs, visited),
             AttrTypeKind::Struct { fields, .. } => fields
                 .iter()
                 .any(|field| walk(&field.field_type, defs, visited)),
@@ -6147,17 +6249,19 @@ fn canonicalize_without_fit<
     visited_refs: &mut Vec<&'a str>,
 ) -> Result<Value<H, B>, P::Error> {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        return canonicalize_without_fit(
-            *inner,
-            unwrapped,
-            defs,
-            ancestry,
-            purpose,
-            error_policy,
-            visited_refs,
-        )
-        .map(|canonical| Value::Deferred(DeferredValue::Secret(Box::new(canonical))))
-        .map_err(|error| error_policy.mask_secret(error));
+        return inner
+            .try_map(|value| {
+                canonicalize_without_fit(
+                    value.clone(),
+                    unwrapped,
+                    defs,
+                    ancestry,
+                    purpose,
+                    error_policy,
+                    visited_refs,
+                )
+            })
+            .map(|inner| Value::Deferred(DeferredValue::Secret(inner)));
     }
 
     if purpose.canonicalizes_full_shape() && is_string_or_list_of_strings(unwrapped, defs) {
@@ -6276,6 +6380,7 @@ fn canonicalize_without_fit<
             crate::schema::Shape::Map {
                 key: key_type,
                 value: value_type,
+                constraints: _,
             },
         ) => {
             let canonicalized = map
@@ -6477,44 +6582,48 @@ pub(crate) fn resolve_provider_config_enum_identifier(
 #[derive(Clone, Copy)]
 struct EnumIdentifierOccurrence<'a> {
     raw: &'a crate::resource::RawEnumIdentifier,
-    inside_secret: bool,
+    scope: DiagnosticScope,
 }
 
 fn first_enum_identifier<H: ValueKind, B: BindingAddress>(
     value: &Value<H, B>,
 ) -> Option<EnumIdentifierOccurrence<'_>> {
-    first_enum_identifier_inner(value, false)
+    first_enum_identifier_inner(value, DiagnosticScope::Public)
 }
 
 fn first_enum_identifier_inner<H: ValueKind, B: BindingAddress>(
     value: &Value<H, B>,
-    inside_secret: bool,
+    scope: DiagnosticScope,
 ) -> Option<EnumIdentifierOccurrence<'_>> {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
             .values()
             .into_iter()
-            .find_map(|value| first_enum_identifier_inner(value, inside_secret)),
+            .find_map(|value| first_enum_identifier_inner(value, scope)),
         Value::Concrete(ConcreteValue::EnumIdentifier(raw)) => {
-            Some(EnumIdentifierOccurrence { raw, inside_secret })
+            Some(EnumIdentifierOccurrence { raw, scope })
         }
         Value::Concrete(ConcreteValue::List(items)) => items
             .iter()
-            .find_map(|value| first_enum_identifier_inner(value, inside_secret)),
+            .find_map(|value| first_enum_identifier_inner(value, scope)),
         Value::Concrete(ConcreteValue::Map(map)) => map
             .values()
-            .find_map(|value| first_enum_identifier_inner(value, inside_secret)),
-        Value::Deferred(DeferredValue::Secret(inner)) => first_enum_identifier_inner(inner, true),
+            .find_map(|value| first_enum_identifier_inner(value, scope)),
+        Value::Deferred(DeferredValue::Secret(inner)) => inner
+            .try_project_plaintext(|value| {
+                first_enum_identifier_inner(value, DiagnosticScope::Secret).ok_or(())
+            })
+            .ok(),
         Value::Deferred(DeferredValue::Access(access)) => {
-            first_enum_identifier_inner(access.base(), inside_secret)
+            first_enum_identifier_inner(access.base(), scope)
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            first_enum_identifier_inner(value, inside_secret)
-                .or_else(|| first_enum_identifier_inner(default, inside_secret))
+            first_enum_identifier_inner(value, scope)
+                .or_else(|| first_enum_identifier_inner(default, scope))
         }
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            first_enum_identifier_inner(expression.lhs(), inside_secret)
-                .or_else(|| first_enum_identifier_inner(expression.rhs(), inside_secret))
+            first_enum_identifier_inner(expression.lhs(), scope)
+                .or_else(|| first_enum_identifier_inner(expression.rhs(), scope))
         }
         Value::Concrete(
             ConcreteValue::String(_)
@@ -6559,7 +6668,9 @@ fn canonicalize_to_string_list<H: ValueKind, B: BindingAddress>(value: Value<H, 
             Value::Concrete(ConcreteValue::StringList(strings))
         }
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            Box::new(canonicalize_to_string_list(*inner)),
+            inner
+                .try_map(|value| Ok::<_, Infallible>(canonicalize_to_string_list(value.clone())))
+                .unwrap(),
         )),
         other => other,
     }
@@ -6641,8 +6752,8 @@ fn mask_enum_identifier_error_for_secret(
     error: crate::schema::TypeError,
     occurrence: EnumIdentifierOccurrence<'_>,
 ) -> crate::schema::TypeError {
-    if occurrence.inside_secret {
-        error.masked_for_secret()
+    if occurrence.scope.is_secret() {
+        error.inside_secret()
     } else {
         error
     }
@@ -7122,9 +7233,12 @@ mod tests {
         use crate::resource::{ExpandedResource as Resource, ResolvedResource, SnapshotState};
 
         let previous = Value::Concrete(ConcreteValue::String("previous-private-token".into()));
-        let desired = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("desired-private-token".into()),
-        ))));
+        let desired = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "desired-private-token".into(),
+            )))
+            .into(),
+        ));
         let public = Value::Concrete(ConcreteValue::String("public-value".into()));
         for (plaintext, secret_shape) in [
             (previous.clone(), desired.clone()),
@@ -7191,12 +7305,18 @@ mod tests {
         use crate::effect::{Effect, ReleasedListKey, ReleasedListKeys};
         use crate::resource::{ExpandedResource as Resource, ResolvedResourceId};
 
-        let root = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("retained-root-private-token".into()),
-        ))));
-        let nested = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("retained-nested-private-token".into()),
-        ))));
+        let root = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "retained-root-private-token".into(),
+            )))
+            .into(),
+        ));
+        let nested = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "retained-nested-private-token".into(),
+            )))
+            .into(),
+        ));
         let public = Value::Concrete(ConcreteValue::String("retained-public-value".into()));
         let retained = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
@@ -7254,9 +7374,9 @@ mod tests {
         use crate::resource::{ExpandedResource as Resource, ResolvedResource, SnapshotState};
 
         let token = Value::Concrete(ConcreteValue::String("old-private-token".into()));
-        let hash = redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(Box::new(
-            token.clone(),
-        ))))
+        let hash = redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
+            Box::new(token.clone()).into(),
+        )))
         .unwrap();
         let sibling = Value::Concrete(ConcreteValue::String(
             "whole-container-plaintext-must-not-leak".into(),
@@ -7280,7 +7400,7 @@ mod tests {
                 ])),
             ),
         ] {
-            let secret = Value::Deferred(DeferredValue::Secret(Box::new(plain.clone())));
+            let secret = Value::Deferred(DeferredValue::Secret(Box::new(plain.clone()).into()));
             let guide = redact_secrets_in_value(&secret).unwrap();
             let resource =
                 Resource::new("mock.Secret", "example").with_attribute("settings", secret.clone());
@@ -7372,9 +7492,9 @@ mod tests {
         let empty = Value::Concrete(ConcreteValue::Map(IndexMap::new()));
         let entry = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "token".into(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("private".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("private".into()))).into(),
+            )),
         )])));
         let desired = crate::resource::ExpandedResource::new("mock.Collections", "example")
             .with_attribute(
@@ -7426,9 +7546,9 @@ mod tests {
             )
             .validate()
             .unwrap();
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("private".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("private".into()))).into(),
+        ));
         let desired = crate::resource::ExpandedResource::new("mock.Aliases", "example")
             .with_attribute(
                 "tokens",
@@ -7500,9 +7620,9 @@ mod tests {
     fn historical_verification_skips_newly_opaque_hash_free_attributes() {
         let id = crate::resource::ResourceId::with_identity("mock.Resource", "history");
         let plaintext = Value::Concrete(ConcreteValue::String("original secret".into()));
-        let hash = redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(Box::new(
-            plaintext.clone(),
-        ))))
+        let hash = redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
+            Box::new(plaintext.clone()).into(),
+        )))
         .unwrap();
         let ordinary = Value::Concrete(ConcreteValue::String("old ordinary".into())).to_snapshot();
         let saved = crate::resource::SnapshotState::existing(
@@ -8116,9 +8236,12 @@ mod tests {
 
     #[test]
     fn persisted_codec_encodes_real_secrets_as_structural_tags() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("structural-secret".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "structural-secret".into(),
+            )))
+            .into(),
+        ));
         let persisted = PersistedValue::encode_provider_value(&secret, None)
             .expect("real secret is persistable");
         let object = persisted
@@ -8355,56 +8478,20 @@ mod tests {
 
     #[test]
     fn test_value_to_json_float() {
-        let v = Value::Concrete(ConcreteValue::Float(1.5));
+        let v = Value::Concrete(ConcreteValue::Float(crate::finite(1.5)));
         assert_eq!(value_to_json(&v).unwrap(), serde_json::json!(1.5));
     }
 
     #[test]
-    fn test_value_to_json_nan_returns_error() {
-        let v = Value::Concrete(ConcreteValue::Float(f64::NAN));
-        let result = value_to_json(&v);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("NaN"));
+    fn test_overflow_admission_in_list_returns_error() {
+        assert!(serde_json::from_str::<PersistedValue>(r#"[1,1e999]"#).is_err());
+        assert!(serde_json::from_str::<PersistedExportValue>(r#"[1,1e999]"#).is_err());
     }
 
     #[test]
-    fn test_value_to_json_infinity_returns_error() {
-        let v = Value::Concrete(ConcreteValue::Float(f64::INFINITY));
-        let result = value_to_json(&v);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("inf"));
-    }
-
-    #[test]
-    fn test_value_to_json_neg_infinity_returns_error() {
-        let v = Value::Concrete(ConcreteValue::Float(f64::NEG_INFINITY));
-        let result = value_to_json(&v);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("-inf"));
-    }
-
-    #[test]
-    fn test_value_to_json_nan_in_list_returns_error() {
-        let v = Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::Int(1)),
-            Value::Concrete(ConcreteValue::Float(f64::NAN)),
-        ]));
-        let result = value_to_json(&v);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("NaN"));
-    }
-
-    #[test]
-    fn test_value_to_json_nan_in_map_returns_error() {
-        let mut map = IndexMap::new();
-        map.insert(
-            "key".to_string(),
-            Value::Concrete(ConcreteValue::Float(f64::INFINITY)),
-        );
-        let v = Value::Concrete(ConcreteValue::Map(map));
-        let result = value_to_json(&v);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("inf"));
+    fn test_overflow_admission_in_map_returns_error() {
+        assert!(serde_json::from_str::<PersistedValue>(r#"{"key":-1e999}"#).is_err());
+        assert!(serde_json::from_str::<PersistedExportValue>(r#"{"key":-1e999}"#).is_err());
     }
 
     #[test]
@@ -8590,7 +8677,7 @@ mod tests {
     fn test_json_to_dsl_value_string() {
         let j = serde_json::json!("hello");
         assert_eq!(
-            json_to_dsl_value(&j),
+            json_to_dsl_value(&j).unwrap(),
             Some(Value::Concrete(ConcreteValue::String("hello".into())))
         );
     }
@@ -8601,7 +8688,9 @@ mod tests {
         let marker = format!("_secret:argon2:{hash}");
         let mut json = serde_json::json!({ "nested": [marker.clone()] });
 
-        let ordinary = json_to_dsl_value(&json).expect("ordinary JSON value");
+        let ordinary = json_to_dsl_value(&json)
+            .unwrap()
+            .expect("ordinary JSON value");
         assert!(!contains_redacted_secret(&ordinary));
 
         let context_free = persisted_json_to_dsl_value(&json, PersistedPurpose::State)
@@ -8720,7 +8809,7 @@ mod tests {
     fn test_json_to_dsl_value_int() {
         let j = serde_json::json!(42);
         assert_eq!(
-            json_to_dsl_value(&j),
+            json_to_dsl_value(&j).unwrap(),
             Some(Value::Concrete(ConcreteValue::Int(42)))
         );
     }
@@ -8729,8 +8818,8 @@ mod tests {
     fn test_json_to_dsl_value_float() {
         let j = serde_json::json!(1.5);
         assert_eq!(
-            json_to_dsl_value(&j),
-            Some(Value::Concrete(ConcreteValue::Float(1.5)))
+            json_to_dsl_value(&j).unwrap(),
+            Some(Value::Concrete(ConcreteValue::Float(crate::finite(1.5))))
         );
     }
 
@@ -8738,7 +8827,7 @@ mod tests {
     fn test_json_to_dsl_value_bool() {
         let j = serde_json::json!(true);
         assert_eq!(
-            json_to_dsl_value(&j),
+            json_to_dsl_value(&j).unwrap(),
             Some(Value::Concrete(ConcreteValue::Bool(true)))
         );
     }
@@ -8747,7 +8836,7 @@ mod tests {
     fn test_json_to_dsl_value_array() {
         let j = serde_json::json!([1, 2]);
         assert_eq!(
-            json_to_dsl_value(&j),
+            json_to_dsl_value(&j).unwrap(),
             Some(Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::Int(1)),
                 Value::Concrete(ConcreteValue::Int(2))
@@ -8758,14 +8847,14 @@ mod tests {
     #[test]
     fn test_json_to_dsl_value_null() {
         let j = serde_json::Value::Null;
-        assert_eq!(json_to_dsl_value(&j), None);
+        assert_eq!(json_to_dsl_value(&j).unwrap(), None);
     }
 
     #[test]
     fn test_json_to_dsl_value_null_in_array() {
         let j = serde_json::json!([1, null, 2]);
         assert_eq!(
-            json_to_dsl_value(&j),
+            json_to_dsl_value(&j).unwrap(),
             Some(Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::Int(1)),
                 Value::Concrete(ConcreteValue::Int(2))
@@ -8776,7 +8865,7 @@ mod tests {
     #[test]
     fn test_json_to_dsl_value_null_in_object() {
         let j = serde_json::json!({"a": 1, "b": null, "c": "hello"});
-        let result = json_to_dsl_value(&j).unwrap();
+        let result = json_to_dsl_value(&j).unwrap().unwrap();
         if let Value::Concrete(ConcreteValue::Map(map)) = result {
             assert_eq!(map.len(), 2);
             assert_eq!(map.get("a"), Some(&Value::Concrete(ConcreteValue::Int(1))));
@@ -8798,7 +8887,7 @@ mod tests {
             Value::Concrete(ConcreteValue::Bool(false)),
         ]));
         let json = value_to_json(&original).unwrap();
-        let back = json_to_dsl_value(&json).unwrap();
+        let back = json_to_dsl_value(&json).unwrap().unwrap();
         assert_eq!(back, original);
     }
 
@@ -9115,7 +9204,7 @@ mod tests {
 
         assert_eq!(json.decode(), Some((v).to_snapshot()));
         assert!(matches!(
-            json_to_dsl_value(json.as_json()),
+            json_to_dsl_value(json.as_json()).unwrap(),
             Some(Value::Concrete(ConcreteValue::Map(map))) if map.contains_key("$enum")
         ));
     }
@@ -9125,7 +9214,7 @@ mod tests {
         let json = serde_json::json!({"$$x": "user value"});
 
         assert!(matches!(
-            json_to_dsl_value(&json),
+            json_to_dsl_value(&json).unwrap(),
             Some(Value::Concrete(ConcreteValue::Map(map)))
                 if map.contains_key("$$x") && !map.contains_key("$x")
         ));
@@ -9483,9 +9572,9 @@ mod tests {
     #[test]
     fn provider_output_union_canonicalizes_recognized_secret_enum_string() {
         let canonical = canonicalize_desired_with_type(
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("Enabled".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("Enabled".into()))).into(),
+            )),
             &status_union(),
             crate::schema::empty_defs_for_schema_walks(),
             DesiredValueSource::ProviderOutput,
@@ -9496,7 +9585,7 @@ mod tests {
             panic!("expected Secret wrapper");
         };
         assert!(matches!(
-            inner.as_ref(),
+            inner.expose_plaintext(),
             Value::Concrete(ConcreteValue::CanonicalEnum(value))
                 if value.api_value() == "Enabled"
         ));
@@ -9703,7 +9792,9 @@ mod tests {
 
     #[test]
     fn secret_map_key_collision_masks_the_colliding_key() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(colliding_map_key_value())));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(colliding_map_key_value()).into(),
+        ));
         let error = canonicalize_desired_with_type(
             secret,
             &separator_folding_map_key_type(),
@@ -10038,9 +10129,9 @@ mod tests {
             crate::resource::Resource::with_provider("test", "widget", "secret", None);
         resource.set_attr(
             "mode",
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::enum_identifier(plaintext),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::enum_identifier(plaintext))).into(),
+            )),
         );
         let mut resources = vec![resource];
 
@@ -10055,9 +10146,9 @@ mod tests {
     #[test]
     fn desired_post_pass_masks_enum_identifier_inside_secret() {
         let plaintext = "post-pass-plaintext-must-not-leak";
-        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::enum_identifier(plaintext),
-        ))));
+        let value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::enum_identifier(plaintext))).into(),
+        ));
 
         let error = canonicalize_desired_with_type(
             value,
@@ -10078,9 +10169,9 @@ mod tests {
 
         let plaintext = "none-schema-plaintext-must-not-leak";
         let secret = || {
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::enum_identifier(plaintext),
-            ))))
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::enum_identifier(plaintext))).into(),
+            ))
         };
         let registries = [SchemaRegistry::new(), {
             let mut registry = SchemaRegistry::new();
@@ -10530,9 +10621,9 @@ mod tests {
 
         let plaintext = "provider-config-plaintext-must-not-leak";
         let secret = || {
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::enum_identifier(plaintext),
-            ))))
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::enum_identifier(plaintext))).into(),
+            ))
         };
 
         let typed = crate::schema::RootlessType::new(AttributeType::string())
@@ -10576,7 +10667,7 @@ mod tests {
 
     #[test]
     fn test_format_value_float() {
-        let v = Value::Concrete(ConcreteValue::Float(1.5));
+        let v = Value::Concrete(ConcreteValue::Float(crate::finite(1.5)));
         assert_eq!(format_value(&v), "1.5");
     }
 
@@ -10797,9 +10888,9 @@ mod tests {
 
     #[test]
     fn test_value_to_json_secret_produces_hash() {
-        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("my-password".into()),
-        ))));
+        let v = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+        ));
         let json = value_to_json(&v).unwrap();
         let hash = redacted_hash_from_persisted_json(&json);
         assert!(hash.verify(serde_json::to_vec(&serde_json::json!("my-password")).unwrap()));
@@ -10807,12 +10898,12 @@ mod tests {
 
     #[test]
     fn test_value_to_json_secret_uses_random_salt() {
-        let v1 = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("my-password".into()),
-        ))));
-        let v2 = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("my-password".into()),
-        ))));
+        let v1 = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+        ));
+        let v2 = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+        ));
         let json1 = value_to_json(&v1).unwrap();
         let json2 = value_to_json(&v2).unwrap();
         assert_ne!(json1, json2);
@@ -10820,12 +10911,12 @@ mod tests {
 
     #[test]
     fn test_value_to_json_secret_different_values_different_hashes() {
-        let v1 = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("password-1".into()),
-        ))));
-        let v2 = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("password-2".into()),
-        ))));
+        let v1 = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("password-1".into()))).into(),
+        ));
+        let v2 = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("password-2".into()))).into(),
+        ));
         let json1 = value_to_json(&v1).unwrap();
         let json2 = value_to_json(&v2).unwrap();
         assert_ne!(json1, json2);
@@ -10833,9 +10924,9 @@ mod tests {
 
     #[test]
     fn test_format_value_secret() {
-        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("my-password".into()),
-        ))));
+        let v = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+        ));
         assert_eq!(format_value(&v), "(secret)");
     }
 
@@ -10848,9 +10939,9 @@ mod tests {
         );
         map.insert(
             "SecretTag".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("my-password".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+            )),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
         let formatted = format_value(&v);
@@ -10876,9 +10967,9 @@ mod tests {
         );
         map.insert(
             "SecretTag".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("my-password".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+            )),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
         let json = value_to_json(&v).unwrap();
@@ -10900,9 +10991,9 @@ mod tests {
 
     #[test]
     fn value_to_json_generates_independently_salted_digests() {
-        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("my-password".into()),
-        ))));
+        let v = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+        ));
         let json1 = value_to_json(&v).unwrap();
         let json2 = value_to_json(&v).unwrap();
         assert_ne!(
@@ -10918,9 +11009,12 @@ mod tests {
 
     #[test]
     fn generated_secret_digest_is_parameterized_argon2id_phc() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("phc-password".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "phc-password".into(),
+            )))
+            .into(),
+        ));
         let encoded = value_to_json(&secret).expect("serialize secret");
         let phc = encoded[PERSISTED_SECRET_KEY]
             .as_str()
@@ -10958,9 +11052,12 @@ mod tests {
     fn persisted_secret_digest_rejects_non_carina_argon2_parameters() {
         use argon2::password_hash::{PasswordHasher, SaltString};
 
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("bounded-argon2".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "bounded-argon2".into(),
+            )))
+            .into(),
+        ));
         let encoded = value_to_json(&secret).expect("serialize secret");
         let digest = encoded[PERSISTED_SECRET_KEY]
             .as_str()
@@ -11014,11 +11111,9 @@ mod tests {
 
     #[test]
     fn unresolved_secret_with_null_provider_value_returns_an_error() {
-        let desired = Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
-            "upstream",
-            "value",
-            Vec::new(),
-        ))));
+        let desired = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref("upstream", "value", Vec::new())).into(),
+        ));
 
         let provider = PersistedValue::from_serialized_json(serde_json::Value::Null).unwrap();
         let error = merge_secrets_into_provider_json(&desired, &provider, None)
@@ -11030,9 +11125,12 @@ mod tests {
     fn non_structural_expression_containing_secret_masks_whole_observed_value() {
         let desired = Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(Value::root_resource_ref("resource", "comment", Vec::new())),
-            default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
-                Value::Concrete(ConcreteValue::String("fallback-secret".into())),
-            )))),
+            default: Box::new(Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "fallback-secret".into(),
+                )))
+                .into(),
+            ))),
         });
         let plaintext = "provider-returned-secret";
         let provider = PersistedValue::encode_provider_value(
@@ -11074,7 +11172,7 @@ mod tests {
         ];
 
         for inner in values {
-            let desired = Value::Deferred(DeferredValue::Secret(Box::new(inner.clone())));
+            let desired = Value::Deferred(DeferredValue::Secret(Box::new(inner.clone()).into()));
             let previous = PersistedValue::encode_desired_value(&desired, None)
                 .expect("desired secret is persistable");
             let provider = PersistedValue::encode_provider_value(&inner, None)
@@ -11102,9 +11200,12 @@ mod tests {
     #[test]
     fn provider_secret_material_treats_nested_marker_strings_as_plaintext() {
         let nested_secret = PersistedValue::encode_provider_value(
-            &Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("nested-secret".into()),
-            )))),
+            &Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "nested-secret".into(),
+                )))
+                .into(),
+            )),
             None,
         )
         .expect("nested secret is persistable");
@@ -11119,7 +11220,9 @@ mod tests {
             Value::Concrete(ConcreteValue::String(nested_marker.into())),
         )])));
         let previous = PersistedValue::encode_desired_value(
-            &Value::Deferred(DeferredValue::Secret(Box::new(provider_plaintext.clone()))),
+            &Value::Deferred(DeferredValue::Secret(
+                Box::new(provider_plaintext.clone()).into(),
+            )),
             None,
         )
         .expect("top-level secret is persistable");
@@ -11130,9 +11233,9 @@ mod tests {
             .expect("nested marker-shaped plaintext can be hashed");
         assert_eq!(refreshed.as_json(), previous.as_json());
 
-        let unresolved = Value::Deferred(DeferredValue::Secret(Box::new(
-            Value::root_resource_ref("upstream", "value", Vec::new()),
-        )));
+        let unresolved = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref("upstream", "value", Vec::new())).into(),
+        ));
         let merged = merge_secrets_into_provider_json(&unresolved, &provider, Some(&previous))
             .expect("provider material with a nested marker-shaped string can be hashed");
         assert_eq!(merged.as_json(), previous.as_json());
@@ -11141,9 +11244,9 @@ mod tests {
     #[test]
     fn equal_nested_secrets_get_distinct_digests() {
         let secret = || {
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("same".into()),
-            ))))
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("same".into()))).into(),
+            ))
         };
         let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             ("left".to_string(), secret()),
@@ -11155,9 +11258,9 @@ mod tests {
 
     #[test]
     fn value_to_json_reuses_matching_previous_digest() {
-        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("my-password".into()),
-        ))));
+        let v = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+        ));
         let json1 = PersistedValue::encode_desired_value(&v, None).unwrap();
         let json2 = PersistedValue::encode_desired_value(&v, Some(&json1)).unwrap();
         assert_eq!(
@@ -11169,12 +11272,18 @@ mod tests {
 
     #[test]
     fn value_to_json_replaces_previous_digest_when_plaintext_changes() {
-        let old = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("old-password".into()),
-        ))));
-        let new = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("new-password".into()),
-        ))));
+        let old = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "old-password".into(),
+            )))
+            .into(),
+        ));
+        let new = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "new-password".into(),
+            )))
+            .into(),
+        ));
         let previous = PersistedValue::encode_desired_value(&old, None).unwrap();
         let replacement = PersistedValue::encode_desired_value(&new, Some(&previous)).unwrap();
         assert_ne!(previous.as_json(), replacement.as_json());
@@ -11182,9 +11291,9 @@ mod tests {
 
     #[test]
     fn test_redact_secrets_in_value_replaces_secret() {
-        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("my-password".into()),
-        ))));
+        let v = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+        ));
         let redacted = redact_secrets_in_value(&v).unwrap();
         // Saved plans retain the hash in a dedicated, non-provider value.
         match &redacted {
@@ -11204,9 +11313,9 @@ mod tests {
     fn integer_arithmetic_secret_operand_redacts_and_rehydrates_recursively() {
         let candidate = Value::Deferred(DeferredValue::IntegerArithmetic(
             crate::integer_arithmetic::ValidatedIntegerExpr::new(
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::Int(42),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::Int(42))).into(),
+                )),
                 crate::integer_arithmetic::IntegerOp::Add,
                 Value::Concrete(ConcreteValue::Int(1)),
                 crate::integer_arithmetic::IntegerOperatorSpan::synthetic(),
@@ -11230,15 +11339,16 @@ mod tests {
 
     #[test]
     fn deferred_secret_interpolation_is_one_placeholder() {
-        let candidate = Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-            DeferredValue::Interpolation(vec![
+        let candidate = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("DEFPLAIN-".into()),
                 InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
                     path: crate::resource::ExpandedAccessPath::root("r", "identifier"),
                 })),
                 InterpolationPart::Literal("-TAIL".into()),
-            ]),
-        ))));
+            ])))
+            .into(),
+        ));
         let redacted = redact_secrets_in_value(&candidate).expect("redact template");
         assert!(
             matches!(
@@ -11255,15 +11365,16 @@ mod tests {
             candidate,
         );
 
-        let changed = Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-            DeferredValue::Interpolation(vec![
+        let changed = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::Interpolation(vec![
                 InterpolationPart::Literal("CHANGED-".into()),
                 InterpolationPart::Expr(Value::Deferred(DeferredValue::ResourceRef {
                     path: crate::resource::ExpandedAccessPath::root("r", "identifier"),
                 })),
                 InterpolationPart::Literal("-TAIL".into()),
-            ]),
-        ))));
+            ])))
+            .into(),
+        ));
         assert!(matches!(
             rehydrate_redacted_secrets(&redacted, &changed),
             Err(SecretRehydrationError::HashMismatch)
@@ -11290,9 +11401,9 @@ mod tests {
     }
 
     fn upper_with_secret_hash_material(hash_material: Value) -> Value {
-        upper_with_argument(Value::Deferred(DeferredValue::Secret(Box::new(
-            hash_material,
-        ))))
+        upper_with_argument(Value::Deferred(DeferredValue::Secret(
+            Box::new(hash_material).into(),
+        )))
     }
 
     fn deferred_interpolation_hash_material(secret: &str) -> Value {
@@ -11382,9 +11493,9 @@ mod tests {
 
     #[test]
     fn secret_rehydration_accepts_matching_unavailable_function_call_shape() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("same-secret".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("same-secret".into()))).into(),
+        ));
         let planned = upper_with_argument(secret.clone());
         let saved = redact_secrets_in_value(&planned).expect("redact function argument");
         let unavailable = unavailable_upper_with_argument(secret);
@@ -11469,16 +11580,16 @@ mod tests {
                         vec![],
                     )),
                     InterpolationPart::Literal("-".into()),
-                    InterpolationPart::Expr(Value::Deferred(DeferredValue::Secret(Box::new(
-                        unavailable_env_evaluation(),
-                    )))),
+                    InterpolationPart::Expr(Value::Deferred(DeferredValue::Secret(
+                        Box::new(unavailable_env_evaluation()).into(),
+                    ))),
                 ])),
             ),
             (
                 deferred_coalesce_hash_material(planned_secret),
-                deferred_coalesce_hash_material(Value::Deferred(DeferredValue::Secret(Box::new(
-                    unavailable_env_evaluation(),
-                )))),
+                deferred_coalesce_hash_material(Value::Deferred(DeferredValue::Secret(
+                    Box::new(unavailable_env_evaluation()).into(),
+                ))),
             ),
         ] {
             let planned = upper_with_secret_hash_material(planned_material);
@@ -11494,9 +11605,12 @@ mod tests {
 
     #[test]
     fn secret_rehydration_rejects_unavailable_in_an_unselected_candidate_subtree() {
-        let planned_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("planned-secret".into()),
-        ))));
+        let planned_secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "planned-secret".into(),
+            )))
+            .into(),
+        ));
         let planned = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             ("verified".to_string(), planned_secret.clone()),
             (
@@ -11509,12 +11623,13 @@ mod tests {
             ("verified".to_string(), planned_secret),
             (
                 "ordinary".to_string(),
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-                    DeferredValue::Interpolation(vec![
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Deferred(DeferredValue::Interpolation(vec![
                         InterpolationPart::Expr(unavailable_env_evaluation()),
                         InterpolationPart::Literal("-suffix".into()),
-                    ]),
-                )))),
+                    ])))
+                    .into(),
+                )),
             ),
         ])));
 
@@ -11531,9 +11646,9 @@ mod tests {
         );
         resource.set_attr(
             "comment",
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(plaintext.into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+            )),
         );
         resource
     }
@@ -11569,8 +11684,12 @@ mod tests {
     fn separate_saved_plan_placeholders_get_distinct_random_salts() {
         let inner = Value::Concrete(ConcreteValue::String("SAME_IMPORT_SECRET".into()));
         assert_ne!(
-            RedactedSecretHash::reuse_or_generate(&inner, None).unwrap(),
-            RedactedSecretHash::reuse_or_generate(&inner, None).unwrap(),
+            crate::resource::SecretPayload::from(Box::new(inner.clone()))
+                .hash(None)
+                .unwrap(),
+            crate::resource::SecretPayload::from(Box::new(inner.clone()))
+                .hash(None)
+                .unwrap(),
             "independent placeholders must not reveal equal plaintexts",
         );
     }
@@ -11622,9 +11741,9 @@ mod tests {
         }
 
         let secret_tree = tree(|plaintext| {
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(plaintext.into()),
-            ))))
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+            ))
         });
         let plaintext_tree =
             tree(|plaintext| Value::Concrete(ConcreteValue::String(plaintext.into())));
@@ -11676,14 +11795,17 @@ mod tests {
 
     #[test]
     fn effect_redaction_uses_effect_values_to_classify_nested_secrets() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("MAP_SECRET".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("MAP_SECRET".into()))).into(),
+        ));
         let reusable_secret = redact_secrets_in_value(&secret).expect("redact reusable secret");
         let resolved_reference_secret =
-            redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(Box::new(
-                Value::Concrete(ConcreteValue::String("RESOLVED_REFERENCE_SECRET".into())),
-            ))))
+            redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "RESOLVED_REFERENCE_SECRET".into(),
+                )))
+                .into(),
+            )))
             .expect("redact resolved reference secret");
         let reference = Value::root_resource_ref("producer", "comment", vec![]);
 
@@ -11740,9 +11862,9 @@ mod tests {
 
     #[test]
     fn saved_plan_rehydration_needs_no_position_context() {
-        let evaluated = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("PLAIN".into()),
-        ))));
+        let evaluated = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("PLAIN".into()))).into(),
+        ));
         let redacted = redact_secrets_in_value(&evaluated).expect("redact secret");
 
         let rehydrated = rehydrate_redacted_secrets(&redacted, &evaluated)
@@ -11818,7 +11940,7 @@ mod tests {
             args: vec![Value::Concrete(ConcreteValue::String("ciphertext".into())).into()],
             source_line: (0).into(),
         });
-        let evaluated = Value::Deferred(DeferredValue::Secret(Box::new(plaintext)));
+        let evaluated = Value::Deferred(DeferredValue::Secret(Box::new(plaintext).into()));
 
         let redacted = redact_secrets_using_evaluated(&source, &evaluated)
             .expect("semantic redaction succeeds");
@@ -11839,9 +11961,9 @@ mod tests {
     #[test]
     fn raw_secret_cannot_cross_serde_boundary() {
         let plaintext = "SERDE_SECRET_MUST_NOT_LEAK_3861";
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String(plaintext.into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+        ));
 
         let error = serde_json::to_string(&secret)
             .expect_err("raw DeferredValue::Secret must fail closed at serde boundaries");
@@ -11866,9 +11988,9 @@ mod tests {
         let evaluated_at_plan = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "password".to_string(),
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("plan-secret".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("plan-secret".into()))).into(),
+                )),
             ),
             (
                 "ordinary".to_string(),
@@ -11883,9 +12005,9 @@ mod tests {
         // which plaintext the saved plan is allowed to restore.
         let evaluated_at_apply = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "password".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("plan-secret".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("plan-secret".into()))).into(),
+            )),
         )])));
         let rehydrated = rehydrate_redacted_secrets(&redacted, &evaluated_at_apply)
             .expect("unchanged secret rehydrates despite unrelated config edits");
@@ -11907,9 +12029,9 @@ mod tests {
 
     #[test]
     fn contains_secret_walks_interpolations_and_function_arguments() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("sensitive".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("sensitive".into()))).into(),
+        ));
         let interpolation = Value::Deferred(DeferredValue::Interpolation(vec![
             InterpolationPart::Literal("prefix-".into()),
             InterpolationPart::Expr(secret),
@@ -11936,9 +12058,9 @@ mod tests {
     #[test]
     fn secret_walkers_visit_both_coalesce_operands() {
         let secret = || {
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("sensitive".into()),
-            ))))
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("sensitive".into()))).into(),
+            ))
         };
 
         for coalesce in [
@@ -11968,14 +12090,14 @@ mod tests {
         let plaintext = Value::Concrete(ConcreteValue::String("selected-secret".into()));
         let shape = Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(Value::root_resource_ref("producer", "comment", vec![])),
-            default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
-                Value::Concrete(ConcreteValue::String("fallback".into())),
-            )))),
+            default: Box::new(Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))).into(),
+            ))),
         });
 
         assert_eq!(
             mask_plaintext_using_secret_shape_fail_closed(&plaintext, &shape),
-            Value::Deferred(DeferredValue::Secret(Box::new(plaintext))),
+            Value::Deferred(DeferredValue::Secret(Box::new(plaintext).into())),
             "an unresolved non-structural shape containing a secret must never leave provider plaintext unwrapped",
         );
     }
@@ -11988,18 +12110,18 @@ mod tests {
         ]));
         let shape = Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::String("public".into())),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("sensitive".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("sensitive".into()))).into(),
+            )),
         ]));
 
         assert_eq!(
             mask_plaintext_using_secret_shape(&plaintext, &shape),
             Value::Concrete(ConcreteValue::List(vec![
                 Value::Concrete(ConcreteValue::String("public".into())),
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("sensitive".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("sensitive".into()),)).into()
+                )),
             ])),
         );
     }
@@ -12017,9 +12139,9 @@ mod tests {
                 "selected".to_string(),
                 Value::Deferred(DeferredValue::Coalesce {
                     value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
-                    default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
-                        Value::Concrete(ConcreteValue::String("fallback".into())),
-                    )))),
+                    default: Box::new(Value::Deferred(DeferredValue::Secret(
+                        Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))).into(),
+                    ))),
                 }),
             ),
             ("sibling".to_string(), plain.clone()),
@@ -12031,7 +12153,7 @@ mod tests {
         };
         assert_eq!(
             values["selected"],
-            Value::Deferred(DeferredValue::Secret(Box::new(public))),
+            Value::Deferred(DeferredValue::Secret(Box::new(public).into())),
         );
         assert_eq!(values["sibling"], plain);
     }
@@ -12045,9 +12167,12 @@ mod tests {
         )])));
         let shape = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "absent".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("not-returned".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "not-returned".into(),
+                )))
+                .into(),
+            )),
         )])));
 
         assert_eq!(
@@ -12061,9 +12186,9 @@ mod tests {
         let applied = Value::Concrete(ConcreteValue::String("selected-public".into()));
         let authored = Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
-            default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
-                Value::Concrete(ConcreteValue::String("fallback".into())),
-            )))),
+            default: Box::new(Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))).into(),
+            ))),
         });
 
         assert_eq!(
@@ -12079,9 +12204,9 @@ mod tests {
         let plain = Value::Concrete(ConcreteValue::String("plain".into()));
         let authored_coalesce = Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
-            default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
-                Value::Concrete(ConcreteValue::String("fallback".into())),
-            )))),
+            default: Box::new(Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))).into(),
+            ))),
         });
         let applied = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             ("selected".to_string(), public.clone()),
@@ -12107,9 +12232,9 @@ mod tests {
         let authored = Value::Concrete(ConcreteValue::List(vec![
             Value::Deferred(DeferredValue::Coalesce {
                 value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
-                default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
-                    Value::Concrete(ConcreteValue::String("fallback".into())),
-                )))),
+                default: Box::new(Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))).into(),
+                ))),
             }),
             Value::Concrete(ConcreteValue::String("plain".into())),
         ]));
@@ -12122,23 +12247,26 @@ mod tests {
 
     #[test]
     fn authored_secret_union_retains_selected_and_explicit_secret_children() {
-        let selected_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("selected-secret".into()),
-        ))));
+        let selected_secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "selected-secret".into(),
+            )))
+            .into(),
+        ));
         let plain = Value::Concrete(ConcreteValue::String("plain".into()));
         let authored = Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "selected".to_string(),
                 Value::Deferred(DeferredValue::Coalesce {
                     value: Box::new(Value::root_resource_ref("producer", "missing", vec![])),
-                    default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
-                        Value::Concrete(ConcreteValue::String("fallback".into())),
-                    )))),
+                    default: Box::new(Value::Deferred(DeferredValue::Secret(
+                        Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))).into(),
+                    ))),
                 }),
             ),
             (
                 "explicit".to_string(),
-                Value::Deferred(DeferredValue::Secret(Box::new(plain.clone()))),
+                Value::Deferred(DeferredValue::Secret(Box::new(plain.clone()).into())),
             ),
             ("sibling".to_string(), plain.clone()),
         ])));
@@ -12176,9 +12304,9 @@ mod tests {
                 "unresolved".to_string(),
                 Value::Deferred(DeferredValue::Coalesce {
                     value: Box::new(Value::root_resource_ref("producer", "identifier", vec![])),
-                    default: Box::new(Value::Deferred(DeferredValue::Secret(Box::new(
-                        Value::Concrete(ConcreteValue::String("fallback".into())),
-                    )))),
+                    default: Box::new(Value::Deferred(DeferredValue::Secret(
+                        Box::new(Value::Concrete(ConcreteValue::String("fallback".into()))).into(),
+                    ))),
                 }),
             ),
             ("sibling".to_string(), plain.clone()),
@@ -12190,16 +12318,19 @@ mod tests {
         };
         assert_eq!(
             values["unresolved"],
-            Value::Deferred(DeferredValue::Secret(Box::new(unresolved))),
+            Value::Deferred(DeferredValue::Secret(Box::new(unresolved).into())),
         );
         assert_eq!(values["sibling"], plain);
     }
 
     #[test]
     fn test_redact_secrets_in_value_no_plaintext_in_serialized_output() {
-        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("super-secret-password".into()),
-        ))));
+        let v = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "super-secret-password".into(),
+            )))
+            .into(),
+        ));
         let redacted = redact_secrets_in_value(&v).unwrap();
         let json = serde_json::to_string(&redacted).unwrap();
         assert!(
@@ -12234,9 +12365,12 @@ mod tests {
         attrs.insert(
             "secret_field".to_string(),
             LiveCompositionAttribute::from_value(
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("plaintext-must-not-leak".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(
+                        "plaintext-must-not-leak".into(),
+                    )))
+                    .into(),
+                )),
                 None,
             ),
         );
@@ -12308,9 +12442,9 @@ mod tests {
         );
         map.insert(
             "password".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("s3cret".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("s3cret".into()))).into(),
+            )),
         );
         let v = Value::Concrete(ConcreteValue::Map(map));
         let redacted = redact_secrets_in_value(&v).unwrap();
@@ -12331,9 +12465,9 @@ mod tests {
     fn test_redact_secrets_in_value_nested_in_list() {
         let v = Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::String("visible".into())),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("hidden".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("hidden".into()))).into(),
+            )),
         ]));
         let redacted = redact_secrets_in_value(&v).unwrap();
         let json = serde_json::to_string(&redacted).unwrap();
@@ -12361,9 +12495,9 @@ mod tests {
         );
         attrs.insert(
             "password".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("hunter2".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("hunter2".into()))).into(),
+            )),
         );
         let redacted = redact_secrets_in_attributes(&attrs).unwrap();
         let json = serde_json::to_string(&redacted).unwrap();
@@ -12554,7 +12688,7 @@ mod tests {
     #[test]
     fn pretty_value_renders_only_through_the_core_formatter() {
         let key = RenderedKey::from_raw("a-b");
-        let value = PrettyValue::new(Value::Concrete(ConcreteValue::Float(1.0)));
+        let value = PrettyValue::new(Value::Concrete(ConcreteValue::Float(crate::finite(1.0))));
 
         assert_eq!(
             value.render(PrettyLayout::for_map_key(0, &key)).plain(),
@@ -12710,9 +12844,9 @@ mod tests {
 
     #[test]
     fn render_value_pretty_secret_masked() {
-        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("my-password".into()),
-        ))));
+        let v = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+        ));
         assert_eq!(render_value_pretty(&v, layout(0, "k")).plain(), "(secret)");
     }
 
@@ -13239,11 +13373,11 @@ mod tests {
         let cases = vec![
             Value::Concrete(ConcreteValue::String("hello".into())),
             Value::Concrete(ConcreteValue::Int(42)),
-            Value::Concrete(ConcreteValue::Float(2.5)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(2.5))),
             Value::Concrete(ConcreteValue::Bool(false)),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("pw".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("pw".into()))).into(),
+            )),
             Value::Deferred(DeferredValue::Unknown(ApplyTimeUnknown::UpstreamExport {
                 path: path.clone(),
             })),
@@ -14000,15 +14134,15 @@ mod tests {
     #[test]
     fn canonicalize_secret_recurses_inner() {
         let t = string_or_list_of_strings();
-        let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("s".into()),
-        ))));
+        let v = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("s".into()))).into(),
+        ));
         let canon =
             canonicalize_state_with_type(v, &t, crate::schema::empty_defs_for_schema_walks());
         match canon {
             Value::Deferred(DeferredValue::Secret(inner)) => {
                 assert_eq!(
-                    *inner,
+                    inner.expose_plaintext().clone(),
                     Value::Concrete(ConcreteValue::StringList(vec!["s".into()]))
                 );
             }
@@ -14054,13 +14188,13 @@ mod tests {
             Value::Concrete(ConcreteValue::String("(empty)".into())),
             Value::Concrete(ConcreteValue::Int(42)),
             Value::Concrete(ConcreteValue::Int(-7)),
-            Value::Concrete(ConcreteValue::Float(1.5)),
-            Value::Concrete(ConcreteValue::Float(2.0)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
+            Value::Concrete(ConcreteValue::Float(crate::finite(2.0))),
             Value::Concrete(ConcreteValue::Bool(true)),
             Value::Concrete(ConcreteValue::Bool(false)),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("hidden".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("hidden".into()))).into(),
+            )),
         ] {
             assert_inline_width_matches_build(&v);
         }
@@ -14847,9 +14981,9 @@ mod tests {
         };
         let secret_inner = Value::Concrete(ConcreteValue::String("super-secret".into()));
         let identifier = Value::Deferred(DeferredValue::Interpolation(vec![
-            InterpolationPart::Expr(Value::Deferred(DeferredValue::Secret(Box::new(
-                secret_inner,
-            )))),
+            InterpolationPart::Expr(Value::Deferred(DeferredValue::Secret(
+                Box::new(secret_inner).into(),
+            ))),
             InterpolationPart::Literal("|tail".into()),
         ]));
         let effect: Effect = Effect::Import {
@@ -14922,9 +15056,12 @@ mod tests {
             crate::resource::AccessMissPolicy::Error,
         )
         .expect("unknown access remains deferred");
-        let secret = LoopValue::Deferred(LoopDeferredValue::Secret(Box::new(LoopValue::Concrete(
-            crate::resource::ConcreteValue::String("DEFERRED_TEMPLATE_PLAINTEXT".into()),
-        ))));
+        let secret = LoopValue::Deferred(LoopDeferredValue::Secret(
+            Box::new(LoopValue::Concrete(crate::resource::ConcreteValue::String(
+                "DEFERRED_TEMPLATE_PLAINTEXT".into(),
+            )))
+            .into(),
+        ));
         let mut template_resource: crate::resource::Resource<
             crate::resource::ModuleSource,
             LoopSlot,
@@ -15021,9 +15158,12 @@ mod tests {
         use crate::parser::{DeferredForExpression, ForBinding};
 
         let secret = |plaintext: &str| {
-            LoopValue::Deferred(LoopDeferredValue::Secret(Box::new(LoopValue::Concrete(
-                crate::resource::ConcreteValue::String(plaintext.into()),
-            ))))
+            LoopValue::Deferred(LoopDeferredValue::Secret(
+                Box::new(LoopValue::Concrete(crate::resource::ConcreteValue::String(
+                    plaintext.into(),
+                )))
+                .into(),
+            ))
         };
         let mut template_resource: crate::resource::Resource<
             crate::resource::ModuleSource,
@@ -15240,9 +15380,12 @@ mod tests {
         };
         use std::collections::HashMap;
 
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("previous-secret".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "previous-secret".into(),
+            )))
+            .into(),
+        ));
         let plan = replacement_plan_with_previous_attributes(
             HashMap::from([("password".to_string(), secret)]),
             None,
@@ -15260,5 +15403,276 @@ mod tests {
                 crate::resource::SnapshotLeaf::RedactedSecret { .. }
             ))
         ));
+    }
+}
+
+#[cfg(test)]
+mod secret_origin_tests {
+    use super::*;
+
+    #[test]
+    fn secret_origin_4275_serialization_errors_drop_inner_payloads() {
+        use crate::resource::{AccessMissPolicy, FunctionArgument, PathSegment, Subscript};
+        let call: Value = Value::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::split,
+            args: ["-", "private-access"]
+                .into_iter()
+                .map(|text| {
+                    FunctionArgument::from_value(Value::Concrete(ConcreteValue::String(
+                        text.into(),
+                    )))
+                })
+                .collect(),
+            source_line: 1.into(),
+        });
+        let access = crate::resource::apply_postfix_access(
+            call,
+            PathSegment::Subscript {
+                index: Subscript::Int { index: 99 },
+            },
+            1,
+            AccessMissPolicy::Error,
+        )
+        .unwrap();
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(access).into()));
+        let error = value_to_json_inner(&secret, None, false, JsonEncoding::Ordinary).unwrap_err();
+        assert!(!format!("{error}\n{error:?}").contains("private-"));
+        assert!(matches!(
+            error,
+            SerializationError::InsideSecret {
+                kind: SecretSerializationErrorKind::UnresolvedAccess
+            }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod secret_template_regression_tests {
+    use super::*;
+
+    #[test]
+    fn secret_origin_4275_nested_deferred_secrets_still_hash_as_templates() {
+        let reference = Value::root_resource_ref("producer", "text", Vec::new());
+        let child = Value::Deferred(DeferredValue::Secret(Box::new(reference).into()));
+        let value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Map(
+                indexmap::IndexMap::from([("nested".into(), child)]),
+            )))
+            .into(),
+        ));
+        let json = value_to_json(&value)
+            .expect("unresolved nested secrets must still use template hashing");
+        assert!(json.get("$secret").is_some());
+    }
+}
+
+#[cfg(test)]
+mod unknown_secret_diagnostic_tests {
+    use super::*;
+
+    const PRIVATE_HASH_MARKER: &str = "private-hash-material-4275";
+
+    fn invalid_hash_material() -> Value {
+        // Module conditionals fail both serialization and template hashing.
+        let condition = crate::parser::DeferredIfCondition::new(
+            Value::Concrete(ConcreteValue::Bool(true)),
+            PRIVATE_HASH_MARKER.into(),
+            1,
+        );
+        Value::Deferred(DeferredValue::ModuleIf(Box::new(
+            crate::parser::DeferredValueIf::new(
+                crate::parser::DeferredIfCondition::new_with_source_expression(
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                    condition.source_file,
+                    condition.source_line,
+                    condition.source_expression,
+                ),
+                Value::Concrete(ConcreteValue::String(PRIVATE_HASH_MARKER.into())),
+                Value::Concrete(ConcreteValue::String(PRIVATE_HASH_MARKER.into())),
+            ),
+        )))
+    }
+
+    fn invalid_secret() -> Value {
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(invalid_hash_material()).into(),
+        ))
+    }
+
+    fn assert_masked_hash_error(error: SerializationError) {
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains(PRIVATE_HASH_MARKER), "{rendered}");
+        }
+        assert!(
+            matches!(
+                error,
+                SerializationError::InsideSecret {
+                    kind: SecretSerializationErrorKind::UnexpandedModuleIf,
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    fn unavailable_provider_material() -> PersistedValue {
+        PersistedValue {
+            encoded: serde_json::json!({
+                "private_hash_path": persisted_secret_json(&RedactedSecretHash::generate(b"valid")),
+            }),
+        }
+    }
+
+    fn assert_masked_unavailable(error: SerializationError) {
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("private_hash_path"), "{rendered}");
+        }
+        assert!(
+            matches!(error, SerializationError::UnavailableSecret(error) if error.path() == "(secret)")
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_observation_hashing_masks_unavailable_paths() {
+        assert_masked_unavailable(
+            merge_secrets_into_observation_json(
+                &invalid_secret(),
+                &unavailable_provider_material(),
+                None,
+            )
+            .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_provider_hashing_masks_unavailable_paths() {
+        let desired = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref("producer", "private_attr", vec![])).into(),
+        ));
+        assert_masked_unavailable(
+            merge_secrets_into_provider_json(&desired, &unavailable_provider_material(), None)
+                .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_mismatched_observation_hashing_masks_unavailable_paths() {
+        assert_masked_unavailable(
+            mask_mismatched_observation_shape(
+                &invalid_secret(),
+                unavailable_provider_material().view(),
+                None,
+            )
+            .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_provider_secret_hashing_masks_unavailable_paths() {
+        assert_masked_unavailable(
+            crate::provider::hash_provider_json_as_secret(&unavailable_provider_material(), None)
+                .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_snapshot_hashing_masks_errors() {
+        assert_masked_hash_error(redact_secrets_in_value(&invalid_secret()).unwrap_err());
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_guided_hashing_masks_errors() {
+        let plain = invalid_hash_material().to_snapshot();
+        let shape = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("authority".into()))).into(),
+        ));
+        assert_masked_hash_error(redact_plaintext_using_secret_shape(&plain, &shape).unwrap_err());
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_guided_hashing_masks_unavailable_paths() {
+        let source: SnapshotValue = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "private_hash_path".into(),
+            SnapshotValue::redacted(RedactedSecretHash::generate(b"valid")),
+        )])));
+        let shape = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("authority".into()))).into(),
+        ));
+        let error = redact_plaintext_using_secret_shape(&source, &shape).unwrap_err();
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("private_hash_path"), "{rendered}");
+        }
+        assert!(
+            matches!(error, SerializationError::UnavailableSecret(error) if error.path() == "(secret)")
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_evaluated_hashing_masks_errors() {
+        let source = Value::Concrete(ConcreteValue::String("source".into())).to_snapshot();
+        assert_masked_hash_error(
+            redact_snapshot_with_guide(&source, SecretRedactionGuide::Evaluated(&invalid_secret()))
+                .unwrap_err(),
+        );
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_template_hashing_masks_nested_errors() {
+        let value = invalid_secret();
+        let error = canonical_secret_template(&value).unwrap_err();
+        assert_masked_hash_error(error);
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_rehydration_masks_hashing_errors() {
+        let saved = SnapshotValue::redacted(RedactedSecretHash::generate(b"valid"));
+        let error = rehydrate_redacted_secrets_impl(
+            &saved,
+            &invalid_secret(),
+            SecretRehydrationInput::Evaluated,
+        )
+        .unwrap_err();
+        let SecretRehydrationError::Serialization(error) = error else {
+            panic!("{error:?}")
+        };
+        assert_masked_hash_error(error);
+    }
+
+    #[test]
+    fn secret_origin_4275_round2_structural_rehydration_masks_hashing_errors() {
+        let saved: SnapshotValue =
+            Value::Concrete(ConcreteValue::List(vec![SnapshotValue::redacted(
+                RedactedSecretHash::generate(b"valid"),
+            )]));
+        let candidate: Value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::List(vec![
+                invalid_hash_material(),
+            ])))
+            .into(),
+        ));
+        let error =
+            rehydrate_redacted_secrets_impl(&saved, &candidate, SecretRehydrationInput::Evaluated)
+                .unwrap_err();
+        let SecretRehydrationError::Serialization(error) = error else {
+            panic!("{error:?}")
+        };
+        assert_masked_hash_error(error);
+    }
+
+    #[test]
+    fn secret_origin_4275_unknown_secret_keeps_upstream_reason() {
+        let path =
+            crate::resource::AccessPath::with_fields("network", "vpc", vec!["vpc_id".into()])
+                .resolve_root_for_test();
+        let value: Value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::Unknown(
+                ApplyTimeUnknown::UpstreamExport { path },
+            )))
+            .into(),
+        ));
+        let error = value_to_json_inner(&value, None, false, JsonEncoding::Ordinary).unwrap_err();
+        assert!(
+            matches!(error, SerializationError::UnknownNotAllowed { reason, .. }
+            if matches!(reason.as_ref(), ApplyTimeUnknown::UpstreamExport { path } if path.to_dot_string() == "network.vpc.vpc_id"))
+        );
     }
 }

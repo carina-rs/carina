@@ -293,17 +293,24 @@ fn value_has_authored_plan_time_expression<P: PlaceholderKind, B: BindingAddress
         Value::Deferred(DeferredValue::Access(access)) => {
             value_has_authored_plan_time_expression(access.base())
         }
-        // Declared identity is rendered into a public address suffix. Even a
-        // fully-authored secret leaf is therefore incomplete: hashing its
-        // deterministic spelling would disclose plaintext-derived material.
-        // The legacy create-only hash does not call this predicate.
-        Value::Deferred(DeferredValue::Secret(_)) => false,
+        // Main retained secret(<ref>) as a FunctionCall until resolution. Its
+        // authored reference expression was complete, while literal secrets
+        // remained opaque. Keep that addressing rule at the intrinsic arm.
+        Value::Deferred(DeferredValue::Secret(payload)) => payload.visit(|value| {
+            secret_has_reference_expression(value) && value_has_authored_plan_time_expression(value)
+        }),
         Value::Deferred(
             DeferredValue::Unavailable { .. }
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => false,
     }
+}
+
+fn secret_has_reference_expression<P: crate::resource::ValueKind, B: BindingAddress>(
+    value: &Value<P, B>,
+) -> bool {
+    !value.root_bindings().is_empty()
 }
 
 enum IdentityPathInput<'a, P: PlaceholderKind, B: BindingAddress> {
@@ -1711,9 +1718,19 @@ fn deterministic_value_string<P: crate::resource::ValueKind, B: BindingAddress>(
             deterministic_value_string(access.base()),
             access.step().to_plaintext_dot_string()
         ),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            format!("Secret({})", deterministic_value_string(inner))
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner
+            .try_project_plaintext(|value| {
+                let material = if secret_has_reference_expression(value) {
+                    format!(
+                        "FunctionCall(secret({}))",
+                        deterministic_value_string(value)
+                    )
+                } else {
+                    format!("Secret({})", deterministic_value_string(value))
+                };
+                Ok::<_, std::convert::Infallible>(material)
+            })
+            .unwrap(),
 
         Value::Deferred(DeferredValue::Unknown(reason)) => {
             use crate::resource::ApplyTimeUnknown;
@@ -3506,7 +3523,10 @@ fn resolve_deferred_create_only_value(
         Ok(
             crate::resolver::ValueResolution::Absent | crate::resolver::ValueResolution::Unknown(_),
         )
-        | Err(crate::resolver::ResolutionError::Message(_)) => Ok(None),
+        | Err(
+            crate::resolver::ResolutionError::Message(_)
+            | crate::resolver::ResolutionError::InsideSecret { .. },
+        ) => Ok(None),
         Err(crate::resolver::ResolutionError::UnavailableSecret(error)) => Err(error),
     }
 }

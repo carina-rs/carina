@@ -266,6 +266,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn diagnostic_renders_context_and_typed_cause_once() {
+        #[derive(Debug)]
+        struct Context(crate::NonFiniteFloatError);
+        impl fmt::Display for Context {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("invalid ratio")
+            }
+        }
+        impl std::error::Error for Context {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let diagnostic = ProviderDiagnostic::new(Context(crate::NonFiniteFloatError::NaN));
+        assert_eq!(
+            diagnostic.to_string(),
+            "invalid ratio: non-finite float NaN"
+        );
+        assert!(
+            diagnostic
+                .error()
+                .source()
+                .unwrap()
+                .is::<crate::NonFiniteFloatError>()
+        );
+    }
+
+    #[test]
     fn provider_text_builder_bounds_storage_and_counts_the_entire_tail() {
         let mut builder = ProviderTextBuilder::default();
         for _ in 0..32 {

@@ -655,19 +655,22 @@ fn cascade_ref_hint(value: &Value, target_binding: &str) -> Option<String> {
     let mut hit: Option<String> = None;
 
     // Multi-ref attributes report the first target-binding ref in list/IndexMap/source order.
-    value.visit_resource_refs(&mut |path| {
-        if hit.is_none() && path.binding() == target_binding {
-            hit = Some(format!("{}.{}", path.binding(), path.attribute()));
+    value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+        if hit.is_none()
+            && reference
+                .identity()
+                .binding_key()
+                .matches_name(target_binding)
+        {
+            hit = Some(reference.head_path().to_dot_string());
         }
     });
-
     if hit.is_some() {
         return hit;
     }
-
-    value.visit_binding_refs(&mut |binding| {
-        if hit.is_none() && binding.as_str() == target_binding {
-            hit = Some(binding.to_string());
+    value.visit_binding_refs_for_diagnostics(&mut |reference| {
+        if hit.is_none() && reference.identity().matches_name(target_binding) {
+            hit = Some(reference.diagnostic_path().to_dot_string());
         }
     });
 
@@ -2275,6 +2278,27 @@ mod typed_current_identifier_tests {
         assert_eq!(
             pending.replacement.old_instances()[0].identifier.as_str(),
             "typed-provider-id"
+        );
+    }
+}
+
+#[cfg(test)]
+mod review3_tests {
+    use super::*;
+
+    #[test]
+    fn review3_cascade_reference_hints_render_scope() {
+        let reference = Value::root_resource_ref("private_source", "token", vec!["field".into()]);
+        assert_eq!(
+            cascade_ref_hint(&reference, "private_source").as_deref(),
+            Some("private_source.token")
+        );
+        let secret = Value::Deferred(crate::resource::DeferredValue::Secret(
+            Box::new(reference).into(),
+        ));
+        assert_eq!(
+            cascade_ref_hint(&secret, "private_source").as_deref(),
+            Some("(secret)")
         );
     }
 }

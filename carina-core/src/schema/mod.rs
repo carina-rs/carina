@@ -199,6 +199,7 @@ pub use compiled_pattern::{
 };
 
 use crate::provider_text::{ProviderString, ProviderText};
+use crate::resource::InsideSecret;
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -260,6 +261,22 @@ impl ListConstraints {
 
     pub const fn elements(self) -> ListElements {
         self.elements
+    }
+}
+
+/// Entry-count policy enforced when walking a map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MapConstraints {
+    length: Option<(Option<u64>, Option<u64>)>,
+}
+
+impl MapConstraints {
+    pub(crate) const fn new(length: Option<(Option<u64>, Option<u64>)>) -> Self {
+        Self { length }
+    }
+
+    pub const fn length(self) -> Option<(Option<u64>, Option<u64>)> {
+        self.length
     }
 }
 
@@ -555,17 +572,20 @@ fn walk_custom_lookup_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
     // may validate the plaintext, but diagnostics crossing back out of this
     // boundary must discard every user-derived value/message.
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        let mut secret_errors = Vec::new();
-        walk_custom_lookup_on_path(
-            attr_type,
-            inner,
-            attr_name,
-            lookup,
-            defs,
-            &mut secret_errors,
-            visited_refs,
-        );
-        errors.extend(secret_errors.into_iter().map(TypeError::masked_for_secret));
+        let result = inner.try_inspect(|value| {
+            let mut secret_errors = Vec::new();
+            walk_custom_lookup_on_path(
+                attr_type,
+                value,
+                attr_name,
+                lookup,
+                defs,
+                &mut secret_errors,
+                visited_refs,
+            );
+            Err::<(), _>(secret_errors)
+        });
+        errors.extend(result.err().into_iter().flatten());
         return;
     }
     if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
@@ -1551,7 +1571,7 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     /// Floating-point number
     Float {
         binding: RefinementBinding,
-        range: Option<(Option<f64>, Option<f64>)>,
+        range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
     },
     /// Boolean
     Bool,
@@ -1595,6 +1615,7 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     Map {
         key: Box<PatternAttributeType<R>>,
         value: Box<PatternAttributeType<R>>,
+        constraints: MapConstraints,
     },
     /// Struct (named object with typed fields)
     Struct {
@@ -1663,7 +1684,7 @@ pub enum Shape<'a, R: PatternForm = Draft> {
     /// Floating-point — see [`AttrTypeKind::Float { .. }`].
     Float {
         identity: Option<&'a TypeIdentity>,
-        range: Option<(Option<f64>, Option<f64>)>,
+        range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
         validate: Option<&'a CustomValidator>,
     },
     /// Boolean — see [`AttrTypeKind::Bool`].
@@ -1689,6 +1710,7 @@ pub enum Shape<'a, R: PatternForm = Draft> {
     Map {
         key: &'a PatternAttributeType<R>,
         value: &'a PatternAttributeType<R>,
+        constraints: MapConstraints,
     },
     /// Named struct — see [`AttrTypeKind::Struct`].
     Struct { name: &'a str },
@@ -1799,10 +1821,15 @@ impl<R: PatternForm> fmt::Debug for Shape<'_, R> {
                 .field("ordered", ordered)
                 .field("constraints", constraints)
                 .finish_non_exhaustive(),
-            Shape::Map { key, value } => f
+            Shape::Map {
+                key,
+                value,
+                constraints,
+            } => f
                 .debug_struct("Shape::Map")
                 .field("key", key)
                 .field("value", value)
+                .field("constraints", constraints)
                 .finish(),
             Shape::Struct { name } => f.debug_struct("Shape::Struct").field("name", name).finish(),
             Shape::Union => f.debug_tuple("Shape::Union").finish(),
@@ -1857,7 +1884,7 @@ pub enum RawShape<'a, R: PatternForm = Draft> {
     /// Floating-point — see [`AttrTypeKind::Float { .. }`].
     Float {
         identity: Option<&'a TypeIdentity>,
-        range: Option<(Option<f64>, Option<f64>)>,
+        range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
         validate: Option<&'a CustomValidator>,
     },
     /// Boolean — see [`AttrTypeKind::Bool`].
@@ -1883,6 +1910,7 @@ pub enum RawShape<'a, R: PatternForm = Draft> {
     Map {
         key: &'a PatternAttributeType<R>,
         value: &'a PatternAttributeType<R>,
+        constraints: MapConstraints,
     },
     /// Named struct — see [`AttrTypeKind::Struct`].
     Struct {
@@ -1971,10 +1999,15 @@ impl<R: PatternForm> fmt::Debug for RawShape<'_, R> {
                 .field("ordered", ordered)
                 .field("constraints", constraints)
                 .finish_non_exhaustive(),
-            RawShape::Map { key, value } => f
+            RawShape::Map {
+                key,
+                value,
+                constraints,
+            } => f
                 .debug_struct("RawShape::Map")
                 .field("key", key)
                 .field("value", value)
+                .field("constraints", constraints)
                 .finish(),
             RawShape::Struct {
                 name,
@@ -2384,21 +2417,20 @@ impl Schema {
         visited_refs: &mut Vec<&'a str>,
     ) {
         if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-            let mut secret_errors = Vec::new();
-            Self::collect_attr_into_on_path(
-                attr,
-                defs,
-                path,
-                inner,
-                ancestry.inside_secret(),
-                &mut secret_errors,
-                visited_refs,
-            );
-            out.extend(
-                secret_errors
-                    .into_iter()
-                    .map(|(path, error)| (path, error.masked_for_secret())),
-            );
+            let result = inner.try_inspect(|value| {
+                let mut secret_errors = Vec::new();
+                Self::collect_attr_into_on_path(
+                    attr,
+                    defs,
+                    path,
+                    value,
+                    ancestry.inside_secret(),
+                    &mut secret_errors,
+                    visited_refs,
+                );
+                Err::<(), _>(secret_errors)
+            });
+            out.extend(result.err().into_iter().flatten());
             return;
         }
         // Peel Ref so the downstream arms never have to think about it.
@@ -2576,6 +2608,7 @@ impl Schema {
             AttrTypeKind::Map {
                 key,
                 value: value_type,
+                constraints,
             } => {
                 let Some(map) = (match concrete {
                     ConcreteValueRef::Map(map) => Some(map),
@@ -2590,6 +2623,9 @@ impl Schema {
                     ));
                     return;
                 };
+                if let Err(error) = constraints.check(map.len()) {
+                    out.push((path.clone(), error));
+                }
                 let mut first_value_error = None;
                 for (map_key, map_value) in map {
                     let next_path = path.push_field(map_key.clone());
@@ -2758,14 +2794,17 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
     visited_refs: &mut Vec<&'a str>,
 ) -> Result<(), TypeError> {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        return validation_error_with_defs_on_path(
-            attr,
-            inner,
-            defs,
-            ancestry.inside_secret(),
-            visited_refs,
-        )
-        .map_err(TypeError::masked_for_secret);
+        return {
+            inner.try_inspect(|secret_value| {
+                validation_error_with_defs_on_path(
+                    attr,
+                    secret_value,
+                    defs,
+                    ancestry.inside_secret(),
+                    visited_refs,
+                )
+            })
+        };
     }
     if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
         validate_attr_with_defs_and_ancestry(attr, value, defs, ancestry)?;
@@ -2852,8 +2891,13 @@ fn validation_error_with_defs_on_path<'a, P: PlaceholderKind, B: BindingAddress>
             }
             Ok(())
         }
-        AttrTypeKind::Map { key, value: val_ty } => {
+        AttrTypeKind::Map {
+            key,
+            value: val_ty,
+            constraints,
+        } => {
             if let Some(ConcreteValueRef::Map(map)) = value.as_concrete() {
+                constraints.check(map.len())?;
                 for (k, v) in map.iter() {
                     let key_val: Value<P, B> = lift_map_key(key, k, defs);
                     if let Err(inner_err) =
@@ -3041,10 +3085,15 @@ impl<R: PatternForm> fmt::Debug for PatternAttributeType<R> {
                 .field("ordered", ordered)
                 .field("constraints", constraints)
                 .finish(),
-            AttrTypeKind::Map { key, value } => f
+            AttrTypeKind::Map {
+                key,
+                value,
+                constraints,
+            } => f
                 .debug_struct("Map")
                 .field("key", key)
                 .field("value", value)
+                .field("constraints", constraints)
                 .finish(),
             AttrTypeKind::Struct {
                 name,
@@ -3130,19 +3179,6 @@ impl FieldPath {
         steps.push(FieldPathStep::Index(index));
         steps.extend(self.steps.iter().cloned());
         Self { steps }
-    }
-
-    fn masked_for_secret(self) -> Self {
-        Self {
-            steps: self
-                .steps
-                .into_iter()
-                .map(|step| match step {
-                    FieldPathStep::Field(_) => FieldPathStep::Field(SECRET_VALUE_MASK.to_string()),
-                    FieldPathStep::Index(index) => FieldPathStep::Index(index),
-                })
-                .collect(),
-        }
     }
 }
 
@@ -3433,9 +3469,14 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 ordered: *ordered,
                 constraints: *constraints,
             },
-            AttrTypeKind::Map { key, value } => Shape::Map {
+            AttrTypeKind::Map {
+                key,
+                value,
+                constraints,
+            } => Shape::Map {
                 key: key.as_ref(),
                 value: value.as_ref(),
+                constraints: *constraints,
             },
             AttrTypeKind::Struct { name, .. } => Shape::Struct {
                 name: name.as_str(),
@@ -3534,9 +3575,14 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 ordered: *ordered,
                 constraints: *constraints,
             },
-            AttrTypeKind::Map { key, value } => RawShape::Map {
+            AttrTypeKind::Map {
+                key,
+                value,
+                constraints,
+            } => RawShape::Map {
                 key: key.as_ref(),
                 value: value.as_ref(),
+                constraints: *constraints,
             },
             AttrTypeKind::Struct {
                 name,
@@ -3701,9 +3747,17 @@ impl<R: PatternForm> PatternAttributeType<R> {
     }
 
     /// Create a Float type with protocol-carried refinement metadata.
+    ///
+    /// Range endpoints must be admitted finite numbers:
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::schema::AttributeType;
+    ///
+    /// let _ = AttributeType::refined_float(None, Some((Some(f64::NAN), None)));
+    /// ```
     pub fn refined_float(
         identity: Option<TypeIdentity>,
-        range: Option<(Option<f64>, Option<f64>)>,
+        range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
     ) -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::Float {
@@ -3716,7 +3770,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
     /// Create a Float type with refinement metadata and a custom validator.
     pub fn refined_float_with_validator(
         identity: TypeIdentity,
-        range: Option<(Option<f64>, Option<f64>)>,
+        range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
         validate: CustomValidator,
     ) -> Self {
         PatternAttributeType {
@@ -3905,10 +3959,20 @@ impl<R: PatternForm> PatternAttributeType<R> {
 
     /// Create a Map type with a typed key constraint.
     pub fn map_with_key(key: PatternAttributeType<R>, value: PatternAttributeType<R>) -> Self {
+        Self::refined_map(key, value, None)
+    }
+
+    /// Create a Map type with protocol-carried refinement metadata.
+    pub fn refined_map(
+        key: PatternAttributeType<R>,
+        value: PatternAttributeType<R>,
+        length: Option<(Option<u64>, Option<u64>)>,
+    ) -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::Map {
                 key: Box::new(key),
                 value: Box::new(value),
+                constraints: MapConstraints::new(length),
             },
         }
     }
@@ -4053,9 +4117,7 @@ impl PatternAttributeType<Compiled> {
         value: &Value<P, B>,
     ) -> Result<(), TypeError> {
         if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-            return self
-                .validate_leaf_value(inner)
-                .map_err(TypeError::masked_for_secret);
+            return inner.try_inspect(|secret_value| self.validate_leaf_value(secret_value));
         }
         if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
             self.validate_leaf_value(value)?;
@@ -4128,8 +4190,8 @@ impl PatternAttributeType<Compiled> {
     }
 
     /// Validate a primitive (`String`/`Int`/`Float`/`Bool`/`Duration`) value.
-    /// `Float` accepts integers as valid numbers and rejects non-finite
-    /// floats explicitly.
+    /// `Float` accepts integers as valid numbers; its float payloads already
+    /// prove finiteness.
     ///
     /// Phase 2 of RFC #2972: takes [`ConcreteValueRef`], so deferred
     /// values (`ResourceRef`, `Interpolation`, ...) cannot reach this
@@ -4199,18 +4261,11 @@ impl PatternAttributeType<Compiled> {
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
             }
-            (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Float(f))
-                if f.is_finite() =>
-            {
+            (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Float(f)) => {
                 validate_float_range(*range, f)?;
                 binding
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
-            }
-            (AttrTypeKind::Float { .. }, ConcreteValueRef::Float(f)) => {
-                Err(TypeError::ValidationFailed {
-                    message: format!("non-finite float value: {f}").into(),
-                })
             }
             (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Int(i)) => {
                 validate_int_in_float_range(*range, i)?;
@@ -4608,7 +4663,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     .in_schema(self.defs)
                     .resolved_type_name_on_path(visited_refs, expand_constraints)
             ),
-            AttrTypeKind::Map { key, value } if expand_constraints => format!(
+            AttrTypeKind::Map {
+                key,
+                value,
+                constraints: _,
+            } if expand_constraints => format!(
                 "Map<key: {}, value: {}>",
                 key.in_schema(self.defs)
                     .resolved_type_name_on_path(visited_refs, true),
@@ -4936,7 +4995,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -4977,7 +5040,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5022,7 +5089,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5049,7 +5120,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5092,7 +5167,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5142,7 +5221,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5188,7 +5271,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5231,7 +5318,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     ordered: _,
                     constraints: _,
                 }
-                | Map { key: _, value: _ }
+                | Map {
+                    key: _,
+                    value: _,
+                    constraints: _,
+                }
                 | Struct {
                     name: _,
                     fields: _,
@@ -5336,8 +5427,8 @@ fn validate_int_range(
 }
 
 fn validate_float_range(
-    range: Option<(Option<f64>, Option<f64>)>,
-    value: f64,
+    range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
+    value: crate::FiniteF64,
 ) -> Result<(), TypeError> {
     if let Some((min, max)) = range
         && (min.is_some_and(|min| value < min) || max.is_some_and(|max| value > max))
@@ -5348,19 +5439,23 @@ fn validate_float_range(
 }
 
 fn validate_int_in_float_range(
-    range: Option<(Option<f64>, Option<f64>)>,
+    range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
     value: i64,
 ) -> Result<(), TypeError> {
     if let Some((min, max)) = range
-        && (min.is_some_and(|min| compare_int_float(value, min) == Some(Ordering::Less))
-            || max.is_some_and(|max| compare_int_float(value, max) == Some(Ordering::Greater)))
+        && (min.is_some_and(|min| compare_int_float(value, min) == Ordering::Less)
+            || max.is_some_and(|max| compare_int_float(value, max) == Ordering::Greater))
     {
         return Err(float_range_error(value, min, max));
     }
     Ok(())
 }
 
-fn float_range_error(value: impl fmt::Display, min: Option<f64>, max: Option<f64>) -> TypeError {
+fn float_range_error(
+    value: impl fmt::Display,
+    min: Option<crate::FiniteF64>,
+    max: Option<crate::FiniteF64>,
+) -> TypeError {
     TypeError::ValidationFailed {
         message: format!("value {value} is outside allowed range {min:?}..={max:?}").into(),
     }
@@ -5502,6 +5597,25 @@ impl KnownListElement {
 struct ListConstraintError {
     index: Option<usize>,
     error: Box<TypeError>,
+}
+
+impl MapConstraints {
+    fn check(self, count: usize) -> Result<(), TypeError> {
+        if let Some((min, max)) = self.length {
+            let count_u64 = count as u64;
+            if min.is_some_and(|min| count_u64 < min) || max.is_some_and(|max| count_u64 > max) {
+                return Err(TypeError::LengthOutOfRange {
+                    value: format!("{count} entries").into(),
+                    length: count,
+                    min,
+                    max,
+                    attribute: None,
+                    type_name: Some("Map".to_string()),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ListConstraints {
@@ -5707,14 +5821,19 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
         | AT::Ref(_) => {}
     }
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        let inner = inspect_value_structure_on_path(
-            attr,
-            inner,
-            defs,
-            ancestry.inside_secret(),
-            purpose,
-            visited_refs,
-        )?;
+        let inner = inner
+            .try_project_plaintext(|value| {
+                inspect_value_structure_on_path(
+                    attr,
+                    value,
+                    defs,
+                    ancestry.inside_secret(),
+                    purpose,
+                    visited_refs,
+                )
+                .ok_or(())
+            })
+            .ok()?;
         let exactness = inner.exactness;
         return Some(Fit::with_kind(
             exactness,
@@ -5917,9 +6036,11 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
             AT::Map {
                 key,
                 value: value_type,
+                constraints,
             },
             ConcreteValueRef::Map(map),
         ) => {
+            constraints.check(map.len()).ok()?;
             let mut exactness = FitExactness::GENERIC_MAP;
             let mut entry_fits = Vec::with_capacity(map.len());
             for (map_key, map_value) in map {
@@ -6709,8 +6830,8 @@ fn i64_range_contains(
 }
 
 fn f64_range_contains(
-    source: Option<&(Option<f64>, Option<f64>)>,
-    sink: Option<&(Option<f64>, Option<f64>)>,
+    source: Option<&(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
+    sink: Option<&(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
 ) -> bool {
     let Some((s_min, s_max)) = source else {
         return matches!(sink, None | Some((None, None)));
@@ -6718,16 +6839,14 @@ fn f64_range_contains(
     let Some((k_min, k_max)) = sink else {
         return true;
     };
-    let s_min = s_min.unwrap_or(f64::NEG_INFINITY);
-    let s_max = s_max.unwrap_or(f64::INFINITY);
-    let k_min = k_min.unwrap_or(f64::NEG_INFINITY);
-    let k_max = k_max.unwrap_or(f64::INFINITY);
-    k_min <= s_min && s_max <= k_max
+    let min_contained = k_min.is_none_or(|min| s_min.is_some_and(|source| min <= source));
+    let max_contained = k_max.is_none_or(|max| s_max.is_some_and(|source| source <= max));
+    min_contained && max_contained
 }
 
 fn i64_range_assignable_to_f64(
     source: Option<&(Option<i64>, Option<i64>)>,
-    sink: Option<&(Option<f64>, Option<f64>)>,
+    sink: Option<&(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
 ) -> bool {
     let Some((source_min, source_max)) = source else {
         return matches!(sink, None | Some((None, None)));
@@ -6737,16 +6856,18 @@ fn i64_range_assignable_to_f64(
     };
     let source_min = source_min.unwrap_or(i64::MIN);
     let source_max = source_max.unwrap_or(i64::MAX);
-    let sink_min = sink_min.unwrap_or(f64::NEG_INFINITY);
-    let sink_max = sink_max.unwrap_or(f64::INFINITY);
-    let min_contained = matches!(
-        compare_int_float(source_min, sink_min),
-        Some(Ordering::Greater | Ordering::Equal)
-    );
-    let max_contained = matches!(
-        compare_int_float(source_max, sink_max),
-        Some(Ordering::Less | Ordering::Equal)
-    );
+    let min_contained = sink_min.is_none_or(|bound| {
+        matches!(
+            compare_int_float(source_min, bound),
+            Ordering::Greater | Ordering::Equal
+        )
+    });
+    let max_contained = sink_max.is_none_or(|bound| {
+        matches!(
+            compare_int_float(source_max, bound),
+            Ordering::Less | Ordering::Equal
+        )
+    });
     min_contained && max_contained
 }
 
@@ -6843,7 +6964,7 @@ fn join_expected(expected: &[ExpectedEnumVariant]) -> String {
         .join(", ")
 }
 
-const SECRET_VALUE_MASK: &str = "(secret)";
+pub(crate) const SECRET_VALUE_MASK: &str = "(secret)";
 
 fn format_string_literal_expected_enum(
     user_typed: &DiagnosticValue,
@@ -7926,155 +8047,6 @@ impl TypeError {
             | TypeError::UnknownStructField { .. }
             | TypeError::UnionStructMismatch { .. } => None,
             TypeError::CustomTypeValidation { attribute, .. } => attribute.as_deref(),
-        }
-    }
-
-    /// Remove user-authored data from an error produced while validating the
-    /// contents of a [`DeferredValue::Secret`]. Structured schema context is
-    /// retained, while free-form validator messages are replaced wholesale
-    /// because providers and custom validators may echo the plaintext.
-    #[must_use]
-    pub(crate) fn masked_for_secret(self) -> Self {
-        const MASKED_MESSAGE: &str = "(secret) failed validation";
-
-        match self {
-            TypeError::InvalidEnumVariant {
-                value_kind,
-                attribute,
-                type_name,
-                expected,
-                ..
-            } => TypeError::InvalidEnumVariant {
-                value: DiagnosticValue::Masked,
-                value_kind,
-                attribute,
-                type_name,
-                expected,
-            },
-            TypeError::PatternMismatch {
-                pattern,
-                attribute,
-                type_name,
-                ..
-            } => TypeError::PatternMismatch {
-                value: DiagnosticValue::Masked,
-                pattern,
-                attribute,
-                type_name,
-            },
-            TypeError::LengthOutOfRange {
-                length,
-                min,
-                max,
-                attribute,
-                type_name,
-                ..
-            } => TypeError::LengthOutOfRange {
-                value: DiagnosticValue::Masked,
-                length,
-                min,
-                max,
-                attribute,
-                type_name,
-            },
-            TypeError::DuplicateListElement {
-                index,
-                first_index,
-                attribute,
-                value: _,
-            } => TypeError::DuplicateListElement {
-                value: DiagnosticValue::Masked,
-                index,
-                first_index,
-                attribute,
-            },
-            TypeError::StringLiteralExpectedEnum {
-                attribute,
-                type_name,
-                expected,
-                extra_message,
-                ..
-            } => TypeError::StringLiteralExpectedEnum {
-                user_typed: DiagnosticValue::Masked,
-                attribute,
-                type_name,
-                expected,
-                extra_message: extra_message.map(|_| MASKED_MESSAGE.into()),
-            },
-            TypeError::ValidationFailed { .. } => TypeError::ValidationFailed {
-                message: MASKED_MESSAGE.into(),
-            },
-            TypeError::CustomTypeValidation { error, attribute } => {
-                TypeError::CustomTypeValidation {
-                    error: Box::new((*error).masked_for_secret()),
-                    attribute,
-                }
-            }
-            TypeError::ResourceValidationFailed { attribute, .. } => {
-                TypeError::ResourceValidationFailed {
-                    message: MASKED_MESSAGE.into(),
-                    attribute,
-                }
-            }
-            TypeError::UnknownAttribute { .. } => TypeError::UnknownAttribute {
-                name: SECRET_VALUE_MASK.to_string(),
-                suggestion: None,
-            },
-            TypeError::UnknownStructField { struct_name, .. } => TypeError::UnknownStructField {
-                struct_name,
-                field: SECRET_VALUE_MASK.to_string(),
-                suggestion: None,
-            },
-            TypeError::UnionStructMismatch {
-                reason,
-                alternatives,
-                ..
-            } => TypeError::UnionStructMismatch {
-                reason: match reason {
-                    UnionStructMismatchReason::ConflictingAlternatives => {
-                        UnionStructMismatchReason::ConflictingAlternatives
-                    }
-                    UnionStructMismatchReason::NoAlternativeSatisfied { .. } => {
-                        UnionStructMismatchReason::NoAlternativeSatisfied {
-                            unrecognized_fields: vec![SECRET_VALUE_MASK.to_string()],
-                        }
-                    }
-                },
-                supplied_fields: Vec::new(),
-                alternatives,
-            },
-            TypeError::UnionAlternativesMismatch { failures } => {
-                let (first, rest) = failures.into_parts();
-                TypeError::from_union_arm_errors(
-                    first.masked_for_secret(),
-                    rest.into_iter().map(TypeError::masked_for_secret),
-                )
-            }
-            TypeError::ListItemError { index, inner } => TypeError::ListItemError {
-                index,
-                inner: Box::new(inner.masked_for_secret()),
-            },
-            TypeError::MapKeyError { inner, .. } => TypeError::MapKeyError {
-                key: SECRET_VALUE_MASK.to_string(),
-                inner: Box::new(inner.masked_for_secret()),
-            },
-            TypeError::MapValueError { inner, .. } => TypeError::MapValueError {
-                key: SECRET_VALUE_MASK.to_string(),
-                inner: Box::new(inner.masked_for_secret()),
-            },
-            TypeError::StructFieldError { inner, .. } => TypeError::StructFieldError {
-                field: SECRET_VALUE_MASK.to_string(),
-                inner: Box::new(inner.masked_for_secret()),
-            },
-            TypeError::FieldGroupViolation { path, group } => TypeError::FieldGroupViolation {
-                path: path.masked_for_secret(),
-                group,
-            },
-            TypeError::TypeMismatch { .. }
-            | TypeError::BindingShadowsEnumMember(_)
-            | TypeError::MissingRequired { .. }
-            | TypeError::ReadOnlyAttribute { .. }
-            | TypeError::BlockSyntaxNotAllowed { .. } => self,
         }
     }
 
@@ -10554,6 +10526,7 @@ fn identified_declaration_kind(
         RawShape::Map {
             key: _key,
             value: _value,
+            constraints: _,
         } => None,
         RawShape::Struct {
             name: _name,
@@ -10626,6 +10599,7 @@ fn identified_declaration_scalar_kind(
         RawShape::Map {
             key: _key,
             value: _value,
+            constraints: _,
         } => None,
         RawShape::Struct {
             name: _name,
@@ -10678,7 +10652,11 @@ fn visit_identified_declarations(
             ordered: _,
             constraints: _constraints,
         } => visit_identified_declarations(element_type, visitor),
-        RawShape::Map { key, value } => {
+        RawShape::Map {
+            key,
+            value,
+            constraints: _,
+        } => {
             visit_identified_declarations(key, visitor);
             visit_identified_declarations(value, visitor);
         }
@@ -10902,7 +10880,11 @@ fn validate_identified_scalar_kind_consistency(
             seen,
             issues,
         ),
-        RawShape::Map { key, value } => {
+        RawShape::Map {
+            key,
+            value,
+            constraints: _,
+        } => {
             validate_identified_scalar_kind_consistency(
                 key,
                 location.with_suffix(".key"),
@@ -11255,7 +11237,11 @@ fn validate_type_definition(
             visited_definitions,
             issues,
         ),
-        AttrTypeKind::Map { key, value } => {
+        AttrTypeKind::Map {
+            key,
+            value,
+            constraints: _,
+        } => {
             validate_type_definition(
                 key,
                 defs,
@@ -11392,7 +11378,11 @@ fn collect_identity_paths_in_type(
             false,
             collection,
         ),
-        AttrTypeKind::Map { key, value } => {
+        AttrTypeKind::Map {
+            key,
+            value,
+            constraints: _,
+        } => {
             collect_identity_paths_in_type(
                 key,
                 defs,
@@ -11503,9 +11493,6 @@ fn validate_portable_default(
             &location,
             "schema default is not a portable wire value",
         ),
-        Value::Concrete(ConcreteValue::Float(value)) if !value.is_finite() => {
-            push_schema_issue(issues, &location, "schema default float must be finite");
-        }
         Value::Concrete(ConcreteValue::List(values)) => {
             for (index, value) in values.iter().enumerate() {
                 validate_portable_default(
@@ -11868,7 +11855,12 @@ fn project_write_only_leaves<'schema, R: PatternForm, P: crate::resource::ValueK
     leaves: &mut Vec<(LeafPath, Value<P>, &'schema PatternAttributeType<R>)>,
 ) {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        project_write_only_leaves(attr_type, inner, defs, path, ref_chain, true, leaves);
+        inner
+            .try_project_plaintext(|value| {
+                project_write_only_leaves(attr_type, value, defs, path, ref_chain, true, leaves);
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .unwrap();
         return;
     }
 
@@ -11944,7 +11936,7 @@ fn project_write_only_leaves<'schema, R: PatternForm, P: crate::resource::ValueK
                     let projected = if inherited_secret
                         && !matches!(field_value, Value::Deferred(DeferredValue::Secret(_)))
                     {
-                        Value::Deferred(DeferredValue::Secret(Box::new(field_value.clone())))
+                        Value::Deferred(DeferredValue::Secret(Box::new(field_value.clone()).into()))
                     } else {
                         field_value.clone()
                     };
@@ -11987,9 +11979,15 @@ fn strip_write_only_leaves_from_value<'schema, P: crate::resource::ValueKind>(
     ref_chain: &mut Vec<&'schema str>,
 ) -> Value<P> {
     if let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        return Value::Deferred(DeferredValue::Secret(Box::new(
-            strip_write_only_leaves_from_value(attr_type, inner, defs, ref_chain),
-        )));
+        return Value::Deferred(DeferredValue::Secret(
+            inner
+                .try_map(|value| {
+                    Ok::<_, std::convert::Infallible>(strip_write_only_leaves_from_value(
+                        attr_type, value, defs, ref_chain,
+                    ))
+                })
+                .unwrap(),
+        ));
     }
 
     match &attr_type.kind {
@@ -12098,22 +12096,51 @@ pub const WAIT_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// for `aws_acm_certificate_validation`.
 pub const WAIT_DEFAULT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn reveal_secret_value_for_validation(value: &Value) -> Value {
+fn check_secret_validation_value<E: InsideSecret>(
+    value: &Value,
+    check: &mut dyn FnMut(&Value) -> Result<(), E>,
+) -> Result<(), E> {
     match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => reveal_secret_value_for_validation(inner),
-        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
-            items
-                .iter()
-                .map(reveal_secret_value_for_validation)
-                .collect(),
-        )),
-        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
-            map.iter()
-                .map(|(key, value)| (key.clone(), reveal_secret_value_for_validation(value)))
-                .collect(),
-        )),
-        other => other.clone(),
+        Value::Deferred(DeferredValue::Secret(payload)) => payload
+            .try_map(|value| {
+                check_secret_validation_value(value, check)?;
+                Ok(value.clone())
+            })
+            .map(|_| ()),
+        Value::Concrete(ConcreteValue::List(items)) => {
+            check_secret_validation_items(items, &mut |items| {
+                check(&Value::Concrete(ConcreteValue::List(items.to_vec())))
+            })
+        }
+        Value::Concrete(ConcreteValue::Map(entries)) => {
+            let items: Vec<_> = entries.values().cloned().collect();
+            check_secret_validation_items(&items, &mut |items| {
+                let entries = entries.keys().cloned().zip(items.iter().cloned()).collect();
+                check(&Value::Concrete(ConcreteValue::Map(entries)))
+            })
+        }
+        other => check(other),
     }
+}
+
+fn check_secret_validation_items<E: InsideSecret>(
+    items: &[Value],
+    check: &mut dyn FnMut(&[Value]) -> Result<(), E>,
+) -> Result<(), E> {
+    let Some(index) = items.iter().position(crate::value::contains_secret) else {
+        return check(items);
+    };
+    let (prefix, remaining) = items.split_at(index);
+    let (first, rest) = remaining.split_first().expect("secret item");
+    check_secret_validation_value(first, &mut |first| {
+        check_secret_validation_items(rest, &mut |rest| {
+            let mut values = Vec::with_capacity(prefix.len() + rest.len() + 1);
+            values.extend_from_slice(prefix);
+            values.push(first.clone());
+            values.extend_from_slice(rest);
+            check(&values)
+        })
+    })
 }
 
 fn run_resource_validator(
@@ -12121,15 +12148,22 @@ fn run_resource_validator(
     attributes: &HashMap<String, Value>,
 ) -> Result<(), Vec<TypeError>> {
     if attributes.values().any(crate::value::contains_secret) {
-        let revealed = attributes
-            .iter()
-            .map(|(name, value)| (name.clone(), reveal_secret_value_for_validation(value)))
-            .collect();
-        validator(&revealed).map_err(|errors| {
-            errors
-                .into_iter()
-                .map(TypeError::masked_for_secret)
-                .collect()
+        let input = Value::Concrete(ConcreteValue::Map(
+            attributes
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
+        ));
+        check_secret_validation_value(&input, &mut |value| {
+            let Value::Concrete(ConcreteValue::Map(entries)) = value else {
+                unreachable!("resource attributes are a map")
+            };
+            validator(
+                &entries
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect(),
+            )
         })
     } else {
         validator(attributes)
@@ -15652,4 +15686,164 @@ pub(crate) fn assignment_catalog_without_edges_for_test()
             )
         });
     &CATALOG
+}
+
+impl crate::resource::InsideSecret for FieldPath {
+    fn inside_secret(self) -> Self {
+        Self {
+            steps: self
+                .steps
+                .into_iter()
+                .map(|step| match step {
+                    FieldPathStep::Field(_) => FieldPathStep::Field(SECRET_VALUE_MASK.to_string()),
+                    FieldPathStep::Index(index) => FieldPathStep::Index(index),
+                })
+                .collect(),
+        }
+    }
+}
+
+impl crate::resource::InsideSecret for TypeError {
+    fn inside_secret(self) -> Self {
+        match self {
+            TypeError::InvalidEnumVariant {
+                value_kind,
+                attribute,
+                type_name,
+                expected,
+                ..
+            } => TypeError::InvalidEnumVariant {
+                value: DiagnosticValue::Masked,
+                value_kind,
+                attribute,
+                type_name,
+                expected,
+            },
+            TypeError::PatternMismatch {
+                pattern,
+                attribute,
+                type_name,
+                ..
+            } => TypeError::PatternMismatch {
+                value: DiagnosticValue::Masked,
+                pattern,
+                attribute,
+                type_name,
+            },
+            TypeError::LengthOutOfRange {
+                length,
+                min,
+                max,
+                attribute,
+                type_name,
+                ..
+            } => TypeError::LengthOutOfRange {
+                value: DiagnosticValue::Masked,
+                length,
+                min,
+                max,
+                attribute,
+                type_name,
+            },
+            TypeError::DuplicateListElement {
+                index,
+                first_index,
+                attribute,
+                value: _,
+            } => TypeError::DuplicateListElement {
+                value: DiagnosticValue::Masked,
+                index,
+                first_index,
+                attribute,
+            },
+            TypeError::StringLiteralExpectedEnum {
+                attribute,
+                type_name,
+                expected,
+                extra_message,
+                ..
+            } => TypeError::StringLiteralExpectedEnum {
+                user_typed: DiagnosticValue::Masked,
+                attribute,
+                type_name,
+                expected,
+                extra_message: extra_message
+                    .map(|_| format!("{SECRET_VALUE_MASK} failed validation").into()),
+            },
+            TypeError::ValidationFailed { .. } => TypeError::ValidationFailed {
+                message: format!("{SECRET_VALUE_MASK} failed validation").into(),
+            },
+            TypeError::CustomTypeValidation { error, attribute } => {
+                TypeError::CustomTypeValidation {
+                    error: Box::new((*error).inside_secret()),
+                    attribute,
+                }
+            }
+            TypeError::ResourceValidationFailed { attribute, .. } => {
+                TypeError::ResourceValidationFailed {
+                    message: format!("{SECRET_VALUE_MASK} failed validation").into(),
+                    attribute,
+                }
+            }
+            TypeError::UnknownAttribute { .. } => TypeError::UnknownAttribute {
+                name: SECRET_VALUE_MASK.to_string(),
+                suggestion: None,
+            },
+            TypeError::UnknownStructField { struct_name, .. } => TypeError::UnknownStructField {
+                struct_name,
+                field: SECRET_VALUE_MASK.to_string(),
+                suggestion: None,
+            },
+            TypeError::UnionStructMismatch {
+                reason,
+                alternatives,
+                ..
+            } => TypeError::UnionStructMismatch {
+                reason: match reason {
+                    UnionStructMismatchReason::ConflictingAlternatives => {
+                        UnionStructMismatchReason::ConflictingAlternatives
+                    }
+                    UnionStructMismatchReason::NoAlternativeSatisfied { .. } => {
+                        UnionStructMismatchReason::NoAlternativeSatisfied {
+                            unrecognized_fields: vec![SECRET_VALUE_MASK.to_string()],
+                        }
+                    }
+                },
+                supplied_fields: Vec::new(),
+                alternatives,
+            },
+            TypeError::UnionAlternativesMismatch { failures } => {
+                let (first, rest) = failures.into_parts();
+                TypeError::from_union_arm_errors(
+                    first.inside_secret(),
+                    rest.into_iter().map(TypeError::inside_secret),
+                )
+            }
+            TypeError::ListItemError { index, inner } => TypeError::ListItemError {
+                index,
+                inner: Box::new((*inner).inside_secret()),
+            },
+            TypeError::MapKeyError { inner, .. } => TypeError::MapKeyError {
+                key: SECRET_VALUE_MASK.to_string(),
+                inner: Box::new((*inner).inside_secret()),
+            },
+            TypeError::MapValueError { inner, .. } => TypeError::MapValueError {
+                key: SECRET_VALUE_MASK.to_string(),
+                inner: Box::new((*inner).inside_secret()),
+            },
+            TypeError::StructFieldError { inner, .. } => TypeError::StructFieldError {
+                field: SECRET_VALUE_MASK.to_string(),
+                inner: Box::new((*inner).inside_secret()),
+            },
+            TypeError::FieldGroupViolation { path, group } => TypeError::FieldGroupViolation {
+                path: path.inside_secret(),
+                group,
+            },
+            TypeError::TypeMismatch { .. }
+            | TypeError::BindingShadowsEnumMember(_)
+            | TypeError::MissingRequired { .. }
+            | TypeError::ReadOnlyAttribute { .. }
+            | TypeError::BlockSyntaxNotAllowed { .. } => self,
+        }
+    }
 }

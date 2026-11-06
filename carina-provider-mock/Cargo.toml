@@ -15,6 +15,10 @@ doctest = false
 name = "carina-provider-mock"
 path = "src/main.rs"
 
+[[bin]]
+name = "carina-provider-mock-raw-float"
+path = "src/bin/raw_float.rs"
+
 [dependencies]
 carina-core = { path = "../carina-core" }
 carina-plugin-sdk = { path = "../carina-plugin-sdk" }

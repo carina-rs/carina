@@ -391,8 +391,15 @@ impl<R: ReferenceEquality> ComparisonContext<'_, R> {
         }
     }
 
-    fn secret_matches_state(&self, inner: &Value, state: &Value) -> bool {
-        match secret_matches_state(inner, state) {
+    fn secret_matches_state(
+        &self,
+        payload: &crate::resource::SecretPayload<
+            crate::resource::SnapshotLeaf,
+            crate::resource::AbsoluteBindingAddress,
+        >,
+        state: &Value,
+    ) -> bool {
+        match payload.try_inspect(|value| secret_matches_state(value, state)) {
             Ok(equal) => equal,
             Err(error) => {
                 self.errors.retain(error.into());
@@ -926,7 +933,7 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
                 Value::Concrete(ConcreteValue::Float(f)),
                 Value::Concrete(ConcreteValue::Int(i)),
                 crate::schema::Shape::Float { .. } | crate::schema::Shape::Int { .. },
-            ) => compare_int_float(*i, *f) == Some(Ordering::Equal),
+            ) => compare_int_float(*i, *f) == Ordering::Equal,
 
             // Preserve provider/API-to-DSL transform equality first, then
             // consult the identity's reference form under this initialized
@@ -1035,7 +1042,7 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
                         )
                     }) =>
                     {
-                        compare_int_float(*i, *f) == Some(Ordering::Equal)
+                        compare_int_float(*i, *f) == Ordering::Equal
                     }
                     _ => types.any_on_path(&mut current_path, |member, member_path| {
                         type_aware_equal_on_path(
@@ -1303,7 +1310,7 @@ fn is_type_default(
         }
         (Value::Concrete(ConcreteValue::Int(0)), Some(crate::schema::Shape::Int { .. })) => true,
         (Value::Concrete(ConcreteValue::Float(f)), Some(crate::schema::Shape::Float { .. }))
-            if *f == 0.0 =>
+            if f.get() == 0.0 =>
         {
             true
         }
@@ -1418,7 +1425,7 @@ fn contains_pending_reread(value: &Value) -> bool {
             .iter()
             .any(|argument| contains_pending_reread(argument.walker_value())),
         Value::Deferred(DeferredValue::Access(access)) => contains_pending_reread(access.base()),
-        Value::Deferred(DeferredValue::Secret(inner)) => contains_pending_reread(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(contains_pending_reread),
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_pending_reread(value) || contains_pending_reread(default)
         }
@@ -1665,7 +1672,7 @@ fn has_observable_content(value: &Value) -> bool {
         }
         Value::Concrete(ConcreteValue::List(items)) => items.iter().any(has_observable_content),
         Value::Concrete(ConcreteValue::StringList(items)) => !items.is_empty(),
-        Value::Deferred(DeferredValue::Secret(inner)) => has_observable_content(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(has_observable_content),
         Value::Deferred(DeferredValue::ModuleIf(_)) => true,
         Value::Concrete(ConcreteValue::String(_))
         | Value::Concrete(ConcreteValue::EnumIdentifier(_))
@@ -2205,7 +2212,7 @@ mod tests {
         );
         let hash =
             crate::value::redact_secrets_in_value(&crate::resource::ExpandedValue::Deferred(
-                crate::resource::ExpandedDeferredValue::Secret(Box::new(plaintext)),
+                crate::resource::ExpandedDeferredValue::Secret(Box::new(plaintext).into()),
             ))
             .unwrap();
         let material = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
@@ -2219,7 +2226,7 @@ mod tests {
             if error.path() == "comparison.secret.opaque")
         );
 
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(material)));
+        let secret = Value::Deferred(DeferredValue::Secret(Box::new(material).into()));
         let schema = crate::differ::exact_comparison_schema_for_tests();
         let witnesses = crate::references::prepare_empty_for_tests();
         let resource = crate::resource::ResourceId::with_identity("test.Resource", "example");
@@ -2262,7 +2269,7 @@ mod tests {
         for verdict in [planning, observation, authoring, recorded] {
             assert!(matches!(verdict, Err(ComparisonError::Secret(
                 SerializationError::UnavailableSecret(ref error)
-            )) if error.path() == "comparison.secret.opaque"));
+            )) if error.path() == "(secret)"));
         }
     }
 

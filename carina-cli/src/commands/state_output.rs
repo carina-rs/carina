@@ -236,9 +236,9 @@ fn public_json_value(value: &SnapshotValue) -> Result<serde_json::Value, &'stati
         Value::Concrete(ConcreteValue::Int(value)) => {
             Ok(serde_json::Value::Number((*value).into()))
         }
-        Value::Concrete(ConcreteValue::Float(value)) => serde_json::Number::from_f64(*value)
-            .map(serde_json::Value::Number)
-            .ok_or("the value is a non-finite float"),
+        Value::Concrete(ConcreteValue::Float(value)) => {
+            Ok(serde_json::Value::Number(value.to_json_number()))
+        }
         Value::Concrete(ConcreteValue::Bool(value)) => Ok(serde_json::Value::Bool(*value)),
         Value::Concrete(ConcreteValue::Duration(value)) => Ok(serde_json::Value::Number(
             serde_json::Number::from(value.as_secs()),

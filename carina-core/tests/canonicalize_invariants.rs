@@ -87,7 +87,7 @@ fn check_value<P: PlaceholderKind, B: BindingAddress>(v: &Value<P, B>, path: &st
             }
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            check_value(inner, &format!("{}/<secret>", path))
+            check_value(inner.plaintext_for_test(), &format!("{}/<secret>", path))
         }
         Value::Deferred(DeferredValue::FunctionCall { name, args, .. }) => {
             for (i, a) in args.iter().enumerate() {

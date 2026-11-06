@@ -80,17 +80,7 @@ impl PatternAttributeType<Draft> {
             },
             AttrTypeKind::StringLiteralSet { values } => AttrTypeKind::StringLiteralSet { values },
             AttrTypeKind::Int { binding, range } => AttrTypeKind::Int { binding, range },
-            AttrTypeKind::Float { binding, range } => {
-                if range.is_some_and(|(min, max)| {
-                    min.into_iter()
-                        .chain(max)
-                        .any(|endpoint| !endpoint.is_finite())
-                }) {
-                    push_schema_issue(issues, &location, "float range endpoints must be finite");
-                    return None;
-                }
-                AttrTypeKind::Float { binding, range }
-            }
+            AttrTypeKind::Float { binding, range } => AttrTypeKind::Float { binding, range },
             AttrTypeKind::Bool => AttrTypeKind::Bool,
             AttrTypeKind::Duration => AttrTypeKind::Duration,
             AttrTypeKind::Enum {
@@ -119,12 +109,17 @@ impl PatternAttributeType<Draft> {
                 ordered,
                 constraints,
             },
-            AttrTypeKind::Map { key, value } => {
+            AttrTypeKind::Map {
+                key,
+                value,
+                constraints,
+            } => {
                 let key = key.compile_patterns(location.with_suffix(".<key>"), issues);
                 let value = value.compile_patterns(location.with_suffix(".<value>"), issues);
                 AttrTypeKind::Map {
                     key: Box::new(key?),
                     value: Box::new(value?),
+                    constraints,
                 }
             }
             AttrTypeKind::Struct {

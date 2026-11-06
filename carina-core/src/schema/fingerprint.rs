@@ -18,7 +18,7 @@ use super::{
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v9";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v10";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -350,8 +350,8 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             encoder.tag(4);
             encoder.option(binding.identity(), encode_type_identity);
             encoder.option(*range, |encoder, (min, max)| {
-                encoder.option(min, |encoder, value| encoder.u64(value.to_bits()));
-                encoder.option(max, |encoder, value| encoder.u64(value.to_bits()));
+                encoder.option(min, |encoder, value| encoder.u64(value.get().to_bits()));
+                encoder.option(max, |encoder, value| encoder.u64(value.get().to_bits()));
             });
             encode_callback_presence(encoder, binding.callback().is_some());
         }
@@ -399,10 +399,15 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             });
             encode_callback_presence(encoder, false);
         }
-        AttrTypeKind::Map { key, value } => {
+        AttrTypeKind::Map {
+            key,
+            value,
+            constraints,
+        } => {
             encoder.tag(9);
             encode_attribute_type(encoder, key);
             encode_attribute_type(encoder, value);
+            encode_optional_u64_range(encoder, constraints.length());
         }
         AttrTypeKind::Struct {
             name,
@@ -705,6 +710,30 @@ mod tests {
             schema(super::super::ListElements::AllowDuplicates).semantic_fingerprint(),
             schema(super::super::ListElements::Unique).semantic_fingerprint()
         );
+    }
+
+    #[test]
+    fn map_length_changes_the_fingerprint() {
+        let schema = |length| {
+            ResourceSchema::new("test.Subject").attribute(
+                AttributeSchema::optional(
+                    "params",
+                    AttributeType::refined_map(
+                        AttributeType::string(),
+                        AttributeType::string(),
+                        length,
+                    ),
+                )
+                .build(),
+            )
+        };
+        let unbounded = schema(None).semantic_fingerprint();
+        let bounded = schema(Some((Some(0), Some(10)))).semantic_fingerprint();
+        let different_max = schema(Some((Some(0), Some(11)))).semantic_fingerprint();
+        let different_min = schema(Some((Some(1), Some(10)))).semantic_fingerprint();
+        assert_ne!(unbounded, bounded);
+        assert_ne!(bounded, different_max);
+        assert_ne!(bounded, different_min);
     }
 
     #[test]

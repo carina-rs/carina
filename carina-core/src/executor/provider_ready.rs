@@ -14,7 +14,7 @@ use indexmap::IndexMap;
 use thiserror::Error;
 
 use crate::binding_index::ResolvedBindings;
-use crate::executor::normalized::apply_desired_normalization;
+use crate::executor::normalized::{apply_dispatch_desired_normalization, unwrap_secret};
 pub use crate::module_resolver::ModuleConstraintFailure;
 use crate::module_resolver::{
     evaluate_live_pending_constraints, evaluate_saved_pending_constraints,
@@ -25,10 +25,10 @@ use crate::provider::{
     ProviderWireTarget, ResourceWirePayload, UpdateRequest, WireAttributes, WireReady,
 };
 use crate::resource::{
-    AbsoluteBindingAddress, BindingAddress, ConcreteValue, DataSource, DeferredValue,
-    LiveComposition, NoPlaceholder, ParserPlaceholder, PlaceholderKind, ProviderDataSource,
-    ProviderModuleSource, ProviderResource, RelativeBindingName, ResolvedDataSource,
-    ResolvedResource, Resource, ResourceId, SavedComposition, Value,
+    AbsoluteBindingAddress, BindingAddress, DataSource, LiveComposition, NoPlaceholder,
+    ParserPlaceholder, PlaceholderKind, ProviderDataSource, ProviderModuleSource, ProviderResource,
+    RelativeBindingName, ResolvedDataSource, ResolvedResource, Resource, ResourceId,
+    SavedComposition, Value,
 };
 use crate::schema::{
     CompiledResourceSchema as ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
@@ -848,8 +848,8 @@ impl std::error::Error for ProviderValueConstraintErrors {}
 
 /// Validate and prepare a resource for provider dispatch.
 ///
-/// This is the sole constructor for [`ProviderReadyResource`]. It unwraps
-/// secrets for the provider, validates every newly known schema value
+/// This is the sole constructor for [`ProviderReadyResource`]. It preserves
+/// secret annotations and validates every newly known schema value
 /// (including provider custom types), re-runs the complete desired-side
 /// normalization pipeline, and finally proves no provider-ineligible deferred value remains.
 pub async fn prepare_provider_ready_resource<S: Clone, D: Clone + Default>(
@@ -931,10 +931,7 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
             }
         }
     }
-    for value in resource.attributes.values_mut() {
-        *value = unwrap_secret(value.clone());
-    }
-    let normalized = apply_desired_normalization(
+    let (normalized, restored) = apply_dispatch_desired_normalization(
         value,
         context.provider_configs,
         context.normalizer,
@@ -945,6 +942,15 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
     crate::resource::assert_resource_fully_resolved(&resource)?;
     let resource =
         ResolvedResource::resolve_with_schemas(resource.into_provider_resource(), context.schemas)?;
+    // Conversion diagnostics still use the protected tree. Remove only the
+    // annotations restored around normalizer output once all host checks pass.
+    WireReady::try_new(
+        resource.clone(),
+        ProviderWireTarget::Resource(resource.id.clone()),
+    )?;
+    let mut resource = resource.into_inner();
+    restored.remove(&mut resource.attributes);
+    let resource = ResolvedResource::resolve_with_schemas(resource, context.schemas)?;
     let directives = context.schemas.resolve_directives(
         &resource.as_resource().id,
         SchemaKind::Resource,
@@ -1010,9 +1016,6 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
             }
         }
     }
-    for value in resource.attributes.values_mut() {
-        *value = unwrap_secret(value.clone());
-    }
     crate::value::canonicalize_data_sources_with_schemas(
         std::slice::from_mut(&mut value),
         context.schemas,
@@ -1020,7 +1023,13 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
     for value in value.attributes.values() {
         crate::resource::assert_value_fully_resolved(value)?;
     }
-    let value = ResolvedDataSource::new(value.into_provider_data_source());
+    let mut value = value.into_provider_data_source();
+    let protected = ResolvedDataSource::new(value.clone());
+    WireReady::try_new(protected, ProviderWireTarget::Resource(value.id.clone()))?;
+    for attribute in value.attributes.values_mut() {
+        *attribute = unwrap_secret(attribute.clone());
+    }
+    let value = ResolvedDataSource::new(value);
     let directives = context.schemas.resolve_directives(
         &value.as_inner().id,
         SchemaKind::DataSource,
@@ -1106,35 +1115,6 @@ fn validate_selected_provider_values(
         })
 }
 
-fn unwrap_secret(value: Value) -> Value {
-    match value {
-        Value::Deferred(DeferredValue::Secret(inner)) => unwrap_secret(*inner),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(unwrap_secret(*value)),
-                default: Box::new(unwrap_secret(*default)),
-            })
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            let lhs = unwrap_secret(expression.lhs().clone());
-            let rhs = unwrap_secret(expression.rhs().clone());
-            let original = Value::Deferred(DeferredValue::IntegerArithmetic(expression.clone()));
-            expression
-                .evaluate_with_operands(lhs, rhs)
-                .unwrap_or(original)
-        }
-        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
-            items.into_iter().map(unwrap_secret).collect(),
-        )),
-        Value::Concrete(ConcreteValue::Map(map)) => Value::Concrete(ConcreteValue::Map(
-            map.into_iter()
-                .map(|(key, value)| (key, unwrap_secret(value)))
-                .collect(),
-        )),
-        other => other,
-    }
-}
-
 #[cfg(test)]
 mod provider_config_tests {
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
@@ -1149,10 +1129,52 @@ mod provider_config_tests {
     use super::*;
     use crate::parser::ResolvedProviderConfigs;
     use crate::provider::{ProviderError, ProviderResult};
-    use crate::resource::{ConcreteValue, ParsedIgnorePath, ParsedIgnorePathSegment};
+    use crate::resource::{
+        ConcreteValue, DeferredValue, ParsedIgnorePath, ParsedIgnorePathSegment,
+    };
     use crate::schema::{
         CompiledAttributeType as AttributeType, RootlessType, TypeIdentity, legacy_validator,
     };
+
+    #[tokio::test]
+    async fn secret_origin_4275_round2_dispatch_masks_still_deferred_secret() {
+        let resource = Resource::with_provider("test", "widget", "example", None).with_attribute(
+            "password",
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::root_resource_ref("producer", "private_attr", vec![])).into(),
+            )),
+        );
+        let bindings = ResolvedBindings::default();
+        let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = SchemaRegistry::new();
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |type_checks| {
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                let error = prepare_create_request(resource, &context)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains(crate::resource::INSIDE_SECRET_MESSAGE)
+                );
+                for rendered in [error.to_string(), format!("{error:?}")] {
+                    assert!(!rendered.contains("producer"), "{rendered}");
+                    assert!(!rendered.contains("private_attr"), "{rendered}");
+                }
+            },
+        )
+        .await;
+    }
 
     #[tokio::test]
     async fn prepare_create_request_resolves_authored_ignore_changes() {
@@ -1984,7 +2006,7 @@ mod provider_config_tests {
         for value in [
             Value::Concrete(ConcreteValue::Int(60)),
             Value::Concrete(ConcreteValue::Int(-61)),
-            Value::Concrete(ConcreteValue::Float(1.25)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.25))),
         ] {
             lookup(&admit_declaration(declaration.clone()), &value)
                 .expect("numeric scalar must bridge");
@@ -2548,9 +2570,9 @@ mod provider_config_tests {
     fn prepare_provider_ready_config_masks_plugin_errors_for_secrets() {
         let plaintext = "plaintext-must-not-leak";
         let factory = ConfigFactory::failing(plaintext);
-        let attributes = config(Value::Deferred(DeferredValue::Secret(Box::new(
-            Value::Concrete(ConcreteValue::String("good-secret".into())),
-        ))));
+        let attributes = config(Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("good-secret".into()))).into(),
+        )));
         let resolved = resolved_configs(attributes);
 
         let error = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
@@ -2566,9 +2588,9 @@ mod provider_config_tests {
     fn secret_error_redaction_preserves_provider_error_kind() {
         let plaintext = "plaintext-timeout-must-not-leak";
         let factory = ConfigFactory::timing_out(plaintext);
-        let attributes = config(Value::Deferred(DeferredValue::Secret(Box::new(
-            Value::Concrete(ConcreteValue::String("good-secret".into())),
-        ))));
+        let attributes = config(Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("good-secret".into()))).into(),
+        )));
         let resolved = resolved_configs(attributes);
 
         let error = prepare_provider_ready_config(&factory, resolved.iter().next().unwrap())
@@ -2589,37 +2611,45 @@ mod provider_config_tests {
     }
 
     #[test]
-    fn provider_boundary_unwraps_secret_builtin_results_to_plaintext() {
-        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("prefix-decrypted:ciphertext-suffix".into()),
-        ))));
-
+    fn provider_wire_projects_secret_builtin_results_to_plaintext() {
+        let value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "prefix-decrypted:ciphertext-suffix".into(),
+            )))
+            .into(),
+        ));
+        let ready = crate::provider_wire::WireReady::try_new(
+            IndexMap::from([("password".into(), value.clone())]),
+            crate::provider_wire::ProviderWireTarget::Configuration {
+                provider: "test".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(ready.as_inner()["password"], value);
+        let wire = ready.wire().get("password").unwrap();
+        assert!(wire.is_secret());
         assert_eq!(
-            unwrap_secret(value),
-            Value::Concrete(ConcreteValue::String(
-                "prefix-decrypted:ciphertext-suffix".into()
-            ))
+            wire.value(),
+            &carina_provider_protocol::types::Value::String(
+                "prefix-decrypted:ciphertext-suffix".into(),
+            )
         );
     }
 
     #[test]
-    fn provider_boundary_unwraps_secrets_in_both_coalesce_operands() {
+    fn provider_boundary_rejects_unresolved_secret_coalesce() {
         let secret = |value: &str| {
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(value.into()),
-            ))))
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(value.into()))).into(),
+            ))
         };
         let value = Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(secret("left")),
             default: Box::new(secret("right")),
         });
-
-        assert_eq!(
-            unwrap_secret(value),
-            Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(Value::Concrete(ConcreteValue::String("left".into()))),
-                default: Box::new(Value::Concrete(ConcreteValue::String("right".into()))),
-            })
-        );
+        assert!(matches!(
+            crate::resource::assert_value_fully_resolved(&value),
+            Err(crate::value::SerializationError::UnresolvedCoalesce { .. })
+        ));
     }
 }

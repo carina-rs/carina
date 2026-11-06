@@ -1262,9 +1262,12 @@ mod tests {
         resource.binding = Some(absolute_binding("credential"));
         resource.set_attr(
             "secret_token",
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("SECRET-SENTINEL-3966".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "SECRET-SENTINEL-3966".into(),
+                )))
+                .into(),
+            )),
         );
         resource.set_attr(
             "write_only_token",

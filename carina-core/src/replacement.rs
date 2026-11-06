@@ -1494,9 +1494,9 @@ mod tests {
             id.clone(),
             HashMap::from([(
                 "secret".into(),
-                Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(string(
-                    "REVIEW_STATIC_SECRET_PLAINTEXT",
-                )))),
+                Value::Deferred(crate::resource::DeferredValue::Secret(
+                    Box::new(string("REVIEW_STATIC_SECRET_PLAINTEXT")).into(),
+                )),
             )]),
         ))
         .unwrap();
@@ -1546,7 +1546,7 @@ mod tests {
                 .clear();
             if redacted {
                 let secret: SnapshotValue = Value::Deferred(
-                    crate::resource::DeferredValue::Secret(Box::new(string("stable"))),
+                    crate::resource::DeferredValue::Secret(Box::new(string("stable")).into()),
                 );
                 let state = crate::resource::State::existing(
                     request.target().id.clone(),

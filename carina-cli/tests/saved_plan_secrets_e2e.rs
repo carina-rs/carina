@@ -408,9 +408,9 @@ fn assert_secret_hash(value: &Value) {
 }
 
 fn valid_legacy_marker_shaped_string(plaintext: &str) -> String {
-    let secret = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-        ConcreteValue::String(plaintext.into()),
-    ))));
+    let secret = CoreValue::Deferred(DeferredValue::Secret(
+        Box::new(CoreValue::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+    ));
     let encoded = PersistedValue::encode_provider_value(&secret, None)
         .expect("test secret must be persistable");
     format!(
@@ -2377,9 +2377,12 @@ mock.test.resource {{
     state["resources"][0]["identity"] = Value::String(reconciled_identity.to_string());
     state["resources"][0]["current"]["attributes"]["comment"] =
         PersistedValue::encode_provider_value(
-            &CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-                ConcreteValue::String("ANONYMOUS_RECONCILE_OLD_3861".into()),
-            )))),
+            &CoreValue::Deferred(DeferredValue::Secret(
+                Box::new(CoreValue::Concrete(ConcreteValue::String(
+                    "ANONYMOUS_RECONCILE_OLD_3861".into(),
+                )))
+                .into(),
+            )),
             None,
         )
         .expect("rehash state secret for the reconciled identity")
@@ -3252,8 +3255,8 @@ fn current_saved_plan_root_and_nested_hashes_round_trip_byte_for_byte() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, SnapshotLeaf, Value as SnapshotTree,
     };
-    assert_eq!(PlanFile::CURRENT_VERSION, 40);
-    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v40.plan.json");
+    assert_eq!(PlanFile::CURRENT_VERSION, 41);
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v41.plan.json");
     let plan: PlanFile = serde_json::from_str(fixture).unwrap();
     assert_eq!(
         carina_core::utils::pretty_with_newline(&plan).unwrap(),

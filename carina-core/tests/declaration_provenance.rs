@@ -580,7 +580,7 @@ fn element_provenance_survives_module_expansion_and_deferred_phase_changes()
     );
     let reference = &consumer.references()[0];
     assert_location(reference.location(), &child_path, child, "target.status");
-    assert!(reference.path().binding().ends_with(".target"));
+    assert!(reference.binding_matches(|binding| binding.ends_with(".target")));
     let wait = tree.waits().next().unwrap();
     assert_eq!(wait.dependencies().len(), 2);
     assert_eq!(wait.target_location().file().path(), child_path);
@@ -675,8 +675,16 @@ fn module_argument_forwarding_preserves_reference_occurrences()
         "supplied.status",
     ]) {
         let location = reference.location();
-        assert_eq!(reference.path().binding(), "target");
-        assert_eq!(reference.path().attribute(), "status");
+        reference.diagnostic_path().render(
+            |path| {
+                let carina_core::resource::ReferencePath::Access(path) = path else {
+                    panic!("resource reference")
+                };
+                assert_eq!(path.binding(), "target");
+                assert_eq!(path.attribute(), "status");
+            },
+            || panic!("public reference"),
+        );
         assert_eq!(location.file().path(), output_path);
         assert_eq!(
             &outputs[location.span().start_byte()..location.span().end_byte()],

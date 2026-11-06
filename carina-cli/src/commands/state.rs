@@ -91,15 +91,7 @@ fn format_deferred_state_refresh_warning(
 ) -> String {
     let mut refs = unresolved
         .iter()
-        .flat_map(|input| {
-            let paths = input.paths.iter().map(|path| path.to_dot_string());
-            let bindings = input.bindings.iter().map(ToString::to_string);
-            let unknowns = input
-                .unknowns
-                .iter()
-                .map(|reason| format!("unknown({reason})"));
-            paths.chain(bindings).chain(unknowns)
-        })
+        .flat_map(UnresolvedDataSourceInput::diagnostic_references)
         .collect::<Vec<_>>();
     if refs.is_empty() {
         refs.extend(
@@ -5890,6 +5882,7 @@ mod tests {
                 .expect("row has applied attributes")
                 .get("vpc_id"),
             carina_core::value::json_to_dsl_value(&json!("vpc-current"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(row.deposed.len(), 1);
@@ -5899,11 +5892,13 @@ mod tests {
         assert_eq!(
             row.deposed[0].persisted_attributes().get("vpc_id"),
             carina_core::value::json_to_dsl_value(&json!("vpc-alive"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
             row.deposed[0].persisted_attributes().get("cidr_block"),
             carina_core::value::json_to_dsl_value(&json!("10.0.1.0/16"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
@@ -6035,11 +6030,13 @@ mod tests {
         assert_eq!(
             attributes.get("password"),
             carina_core::value::json_to_dsl_value(&json!("previous-password"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
             attributes.get("endpoint"),
             carina_core::value::json_to_dsl_value(&json!("new.example"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
     }
@@ -6110,6 +6107,7 @@ mod tests {
         assert_eq!(
             attributes.get("password"),
             carina_core::value::json_to_dsl_value(&json!("previous-password"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
     }
@@ -6141,9 +6139,9 @@ mod tests {
         );
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
             "password",
-            Value::Deferred(DeferredValue::Secret(Box::new(string_value(
-                "plain-secret",
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(string_value("plain-secret")).into(),
+            )),
         );
 
         refresh_deposed_generations_until_cancelled(
@@ -6242,11 +6240,13 @@ mod tests {
         assert_eq!(
             attributes.get("endpoint"),
             carina_core::value::json_to_dsl_value(&json!("db.example"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
             attributes.get("password"),
             carina_core::value::json_to_dsl_value(&json!("old-hash"))
+                .unwrap()
                 .map(|value| value.to_snapshot()),
             "deposed refresh must carry its persisted value instead of a provider echo"
         );
@@ -6550,6 +6550,7 @@ mod tests {
                 .expect("refreshed orphan has attributes")
                 .get("token"),
             carina_core::value::json_to_dsl_value(&json!("old-token"))
+                .unwrap()
                 .map(|value| value.to_snapshot()),
             "orphan refresh must carry the previous write-only value even if the provider echoes it"
         );
@@ -7364,7 +7365,9 @@ mod tests {
             row.persisted_attributes()
                 .expect("row has applied attributes")
                 .get("password"),
-            carina_core::value::json_to_dsl_value(&json!("old")).map(|value| value.to_snapshot()),
+            carina_core::value::json_to_dsl_value(&json!("old"))
+                .unwrap()
+                .map(|value| value.to_snapshot()),
         );
         assert_eq!(row.write_only_attributes(), ["password"]);
     }
@@ -7422,7 +7425,9 @@ mod tests {
             row.persisted_attributes()
                 .expect("row has applied attributes")
                 .get("password"),
-            carina_core::value::json_to_dsl_value(&json!(marker)).map(|value| value.to_snapshot())
+            carina_core::value::json_to_dsl_value(&json!(marker))
+                .unwrap()
+                .map(|value| value.to_snapshot())
         );
     }
 
@@ -7481,11 +7486,13 @@ mod tests {
         assert_eq!(
             attrs.get("endpoint"),
             carina_core::value::json_to_dsl_value(&json!("new.example"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
             attrs.get("description"),
             carina_core::value::json_to_dsl_value(&json!("kept from state"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
@@ -7650,9 +7657,9 @@ mod tests {
             Resource::with_provider("awscc", "db.Instance", "main", Some("east".to_string()))
                 .with_attribute(
                     "password",
-                    Value::Deferred(DeferredValue::Secret(Box::new(string_value(
-                        "plain-secret",
-                    )))),
+                    Value::Deferred(DeferredValue::Secret(
+                        Box::new(string_value("plain-secret")).into(),
+                    )),
                 );
         let right_instance =
             Resource::with_provider("awscc", "db.Instance", "main", Some("west".to_string()));
@@ -7728,6 +7735,7 @@ mod tests {
         assert_eq!(
             row.deposed[0].persisted_attributes().get("vpc_id"),
             carina_core::value::json_to_dsl_value(&json!("vpc-old"))
+                .unwrap()
                 .map(|value| value.to_snapshot())
         );
         assert_eq!(
@@ -7898,15 +7906,14 @@ mod tests {
         let resource: DataSource = DataSource::with_provider("mock", "iam.Roles", "roles", None);
         let warning = format_deferred_state_refresh_warning(
             &resource,
-            &[UnresolvedDataSourceInput {
-                attribute: "name_regex".to_string(),
-                paths: vec![
-                    carina_core::resource::AccessPath::new("target_role", "role_name")
+            &[UnresolvedDataSourceInput::collect(
+                "name_regex",
+                &Value::Deferred(carina_core::resource::DeferredValue::ResourceRef {
+                    path: carina_core::resource::AccessPath::new("target_role", "role_name")
                         .resolve_root_for_test(),
-                ],
-                bindings: Vec::new(),
-                unknowns: Vec::new(),
-            }],
+                }),
+            )
+            .unwrap()],
         );
 
         assert!(warning.contains("mock.iam.Roles.roles"));

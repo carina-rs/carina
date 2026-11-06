@@ -42,7 +42,9 @@ pub(crate) fn contains_comparison_expression(value: &Value) -> bool {
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
         ) => false,
-        Value::Deferred(DeferredValue::Secret(inner)) => contains_comparison_expression(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            inner.visit(contains_comparison_expression)
+        }
         Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::RedactedSecret { .. })) => false,
         Value::Deferred(DeferredValue::Placeholder(SnapshotLeaf::Expression(never))) => {
             match *never {}
@@ -891,7 +893,15 @@ pub(super) fn pairing_hashes<R: ReferenceEquality>(
             // hashes cover plaintext (including schema normalizations); the
             // fixed tag deliberately admits every state-secret spelling for
             // exact verification by `similarity_score`.
-            hashes.extend(pairing_hashes(inner, attr_type, defs, context));
+            hashes.extend(
+                inner
+                    .try_project_plaintext(|value| {
+                        Ok::<_, std::convert::Infallible>(pairing_hashes(
+                            value, attr_type, defs, context,
+                        ))
+                    })
+                    .unwrap(),
+            );
             hashes.push(secret_state_pairing_hash());
         }
         // Arithmetic has its own canonical hash above. A nested Secret is
@@ -1021,7 +1031,7 @@ fn numeric_pairing_hash(value: &Value) -> Option<u64> {
             if let Some(integer) = float_as_exact_i64(*value) {
                 Some(pairing_component_hash(0x06, &integer))
             } else {
-                Some(pairing_component_hash(0x07, &value.to_bits()))
+                Some(pairing_component_hash(0x07, &value.get().to_bits()))
             }
         }
         _ => None,
@@ -1228,9 +1238,9 @@ mod tests {
     #[test]
     fn numeric_pairing_hash_exact_numeric_i64_boundary() {
         assert_ne!(
-            numeric_pairing_hash(&Value::Concrete(ConcreteValue::Float(
+            numeric_pairing_hash(&Value::Concrete(ConcreteValue::Float(crate::finite(
                 9_223_372_036_854_775_808.0
-            ))),
+            )))),
             numeric_pairing_hash(&Value::Concrete(ConcreteValue::Int(i64::MAX))),
         );
     }
@@ -1244,7 +1254,7 @@ mod tests {
             (i64::MIN, -9_223_372_036_854_775_808.0),
         ] {
             assert_eq!(
-                numeric_pairing_hash(&Value::Concrete(ConcreteValue::Float(float))),
+                numeric_pairing_hash(&Value::Concrete(ConcreteValue::Float(crate::finite(float)))),
                 numeric_pairing_hash(&Value::Concrete(ConcreteValue::Int(integer))),
             );
         }

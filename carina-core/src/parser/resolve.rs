@@ -14,6 +14,7 @@ use crate::resource::{
     LoopSlot, NoPlaceholder, ParserPlaceholder, RelativeBindingName, UnavailableCoalescePolicy,
     UnavailableReason, UnavailableSecretPolicy, Value as GenericValue, find_unavailable_evaluation,
 };
+use crate::resource::{DiagnosticPath, DiagnosticScope, ReferencePath};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
@@ -440,9 +441,12 @@ mod saved_provider_config_secret_tests {
     use crate::resource::DeferredValue as GenericDeferredValue;
 
     fn secret(value: &str) -> RuntimeValue {
-        GenericValue::Deferred(GenericDeferredValue::Secret(Box::new(
-            GenericValue::Concrete(GenericConcreteValue::String(value.into())),
-        )))
+        GenericValue::Deferred(GenericDeferredValue::Secret(
+            Box::new(GenericValue::Concrete(GenericConcreteValue::String(
+                value.into(),
+            )))
+            .into(),
+        ))
     }
 
     fn provider(token: &str) -> RuntimeProviderConfig {
@@ -1324,7 +1328,7 @@ pub(crate) fn reject_cyclic_let_bindings_in_variables(
 fn find_let_binding_cycle(
     variables: &IndexMap<String, Value>,
     structural: &HashSet<&str>,
-) -> Option<Vec<String>> {
+) -> Option<Vec<DiagnosticPath<RelativeBindingName>>> {
     let mut visited = HashSet::new();
     let mut visiting = Vec::new();
 
@@ -1332,9 +1336,15 @@ fn find_let_binding_cycle(
         if structural.contains(name.as_str()) {
             continue;
         }
-        if let Some(chain) =
-            visit_let_binding(name, variables, structural, &mut visited, &mut visiting)
-        {
+        if let Some(chain) = visit_let_binding(
+            name,
+            crate::resource::DiagnosticScope::Public
+                .path(ReferencePath::Binding(name.as_str().into())),
+            variables,
+            structural,
+            &mut visited,
+            &mut visiting,
+        ) {
             return Some(chain);
         }
     }
@@ -1344,26 +1354,35 @@ fn find_let_binding_cycle(
 
 fn visit_let_binding(
     name: &str,
+    diagnostic_path: DiagnosticPath<RelativeBindingName>,
     variables: &IndexMap<String, Value>,
     structural: &HashSet<&str>,
     visited: &mut HashSet<String>,
-    visiting: &mut Vec<String>,
-) -> Option<Vec<String>> {
+    visiting: &mut Vec<(String, DiagnosticPath<RelativeBindingName>)>,
+) -> Option<Vec<DiagnosticPath<RelativeBindingName>>> {
     if visited.contains(name) {
         return None;
     }
-    if let Some(pos) = visiting.iter().position(|candidate| candidate == name) {
-        let mut cycle = visiting[pos..].to_vec();
-        cycle.push(name.to_string());
+    if let Some(pos) = visiting.iter().position(|(candidate, _)| candidate == name) {
+        let mut cycle = visiting[pos..]
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect::<Vec<_>>();
+        cycle.push(diagnostic_path);
+        if cycle.iter().any(DiagnosticPath::is_secret) {
+            cycle.fill(crate::resource::DiagnosticScope::Secret.path(None));
+        }
         return Some(cycle);
     }
 
     let value = variables.get(name)?;
-    visiting.push(name.to_string());
+    visiting.push((name.to_string(), diagnostic_path));
 
     let roots = reference_roots_in_value(value, variables, structural);
-    for root in roots {
-        if let Some(chain) = visit_let_binding(&root, variables, structural, visited, visiting) {
+    for (root, path) in roots {
+        if let Some(chain) =
+            visit_let_binding(&root, path, variables, structural, visited, visiting)
+        {
             return Some(chain);
         }
     }
@@ -1377,9 +1396,15 @@ fn reference_roots_in_value(
     value: &Value,
     variables: &IndexMap<String, Value>,
     structural: &HashSet<&str>,
-) -> Vec<String> {
+) -> Vec<(String, DiagnosticPath<RelativeBindingName>)> {
     let mut roots = Vec::new();
-    collect_reference_roots(value, variables, structural, &mut roots);
+    collect_reference_roots(
+        value,
+        variables,
+        structural,
+        DiagnosticScope::Public,
+        &mut roots,
+    );
     roots
 }
 
@@ -1387,38 +1412,39 @@ fn collect_reference_roots(
     value: &Value,
     variables: &IndexMap<String, Value>,
     structural: &HashSet<&str>,
-    roots: &mut Vec<String>,
+    scope: DiagnosticScope,
+    roots: &mut Vec<(String, DiagnosticPath<RelativeBindingName>)>,
 ) {
     match value {
         GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
             for nested in deferred.values() {
-                collect_reference_roots(nested, variables, structural, roots);
+                collect_reference_roots(nested, variables, structural, scope, roots);
             }
         }
         Value::Concrete(ConcreteValue::EnumIdentifier(name)) => {
             // Bare-identifier fallback (`EnumIdentifier("B")`) and dotted-access
             // fallback (`EnumIdentifier("B.attr")`) both appear before the parser
             // classifies the RHS as a binding ref or resource ref.
-            push_root(name.as_str(), variables, structural, roots);
+            push_root(name.as_str(), variables, structural, scope, roots);
             if let Some((root, _)) = name.as_str().split_once('.') {
-                push_root(root, variables, structural, roots);
+                push_root(root, variables, structural, scope, roots);
             }
         }
         Value::Concrete(ConcreteValue::List(items)) => {
             for item in items {
-                collect_reference_roots(item, variables, structural, roots);
+                collect_reference_roots(item, variables, structural, scope, roots);
             }
         }
         Value::Concrete(ConcreteValue::Map(map)) => {
             for item in map.values() {
-                collect_reference_roots(item, variables, structural, roots);
+                collect_reference_roots(item, variables, structural, scope, roots);
             }
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            push_root(binding, variables, structural, roots);
+            push_root(binding, variables, structural, scope, roots);
         }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            push_root(path.binding(), variables, structural, roots);
+            push_root(path.binding(), variables, structural, scope, roots);
         }
         GenericValue::Deferred(
             DeferredValue::FunctionCall { args, .. }
@@ -1426,29 +1452,31 @@ fn collect_reference_roots(
             | DeferredValue::ResolvedFunctionCall { args, .. },
         ) => {
             for arg in args {
-                collect_reference_roots(arg.walker_value(), variables, structural, roots);
+                collect_reference_roots(arg.walker_value(), variables, structural, scope, roots);
             }
         }
         Value::Deferred(DeferredValue::Access(access)) => {
-            collect_reference_roots(access.base(), variables, structural, roots);
+            collect_reference_roots(access.base(), variables, structural, scope, roots);
         }
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
             for part in parts {
                 if let InterpolationPart::Expr(expr) = part {
-                    collect_reference_roots(expr, variables, structural, roots);
+                    collect_reference_roots(expr, variables, structural, scope, roots);
                 }
             }
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
-            collect_reference_roots(inner, variables, structural, roots);
+            inner.visit_plaintext_reference_inventory(|value, scope| {
+                collect_reference_roots(value, variables, structural, scope, roots)
+            });
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            collect_reference_roots(value, variables, structural, roots);
-            collect_reference_roots(default, variables, structural, roots);
+            collect_reference_roots(value, variables, structural, scope, roots);
+            collect_reference_roots(default, variables, structural, scope, roots);
         }
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            collect_reference_roots(expression.lhs(), variables, structural, roots);
-            collect_reference_roots(expression.rhs(), variables, structural, roots);
+            collect_reference_roots(expression.lhs(), variables, structural, scope, roots);
+            collect_reference_roots(expression.rhs(), variables, structural, scope, roots);
         }
         Value::Concrete(
             ConcreteValue::Int(_)
@@ -1468,13 +1496,20 @@ fn push_root(
     root: &str,
     variables: &IndexMap<String, Value>,
     structural: &HashSet<&str>,
-    roots: &mut Vec<String>,
+    scope: DiagnosticScope,
+    roots: &mut Vec<(String, DiagnosticPath<RelativeBindingName>)>,
 ) {
-    if variables.contains_key(root)
-        && !structural.contains(root)
-        && !roots.iter().any(|existing| existing == root)
-    {
-        roots.push(root.to_string());
+    if variables.contains_key(root) && !structural.contains(root) {
+        if let Some((_, path)) = roots.iter_mut().find(|(name, _)| name == root) {
+            if scope.is_secret() {
+                *path = crate::resource::DiagnosticScope::Secret.path(None);
+            }
+        } else {
+            roots.push((
+                root.to_string(),
+                scope.path(ReferencePath::Binding(root.into())),
+            ));
+        }
     }
 }
 
@@ -1529,14 +1564,17 @@ fn accumulate_undefined_reference_errors(
     known: &std::collections::HashSet<&str>,
     errors: &mut Vec<ParseError>,
 ) {
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
 
     let mut check = |value: &Value| {
-        value.visit_resource_refs(&mut |path| {
-            let root = path.binding();
-            let root_ident = root.split(['[', ']']).next().unwrap_or(root);
-            if !known.contains(root_ident) && seen.insert(root_ident.to_string()) {
-                errors.push(undefined_identifier_error(known, root_ident.to_string(), 0));
+        value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+            let root = reference.root_identifier_key();
+            if !root.is_in_strings(known) && seen.insert(root) {
+                errors.push(undefined_identifier_error(
+                    known,
+                    reference.root_identifier_path().to_dot_string(),
+                    0,
+                ));
             }
         });
     };
@@ -1623,6 +1661,7 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
         session,
         defer_unknown_functions,
         preserve_failed_user_calls,
+        DiagnosticScope::Public,
     )
 }
 
@@ -1633,6 +1672,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     defer_unknown_functions: bool,
     preserve_failed_user_calls: bool,
+    scope: DiagnosticScope,
 ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
     match value {
         GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
@@ -1644,6 +1684,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                     session,
                     defer_unknown_functions,
                     preserve_failed_user_calls,
+                    scope,
                 )
             })?;
             Ok(GenericValue::Deferred(DeferredValue::ModuleIf(Box::new(
@@ -1661,6 +1702,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
+                scope,
             )?;
             if matches!(left, GenericValue::Concrete(_)) {
                 Ok(left)
@@ -1675,6 +1717,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                     session,
                     true,
                     true,
+                    scope,
                 )?;
                 Ok(GenericValue::Deferred(DeferredValue::Coalesce {
                     value: Box::new(left),
@@ -1690,6 +1733,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
+                scope,
             )?;
             let rhs = resolve_value_with_binding_lookup(
                 expression.rhs(),
@@ -1698,6 +1742,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
+                scope,
             )?;
             let span = expression.operator_span();
             expression
@@ -1723,6 +1768,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                     session,
                     defer_unknown_functions,
                     preserve_failed_user_calls,
+                    scope,
                 ),
                 // A missing binding or attribute may become available later.
                 // The directory-wide scope check owns undefined identifiers.
@@ -1740,6 +1786,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                         session,
                         defer_unknown_functions,
                         preserve_failed_user_calls,
+                        scope,
                     )
                 })
                 .collect();
@@ -1757,6 +1804,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                         session,
                         defer_unknown_functions,
                         preserve_failed_user_calls,
+                        scope,
                     )?,
                 );
             }
@@ -1774,6 +1822,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                             session,
                             defer_unknown_functions,
                             preserve_failed_user_calls,
+                            scope,
                         )?))
                     }
                     other => Ok(other.clone()),
@@ -1789,7 +1838,16 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
             source_line,
             ..
         }) => {
-            if defer_unknown_functions {
+            // External inputs can remain unavailable below a secret until
+            // planning/apply. Deterministic builtin failures still fail validation.
+            if defer_unknown_functions
+                || (scope.is_secret()
+                    && matches!(
+                        name,
+                        crate::builtins::BuiltinFunction::env
+                            | crate::builtins::BuiltinFunction::decrypt
+                    ))
+            {
                 Ok(value.clone())
             } else {
                 Err(unavailable_builtin_error(*name, reason, *source_line))
@@ -1813,6 +1871,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                             session,
                             defer_unknown_functions,
                             preserve_failed_user_calls,
+                            scope,
                         )
                     })
                 })
@@ -1847,6 +1906,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                             session,
                             defer_unknown_functions,
                             preserve_failed_user_calls,
+                            scope,
                         )
                     })
                 })
@@ -1868,7 +1928,11 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 }),
                 Err(e) => {
                     if all_args_resolved {
-                        let reason = UnavailableReason::from_builtin_error(e);
+                        let reason = if scope.is_secret() {
+                            UnavailableReason::inside_secret()
+                        } else {
+                            UnavailableReason::from_builtin_error(e)
+                        };
                         if defer_unknown_functions {
                             Ok(GenericValue::Deferred(DeferredValue::Unavailable {
                                 name: *name,
@@ -1898,6 +1962,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 session,
                 defer_unknown_functions,
                 preserve_failed_user_calls,
+                scope,
             )?;
             access
                 .rebuild_with_base(resolved_base, AccessMissPolicy::Error)
@@ -1906,6 +1971,19 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                     message: error.to_string(),
                 })
         }
+        GenericValue::Deferred(DeferredValue::Secret(inner)) => inner
+            .try_map(|value| {
+                resolve_value_with_binding_lookup(
+                    value,
+                    binding_lookup,
+                    config,
+                    session,
+                    defer_unknown_functions,
+                    preserve_failed_user_calls,
+                    DiagnosticScope::Secret,
+                )
+            })
+            .map(|inner| GenericValue::Deferred(DeferredValue::Secret(inner))),
         GenericValue::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -1918,7 +1996,6 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
         )
         | GenericValue::Deferred(
             DeferredValue::BindingRef { .. }
-            | DeferredValue::Secret(_)
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => Ok(value.clone()),
@@ -2008,7 +2085,8 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
             | DeferredValue::ResolvedFunctionCall { .. }
             | DeferredValue::Access(_)
             | DeferredValue::Coalesce { .. }
-            | DeferredValue::IntegerArithmetic(_),
+            | DeferredValue::IntegerArithmetic(_)
+            | DeferredValue::Secret(_),
         ) => resolve_value_with_config(
             value,
             binding_map,
@@ -2084,7 +2162,6 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
         | GenericValue::Deferred(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
-            | DeferredValue::Secret(_)
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => Ok(value.clone()),
@@ -2330,6 +2407,7 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
                     Some(config),
                     false,
                     false,
+                    DiagnosticScope::Public,
                 )?;
                 let expanded = parser_resolved.into_expanded().map_err(|error| {
                     ParseError::InvalidExpression {
@@ -2568,6 +2646,26 @@ let item = mock.test.resource {
     }
 
     #[test]
+    fn secret_origin_4275_round3_strict_resolution_rejects_recorded_static_failure() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut parsed =
+            parsed_with_comment(r#"secret(cidr_subnet("private-invalid-cidr", 1, 1))"#);
+        resolve_resource_refs_defer_unknown_functions(&mut parsed, &config)
+            .expect("permissive pass retains the protected failure");
+        let error = resolve_resource_refs_with_config(&mut parsed, &config)
+            .expect_err("a deterministic builtin failure must fail the strict pass");
+        assert!(
+            error
+                .to_string()
+                .contains(crate::resource::INSIDE_SECRET_MESSAGE),
+            "{error}"
+        );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("private-invalid-cidr"), "{rendered}");
+        }
+    }
+
+    #[test]
     fn secret_wraps_an_unavailable_value_without_losing_taint() {
         let mut parsed = parsed_with_comment(&format!(r#"secret(env("{MISSING_ENV}"))"#));
         resolve_resource_refs_defer_unknown_functions(
@@ -2579,7 +2677,7 @@ let item = mock.test.resource {
         assert!(matches!(
             comment(&parsed),
             Value::Deferred(DeferredValue::Secret(inner))
-                if matches!(inner.as_ref(), Value::Deferred(DeferredValue::Unavailable {
+                if matches!(inner.expose_plaintext(), Value::Deferred(DeferredValue::Unavailable {
                     name: crate::builtins::BuiltinFunction::env,
                     ..
                 }))
@@ -2705,7 +2803,7 @@ for item in source.arn {
         };
         assert!(matches!(
             template.attributes().get("comment"),
-            Some(Value::Deferred(DeferredValue::FunctionCall { name, .. })) if name == "secret"
+            Some(Value::Deferred(DeferredValue::Secret(_)))
         ));
 
         resolve_resource_refs_with_config(
@@ -2723,5 +2821,39 @@ for item in source.arn {
             template.attributes().get("comment"),
             Some(Value::Deferred(DeferredValue::Secret(_)))
         ));
+    }
+}
+
+#[cfg(test)]
+mod review2_cycle_tests {
+    use super::*;
+    #[test]
+    fn review2_f8_let_cycle_keeps_public_chain_and_protects_secret_roots() {
+        let reference = |name: &str| {
+            Value::Deferred(DeferredValue::BindingRef {
+                binding: name.into(),
+            })
+        };
+        let public = IndexMap::from([("a".into(), reference("b")), ("b".into(), reference("a"))]);
+        assert_eq!(
+            reject_cyclic_let_bindings_in_variables(&public, &HashSet::new())
+                .unwrap_err()
+                .to_string(),
+            "Cyclic let binding detected: a -> b -> a"
+        );
+        let private = IndexMap::from([
+            (
+                "public".into(),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(reference("private_root")).into(),
+                )),
+            ),
+            ("private_root".into(), reference("public")),
+        ]);
+        let error = reject_cyclic_let_bindings_in_variables(&private, &HashSet::new()).unwrap_err();
+        assert!(
+            !format!("{error} {error:?}").contains("private_root"),
+            "{error:?}"
+        );
     }
 }

@@ -403,6 +403,7 @@ impl ResidualModuleResolutionError {
                 }
                 ParseError::Syntax(_)
                 | ParseError::UnavailableSecret(_)
+                | ParseError::InvalidFloatLiteral { line: _, source: _ }
                 | ParseError::InvalidExpression {
                     line: _,
                     message: _,
@@ -476,6 +477,8 @@ impl ResidualModuleResolutionError {
                 }
                 | ParseError::RecursiveFunction(_)
                 | ParseError::CyclicLetBinding { chain: _ }
+                | ParseError::InsideSecret { .. }
+                | ParseError::SecretInConstraint { .. }
                 | ParseError::UserFunctionError(_) => false,
             },
             ModuleError::ParseInFile { path, error } => {

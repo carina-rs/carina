@@ -322,12 +322,29 @@ fn authored_expression_judges_coalesce_before_enclosing_reduction() {
             .binding(&RelativeBindingName::new("result"))
             .unwrap()
             .static_type();
-        if !matches!(
-            result,
-            Err(crate::static_type::InferenceIssue::Failed(
-                inference::InferenceError::IncompatibleCoalesceTypes { .. }
-            ))
-        ) {
+        let expected_failure = if expression.starts_with("secret(") {
+            for rendered in [
+                result.as_ref().unwrap_err().to_string(),
+                format!("{result:?}"),
+            ] {
+                assert!(!rendered.contains("present"), "{rendered}");
+                assert!(!rendered.contains("42"), "{rendered}");
+            }
+            matches!(
+                result,
+                Err(crate::static_type::InferenceIssue::Failed(
+                    inference::InferenceError::IncompatibleCoalesceTypes { .. }
+                ))
+            )
+        } else {
+            matches!(
+                result,
+                Err(crate::static_type::InferenceIssue::Failed(
+                    inference::InferenceError::IncompatibleCoalesceTypes { .. }
+                ))
+            )
+        };
+        if !expected_failure {
             missed.push(format!("{expression}: {result:?}"));
         }
     }
@@ -868,10 +885,14 @@ fn ref_walker_does_not_inherit_function_result_sink_for_arguments() {
     let result_type = TypeExpr::String;
     let mut visited = Vec::new();
 
-    visit_refs_with_sink(
+    visit_refs_with_sink_inner(
         &value,
         Some(RefSink::TypeExpr(&result_type)),
-        &mut |path, sink, _usage, _candidate| visited.push((path.to_dot_string(), sink.is_none())),
+        crate::resource::ResourceRefUsage::Required,
+        DiagnosticScope::Public,
+        &mut |path, sink, _usage, _candidate, _scope| {
+            visited.push((path.to_dot_string(), sink.is_none()))
+        },
     );
 
     assert_eq!(
@@ -3474,23 +3495,29 @@ fn postfix_function_result_type_is_checked_against_resource_attribute_type() {
 
 #[test]
 fn secret_preserves_its_argument_type_through_postfix_access() {
-    let parsed = crate::parser::parse(
-        r#"
-            let q = mock.test.Queue { identifier = "a-b" }
-            mock.test.Consumer {
-                value = secret(split("-", q.identifier))[0]
-            }
-        "#,
-        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
-    )
-    .expect("secret-wrapped computed collection must parse");
     let (_, schemas) = postfix_access_validation_fixture(
         Value::Concrete(ConcreteValue::String("unused".into())),
         PatternAttributeType::string(),
     );
-
-    validate_resource_ref_types_for_test(&parsed, &schemas)
-        .expect("secret(list(String))[0] must infer as String");
+    for collection in [
+        r#"secret(split("-", q.identifier))"#,
+        r#"secret(secret(split("-", q.identifier)))"#,
+        "private_values",
+    ] {
+        let parsed = crate::parser::parse(
+            &format!(
+                r#"
+                    let q = mock.test.Queue {{ identifier = "a-b" }}
+                    let private_values = secret(split("-", q.identifier))
+                    mock.test.Consumer {{ value = {collection}[0] }}
+                "#,
+            ),
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .expect("secret-wrapped computed collection must parse");
+        validate_resource_ref_types_for_test(&parsed, &schemas)
+            .unwrap_or_else(|error| panic!("{collection}[0] must infer as String: {error}"));
+    }
 }
 
 #[test]
@@ -4463,7 +4490,7 @@ fn empty_arguments_in_root_ok() {
 fn bare_builtin_custom_types_report_scalar_kind_mismatches() {
     for (name, value) in [
         ("positive_int", ConcreteValue::String("5".into())),
-        ("positive_int", ConcreteValue::Float(5.0)),
+        ("positive_int", ConcreteValue::Float(crate::finite(5.0))),
         ("positive_int", ConcreteValue::Bool(true)),
         ("domain_name", ConcreteValue::Int(5)),
         ("email", ConcreteValue::Int(5)),
@@ -4754,7 +4781,7 @@ fn rendered_typecheck_result_string_got_int() {
 fn rendered_typecheck_result_string_got_float() {
     let result = rendered_typecheck_result(
         &TypeExpr::String,
-        &Value::Concrete(ConcreteValue::Float(1.5)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
@@ -4799,7 +4826,7 @@ fn rendered_typecheck_result_bool_got_float_is_rejected() {
     // Regression for #2864: Float must not silently coerce into Bool.
     let result = rendered_typecheck_result(
         &TypeExpr::Bool,
-        &Value::Concrete(ConcreteValue::Float(1.5)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
@@ -4811,7 +4838,7 @@ fn rendered_typecheck_result_int_got_float_is_rejected() {
     // Regression for #2864: Float must not silently coerce into Int.
     let result = rendered_typecheck_result(
         &TypeExpr::Int,
-        &Value::Concrete(ConcreteValue::Float(1.5)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
     assert!(result.is_some());
@@ -4836,7 +4863,7 @@ fn rendered_typecheck_result_escapes_string_literal_value() {
 fn rendered_typecheck_result_preserves_float_fraction() {
     let result = rendered_typecheck_result(
         &TypeExpr::Int,
-        &Value::Concrete(ConcreteValue::Float(1.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(1.0))),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     );
 
@@ -7639,7 +7666,7 @@ fn validate_export_params_rejects_decrypt_result_as_secret_export() {
 #[test]
 fn validate_export_params_rejects_every_secret_value_shape_uniformly() {
     fn secret(value: RuntimeValue) -> RuntimeValue {
-        RuntimeValue::Deferred(RuntimeDeferredValue::Secret(Box::new(value)))
+        RuntimeValue::Deferred(RuntimeDeferredValue::Secret(Box::new(value).into()))
     }
 
     let secret_string = || {
@@ -9695,19 +9722,23 @@ fn value_contains_unresolved_ref_detects_list_element() {
 fn value_contains_unresolved_ref_unwraps_secret() {
     use crate::resource::AccessPath;
 
-    let secret_with_ref = RuntimeValue::Deferred(RuntimeDeferredValue::Secret(Box::new(
-        RuntimeValue::Deferred(RuntimeDeferredValue::ResourceRef {
+    let secret_with_ref = RuntimeValue::Deferred(RuntimeDeferredValue::Secret(
+        Box::new(RuntimeValue::Deferred(RuntimeDeferredValue::ResourceRef {
             path: AccessPath::root("vault", "token"),
-        }),
-    )));
+        }))
+        .into(),
+    ));
     assert!(
         value_contains_unresolved_ref(&secret_with_ref),
         "Secret(ResourceRef) must propagate the unresolved signal",
     );
 
-    let secret_literal = RuntimeValue::Deferred(RuntimeDeferredValue::Secret(Box::new(
-        RuntimeValue::Concrete(RuntimeConcreteValue::String("plaintext".into())),
-    )));
+    let secret_literal = RuntimeValue::Deferred(RuntimeDeferredValue::Secret(
+        Box::new(RuntimeValue::Concrete(RuntimeConcreteValue::String(
+            "plaintext".into(),
+        )))
+        .into(),
+    ));
     assert!(
         !value_contains_unresolved_ref(&secret_literal),
         "Secret(literal) must not be flagged",
@@ -10055,8 +10086,8 @@ fn attribute_reference_message_fixture(module_directory: &str) -> CompositionAtt
     CompositionAttributeRefError {
         error: AttributeParamRefError {
             attribute: "bad".to_string(),
-            path: crate::resource::ReferencePath::Binding(
-                RootScope::new().resolve("source".into()),
+            path: crate::resource::DiagnosticScope::Public.path(
+                crate::resource::ReferencePath::Binding(RootScope::new().resolve("source".into())),
             ),
             kind: ModuleCallRefErrorKind::TypeMismatch {
                 types: MismatchTypeNames::for_type_exprs(&TypeExpr::String, &TypeExpr::Int),
@@ -10867,5 +10898,49 @@ fn schema_bundle_replaces_findings_from_a_different_registry() {
         first.judged().report().findings().len(),
         1,
         "the first bundle is immutable"
+    );
+}
+
+#[test]
+fn review2_f7_secret_coalesce_keeps_main_type_only_error() {
+    let parsed =
+        crate::parser::parse_and_resolve("let a = 'present'\nlet result = secret(a ?? 42)\n")
+            .unwrap();
+    let report = crate::parser::retained::judge_expressions(
+        &parsed,
+        &SchemaRegistry::new(),
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
+    let error = report
+        .binding(&RelativeBindingName::new("result"))
+        .unwrap()
+        .static_type()
+        .unwrap_err();
+    assert!(
+        matches!(&error, crate::static_type::InferenceIssue::Failed(inference::InferenceError::IncompatibleCoalesceTypes { types }) if types.expected() == "String" && types.actual() == "Int"),
+        "{error:?}"
+    );
+    assert_eq!(
+        error.to_string(),
+        "coalesce default type `Int` does not match left type `String`"
+    );
+}
+
+#[test]
+fn review2_resource_type_mismatch_preserves_main_origin_text() {
+    let finding = ReferenceFinding::new(
+        &ReferenceFindingLocation::Resource {
+            location: "mock.test.Resource.example".into(),
+            attribute: "name".into(),
+        },
+        ReferenceFindingKind::TypeMismatch {
+            types: MismatchTypeNames::for_type_exprs(&TypeExpr::String, &TypeExpr::Int),
+            path: SecretDiagnosticError::Public("source.value".into()),
+            origin: Some(SecretDiagnosticError::Public("from source.value".into())),
+        },
+    );
+    assert_eq!(
+        finding.to_string(),
+        "mock.test.Resource.example: cannot assign Int to 'name': expected String, got Int (from source.value)"
     );
 }

@@ -17,6 +17,108 @@ use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 
 #[test]
+fn review3_secret_deferred_iterable_diagnostics_mask_roots() {
+    let parsed = parse(
+        "for item in secret(private_iterable.names) { mock.test.Resource { name = item } }",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+    let errors = crate::validation::validate_for_iterable_bindings(&tree);
+    assert_eq!(errors.len(), 1);
+    for text in [errors[0].to_string(), format!("{:?}", errors[0])] {
+        assert!(!text.contains("private_iterable"), "{text}");
+    }
+}
+
+#[test]
+fn review3_secret_reference_inventory_debug_hides_paths() {
+    let parsed = parse(
+        "mock.test.Resource { attr = secret(private_typo.token) }",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let text = format!("{:?}", parsed.resources[0].dependencies);
+    assert!(!text.contains("private_typo"), "{text}");
+}
+
+#[test]
+fn review3_secret_undefined_reference_masks_identifier() {
+    let parsed = parse(
+        "mock.test.Resource { attr = secret(private_typo.token) }",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let errors = check_identifier_scope(&parsed);
+    assert_eq!(errors.len(), 1);
+    assert_eq!(
+        errors[0].to_string(),
+        "Undefined identifier `(secret)`: no bindings are in scope (let / upstream_state / read / module / function / for / fn / arguments)"
+    );
+    for text in [errors[0].to_string(), format!("{:?}", errors[0])] {
+        assert!(!text.contains("private_typo"), "{text}");
+    }
+    let public = parse(
+        "mock.test.Resource { attr = private_typo.token }",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    assert!(
+        check_identifier_scope(&public)[0]
+            .to_string()
+            .contains("private_typo")
+    );
+}
+
+#[test]
+fn review3_secret_reference_origins_retain_scope_after_attribute_removal() {
+    let mut parsed = parse(
+        "let private_source = mock.test.Resource {}\nmock.test.Resource { attr = secret(private_source.token) }",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).unwrap();
+    // Exercise both removed and unwrapped values: retained origins are the
+    // authority when normalization discarded an annotation.
+    let original = parsed.resources[1].attributes["attr"].clone();
+    let Value::Deferred(DeferredValue::Secret(payload)) = original else {
+        panic!("secret reference")
+    };
+    for normalized in [None, Some(payload.expose_plaintext().clone())] {
+        parsed.resources[1].attributes.clear();
+        if let Some(value) = normalized {
+            parsed.resources[1].attributes.insert("attr".into(), value);
+        }
+        let tree = AnalysisTree::try_from_file(&parsed).unwrap();
+        let references = tree.resources().nth(1).unwrap().references();
+        assert_eq!(references.len(), 1);
+        assert!(!format!("{references:?}").contains("private_source"));
+    }
+}
+
+#[test]
+fn review3_secret_missing_syntax_provenance_masks_reference() {
+    let mut parsed = parse(
+        "mock.test.Resource {}",
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    parsed.resources[0].attributes.insert(
+        "attr".into(),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::ResourceRef {
+                path: crate::resource::AccessPath::new("private_source", "token"),
+            }))
+            .into(),
+        )),
+    );
+    let error = AnalysisTree::try_from_file(&parsed)
+        .err()
+        .expect("missing reference provenance");
+    for text in [error.to_string(), format!("{error:?}")] {
+        assert!(!text.contains("private_source"), "{text}");
+    }
+}
+
+#[test]
 fn declaration_location_and_envelope_keep_parser_span() {
     let source = "// sibling declaration\nlet bucket = mock.test.Resource { name = '東京' }\n";
     let file = preprocess_file(source).unwrap();
@@ -116,7 +218,8 @@ fn analysis_tree_rejects_unlocated_data_wait_and_nested_declarations() {
             AnalysisTreeErrorKind::MissingWaitProvenance { .. } => {
                 assert_eq!(expected, AnalysisItemKind::Wait)
             }
-            error @ (AnalysisTreeErrorKind::MissingElementProvenance { .. }
+            error @ (AnalysisTreeErrorKind::InsideSecret
+            | AnalysisTreeErrorKind::MissingElementProvenance { .. }
             | AnalysisTreeErrorKind::MissingSyntaxProvenance { .. }) => {
                 panic!("unexpected element invariant: {error}")
             }
@@ -182,9 +285,9 @@ fn min_exact_numeric_dsl() {
     let parsed = parse_and_resolve("let x = min(9007199254740993, 9007199254740992.0)").unwrap();
     assert_eq!(
         parsed.variables.get("x"),
-        Some(&Value::Concrete(ConcreteValue::Float(
+        Some(&Value::Concrete(ConcreteValue::Float(crate::finite(
             9_007_199_254_740_992.0
-        )))
+        ))))
     );
 }
 
@@ -394,15 +497,15 @@ fn secret_integer_arithmetic_taints_plain_and_interpolated_results() {
 
     assert_eq!(
         parsed.variables.get("plain"),
-        Some(&Value::Deferred(DeferredValue::Secret(Box::new(
-            Value::Concrete(ConcreteValue::Int(2)),
-        ))))
+        Some(&Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Int(2)),).into()
+        )))
     );
     assert_eq!(
         parsed.variables.get("text"),
-        Some(&Value::Deferred(DeferredValue::Secret(Box::new(
-            Value::Concrete(ConcreteValue::String("minutes=2".into())),
-        ))))
+        Some(&Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("minutes=2".into())),).into()
+        )))
     );
 }
 
@@ -2727,7 +2830,7 @@ fn schema_type_serde_preserves_every_scalar_kind_without_registry() {
             ),
             RefinedScalarKind::Float => crate::schema::CompiledAttributeType::refined_float(
                 Some(identity),
-                Some((Some(0.5), Some(9.5))),
+                Some((Some(crate::finite(0.5)), Some(crate::finite(9.5)))),
             ),
         };
         let original = TypeExpr::SchemaType {
@@ -2757,7 +2860,10 @@ fn schema_type_serde_preserves_every_scalar_kind_without_registry() {
                 assert_eq!(range, Some((Some(2), Some(42))));
             }
             crate::schema::RawShape::Float { range, .. } => {
-                assert_eq!(range, Some((Some(0.5), Some(9.5))));
+                assert_eq!(
+                    range,
+                    Some((Some(crate::finite(0.5)), Some(crate::finite(9.5))))
+                );
             }
             _ => panic!("scalar witness must retain its declaration"),
         }
@@ -3132,7 +3238,7 @@ fn parse_float_literal() {
     .unwrap();
     assert_eq!(
         result.resources[0].get_attr("weight"),
-        Some(&Value::Concrete(ConcreteValue::Float(2.5)))
+        Some(&Value::Concrete(ConcreteValue::Float(crate::finite(2.5))))
     );
 }
 
@@ -3152,7 +3258,7 @@ fn parse_negative_float_literal() {
     .unwrap();
     assert_eq!(
         result.resources[0].get_attr("offset"),
-        Some(&Value::Concrete(ConcreteValue::Float(-0.5)))
+        Some(&Value::Concrete(ConcreteValue::Float(crate::finite(-0.5))))
     );
 }
 
@@ -6242,7 +6348,7 @@ fn empty_interpolation_retains_authored_file_and_original_range() {
             .variables
             .get(name)
             .unwrap_or_else(|| panic!("missing variable {name}"))
-            .visit_placeholders(&mut |placeholder| {
+            .visit_placeholders(&mut |placeholder, _| {
                 if let ParserPlaceholder::EmptyInterpolation { source } = placeholder
                     && let Some((file, range)) = source.authored_location()
                 {
@@ -12272,9 +12378,12 @@ fn parse_decrypt_uses_config_decryptor() {
     let secret_val = parsed.resources[0].get_attr("secret").unwrap();
     assert_eq!(
         *secret_val,
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("decrypted:AQICAHh".into())
-        ))))
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "decrypted:AQICAHh".into()
+            )))
+            .into()
+        ))
     );
     let wrapped_val = parsed.resources[0].get_attr("wrapped").unwrap();
     assert_eq!(
@@ -12310,9 +12419,12 @@ fn decrypt_inside_interpolation_resolves_to_a_secret_string() {
 
     assert_eq!(
         value,
-        &Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("prefix-decrypted:ciphertext-suffix".into()),
-        ))))
+        &Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "prefix-decrypted:ciphertext-suffix".into()
+            ),))
+            .into()
+        ))
     );
     assert_eq!(crate::value::format_value(value), "(secret)");
     let state_value = crate::value::value_to_json(&expanded_value(value)).unwrap();
@@ -12468,6 +12580,38 @@ fn schema_custom_type_validation_accepts_a_loaded_context_witness() {
 }
 
 #[test]
+fn schema_custom_type_validation_preserves_bridge_decode_error_chain() {
+    let owned = crate::parser::OwnedTypeIdentity::provider(
+        "test",
+        TypeIdentity::bare("Count"),
+        crate::schema::RefinedScalarKind::Int,
+    )
+    .unbounded_witness_for_test();
+    let config = ProviderContext {
+        custom_types: crate::parser::ProviderCustomTypes::loaded(
+            HashSet::from([(*owned).clone()]),
+            Box::new(|_, _| Ok(())),
+        ),
+        ..ProviderContext::new(crate::EnvironmentSnapshot::empty())
+    };
+    let value = ExpandedValue::Concrete(ExpandedConcreteValue::EnumIdentifier(
+        crate::resource::RawEnumIdentifier::parse("not_an_integer"),
+    ));
+
+    let error = super::functions::validate_schema_custom_type_with_context(&owned, &value, &config)
+        .expect_err("invalid integer bridge text must fail decoding");
+    let message = error.to_string();
+    assert!(
+        message.contains("invalid integer bridge value"),
+        "{message}"
+    );
+    assert!(
+        message.contains("invalid digit found in string"),
+        "{message}"
+    );
+}
+
+#[test]
 fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
     let identity = TypeIdentity::from_dotted("test.Widget.SecretId");
     let config = crate::parser::LoadedProviderContext::for_test(ProviderContext {
@@ -12488,9 +12632,12 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
             identity,
             crate::schema::RefinedScalarKind::String,
         ),
-        &ExpandedValue::Deferred(ExpandedDeferredValue::Secret(Box::new(
-            ExpandedValue::Concrete(ExpandedConcreteValue::String("do-not-leak".into())),
-        ))),
+        &ExpandedValue::Deferred(ExpandedDeferredValue::Secret(
+            Box::new(ExpandedValue::Concrete(ExpandedConcreteValue::String(
+                "do-not-leak".into(),
+            )))
+            .into(),
+        )),
         &config,
     )
     .expect("a secret value defers custom-type validation");
@@ -12510,7 +12657,7 @@ fn provider_context_validator_receives_canonical_numeric_text() {
         ),
         (
             RefinedScalarKind::Float,
-            ExpandedValue::Concrete(ExpandedConcreteValue::Float(1.25)),
+            ExpandedValue::Concrete(ExpandedConcreteValue::Float(crate::finite(1.25))),
         ),
         (
             RefinedScalarKind::String,
@@ -16191,7 +16338,13 @@ fn parse_rejects_self_referential_let_binding() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["X", "X"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["X", "X"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16217,7 +16370,13 @@ fn parse_directory_files_rejects_self_referential_let_binding() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["X", "X"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["X", "X"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16368,7 +16527,13 @@ fn parse_directory_files_rejects_cyclic_sibling_let_chain() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["A", "B", "A"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16395,7 +16560,13 @@ fn parse_directory_files_rejects_resource_ref_let_cycle() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["A", "B", "A"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16422,7 +16593,13 @@ fn parse_directory_files_rejects_function_call_let_cycle() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["A", "B", "A"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16449,7 +16626,13 @@ fn parse_directory_files_rejects_interpolation_let_cycle() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["A", "B", "A"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16470,7 +16653,13 @@ fn parse_directory_files_rejects_list_let_cycle() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["A", "B", "A"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16497,7 +16686,13 @@ fn parse_directory_files_rejects_map_let_cycle() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(
+                chain
+                    .iter()
+                    .map(crate::resource::DiagnosticPath::to_dot_string)
+                    .collect::<Vec<_>>(),
+                vec!["A", "B", "A"]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }
@@ -16508,19 +16703,21 @@ fn reject_cyclic_let_bindings_detects_secret_value_cycle() {
     let mut variables = IndexMap::new();
     variables.insert(
         "A".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-            DeferredValue::BindingRef {
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::BindingRef {
                 binding: "B".into(),
-            },
-        )))),
+            }))
+            .into(),
+        )),
     );
     variables.insert(
         "B".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-            DeferredValue::BindingRef {
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::BindingRef {
                 binding: "A".into(),
-            },
-        )))),
+            }))
+            .into(),
+        )),
     );
     let structural: HashSet<&str> = HashSet::new();
 
@@ -16529,7 +16726,10 @@ fn reject_cyclic_let_bindings_detects_secret_value_cycle() {
 
     match err {
         ParseError::CyclicLetBinding { chain } => {
-            assert_eq!(chain, vec!["A", "B", "A"]);
+            assert_eq!(
+                chain,
+                vec![crate::resource::DiagnosticScope::Secret.path(None); 3]
+            );
         }
         other => panic!("expected CyclicLetBinding, got {other:?}"),
     }

@@ -3481,9 +3481,9 @@ mod tests {
     #[test]
     fn redacted_saved_plan_update_and_replace_render_before_rehydration() {
         let secret = |plaintext: &str| {
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(plaintext.into()),
-            ))))
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+            ))
         };
         let attributes = |plaintext: &str| {
             HashMap::from([
@@ -3625,9 +3625,9 @@ mod tests {
     #[test]
     fn saved_plan_secret_rehydration_renders_from_rehydrated_effect() {
         let secret = |plaintext: &str| {
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(plaintext.into()),
-            ))))
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+            ))
         };
         let mut registry = SchemaRegistry::new();
         registry.insert(
@@ -4858,9 +4858,9 @@ mod tests {
         const PLAINTEXT: &str = "hunter2";
         let to = Resource::new("test.Widget", "widget").with_attribute(
             "comment",
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("rotated".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("rotated".into()))).into(),
+            )),
         );
         let mut plan = Plan::new();
         plan.add(Effect::Create(resolved(to.clone())));
@@ -7434,18 +7434,18 @@ mod tests {
             ResourceId::with_identity("x.Thing", "t"),
             [(
                 "password".to_string(),
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("old-secret".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String("old-secret".into()))).into(),
+                )),
             )]
             .into_iter()
             .collect(),
         );
         let to = Resource::new("x.Thing", "t").with_attribute(
             "password",
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("new-secret".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("new-secret".into()))).into(),
+            )),
         );
         let effect = Effect::Update {
             identifier: crate::effect::fixture_applied_identifier(
@@ -7560,16 +7560,16 @@ mod tests {
         let mut old_map = indexmap::IndexMap::new();
         old_map.insert(
             "password".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("old".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("old".into()))).into(),
+            )),
         );
         let mut new_map = indexmap::IndexMap::new();
         new_map.insert(
             "password".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("new".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("new".into()))).into(),
+            )),
         );
         let old_value = Value::Concrete(ConcreteValue::Map(old_map));
         let new_value = Value::Concrete(ConcreteValue::Map(new_map));
@@ -7596,12 +7596,12 @@ mod tests {
     /// field, not fold into the hidden-count.
     #[test]
     fn list_of_maps_modified_keeps_secret_rotation_visible() {
-        let secret_old = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("old".into()),
-        ))));
-        let secret_new = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("new".into()),
-        ))));
+        let secret_old = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("old".into()))).into(),
+        ));
+        let secret_new = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("new".into()))).into(),
+        ));
 
         // Same `sid` on both sides so the similarity score is positive → Phase 2
         // pairs them. A different `effect` key forces Phase 1

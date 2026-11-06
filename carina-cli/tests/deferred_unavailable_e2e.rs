@@ -185,11 +185,10 @@ fn secret_wrapped_unavailable_interpolations_load_but_fail_when_planned() {
         "plan unexpectedly accepted a required missing secret input:\n{rendered}",
     );
     assert!(
-        rendered.contains("env()")
-            && rendered.contains("SECRET_V")
-            && rendered.contains("is not set"),
-        "plan lost the original env() diagnostic:\n{rendered}",
+        rendered.contains(carina_core::resource::INSIDE_SECRET_MESSAGE),
+        "plan lost the protected unavailable-input diagnostic:\n{rendered}",
     );
+    assert!(!rendered.contains("SECRET_V"), "{rendered}");
 }
 
 #[test]

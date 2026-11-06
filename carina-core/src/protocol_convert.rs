@@ -134,7 +134,6 @@ impl fmt::Display for WirePathKey {
 /// A core value or type cannot be represented by the provider protocol.
 #[derive(Debug)]
 pub enum ProtocolConvertError {
-    NonFiniteFloat,
     DurationOutOfRange,
     InvalidRedactedSecretDigest,
     UnavailableSecret(crate::resource::UnavailableSecretError),
@@ -185,9 +184,6 @@ pub enum ProtocolConvertError {
 impl fmt::Display for ProtocolConvertError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NonFiniteFloat => {
-                formatter.write_str("non-finite float cannot cross the provider protocol")
-            }
             Self::DurationOutOfRange => formatter
                 .write_str("duration in seconds does not fit the provider protocol integer domain"),
             Self::UnavailableSecret(error) => fmt::Display::fmt(error, formatter),
@@ -273,7 +269,6 @@ impl Error for ProtocolConvertError {
                 source,
             } => Some(source.as_ref()),
             Self::ValuePath { error, .. } => Some(error.as_ref()),
-            Self::NonFiniteFloat => None,
             Self::DurationOutOfRange => None,
             Self::InvalidRedactedSecretDigest => None,
             Self::UnavailableSecret(error) => error.source(),
@@ -304,6 +299,20 @@ impl Error for ProtocolConvertError {
                 base_kind: _base_kind,
             } => None,
         }
+    }
+}
+
+impl crate::resource::InsideSecret for ProtocolConvertError {
+    fn inside_secret(self) -> Self {
+        let leaf = match self.into_leaf_error() {
+            error @ (Self::DurationOutOfRange
+            | Self::InvalidRedactedSecretDigest
+            | Self::NonWireValue { .. }
+            | Self::NonWireAttributeType { .. }
+            | Self::ValidatorWithoutIdentity { .. }) => error,
+            _ => Self::NonWireValue { variant: "Secret" },
+        };
+        leaf.at_value_path(WirePathSegment::Secret)
     }
 }
 
@@ -730,7 +739,7 @@ fn protocol_to_type_identity(identity: &str) -> TypeIdentity {
     TypeIdentity::from_dotted(identity)
 }
 
-/// Project one aggregate provider-schema witness onto the version-21 envelope.
+/// Project one aggregate provider-schema witness onto the version-22 envelope.
 pub fn provider_schema_to_protocol(
     witness: &ValidatedProviderSchemaWitness,
 ) -> Result<protocol::ProviderSchemaEnvelope, ProtocolConvertError> {
@@ -793,7 +802,7 @@ fn protocol_to_assignability_edge(
     .map_err(SchemaDecodeError::InvalidProviderSchema)
 }
 
-/// Decode the version-21 provider-schema envelope and jointly admit resource,
+/// Decode the version-22 provider-schema envelope and jointly admit resource,
 /// config, reference-form, and assignability declarations.
 pub fn protocol_to_provider_schema_witness(
     envelope: &protocol::ProviderSchemaEnvelope,
@@ -1020,9 +1029,14 @@ pub fn attribute_type_to_protocol(
             elements: constraints.elements(),
             validate: None,
         }),
-        RawShape::Map { key, value } => Ok(protocol::AttributeType::Map {
+        RawShape::Map {
+            key,
+            value,
+            constraints,
+        } => Ok(protocol::AttributeType::Map {
             inner: Box::new(attribute_type_to_protocol(value)?),
             key: Box::new(attribute_type_to_protocol(key)?),
+            length: constraints.length(),
         }),
         RawShape::Struct {
             name,
@@ -1475,9 +1489,10 @@ pub fn protocol_to_attribute_type(
                 *elements,
             ))
         }
-        protocol::AttributeType::Map { inner, key } => Ok(DraftAttributeType::map_with_key(
+        protocol::AttributeType::Map { inner, key, length } => Ok(DraftAttributeType::refined_map(
             protocol_to_attribute_type(key)?,
             protocol_to_attribute_type(inner)?,
+            *length,
         )),
         protocol::AttributeType::Struct {
             name,
@@ -1596,7 +1611,7 @@ fn decoded_refined_int(
 
 fn decoded_refined_float(
     identity: Option<TypeIdentity>,
-    range: Option<(Option<f64>, Option<f64>)>,
+    range: Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>,
 ) -> DraftAttributeType {
     match identity {
         Some(identity) => match crate::schema::builtin_validator(
@@ -1736,6 +1751,7 @@ fn protocol_legacy_custom_to_core(
         protocol::AttributeType::Map {
             inner: _base_inner,
             key: _base_key,
+            length: _base_length,
         } => Err(SchemaDecodeError::unsupported_custom_base(
             enclosing_name,
             "Map",
@@ -1987,13 +2003,7 @@ pub fn try_core_to_protocol_value(value: &Value) -> Result<protocol::Value, Prot
             Ok(protocol::Value::String(value.api_value().to_string()))
         }
         Value::Concrete(ConcreteValue::Int(value)) => Ok(protocol::Value::Int(*value)),
-        Value::Concrete(ConcreteValue::Float(value)) => {
-            if value.is_finite() {
-                Ok(protocol::Value::Float(*value))
-            } else {
-                Err(ProtocolConvertError::NonFiniteFloat)
-            }
-        }
+        Value::Concrete(ConcreteValue::Float(value)) => Ok(protocol::Value::Float(*value)),
         Value::Concrete(ConcreteValue::Bool(value)) => Ok(protocol::Value::Bool(*value)),
         Value::Concrete(ConcreteValue::Duration(value)) => i64::try_from(value.as_secs())
             .map(protocol::Value::Int)
@@ -2072,13 +2082,7 @@ pub fn protocol_to_core_value(value: &protocol::Value) -> Result<Value, Protocol
     match value {
         protocol::Value::Bool(value) => Ok(Value::Concrete(ConcreteValue::Bool(*value))),
         protocol::Value::Int(value) => Ok(Value::Concrete(ConcreteValue::Int(*value))),
-        protocol::Value::Float(value) => {
-            if value.is_finite() {
-                Ok(Value::Concrete(ConcreteValue::Float(*value)))
-            } else {
-                Err(ProtocolConvertError::NonFiniteFloat)
-            }
-        }
+        protocol::Value::Float(value) => Ok(Value::Concrete(ConcreteValue::Float(*value))),
         protocol::Value::String(value) => {
             Ok(Value::Concrete(ConcreteValue::String(value.clone().into())))
         }
@@ -2119,13 +2123,7 @@ pub fn protocol_schema_default_to_core(
     match value {
         protocol::Value::Bool(value) => Ok(Value::Concrete(ConcreteValue::Bool(*value))),
         protocol::Value::Int(value) => Ok(Value::Concrete(ConcreteValue::Int(*value))),
-        protocol::Value::Float(value) => {
-            if value.is_finite() {
-                Ok(Value::Concrete(ConcreteValue::Float(*value)))
-            } else {
-                Err(ProtocolConvertError::NonFiniteFloat)
-            }
-        }
+        protocol::Value::Float(value) => Ok(Value::Concrete(ConcreteValue::Float(*value))),
         protocol::Value::String(value) => {
             Ok(Value::Concrete(ConcreteValue::String(value.clone().into())))
         }
@@ -2207,13 +2205,7 @@ pub fn try_core_to_protocol_persisted_value(
             protocol::PersistedValue::String(value.api_value().to_string()),
         ),
         Value::Concrete(ConcreteValue::Int(value)) => Ok(protocol::PersistedValue::Int(*value)),
-        Value::Concrete(ConcreteValue::Float(value)) => {
-            if value.is_finite() {
-                Ok(protocol::PersistedValue::Float(*value))
-            } else {
-                Err(ProtocolConvertError::NonFiniteFloat)
-            }
-        }
+        Value::Concrete(ConcreteValue::Float(value)) => Ok(protocol::PersistedValue::Float(*value)),
         Value::Concrete(ConcreteValue::Bool(value)) => Ok(protocol::PersistedValue::Bool(*value)),
         Value::Concrete(ConcreteValue::Duration(value)) => i64::try_from(value.as_secs())
             .map(protocol::PersistedValue::Int)
@@ -2264,13 +2256,7 @@ pub fn protocol_to_core_persisted_value(
     match value {
         protocol::PersistedValue::Bool(value) => Ok(Value::Concrete(ConcreteValue::Bool(*value))),
         protocol::PersistedValue::Int(value) => Ok(Value::Concrete(ConcreteValue::Int(*value))),
-        protocol::PersistedValue::Float(value) => {
-            if value.is_finite() {
-                Ok(Value::Concrete(ConcreteValue::Float(*value)))
-            } else {
-                Err(ProtocolConvertError::NonFiniteFloat)
-            }
-        }
+        protocol::PersistedValue::Float(value) => Ok(Value::Concrete(ConcreteValue::Float(*value))),
         protocol::PersistedValue::String(value) => {
             Ok(Value::Concrete(ConcreteValue::String(value.clone().into())))
         }
@@ -3172,6 +3158,66 @@ mod tests {
     };
 
     #[test]
+    fn map_length_round_trip_through_protocol_json() {
+        for length in [Some((Some(0), Some(10))), Some((Some(2), None)), None] {
+            let wire = serde_json::from_value(serde_json::json!({
+                "type": "map", "inner": {"type": "String"},
+                "key": {"type": "String"}, "length": length,
+            }))
+            .unwrap();
+            let schema =
+                protocol_to_config_schema(BTreeMap::from([("value".into(), wire)])).unwrap();
+            let original = &schema.parts()["value"];
+            let wire = attribute_type_to_protocol(original).unwrap();
+            let json = serde_json::to_value(&wire).unwrap();
+            assert_eq!(json["length"], serde_json::to_value(length).unwrap());
+            let decoded_wire = serde_json::from_value(json.clone()).unwrap();
+            let decoded =
+                protocol_to_config_schema(BTreeMap::from([("value".into(), decoded_wire)]))
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(
+                    attribute_type_to_protocol(&decoded.parts()["value"]).unwrap()
+                )
+                .unwrap(),
+                json
+            );
+        }
+    }
+
+    #[test]
+    fn map_length_missing_json_decodes_as_unbounded() {
+        let wire = serde_json::from_value(serde_json::json!({
+            "type": "map", "inner": {"type": "String"}, "key": {"type": "String"},
+        }))
+        .unwrap();
+        let schema = protocol_to_config_schema(BTreeMap::from([("value".into(), wire)])).unwrap();
+        let value: Value = Value::Concrete(ConcreteValue::Map(
+            (0..11)
+                .map(|i| {
+                    (
+                        format!("key_{i}"),
+                        Value::Concrete(ConcreteValue::String("value".into())),
+                    )
+                })
+                .collect(),
+        ));
+        assert!(
+            schema
+                .rootless_type("value")
+                .unwrap()
+                .validate(&value)
+                .is_ok()
+        );
+        assert!(
+            serde_json::to_value(attribute_type_to_protocol(&schema.parts()["value"]).unwrap())
+                .unwrap()
+                .get("length")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn list_elements_refinements_round_trip_through_json() {
         use crate::schema::ListElements;
         for elements in [ListElements::AllowDuplicates, ListElements::Unique] {
@@ -3598,41 +3644,24 @@ mod tests {
         ));
 
         let nested = protocol::Value::Map(BTreeMap::from([(
-            "items".to_string(),
-            protocol::Value::List(vec![protocol::Value::Float(f64::INFINITY)]),
+            "items".into(),
+            protocol::Value::List(vec![protocol::Value::Float(crate::finite(-0.0))]),
         )]));
-        let error = protocol_schema_default_to_core(&nested)
-            .expect_err("nested non-finite defaults must fail before JSON serialization");
-        assert!(error.to_string().contains("map key `items`"));
-        assert!(std::error::Error::source(&error).is_some());
+        let decoded = protocol_schema_default_to_core(&nested).unwrap();
+        assert_eq!(try_core_to_protocol_value(&decoded).unwrap(), nested);
     }
 
     #[test]
     fn protocol_ordered_map_conversion_uses_canonical_key_order() {
         for iteration in 0..200 {
-            let invalid = BTreeMap::from([
-                (
-                    "z_invalid".to_string(),
-                    protocol::Value::Float(f64::INFINITY),
-                ),
-                ("a_invalid".to_string(), protocol::Value::Float(f64::NAN)),
-            ]);
-            let error = protocol_to_core_value_map(&invalid)
-                .expect_err("both protocol values are non-finite");
-            assert_eq!(
-                error.to_string(),
-                "map key `a_invalid`",
-                "iteration {iteration}"
-            );
-
             let valid = protocol::Value::Map(BTreeMap::from([
                 ("z_last".to_string(), protocol::Value::Int(2)),
                 ("a_first".to_string(), protocol::Value::Int(1)),
             ]));
             let Value::Concrete(ConcreteValue::Map(decoded)) =
-                protocol_to_core_value(&valid).expect("finite protocol map must decode")
+                protocol_to_core_value(&valid).unwrap()
             else {
-                panic!("protocol map must decode to a concrete core map")
+                panic!("expected a map")
             };
             assert_eq!(
                 decoded.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -3653,7 +3682,7 @@ mod tests {
         );
         assert!(matches!(
             error.leaf_error(),
-            ProtocolConvertError::NonFiniteFloat
+            ProtocolConvertError::DurationOutOfRange
         ));
         let mut messages = Vec::new();
         let mut current: Option<&dyn std::error::Error> = Some(&error);
@@ -3667,7 +3696,7 @@ mod tests {
                 "map key `root`",
                 "list index 0",
                 "map key `leaf`",
-                "non-finite float cannot cross the provider protocol",
+                "duration in seconds does not fit the provider protocol integer domain",
             ]
         );
     }
@@ -3679,25 +3708,19 @@ mod tests {
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(IndexMap::from([(
                     "leaf".into(),
-                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                    Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                        u64::MAX,
+                    ))),
                 )])),
             )])),
         )]);
-        let wire = BTreeMap::from([(
-            "root".into(),
-            protocol::Value::List(vec![protocol::Value::Map(BTreeMap::from([(
-                "leaf".into(),
-                protocol::Value::Float(f64::NAN),
-            )]))]),
-        )]);
-        for error in [
-            try_core_to_protocol_value_map(&core).unwrap_err(),
-            protocol_to_core_value_map(&wire).unwrap_err(),
-            protocol_to_core_value(&protocol::Value::Map(wire.clone())).unwrap_err(),
-            protocol_schema_default_to_core(&protocol::Value::Map(wire)).unwrap_err(),
-        ] {
-            assert_complete_value_path(error);
-        }
+        assert_complete_value_path(try_core_to_protocol_value_map(&core).unwrap_err());
+        assert_complete_value_path(
+            try_core_to_protocol_value(&Value::Concrete(ConcreteValue::Map(
+                core.into_iter().collect(),
+            )))
+            .unwrap_err(),
+        );
     }
 
     #[test]
@@ -3707,41 +3730,50 @@ mod tests {
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(IndexMap::from([(
                     "leaf".into(),
-                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                    Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                        u64::MAX,
+                    ))),
                 )])),
             )])),
         )]);
-        let wire = BTreeMap::from([(
-            "root".into(),
-            protocol::PersistedValue::List(vec![protocol::PersistedValue::Map(BTreeMap::from([
-                ("leaf".into(), protocol::PersistedValue::Float(f64::NAN)),
-            ]))]),
-        )]);
-        for error in [
-            try_core_to_protocol_persisted_value_map(&core).unwrap_err(),
+        assert_complete_value_path(try_core_to_protocol_persisted_value_map(&core).unwrap_err());
+        assert_complete_value_path(
             try_core_to_protocol_persisted_value(&Value::Concrete(ConcreteValue::Map(
                 core.into_iter().collect(),
             )))
             .unwrap_err(),
+        );
+        let wire = BTreeMap::from([(
+            "root".into(),
+            protocol::PersistedValue::List(vec![protocol::PersistedValue::Map(BTreeMap::from([
+                (
+                    "leaf".into(),
+                    protocol::PersistedValue::RedactedSecret("invalid-digest".into()),
+                ),
+            ]))]),
+        )]);
+        for error in [
             protocol_to_core_persisted_value_map(&wire).unwrap_err(),
             protocol_to_core_persisted_value(&protocol::PersistedValue::Map(wire)).unwrap_err(),
         ] {
-            assert_complete_value_path(error);
+            assert_eq!(
+                error.value_path(),
+                vec![
+                    WirePathSegment::Key("root".into()),
+                    WirePathSegment::Index(0),
+                    WirePathSegment::Key("leaf".into())
+                ]
+            );
+            assert!(matches!(
+                error.leaf_error(),
+                ProtocolConvertError::InvalidRedactedSecretDigest
+            ));
+            assert!(std::error::Error::source(&error).is_some());
         }
     }
 
     #[test]
-    fn schema_default_projection_rejects_non_wire_values_and_every_non_finite_float() {
-        for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-            assert!(matches!(
-                try_core_to_protocol_value(&Value::Concrete(ConcreteValue::Float(value))),
-                Err(ProtocolConvertError::NonFiniteFloat)
-            ));
-            assert!(matches!(
-                protocol_schema_default_to_core(&protocol::Value::Float(value)),
-                Err(ProtocolConvertError::NonFiniteFloat)
-            ));
-        }
+    fn schema_default_projection_rejects_non_wire_values() {
         assert!(matches!(
             try_core_to_protocol_value(&Value::Concrete(ConcreteValue::Duration(
                 std::time::Duration::from_secs(u64::MAX),
@@ -3819,9 +3851,9 @@ mod tests {
                 source_line: (0).into(),
             }),
             access,
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("secret".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("secret".into()))).into(),
+            )),
             Value::Deferred(DeferredValue::Unknown(
                 crate::resource::ApplyTimeUnknown::UpstreamAllExports {
                     binding: absolute_binding("upstream"),
@@ -3890,13 +3922,13 @@ mod tests {
 
     #[test]
     fn contextual_errors_display_only_their_context_and_expose_the_source() {
-        let error = ProtocolConvertError::NonFiniteFloat.context("list index 0");
+        let error = ProtocolConvertError::DurationOutOfRange.context("list index 0");
         assert_eq!(error.to_string(), "list index 0");
         assert_eq!(
             std::error::Error::source(&error)
                 .expect("context must expose its source")
                 .to_string(),
-            "non-finite float cannot cross the provider protocol"
+            "duration in seconds does not fit the provider protocol integer domain"
         );
 
         let decode = SchemaDecodeError::from_default(error);
@@ -4524,6 +4556,7 @@ mod tests {
             (
                 "map",
                 protocol::AttributeType::Map {
+                    length: None,
                     inner: Box::new(identity_struct()),
                     key: Box::new(protocol::AttributeType::String {
                         pattern: None,
@@ -4640,6 +4673,7 @@ mod tests {
                 RawShape::Map {
                     key: _key,
                     value: _value,
+                    constraints: _constraints,
                 } => panic!("unexpected Map builtin wire shape for {identity}"),
                 RawShape::Struct {
                     name: _name,
@@ -4873,7 +4907,7 @@ mod tests {
         let float_wire = protocol::AttributeType::Custom {
             name: "test.Ratio".to_string(),
             base: Box::new(protocol::AttributeType::Float {
-                range: Some((Some(0.0), Some(1.0))),
+                range: Some((Some(crate::finite(0.0)), Some(crate::finite(1.0)))),
                 identity: None,
             }),
             pattern: None,
@@ -4898,7 +4932,7 @@ mod tests {
             RawShape::Float {
                 range: Some((Some(min), Some(max))),
                 ..
-            } if min == 0.0 && max == 1.0
+            } if min.get() == 0.0 && max.get() == 1.0
         ));
     }
 

@@ -4,6 +4,45 @@ use carina_core::parser::TypeExpr;
 use carina_core::resource::AuthoredValue as Value;
 use tower_lsp::lsp_types::{Position, Range, TextDocumentContentChangeEvent};
 
+#[path = "../../../../carina-core/tests/support/secret_origin.rs"]
+mod secret_origin_fixture;
+
+#[test]
+fn secret_origin_4275_directory_diagnostics_are_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    secret_origin_fixture::write_directory(dir.path());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", secret_origin_fixture::schema());
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let diagnostics =
+        analyze_with_buffer(&engine, dir.path(), "main.crn", secret_origin_fixture::MAIN);
+    let mismatch = diagnostics
+        .iter()
+        .find(|d| d.message.contains("expected Int"))
+        .unwrap_or_else(|| panic!("the mismatch must survive redaction: {diagnostics:?}"));
+    assert_eq!(
+        mismatch.message,
+        "Type mismatch: expected Int, got String (from (secret))"
+    );
+    assert_eq!(mismatch.range.start.line, 0);
+    assert!(
+        !serde_json::to_string(&diagnostics)
+            .unwrap()
+            .contains("private-"),
+        "{diagnostics:?}"
+    );
+    assert!(
+        analyze_with_buffer(
+            &engine,
+            dir.path(),
+            "producer.crn",
+            "let producer = mock.test.Secret {}\n"
+        )
+        .iter()
+        .all(|d| !d.message.contains("expected Int"))
+    );
+}
+
 const ATTRIBUTE_DERIVED_IDENTITY_ERROR: &str = "Anonymous resource identity is derived from \
 mutable attributes for multiple 'mock.test.resource' declarations using provider instance \
 '<default>' in the root scope. Use `let` bindings to give them distinct stable identities.";
@@ -17390,6 +17429,133 @@ fn reference_constraints_validate_offline_in_a_directory_configuration() {
 }
 
 #[test]
+fn map_length_diagnostics_in_directory_configuration() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema};
+    let params = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((Some(0), Some(10))),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Request")
+            .attribute(AttributeSchema::required("params", params).build())
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("providers.crn"), "provider mock {}\n").unwrap();
+    for count in [10, 11] {
+        let entries = (0..count)
+            .map(|i| format!("    key_{i} = 'value'\n"))
+            .collect::<String>();
+        let source = format!("mock.Request {{\n  params = {{\n{entries}  }}\n}}\n");
+        std::fs::write(directory.path().join("main.crn"), &source).unwrap();
+        let diagnostics = analyze_with_buffer(&engine, directory.path(), "main.crn", &source);
+        if count == 10 {
+            assert!(diagnostics.is_empty(), "{diagnostics:#?}");
+        } else {
+            let errors = diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "{diagnostics:#?}");
+            assert!(errors[0].message.contains("params"), "{diagnostics:#?}");
+            assert!(
+                errors[0]
+                    .message
+                    .contains("length 11 is outside allowed range [0, 10]"),
+                "{diagnostics:#?}"
+            );
+            // The duplicate Warning for the same error is carina-rs/carina#4265.
+            assert!(
+                diagnostics.iter().all(|diagnostic| diagnostic
+                    .message
+                    .contains("length 11 is outside allowed range [0, 10]")),
+                "{diagnostics:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn map_and_list_length_diagnostics_keep_whole_resource_errors() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
+    let length = Some((Some(1), Some(2)));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Request")
+            .attribute(
+                AttributeSchema::required(
+                    "params",
+                    AttributeType::refined_map(
+                        AttributeType::string(),
+                        AttributeType::string(),
+                        length,
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::required(
+                    "items",
+                    AttributeType::refined_list(
+                        AttributeType::string(),
+                        true,
+                        length,
+                        ListElements::AllowDuplicates,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    for count in [0, 1, 2, 3] {
+        let entries = (0..count)
+            .map(|index| format!("key_{index} = 'value' "))
+            .collect::<String>();
+        let items = vec!["'value'"; count].join(", ");
+        let source =
+            format!("mock.Request {{\n  params = {{ {entries}}}\n  items = [{items}]\n}}\n");
+        let diagnostics = engine.analyze(&create_document(&source), None);
+        if (1..=2).contains(&count) {
+            assert!(diagnostics.is_empty(), "{count}: {diagnostics:#?}");
+            continue;
+        }
+        let severities_for = |attribute| {
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains(&format!("'{attribute}'")))
+                .map(|diagnostic| diagnostic.severity)
+                .collect::<Vec<_>>()
+        };
+        let map_severities = severities_for("params");
+        assert_eq!(map_severities, severities_for("items"), "{diagnostics:#?}");
+        assert_eq!(
+            map_severities
+                .iter()
+                .filter(|severity| **severity == Some(DiagnosticSeverity::ERROR))
+                .count(),
+            1,
+            "{count}: {diagnostics:#?}"
+        );
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic
+                .message
+                .contains(&format!("length {count} is outside allowed range [1, 2]"))),
+            "{count}: {diagnostics:#?}"
+        );
+    }
+}
+
+#[test]
 fn non_string_interpolation_sinks_across_files() {
     let engine = coalesce_resource_engine();
     for source in [
@@ -17502,5 +17668,49 @@ fn resource_child_failure_has_one_error_across_files() {
     assert!(
         errors[0].message.contains("no_such_attr"),
         "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn secret_origin_4275_lsp_nested_failure_is_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    secret_origin_fixture::write_directory(dir.path());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", secret_origin_fixture::schema());
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let diagnostics = analyze_with_buffer(
+        &engine,
+        dir.path(),
+        "main.crn",
+        "mock.test.Secret { params = secret(cidr_subnet(\"private-invalid-cidr\", 1, 1)) }\n",
+    );
+    assert!(!diagnostics.is_empty());
+    assert!(
+        !serde_json::to_string(&diagnostics)
+            .unwrap()
+            .contains("private-"),
+        "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn secret_origin_4275_lsp_reference_errors_are_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    secret_origin_fixture::write_directory(dir.path());
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("mock", secret_origin_fixture::reference_schema());
+    let engine = DiagnosticEngine::new(loaded_test_providers(schemas), vec!["mock".into()]);
+    let diagnostics = analyze_with_buffer(
+        &engine,
+        dir.path(),
+        "main.crn",
+        "mock.test.Secret { params = secret(producer.config.private_field) }\n",
+    );
+    assert!(!diagnostics.is_empty());
+    assert!(
+        !serde_json::to_string(&diagnostics)
+            .unwrap()
+            .contains("private_field"),
+        "{diagnostics:?}"
     );
 }

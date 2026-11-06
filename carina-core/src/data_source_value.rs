@@ -11,12 +11,169 @@ use crate::resource::{
 
 /// A data-source input attribute whose unresolved value shapes make the read
 /// apply-time dependent or unsafe to hand to a provider.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnresolvedDataSourceInput {
     pub attribute: String,
-    pub paths: Vec<AccessPath>,
-    pub bindings: Vec<AbsoluteBindingAddress>,
-    pub unknowns: Vec<ApplyTimeUnknown>,
+    paths: Vec<AccessPath>,
+    bindings: Vec<AbsoluteBindingAddress>,
+    unknowns: Vec<ApplyTimeUnknown>,
+    #[serde(default = "secret_scope")]
+    diagnostic_scope: crate::resource::DiagnosticScope,
+}
+
+fn secret_scope() -> crate::resource::DiagnosticScope {
+    crate::resource::DiagnosticScope::Secret
+}
+
+impl UnresolvedDataSourceInput {
+    /// Collect identities and their diagnostic protection in the same operation.
+    pub fn collect(attribute: impl Into<String>, value: &crate::resource::Value) -> Option<Self> {
+        use crate::resource::DiagnosticScope;
+        let mut input = Self {
+            attribute: attribute.into(),
+            paths: Vec::new(),
+            bindings: Vec::new(),
+            unknowns: Vec::new(),
+            diagnostic_scope: DiagnosticScope::Public,
+        };
+        value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+            if reference.is_secret() {
+                input.diagnostic_scope = DiagnosticScope::Secret;
+            }
+            let _: Result<(), std::convert::Infallible> = reference.check(|path| {
+                input.paths.push(path.clone());
+                Ok(())
+            });
+        });
+        value.visit_binding_refs_for_diagnostics(&mut |reference| {
+            if reference.is_secret() {
+                input.diagnostic_scope = DiagnosticScope::Secret;
+            }
+            reference.identity().record_graph_key(&mut input.bindings);
+        });
+        visit_unknowns(value, DiagnosticScope::Public, &mut |reason, scope| {
+            if scope.is_secret() {
+                input.diagnostic_scope = scope;
+            }
+            input.unknowns.push(reason.clone());
+        });
+        (!input.paths.is_empty() || !input.bindings.is_empty() || !input.unknowns.is_empty())
+            .then_some(input)
+    }
+
+    /// Compare scheduler identities without returning raw diagnostic data.
+    pub fn any_binding_matches(
+        &self,
+        mut matches: impl FnMut(crate::resource::DependencyKey<AbsoluteBindingAddress>) -> bool,
+    ) -> bool {
+        self.paths
+            .iter()
+            .map(AccessPath::binding_address)
+            .chain(&self.bindings)
+            .any(|binding| matches(crate::resource::DependencyKey::new(binding.clone())))
+    }
+
+    pub fn has_unknowns(&self) -> bool {
+        !self.unknowns.is_empty()
+    }
+
+    /// Render inventory findings without exposing identities collected inside secrets.
+    pub fn diagnostic_references(&self) -> Vec<String> {
+        if self.diagnostic_scope.is_secret() {
+            return vec![
+                crate::resource::DiagnosticScope::Secret
+                    .path::<AbsoluteBindingAddress>(None)
+                    .to_dot_string(),
+            ];
+        }
+        self.paths
+            .iter()
+            .map(AccessPath::to_dot_string)
+            .chain(self.bindings.iter().map(ToString::to_string))
+            .chain(
+                self.unknowns
+                    .iter()
+                    .map(|reason| format!("unknown({reason})")),
+            )
+            .collect()
+    }
+}
+
+impl std::fmt::Debug for UnresolvedDataSourceInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("UnresolvedDataSourceInput");
+        debug.field("attribute", &self.attribute);
+        if self.diagnostic_scope.is_secret() {
+            debug.field(
+                "references",
+                &crate::resource::DiagnosticScope::Secret.path::<AbsoluteBindingAddress>(None),
+            );
+        } else {
+            debug
+                .field("paths", &self.paths)
+                .field("bindings", &self.bindings)
+                .field("unknowns", &self.unknowns);
+        }
+        debug.finish()
+    }
+}
+
+fn visit_unknowns(
+    value: &crate::resource::Value,
+    scope: crate::resource::DiagnosticScope,
+    f: &mut impl FnMut(&ApplyTimeUnknown, crate::resource::DiagnosticScope),
+) {
+    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
+    match value {
+        Value::Deferred(DeferredValue::Unknown(reason)) => f(reason, scope),
+        Value::Concrete(ConcreteValue::List(items)) => {
+            for item in items {
+                visit_unknowns(item, scope, f);
+            }
+        }
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            for item in map.values() {
+                visit_unknowns(item, scope, f);
+            }
+        }
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            for part in parts {
+                if let InterpolationPart::Expr(value) = part {
+                    visit_unknowns(value, scope, f);
+                }
+            }
+        }
+        Value::Deferred(
+            DeferredValue::FunctionCall { args, .. }
+            | DeferredValue::Unavailable { args, .. }
+            | DeferredValue::ResolvedFunctionCall { args, .. },
+        ) => {
+            for arg in args {
+                visit_unknowns(arg.walker_value(), scope, f);
+            }
+        }
+        Value::Deferred(DeferredValue::Access(access)) => visit_unknowns(access.base(), scope, f),
+        Value::Deferred(DeferredValue::Secret(inner)) => inner
+            .visit_plaintext_reference_inventory(|value, scope| visit_unknowns(value, scope, f)),
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            visit_unknowns(value, scope, f);
+            visit_unknowns(default, scope, f);
+        }
+        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            deferred
+                .values()
+                .into_iter()
+                .for_each(|value| visit_unknowns(value, scope, f));
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            visit_unknowns(expression.lhs(), scope, f);
+            visit_unknowns(expression.rhs(), scope, f);
+        }
+        Value::Concrete(_)
+        | Value::Deferred(DeferredValue::ResourceRef { .. })
+        | Value::Deferred(DeferredValue::BindingRef { .. }) => {}
+        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
+    }
 }
 
 /// The value status of one configured data source after the pre-apply read
@@ -334,6 +491,26 @@ mod tests {
     }
 
     #[test]
+    fn review3_unresolved_inventory_defaults_secret_and_round_trips_public_scope() {
+        let public = UnresolvedDataSourceInput::collect(
+            "query",
+            &crate::resource::Value::Deferred(crate::resource::DeferredValue::ResourceRef {
+                path: AccessPath::new("private_producer", "token").resolve_root(&RootScope::new()),
+            }),
+        )
+        .unwrap();
+        let encoded = serde_json::to_value(&public).unwrap();
+        let decoded: UnresolvedDataSourceInput = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(public, decoded);
+        assert_eq!(decoded.diagnostic_references(), ["private_producer.token"]);
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("diagnostic_scope");
+        let decoded: UnresolvedDataSourceInput = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.diagnostic_references(), ["(secret)"]);
+        assert!(!format!("{decoded:?}").contains("private_producer"));
+    }
+
+    #[test]
     fn construction_classifies_every_configured_data_source() {
         let data_sources = [data_source("read_now"), data_source("read_later")];
         let mut visited = Vec::new();
@@ -397,6 +574,7 @@ mod tests {
             paths: vec![AccessPath::new("producer", "name").resolve_root(&RootScope::new())],
             bindings: vec![absolute_binding("producer")],
             unknowns: Vec::new(),
+            diagnostic_scope: crate::resource::DiagnosticScope::Public,
         };
         let mut values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
             if data_source
@@ -471,6 +649,7 @@ mod tests {
             paths: vec![AccessPath::new("producer", "name").resolve_root(&RootScope::new())],
             bindings: vec![absolute_binding("producer")],
             unknowns: Vec::new(),
+            diagnostic_scope: crate::resource::DiagnosticScope::Public,
         };
         let values = DataSourceValues::from_data_sources(&data_sources, |data_source| {
             if data_source.id == data_sources[0].id {

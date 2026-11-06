@@ -34,26 +34,23 @@ pub(crate) fn apply_pipe_step(
     column: usize,
     location: crate::parser::DeclarationLocation,
 ) -> Result<EvalValue, ParseError> {
+    let mut eval_args = extra_args;
+    eval_args.push(value);
     if let Some(EvalValue::Closure {
         name: fn_name,
         captured_args,
         remaining_arity,
     }) = ctx.get_variable(&func_name)
     {
-        let mut all_args = extra_args.clone();
-        all_args.push(value.clone());
         return apply_parser_closure(
             fn_name,
             captured_args,
             *remaining_arity,
-            all_args,
+            eval_args,
             ctx,
             line,
         );
     }
-
-    let mut eval_args = extra_args;
-    eval_args.push(value);
 
     if crate::builtins::builtin_arity(&func_name).is_some() {
         reject_builtin_handle_arguments(&eval_args, line)?;
@@ -87,8 +84,7 @@ pub(crate) fn apply_pipe_step(
         )));
     }
 
-    let args = lower_function_arguments(eval_args, line)?;
-    let builtin = crate::builtins::BuiltinFunction::from_name(&func_name).ok_or_else(|| {
+    let builtin = crate::builtins::Builtin::from_name(&func_name).ok_or_else(|| {
         ParseError::UnknownFunction {
             name: func_name.clone(),
             line,
@@ -97,36 +93,16 @@ pub(crate) fn apply_pipe_step(
     })?;
 
     if let Some(arity) = crate::builtins::builtin_arity(&func_name)
-        && args.len() < arity
-        && args
-            .iter()
-            .all(|argument| argument.value().is_some_and(crate::parser::is_static_value))
+        && eval_args.len() < arity
+        && eval_args.iter().all(is_static_eval)
     {
-        let eval_args: Vec<EvalValue> = args
-            .iter()
-            .map(|argument| {
-                EvalValue::from_value(
-                    argument
-                        .value()
-                        .expect("static function argument is a value")
-                        .clone(),
-                )
-            })
-            .collect();
         return crate::builtins::evaluate_builtin_with_config(&func_name, &eval_args, ctx.config)
             .map_err(|message| ParseError::InvalidExpression {
                 line,
                 message: format!("{func_name}(): {message}"),
             });
     }
-
-    Ok(EvalValue::from_value(Value::Deferred(
-        DeferredValue::FunctionCall {
-            name: builtin,
-            args,
-            source_line: (line).into(),
-        },
-    )))
+    crate::parser::functions::construct_builtin_call(builtin, eval_args, ctx, line)
 }
 
 pub(crate) fn parse_coalesce_expr(

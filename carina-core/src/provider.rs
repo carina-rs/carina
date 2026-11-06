@@ -1968,7 +1968,7 @@ fn hash_provider_view_as_secret(
     let plaintext = provider_value
         .decode_value()
         .ok_or(SerializationError::NullProviderSecret)?;
-    crate::value::persist_secret_json(&plaintext.to_value_at("provider secret")?, previous)
+    crate::value::persist_secret_json(&plaintext, previous)
 }
 
 /// Saved attributes decoded from persisted state but not yet reconciled
@@ -5547,7 +5547,7 @@ impl From<&ResourceId> for ProviderInstanceKey {
 }
 
 /// Check a default-tag value before host-owned merging. Unresolved values are
-/// skippable; non-finite floats at any depth and redacted secrets are fatal.
+/// skippable; redacted secrets are fatal.
 fn assert_default_tag_value_encodable(value: &Value) -> Result<(), SerializationError> {
     match value {
         Value::Concrete(ConcreteValue::List(items)) => {
@@ -5565,12 +5565,6 @@ fn assert_default_tag_value_encodable(value: &Value) -> Result<(), Serialization
         // The former seal path replaced a whole secret with an opaque token
         // before encoding, so its plaintext was not inspected by the boundary.
         Value::Deferred(DeferredValue::Secret(_)) => Ok(()),
-        Value::Concrete(ConcreteValue::Float(value)) if !value.is_finite() => {
-            Err(SerializationError::NonFiniteFloat {
-                value: *value,
-                context: crate::value::SerializationContext::WasmBoundary,
-            })
-        }
         Value::Concrete(ConcreteValue::EnumIdentifier(value)) => {
             Err(SerializationError::UnresolvedEnumIdentifier {
                 value: value.to_string(),
@@ -5670,11 +5664,11 @@ pub fn merge_default_tags<S, D>(
                 log::error!("Skipping default_tag '{key}' with unresolvable value: {error}");
             }
             Err(
-                source @ (SerializationError::NonFiniteFloat { .. }
-                | SerializationError::NullProviderSecret
+                source @ (SerializationError::NullProviderSecret
                 | SerializationError::UnresolvedEnumIdentifier { .. }
                 | SerializationError::UnexpandedModuleIf { .. }
-                | SerializationError::UnavailableSecret(_)),
+                | SerializationError::UnavailableSecret(_)
+                | SerializationError::InsideSecret { .. }),
             ) => {
                 return Err(ProviderError::invalid_input_caused_by(
                     "failed to encode default tag",
@@ -5706,7 +5700,12 @@ pub fn merge_default_tags<S, D>(
             let Some(tags) = schema.attributes.get("tags") else {
                 return false;
             };
-            let Shape::Map { key, value } = schema.shape_of(&tags.attr_type) else {
+            let Shape::Map {
+                key,
+                value,
+                constraints: _,
+            } = schema.shape_of(&tags.attr_type)
+            else {
                 return false;
             };
             matches!(schema.shape_of(key), Shape::String { .. })
@@ -6626,8 +6625,6 @@ pub enum CustomTypeCanonicalizationError {
         identity: TypeIdentity,
         type_name: String,
     },
-    #[error("custom type `{identity}` requires a finite float")]
-    NonFiniteFloat { identity: TypeIdentity },
     #[error("integer {value} cannot be represented exactly as Float for custom type `{identity}`")]
     InexactFloatWidening { identity: TypeIdentity, value: i64 },
     #[error("could not canonicalize enum `{identity}`: {error}")]
@@ -6665,7 +6662,6 @@ impl CustomTypeCanonicalizationError {
             ),
             error @ (Self::UnidentifiedDeclaration { .. }
             | Self::MissingScalarKind { .. }
-            | Self::NonFiniteFloat { .. }
             | Self::InexactFloatWidening { .. }
             | Self::EnumIdentityMismatch { .. }) => crate::schema::TypeError::ValidationFailed {
                 message: error.to_string().into(),
@@ -6847,15 +6843,7 @@ pub fn canonicalize_custom_type_value(
                 validate: _,
             },
             Value::Concrete(ConcreteValue::Float(value)),
-        ) => {
-            if value.is_finite() {
-                Ok(Some(CanonicalCustomTypeValue(value.to_string())))
-            } else {
-                Err(CustomTypeCanonicalizationError::NonFiniteFloat {
-                    identity: identity.clone(),
-                })
-            }
-        }
+        ) => Ok(Some(CanonicalCustomTypeValue(value.to_string()))),
         (
             RawShape::Enum {
                 identity: _,
@@ -7330,7 +7318,11 @@ fn collect_type_names_from_type(
         } => {
             collect_type_names_from_type(inner, names);
         }
-        RawShape::Map { key, value: inner } => {
+        RawShape::Map {
+            key,
+            value: inner,
+            constraints: _,
+        } => {
             collect_type_names_from_type(key, names);
             collect_type_names_from_type(inner, names);
         }
@@ -7613,39 +7605,104 @@ impl CustomTypeDispatchTable {
         Ok(Self { bindings })
     }
 
-    pub fn dispatch(&self, identity: &TypeIdentity, canonical_text: &str) -> Result<(), String> {
+    pub fn dispatch(
+        &self,
+        identity: &TypeIdentity,
+        canonical_text: &str,
+    ) -> Result<(), CustomTypeDispatchError> {
         let binding = self
             .bindings
             .get(identity)
-            .ok_or_else(|| format!("custom type `{identity}` is not declared by this provider"))?;
+            .ok_or_else(|| CustomTypeDispatchError::Undeclared(identity.clone()))?;
         let value = bridge_text_to_typed_value(binding.scalar_kind, canonical_text.into())?;
         for callback in &binding.callbacks {
-            callback(&value).map_err(custom_validator_bridge_message)?;
+            callback(&value).map_err(|error| {
+                CustomTypeDispatchError::Validation(custom_validator_bridge_message(error))
+            })?;
         }
         Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub enum CustomTypeBridgeDecodeError {
+    Integer(std::num::ParseIntError),
+    FloatSyntax(std::num::ParseFloatError),
+    Float(crate::NonFiniteFloatError),
+}
+
+impl fmt::Display for CustomTypeBridgeDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Integer(_) => f.write_str("invalid integer bridge value"),
+            Self::FloatSyntax(_) | Self::Float(_) => f.write_str("invalid float bridge value"),
+        }
+    }
+}
+
+impl std::error::Error for CustomTypeBridgeDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Integer(source) => Some(source),
+            Self::FloatSyntax(source) => Some(source),
+            Self::Float(source) => Some(source),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum CustomTypeDispatchError {
+    Undeclared(TypeIdentity),
+    Decode(CustomTypeBridgeDecodeError),
+    Validation(String),
+}
+
+impl fmt::Display for CustomTypeDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Undeclared(identity) => write!(
+                f,
+                "custom type `{identity}` is not declared by this provider"
+            ),
+            Self::Decode(_) => f.write_str("failed to decode custom type bridge value"),
+            Self::Validation(message) => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for CustomTypeDispatchError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Undeclared(_) | Self::Validation(_) => None,
+            Self::Decode(source) => Some(source),
+        }
+    }
+}
+
+impl From<CustomTypeBridgeDecodeError> for CustomTypeDispatchError {
+    fn from(source: CustomTypeBridgeDecodeError) -> Self {
+        Self::Decode(source)
     }
 }
 
 pub(crate) fn bridge_text_to_typed_value(
     scalar_kind: RefinedScalarKind,
     canonical_text: ValueString,
-) -> Result<Value, String> {
+) -> Result<Value, CustomTypeBridgeDecodeError> {
     match scalar_kind {
         RefinedScalarKind::String => Ok(Value::Concrete(ConcreteValue::String(canonical_text))),
         RefinedScalarKind::Int => Ok(Value::Concrete(ConcreteValue::Int(
             canonical_text
                 .expose_plaintext()
                 .parse::<i64>()
-                .map_err(|error| format!("invalid integer bridge value: {error}"))?,
+                .map_err(CustomTypeBridgeDecodeError::Integer)?,
         ))),
         RefinedScalarKind::Float => {
             let value = canonical_text
                 .expose_plaintext()
                 .parse::<f64>()
-                .map_err(|error| format!("invalid float bridge value: {error}"))?;
-            if !value.is_finite() {
-                return Err("custom-type validation requires a finite float".to_string());
-            }
+                .map_err(CustomTypeBridgeDecodeError::FloatSyntax)?;
+            let value = crate::FiniteF64::new(value).map_err(CustomTypeBridgeDecodeError::Float)?;
             Ok(Value::Concrete(ConcreteValue::Float(value)))
         }
     }
@@ -8662,7 +8719,54 @@ mod tests {
         let error = table
             .dispatch(&identity, "5")
             .expect_err("the schema callback must be exported without a provider override");
-        assert_eq!(error, "schema-derived callback rejected five");
+        assert_eq!(error.to_string(), "schema-derived callback rejected five");
+    }
+
+    #[test]
+    fn raw_float_bridge_rejection_preserves_source_without_invoking_callbacks() {
+        use std::error::Error;
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (identity, table) = recording_float_dispatch_table(received.clone());
+        for (text, category) in [
+            ("NaN", crate::NonFiniteFloatError::NaN),
+            ("inf", crate::NonFiniteFloatError::PositiveInfinity),
+            ("-inf", crate::NonFiniteFloatError::NegativeInfinity),
+            ("1e999", crate::NonFiniteFloatError::PositiveInfinity),
+            ("-1e999", crate::NonFiniteFloatError::NegativeInfinity),
+        ] {
+            let error = table.dispatch(&identity, text).unwrap_err();
+            let rendered = crate::executor::render_error_chain(&error);
+            assert_eq!(
+                rendered.matches("invalid float bridge value").count(),
+                1,
+                "{rendered}"
+            );
+            assert_eq!(
+                rendered.matches(&category.to_string()).count(),
+                1,
+                "{rendered}"
+            );
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<crate::NonFiniteFloatError>(),
+                Some(&category)
+            );
+            assert!(received.lock().unwrap().is_empty());
+        }
+        let error = table.dispatch(&identity, "not-a-float").unwrap_err();
+        assert!(
+            error
+                .source()
+                .unwrap()
+                .source()
+                .unwrap()
+                .is::<std::num::ParseFloatError>()
+        );
+        assert!(received.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -8687,8 +8791,11 @@ mod tests {
         let error = table
             .dispatch(&identity, "not-an-integer")
             .expect_err("the table must parse using the identity's declared scalar kind");
-        assert!(error.contains("invalid integer bridge value"), "{error}");
-        assert!(!error.contains("not-an-integer"), "{error}");
+        assert!(
+            crate::executor::render_error_chain(&error).contains("invalid integer bridge value"),
+            "{error}"
+        );
+        assert!(!error.to_string().contains("not-an-integer"), "{error}");
     }
 
     fn recording_float_dispatch_table(
@@ -8706,7 +8813,7 @@ mod tests {
                             crate::resource::Value::Concrete(
                                 crate::resource::ConcreteValue::Float(value),
                             ) => {
-                                received.lock().unwrap().push(*value);
+                                received.lock().unwrap().push(value.get());
                                 Ok(())
                             }
                             _ => Err("Expected float".to_string()),
@@ -8730,7 +8837,7 @@ mod tests {
         let declaration = AttributeType::refined_float(Some(identity.clone()), None);
         let canonical = canonicalize_custom_type_value(
             &declaration,
-            &Value::Concrete(ConcreteValue::Float(value)),
+            &Value::Concrete(ConcreteValue::Float(crate::finite(value))),
         )
         .expect("Float values must canonicalize")
         .expect("Float values must produce bridge text");
@@ -8762,7 +8869,11 @@ mod tests {
 
         for (value, expected_text, expected_float) in [
             (Value::Concrete(ConcreteValue::Int(3)), "3", 3.0),
-            (Value::Concrete(ConcreteValue::Float(1.5)), "1.5", 1.5),
+            (
+                Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
+                "1.5",
+                1.5,
+            ),
             (
                 Value::Concrete(ConcreteValue::Int(9_223_372_036_854_774_784)),
                 "9223372036854775000",
@@ -8831,7 +8942,9 @@ mod tests {
             .dispatch(&unknown_identity, "5")
             .expect_err("an identity absent from the provider schemas must be rejected");
         assert!(
-            error.contains("is not declared by this provider"),
+            error
+                .to_string()
+                .contains("is not declared by this provider"),
             "{error}"
         );
     }
@@ -8971,7 +9084,8 @@ mod tests {
                 .dispatch(&identity, "value")
                 .expect_err("the first rejecting callback must stop dispatch");
             assert_eq!(
-                error, "middle declaration rejected",
+                error.to_string(),
+                "middle declaration rejected",
                 "iteration {iteration}"
             );
             assert_eq!(
@@ -9392,7 +9506,7 @@ mod tests {
             ),
             (
                 AttributeType::refined_float(Some(identity.clone()), None),
-                Value::Concrete(ConcreteValue::Float(1.25)),
+                Value::Concrete(ConcreteValue::Float(crate::finite(1.25))),
                 "1.25",
             ),
             (
@@ -9409,13 +9523,6 @@ mod tests {
             assert_eq!(canonical.as_str(), expected);
         }
 
-        assert!(
-            canonicalize_custom_type_value(
-                &AttributeType::refined_float(Some(identity.clone()), None),
-                &Value::Concrete(ConcreteValue::Float(f64::INFINITY)),
-            )
-            .is_err()
-        );
         assert!(
             canonicalize_custom_type_value(
                 &enum_type,
@@ -9889,9 +9996,12 @@ mod tests {
             ),
             ("$enum".to_string(), enum_shaped_user_map),
         ])));
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("guest-secret".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "guest-secret".into(),
+            )))
+            .into(),
+        ));
 
         let persisted = PersistedAttributes::from_persisted_values(HashMap::from([
             (
@@ -10004,9 +10114,12 @@ mod tests {
 
     #[test]
     fn saved_plan_hash_inventory_ignores_non_placeholder_siblings() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("SAVED_PLAN_SECRET".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "SAVED_PLAN_SECRET".into(),
+            )))
+            .into(),
+        ));
         let placeholder =
             crate::value::redact_secrets_in_value(&secret).expect("redact saved-plan secret");
         let attributes = HashMap::from([
@@ -10063,9 +10176,12 @@ mod tests {
 
     #[test]
     fn persistence_merges_propagate_typed_unavailable_secret() {
-        let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("previous secret".into()),
-        ))));
+        let secret = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                "previous secret".into(),
+            )))
+            .into(),
+        ));
         let previous = PersistedValue::encode_desired_value(&secret, None).unwrap();
         let opaque = previous.decode().unwrap();
         let provider = PersistedValue::encode_provider_value(
@@ -10078,8 +10194,11 @@ mod tests {
         let error = hash_provider_json_as_secret(&provider, Some(&previous)).unwrap_err();
         assert!(
             matches!(error, SerializationError::UnavailableSecret(ref error)
-            if error.path() == "provider secret.token")
+            if error.path() == "(secret)")
         );
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(!rendered.contains("token"), "{rendered}");
+        }
         let map = |value: &PersistedValue| {
             PersistedValue::from_serialized_json(serde_json::json!({"protected": value.as_json()}))
                 .unwrap()
@@ -10097,8 +10216,11 @@ mod tests {
                     .expect_err("an unavailable provider secret must not retain stale evidence");
             assert!(
                 matches!(error, SerializationError::UnavailableSecret(ref error)
-                if error.path().ends_with(".token"))
+                if error.path() == "(secret)")
             );
+            for rendered in [error.to_string(), format!("{error:?}")] {
+                assert!(!rendered.contains("token"), "{rendered}");
+            }
         }
     }
 
@@ -12009,9 +12131,9 @@ mod tests {
                     ),
                     (
                         "client_secret".to_string(),
-                        Value::Deferred(DeferredValue::Secret(Box::new(patch_test_value(
-                            "client-secret",
-                        )))),
+                        Value::Deferred(DeferredValue::Secret(
+                            Box::new(patch_test_value("client-secret")).into(),
+                        )),
                     ),
                 ]))),
             )])),
@@ -12066,9 +12188,9 @@ mod tests {
                 ),
                 (
                     "client_secret".to_string(),
-                    Value::Deferred(DeferredValue::Secret(Box::new(patch_test_value(
-                        "client-secret",
-                    )))),
+                    Value::Deferred(DeferredValue::Secret(
+                        Box::new(patch_test_value("client-secret")).into(),
+                    )),
                 ),
             ]))),
         )])));

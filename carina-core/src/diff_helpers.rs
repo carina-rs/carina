@@ -487,9 +487,9 @@ mod tests {
     #[test]
     fn historical_attribute_comparison_verifies_root_and_nested_secret_hashes() {
         let secret = |text: &str| -> Value {
-            Value::Deferred(crate::resource::DeferredValue::Secret(Box::new(
-                Value::Concrete(ConcreteValue::String(text.into())),
-            )))
+            Value::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(text.into()))).into(),
+            ))
         };
         for nested in [false, true] {
             let schema_type = if nested {

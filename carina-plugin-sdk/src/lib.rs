@@ -5,6 +5,7 @@
 pub use carina_core as core;
 pub use carina_provider_protocol as protocol;
 pub use carina_provider_protocol::types;
+pub use carina_provider_protocol::{FiniteF64, NonFiniteFloatError};
 
 pub mod aws_credentials;
 
@@ -88,7 +89,7 @@ use carina_provider_protocol::types::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// Failure while projecting validated SDK schemas onto version-21 JSON.
+/// Failure while projecting validated SDK schemas onto version-22 JSON.
 #[derive(Debug)]
 pub enum SchemaSerializationError {
     Convert(carina_core::protocol_convert::ProtocolConvertError),
@@ -197,13 +198,13 @@ impl ProviderSchemaCache {
 
 /// Dispatch one identity bridge call through the cached table.
 ///
-/// The validated provider schemas determine the scalar kind. The version-21
+/// The validated provider schemas determine the scalar kind. The version-22
 /// guest ABI deliberately carries only the identity and canonical text.
 pub fn dispatch_custom_type_validation(
     cache: &ProviderSchemaCache,
     identity: &TypeIdentity,
     canonical_text: &str,
-) -> Result<(), String> {
+) -> Result<(), core::provider::CustomTypeDispatchError> {
     let core_identity = carina_core::schema::TypeIdentity::new(
         (!identity.provider.is_empty()).then(|| identity.provider.clone()),
         identity.segments.clone(),
@@ -1617,6 +1618,11 @@ fn read_back_without_identifier(id: &ResourceId) -> ProviderError {
         code: Some("READ_BACK_WITHOUT_IDENTIFIER".to_string()),
         request_id: None,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn finite(value: f64) -> carina_provider_protocol::FiniteF64 {
+    carina_provider_protocol::FiniteF64::new(value).unwrap()
 }
 
 #[cfg(test)]

@@ -511,10 +511,9 @@ fn type_aware_exact_numeric_i64_boundary() {
             (i64::MIN, -9_223_372_036_854_775_808.0, true),
             (3, 3.0, true),
             (3, 3.5, false),
-            (0, f64::NAN, false),
         ] {
             let a = Value::Concrete(ConcreteValue::Int(integer));
-            let b = Value::Concrete(ConcreteValue::Float(float));
+            let b = Value::Concrete(ConcreteValue::Float(crate::finite(float)));
             for (a, b) in [(&a, &b), (&b, &a)] {
                 assert_eq!(
                     type_aware_equal(
@@ -535,12 +534,12 @@ fn type_aware_exact_numeric_i64_boundary() {
 fn type_aware_int_float_coercion() {
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(42)),
-        &Value::Concrete(ConcreteValue::Float(42.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(42.0))),
         Some(&AttributeType::float()),
         crate::schema::empty_defs_for_schema_walks(),
     ));
     assert!(type_aware_equal(
-        &Value::Concrete(ConcreteValue::Float(42.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(42.0))),
         &Value::Concrete(ConcreteValue::Int(42)),
         Some(&AttributeType::float()),
         crate::schema::empty_defs_for_schema_walks(),
@@ -548,14 +547,14 @@ fn type_aware_int_float_coercion() {
     // Non-exact conversion should not be equal
     assert!(!type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(42)),
-        &Value::Concrete(ConcreteValue::Float(42.5)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(42.5))),
         Some(&AttributeType::float()),
         crate::schema::empty_defs_for_schema_walks(),
     ));
     // Without type info, Int and Float are not equal
     assert!(!type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(42)),
-        &Value::Concrete(ConcreteValue::Float(42.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(42.0))),
         None,
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -597,7 +596,7 @@ fn type_aware_int_float_coercion_for_int_type() {
     // Int type also allows coercion (e.g., provider returns Float for an Int field)
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(10)),
-        &Value::Concrete(ConcreteValue::Float(10.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(10.0))),
         Some(&AttributeType::int()),
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -613,8 +612,8 @@ fn type_aware_list_with_inner_type() {
             Value::Concrete(ConcreteValue::Int(2))
         ])),
         &Value::Concrete(ConcreteValue::List(vec![
-            Value::Concrete(ConcreteValue::Float(2.0)),
-            Value::Concrete(ConcreteValue::Float(1.0))
+            Value::Concrete(ConcreteValue::Float(crate::finite(2.0))),
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.0)))
         ])),
         Some(&list_type),
         crate::schema::empty_defs_for_schema_walks(),
@@ -642,7 +641,7 @@ fn type_aware_struct_per_field() {
     let b = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "count".to_string(),
-            Value::Concrete(ConcreteValue::Float(5.0)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(5.0))),
         ),
         (
             "name".to_string(),
@@ -662,7 +661,7 @@ fn type_aware_union_numeric() {
     let union_type = AttributeType::union(vec![AttributeType::int(), AttributeType::float()]);
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(7)),
-        &Value::Concrete(ConcreteValue::Float(7.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(7.0))),
         Some(&union_type),
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -677,7 +676,7 @@ fn type_aware_custom_delegates_to_base() {
     );
     assert!(type_aware_equal(
         &Value::Concrete(ConcreteValue::Int(8080)),
-        &Value::Concrete(ConcreteValue::Float(8080.0)),
+        &Value::Concrete(ConcreteValue::Float(crate::finite(8080.0))),
         Some(&custom_type),
         crate::schema::empty_defs_for_schema_walks(),
     ));
@@ -698,7 +697,7 @@ fn type_aware_diff_no_change_with_schema() {
     let mut current_attrs = HashMap::new();
     current_attrs.insert(
         "port".to_string(),
-        Value::Concrete(ConcreteValue::Float(443.0)),
+        Value::Concrete(ConcreteValue::Float(crate::finite(443.0))),
     );
     let current = State::existing(
         ResourceId::with_identity("test.resource", "test"),
@@ -1432,9 +1431,12 @@ fn oidc_listener_with_matching_nested_write_only_provenance_converges() {
         )
         .attribute(AttributeSchema::optional("ssl_policy", AttributeType::string()).build());
 
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("oidc-client-secret".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "oidc-client-secret".into(),
+        )))
+        .into(),
+    ));
     let action = |client_secret: Option<Value>| {
         let mut config = IndexMap::from([(
             "issuer".to_string(),
@@ -1542,9 +1544,9 @@ fn oidc_listener_diff_fixture(
         if let Some(secret) = secret {
             config.insert(
                 "client_secret".to_string(),
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String(secret.into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(secret.into()))).into(),
+                )),
             );
         }
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
@@ -1732,7 +1734,7 @@ fn secret_wrapped_oidc_listener_fixture(
             ))),
         ]))
     }
-    let secret = |value| Value::Deferred(DeferredValue::Secret(Box::new(value)));
+    let secret = |value: Value| Value::Deferred(DeferredValue::Secret(Box::new(value).into()));
 
     let (desired_actions, current_actions) = if wrap_default_actions {
         let desired = secret(action(desired_config));
@@ -1831,9 +1833,12 @@ fn entirely_write_only_struct_absent_from_read_converges_with_matching_record() 
         "creds".to_string(),
         Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "password".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("accepted-secret".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "accepted-secret".into(),
+                )))
+                .into(),
+            )),
         )]))),
     )]);
     let current: HashMap<String, Value> = HashMap::new();
@@ -1890,9 +1895,12 @@ fn omitted_read_with_empty_observable_string_list_converges() {
             ),
             (
                 "password".to_string(),
-                Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                    ConcreteValue::String("accepted-secret".into()),
-                )))),
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(
+                        "accepted-secret".into(),
+                    )))
+                    .into(),
+                )),
             ),
         ]))),
     )]);
@@ -1941,12 +1949,13 @@ fn entirely_write_only_secret_wrapped_struct_absent_from_read_converges() {
     );
     let desired = HashMap::from([(
         "creds".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::Map(IndexMap::from([(
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "password".to_string(),
                 Value::Concrete(ConcreteValue::String("accepted-secret".into())),
-            )])),
-        )))),
+            )]))))
+            .into(),
+        )),
     )]);
     let current: HashMap<String, Value> = HashMap::new();
     let mut nested_write_only = NestedWriteOnlyRecord::new();
@@ -2202,9 +2211,9 @@ fn non_write_only_attr_in_desired_not_in_current_detects_diff() {
 fn secret_unchanged_same_hash() {
     use crate::value::value_to_json;
 
-    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".into()),
-    ))));
+    let secret_value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+    ));
     // Compute the hash that would be stored in state
     let hash_json = value_to_json(&secret_value).unwrap();
     // State has a typed hash, desired has the Secret wrapper.
@@ -2227,12 +2236,18 @@ fn secret_unchanged_same_hash() {
 fn secret_changed_different_hash() {
     use crate::value::value_to_json;
 
-    let old_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("old-password".into()),
-    ))));
-    let new_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("new-password".into()),
-    ))));
+    let old_secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "old-password".into(),
+        )))
+        .into(),
+    ));
+    let new_secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "new-password".into(),
+        )))
+        .into(),
+    ));
     // Compute the hash for the OLD secret (stored in state)
     let old_hash_json = value_to_json(&old_secret).unwrap();
     // New desired vs old state hash should be different
@@ -2248,9 +2263,9 @@ fn secret_changed_different_hash() {
 fn secret_in_find_changed_attributes_no_change() {
     use crate::value::value_to_json;
 
-    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".into()),
-    ))));
+    let secret_value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+    ));
     let hash_json = value_to_json(&secret_value).unwrap();
     let desired = HashMap::from([("password".to_string(), secret_value)]);
     let current = HashMap::from([("password".to_string(), persisted_secret(&hash_json))]);
@@ -2301,12 +2316,18 @@ fn diagnostic_sensitive_string_matches_plain_state_without_diff() {
 fn secret_in_find_changed_attributes_changed() {
     use crate::value::value_to_json;
 
-    let old_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("old-password".into()),
-    ))));
-    let new_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("new-password".into()),
-    ))));
+    let old_secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "old-password".into(),
+        )))
+        .into(),
+    ));
+    let new_secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "new-password".into(),
+        )))
+        .into(),
+    ));
     let old_hash_json = value_to_json(&old_secret).unwrap();
     let desired = HashMap::from([("password".to_string(), new_secret)]);
     let current = HashMap::from([("password".to_string(), persisted_secret(&old_hash_json))]);
@@ -2445,9 +2466,12 @@ fn dependent_nested_post_create_read_unknown_cannot_force_replacement() {
 #[test]
 fn secret_in_map_no_change_when_hash_matches() {
     // Desired: tags map with a secret value
-    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("super-secret".into()),
-    ))));
+    let secret_value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "super-secret".into(),
+        )))
+        .into(),
+    ));
     let desired_tags = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         (
             "Name".to_string(),
@@ -2490,9 +2514,9 @@ fn secret_in_map_no_change_when_hash_matches() {
 
 #[test]
 fn secret_with_embedded_salt_no_change_when_hash_matches() {
-    let secret_value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".into()),
-    ))));
+    let secret_value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+    ));
     let hash_json = value_to_json(&secret_value).unwrap();
     let desired = HashMap::from([("master_password".to_string(), secret_value)]);
     let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash_json))]);
@@ -2514,12 +2538,18 @@ fn secret_with_embedded_salt_no_change_when_hash_matches() {
 
 #[test]
 fn secret_with_embedded_salt_detects_change() {
-    let old_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("old-password".into()),
-    ))));
-    let new_secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("new-password".into()),
-    ))));
+    let old_secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "old-password".into(),
+        )))
+        .into(),
+    ));
+    let new_secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "new-password".into(),
+        )))
+        .into(),
+    ));
     let hash_json = value_to_json(&old_secret).unwrap();
     let desired = HashMap::from([("master_password".to_string(), new_secret)]);
     let current = HashMap::from([("master_password".to_string(), persisted_secret(&hash_json))]);
@@ -2540,9 +2570,12 @@ fn secret_with_embedded_salt_detects_change() {
 
 #[test]
 fn equal_plaintexts_get_distinct_digests_that_both_verify() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("shared-password".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "shared-password".into(),
+        )))
+        .into(),
+    ));
 
     let hash1 = value_to_json(&secret).unwrap();
     let hash2 = value_to_json(&secret).unwrap();
@@ -2579,12 +2612,13 @@ fn provider_null_fields_do_not_create_a_secret_diff() {
     let current = HashMap::from([("config".to_string(), persisted_secret(marker.as_json()))]);
     let desired = HashMap::from([(
         "config".to_string(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::Map(IndexMap::from([(
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                 "a".to_string(),
                 Value::Concrete(ConcreteValue::String("x".into())),
-            )])),
-        )))),
+            )]))))
+            .into(),
+        )),
     )]);
 
     assert!(
@@ -2606,9 +2640,9 @@ fn provider_null_fields_do_not_create_a_secret_diff() {
 /// the inner values are equal.
 #[test]
 fn secret_matches_plain_text_state_value() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+    ));
     let plain = Value::Concrete(ConcreteValue::String("my-password".into()));
     assert!(
         type_aware_equal(
@@ -2633,9 +2667,9 @@ fn secret_matches_plain_text_state_value() {
 /// Secret with different inner value should NOT match plain-text state.
 #[test]
 fn secret_does_not_match_different_plain_text() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("my-password".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("my-password".into()))).into(),
+    ));
     let plain = Value::Concrete(ConcreteValue::String("other-password".into()));
     assert!(
         !type_aware_equal(
@@ -2667,9 +2701,12 @@ fn secret_in_map_with_refresh_no_false_diff() {
         ),
         (
             "SecretTag".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("super-secret-value".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "super-secret-value".into(),
+                )))
+                .into(),
+            )),
         ),
     ])));
 
@@ -3902,4 +3939,65 @@ fn find_changed_attributes_keeps_nested_legacy_unrecorded_list_element_in_desire
         changed.is_empty(),
         "desired matching must reach nested ListElements records recursively: {changed:?}"
     );
+}
+
+#[test]
+fn review2_f2_repeated_secret_wrapping_has_no_phantom_state_diff() {
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("t".into()))).into(),
+    ));
+    let state = persisted_secret(&value_to_json(&secret).unwrap());
+    let resolved = Value::Deferred(DeferredValue::Secret(Box::new(secret).into()));
+    assert!(type_aware_equal(
+        &resolved,
+        &state,
+        None,
+        crate::schema::empty_defs_for_schema_walks()
+    ));
+}
+
+#[test]
+fn review3_payload_string_marking_preserves_diff_results() {
+    let plain = Value::Concrete(ConcreteValue::Map(IndexMap::from([
+        (
+            "text".into(),
+            Value::Concrete(ConcreteValue::String("runtime".into())),
+        ),
+        (
+            "list".into(),
+            Value::Concrete(ConcreteValue::StringList(vec!["entry".into()])),
+        ),
+    ])));
+    let payload: crate::resource::SecretPayload<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    > = Box::new(plain.clone()).into();
+    let marked = payload.expose_plaintext();
+    let desired = HashMap::from([("attr".into(), marked.clone())]);
+    let current = HashMap::from([("attr".into(), plain.clone())]);
+    assert!(type_aware_equal(
+        marked,
+        &plain,
+        None,
+        crate::schema::empty_defs_for_schema_walks()
+    ));
+    assert!(
+        find_changed_attributes(
+            &desired,
+            &current,
+            None,
+            &NestedWriteOnlyRecord::default(),
+            None,
+            None
+        )
+        .is_empty()
+    );
+    let secret = Value::Deferred(DeferredValue::Secret(payload));
+    let hashed = persisted_secret(&value_to_json(&secret).unwrap());
+    assert!(type_aware_equal(
+        &secret,
+        &hashed,
+        None,
+        crate::schema::empty_defs_for_schema_walks()
+    ));
 }

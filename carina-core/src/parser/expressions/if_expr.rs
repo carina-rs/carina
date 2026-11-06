@@ -205,7 +205,7 @@ pub(crate) fn parse_if_expr(
     // Parse the condition expression
     let condition_pair = next_pair(&mut inner, "condition", "if expression")?;
     let condition_line = condition_pair.line_col().0;
-    let condition_source = condition_pair.as_str().trim().to_string();
+    let condition_source = ctx.diagnostic_source_text(condition_pair.clone());
     let condition_value = parse_expression_eval(condition_pair, ctx)?;
 
     // Pass 1 of a directory fixed point knows that a sibling name exists but
@@ -224,6 +224,11 @@ pub(crate) fn parse_if_expr(
         .into_value()
         .map_err(|error| ParseError::from_eval_value(error, condition_line))?;
 
+    let condition_source =
+        crate::parser::deferred_if::DiagnosticExpressionText::from_value_and_source(
+            &condition_value,
+            condition_source,
+        );
     let decision = decide_if_condition(&condition_value, ctx.config)
         .map_err(|error| error.into_parse_error(condition_line))?;
     let if_body = classify_if_body(next_pair(&mut inner, "if body", "if expression")?)?;
@@ -476,7 +481,7 @@ pub(crate) fn parse_if_value_expr_with_mode(
     // Parse the condition expression
     let condition_pair = next_pair(&mut inner, "condition", "if value expression")?;
     let condition_line = condition_pair.line_col().0;
-    let condition_source = condition_pair.as_str().trim().to_string();
+    let condition_source = ctx.diagnostic_source_text(condition_pair.clone());
     let condition_value = parse_expression_eval(condition_pair, ctx)?;
     if matches!(condition_value, EvalValue::ProvisionalReference { .. })
         && ctx.defer_provisional_static_conditions
@@ -491,6 +496,11 @@ pub(crate) fn parse_if_value_expr_with_mode(
 
     // Preserve eager ordering: decide and type-check the condition before
     // inspecting either branch.
+    let condition_source =
+        crate::parser::deferred_if::DiagnosticExpressionText::from_value_and_source(
+            &condition_value,
+            condition_source,
+        );
     let decision = decide_if_condition(&condition_value, ctx.config)
         .map_err(|error| error.into_parse_error(condition_line))?;
 

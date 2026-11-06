@@ -1824,7 +1824,7 @@ fn plan_export_values_use_the_core_value_formatter() {
     let value: Value = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
         (
             "ratio".to_string(),
-            Value::Concrete(ConcreteValue::Float(1.0)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.0))),
         ),
         (
             "region".to_string(),
@@ -1917,7 +1917,7 @@ fn modified_plan_export_formats_old_and_new_floats_identically() {
             name: "ratio".to_string(),
             type_expr: None,
             old_json: serde_json::from_value(serde_json::json!(value)).unwrap(),
-            new_value: Value::Concrete(ConcreteValue::Float(value)),
+            new_value: Value::Concrete(ConcreteValue::Float(crate::finite(value))),
         };
 
         assert_eq!(

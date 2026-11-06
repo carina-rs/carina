@@ -51,6 +51,42 @@ fn absolute_binding(binding: &str) -> AbsoluteBindingAddress {
 }
 
 #[test]
+fn secret_origin_4275_round2_fully_resolved_check_masks_secret_path() {
+    let reference = Value::root_resource_ref("private_producer", "private_attr", vec![]);
+    let public_error = assert_value_fully_resolved(&reference).unwrap_err();
+    assert!(
+        public_error
+            .to_string()
+            .contains("private_producer.private_attr")
+    );
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(reference).into()));
+    let error = assert_value_fully_resolved(&secret).unwrap_err();
+    for rendered in [error.to_string(), format!("{error:?}")] {
+        assert!(!rendered.contains("private_"), "{rendered}");
+    }
+    assert!(matches!(
+        error,
+        crate::value::SerializationError::InsideSecret { .. }
+    ));
+}
+
+#[test]
+fn secret_origin_4275_round2_deferred_projection_keeps_payload_opaque() {
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::root_resource_ref(
+            "private_producer",
+            "private_attr",
+            vec![],
+        ))
+        .into(),
+    ));
+    let projected = value.as_deferred().unwrap();
+    assert!(matches!(projected, DeferredValueRef::Secret(_)));
+    let rendered = format!("{projected:?}");
+    assert!(!rendered.contains("private_"), "{rendered}");
+}
+
+#[test]
 fn desired_leaf_deferral_keeps_containers_structural() {
     let reference = Value::root_resource_ref("peer", "id", vec![]);
     let unknown = Value::Deferred(DeferredValue::Unknown(
@@ -59,7 +95,7 @@ fn desired_leaf_deferral_keeps_containers_structural() {
         },
     ));
     let known = Value::Concrete(ConcreteValue::String("known".into()));
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(known.clone())));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(known.clone()).into()));
     for value in [reference, unknown, secret] {
         assert!(is_deferred_desired_leaf(&value));
         let list = Value::Concrete(ConcreteValue::List(vec![known.clone(), value]));
@@ -111,7 +147,7 @@ fn into_expanded_rejects_leftover_function_parameter() {
 
     assert!(matches!(
         error.placeholder(),
-        ParserPlaceholder::FnParam { name } if name == "input"
+        Some(ParserPlaceholder::FnParam { name }) if name == "input"
     ));
 }
 
@@ -129,7 +165,7 @@ fn into_expanded_rejects_leftover_function_local() {
 
     assert!(matches!(
         error.placeholder(),
-        ParserPlaceholder::FnLocal { name } if name == "local"
+        Some(ParserPlaceholder::FnLocal { name }) if name == "local"
     ));
 }
 
@@ -153,7 +189,7 @@ fn into_expanded_rejects_leftover_module_argument() {
     );
     assert!(matches!(
         error.placeholder(),
-        ParserPlaceholder::ModuleArgument { name, .. } if name == "region"
+        Some(ParserPlaceholder::ModuleArgument { name, .. }) if name == "region"
     ));
 }
 
@@ -637,9 +673,12 @@ fn diagnostic_sensitive_string_is_runtime_equivalent_but_formatting_safe() {
 
 #[test]
 fn secret_debug_never_formats_the_inner_plaintext() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("hunter2SECRET".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "hunter2SECRET".into(),
+        )))
+        .into(),
+    ));
 
     let rendered = format!("{secret:?}");
 
@@ -670,8 +709,8 @@ fn value_serde_round_trip() {
     let values = vec![
         Value::Concrete(ConcreteValue::String("hello".into())),
         Value::Concrete(ConcreteValue::Int(42)),
-        Value::Concrete(ConcreteValue::Float(2.5)),
-        Value::Concrete(ConcreteValue::Float(-0.5)),
+        Value::Concrete(ConcreteValue::Float(crate::finite(2.5))),
+        Value::Concrete(ConcreteValue::Float(crate::finite(-0.5))),
         Value::Concrete(ConcreteValue::Bool(true)),
         Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::String("a".into())),
@@ -2142,7 +2181,8 @@ fn list_element_pairing_marks_a_sole_positive_best_match_as_unique() {
 #[test]
 fn pair_list_elements_handles_secrets_in_both_paths() {
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
-    let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
+    let secret =
+        |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value)).into()));
     let record = |id: i64, secret_value: &str| {
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
             ("id".to_string(), Value::Concrete(ConcreteValue::Int(id))),
@@ -2184,7 +2224,8 @@ fn pair_list_elements_handles_secrets_in_both_paths() {
 #[test]
 fn pair_list_elements_secret_plaintext_pairing_is_threshold_independent() {
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
-    let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
+    let secret =
+        |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value)).into()));
     let attr_type = AttributeType::string();
     let defs = crate::schema::empty_defs_for_schema_walks();
 
@@ -2209,7 +2250,8 @@ fn pair_list_elements_secret_plaintext_pairing_is_threshold_independent() {
 #[test]
 fn pair_list_elements_struct_secret_field_pairing_is_threshold_independent() {
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
-    let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
+    let secret =
+        |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value)).into()));
     let record = |credential: Value, label: &str| {
         Value::Concrete(ConcreteValue::Map(IndexMap::from([
             ("credential".to_string(), credential),
@@ -2251,7 +2293,8 @@ fn pair_list_elements_struct_secret_field_pairing_is_threshold_independent() {
 fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
     use crate::resource::{ConcreteValue, DeferredValue, SnapshotValue as Value};
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
-    let secret = |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value))));
+    let secret =
+        |value: &str| Value::Deferred(DeferredValue::Secret(Box::new(string(value)).into()));
     let serialized = serde_json::to_string("p").expect("string serialization must succeed");
     let state_hash = RedactedSecretHash::generate(serialized.as_bytes());
     let persisted_secret = || {
@@ -2285,7 +2328,7 @@ fn pair_list_elements_secret_hash_pairing_is_threshold_independent() {
 fn list_element_with_persisted_secret_hash_pairs_uniquely() {
     use crate::resource::{ConcreteValue, DeferredValue, SnapshotValue as Value};
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
-    let desired_secret = Value::Deferred(DeferredValue::Secret(Box::new(string("p"))));
+    let desired_secret = Value::Deferred(DeferredValue::Secret(Box::new(string("p")).into()));
     let serialized = serde_json::to_string("p").expect("string serialization must succeed");
     let state_hash = RedactedSecretHash::generate(serialized.as_bytes());
     let persisted_secret = serde_json::from_value::<Value>(serde_json::json!({
@@ -2897,8 +2940,8 @@ fn canonical_hash_consistency() {
     let v3 = Value::Concrete(ConcreteValue::Int(43));
     assert_ne!(v1.canonical_hash(), v3.canonical_hash());
 
-    let positive_zero = Value::Concrete(ConcreteValue::Float(0.0));
-    let negative_zero = Value::Concrete(ConcreteValue::Float(-0.0));
+    let positive_zero = Value::Concrete(ConcreteValue::Float(crate::finite(0.0)));
+    let negative_zero = Value::Concrete(ConcreteValue::Float(crate::finite(-0.0)));
     assert!(positive_zero.semantically_equal(&negative_zero));
     assert_eq!(
         positive_zero.canonical_hash(),
@@ -3504,11 +3547,9 @@ fn visit_resource_refs_collects_from_all_nested_variants() {
             args: vec![Value::root_resource_ref("d", "id", vec![]).into()],
             source_line: (0).into(),
         }),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::root_resource_ref(
-            "e",
-            "id",
-            vec![],
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref("e", "id", vec![])).into(),
+        )),
         Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(Value::root_resource_ref("f", "id", vec![])),
             default: Box::new(Value::root_resource_ref("g", "id", vec![])),
@@ -3516,12 +3557,15 @@ fn visit_resource_refs_collects_from_all_nested_variants() {
         Value::Concrete(ConcreteValue::String("plain".into())),
     ]));
 
-    let mut collected: Vec<String> = Vec::new();
-    value.visit_resource_refs(&mut |path| {
-        collected.push(path.binding().to_string());
+    let mut collected: Vec<AbsoluteBindingAddress> = Vec::new();
+    value.visit_resource_refs(&mut |path, _usage| {
+        path.binding_key().record_graph_key(&mut collected);
     });
     collected.sort();
-    assert_eq!(collected, vec!["a", "b", "c", "d", "e", "f", "g"]);
+    assert_eq!(
+        collected,
+        ["a", "b", "c", "d", "e", "f", "g"].map(absolute_binding)
+    );
 }
 
 #[test]
@@ -3534,19 +3578,25 @@ fn resource_ref_usage_marks_only_the_coalesce_value_optional() {
         })),
     });
     let mut collected = Vec::new();
-    value.visit_resource_refs_with_usage(&mut |path, usage| {
-        collected.push((path.binding().to_string(), usage));
+    value.visit_resource_refs(&mut |path, usage| {
+        collected.push((path.binding_key(), usage));
     });
 
     assert_eq!(
         collected,
         vec![
-            ("optional".to_string(), ResourceRefUsage::CoalesceValue),
             (
-                "nested_optional".to_string(),
+                super::DependencyKey::new(absolute_binding("optional")),
+                ResourceRefUsage::CoalesceValue
+            ),
+            (
+                super::DependencyKey::new(absolute_binding("nested_optional")),
                 ResourceRefUsage::CoalesceValue,
             ),
-            ("required".to_string(), ResourceRefUsage::Required),
+            (
+                super::DependencyKey::new(absolute_binding("required")),
+                ResourceRefUsage::Required
+            ),
         ],
     );
 }
@@ -3579,11 +3629,12 @@ fn visit_binding_refs_collects_from_all_nested_variants() {
             ],
             source_line: (0).into(),
         }),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-            DeferredValue::BindingRef {
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::BindingRef {
                 binding: absolute_binding("e"),
-            },
-        )))),
+            }))
+            .into(),
+        )),
         Value::Deferred(DeferredValue::Coalesce {
             value: Box::new(Value::Deferred(DeferredValue::BindingRef {
                 binding: absolute_binding("f"),
@@ -3596,11 +3647,14 @@ fn visit_binding_refs_collects_from_all_nested_variants() {
 
     let mut collected = Vec::new();
     value.visit_binding_refs(&mut |binding| {
-        collected.push(binding.to_string());
+        binding.record_graph_key(&mut collected);
     });
     collected.sort();
 
-    assert_eq!(collected, vec!["a", "b", "c", "d", "e", "f", "g"]);
+    assert_eq!(
+        collected,
+        ["a", "b", "c", "d", "e", "f", "g"].map(absolute_binding)
+    );
 }
 
 #[test]
@@ -3608,11 +3662,11 @@ fn visit_resource_refs_on_leaf_variants_calls_nothing() {
     for v in [
         Value::Concrete(ConcreteValue::String("s".into())),
         Value::Concrete(ConcreteValue::Int(1)),
-        Value::Concrete(ConcreteValue::Float(1.0)),
+        Value::Concrete(ConcreteValue::Float(crate::finite(1.0))),
         Value::Concrete(ConcreteValue::Bool(true)),
     ] {
         let mut count = 0;
-        v.visit_resource_refs(&mut |_| count += 1);
+        v.visit_resource_refs(&mut |_, _usage| count += 1);
         assert_eq!(count, 0);
     }
 }
@@ -3624,7 +3678,7 @@ fn canonicalize_leaves_simple_values_alone() {
     for v in [
         Value::Concrete(ConcreteValue::String("s".into())),
         Value::Concrete(ConcreteValue::Int(1)),
-        Value::Concrete(ConcreteValue::Float(1.5)),
+        Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
         Value::Concrete(ConcreteValue::Bool(true)),
         Value::root_resource_ref("vpc", "id", vec![]),
     ] {
@@ -3663,7 +3717,10 @@ fn canonicalize_unwraps_single_scalar_expr_interpolation() {
     let cases: Vec<(Value, &str)> = vec![
         (Value::Concrete(ConcreteValue::String("foo".into())), "foo"),
         (Value::Concrete(ConcreteValue::Int(42)), "42"),
-        (Value::Concrete(ConcreteValue::Float(1.5)), "1.5"),
+        (
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
+            "1.5",
+        ),
         (Value::Concrete(ConcreteValue::Bool(true)), "true"),
     ];
     for (inner, expected) in cases {
@@ -3775,14 +3832,17 @@ fn canonicalize_recurses_into_function_call_args() {
 
 #[test]
 fn canonicalize_recurses_into_secret() {
-    let v = Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-        DeferredValue::Interpolation(vec![InterpolationPart::Literal("hidden".into())]),
-    ))));
+    let v = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Deferred(DeferredValue::Interpolation(vec![
+            InterpolationPart::Literal("hidden".into()),
+        ])))
+        .into(),
+    ));
     assert_eq!(
         v.canonicalize(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("hidden".into())
-        ))))
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("hidden".into()))).into()
+        ))
     );
 }
 
@@ -3806,18 +3866,18 @@ fn canonicalize_collapses_nested_interpolation() {
 fn canonicalize_resolves_secret_interpolation_to_a_secret_string() {
     // A `Secret(_)` inside an interpolation participates in ordinary string
     // evaluation, but the completed string must retain the Secret wrapper.
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("password".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("password".into()))).into(),
+    ));
     let v = Value::Deferred(DeferredValue::Interpolation(vec![
         InterpolationPart::Literal("db-".into()),
         InterpolationPart::Expr(secret.clone()),
     ]));
     assert_eq!(
         v.canonicalize(),
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String("db-password".into()),
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String("db-password".into()),)).into()
+        )),
     );
 
     // A sole Secret expression is normalized the same way, without nesting
@@ -3850,9 +3910,12 @@ fn canonicalize_is_idempotent() {
         )])),
         // Secret-wrapped Interpolation: canonicalize recurses through
         // Secret at the Value level but keeps Secret(Expr) wrapped.
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Deferred(
-            DeferredValue::Interpolation(vec![InterpolationPart::Literal("hidden".into())]),
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::Interpolation(vec![
+                InterpolationPart::Literal("hidden".into()),
+            ])))
+            .into(),
+        )),
         // List, Map, FunctionCall — recursion shapes.
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
             ConcreteValue::String("x".into()),
@@ -4146,7 +4209,10 @@ fn as_concrete_returns_projection_for_concrete_variants() {
     let cases: Vec<(Value, &'static str)> = vec![
         (Value::Concrete(ConcreteValue::String("x".into())), "String"),
         (Value::Concrete(ConcreteValue::Int(1)), "Int"),
-        (Value::Concrete(ConcreteValue::Float(1.5)), "Float"),
+        (
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
+            "Float",
+        ),
         (Value::Concrete(ConcreteValue::Bool(true)), "Bool"),
         (
             Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60))),
@@ -4197,9 +4263,9 @@ fn as_deferred_returns_projection_for_deferred_variants() {
             "FunctionCall",
         ),
         (
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("inner".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("inner".into()))).into(),
+            )),
             "Secret",
         ),
         (
@@ -4400,12 +4466,14 @@ mod navigate_value_path_tests {
         // the Secret so the tag survives end-to-end (#2439 parity).
         let root = map(&[(
             "tok",
-            Value::Deferred(DeferredValue::Secret(Box::new(s("s")))),
+            Value::Deferred(DeferredValue::Secret(Box::new(s("s")).into())),
         )]);
         let path = AccessPath::root("o", "tok");
         assert_eq!(
             navigate_value_path(&root, &path),
-            Some(Value::Deferred(DeferredValue::Secret(Box::new(s("s")))))
+            Some(Value::Deferred(DeferredValue::Secret(
+                Box::new(s("s")).into()
+            )))
         );
     }
 
@@ -4416,12 +4484,14 @@ mod navigate_value_path_tests {
         let inner = map(&[("name", s("n"))]);
         let root = map(&[(
             "rr",
-            Value::Deferred(DeferredValue::Secret(Box::new(inner))),
+            Value::Deferred(DeferredValue::Secret(Box::new(inner).into())),
         )]);
         let path = AccessPath::root_with_fields("o", "rr", vec!["name".into()]);
         assert_eq!(
             navigate_value_path(&root, &path),
-            Some(Value::Deferred(DeferredValue::Secret(Box::new(s("n")))))
+            Some(Value::Deferred(DeferredValue::Secret(
+                Box::new(s("n")).into()
+            )))
         );
     }
 }
@@ -4474,9 +4544,9 @@ fn provider_normalization_boundary_strips_then_restores_host_dependencies() {
 
 #[test]
 fn exact_pairing_preserves_hash_container_evidence() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("private".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("private".into()))).into(),
+    ));
     let hash = crate::value::redact_secrets_in_value(&secret).unwrap();
     let item = SnapshotValue::Concrete(super::ConcreteValue::Map(IndexMap::from([(
         "token".into(),
@@ -4486,4 +4556,157 @@ fn exact_pairing_preserves_hash_container_evidence() {
         super::match_equal_concrete_items(std::slice::from_ref(&item), std::slice::from_ref(&item));
     assert_eq!(pairs, vec![Some(0)]);
     assert_eq!(matched, vec![true]);
+}
+
+#[test]
+fn review2_f8_leftover_placeholder_inventory_protects_secret_names() {
+    let value: super::Value<super::ParserPlaceholder> =
+        super::Value::Deferred(super::DeferredValue::Secret(
+            Box::new(super::Value::Deferred(super::DeferredValue::Placeholder(
+                super::ParserPlaceholder::ModuleArgument {
+                    name: "private_argument".into(),
+                    diagnostic: Default::default(),
+                },
+            )))
+            .into(),
+        ));
+    let mut errors = vec![];
+    value.collect_leftover_placeholders(
+        super::LeftoverPlaceholderContext::Value,
+        super::LeftoverPlaceholderPolicy::REJECT_ALL,
+        &mut errors,
+    );
+    assert_eq!(errors.len(), 1);
+    assert!(!format!("{} {:?}", errors[0], errors[0]).contains("private_argument"));
+}
+
+#[test]
+fn review2_f8_binding_inventory_callbacks_keep_public_and_secret_scopes() {
+    let reference = |name: &str| {
+        Value::Deferred(DeferredValue::BindingRef {
+            binding: absolute_binding(name),
+        })
+    };
+    let value = Value::Concrete(ConcreteValue::List(vec![
+        reference("public"),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(reference("private_binding")).into(),
+        )),
+    ]));
+    let mut findings = Vec::new();
+    value.visit_binding_refs_for_diagnostics(&mut |reference| {
+        findings.push(reference.diagnostic_path())
+    });
+    assert_eq!(findings[0].to_dot_string(), "public");
+    assert_eq!(findings[1], super::DiagnosticScope::Secret.path(None));
+    assert!(!format!("{findings:?}").contains("private_binding"));
+}
+
+#[test]
+fn secret_origin_4275_reference_visitors_separate_keys_from_diagnostic_paths() {
+    let public = Value::root_resource_ref("public", "config", vec!["field".into()]);
+    let private = Value::root_resource_ref(
+        "private-binding",
+        "private-attribute",
+        vec!["private-field".into()],
+    );
+    let value = Value::Concrete(ConcreteValue::List(vec![
+        public,
+        Value::Deferred(DeferredValue::Secret(Box::new(private).into())),
+    ]));
+    let mut dependencies = Vec::new();
+    value.visit_resource_refs(&mut |identity, usage| {
+        dependencies.push((identity.binding_key(), identity.attribute_key(), usage));
+    });
+    assert_eq!(
+        dependencies,
+        vec![
+            (
+                super::DependencyKey::new(absolute_binding("public")),
+                super::DependencyKey::new("config".to_string()),
+                ResourceRefUsage::Required
+            ),
+            (
+                super::DependencyKey::new(absolute_binding("private-binding")),
+                super::DependencyKey::new("private-attribute".to_string()),
+                ResourceRefUsage::Required
+            ),
+        ]
+    );
+    assert!(!format!("{dependencies:?}").contains("private-"));
+    let mut paths = Vec::new();
+    let mut errors = Vec::new();
+    value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+        paths.push((
+            reference.diagnostic_path(),
+            reference.binding_path(),
+            reference.head_path(),
+        ));
+        errors.push(
+            reference
+                .check(|path| Err::<(), _>(format!("bad {}", path.to_dot_string())))
+                .unwrap_err(),
+        );
+    });
+    assert_eq!(paths[0].0.to_dot_string(), "public.config.field");
+    assert_eq!(paths[0].1.to_dot_string(), "public");
+    assert_eq!(paths[0].2.to_dot_string(), "public.config");
+    for path in [&paths[1].0, &paths[1].1, &paths[1].2] {
+        assert_eq!(path.to_dot_string(), "(secret)");
+    }
+    assert!(!format!("{paths:?}").contains("private-"));
+    assert_eq!(
+        errors,
+        ["bad public.config.field", super::INSIDE_SECRET_MESSAGE]
+    );
+}
+
+#[test]
+fn secret_origin_4275_scoped_lookup_protects_shared_public_reference_origin() {
+    let parsed = crate::parser::parse_file(
+        "let producer = mock.test.Resource {}\nlet shared = producer.private_attribute\nmock.test.Resource { public = shared protected = secret(shared) }\n",
+        std::path::Path::new("shared.crn"),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    ).unwrap();
+    let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+    let mut checked = 0;
+    for resource in tree.resources() {
+        for value in resource.attributes().values() {
+            value.visit_resource_refs_for_diagnostics(&mut |reference, _| {
+                let expected = reference.diagnostic_path();
+                let analyzed = tree.reference_for_scoped(reference);
+                assert_eq!(analyzed.diagnostic_path(), expected);
+                checked += 1;
+            });
+        }
+    }
+    assert_eq!(checked, 2);
+}
+
+#[test]
+fn review3_secret_combinator_protects_errors_and_rewraps_success() {
+    let plain = Value::Concrete(ConcreteValue::String("private-combinator".into()));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(plain.clone()).into()));
+    let compute = |values: Vec<Value>| {
+        let Value::Concrete(ConcreteValue::String(text)) = &values[0] else {
+            panic!("peeled string")
+        };
+        Err::<Value, _>(format!("failed for {}", text.expose_plaintext()))
+    };
+    assert_eq!(
+        super::with_secret_values([plain.clone()], compute).unwrap_err(),
+        "failed for private-combinator"
+    );
+    let error = super::with_secret_values([secret.clone()], compute).unwrap_err();
+    assert_eq!(error, super::INSIDE_SECRET_MESSAGE);
+    assert!(!format!("{error:?}").contains("private-combinator"));
+    let result = super::with_secret_values([plain.clone(), secret], |values| {
+        assert_eq!(values, [plain.clone(), plain.clone()]);
+        Ok::<_, String>(plain.clone())
+    })
+    .unwrap();
+    assert_eq!(
+        result,
+        Value::Deferred(DeferredValue::Secret(Box::new(plain).into()))
+    );
 }

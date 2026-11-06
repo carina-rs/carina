@@ -9,6 +9,7 @@ use super::types::parse_type_expr;
 use super::{ParsedFunctionArgument as FunctionArgument, ParsedValue as Value};
 use super::{ProviderContext, Rule, is_static_eval, parse_expression};
 use crate::eval_value::{BareStructuralHandle, EvalValue, UnexpandedStructuralHandleKind};
+use crate::resource::InsideSecret;
 use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, ParserPlaceholder, PlaceholderKind,
     Value as GenericValue, ValueString,
@@ -401,7 +402,7 @@ fn contains_deferred_user_function_call(value: &Value) -> bool {
             )
         }),
         Value::Deferred(DeferredValue::Secret(value)) => {
-            contains_deferred_user_function_call(value)
+            value.visit(contains_deferred_user_function_call)
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             contains_deferred_user_function_call(access.base())
@@ -517,7 +518,7 @@ pub(crate) fn contains_module_argument_matching<B: BindingAddress>(
             matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_module_argument_matching(value, predicate))
         }),
         GenericValue::Deferred(DeferredValue::Secret(inner)) => {
-            contains_module_argument_matching(inner, predicate)
+            inner.visit(|secret_value| { contains_module_argument_matching(secret_value, predicate) })
         }
         GenericValue::Deferred(DeferredValue::Coalesce { value, default }) => {
             contains_module_argument_matching(value, predicate)
@@ -784,7 +785,7 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
                     .into(),
                 identity: owned.identity().clone(),
                 error: Box::new(if sensitive {
-                    error.masked_for_secret()
+                    error.inside_secret()
                 } else {
                     error
                 }),
@@ -825,9 +826,9 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
                 };
                 let text = ValueString::derived_from(text, source);
                 crate::provider::bridge_text_to_typed_value(owned.scalar_kind(), text).map_err(
-                    |message| {
+                    |error| {
                         invalid_value(crate::schema::TypeError::ValidationFailed {
-                            message: message.into(),
+                            message: crate::executor::render_error_chain(&error).into(),
                         })
                     },
                 )?
@@ -1065,6 +1066,30 @@ pub(crate) fn lower_function_arguments(
                 .map_err(|error| ParseError::from_eval_value(error, line)),
         })
         .collect()
+}
+
+pub(crate) fn construct_builtin_call(
+    builtin: crate::builtins::Builtin,
+    args: Vec<EvalValue>,
+    ctx: &ParseContext<'_, impl Clone>,
+    line: usize,
+) -> Result<EvalValue, ParseError> {
+    reject_builtin_handle_arguments(&args, line)
+        .map_err(|error| builtin.protect_parse_error(error, line))?;
+    let args = lower_function_arguments(args, line)
+        .map_err(|error| builtin.protect_parse_error(error, line))?;
+    builtin
+        .call(args, line.into(), |value| {
+            if super::is_static_value(&value) {
+                // Normalize successful authored inputs here. A failed static
+                // evaluation stays deferred so the normal strict/permissive
+                // resolver policy still owns unavailable values.
+                Ok(try_evaluate_fn_value(value.clone(), ctx, line).unwrap_or(value))
+            } else {
+                Ok(value)
+            }
+        })
+        .map(EvalValue::from_value)
 }
 
 pub(super) fn record_deferred_function_type_check<Source: Clone>(
@@ -1369,7 +1394,7 @@ pub fn contains_function_call(value: &Value) -> bool {
         Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().any(|part| {
             matches!(part, crate::resource::InterpolationPart::Expr(value) if contains_function_call(value))
         }),
-        Value::Deferred(DeferredValue::Secret(inner)) => contains_function_call(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => { inner.visit(|secret_value| { contains_function_call(secret_value) }) },
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
             contains_function_call(expression.lhs()) || contains_function_call(expression.rhs())
         }
@@ -1610,11 +1635,9 @@ fn substitute_fn_params_with_position<B: BindingAddress>(
             ))
         }
         GenericValue::Deferred(DeferredValue::Secret(inner)) => {
-            GenericValue::Deferred(DeferredValue::Secret(Box::new(substitute_fn_params(
-                inner,
-                substitutions,
-                source_line,
-            )?)))
+            GenericValue::Deferred(DeferredValue::Secret(
+                inner.try_map(|value| substitute_fn_params(value, substitutions, source_line))?,
+            ))
         }
         GenericValue::Deferred(DeferredValue::Coalesce { value, default }) => {
             GenericValue::Deferred(DeferredValue::Coalesce {
@@ -1741,20 +1764,12 @@ pub(crate) fn apply_parser_closure(
         return Ok(EvalValue::closure(name, all_args, remaining));
     }
 
-    let builtin = crate::builtins::BuiltinFunction::from_name(name).ok_or_else(|| {
-        ParseError::InvalidExpression {
+    let builtin =
+        crate::builtins::Builtin::from_name(name).ok_or_else(|| ParseError::InvalidExpression {
             line,
             message: format!("Unknown built-in function: {name}"),
-        }
-    })?;
-    let args = lower_function_arguments(all_args, line)?;
-    Ok(EvalValue::from_value(Value::Deferred(
-        DeferredValue::FunctionCall {
-            name: builtin,
-            args,
-            source_line: line.into(),
-        },
-    )))
+        })?;
+    construct_builtin_call(builtin, all_args, ctx, line)
 }
 
 pub(super) fn try_evaluate_fn_value<Source: Clone>(
@@ -1900,6 +1915,9 @@ pub(super) fn try_evaluate_fn_value<Source: Clone>(
             line: source_line.unwrap_or(containing_line),
             message: format!("{name}(): {reason}"),
         }),
+        Value::Deferred(DeferredValue::Secret(inner)) => inner
+            .try_map(|value| try_evaluate_fn_value(value.clone(), ctx, containing_line))
+            .map(|inner| Value::Deferred(DeferredValue::Secret(inner))),
         value @ Value::Concrete(
             ConcreteValue::String(_)
             | ConcreteValue::EnumIdentifier(_)
@@ -1914,9 +1932,50 @@ pub(super) fn try_evaluate_fn_value<Source: Clone>(
             DeferredValue::ResourceRef { .. }
             | DeferredValue::BindingRef { .. }
             | DeferredValue::Coalesce { .. }
-            | DeferredValue::Secret(_)
             | DeferredValue::Unknown(_)
             | DeferredValue::Placeholder(_),
         ) => Ok(value),
+    }
+}
+
+#[cfg(test)]
+mod secret_origin_tests {
+    use super::*;
+
+    #[test]
+    fn secret_origin_4275_closure_and_composition_wrap_deferred_arguments() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let ctx = ParseContext::new(
+            &config,
+            std::path::Path::new("test.crn"),
+            std::sync::Arc::new(crate::parser::grammar::preprocess_file("").unwrap()),
+        );
+        let argument = Value::Deferred(DeferredValue::Interpolation(vec![
+            crate::resource::InterpolationPart::Literal("private-closure".into()),
+            crate::resource::InterpolationPart::Expr(Value::resource_ref(
+                "producer",
+                "text",
+                Vec::new(),
+            )),
+        ]));
+        let secret = EvalValue::closure("secret", Vec::new(), 1);
+        let upper = EvalValue::closure("upper", Vec::new(), 1);
+        for (name, captured, remaining) in [
+            ("secret", Vec::new(), 1),
+            ("__compose__", vec![secret, upper], 1),
+        ] {
+            let value = apply_parser_closure(
+                name,
+                &captured,
+                remaining,
+                vec![EvalValue::from_value(argument.clone())],
+                &ctx,
+                1,
+            )
+            .unwrap()
+            .into_value()
+            .unwrap();
+            assert!(!format!("{value:?}").contains("private-"), "{value:?}");
+        }
     }
 }

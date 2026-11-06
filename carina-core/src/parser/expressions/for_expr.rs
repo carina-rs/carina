@@ -361,7 +361,7 @@ pub(crate) fn parse_for_expr(
     // Parse the iterable expression
     let iterable_pair = next_pair(&mut inner, "iterable", "for expression")?;
     let iterable_location = ctx.declaration_location(&iterable_pair);
-    let iterable_surface = iterable_pair.as_str().trim().to_string();
+    let iterable_source = ctx.diagnostic_source_text(iterable_pair.clone());
     let ParsedForIterable {
         value: iterable,
         bare_unbound_identifier,
@@ -370,6 +370,11 @@ pub(crate) fn parse_for_expr(
         structural_handle_metadata,
     } = parse_for_iterable(iterable_pair, ctx)?;
 
+    let iterable_surface =
+        crate::parser::deferred_if::DiagnosticExpressionText::from_value_and_source(
+            &iterable,
+            iterable_source,
+        );
     // Parse the body (we'll re-parse it for each iteration)
     let body_pair = next_pair(&mut inner, "body", "for expression")?;
 
@@ -566,7 +571,7 @@ pub(crate) fn parse_for_expr(
                 Value::Deferred(
                     DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument { .. })
                     | DeferredValue::ModuleIf(_),
-                ) => iterable_surface.clone(),
+                ) => iterable_surface.as_str().to_string(),
                 _ => crate::value::format_value(&iterable),
             };
             let header = deferred_for_header(&binding, &iterable_surface);

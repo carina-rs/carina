@@ -14,7 +14,7 @@ fn root_resource_ref(
 fn hash_wire() -> serde_json::Value {
     serde_json::to_value(
         carina_core::value::redact_secrets_in_value(&Value::Deferred(DeferredValue::Secret(
-            Box::new(Value::Concrete(ConcreteValue::String("password".into()))),
+            Box::new(Value::Concrete(ConcreteValue::String("password".into()))).into(),
         )))
         .unwrap(),
     )
@@ -115,9 +115,12 @@ fn snapshot_saved_plan_root_and_nested_hash_round_trip() {
     use carina_core::effect::Effect;
     use carina_core::plan::{Plan, SavedPlan, UnresolvedSavedPlan};
     use carina_core::resource::{ResolvedResource, Resource, SavedModuleSource};
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("plan-password".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "plan-password".into(),
+        )))
+        .into(),
+    ));
     for value in [
         secret.clone(),
         Value::Concrete(ConcreteValue::List(vec![secret])),
@@ -149,9 +152,9 @@ fn historical_siblings() -> SnapshotValue {
     let desired = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([
         (
             "password".into(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("password".into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("password".into()))).into(),
+            )),
         ),
         (
             "name".into(),
@@ -408,9 +411,9 @@ fn snapshot_saved_plan_loop_expansion_uses_checked_conversion() {
 #[test]
 fn snapshot_saved_plan_hash_mismatch_is_rejected() {
     let saved: SnapshotValue = serde_json::from_value(hash_wire()).unwrap();
-    let changed = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("changed".into()),
-    ))));
+    let changed = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String("changed".into()))).into(),
+    ));
     assert!(matches!(
         carina_core::value::rehydrate_redacted_secrets(&saved, &changed),
         Err(carina_core::value::SecretRehydrationError::HashMismatch)

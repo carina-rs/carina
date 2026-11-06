@@ -35,9 +35,9 @@ pub(crate) fn builtin_decrypt_with_config<B: BindingAddress>(
             error
         }
     })?;
-    Ok(Value::Deferred(DeferredValue::Secret(Box::new(
-        Value::Concrete(ConcreteValue::String(plaintext.into())),
-    ))))
+    Ok(Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+    )))
 }
 
 /// Parse and validate arguments for `decrypt()`.
@@ -108,9 +108,12 @@ mod tests {
         let result = evaluate_builtin_with_config("decrypt", &args, &config).unwrap();
         assert_eq!(
             result,
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("decrypted:AQICAHh".into())
-            ))))
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "decrypted:AQICAHh".into()
+                )))
+                .into()
+            ))
         );
     }
 
@@ -128,9 +131,12 @@ mod tests {
         let result = evaluate_builtin_with_config("decrypt", &args, &config).unwrap();
         assert_eq!(
             result,
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("decrypted:AQICAHh:key=alias/my-key".into())
-            ))))
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "decrypted:AQICAHh:key=alias/my-key".into()
+                )))
+                .into()
+            ))
         );
     }
 
@@ -234,9 +240,12 @@ mod tests {
         assert_eq!(secret, decrypted);
         assert_eq!(
             secret,
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String("my-secret-password".into())
-            ))))
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    "my-secret-password".into()
+                )))
+                .into()
+            ))
         );
     }
 }

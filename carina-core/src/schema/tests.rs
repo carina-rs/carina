@@ -1,3 +1,4 @@
+use crate::resource::InsideSecret;
 static TEST_OWNER: std::sync::LazyLock<crate::parser::SchemaTypeOwner> =
     std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
 
@@ -31,6 +32,178 @@ use super::{
 use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
+
+fn map_entries(count: usize) -> Value {
+    Value::Concrete(ConcreteValue::Map(
+        (0..count)
+            .map(|index| (format!("key_{index}"), string_value("value")))
+            .collect(),
+    ))
+}
+
+#[test]
+fn map_length_max_accepts_ten_entries() {
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((None, Some(10))),
+    );
+    let value = map_entries(10);
+    assert!(map.validate(&value).is_ok());
+    assert!(Schema::flat(map).validate_collect(&value).is_empty());
+}
+
+#[test]
+fn map_length_max_rejects_eleven_entries() {
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((None, Some(10))),
+    );
+    let value = map_entries(11);
+    let error = map
+        .validate(&value)
+        .expect_err("11 entries must exceed max 10");
+    assert!(matches!(
+        error,
+        TypeError::LengthOutOfRange {
+            length: 11,
+            min: None,
+            max: Some(10),
+            attribute: None,
+            ..
+        }
+    ));
+    assert!(
+        error
+            .to_string()
+            .contains("length 11 is outside allowed range [, 10]")
+    );
+    let errors = Schema::flat(map).validate_collect(&value);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(matches!(
+        errors[0].1,
+        TypeError::LengthOutOfRange { length: 11, .. }
+    ));
+}
+
+#[test]
+fn map_length_min_rejects_too_few_entries() {
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((Some(2), None)),
+    );
+    assert!(map.validate(&map_entries(2)).is_ok());
+    let value = map_entries(1);
+    assert!(matches!(
+        map.validate(&value),
+        Err(TypeError::LengthOutOfRange {
+            length: 1,
+            min: Some(2),
+            max: None,
+            ..
+        })
+    ));
+    let errors = Schema::flat(map).validate_collect(&value);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+}
+
+#[test]
+fn map_length_unbounded_preserves_validation() {
+    for map in [
+        AttributeType::map(AttributeType::string()),
+        AttributeType::refined_map(AttributeType::string(), AttributeType::string(), None),
+    ] {
+        for count in [0, 11, 100] {
+            let value = map_entries(count);
+            assert!(map.validate(&value).is_ok());
+            assert!(
+                Schema::flat(map.clone())
+                    .validate_collect(&value)
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[test]
+fn map_length_is_checked_for_every_validation_purpose() {
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((Some(1), Some(10))),
+    );
+    for purpose in [
+        CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
+        CanonicalizationPurpose::ProviderConfig {
+            provider_name: "mock",
+        },
+        CanonicalizationPurpose::WaitRhs,
+        CanonicalizationPurpose::Desired(DesiredValueSource::ProviderOutput),
+        CanonicalizationPurpose::State,
+    ] {
+        for count in [0, 11] {
+            assert!(
+                fit_value_to_type_on_path(
+                    &map,
+                    &map_entries(count),
+                    empty_defs_for_schema_walks(),
+                    FieldAncestry::WRITABLE,
+                    purpose,
+                    &mut Vec::new(),
+                )
+                .is_none(),
+                "{count} entries must fail the map bound"
+            );
+        }
+    }
+}
+
+#[test]
+fn map_length_collector_keeps_entry_errors() {
+    let map = AttributeType::refined_map(
+        AttributeType::string(),
+        AttributeType::string(),
+        Some((None, Some(0))),
+    );
+    let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "key".into(),
+        Value::Concrete(ConcreteValue::Int(7)),
+    )])));
+    let errors = Schema::flat(map).validate_collect(&value);
+    assert!(
+        errors
+            .iter()
+            .any(|(_, error)| matches!(error, TypeError::LengthOutOfRange { length: 1, .. })),
+        "{errors:?}"
+    );
+    assert!(errors.iter().any(|(_, error)| matches!(error, TypeError::MapValueError { inner, .. } if matches!(inner.as_ref(), TypeError::TypeMismatch { .. }))), "{errors:?}");
+}
+
+#[test]
+fn map_length_schema_admission_matches_list_for_inverted_bounds() {
+    let length = Some((Some(10), Some(1)));
+    let list = ValidatedConfigSchema::validate(BTreeMap::from([(
+        "value".into(),
+        PatternAttributeType::refined_list(
+            PatternAttributeType::string(),
+            true,
+            length,
+            ListElements::AllowDuplicates,
+        ),
+    )]));
+    let map = ValidatedConfigSchema::validate(BTreeMap::from([(
+        "value".into(),
+        PatternAttributeType::refined_map(
+            PatternAttributeType::string(),
+            PatternAttributeType::string(),
+            length,
+        ),
+    )]));
+    assert!(list.is_ok(), "List currently admits inverted length bounds");
+    assert!(map.is_ok(), "Map must follow List schema admission");
+}
 
 // Stage A storage/admission tests; stage B judgement tests are separate.
 mod assignability_edges_stage_a {
@@ -914,7 +1087,7 @@ fn unique_list_skips_whole_secrets_and_diagnostic_sensitive_elements() {
         Value::Concrete(ConcreteValue::String("private-claim".into())),
         Value::Concrete(ConcreteValue::String("private-claim".into())),
     ]));
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(duplicate)));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(duplicate).into()));
     assert!(list.validate(&secret).is_ok());
     assert!(Schema::flat(list).validate_collect(&secret).is_empty());
 
@@ -986,9 +1159,9 @@ fn unique_list_whole_secret_still_checks_length_and_element_types() {
         vec![string_value("private"); 3],
         vec![Value::Concrete(ConcreteValue::Int(1)); 2],
     ] {
-        let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::List(items),
-        ))));
+        let value = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::List(items))).into(),
+        ));
         assert!(list.validate(&value).is_err());
         let collected = Schema::flat(list.clone()).validate_collect(&value);
         assert!(!collected.is_empty());
@@ -1090,7 +1263,7 @@ fn unique_list_constraints_collect_length_and_element_errors_together() {
 fn assert_mixed_sensitive_list_is_not_comparable(secret: bool, sensitive_first: bool) {
     let plain = Value::Concrete(ConcreteValue::String("private-mixed-claim".into()));
     let sensitive = if secret {
-        Value::Deferred(DeferredValue::Secret(Box::new(plain.clone())))
+        Value::Deferred(DeferredValue::Secret(Box::new(plain.clone()).into()))
     } else {
         Value::Concrete(ConcreteValue::String(ValueString::diagnostic_sensitive(
             "private-mixed-claim",
@@ -1133,7 +1306,7 @@ fn unique_list_skips_plain_before_diagnostic_sensitive() {
 
 #[test]
 fn unique_list_skips_two_secrets() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string_value("x"))));
+    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string_value("x")).into()));
     let value = Value::Concrete(ConcreteValue::List(vec![secret.clone(), secret]));
     let list = unique_list_from_protocol(AttributeType::string(), true);
     assert!(list.validate(&value).is_ok());
@@ -1150,9 +1323,9 @@ fn unique_list_skips_nested_secret_struct_elements() {
         true,
     );
     let object = |a| Value::Concrete(ConcreteValue::Map(IndexMap::from([("a".into(), a)])));
-    let secret = object(Value::Deferred(DeferredValue::Secret(Box::new(
-        string_value("x"),
-    ))));
+    let secret = object(Value::Deferred(DeferredValue::Secret(
+        Box::new(string_value("x")).into(),
+    )));
     let plain = object(string_value("x"));
     let value = Value::Concrete(ConcreteValue::List(vec![secret.clone(), plain, secret]));
     assert!(list.validate(&value).is_ok());
@@ -1241,15 +1414,16 @@ fn unique_list_inside_whole_secret_struct_does_not_report_equality() {
             StructField::required("enabled", AttributeType::bool()).build(),
         ],
     ));
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::Map(IndexMap::from([
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([
             (
                 "items".into(),
                 Value::Concrete(ConcreteValue::List(vec![string_value("private"); 2])),
             ),
             ("enabled".into(), string_value("invalid")),
-        ])),
-    ))));
+        ]))))
+        .into(),
+    ));
     let error = schema.validate(&value).unwrap_err();
     let collected = schema.validate_collect(&value);
     assert_eq!(collected.len(), 1, "{collected:?}");
@@ -1359,8 +1533,14 @@ fn unique_list_compares_canonical_string_or_list_containers() {
 fn unique_float_list_keeps_integer_and_float_spellings_distinct() {
     let list = unique_list_from_protocol(AttributeType::float(), true);
     for items in [
-        vec![ConcreteValue::Int(1), ConcreteValue::Float(1.0)],
-        vec![ConcreteValue::Float(1.0), ConcreteValue::Int(1)],
+        vec![
+            ConcreteValue::Int(1),
+            ConcreteValue::Float(crate::finite(1.0)),
+        ],
+        vec![
+            ConcreteValue::Float(crate::finite(1.0)),
+            ConcreteValue::Int(1),
+        ],
         vec![
             ConcreteValue::Int(9_007_199_254_740_992),
             ConcreteValue::Int(9_007_199_254_740_993),
@@ -1770,6 +1950,7 @@ fn explicit_json_null_is_absent_for_groups_and_required_fields() {
     let decoded = crate::value::json_to_dsl_value(&serde_json::json!({
         "sliding_window": null
     }))
+    .unwrap()
     .expect("an object remains a map when its null member is omitted");
     assert_eq!(
         choice_struct(FieldGroupKind::ExactlyOne)
@@ -1804,7 +1985,9 @@ fn write_only_secret_group_errors_never_render_values() {
         vec![FieldGroup::at_most_one(["access_token", "password"]).unwrap()],
     );
     let plaintext = "must-never-appear-in-group-errors";
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string_value(plaintext))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(string_value(plaintext)).into(),
+    ));
     let both_secret = Value::Concrete(ConcreteValue::Map(IndexMap::from([
         ("access_token".to_string(), secret.clone()),
         ("password".to_string(), secret),
@@ -1822,12 +2005,13 @@ fn write_only_secret_group_errors_never_render_values() {
 
 #[test]
 fn secret_map_of_grouped_structs_masks_the_map_key_in_group_errors() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::Map(IndexMap::from([(
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "leaky-key".to_string(),
             Value::Concrete(ConcreteValue::Map(IndexMap::new())),
-        )])),
-    ))));
+        )]))))
+        .into(),
+    ));
     let error = RootlessType::new(AttributeType::map(choice_struct(
         FieldGroupKind::ExactlyOne,
     )))
@@ -1843,12 +2027,13 @@ fn secret_map_of_grouped_structs_masks_the_map_key_in_group_errors() {
 
 #[test]
 fn secret_struct_masks_nested_struct_paths_in_group_errors() {
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::Map(IndexMap::from([(
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "leaky_field".to_string(),
             Value::Concrete(ConcreteValue::Map(IndexMap::new())),
-        )])),
-    ))));
+        )]))))
+        .into(),
+    ));
     let envelope = AttributeType::struct_(
         "SecretEnvelope",
         vec![
@@ -2038,7 +2223,7 @@ fn secret_masking_preserves_custom_type_attribute_position() {
         attribute: Some("secret_value".to_string()),
     };
 
-    let masked = error.masked_for_secret();
+    let masked = error.inside_secret();
     assert_eq!(masked.attribute_name(), Some("secret_value"));
     assert!(matches!(
         masked,
@@ -2867,7 +3052,7 @@ fn domain_name_builtins_reject_non_string_values() {
             .expect("Domain name types must be registered built-ins");
         for value in [
             Value::Concrete(ConcreteValue::Int(123)),
-            Value::Concrete(ConcreteValue::Float(1.2)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.2))),
             Value::Concrete(ConcreteValue::Bool(true)),
             Value::Concrete(ConcreteValue::List(vec![])),
         ] {
@@ -3070,7 +3255,7 @@ fn https_url_builtin_rejects_non_string_values() {
         .expect("HttpsUrl must be a registered built-in");
     for value in [
         Value::Concrete(ConcreteValue::Int(443)),
-        Value::Concrete(ConcreteValue::Float(443.0)),
+        Value::Concrete(ConcreteValue::Float(crate::finite(443.0))),
         Value::Concrete(ConcreteValue::Bool(true)),
         Value::Concrete(ConcreteValue::List(vec![])),
     ] {
@@ -3252,33 +3437,10 @@ fn schema_admission_rejects_an_unknown_unique_name_attribute() {
 }
 
 #[test]
-fn schema_admission_rejects_every_non_finite_default_at_top_level_and_nested() {
-    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        let error = admission_error(
-            PatternResourceSchema::new("test.Widget").attribute(
-                PatternAttributeSchema::optional("threshold", PatternAttributeType::float())
-                    .with_default(Value::Concrete(ConcreteValue::Float(value)))
-                    .build(),
-            ),
-        );
-        assert!(error.contains("threshold"), "{error}");
-        assert!(error.contains("finite"), "{error}");
+fn schema_defaults_require_finite_admission() {
+    for json in ["1e999", "[1e999]", r#"{"threshold":-1e999}"#] {
+        assert!(serde_json::from_str::<carina_provider_protocol::types::Value>(json).is_err());
     }
-
-    let error = admission_error(
-        PatternResourceSchema::new("test.Widget").attribute(
-            PatternAttributeSchema::optional(
-                "thresholds",
-                PatternAttributeType::list(PatternAttributeType::float()),
-            )
-            .with_default(Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::Float(f64::NAN),
-            )])))
-            .build(),
-        ),
-    );
-    assert!(error.contains("thresholds[0]"), "{error}");
-    assert!(error.contains("finite"), "{error}");
 }
 
 #[test]
@@ -5452,11 +5614,11 @@ fn validate_enum_rejects_double_namespace() {
 fn validate_float_type() {
     let t = AttributeType::float();
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::Float(2.5)))
+        t.validate(&Value::Concrete(ConcreteValue::Float(crate::finite(2.5))))
             .is_ok()
     );
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::Float(-0.5)))
+        t.validate(&Value::Concrete(ConcreteValue::Float(crate::finite(-0.5))))
             .is_ok()
     );
     assert!(t.validate(&Value::Concrete(ConcreteValue::Int(42))).is_ok()); // integers are valid numbers
@@ -5471,28 +5633,11 @@ fn validate_float_type() {
 }
 
 #[test]
-fn validate_float_rejects_non_finite() {
-    let t = AttributeType::float();
-    assert!(
-        t.validate(&Value::Concrete(ConcreteValue::Float(f64::NAN)))
-            .is_err()
-    );
-    assert!(
-        t.validate(&Value::Concrete(ConcreteValue::Float(f64::INFINITY)))
-            .is_err()
-    );
-    assert!(
-        t.validate(&Value::Concrete(ConcreteValue::Float(f64::NEG_INFINITY)))
-            .is_err()
-    );
-}
-
-#[test]
 fn validate_int_rejects_float() {
     let t = AttributeType::int();
     assert!(t.validate(&Value::Concrete(ConcreteValue::Int(42))).is_ok());
     assert!(
-        t.validate(&Value::Concrete(ConcreteValue::Float(2.5)))
+        t.validate(&Value::Concrete(ConcreteValue::Float(crate::finite(2.5))))
             .is_err()
     ); // strict integer typing
 }
@@ -6626,9 +6771,12 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
         .validate()
         .expect("secret validation schema must be valid");
     let secret = |value: &str| {
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String(value.to_string().into()),
-        ))))
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                value.to_string().into(),
+            )))
+            .into(),
+        ))
     };
     let mut map = IndexMap::new();
     map.insert("key".to_string(), secret("map-plaintext"));
@@ -6642,9 +6790,12 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
         ("length".to_string(), secret("length-plaintext")),
         (
             "enum_value".to_string(),
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::enum_identifier("enum-plaintext"),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::enum_identifier(
+                    "enum-plaintext",
+                )))
+                .into(),
+            )),
         ),
         ("custom".to_string(), secret("schema-custom-plaintext")),
         ("lookup".to_string(), secret("lookup-plaintext")),
@@ -6757,9 +6908,12 @@ fn secret_enum_literal_masks_typed_value_and_validator_message() {
         .validate()
         .expect("secret enum schema must be valid");
     let secret = |plaintext: &str| {
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String(plaintext.to_string().into()),
-        ))))
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                plaintext.to_string().into(),
+            )))
+            .into(),
+        ))
     };
     let attributes = HashMap::from([
         ("enumerated".to_string(), secret(enumerated_plaintext)),
@@ -6844,9 +6998,12 @@ fn secret_wrapped_containers_mask_user_derived_error_paths() {
     use indexmap::IndexMap;
 
     fn secret_map(entries: impl IntoIterator<Item = (String, Value)>) -> Value {
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::Map(entries.into_iter().collect::<IndexMap<_, _>>()),
-        ))))
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Map(
+                entries.into_iter().collect::<IndexMap<_, _>>(),
+            )))
+            .into(),
+        ))
     }
 
     let constrained = || {
@@ -6942,9 +7099,12 @@ fn secret_wrapped_containers_mask_user_derived_error_paths() {
 #[test]
 fn secret_length_out_of_range_is_masked_without_pattern_error() {
     let plaintext = "short";
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(plaintext.to_string().into()),
-    ))));
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            plaintext.to_string().into(),
+        )))
+        .into(),
+    ));
     let error = AttributeType::refined_string(None, None, Some((Some(8), None)), None)
         .validate(&value)
         .expect_err("short secret must fail the length constraint");
@@ -6965,9 +7125,12 @@ fn secret_length_out_of_range_is_masked_without_pattern_error() {
 #[test]
 fn secret_pattern_mismatch_is_masked_without_literal_quotes() {
     let plaintext = "wrong";
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(plaintext.to_string().into()),
-    ))));
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            plaintext.to_string().into(),
+        )))
+        .into(),
+    ));
     let error = AttributeType::refined_string(
         None,
         Some(crate::schema::CompiledPattern::try_new("^allowed$").unwrap()),
@@ -7013,9 +7176,12 @@ fn secret_structured_string_enum_error_is_masked_without_literal_quotes() {
         }),
         None,
     );
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(plaintext.to_string().into()),
-    ))));
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            plaintext.to_string().into(),
+        )))
+        .into(),
+    ));
     let error = attr
         .validate(&value)
         .expect_err("secret must fail the structured enum validator");
@@ -9236,8 +9402,14 @@ fn finite_assignability_universe() -> Vec<NamedAssignableType> {
     );
     let int_0_100 = AttributeType::refined_int(None, Some((Some(0), Some(100))));
     let int_25_75 = AttributeType::refined_int(None, Some((Some(25), Some(75))));
-    let float_0_100 = AttributeType::refined_float(None, Some((Some(0.0), Some(100.0))));
-    let float_25_75 = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+    let float_0_100 = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+    );
+    let float_25_75 = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
+    );
     let status = AttributeType::enum_(
         crate::schema::enum_identity("Status", Some("aws.test.Widget")),
         Some(vec!["Enabled".to_string(), "Disabled".to_string()]),
@@ -9509,11 +9681,17 @@ fn assignability_rule_10_accepts_all_identityless_refinement_sinks() {
             vec![
                 NamedAssignableType::new(
                     "Float(range=0..100)",
-                    AttributeType::refined_float(None, Some((Some(0.0), Some(100.0)))),
+                    AttributeType::refined_float(
+                        None,
+                        Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+                    ),
                 ),
                 NamedAssignableType::new(
                     "Float(range=25..75)",
-                    AttributeType::refined_float(None, Some((Some(25.0), Some(75.0)))),
+                    AttributeType::refined_float(
+                        None,
+                        Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
+                    ),
                 ),
             ],
         ),
@@ -9567,11 +9745,17 @@ fn assignability_rule_8_rejects_unproven_refined_sources() {
         (
             NamedAssignableType::new(
                 "Float(range=0..100)",
-                AttributeType::refined_float(None, Some((Some(0.0), Some(100.0)))),
+                AttributeType::refined_float(
+                    None,
+                    Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+                ),
             ),
             NamedAssignableType::new(
                 "Float(range=25..75)",
-                AttributeType::refined_float(None, Some((Some(25.0), Some(75.0)))),
+                AttributeType::refined_float(
+                    None,
+                    Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
+                ),
             ),
         ),
     ];
@@ -9682,9 +9866,11 @@ fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
             ..
         } => true,
         AttrTypeKind::List { element_type, .. } => contains_unrefined_primitive(element_type),
-        AttrTypeKind::Map { key, value } => {
-            contains_unrefined_primitive(key) || contains_unrefined_primitive(value)
-        }
+        AttrTypeKind::Map {
+            key,
+            value,
+            constraints: _,
+        } => contains_unrefined_primitive(key) || contains_unrefined_primitive(value),
         AttrTypeKind::Union(members) => members
             .as_raw_slice()
             .iter()
@@ -10555,7 +10741,10 @@ fn assignable_plain_int_accepts_identityless_range_sink() {
 
 #[test]
 fn assignable_plain_float_accepts_identityless_range_sink() {
-    let sink = AttributeType::refined_float(None, Some((Some(1.0), Some(65_535.0))));
+    let sink = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(1.0)), Some(crate::finite(65_535.0)))),
+    );
 
     assert!(assignable(&AttributeType::float(), &sink));
 }
@@ -10563,10 +10752,13 @@ fn assignable_plain_float_accepts_identityless_range_sink() {
 #[test]
 fn float_range_exact_numeric_int_bounds() {
     for (integer, range) in [
-        (9_007_199_254_740_993, (None, Some(9_007_199_254_740_992.0))),
+        (
+            9_007_199_254_740_993,
+            (None, Some(crate::finite(9_007_199_254_740_992.0))),
+        ),
         (
             -9_007_199_254_740_993,
-            (Some(-9_007_199_254_740_992.0), None),
+            (Some(crate::finite(-9_007_199_254_740_992.0)), None),
         ),
     ] {
         let attr_type = AttributeType::refined_float(None, Some(range));
@@ -10591,26 +10783,26 @@ fn assignable_exact_numeric_int_float_bounds() {
     for (source, sink, expected) in [
         (
             (None, Some(9_007_199_254_740_993)),
-            (None, Some(9_007_199_254_740_992.0)),
+            (None, Some(crate::finite(9_007_199_254_740_992.0))),
             false,
         ),
         (
             (Some(-9_007_199_254_740_993), None),
-            (Some(-9_007_199_254_740_992.0), None),
+            (Some(crate::finite(-9_007_199_254_740_992.0)), None),
             false,
         ),
         (
             (None, Some(i64::MAX)),
-            (None, Some(9_223_372_036_854_775_808.0)),
+            (None, Some(crate::finite(9_223_372_036_854_775_808.0))),
             true,
         ),
         (
             (Some(i64::MIN), None),
-            (Some(-9_223_372_036_854_775_808.0), None),
+            (Some(crate::finite(-9_223_372_036_854_775_808.0)), None),
             true,
         ),
-        ((Some(3), Some(4)), (Some(3.5), None), false),
-        ((Some(3), Some(4)), (None, Some(3.5)), false),
+        ((Some(3), Some(4)), (Some(crate::finite(3.5)), None), false),
+        ((Some(3), Some(4)), (None, Some(crate::finite(3.5))), false),
     ] {
         assert_eq!(
             assignable(
@@ -10626,11 +10818,15 @@ fn assignable_exact_numeric_int_float_bounds() {
 #[test]
 fn assignable_int_float_missing_bounds_use_i64_limits() {
     for (source, sink, expected) in [
-        ((Some(0), None), (Some(-1.0), Some(1e300)), true),
-        ((None, None), (None, Some(1e300)), true),
-        ((None, None), (None, Some(9.0e18)), false),
-        ((None, None), (Some(-1e300), None), true),
-        ((None, None), (Some(-9.0e18), None), false),
+        (
+            (Some(0), None),
+            (Some(crate::finite(-1.0)), Some(crate::finite(1e300))),
+            true,
+        ),
+        ((None, None), (None, Some(crate::finite(1e300))), true),
+        ((None, None), (None, Some(crate::finite(9.0e18))), false),
+        ((None, None), (Some(crate::finite(-1e300)), None), true),
+        ((None, None), (Some(crate::finite(-9.0e18)), None), false),
     ] {
         assert_eq!(
             assignable(
@@ -10652,7 +10848,10 @@ fn assignable_int_source_widens_to_float_sink() {
 #[test]
 fn assignable_identified_int_without_range_widens_to_ranged_float_sink() {
     let source = AttributeType::refined_int(Some(TypeIdentity::bare("Count")), None);
-    let sink = AttributeType::refined_float(None, Some((Some(0.0), Some(100.0))));
+    let sink = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+    );
 
     assert!(
         assignable(&source, &sink),
@@ -10662,8 +10861,14 @@ fn assignable_identified_int_without_range_widens_to_ranged_float_sink() {
 
 #[test]
 fn assignable_wider_float_range_rejects_narrower_identityless_range_sink() {
-    let source = AttributeType::refined_float(None, Some((Some(0.0), Some(100.0))));
-    let sink = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+    let source = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+    );
+    let sink = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
+    );
 
     assert!(!assignable(&source, &sink));
 }
@@ -11131,12 +11336,15 @@ fn typed_ref_anonymous_refined_int_defers_range_constraints() {
 fn typed_ref_anonymous_refined_float_defers_range_constraints() {
     for range in [
         None,
-        Some((Some(30.0), Some(60.0))),
-        Some((Some(0.0), Some(100.0))),
-        Some((Some(100.0), Some(200.0))),
+        Some((Some(crate::finite(30.0)), Some(crate::finite(60.0)))),
+        Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+        Some((Some(crate::finite(100.0)), Some(crate::finite(200.0)))),
     ] {
         let source = AttributeType::refined_float(Some(TypeIdentity::bare("Ratio")), range);
-        let sink = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+        let sink = AttributeType::refined_float(
+            None,
+            Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
+        );
         let actual = assignable(&source, &sink);
         assert!(
             actual,
@@ -11173,7 +11381,10 @@ fn typed_ref_anonymous_refined_numeric_preserves_identity_range_and_primitive_ru
         );
     }
 
-    let narrow_float = AttributeType::refined_float(None, Some((Some(25.0), Some(75.0))));
+    let narrow_float = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(25.0)), Some(crate::finite(75.0)))),
+    );
     assert!(
         !assignable(&wide_int, &narrow_float),
         "Int to Float widening still requires identity-less source range containment"
@@ -14510,9 +14721,9 @@ fn unique_best_union_failure_remains_verbatim() {
 #[test]
 fn secret_scalar_union_masks_every_tied_failure() {
     let plaintext = "z14grhdcwa56qt";
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(plaintext.into()),
-    ))));
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+    ));
 
     for (path, error) in union_errors_from_public_paths(&hosted_zone_id_union(true), &value) {
         let TypeError::UnionAlternativesMismatch { failures } = &error else {
@@ -17209,4 +17420,12 @@ fn draft_keyed_partial_update_rejects_unresolvable_shapes() {
             "{error}"
         );
     }
+}
+
+#[test]
+fn unbounded_integer_range_is_assignable_to_unbounded_float_range() {
+    assert!(super::i64_range_assignable_to_f64(
+        Some(&(None, None)),
+        Some(&(None, None))
+    ));
 }

@@ -112,7 +112,9 @@ async fn wire_boundary_factory_config_has_native_and_wasm_parity() {
         "extra".into(),
         Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
             "unrelated".into(),
-            Value::Concrete(ConcreteValue::Float(f64::NAN)),
+            Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                u64::MAX,
+            ))),
         )]))),
     )]);
     let config = resolved_provider_config("mock", attributes);
@@ -144,7 +146,7 @@ async fn wire_boundary_factory_config_has_native_and_wasm_parity() {
         );
         assert!(matches!(
             error.conversion_error(),
-            carina_core::protocol_convert::ProtocolConvertError::NonFiniteFloat
+            carina_core::protocol_convert::ProtocolConvertError::DurationOutOfRange
         ));
         assert!(std::error::Error::source(error).is_none());
     }
@@ -371,9 +373,9 @@ fn migrate_legacy_state_attribute(
 }
 
 fn redacted_secret_and_legacy_marker(plaintext: &str) -> (SnapshotValue, String) {
-    let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(plaintext.into()),
-    ))));
+    let secret: Value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+    ));
     let persisted = PersistedValue::encode_provider_value(&secret, None)
         .expect("test secret must be persistable");
     let encoded = persisted.as_json();
@@ -504,6 +506,57 @@ fn wasm_path() -> Option<PathBuf> {
         }
     }
     None
+}
+
+const NON_FINITE_FLOAT_CASES: [(&str, carina_core::NonFiniteFloatError); 3] = [
+    ("nan", carina_core::NonFiniteFloatError::NaN),
+    (
+        "positive",
+        carina_core::NonFiniteFloatError::PositiveInfinity,
+    ),
+    (
+        "negative",
+        carina_core::NonFiniteFloatError::NegativeInfinity,
+    ),
+];
+
+fn raw_float_wasm_path() -> PathBuf {
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+    let path =
+        workspace_root.join("target/wasm32-wasip2/debug/carina-provider-mock-raw-float.wasm");
+    assert!(
+        path.exists(),
+        "build carina-provider-mock's raw float fixture first: {}",
+        path.display()
+    );
+    path
+}
+
+fn assert_raw_float_cause(
+    error: &ProviderError,
+    category: carina_core::NonFiniteFloatError,
+    operation: &str,
+) {
+    let message = error.to_string();
+    assert!(message.contains(operation), "{message}");
+    assert!(message.contains("ratio"), "{message}");
+    assert_eq!(
+        message.matches(&category.to_string()).count(),
+        1,
+        "{message}"
+    );
+    let mut source: Option<&(dyn std::error::Error + 'static)> = error
+        .detail()
+        .cause()
+        .map(|source| source as &dyn std::error::Error);
+    while let Some(error) = source {
+        if let Some(found) = error.downcast_ref::<carina_core::NonFiniteFloatError>() {
+            assert_eq!(*found, category);
+            return;
+        }
+        source = error.source();
+    }
+    panic!("constructor source was lost: {message}");
 }
 
 fn http_wasm_path() -> Option<PathBuf> {
@@ -3528,20 +3581,24 @@ async fn wasm_mock_exercises_not_created_identifier_reported_and_malformed_pendi
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn initial_issued_encode_failure_is_identifier_reported_never_not_created() {
+async fn initial_token_encode_failure_with_create_done_identifier_is_identifier_reported() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
         .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
-    let id =
-        ResourceId::with_provider_identity("mock", "test.resource", "unencodable-created", None);
+    let id = ResourceId::with_provider_identity(
+        "mock",
+        "test.resource",
+        "unencodable-create-done-token",
+        None,
+    );
     let resource = resource_with_string_attribute(
         "test.resource",
-        "unencodable-created",
+        "unencodable-create-done-token",
         "create_mode",
-        "unencodable_created",
+        "unencodable_token_create_done_identifier",
     );
 
     let failure = provider
@@ -4959,26 +5016,35 @@ async fn test_wasm_mock_provider_create_and_read() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wasm_guest_read_reports_nested_non_finite_float_as_provider_error() {
-    let path = skip_if_no_wasm!();
-    let (factory, _cache) = load_factory(&path).await;
+async fn test_wasm_host_rejects_raw_non_finite_read_values_as_provider_errors() {
+    let (factory, _cache) = load_factory(&raw_float_wasm_path()).await;
     let provider = factory
         .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
-        .expect("provider should init");
-    let id = ResourceId::with_provider_identity("mock", "test.resource", "non-finite-read", None);
-    let identifier = AppliedIdentifier::new("__mock_non_finite_read__")
-        .expect("the non-finite read fixture identifier is non-empty");
-
-    let error = provider
-        .provider()
-        .read(&id, &identifier, ReadRequest)
-        .await
-        .expect_err("guest output containing nested NaN must be a provider error");
-
-    let rendered = error.to_string();
-    assert!(rendered.contains("WASM boundary encode error"));
-    assert!(rendered.contains("non-finite float NaN"));
+        .unwrap();
+    for (selector, category) in NON_FINITE_FLOAT_CASES {
+        let id = ResourceId::with_provider_identity("mock", "test.resource", selector, None);
+        let identifier = AppliedIdentifier::new(selector).unwrap();
+        let error = provider
+            .provider()
+            .read(&id, &identifier, ReadRequest)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error
+                .detail()
+                .resource_id
+                .as_deref()
+                .map(|id| id.as_resource_id()),
+            Some(&id)
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("failed to decode WIT float-val attribute 'ratio'")
+        );
+        assert_raw_float_cause(&error, category, "read");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -5512,7 +5578,9 @@ async fn wasm_normalize_desired_edits_known_leaves_in_mixed_containers() {
         .await
         .unwrap();
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(string("private-leaf"))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(string("private-leaf")).into(),
+    ));
     let reference = root_resource_ref("peer", "identifier");
     let resource = Resource::with_provider("mock", "test.normalize_leaf", "mixed", None)
         .with_attribute("domain_name", string("example.com"))
@@ -5560,7 +5628,7 @@ async fn wasm_normalize_desired_edits_known_leaves_in_mixed_containers() {
     );
     assert_eq!(names[0], string("www.example.com"));
     assert!(
-        matches!(&names[1], Value::Deferred(DeferredValue::Secret(inner)) if inner.as_ref() == &string("private-leaf"))
+        matches!(&names[1], Value::Deferred(DeferredValue::Secret(inner)) if inner.plaintext_for_test() == &string("private-leaf"))
     );
     assert!(matches!(
         &names[2],
@@ -5644,9 +5712,12 @@ async fn http_wasm_normalize_desired_preserves_leaf_handles() {
         .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .unwrap();
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("http-private".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "http-private".into(),
+        )))
+        .into(),
+    ));
     let reference = root_resource_ref("peer", "identifier");
     let resource = Resource::with_provider("mock_http", "test.resource", "http-leaves", None)
         .with_attribute("secret", secret.clone())
@@ -5668,7 +5739,7 @@ async fn http_wasm_normalize_desired_preserves_leaf_handles() {
         panic!()
     };
     assert_eq!(
-        inner.as_ref(),
+        inner.plaintext_for_test(),
         &Value::Concrete(ConcreteValue::String("http-private".into()))
     );
     let Some(Value::Concrete(ConcreteValue::List(items))) = resources[0].get_attr("items") else {
@@ -5939,7 +6010,7 @@ async fn test_wasm_provider_config_preparation_propagates_boundary_encoding_fail
     let attributes = indexmap::IndexMap::from([(
         "bad".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::Float(f64::INFINITY),
+            ConcreteValue::Duration(std::time::Duration::from_secs(u64::MAX)),
         )])),
     )]);
 
@@ -6075,9 +6146,12 @@ async fn test_wasm_hydrate_read_state_round_trips_structural_redacted_secret() {
         .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
-    let secret: Value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("wasm-wire-secret".into()),
-    ))));
+    let secret: Value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "wasm-wire-secret".into(),
+        )))
+        .into(),
+    ));
     let persisted = PersistedValue::encode_provider_value(&secret, None)
         .expect("serialize test secret")
         .as_json()
@@ -6251,9 +6325,9 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
 
     let desired = Resource::from_id(id.clone()).with_attribute(
         "__mock_write_only_secret__",
-        Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-            ConcreteValue::String(plaintext.into()),
-        )))),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+        )),
     );
     let diff = carina_core::differ::diff_for_test(
         &ResolvedResource::new(desired.into_value_snapshot()),
@@ -6617,7 +6691,7 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wasm_normalizer_rejects_nested_non_finite_float_without_mutating_resource() {
+async fn test_wasm_normalizer_rejects_out_of_range_duration_without_mutating_resource() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
@@ -6625,11 +6699,11 @@ async fn test_wasm_normalizer_rejects_nested_non_finite_float_without_mutating_r
         .await
         .expect("normalizer should initialize");
 
-    let mut resource = Resource::with_provider("mock", "test.resource", "non-finite", None);
+    let mut resource = Resource::with_provider("mock", "test.resource", "duration", None);
     resource.attributes.insert(
         "values".to_string(),
         Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-            ConcreteValue::Float(f64::INFINITY),
+            ConcreteValue::Duration(std::time::Duration::from_secs(u64::MAX)),
         )])),
     );
     let mut resources = provider_resources(vec![resource]);
@@ -6638,15 +6712,15 @@ async fn test_wasm_normalizer_rejects_nested_non_finite_float_without_mutating_r
     let error = normalizer
         .normalize_desired(&mut resources)
         .await
-        .expect_err("nested non-finite floats must be provider errors, not panics");
+        .expect_err("out-of-range durations must be provider errors");
 
-    assert!(error.to_string().contains("non-finite float"));
+    assert!(error.to_string().contains("duration"));
     assert!(error.detail().cause().is_some());
     assert_eq!(resources, before, "failed encoding must be atomic");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wasm_normalize_state_rejects_nested_non_finite_float_without_mutation() {
+async fn test_wasm_normalize_state_rejects_unresolved_enum_without_mutation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
@@ -6661,7 +6735,7 @@ async fn test_wasm_normalize_state_rejects_nested_non_finite_float_without_mutat
             HashMap::from([(
                 "values".to_string(),
                 Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                    ConcreteValue::Float(f64::INFINITY),
+                    ConcreteValue::enum_identifier("mock.Mode.unresolved"),
                 )])),
             )]),
         ),
@@ -6670,14 +6744,14 @@ async fn test_wasm_normalize_state_rejects_nested_non_finite_float_without_mutat
 
     let error = normalize_provider_states(normalizer.as_ref(), &mut states)
         .await
-        .expect_err("non-finite state values must fail boundary encoding");
+        .expect_err("unresolved enum identifiers must fail boundary encoding");
 
-    assert!(error.to_string().contains("non-finite float"));
+    assert!(error.to_string().contains("unresolved enum identifier"));
     assert_eq!(states, before, "failed encoding must be atomic");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_wasm_hydrate_rejects_non_finite_saved_attribute_without_mutation() {
+async fn test_wasm_hydrate_rejects_unresolved_enum_without_mutation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
@@ -6695,7 +6769,7 @@ async fn test_wasm_hydrate_rejects_non_finite_saved_attribute_without_mutation()
         HashMap::from([(
             "values".to_string(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
-                ConcreteValue::Float(f64::NEG_INFINITY),
+                ConcreteValue::enum_identifier("mock.Mode.unresolved"),
             )])),
         )]),
     )]);
@@ -6705,9 +6779,9 @@ async fn test_wasm_hydrate_rejects_non_finite_saved_attribute_without_mutation()
         saved_attrs.as_provider_saved_attrs(),
     )
     .await
-    .expect_err("non-finite saved attributes must fail boundary encoding");
+    .expect_err("unresolved saved enum identifiers must fail boundary encoding");
 
-    assert!(error.to_string().contains("non-finite float"));
+    assert!(error.to_string().contains("unresolved enum identifier"));
     assert_eq!(states, before, "failed encoding must be atomic");
 }
 
@@ -6720,9 +6794,12 @@ async fn test_wasm_normalize_desired_preserves_secret() {
         .await
         .expect("normalizer should initialize");
 
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("normalize-secret-plaintext".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "normalize-secret-plaintext".into(),
+        )))
+        .into(),
+    ));
     let mut resource = Resource::with_provider("mock", "test.resource", "secret-normalize", None);
     resource
         .attributes
@@ -7003,4 +7080,111 @@ async fn wasm_reference_batches_preserve_order_and_all_typed_outcomes() {
         results.next().unwrap(),
         Err(ReferenceError::InvalidReference(_))
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_float_normalization_outputs_are_rejected_atomically() {
+    let (factory, _cache) = load_factory(&raw_float_wasm_path()).await;
+    let normalizer = factory
+        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .unwrap();
+    for (selector, category) in NON_FINITE_FLOAT_CASES {
+        let mut resources = provider_resources(vec![
+            Resource::with_provider("mock", "test.resource", "finite", None),
+            Resource::with_provider("mock", "test.resource", selector, None),
+        ]);
+        let before = resources.clone();
+        let error = normalizer
+            .normalize_desired(&mut resources)
+            .await
+            .unwrap_err();
+        assert_raw_float_cause(&error, category, "normalize_desired");
+        assert_eq!(resources, before);
+        let id = ResourceId::with_provider_identity("mock", "test.resource", selector, None);
+        let mut states = HashMap::from([(
+            id.clone(),
+            SnapshotState::existing(id.clone(), HashMap::new()),
+        )]);
+        let before = states.clone();
+        let error = normalize_provider_states(normalizer.as_ref(), &mut states)
+            .await
+            .unwrap_err();
+        assert_raw_float_cause(&error, category, "normalize_state");
+        assert_eq!(states, before);
+        let saved = lifted_saved_attrs([(id.clone(), HashMap::new())]);
+        let error = hydrate_provider_states(
+            normalizer.as_ref(),
+            &mut states,
+            saved.as_provider_saved_attrs(),
+        )
+        .await
+        .unwrap_err();
+        assert_raw_float_cause(&error, category, "hydrate_read_state");
+        assert_eq!(states, before);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_data_source_floats_retain_resource_operation_and_constructor_source() {
+    let (factory, _cache) = load_factory(&raw_float_wasm_path()).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .unwrap();
+    for (selector, category) in NON_FINITE_FLOAT_CASES {
+        let resource = DataSource::with_provider("mock", "test.data_source", selector, None);
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = carina_core::schema::SchemaRegistry::new();
+        carina_core::validation::deferred_types::with_session_for_test_async(
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+            async |type_checks| {
+                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                let resource = carina_core::executor::prepare_provider_ready_data_source(
+                    resource,
+                    &preparation,
+                )
+                .unwrap();
+                let error = provider
+                    .provider()
+                    .read_data_source(&resource)
+                    .await
+                    .unwrap_err();
+                assert_raw_float_cause(&error, category, "read_data_source");
+                assert!(error.detail().resource_id.is_some());
+            },
+        )
+        .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_create_float_decode_failure_preserves_the_reported_identifier() {
+    let (factory, _cache) = load_factory(&raw_float_wasm_path()).await;
+    let provider = factory
+        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .await
+        .unwrap();
+    let resource = Resource::with_provider("mock", "test.resource", "raw-create", None);
+    let id = resource.id.clone();
+    let failure = provider
+        .provider()
+        .create_for_test(&id, create_request_for_test(resource).await)
+        .await
+        .unwrap_err()
+        .into_kind();
+    let CreateFailureKind::IdentifierReported { identified, error } = failure else {
+        panic!("an invalid float observation must preserve the provider's reported identifier")
+    };
+    assert_eq!(identified.identifier().as_str(), "raw-created");
+    assert_raw_float_cause(&error, carina_core::NonFiniteFloatError::NaN, "create");
 }

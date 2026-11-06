@@ -22,7 +22,39 @@ pub struct DeferredIfCondition<
     pub(crate) value: Value<P, B>,
     pub(crate) source_file: PathBuf,
     pub(crate) source_line: usize,
-    pub(crate) source_expression: String,
+    pub(crate) source_expression: DiagnosticExpressionText,
+}
+
+/// Diagnostic text can only be produced from a value whose intrinsic secret
+/// boundaries already exist. It has no constructor from authored source.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct DiagnosticExpressionText(String);
+
+impl DiagnosticExpressionText {
+    pub(crate) fn from_value_and_source(
+        value: &Value<ParserPlaceholder, RelativeBindingName>,
+        source: super::retained::DiagnosticSourceText,
+    ) -> Self {
+        if crate::value::contains_secret(value) {
+            Self::of(value)
+        } else {
+            source
+                .into_text()
+                .map_or_else(|| Self::of(value), |text| Self(text.to_string()))
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+    pub(crate) fn of(value: &Value<ParserPlaceholder, RelativeBindingName>) -> Self {
+        Self(match value {
+            Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                ParserPlaceholder::ModuleArgument { name, diagnostic },
+            )) => diagnostic.diagnostic_name().unwrap_or(name).to_string(),
+            _ => crate::value::format_value(value),
+        })
+    }
 }
 
 impl DeferredIfCondition<ParserPlaceholder, RelativeBindingName> {
@@ -32,12 +64,7 @@ impl DeferredIfCondition<ParserPlaceholder, RelativeBindingName> {
         source_file: PathBuf,
         source_line: usize,
     ) -> Self {
-        let source_expression = match &value {
-            Value::Deferred(crate::resource::DeferredValue::Placeholder(
-                ParserPlaceholder::ModuleArgument { name, diagnostic },
-            )) => diagnostic.diagnostic_name().unwrap_or(name).to_string(),
-            _ => crate::value::format_value(&value),
-        };
+        let source_expression = DiagnosticExpressionText::of(&value);
         Self::new_with_source_expression(value, source_file, source_line, source_expression)
     }
 }
@@ -47,7 +74,7 @@ impl<P: ValueKind, B: BindingAddress> DeferredIfCondition<P, B> {
         value: Value<P, B>,
         source_file: PathBuf,
         source_line: usize,
-        source_expression: String,
+        source_expression: DiagnosticExpressionText,
     ) -> Self {
         Self {
             value,
@@ -70,7 +97,7 @@ impl<P: ValueKind, B: BindingAddress> DeferredIfCondition<P, B> {
     }
 
     pub fn source_expression(&self) -> &str {
-        &self.source_expression
+        &self.source_expression.0
     }
 }
 

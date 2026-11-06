@@ -745,9 +745,9 @@ fn typed_ref_secret_constraint_error_does_not_leak_value() {
     ] {
         let result = apply_unknown_output(
             "  x = producer.typed_out",
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::String(secret.into()),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(secret.into()))).into(),
+            )),
         );
         let error = result.failures()[0].to_string();
         assert!(error.contains("'x'") && error.contains(reason), "{error}");

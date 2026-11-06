@@ -25,6 +25,18 @@ pub(crate) use directive_expr::Substituted;
 mod enum_value;
 mod ignore_changes;
 mod loop_origin;
+mod reference_visit;
+mod secret_diagnostic;
+mod secret_payload;
+pub(crate) use reference_visit::ScopedResourceOrigin;
+pub use reference_visit::{
+    DependencyKey, DependencyResourceRef, ScopedBindingRef, ScopedResourceRef,
+};
+pub use secret_diagnostic::{
+    DiagnosticPath, DiagnosticScope, INSIDE_SECRET_MESSAGE, InsideSecret, SecretDiagnosticError,
+};
+pub(crate) use secret_payload::SealedSecretReadResult;
+pub use secret_payload::{SecretPayload, SecretReadResult};
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -2294,34 +2306,6 @@ impl<'a, B: BindingAddress> From<&'a ReferencePath<B>> for ReferencePathRef<'a, 
     }
 }
 
-/// Peel `Value::Secret` wrappers, returning the inner value and the
-/// number of layers peeled. Pair with [`rewrap_secrets`] so dot-form /
-/// subscript access can descend into a secret container and re-tag the
-/// leaf (#2439; plan-display redaction depends on the tag). Single
-/// source of truth for the secret-tunnel discipline, shared by
-/// `resolver::resolve_ref_value` and [`navigate_value_path`].
-pub(crate) fn peel_secrets<P: ValueKind, B: BindingAddress>(
-    mut value: Value<P, B>,
-) -> (Value<P, B>, usize) {
-    let mut depth = 0;
-    while let Value::Deferred(DeferredValue::Secret(inner)) = value {
-        value = *inner;
-        depth += 1;
-    }
-    (value, depth)
-}
-
-/// Re-wrap `value` in `depth` layers of `Value::Secret`. Inverse of
-/// [`peel_secrets`].
-pub(crate) fn rewrap_secrets<P: ValueKind, B: BindingAddress>(
-    value: Value<P, B>,
-    depth: usize,
-) -> Value<P, B> {
-    (0..depth).fold(value, |acc, _| {
-        Value::Deferred(DeferredValue::Secret(Box::new(acc)))
-    })
-}
-
 /// Failure to apply one [`PathSegment`] to a value whose shape is already
 /// known. Deferred bases are not errors: [`apply_value_path_segment`] retains
 /// them as [`DeferredValue::Access`] until resolution makes their shape
@@ -2551,6 +2535,22 @@ fn deferred_access<P: ValueKind, B: BindingAddress>(
     }))
 }
 
+struct SecretSelectionError {
+    error: ValueAccessError,
+    deferred_miss: bool,
+}
+
+impl InsideSecret for SecretSelectionError {
+    fn inside_secret(mut self) -> Self {
+        match &mut self.error {
+            ValueAccessError::MissingField { available, .. }
+            | ValueAccessError::MissingKey { available, .. } => *available = None,
+            ValueAccessError::IndexOutOfRange { .. } | ValueAccessError::WrongShape { .. } => {}
+        }
+        self
+    }
+}
+
 fn handle_access_miss<P: ValueKind, B: BindingAddress>(
     miss_policy: AccessMissPolicy,
     miss: ValueAccessMiss,
@@ -2574,16 +2574,51 @@ pub(crate) fn apply_value_path_segment<P: ValueKind, B: BindingAddress>(
     source_line: usize,
     miss_policy: AccessMissPolicy,
 ) -> Result<ValuePathSegmentResult<P, B>, ValueAccessError> {
-    let (peeled, secret_depth) = peel_secrets(base);
-    let selected = match peeled {
+    if let Value::Deferred(DeferredValue::Secret(payload)) = &base {
+        let mut deferred = false;
+        let selected = payload.try_map(|value| {
+            match apply_value_path_segment(value.clone(), step, source_line, miss_policy).map_err(
+                |error| SecretSelectionError {
+                    error,
+                    deferred_miss: false,
+                },
+            )? {
+                ValuePathSegmentResult::Resolved(value) => Ok(value),
+                ValuePathSegmentResult::Deferred(value) => {
+                    deferred = true;
+                    Ok(value)
+                }
+                ValuePathSegmentResult::DeferredMiss(error) => Err(SecretSelectionError {
+                    error,
+                    deferred_miss: true,
+                }),
+            }
+        });
+        return match selected {
+            Ok(payload) => {
+                let value = Value::Deferred(DeferredValue::Secret(payload));
+                Ok(if deferred {
+                    ValuePathSegmentResult::Deferred(value)
+                } else {
+                    ValuePathSegmentResult::Resolved(value)
+                })
+            }
+            Err(SecretSelectionError {
+                error,
+                deferred_miss: true,
+            }) => Ok(ValuePathSegmentResult::DeferredMiss(error)),
+            Err(SecretSelectionError {
+                error,
+                deferred_miss: false,
+            }) => Err(error),
+        };
+    }
+    let selected = match base {
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             let reference = Value::Deferred(DeferredValue::ResourceRef {
                 path: path.with_appended_segment(step),
             });
-            return Ok(ValuePathSegmentResult::Deferred(rewrap_secrets(
-                reference,
-                secret_depth,
-            )));
+            return Ok(ValuePathSegmentResult::Deferred(reference));
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
             let reference = match step {
@@ -2601,13 +2636,10 @@ pub(crate) fn apply_value_path_segment<P: ValueKind, B: BindingAddress>(
                     binding: binding_with_map_key(&binding, &key),
                 }),
             };
-            return Ok(ValuePathSegmentResult::Deferred(rewrap_secrets(
-                reference,
-                secret_depth,
-            )));
+            return Ok(ValuePathSegmentResult::Deferred(reference));
         }
         Value::Deferred(deferred) => {
-            let base = rewrap_secrets(Value::Deferred(deferred), secret_depth);
+            let base = Value::Deferred(deferred);
             return Ok(ValuePathSegmentResult::Deferred(deferred_access(
                 base,
                 step,
@@ -2653,7 +2685,7 @@ pub(crate) fn apply_value_path_segment<P: ValueKind, B: BindingAddress>(
             }
         },
         Value::Concrete(ConcreteValue::Map(map)) => {
-            let available = (secret_depth == 0).then(|| map.keys().cloned().collect());
+            let available = Some(map.keys().cloned().collect());
             let len = map.len();
             match &step {
                 PathSegment::Field { name } => match map.get(name).cloned() {
@@ -2697,10 +2729,7 @@ pub(crate) fn apply_value_path_segment<P: ValueKind, B: BindingAddress>(
         }
     };
 
-    Ok(ValuePathSegmentResult::Resolved(rewrap_secrets(
-        selected,
-        secret_depth,
-    )))
+    Ok(ValuePathSegmentResult::Resolved(selected))
 }
 
 /// Construct one postfix access through the canonical access seam.
@@ -2767,14 +2796,21 @@ pub fn navigate_value_path<P: ValueKind, B: BindingAddress>(
     root: &Value<P, B>,
     path: &AccessPath<B>,
 ) -> Option<Value<P, B>> {
-    // The `attribute` head is the first hop: `root` is the loop
-    // element, `root[attribute]` is the first navigated value.
-    let (peeled_root, root_secret) = peel_secrets(root.clone());
-    let Value::Concrete(ConcreteValue::Map(root_map)) = &peeled_root else {
-        return None;
+    let mut current = match apply_value_path_segment(
+        root.clone(),
+        PathSegment::Field {
+            name: path.attribute().into(),
+        },
+        0,
+        AccessMissPolicy::Error,
+    )
+    .ok()?
+    {
+        ValuePathSegmentResult::Resolved(value) => value,
+        ValuePathSegmentResult::Deferred(_) | ValuePathSegmentResult::DeferredMiss(_) => {
+            return None;
+        }
     };
-    let mut current = rewrap_secrets(root_map.get(path.attribute())?.clone(), root_secret);
-
     for segment in path.segments() {
         current =
             match apply_value_path_segment(current, segment.clone(), 0, AccessMissPolicy::Error)
@@ -2786,9 +2822,15 @@ pub fn navigate_value_path<P: ValueKind, B: BindingAddress>(
                 }
             };
     }
+    value_has_concrete_root(&current).then_some(current)
+}
 
-    let (peeled, _) = peel_secrets(current.clone());
-    matches!(peeled, Value::Concrete(_)).then_some(current)
+fn value_has_concrete_root<P: ValueKind, B: BindingAddress>(value: &Value<P, B>) -> bool {
+    match value {
+        Value::Concrete(_) => true,
+        Value::Deferred(DeferredValue::Secret(payload)) => payload.visit(value_has_concrete_root),
+        Value::Deferred(_) => false,
+    }
 }
 
 /// Serde adapter that maps `std::time::Duration` ↔ integer seconds.
@@ -2865,7 +2907,7 @@ impl ValueString {
 
     /// Construct a string whose contents must never be included in a
     /// diagnostic. Kept crate-private so only trusted value producers (`env()`
-    /// and the builtin dispatcher while computing through `Secret`) can attach
+    /// and secret payload construction) can attach
     /// the provenance mark.
     pub(crate) fn diagnostic_sensitive(plaintext: impl Into<String>) -> Self {
         Self {
@@ -3006,6 +3048,10 @@ impl<'de> Deserialize<'de> for ValueString {
 
 /// Concrete-axis variants: values that carry their own runtime type
 /// and are safe to type-check at validate time.
+/// Non-finite raw floats cannot be used as a value payload.
+/// ```compile_fail,E0308
+/// let _: carina_core::resource::ExpandedConcreteValue = carina_core::resource::ConcreteValue::Float(f64::NAN);
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ConcreteValue<P: ValueKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     String(ValueString),
@@ -3020,7 +3066,7 @@ pub enum ConcreteValue<P: ValueKind = NoPlaceholder, B: BindingAddress = Absolut
     EnumIdentifier(RawEnumIdentifier),
     CanonicalEnum(CanonicalEnumValue),
     Int(i64),
-    Float(f64),
+    Float(carina_provider_protocol::FiniteF64),
     Bool(bool),
     /// Time duration carried as `std::time::Duration`.
     ///
@@ -3312,6 +3358,13 @@ impl<P: ValueKind, B: BindingAddress> FunctionArgument<P, B> {
         self.operand.value()
     }
 
+    pub(crate) fn into_value(self) -> Option<Value<P, B>> {
+        match self.operand {
+            StructuralOperand::Value { value, .. } => Some(value),
+            _ => None,
+        }
+    }
+
     pub(crate) fn handle(&self) -> Option<&crate::eval_value::UnexpandedStructuralHandle<B>> {
         self.operand.handle()
     }
@@ -3357,8 +3410,8 @@ impl<P: ValueKind, B: BindingAddress> FunctionArgument<P, B> {
         Ok(Self { operand })
     }
 
-    pub(crate) fn try_into_expanded(self) -> Result<FunctionArgument<NoPlaceholder, B>, P> {
-        let mut reject = |placeholder| Err(placeholder);
+    pub(crate) fn try_into_expanded(self) -> Result<FunctionArgument<NoPlaceholder, B>, ()> {
+        let mut reject = |_placeholder| Err(());
         let operand = self
             .operand
             .try_map_stage(&mut |value| value.try_map_placeholder(&mut reject))?;
@@ -3789,21 +3842,36 @@ impl Hash for ModuleArgumentDiagnostic {
 /// attaching arbitrary, potentially sensitive payloads to an unavailable
 /// value.
 #[derive(Clone, PartialEq, Eq, Hash)]
-pub struct UnavailableReason(String);
+pub struct UnavailableReason(UnavailableFailure);
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum UnavailableFailure {
+    Builtin(String),
+    InsideSecret,
+}
 
 impl UnavailableReason {
     pub(crate) fn from_builtin_error(message: String) -> Self {
-        Self(message)
+        Self(UnavailableFailure::Builtin(message))
+    }
+
+    pub(crate) fn inside_secret() -> Self {
+        Self(UnavailableFailure::InsideSecret)
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        match &self.0 {
+            UnavailableFailure::Builtin(message) => message,
+            UnavailableFailure::InsideSecret => INSIDE_SECRET_MESSAGE,
+        }
     }
 }
 
 impl fmt::Debug for UnavailableReason {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("UnavailableReason").field(&self.0).finish()
+        f.debug_tuple("UnavailableReason")
+            .field(&self.as_str())
+            .finish()
     }
 }
 
@@ -3877,7 +3945,7 @@ pub enum DeferredValue<P: ValueKind = NoPlaceholder, B: BindingAddress = Absolut
     Access(AccessExpr<P, B>),
     /// A secret value. The inner value is sent to the provider but
     /// stored as an Argon2id hash in state.
-    Secret(Box<Value<P, B>>),
+    Secret(SecretPayload<P, B>),
     /// A value not known at plan time. RFC #2371.
     Unknown(ApplyTimeUnknown<B>),
     /// A stage-specific slot that must be consumed at its phase boundary.
@@ -4075,7 +4143,43 @@ impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
     }
 }
 
+/// Compute through top-level secret arguments while owning both boundary directions.
+/// Nested element annotations retain their ordinary collection semantics.
+pub(crate) fn with_secret_values<P: ValueKind, B: BindingAddress, E: InsideSecret>(
+    values: impl IntoIterator<Item = Value<P, B>>,
+    compute: impl FnOnce(Vec<Value<P, B>>) -> Result<Value<P, B>, E>,
+) -> Result<Value<P, B>, E> {
+    let mut scope = DiagnosticScope::Public;
+    let values = values
+        .into_iter()
+        .map(|mut value| {
+            while let Value::Deferred(DeferredValue::Secret(payload)) = value {
+                scope = DiagnosticScope::Secret;
+                value = payload.expose_plaintext().clone();
+            }
+            value
+        })
+        .collect();
+    compute(values)
+        .map(|value| {
+            if scope.is_secret() {
+                value.into_secret()
+            } else {
+                value
+            }
+        })
+        .map_err(|error| scope.protect_error(error))
+}
+
 impl<P: ValueKind, B: BindingAddress> Value<P, B> {
+    /// Preserve sensitivity while normalizing an intrinsic or evaluated wrapper.
+    pub(crate) fn into_secret(self) -> Self {
+        match self {
+            secret @ Self::Deferred(DeferredValue::Secret(_)) => secret,
+            value => Self::Deferred(DeferredValue::Secret(Box::new(value).into())),
+        }
+    }
+
     /// Whether this value is the one syntactic shape for which `??` may
     /// interpret a missing selection as absence: a direct reference, or an
     /// access chain whose base is itself a direct reference.
@@ -4111,11 +4215,11 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
     /// so dependency and diagnostic callers cannot drift.
     pub fn root_bindings(&self) -> std::collections::BTreeSet<B> {
         let mut roots = std::collections::BTreeSet::new();
-        self.visit_resource_refs(&mut |path| {
-            roots.insert(path.binding_address().clone());
+        self.visit_resource_refs(&mut |path, _usage| {
+            path.binding_key().record_graph_key(&mut roots);
         });
         self.visit_binding_refs(&mut |binding| {
-            roots.insert(binding.clone());
+            binding.record_graph_key(&mut roots);
         });
         roots
     }
@@ -4128,9 +4232,9 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         binding: &B,
     ) -> Option<(Option<std::path::PathBuf>, usize)> {
         let mut source = None;
-        self.visit_resource_refs(&mut |path| {
-            if source.is_none() && path.binding_address() == binding {
-                source = path.diagnostic_source_owned();
+        self.visit_resource_refs(&mut |path, _usage| {
+            if source.is_none() && path.binding_key().matches(binding) {
+                source = path.source();
             }
         });
         source
@@ -4148,7 +4252,9 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             Value::Concrete(ConcreteValue::Map(values)) => {
                 values.values().all(Value::is_fully_resolved)
             }
-            Value::Deferred(DeferredValue::Secret(inner)) => inner.is_fully_resolved(),
+            Value::Deferred(DeferredValue::Secret(inner)) => {
+                inner.visit(|secret_value| secret_value.is_fully_resolved())
+            }
             Value::Concrete(
                 ConcreteValue::String(_)
                 | ConcreteValue::EnumIdentifier(_)
@@ -4193,7 +4299,13 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 ));
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
-                **inner = inner.clone().with_reference_locations(locations);
+                *inner = inner
+                    .try_map(|value| {
+                        Ok::<_, std::convert::Infallible>(
+                            value.clone().with_reference_locations(locations),
+                        )
+                    })
+                    .unwrap();
             }
             _ => {}
         }
@@ -4370,13 +4482,13 @@ where
             Interpolation(Vec<InterpolationPart<P, B>>),
             FunctionCall {
                 name: String,
-                args: Vec<FunctionArgument<P, B>>,
+                args: serde_json::Value,
             },
             Access {
                 base: Box<Value<P, B>>,
                 step: PathSegment,
             },
-            Secret(Box<Value<P, B>>),
+            Secret(serde_json::Value),
             RedactedSecret {
                 hash: RedactedSecretHash,
             },
@@ -4398,6 +4510,9 @@ where
                 let name = crate::builtins::BuiltinFunction::from_name(&name).ok_or_else(|| {
                     serde::de::Error::custom(format!("unknown built-in function '{name}'"))
                 })?;
+                // Validate the sealed call identity before decoding any argument.
+                let args = Vec::<FunctionArgument<P, B>>::deserialize(args)
+                    .map_err(serde::de::Error::custom)?;
                 Ok(Self::FunctionCall {
                     name,
                     args,
@@ -4414,7 +4529,11 @@ where
                     )),
                 }
             }
-            DeserializableDeferredValue::Secret(inner) => Ok(Self::Secret(inner)),
+            DeserializableDeferredValue::Secret(inner) => {
+                let inner = Value::<P, B>::deserialize(inner)
+                    .map_err(|_| serde::de::Error::custom(INSIDE_SECRET_MESSAGE))?;
+                Ok(Self::Secret(Box::new(inner).into()))
+            }
             DeserializableDeferredValue::RedactedSecret { hash } => P::from_redacted_secret(hash)
                 .map(Self::Placeholder)
                 .map_err(serde::de::Error::custom),
@@ -4456,7 +4575,7 @@ where
             EnumIdentifier(RawEnumIdentifier),
             CanonicalEnum(CanonicalEnumValue),
             Int(i64),
-            Float(f64),
+            Float(carina_provider_protocol::FiniteF64),
             Bool(bool),
             #[serde(with = "duration_secs")]
             Duration(std::time::Duration),
@@ -4477,13 +4596,13 @@ where
             Interpolation(Vec<InterpolationPart<P, B>>),
             FunctionCall {
                 name: String,
-                args: Vec<FunctionArgument<P, B>>,
+                args: serde_json::Value,
             },
             Access {
                 base: Box<Value<P, B>>,
                 step: PathSegment,
             },
-            Secret(Box<Value<P, B>>),
+            Secret(serde_json::Value),
             RedactedSecret {
                 hash: RedactedSecretHash,
             },
@@ -4527,6 +4646,8 @@ where
                 let name = crate::builtins::BuiltinFunction::from_name(&name).ok_or_else(|| {
                     serde::de::Error::custom(format!("unknown built-in function '{name}'"))
                 })?;
+                let args = Vec::<FunctionArgument<P, B>>::deserialize(args)
+                    .map_err(serde::de::Error::custom)?;
                 Value::Deferred(DeferredValue::FunctionCall {
                     name,
                     args,
@@ -4543,7 +4664,11 @@ where
                 }
                 value
             }
-            DeserializableValue::Secret(value) => Value::Deferred(DeferredValue::Secret(value)),
+            DeserializableValue::Secret(value) => {
+                let inner = Value::<P, B>::deserialize(value)
+                    .map_err(|_| serde::de::Error::custom(INSIDE_SECRET_MESSAGE))?;
+                Value::Deferred(DeferredValue::Secret(Box::new(inner).into()))
+            }
             DeserializableValue::RedactedSecret { hash } => {
                 Value::Deferred(DeferredValue::Placeholder(
                     P::from_redacted_secret(hash).map_err(serde::de::Error::custom)?,
@@ -4629,7 +4754,7 @@ impl<P: ValueKind + fmt::Debug, B: BindingAddress> fmt::Debug for DeferredValue<
                 .field("source_line", &access.source_line())
                 .field("display_root", &access.display_root())
                 .finish(),
-            Self::Secret(_) => f.write_str("Secret((secret))"),
+            Self::Secret(_) => write!(f, "Secret({})", crate::schema::SECRET_VALUE_MASK),
             Self::Unknown(reason) => f.debug_tuple("Unknown").field(reason).finish(),
             Self::Placeholder(placeholder) => {
                 f.debug_tuple("Placeholder").field(placeholder).finish()
@@ -4683,18 +4808,13 @@ impl RedactedSecretHash {
 
     /// Reuse a matching self-contained digest or generate a fresh PHC digest.
     /// Legacy hashes are verification-only and are always upgraded on write.
-    pub(crate) fn reuse_or_generate<P: PlaceholderKind>(
-        plaintext: &Value<P>,
-        previous: Option<&Self>,
-    ) -> Result<Self, crate::value::SerializationError> {
+    pub(crate) fn reuse_or_generate(material: &[u8], previous: Option<&Self>) -> Self {
         if let Some(previous @ Self(RedactedSecretHashKind::Argon2idPhc { .. })) = previous
-            && SnapshotValue::<P>::redacted(previous.clone()).verify_secret(plaintext)?
+            && previous.verify(material)
         {
-            return Ok(previous.clone());
+            return previous.clone();
         }
-        Ok(Self::generate(
-            &crate::value::canonical_secret_hash_material(plaintext)?,
-        ))
+        Self::generate(material)
     }
 
     /// Verify a candidate against this typed digest.
@@ -5368,7 +5488,7 @@ pub enum ConcreteValueRef<
     EnumIdentifier(&'a RawEnumIdentifier),
     CanonicalEnum(&'a CanonicalEnumValue),
     Int(i64),
-    Float(f64),
+    Float(carina_provider_protocol::FiniteF64),
     Bool(bool),
     Duration(std::time::Duration),
     List(&'a [Value<P, B>]),
@@ -5454,7 +5574,7 @@ pub enum DeferredValueRef<
         step: &'a PathSegment,
         source_line: usize,
     },
-    Secret(&'a Value<P, B>),
+    Secret(&'a SecretPayload<P, B>),
     Unknown(&'a ApplyTimeUnknown<B>),
     Placeholder(&'a P),
 }
@@ -5511,7 +5631,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                     || expression.rhs().contains_diagnostic_sensitive_string()
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
-                inner.contains_diagnostic_sensitive_string()
+                inner.visit(|secret_value| secret_value.contains_diagnostic_sensitive_string())
             }
             Value::Concrete(
                 ConcreteValue::EnumIdentifier(_)
@@ -5790,7 +5910,8 @@ pub enum ApplyTimeUnknown<B: BindingAddress = AbsoluteBindingAddress> {
 /// transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeftoverPlaceholder {
-    placeholder: ParserPlaceholder,
+    placeholder: SecretDiagnosticError<Box<ParserPlaceholder>>,
+    location: Option<Box<crate::parser::DeclarationLocation>>,
     context: LeftoverPlaceholderContext,
 }
 
@@ -5806,7 +5927,11 @@ struct LocatedLeftoverPlaceholder<'a>(&'a LeftoverPlaceholder);
 
 impl fmt::Display for LocatedLeftoverPlaceholder<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some((source_file, range)) = self.0.placeholder.authored_location() {
+        if let Some((source_file, range)) = self
+            .0
+            .placeholder()
+            .and_then(ParserPlaceholder::authored_location)
+        {
             write!(
                 formatter,
                 "{}:{}:{}: ",
@@ -5960,7 +6085,23 @@ impl fmt::Display for LeftoverPlaceholderContext {
     }
 }
 
+impl InsideSecret for LeftoverPlaceholder {
+    fn inside_secret(mut self) -> Self {
+        self.placeholder = SecretDiagnosticError::InsideSecret;
+        self
+    }
+}
+
 impl LeftoverPlaceholder {
+    fn new(placeholder: ParserPlaceholder, context: LeftoverPlaceholderContext) -> Self {
+        let location = placeholder.declaration_location().cloned().map(Box::new);
+        Self {
+            placeholder: SecretDiagnosticError::Public(Box::new(placeholder)),
+            location,
+            context,
+        }
+    }
+
     /// Render this error with its authored source location when one is known.
     pub fn located(&self) -> impl fmt::Display + '_ {
         LocatedLeftoverPlaceholder(self)
@@ -5970,7 +6111,7 @@ impl LeftoverPlaceholder {
     pub fn diagnostic(
         &self,
     ) -> Result<crate::parser::Located<&Self>, crate::parser::AnalysisTreeError> {
-        let location = self.placeholder.declaration_location().ok_or_else(|| {
+        let location = self.location.as_deref().ok_or_else(|| {
             crate::parser::AnalysisTreeError::new(
                 crate::parser::AnalysisTreeErrorKind::MissingSyntaxProvenance {
                     element: self.to_string(),
@@ -5980,8 +6121,11 @@ impl LeftoverPlaceholder {
         Ok(crate::parser::Located::new(location.clone(), self))
     }
 
-    pub fn placeholder(&self) -> &ParserPlaceholder {
-        &self.placeholder
+    pub fn placeholder(&self) -> Option<&ParserPlaceholder> {
+        match &self.placeholder {
+            SecretDiagnosticError::Public(placeholder) => Some(placeholder.as_ref()),
+            SecretDiagnosticError::InsideSecret => None,
+        }
     }
 
     pub(crate) fn in_resource_attribute(
@@ -6395,9 +6539,13 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                         .collect::<Option<IndexMap<_, _>>>()?,
                 ),
             })),
-            Value::Deferred(DeferredValue::Secret(value)) => Some(Value::Deferred(
-                DeferredValue::Secret(Box::new(value.try_into_address_free_absolute()?)),
-            )),
+            Value::Deferred(DeferredValue::Secret(value)) => {
+                Some(Value::Deferred(DeferredValue::Secret(
+                    value
+                        .try_map(|value| value.clone().try_into_address_free_absolute().ok_or(()))
+                        .ok()?,
+                )))
+            }
             Value::Deferred(
                 DeferredValue::ModuleIf(_)
                 | DeferredValue::ResourceRef { path: _ }
@@ -6434,36 +6582,44 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
 
     pub(crate) fn references_loop_slot(&self) -> bool {
         let mut found = false;
-        self.visit_placeholders(&mut |placeholder| found |= placeholder.loop_slot().is_some());
+        self.visit_placeholders(&mut |placeholder, _| found |= placeholder.loop_slot().is_some());
         found
     }
 
-    pub(crate) fn visit_placeholders(&self, visitor: &mut impl FnMut(&P)) {
+    pub(crate) fn visit_placeholders(&self, visitor: &mut impl FnMut(&P, DiagnosticScope)) {
+        self.visit_placeholders_in_scope(DiagnosticScope::Public, visitor);
+    }
+
+    fn visit_placeholders_in_scope(
+        &self,
+        scope: DiagnosticScope,
+        visitor: &mut impl FnMut(&P, DiagnosticScope),
+    ) {
         match self {
-            Value::Deferred(DeferredValue::Placeholder(placeholder)) => visitor(placeholder),
+            Value::Deferred(DeferredValue::Placeholder(placeholder)) => visitor(placeholder, scope),
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
                 for value in deferred.values() {
-                    value.visit_placeholders(visitor);
+                    value.visit_placeholders_in_scope(scope, visitor);
                 }
             }
             Value::Concrete(ConcreteValue::List(values)) => {
                 for value in values {
-                    value.visit_placeholders(visitor);
+                    value.visit_placeholders_in_scope(scope, visitor);
                 }
             }
             Value::Concrete(ConcreteValue::Map(values)) => {
                 for value in values.values() {
-                    value.visit_placeholders(visitor);
+                    value.visit_placeholders_in_scope(scope, visitor);
                 }
             }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-                value.visit_placeholders(visitor);
-                default.visit_placeholders(visitor);
+                value.visit_placeholders_in_scope(scope, visitor);
+                default.visit_placeholders_in_scope(scope, visitor);
             }
             Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 for part in parts {
                     if let InterpolationPart::Expr(value) = part {
-                        value.visit_placeholders(visitor);
+                        value.visit_placeholders_in_scope(scope, visitor);
                     }
                 }
             }
@@ -6474,19 +6630,21 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             ) => {
                 for argument in args {
                     argument.operand.visit_values(&mut |value| {
-                        value.visit_placeholders(visitor);
+                        value.visit_placeholders_in_scope(scope, visitor);
                     });
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
-                access.base().visit_placeholders(visitor);
+                access.base().visit_placeholders_in_scope(scope, visitor);
             }
             Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-                expression.lhs().visit_placeholders(visitor);
-                expression.rhs().visit_placeholders(visitor);
+                expression.lhs().visit_placeholders_in_scope(scope, visitor);
+                expression.rhs().visit_placeholders_in_scope(scope, visitor);
             }
             Value::Deferred(DeferredValue::Secret(value)) => {
-                value.visit_placeholders(visitor);
+                value.visit_plaintext_reference_inventory(|value, scope| {
+                    value.visit_placeholders_in_scope(scope, visitor)
+                });
             }
             Value::Concrete(
                 ConcreteValue::String(_)
@@ -6506,7 +6664,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         }
     }
 
-    pub(crate) fn try_map_placeholder<Q: ValueKind, E>(
+    pub(crate) fn try_map_placeholder<Q: ValueKind, E: InsideSecret>(
         self,
         map: &mut dyn FnMut(P) -> Result<Value<Q, B>, E>,
     ) -> Result<Value<Q, B>, E> {
@@ -6641,7 +6799,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 }))
             }
             Self::Deferred(DeferredValue::Secret(value)) => Value::Deferred(DeferredValue::Secret(
-                Box::new(value.try_map_placeholder(map)?),
+                value.try_map(|value| value.clone().try_map_placeholder(map))?,
             )),
             Self::Deferred(DeferredValue::Unknown(reason)) => {
                 Value::Deferred(DeferredValue::Unknown(reason))
@@ -6667,7 +6825,7 @@ impl<B: BindingAddress> Value<ParserPlaceholder, B> {
         policy: LeftoverPlaceholderPolicy,
         errors: &mut Vec<LeftoverPlaceholder>,
     ) {
-        self.visit_placeholders(&mut |placeholder| {
+        self.visit_placeholders(&mut |placeholder, scope| {
             let allowed = match placeholder {
                 ParserPlaceholder::Loop(_) => {
                     policy.loop_slots == LoopPlaceholderPolicy::AllowInDeferredTemplate
@@ -6682,29 +6840,29 @@ impl<B: BindingAddress> Value<ParserPlaceholder, B> {
             if allowed {
                 return;
             }
-            errors.push(LeftoverPlaceholder {
-                placeholder: placeholder.clone(),
-                context: context.clone(),
-            });
+            errors.push(scope.protect_error(LeftoverPlaceholder::new(
+                placeholder.clone(),
+                context.clone(),
+            )));
         });
     }
 
     pub fn into_expanded(self) -> Result<Value<NoPlaceholder, B>, LeftoverPlaceholder> {
         self.try_map_placeholder(&mut |placeholder| {
-            Err(LeftoverPlaceholder {
+            Err(LeftoverPlaceholder::new(
                 placeholder,
-                context: LeftoverPlaceholderContext::Value,
-            })
+                LeftoverPlaceholderContext::Value,
+            ))
         })
     }
 
     pub(crate) fn into_loop_template(self) -> Result<Value<LoopSlot, B>, LeftoverPlaceholder> {
         self.try_map_placeholder(&mut |placeholder| match placeholder {
             ParserPlaceholder::Loop(slot) => Ok(Value::Deferred(DeferredValue::Placeholder(slot))),
-            placeholder => Err(LeftoverPlaceholder {
+            placeholder => Err(LeftoverPlaceholder::new(
                 placeholder,
-                context: LeftoverPlaceholderContext::Value,
-            }),
+                LeftoverPlaceholderContext::Value,
+            )),
         })
     }
 }
@@ -7003,9 +7161,13 @@ impl<P: ValueKind, B: BindingAddress> DeferredValue<P, B> {
                     reference,
                 })
             }
-            DeferredValue::Secret(value) => {
-                DeferredValue::Secret(Box::new(value.map_bindings(map)))
-            }
+            DeferredValue::Secret(value) => DeferredValue::Secret(
+                value
+                    .try_map(|value| {
+                        Ok::<_, std::convert::Infallible>(value.clone().map_bindings(map))
+                    })
+                    .unwrap(),
+            ),
             DeferredValue::Unknown(reason) => DeferredValue::Unknown(reason.map_bindings(map)),
             DeferredValue::Placeholder(placeholder) => DeferredValue::Placeholder(placeholder),
         }
@@ -7213,7 +7375,7 @@ fn canonicalize_interpolation<P: PlaceholderKind, B: BindingAddress>(
         Value::Deferred(DeferredValue::Interpolation(merged))
     };
     if contains_folded_secret {
-        Value::Deferred(DeferredValue::Secret(Box::new(value)))
+        Value::Deferred(DeferredValue::Secret(Box::new(value).into()))
     } else {
         value
     }
@@ -7234,10 +7396,22 @@ fn value_into_literal<P: ValueKind, B: BindingAddress>(
         Value::Concrete(ConcreteValue::Int(n)) => Ok((n.to_string().into(), false)),
         Value::Concrete(ConcreteValue::Float(f)) => Ok((f.to_string().into(), false)),
         Value::Concrete(ConcreteValue::Bool(b)) => Ok((b.to_string().into(), false)),
-        Value::Deferred(DeferredValue::Secret(inner)) => match value_into_literal(*inner) {
-            Ok((literal, _)) => Ok((literal, true)),
-            Err(inner) => Err(Value::Deferred(DeferredValue::Secret(Box::new(inner)))),
-        },
+        secret @ Value::Deferred(DeferredValue::Secret(_)) => {
+            let Value::Deferred(DeferredValue::Secret(payload)) = &secret else {
+                unreachable!()
+            };
+            let literal = payload
+                .try_project_plaintext(|value| {
+                    value_into_literal(value.clone())
+                        .map(|(text, _)| text)
+                        .map_err(|_| ())
+                })
+                .ok();
+            match literal {
+                Some(text) => Ok((text, true)),
+                None => Err(secret),
+            }
+        }
         other => Err(other),
     }
 }
@@ -7301,7 +7475,15 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                     v.canonicalize_in_place();
                 }
             }
-            Value::Deferred(DeferredValue::Secret(inner)) => inner.canonicalize_in_place(),
+            Value::Deferred(DeferredValue::Secret(inner)) => {
+                *inner = inner
+                    .try_map(|value| {
+                        let mut value = value.clone();
+                        value.canonicalize_in_place();
+                        Ok::<_, std::convert::Infallible>(value)
+                    })
+                    .unwrap();
+            }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 value.canonicalize_in_place();
                 default.canonicalize_in_place();
@@ -7375,48 +7557,73 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         }
     }
 
-    /// Recursively walk this value, invoking `f` on each `ResourceRef` access path.
+    /// Walk resource dependency keys, preserving coalesce usage and traversal order.
+    /// Companion: [`Self::visit_binding_refs`] for bare binding dependencies.
     ///
-    /// Companion: `visit_binding_refs` for bare `BindingRef` names. A consumer that
-    /// needs both must call both — drift is visible at the call site.
-    pub fn visit_resource_refs(&self, f: &mut impl FnMut(&AccessPath<B>)) {
-        self.visit_resource_refs_with_usage(&mut |path, _usage| f(path));
-    }
-
-    /// Recursively walk resource references while identifying references whose
-    /// existence is guarded by the left operand of `??`.
+    /// ```compile_fail
+    /// use carina_core::resource::Value;
+    /// fn render(value: &Value) {
+    ///     value.visit_resource_refs(&mut |identity, _| { let _ = identity.to_dot_string(); });
+    /// }
+    /// ```
     ///
-    /// The right operand normally starts a required context. When the whole
-    /// coalesce is itself a left operand, a direct-reference default remains
-    /// optional so `(a ?? b) ?? c` has the same existence semantics as
-    /// `a ?? (b ?? c)`. References nested in computations remain required.
-    pub fn visit_resource_refs_with_usage(
+    /// ```compile_fail
+    /// use carina_core::resource::Value;
+    /// fn render(value: &Value) {
+    ///     value.visit_resource_refs(&mut |identity, _| { let _ = format!("{}", identity.attribute_key()); });
+    /// }
+    /// ```
+    pub fn visit_resource_refs(
         &self,
-        f: &mut impl FnMut(&AccessPath<B>, ResourceRefUsage),
+        f: &mut impl FnMut(DependencyResourceRef<'_, B>, ResourceRefUsage),
     ) {
-        self.visit_resource_refs_with_usage_inner(ResourceRefUsage::Required, f);
+        self.visit_resource_refs_in_scope(
+            ResourceRefUsage::Required,
+            DiagnosticScope::Public,
+            &mut |path, usage, _| f(DependencyResourceRef::new(path), usage),
+        );
     }
 
-    fn visit_resource_refs_with_usage_inner(
+    /// Walk references whose diagnostic spelling is available only through `DiagnosticPath`.
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::Value;
+    /// fn render(value: &Value) {
+    ///     value.visit_resource_refs_for_diagnostics(&mut |reference, _| { let _ = reference.binding_address(); });
+    /// }
+    /// ```
+    pub fn visit_resource_refs_for_diagnostics(
+        &self,
+        f: &mut impl FnMut(ScopedResourceRef<'_, B>, ResourceRefUsage),
+    ) {
+        self.visit_resource_refs_in_scope(
+            ResourceRefUsage::Required,
+            DiagnosticScope::Public,
+            &mut |path, usage, scope| f(ScopedResourceRef::new(path, scope), usage),
+        );
+    }
+
+    fn visit_resource_refs_in_scope(
         &self,
         usage: ResourceRefUsage,
-        f: &mut impl FnMut(&AccessPath<B>, ResourceRefUsage),
+        scope: DiagnosticScope,
+        f: &mut impl FnMut(&AccessPath<B>, ResourceRefUsage, DiagnosticScope),
     ) {
         match self {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
                 deferred.values().into_iter().for_each(|value| {
-                    value.visit_resource_refs_with_usage_inner(usage, f);
+                    value.visit_resource_refs_in_scope(usage, scope, f);
                 });
             }
-            Value::Deferred(DeferredValue::ResourceRef { path }) => f(path, usage),
+            Value::Deferred(DeferredValue::ResourceRef { path }) => f(path, usage, scope),
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
-                    v.visit_resource_refs_with_usage_inner(usage, f);
+                    v.visit_resource_refs_in_scope(usage, scope, f);
                 }
             }
             Value::Concrete(ConcreteValue::Map(map)) => {
                 for v in map.values() {
-                    v.visit_resource_refs_with_usage_inner(usage, f);
+                    v.visit_resource_refs_in_scope(usage, scope, f);
                 }
             }
             Value::Deferred(DeferredValue::Interpolation(parts)) => {
@@ -7424,7 +7631,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                     match part {
                         InterpolationPart::Literal(_) => {}
                         InterpolationPart::Expr(v) => {
-                            v.visit_resource_refs_with_usage_inner(usage, f)
+                            v.visit_resource_refs_in_scope(usage, scope, f)
                         }
                     }
                 }
@@ -7436,11 +7643,11 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             ) => {
                 for arg in args {
                     arg.walker_value()
-                        .visit_resource_refs_with_usage_inner(usage, f);
+                        .visit_resource_refs_in_scope(usage, scope, f);
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
-                access.base().visit_resource_refs_with_usage_inner(usage, f);
+                access.base().visit_resource_refs_in_scope(usage, scope, f);
             }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 let value_usage = if value.is_coalesce_optional_operand() {
@@ -7455,20 +7662,21 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 } else {
                     ResourceRefUsage::Required
                 };
-                value.visit_resource_refs_with_usage_inner(value_usage, f);
-                default.visit_resource_refs_with_usage_inner(default_usage, f);
+                value.visit_resource_refs_in_scope(value_usage, scope, f);
+                default.visit_resource_refs_in_scope(default_usage, scope, f);
             }
             Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
                 expression
                     .lhs()
-                    .visit_resource_refs_with_usage_inner(usage, f);
+                    .visit_resource_refs_in_scope(usage, scope, f);
                 expression
                     .rhs()
-                    .visit_resource_refs_with_usage_inner(usage, f);
+                    .visit_resource_refs_in_scope(usage, scope, f);
             }
-            Value::Deferred(DeferredValue::Secret(inner)) => {
-                inner.visit_resource_refs_with_usage_inner(usage, f)
-            }
+            Value::Deferred(DeferredValue::Secret(inner)) => inner
+                .visit_plaintext_reference_inventory(|value, scope| {
+                    value.visit_resource_refs_in_scope(usage, scope, f)
+                }),
             Value::Concrete(ConcreteValue::String(_))
             | Value::Concrete(ConcreteValue::EnumIdentifier(_))
             | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -7488,34 +7696,59 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         }
     }
 
-    /// Recursively walk this value, invoking `f` on each bare `BindingRef` name.
+    /// Recursively walk bare binding dependency keys.
     ///
-    /// Companion: `visit_resource_refs` for `ResourceRef` access paths. A consumer
+    /// Companion: [`Self::visit_resource_refs`] for resource dependency keys. A consumer
     /// that needs both must call both — drift is visible at the call site.
-    pub fn visit_binding_refs(&self, f: &mut impl FnMut(&B)) {
+    ///
+    /// ```compile_fail
+    /// use carina_core::resource::Value;
+    /// fn render(value: &Value) {
+    ///     value.visit_binding_refs(&mut |identity| { let _ = identity.to_string(); });
+    /// }
+    /// ```
+    pub fn visit_binding_refs(&self, f: &mut impl FnMut(DependencyKey<B>)) {
+        self.visit_binding_refs_in_scope(DiagnosticScope::Public, &mut |binding, _| {
+            f(DependencyKey::new(binding.clone()))
+        });
+    }
+
+    /// Walk bare references with inseparable diagnostic protection.
+    /// Companion: [`Self::visit_resource_refs_for_diagnostics`] for access paths.
+    pub fn visit_binding_refs_for_diagnostics(&self, f: &mut impl FnMut(ScopedBindingRef<'_, B>)) {
+        self.visit_binding_refs_in_scope(DiagnosticScope::Public, &mut |binding, scope| {
+            f(ScopedBindingRef::new(binding, scope))
+        });
+    }
+
+    fn visit_binding_refs_in_scope(
+        &self,
+        scope: DiagnosticScope,
+        f: &mut impl FnMut(&B, DiagnosticScope),
+    ) {
         match self {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
                 deferred
                     .values()
                     .into_iter()
-                    .for_each(|value| value.visit_binding_refs(f));
+                    .for_each(|value| value.visit_binding_refs_in_scope(scope, f));
             }
-            Value::Deferred(DeferredValue::BindingRef { binding }) => f(binding),
+            Value::Deferred(DeferredValue::BindingRef { binding }) => f(binding, scope),
             Value::Concrete(ConcreteValue::List(items)) => {
                 for v in items {
-                    v.visit_binding_refs(f);
+                    v.visit_binding_refs_in_scope(scope, f);
                 }
             }
             Value::Concrete(ConcreteValue::Map(map)) => {
                 for v in map.values() {
-                    v.visit_binding_refs(f);
+                    v.visit_binding_refs_in_scope(scope, f);
                 }
             }
             Value::Deferred(DeferredValue::Interpolation(parts)) => {
                 for part in parts {
                     match part {
                         InterpolationPart::Literal(_) => {}
-                        InterpolationPart::Expr(v) => v.visit_binding_refs(f),
+                        InterpolationPart::Expr(v) => v.visit_binding_refs_in_scope(scope, f),
                     }
                 }
             }
@@ -7525,21 +7758,24 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 | DeferredValue::ResolvedFunctionCall { args, .. },
             ) => {
                 for arg in args {
-                    arg.walker_value().visit_binding_refs(f);
+                    arg.walker_value().visit_binding_refs_in_scope(scope, f);
                 }
             }
             Value::Deferred(DeferredValue::Access(access)) => {
-                access.base().visit_binding_refs(f);
+                access.base().visit_binding_refs_in_scope(scope, f);
             }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-                value.visit_binding_refs(f);
-                default.visit_binding_refs(f);
+                value.visit_binding_refs_in_scope(scope, f);
+                default.visit_binding_refs_in_scope(scope, f);
             }
             Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-                expression.lhs().visit_binding_refs(f);
-                expression.rhs().visit_binding_refs(f);
+                expression.lhs().visit_binding_refs_in_scope(scope, f);
+                expression.rhs().visit_binding_refs_in_scope(scope, f);
             }
-            Value::Deferred(DeferredValue::Secret(inner)) => inner.visit_binding_refs(f),
+            Value::Deferred(DeferredValue::Secret(inner)) => inner
+                .visit_plaintext_reference_inventory(|value, scope| {
+                    value.visit_binding_refs_in_scope(scope, f)
+                }),
             Value::Concrete(ConcreteValue::String(_))
             | Value::Concrete(ConcreteValue::EnumIdentifier(_))
             | Value::Concrete(ConcreteValue::CanonicalEnum(_))
@@ -7582,7 +7818,7 @@ pub fn attrs_to_hashmap<P: ValueKind, B: BindingAddress>(
 /// Check if a Value contains any ResourceRef (possibly nested)
 pub fn contains_resource_ref<P: ValueKind, B: BindingAddress>(value: &Value<P, B>) -> bool {
     let mut found = false;
-    value.visit_resource_refs(&mut |_| found = true);
+    value.visit_resource_refs(&mut |_, _usage| found = true);
     found
 }
 
@@ -7620,7 +7856,9 @@ pub fn value_contains_unknown<P: ValueKind>(value: &Value<P>) -> bool {
             .iter()
             .any(|argument| value_contains_unknown(argument.walker_value())),
         Value::Deferred(DeferredValue::Access(access)) => value_contains_unknown(access.base()),
-        Value::Deferred(DeferredValue::Secret(inner)) => value_contains_unknown(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            inner.visit(|secret_value| value_contains_unknown(secret_value))
+        }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             value_contains_unknown(value) || value_contains_unknown(default)
         }
@@ -7662,13 +7900,13 @@ pub(crate) fn find_unavailable_evaluation<P: ValueKind, B: BindingAddress>(
         value: &Value<P, B>,
         coalesce_policy: UnavailableCoalescePolicy,
         secret_policy: UnavailableSecretPolicy,
-        inside_secret: bool,
+        scope: DiagnosticScope,
     ) -> Option<(
         crate::builtins::BuiltinFunction,
         &UnavailableReason,
         DiagnosticSourceLine,
     )> {
-        let recurse = |value| find(value, coalesce_policy, secret_policy, inside_secret);
+        let recurse = |value| find(value, coalesce_policy, secret_policy, scope);
         match value {
             Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
                 deferred.values().into_iter().find_map(recurse)
@@ -7678,7 +7916,7 @@ pub(crate) fn find_unavailable_evaluation<P: ValueKind, B: BindingAddress>(
                 reason,
                 source_line,
                 ..
-            }) if secret_policy != UnavailableSecretPolicy::OnlyInside || inside_secret => {
+            }) if secret_policy != UnavailableSecretPolicy::OnlyInside || scope.is_secret() => {
                 Some((*name, reason, *source_line))
             }
             Value::Deferred(DeferredValue::Unavailable { args, .. }) => args
@@ -7702,9 +7940,17 @@ pub(crate) fn find_unavailable_evaluation<P: ValueKind, B: BindingAddress>(
             Value::Deferred(DeferredValue::Access(access)) => recurse(access.base()),
             Value::Deferred(DeferredValue::Secret(inner)) => match secret_policy {
                 UnavailableSecretPolicy::Exclude => None,
-                UnavailableSecretPolicy::Include | UnavailableSecretPolicy::OnlyInside => {
-                    find(inner, coalesce_policy, secret_policy, true)
-                }
+                UnavailableSecretPolicy::Include | UnavailableSecretPolicy::OnlyInside => inner
+                    .try_project_plaintext(|value| {
+                        find(
+                            value,
+                            coalesce_policy,
+                            secret_policy,
+                            DiagnosticScope::Secret,
+                        )
+                        .ok_or(())
+                    })
+                    .ok(),
             },
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
                 recurse(value).or_else(|| match coalesce_policy {
@@ -7734,7 +7980,12 @@ pub(crate) fn find_unavailable_evaluation<P: ValueKind, B: BindingAddress>(
         }
     }
 
-    find(value, coalesce_policy, secret_policy, false)
+    find(
+        value,
+        coalesce_policy,
+        secret_policy,
+        DiagnosticScope::Public,
+    )
 }
 
 impl<P: ValueKind, B: BindingAddress> Value<P, B> {
@@ -7779,14 +8030,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             Value::Concrete(ConcreteValue::CanonicalEnum(c)) => c.hash(hasher),
             Value::Concrete(ConcreteValue::Int(i)) => i.hash(hasher),
             Value::Concrete(ConcreteValue::Float(f)) => {
-                // Float equality treats +0.0 and -0.0 as equal, so their
-                // canonical hashes must also agree. Other values use their
-                // bits for deterministic hashing (NaN never compares equal).
-                if *f == 0.0 {
-                    0.0_f64.to_bits().hash(hasher);
-                } else {
-                    f.to_bits().hash(hasher);
-                }
+                f.hash(hasher);
             }
             Value::Concrete(ConcreteValue::Bool(b)) => b.hash(hasher),
             Value::Concrete(ConcreteValue::Duration(d)) => d.as_secs().hash(hasher),
@@ -7879,7 +8123,7 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 access.step().hash(hasher);
             }
             Value::Deferred(DeferredValue::Secret(inner)) => {
-                inner.hash_into(hasher);
+                inner.hash_plaintext_into(hasher);
             }
 
             Value::Deferred(DeferredValue::Unknown(reason)) => {
@@ -10452,7 +10696,9 @@ pub(crate) fn assert_value_fully_resolved(
             }
             Ok(())
         }
-        Value::Deferred(DeferredValue::Secret(inner)) => assert_value_fully_resolved(inner),
+        Value::Deferred(DeferredValue::Secret(inner)) => {
+            inner.try_inspect(assert_value_fully_resolved)
+        }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             Err(crate::value::SerializationError::UnresolvedResourceRef {
                 path: path.to_dot_string(),

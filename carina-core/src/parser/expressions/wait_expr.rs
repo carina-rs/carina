@@ -379,13 +379,8 @@ fn lower_until_rhs(pair: Pair<'_, Rule>, line: usize) -> Result<Value, ParseErro
             Ok(Value::Concrete(ConcreteValue::Int(n)))
         }
         Rule::float => {
-            let f: f64 = primary
-                .as_str()
-                .parse()
-                .map_err(|e| ParseError::InvalidExpression {
-                    line,
-                    message: format!("`until`: invalid float: {}", e),
-                })?;
+            let f =
+                super::super::error::parse_float_literal(primary.as_str(), primary.line_col().0)?;
             Ok(Value::Concrete(ConcreteValue::Float(f)))
         }
         Rule::boolean => Ok(Value::Concrete(ConcreteValue::Bool(

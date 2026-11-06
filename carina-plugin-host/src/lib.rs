@@ -11,3 +11,8 @@ pub use wasm_factory::{
     SchemaOnlyWasmProviderFactory, WASI_HTTP_HOST_VERSION, WasmProviderFactory,
     WasmProviderLoadError,
 };
+
+#[cfg(test)]
+pub(crate) fn finite(value: f64) -> carina_provider_protocol::FiniteF64 {
+    carina_provider_protocol::FiniteF64::new(value).unwrap()
+}

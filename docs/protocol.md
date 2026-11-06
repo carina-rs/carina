@@ -1,9 +1,10 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **21**.
+The current protocol and minimum supported provider protocol are both **22**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 22 | 22 | Optional entry-count bound on `Map` attribute types. |
 | 21 | 21 | Required provider-wide identity assignability declarations in the schema envelope. |
 | 20 | 20 | Create-outcome names describe cloud knowledge; identifier-bearing payloads are `create-identified` and `resume-identified`. |
 | 19 | 19 | Per-leaf desired normalization with scoped, exactly-once deferred handles. |
@@ -12,6 +13,34 @@ The current protocol and minimum supported provider protocol are both **21**.
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 22
+
+Protocol v22 adds an optional `length` field to the `map` attribute type, with
+the same `[min, max]` shape and serde rules as the `list` type's `length`. An
+unbounded endpoint is written as `null`, for example `[null, 10]` or `[2, null]`.
+A missing `length` means the map has no entry-count bound.
+
+Hosts enforce the bound during validation, planning, and LSP diagnostics, the
+same way they enforce a list's item-count bound. The bound counts entries. Type
+assignability does not compare collection count bounds for either lists or maps
+(carina-rs/carina#4264).
+
+`PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both 22. A version-21
+host would ignore the new field and silently drop the bound, so hosts and
+providers must rebuild together.
+
+Later within version 22, the Rust protocol types carry floats as
+`FiniteF64`, whose only constructor rejects NaN and infinities
+(carina-rs/carina#4257). This covers `Value::Float`, `PersistedValue::Float`,
+normalization values, and float range bounds in schema records. The WIT
+`float-val(f64)` layout and the JSON numbers are unchanged, and a finite float
+always meant the same thing on the wire. Only receiving-side admission is
+stricter: the host and SDK guest now reject a non-finite `float-val` or JSON
+number with a typed decode error instead of letting it through. The SDK
+already refused to encode non-finite floats, so a compliant provider never
+sent one, and the protocol version stays 22. Providers must update their Rust
+source when they move to this SDK revision.
 
 ## Version 21
 
@@ -473,6 +502,11 @@ Saved-plan format 40 adds the required canonical source identity to format 39.
 The source locator is stored as an absolute path without resolving its symlinks,
 so apply can reload the source from another working directory and reject
 symlinks retargeted since planning. Format 39 and older plans must be regenerated.
+
+Saved-plan format 41 represents `secret(...)` only with a typed `Secret` node.
+Format 40 plans from v0.11.0 may contain ordinary `FunctionCall` nodes named
+`secret`. Format 40 and older plans fail the version gate before payload
+decoding and must be regenerated with `carina plan --out`.
 
 State format 21 stores current and deposed dependencies and persisted
 `depends_on` directives as complete managed resource addresses. Pre-v21 state

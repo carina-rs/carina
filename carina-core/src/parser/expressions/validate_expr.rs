@@ -122,10 +122,17 @@ pub(crate) fn parse_validate_expr(
             parse_validate_expr(inner, ctx)
         }
         Rule::validate_function_call => {
+            let line = pair.line_col().0;
             let mut inner = pair.into_inner();
             let name = next_pair(&mut inner, "function name", "validate_function_call")?
                 .as_str()
                 .to_string();
+            if matches!(
+                crate::builtins::Builtin::from_name(&name),
+                Some(crate::builtins::Builtin::Secret)
+            ) {
+                return Err(ParseError::SecretInConstraint { line });
+            }
             let mut args = Vec::new();
             for arg_pair in inner {
                 args.push(parse_validate_expr(arg_pair, ctx)?);
@@ -135,13 +142,7 @@ pub(crate) fn parse_validate_expr(
         Rule::null_literal => Ok(ValidateExpr::Null),
         Rule::boolean => Ok(ValidateExpr::Bool(pair.as_str() == "true")),
         Rule::float => {
-            let f: f64 = pair
-                .as_str()
-                .parse()
-                .map_err(|e| ParseError::InvalidExpression {
-                    line: 0,
-                    message: format!("Invalid float: {}", e),
-                })?;
+            let f = super::super::error::parse_float_literal(pair.as_str(), pair.line_col().0)?;
             Ok(ValidateExpr::Float(f))
         }
         Rule::number => {

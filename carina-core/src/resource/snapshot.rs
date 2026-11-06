@@ -15,7 +15,7 @@ impl<P: PlaceholderKind> fmt::Display for SnapshotLeaf<P> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
             Self::Expression(p) => fmt::Display::fmt(p, f),
-            Self::RedactedSecret { .. } => f.write_str("(secret)"),
+            Self::RedactedSecret { .. } => f.write_str(crate::schema::SECRET_VALUE_MASK),
         }
     }
 }
@@ -66,7 +66,7 @@ impl<P: PlaceholderKind> ValueKind for SnapshotLeaf<P> {
     fn render(&self) -> String {
         match self {
             Self::Expression(leaf) => leaf.render(),
-            Self::RedactedSecret { .. } => "(secret)".to_string(),
+            Self::RedactedSecret { .. } => crate::schema::SECRET_VALUE_MASK.to_string(),
         }
     }
 
@@ -163,14 +163,16 @@ pub type SnapshotValue<P = NoPlaceholder, B = AbsoluteBindingAddress> = Value<Sn
 
 /// An opaque historical secret was selected where its value is required.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-#[error("secret value unavailable at {path}", path = crate::provider_text::ProviderText::new(path))]
+#[error("secret value unavailable at {path}", path = crate::provider_text::ProviderText::new(self.path()))]
 pub struct UnavailableSecretError {
-    path: String,
+    path: Option<String>,
 }
 
 impl UnavailableSecretError {
     pub fn path(&self) -> &str {
-        &self.path
+        self.path
+            .as_deref()
+            .unwrap_or(crate::schema::SECRET_VALUE_MASK)
     }
 }
 
@@ -218,9 +220,9 @@ impl<P: PlaceholderKind, B: BindingAddress> SnapshotValue<P, B> {
         self.first_secret_path("$").is_some()
     }
 
-    fn first_secret_path(&self, path: &str) -> Option<String> {
+    fn first_secret_path(&self, path: &str) -> Option<SecretDiagnosticError<String>> {
         if self.secret_hash().is_some() {
-            return Some(path.to_owned());
+            return Some(SecretDiagnosticError::Public(path.to_owned()));
         }
         match self {
             Self::Concrete(ConcreteValue::Map(values)) => values
@@ -230,7 +232,9 @@ impl<P: PlaceholderKind, B: BindingAddress> SnapshotValue<P, B> {
                 .iter()
                 .enumerate()
                 .find_map(|(i, value)| value.first_secret_path(&format!("{path}[{i}]"))),
-            Self::Deferred(DeferredValue::Secret(value)) => value.first_secret_path(path),
+            Self::Deferred(DeferredValue::Secret(value)) => value
+                .try_inspect(|value| value.first_secret_path(path).map_or(Ok(()), Err))
+                .err(),
             Self::Deferred(DeferredValue::Coalesce { value, default }) => value
                 .first_secret_path(&format!("{path}.value"))
                 .or_else(|| default.first_secret_path(&format!("{path}.default"))),
@@ -275,7 +279,10 @@ impl<P: PlaceholderKind, B: BindingAddress> SnapshotValue<P, B> {
         self.clone().try_map_placeholder(&mut |leaf| match leaf {
             SnapshotLeaf::Expression(p) => Ok(Value::Deferred(DeferredValue::Placeholder(p))),
             SnapshotLeaf::RedactedSecret { .. } => Err(UnavailableSecretError {
-                path: unavailable.clone().expect("hash traversal found this leaf"),
+                path: match unavailable.clone().expect("hash traversal found this leaf") {
+                    SecretDiagnosticError::Public(path) => Some(path),
+                    SecretDiagnosticError::InsideSecret => None,
+                },
             }),
         })
     }
@@ -288,7 +295,7 @@ impl<P: PlaceholderKind> SnapshotValue<P> {
         material: &Value<P>,
     ) -> Result<bool, crate::value::SerializationError> {
         match self.secret_hash() {
-            Some(hash) => Ok(hash.verify(crate::value::canonical_secret_hash_material(material)?)),
+            Some(hash) => super::SecretPayload::from(Box::new(material.clone())).verify_hash(hash),
             None => Ok(false),
         }
     }
@@ -570,5 +577,11 @@ impl<P: StateValueLeaf> State<P> {
             dependency_bindings: self.dependency_bindings.clone(),
             partial_read: self.partial_read.clone(),
         }
+    }
+}
+
+impl crate::resource::InsideSecret for UnavailableSecretError {
+    fn inside_secret(self) -> Self {
+        Self { path: None }
     }
 }

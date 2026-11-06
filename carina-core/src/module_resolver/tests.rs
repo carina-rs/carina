@@ -442,7 +442,8 @@ let consumer = mock.test.resource {
     else {
         panic!("comment must remain a secret expression")
     };
-    let ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }) = inner.as_ref()
+    let ExpandedValue::Deferred(ExpandedDeferredValue::ResourceRef { path }) =
+        inner.expose_plaintext()
     else {
         panic!("secret must retain the inner resource reference")
     };
@@ -1319,6 +1320,47 @@ let second = alias { label = "second" }
         });
         assert!(resource.is_some(), "missing nested resource for {label}");
     }
+}
+
+#[test]
+fn module_parse_error_preserves_float_literal_error_chain() {
+    let temp = tempfile::tempdir().unwrap();
+    let module = temp.path().join("child");
+    fs::create_dir(&module).unwrap();
+    fs::write(module.join("main.crn"), "arguments {}\n").unwrap();
+    // Exponent notation is not part of the DSL; this decimal also overflows f64.
+    fs::write(
+        module.join("ratios.crn"),
+        format!("\n\nlet ratio = 1{}.0\n", "0".repeat(400)),
+    )
+    .unwrap();
+    let source = "let child = use { source = './child' }\nchild {}\n";
+    let root_file = temp.path().join("main.crn");
+    fs::write(&root_file, source).unwrap();
+    let parsed = crate::parser::parse_file(
+        source,
+        &root_file,
+        &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+
+    let error = resolve_modules(parsed, temp.path())
+        .expect_err("an overflowing module literal must fail parsing");
+    let relative = error.display_relative_to(temp.path());
+    assert!(relative.contains("child/ratios.crn"), "{relative}");
+    assert!(
+        relative.contains("Invalid float literal at line 3"),
+        "{relative}"
+    );
+    assert_eq!(
+        relative.matches("non-finite float +inf").count(),
+        1,
+        "{relative}"
+    );
+    assert!(
+        !relative.contains(&temp.path().display().to_string()),
+        "{relative}"
+    );
 }
 
 #[cfg(unix)]
@@ -2384,7 +2426,7 @@ fn test_substitute_arguments_nested() {
 }
 
 #[test]
-fn substitute_arguments_enters_secret_only_along_module_if_paths() {
+fn substitute_arguments_enters_secret_and_selects_module_if() {
     let module_argument = |name: &str| {
         Value::Deferred(DeferredValue::Placeholder(
             ParserPlaceholder::ModuleArgument {
@@ -2398,9 +2440,13 @@ fn substitute_arguments_enters_secret_only_along_module_if_paths() {
         Value::Concrete(ConcreteValue::String("yes".into())),
         Value::Concrete(ConcreteValue::String("no".into())),
     ))));
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::List(vec![module_argument("plain"), conditional]),
-    ))));
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::List(vec![
+            module_argument("plain"),
+            conditional,
+        ])))
+        .into(),
+    ));
     let inputs = HashMap::from([
         (
             "flag".to_string(),
@@ -2408,7 +2454,7 @@ fn substitute_arguments_enters_secret_only_along_module_if_paths() {
         ),
         (
             "plain".to_string(),
-            Value::Concrete(ConcreteValue::String("must-stay-deferred".into())),
+            Value::Concrete(ConcreteValue::String("substituted".into())),
         ),
     ]);
 
@@ -2416,13 +2462,13 @@ fn substitute_arguments_enters_secret_only_along_module_if_paths() {
     let Value::Deferred(DeferredValue::Secret(inner)) = substituted else {
         panic!("secret wrapper was not preserved")
     };
-    let Value::Concrete(ConcreteValue::List(items)) = inner.as_ref() else {
+    let Value::Concrete(ConcreteValue::List(items)) = inner.expose_plaintext() else {
         panic!("secret list was not preserved")
     };
     assert_eq!(
         items[0],
-        module_argument("plain"),
-        "ordinary argument substitution inside Secret is outside #4149's behavior change",
+        Value::Concrete(ConcreteValue::String("substituted".into())),
+        "early intrinsic wrappers must not block ordinary module argument substitution",
     );
     assert_eq!(
         items[1],
@@ -10122,9 +10168,12 @@ fn argument_type_mismatch_error_shows_int_literal_value() {
 #[test]
 fn argument_type_mismatch_error_redacts_secret_value() {
     let secret = "issue-3804-secret-plaintext";
-    let value = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String(secret.to_string().into()),
-    ))));
+    let value = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            secret.to_string().into(),
+        )))
+        .into(),
+    ));
 
     let msg = module_argument_type_error("environment", TypeExpr::Int, value);
 
@@ -10284,9 +10333,12 @@ fn directory_module_loader_preserves_parameter_diagnostic_sources() {
 fn argument_type_mismatch_error_redacts_secret_list_element() {
     let secret = "issue-3804-nested-secret-plaintext";
     let value = Value::Concrete(ConcreteValue::List(vec![Value::Deferred(
-        DeferredValue::Secret(Box::new(Value::Concrete(ConcreteValue::String(
-            secret.to_string().into(),
-        )))),
+        DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::String(
+                secret.to_string().into(),
+            )))
+            .into(),
+        ),
     )]));
 
     let msg = module_argument_type_error("counts", TypeExpr::List(Box::new(TypeExpr::Int)), value);
@@ -10362,7 +10414,7 @@ fn argument_type_mismatch_error_escapes_string_literal_value() {
 
 #[test]
 fn argument_type_mismatch_error_preserves_float_fraction() {
-    let value = Value::Concrete(ConcreteValue::Float(1.0));
+    let value = Value::Concrete(ConcreteValue::Float(crate::finite(1.0)));
 
     let msg = module_argument_type_error("count", TypeExpr::Int, value);
 

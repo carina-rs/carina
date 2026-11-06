@@ -85,7 +85,7 @@ impl std::error::Error for SchemaDecodeError {
     }
 }
 
-/// Failure to decode a JSON-backed recursive value at the WIT boundary.
+/// Failure to decode a raw scalar or JSON-backed recursive value at the WIT boundary.
 ///
 /// The payload itself is deliberately not retained: `secret-val` may contain
 /// plaintext credentials. JSON syntax failures retain the structured serde
@@ -100,6 +100,7 @@ pub struct WasmValueDecodeError {
 
 #[derive(Debug, Clone, Copy)]
 enum WitValueVariant {
+    Float,
     StringList,
     List,
     Map,
@@ -110,6 +111,7 @@ enum WitValueVariant {
 impl fmt::Display for WitValueVariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Self::Float => "float-val",
             Self::StringList => "string-list-val",
             Self::List => "list-val",
             Self::Map => "map-val",
@@ -121,6 +123,7 @@ impl fmt::Display for WitValueVariant {
 
 #[derive(Debug)]
 enum WasmValueDecodeErrorKind {
+    InvalidFloat(carina_provider_protocol::NonFiniteFloatError),
     InvalidJson(serde_json::Error),
     ExpectedArray,
     ExpectedObject,
@@ -158,6 +161,7 @@ impl fmt::Display for WasmValueDecodeError {
             )?;
         }
         match &self.kind {
+            WasmValueDecodeErrorKind::InvalidFloat(_) => Ok(()),
             WasmValueDecodeErrorKind::InvalidJson(error) => {
                 write!(f, ": invalid JSON: {error}")
             }
@@ -185,7 +189,22 @@ impl fmt::Display for WasmValueDecodeError {
     }
 }
 
-impl std::error::Error for WasmValueDecodeError {}
+impl std::error::Error for WasmValueDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            WasmValueDecodeErrorKind::InvalidFloat(source) => Some(source),
+            WasmValueDecodeErrorKind::InvalidJson(_source) => None,
+            WasmValueDecodeErrorKind::ExpectedArray
+            | WasmValueDecodeErrorKind::ExpectedObject
+            | WasmValueDecodeErrorKind::ExpectedString { index: _ }
+            | WasmValueDecodeErrorKind::Null
+            | WasmValueDecodeErrorKind::UnsupportedNumber
+            | WasmValueDecodeErrorKind::MalformedPersistedSecret
+            | WasmValueDecodeErrorKind::ReservedPersistedKey
+            | WasmValueDecodeErrorKind::InvalidRedactedSecretDigest => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AppliedStateOperation {
@@ -213,9 +232,8 @@ enum WasmAppliedStateDecodeErrorKind {
 /// Failure to decode an existing-resource observation returned across the WIT
 /// boundary.
 ///
-/// The operation and request resource ID are host-owned context. This is a
-/// terminal in-repo error: its display contains the complete diagnostic while
-/// `kind` preserves structured classification for tests and callers.
+/// The operation and request resource ID are host-owned context. Causes are
+/// retained through the typed source chain.
 #[derive(Debug)]
 pub(crate) struct WasmAppliedStateDecodeError {
     operation: AppliedStateOperation,
@@ -252,9 +270,9 @@ impl WasmAppliedStateDecodeError {
 impl fmt::Display for WasmAppliedStateDecodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
-            WasmAppliedStateDecodeErrorKind::Attributes(error) => write!(
+            WasmAppliedStateDecodeErrorKind::Attributes(_) => write!(
                 f,
-                "failed to decode WIT {} outcome applied state attributes for resource '{}': {error}",
+                "failed to decode WIT {} outcome applied state attributes for resource '{}'",
                 self.operation, self.resource_id
             ),
             WasmAppliedStateDecodeErrorKind::Identifier(error) => write!(
@@ -266,7 +284,23 @@ impl fmt::Display for WasmAppliedStateDecodeError {
     }
 }
 
-impl std::error::Error for WasmAppliedStateDecodeError {}
+impl std::error::Error for WasmAppliedStateDecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            WasmAppliedStateDecodeErrorKind::Attributes(source) => Some(source.as_ref()),
+            WasmAppliedStateDecodeErrorKind::Identifier(_source) => None,
+        }
+    }
+}
+
+fn decode_float(value: f64) -> Result<carina_provider_protocol::FiniteF64, WasmValueDecodeError> {
+    carina_provider_protocol::FiniteF64::new(value).map_err(|source| {
+        WasmValueDecodeError::new(
+            WitValueVariant::Float,
+            WasmValueDecodeErrorKind::InvalidFloat(source),
+        )
+    })
+}
 
 // -- Value --
 
@@ -311,7 +345,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
             Ok(wit::Value::StrVal(c.api_value().to_string()))
         }
         CoreValue::Concrete(ConcreteValue::Int(i)) => Ok(wit::Value::IntVal(*i)),
-        CoreValue::Concrete(ConcreteValue::Float(f)) => Ok(wit::Value::FloatVal(*f)),
+        CoreValue::Concrete(ConcreteValue::Float(f)) => Ok(wit::Value::FloatVal(f.get())),
         CoreValue::Concrete(ConcreteValue::Bool(b)) => Ok(wit::Value::BoolVal(*b)),
         // Duration crosses the WIT boundary as integer seconds — see
         // `notes/specs/2026-05-10-duration-design.md` for the rationale
@@ -403,7 +437,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
             })
         }
         CoreValue::Deferred(DeferredValue::Secret(inner)) => {
-            let json = core_value_to_json(inner).map_err(SerializationError::masked_for_secret)?;
+            let json = inner.project_plaintext_json_for_transport(core_value_to_json)?;
             let json_str =
                 serde_json::to_string(&json).expect("serde_json::Value -> String is infallible");
             Ok(wit::Value::SecretVal(json_str))
@@ -489,7 +523,7 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
     match v {
         wit::Value::StrVal(s) => Ok(CoreValue::Concrete(ConcreteValue::String(s.clone().into()))),
         wit::Value::IntVal(i) => Ok(CoreValue::Concrete(ConcreteValue::Int(*i))),
-        wit::Value::FloatVal(f) => Ok(CoreValue::Concrete(ConcreteValue::Float(*f))),
+        wit::Value::FloatVal(f) => Ok(CoreValue::Concrete(ConcreteValue::Float(decode_float(*f)?))),
         wit::Value::BoolVal(b) => Ok(CoreValue::Concrete(ConcreteValue::Bool(*b))),
         wit::Value::StringListVal(json) => {
             let value: serde_json::Value = serde_json::from_str(json).map_err(|source| {
@@ -559,7 +593,9 @@ pub(crate) fn wit_to_core_value(v: &wit::Value) -> Result<CoreValue, WasmValueDe
                 )
             })?;
             let inner = json_to_core_value(&inner_json, WitValueVariant::Secret)?;
-            Ok(CoreValue::Deferred(DeferredValue::Secret(Box::new(inner))))
+            Ok(CoreValue::Deferred(DeferredValue::Secret(
+                Box::new(inner).into(),
+            )))
         }
     }
 }
@@ -616,9 +652,9 @@ fn wit_to_core_persisted_value(
         }
         wit::PersistedValue::BoolVal(value) => Ok(CoreValue::Concrete(ConcreteValue::Bool(*value))),
         wit::PersistedValue::IntVal(value) => Ok(CoreValue::Concrete(ConcreteValue::Int(*value))),
-        wit::PersistedValue::FloatVal(value) => {
-            Ok(CoreValue::Concrete(ConcreteValue::Float(*value)))
-        }
+        wit::PersistedValue::FloatVal(value) => Ok(CoreValue::Concrete(ConcreteValue::Float(
+            decode_float(*value)?,
+        ))),
         wit::PersistedValue::StrVal(value) => Ok(CoreValue::Concrete(ConcreteValue::String(
             value.clone().into(),
         ))),
@@ -698,12 +734,9 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
             Ok(serde_json::Value::String(c.api_value().to_string()))
         }
         CoreValue::Concrete(ConcreteValue::Int(i)) => Ok(serde_json::Value::Number((*i).into())),
-        CoreValue::Concrete(ConcreteValue::Float(f)) => serde_json::Number::from_f64(*f)
-            .map(serde_json::Value::Number)
-            .ok_or(SerializationError::NonFiniteFloat {
-                value: *f,
-                context: SerializationContext::WasmBoundary,
-            }),
+        CoreValue::Concrete(ConcreteValue::Float(f)) => {
+            Ok(serde_json::Value::Number(f.to_json_number()))
+        }
         CoreValue::Concrete(ConcreteValue::Bool(b)) => Ok(serde_json::Value::Bool(*b)),
         CoreValue::Concrete(ConcreteValue::Duration(d)) => {
             Ok(serde_json::Value::Number((d.as_secs() as i64).into()))
@@ -785,7 +818,7 @@ fn core_value_to_json(v: &CoreValue) -> Result<serde_json::Value, SerializationE
         // `secret-val` is the channel used to mark the *attribute* itself
         // as a secret.
         CoreValue::Deferred(DeferredValue::Secret(inner)) => {
-            core_value_to_json(inner).map_err(SerializationError::masked_for_secret)
+            inner.project_plaintext_json_for_transport(core_value_to_json)
         }
         CoreValue::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
@@ -834,7 +867,14 @@ fn json_to_core_value(
             if let Some(i) = n.as_i64() {
                 Ok(CoreValue::Concrete(ConcreteValue::Int(i)))
             } else if let Some(f) = n.as_f64() {
-                Ok(CoreValue::Concrete(ConcreteValue::Float(f)))
+                Ok(CoreValue::Concrete(ConcreteValue::Float(
+                    carina_provider_protocol::FiniteF64::new(f).map_err(|source| {
+                        WasmValueDecodeError::new(
+                            wit_variant,
+                            WasmValueDecodeErrorKind::InvalidFloat(source),
+                        )
+                    })?,
+                )))
             } else {
                 Err(WasmValueDecodeError::new(
                     wit_variant,
@@ -1798,7 +1838,7 @@ fn checked_value_to_wit(value: &WireValue) -> wit::Value {
     match value.value() {
         proto::Value::String(value) => wit::Value::StrVal(value.clone()),
         proto::Value::Int(value) => wit::Value::IntVal(*value),
-        proto::Value::Float(value) => wit::Value::FloatVal(*value),
+        proto::Value::Float(value) => wit::Value::FloatVal(value.get()),
         proto::Value::Bool(value) => wit::Value::BoolVal(*value),
         proto::Value::List(_) => wit::Value::ListVal(json()),
         proto::Value::StringList(_) => wit::Value::StringListVal(json()),
@@ -2816,9 +2856,9 @@ mod tests {
     impl std::error::Error for TestOperationError {}
 
     fn redacted_secret_and_digest(plaintext: &str) -> (CoreSnapshotValue, String) {
-        let secret: CoreValue = CoreValue::Deferred(DeferredValue::Secret(Box::new(
-            CoreValue::Concrete(ConcreteValue::String(plaintext.into())),
-        )));
+        let secret: CoreValue = CoreValue::Deferred(DeferredValue::Secret(
+            Box::new(CoreValue::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+        ));
         let persisted = carina_core::value::PersistedValue::encode_provider_value(&secret, None)
             .expect("serialize test secret")
             .as_json()
@@ -2952,7 +2992,7 @@ mod tests {
             ),
             (
                 PatternAttributeType::float(),
-                CoreValue::Concrete(ConcreteValue::Float(1.25)),
+                CoreValue::Concrete(ConcreteValue::Float(crate::finite(1.25))),
             ),
             (
                 PatternAttributeType::string(),
@@ -3997,9 +4037,12 @@ mod tests {
     #[test]
     fn secret_enum_identifier_error_is_masked_by_scalar_wit_encoder() {
         let plaintext = "scalar-secret-plaintext-must-not-leak";
-        let value = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::enum_identifier(plaintext),
-        ))));
+        let value = CoreValue::Deferred(DeferredValue::Secret(
+            Box::new(CoreValue::Concrete(ConcreteValue::enum_identifier(
+                plaintext,
+            )))
+            .into(),
+        ));
 
         let error = core_to_wit_value(&value).expect_err("the unresolved enum must be rejected");
         let display = error.to_string();
@@ -4013,7 +4056,7 @@ mod tests {
         let value = CoreValue::Concrete(ConcreteValue::Map(indexmap::indexmap! {
             "items".to_string() => CoreValue::Deferred(DeferredValue::Secret(Box::new(
                 CoreValue::Concrete(ConcreteValue::enum_identifier(plaintext)),
-            ))),
+            ).into())),
         }));
 
         let error = core_value_to_json(&value).expect_err("the unresolved enum must be rejected");
@@ -4078,9 +4121,9 @@ mod tests {
     #[test]
     fn persisted_state_rejects_live_secret_without_exposing_plaintext() {
         let plaintext = "persisted-boundary-secret-must-not-leak";
-        let secret: CoreValue = CoreValue::Deferred(DeferredValue::Secret(Box::new(
-            CoreValue::Concrete(ConcreteValue::String(plaintext.into())),
-        )));
+        let secret: CoreValue = CoreValue::Deferred(DeferredValue::Secret(
+            Box::new(CoreValue::Concrete(ConcreteValue::String(plaintext.into()))).into(),
+        ));
         let nested = CoreValue::Concrete(ConcreteValue::Map(indexmap::indexmap! {
             "token".to_string() => secret.clone(),
         }));
@@ -4190,18 +4233,64 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_float_nested_in_list_is_rejected_at_wasm_boundary() {
-        let value = CoreValue::Concrete(ConcreteValue::List(vec![CoreValue::Concrete(
-            ConcreteValue::Float(f64::NAN),
-        )]));
+    fn finite_wit_float_round_trips_preserve_bits() {
+        for raw in [f64::MIN, -0.0, 0.0, f64::from_bits(1), f64::MAX] {
+            let core = CoreValue::Concrete(ConcreteValue::Float(crate::finite(raw)));
+            let wit = core_to_wit_value(&core).unwrap();
+            let CoreValue::Concrete(ConcreteValue::Float(decoded)) =
+                wit_to_core_value(&wit).unwrap()
+            else {
+                panic!("expected float")
+            };
+            assert_eq!(decoded.get().to_bits(), raw.to_bits());
+            let wit = core_to_wit_persisted_value(&core.to_snapshot()).unwrap();
+            let CoreValue::Concrete(ConcreteValue::Float(decoded)) =
+                wit_to_core_persisted_value(&wit).unwrap()
+            else {
+                panic!("expected float")
+            };
+            assert_eq!(decoded.get().to_bits(), raw.to_bits());
+        }
+    }
 
-        assert!(matches!(
-            core_to_wit_value(&value),
-            Err(SerializationError::NonFiniteFloat {
-                context: SerializationContext::WasmBoundary,
-                ..
-            })
-        ));
+    #[test]
+    fn raw_non_finite_persisted_float_is_rejected_at_wasm_boundary() {
+        use std::error::Error;
+        for (raw, category) in [
+            (f64::NAN, carina_core::NonFiniteFloatError::NaN),
+            (
+                f64::INFINITY,
+                carina_core::NonFiniteFloatError::PositiveInfinity,
+            ),
+            (
+                f64::NEG_INFINITY,
+                carina_core::NonFiniteFloatError::NegativeInfinity,
+            ),
+        ] {
+            let error = wit_to_core_persisted_value_map(&[(
+                "ratio".into(),
+                wit::PersistedValue::FloatVal(raw),
+            )])
+            .unwrap_err();
+            let rendered = render_error_chain(&error);
+            assert_eq!(
+                rendered.matches("float-val attribute 'ratio'").count(),
+                1,
+                "{rendered}"
+            );
+            assert_eq!(
+                rendered.matches(&category.to_string()).count(),
+                1,
+                "{rendered}"
+            );
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<carina_core::NonFiniteFloatError>(),
+                Some(&category)
+            );
+        }
     }
 
     // -- Value roundtrips --
@@ -4224,7 +4313,7 @@ mod tests {
 
     #[test]
     fn test_scalar_float_roundtrip() {
-        let core = CoreValue::Concrete(ConcreteValue::Float(2.78));
+        let core = CoreValue::Concrete(ConcreteValue::Float(crate::finite(2.78)));
         let wit = core_to_wit_value(&core).unwrap();
         let back = wit_to_core_value(&wit).unwrap();
         assert_eq!(core, back);
@@ -4465,9 +4554,12 @@ mod tests {
     /// `format!("{v:?}")` debug string.
     #[test]
     fn secret_string_emits_secret_val_variant() {
-        let v = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::String("password".into()),
-        ))));
+        let v = CoreValue::Deferred(DeferredValue::Secret(
+            Box::new(CoreValue::Concrete(ConcreteValue::String(
+                "password".into(),
+            )))
+            .into(),
+        ));
         let wit_v = core_to_wit_value(&v).unwrap();
         match wit_v {
             wit::Value::SecretVal(json) => assert_eq!(json, "\"password\""),
@@ -4479,9 +4571,9 @@ mod tests {
     fn secret_int_emits_secret_val_variant() {
         // Audit (carina#2390 step 12) confirmed `secret()` accepts any
         // scalar; pin the wire format for non-string inner values too.
-        let v = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::Int(42),
-        ))));
+        let v = CoreValue::Deferred(DeferredValue::Secret(
+            Box::new(CoreValue::Concrete(ConcreteValue::Int(42))).into(),
+        ));
         let wit_v = core_to_wit_value(&v).unwrap();
         match wit_v {
             wit::Value::SecretVal(json) => assert_eq!(json, "42"),
@@ -4494,13 +4586,13 @@ mod tests {
         // Round-tripping through the WIT boundary preserves the
         // `Secret` wrapper so host-side machinery (state hashing, plan
         // redaction) keeps recognising it after a guest call returns.
-        let original = CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
-            ConcreteValue::String("hunter2".into()),
-        ))));
+        let original = CoreValue::Deferred(DeferredValue::Secret(
+            Box::new(CoreValue::Concrete(ConcreteValue::String("hunter2".into()))).into(),
+        ));
         let wit_v = core_to_wit_value(&original).unwrap();
         let back = wit_to_core_value(&wit_v).unwrap();
         match back {
-            CoreValue::Deferred(DeferredValue::Secret(inner)) => match *inner {
+            CoreValue::Deferred(DeferredValue::Secret(inner)) => match inner.plaintext_for_test() {
                 CoreValue::Concrete(ConcreteValue::String(s)) => assert_eq!(s, "hunter2"),
                 other => panic!("expected inner String, got: {other:?}"),
             },
@@ -4517,9 +4609,9 @@ mod tests {
         // *attribute*-level secret signal goes through `secret-val` via
         // `core_to_wit_value`, not this path.
         let v = CoreValue::Concrete(ConcreteValue::List(vec![CoreValue::Deferred(
-            DeferredValue::Secret(Box::new(CoreValue::Concrete(ConcreteValue::String(
-                "p".into(),
-            )))),
+            DeferredValue::Secret(
+                Box::new(CoreValue::Concrete(ConcreteValue::String("p".into()))).into(),
+            ),
         )]));
         let wit_v = core_to_wit_value(&v).unwrap();
         match wit_v {
@@ -5162,6 +5254,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn review2_f4_dispatch_uses_main_wit_variants_for_top_level_secrets() {
+        carina_core::validation::deferred_types::with_session_for_test_async(&carina_core::parser::LoadedProviderContext::empty_for_test(), async |type_checks| {
+            let secret = |value: CoreValue| CoreValue::Deferred(DeferredValue::Secret(Box::new(value).into()));
+            let resource = CoreResource::new("test", "secret-inputs")
+                .with_attribute("text", secret(CoreValue::Concrete(ConcreteValue::String("t".into()))))
+                .with_attribute("list", secret(CoreValue::Concrete(ConcreteValue::StringList(vec!["a".into(), "b".into()]))))
+                .with_attribute("map", secret(CoreValue::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([("key".into(), CoreValue::Concrete(ConcreteValue::String("value".into())))])))));
+            let bindings = carina_core::binding_index::ResolvedBindings::default();
+            let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+            let schemas = CoreSchemaRegistry::new();
+            let context = carina_core::executor::ProviderPreparationContext::new(&bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &[], &schemas, type_checks);
+            let request = carina_core::executor::prepare_create_request(resource, &context).await.unwrap();
+            let wire = core_to_wit_create_request(&request).res;
+            let values: std::collections::HashMap<_, _> = wire.attributes.into_iter().collect();
+            assert!(matches!(&values["text"], wit::Value::StrVal(value) if value == "t"));
+            assert!(matches!(&values["list"], wit::Value::StringListVal(value) if value == r#"["a","b"]"#));
+            assert!(matches!(&values["map"], wit::Value::MapVal(value) if value == r#"{"key":"value"}"#));
+        }).await;
+    }
+
+    #[tokio::test]
     async fn create_and_update_wire_values_keep_plaintext_secrets() {
         carina_core::validation::deferred_types::with_session_for_test_async(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -5178,7 +5291,7 @@ mod tests {
                     let secret = |text: &str| {
                         CoreValue::Deferred(DeferredValue::Secret(Box::new(CoreValue::Concrete(
                             ConcreteValue::String(text.into()),
-                        ))))
+                        )).into()))
                     };
                     for resource in resources {
                         resource.set_attr("top", secret("top-plaintext"));
@@ -6516,6 +6629,7 @@ mod tests {
                 proto_attr(
                     "tags",
                     proto::AttributeType::Map {
+                        length: None,
                         inner: Box::new(proto_string()),
                         key: Box::new(proto_string()),
                     },
@@ -7303,7 +7417,10 @@ mod tests {
                     identity, range, ..
                 } => {
                     assert_eq!(identity.map(|id| id.kind.as_str()), Some("Size"));
-                    assert_eq!(range, Some((Some(0.0), Some(1.0))));
+                    assert_eq!(
+                        range,
+                        Some((Some(crate::finite(0.0)), Some(crate::finite(1.0))))
+                    );
                 }
                 carina_core::schema::Shape::List {
                     ordered,
@@ -7381,6 +7498,7 @@ mod tests {
                 proto_attr(
                     "tags",
                     proto::AttributeType::Map {
+                        length: None,
                         inner: Box::new(proto_string()),
                         key: Box::new(proto_string()),
                     },
@@ -7459,5 +7577,63 @@ mod tests {
 
         assert!(check_schema_only_protocol_version(info).is_ok());
         assert!(check_protocol_version(info).is_err());
+    }
+
+    #[test]
+    fn wit_decode_rejects_nan_float_attribute() {
+        use std::error::Error;
+        for (raw, category) in [
+            (f64::NAN, carina_core::NonFiniteFloatError::NaN),
+            (
+                f64::INFINITY,
+                carina_core::NonFiniteFloatError::PositiveInfinity,
+            ),
+            (
+                f64::NEG_INFINITY,
+                carina_core::NonFiniteFloatError::NegativeInfinity,
+            ),
+        ] {
+            let attributes = [("ratio".to_string(), wit::Value::FloatVal(raw))];
+            let error = wit_to_core_value_map(&attributes).unwrap_err();
+            let message = render_error_chain(&error);
+            assert!(
+                message.contains("failed to decode WIT float-val attribute 'ratio'"),
+                "{message}"
+            );
+            assert_eq!(
+                message
+                    .matches("failed to decode WIT float-val attribute 'ratio'")
+                    .count(),
+                1,
+                "{message}"
+            );
+            assert_eq!(
+                message.matches(&category.to_string()).count(),
+                1,
+                "{message}"
+            );
+            assert_eq!(
+                error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<carina_core::NonFiniteFloatError>(),
+                Some(&category)
+            );
+            let id =
+                CoreResourceId::with_provider_identity("mock", "test.resource", "example", None);
+            let error =
+                WasmAppliedStateDecodeError::attributes(AppliedStateOperation::Read, &id, error);
+            let diagnostic = ProviderDiagnostic::new(error).to_string();
+            assert_eq!(
+                diagnostic.matches("float-val attribute 'ratio'").count(),
+                1,
+                "{diagnostic}"
+            );
+            assert_eq!(
+                diagnostic.matches(&category.to_string()).count(),
+                1,
+                "{diagnostic}"
+            );
+        }
     }
 }

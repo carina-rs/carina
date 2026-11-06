@@ -94,8 +94,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_40_for_pinned_source_identity_and_resolved_dependencies() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 40);
+fn saved_plan_version_is_41_for_typed_secrets_and_pinned_source_identity() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 41);
 }
 
 #[test]
@@ -696,7 +696,9 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
             .persisted_attributes()
             .expect("saved resource has applied attributes")
             .get("status"),
-        carina_core::value::json_to_dsl_value(&json!("after")).map(|value| value.to_snapshot())
+        carina_core::value::json_to_dsl_value(&json!("after"))
+            .unwrap()
+            .map(|value| value.to_snapshot())
     );
 }
 
@@ -831,7 +833,9 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
             .persisted_attributes()
             .expect("saved resource has applied attributes")
             .get("status"),
-        carina_core::value::json_to_dsl_value(&json!("saved")).map(|value| value.to_snapshot())
+        carina_core::value::json_to_dsl_value(&json!("saved"))
+            .unwrap()
+            .map(|value| value.to_snapshot())
     );
 }
 
@@ -2208,9 +2212,12 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
 #[tokio::test]
 async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file() {
     let color_mode = crate::output_style::ColorMode::Plain;
-    let secret = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("secret-value".into()),
-    ))));
+    let secret = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "secret-value".into(),
+        )))
+        .into(),
+    ));
     let persisted_secret = PersistedValue::encode_desired_value(&secret, None)
         .expect("secret is persistable")
         .as_json()
@@ -2996,7 +3003,9 @@ async fn state_refresh_locked_updates_alive_deposed_generation() {
     assert_eq!(row.deposed.len(), 1);
     assert_eq!(
         row.deposed[0].persisted_attributes().get("status"),
-        carina_core::value::json_to_dsl_value(&json!("alive")).map(|value| value.to_snapshot())
+        carina_core::value::json_to_dsl_value(&json!("alive"))
+            .unwrap()
+            .map(|value| value.to_snapshot())
     );
 }
 
@@ -3683,7 +3692,9 @@ fn build_state_after_apply_persists_write_only_attributes() {
             .persisted_attributes()
             .expect("saved resource has applied attributes")
             .get("ipv4_netmask_length"),
-        carina_core::value::json_to_dsl_value(&json!(16)).map(|value| value.to_snapshot()),
+        carina_core::value::json_to_dsl_value(&json!(16))
+            .unwrap()
+            .map(|value| value.to_snapshot()),
         "write-only attribute should be persisted in state"
     );
     assert_eq!(
@@ -3699,6 +3710,7 @@ fn build_state_after_apply_persists_write_only_attributes() {
             .expect("saved resource has applied attributes")
             .get("cidr_block"),
         carina_core::value::json_to_dsl_value(&json!("10.0.0.0/16"))
+            .unwrap()
             .map(|value| value.to_snapshot())
     );
 }
@@ -3898,7 +3910,9 @@ fn build_state_after_apply_write_only_detects_value_change() {
             .persisted_attributes()
             .expect("saved resource has applied attributes")
             .get("ipv4_netmask_length"),
-        carina_core::value::json_to_dsl_value(&json!(24)).map(|value| value.to_snapshot()),
+        carina_core::value::json_to_dsl_value(&json!(24))
+            .unwrap()
+            .map(|value| value.to_snapshot()),
         "write-only attribute should reflect the updated desired value"
     );
 }
@@ -3910,14 +3924,17 @@ fn plan_file_serialization_redacts_secrets() {
     };
 
     // Build a plan with secrets in resources, states, and effects
-    let secret_password = Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-        ConcreteValue::String("super-secret-pw".into()),
-    ))));
+    let secret_password = Value::Deferred(DeferredValue::Secret(
+        Box::new(Value::Concrete(ConcreteValue::String(
+            "super-secret-pw".into(),
+        )))
+        .into(),
+    ));
     let secret_arithmetic = Value::Deferred(DeferredValue::IntegerArithmetic(
         carina_core::integer_arithmetic::ValidatedIntegerExpr::new(
-            Value::Deferred(DeferredValue::Secret(Box::new(Value::Concrete(
-                ConcreteValue::Int(42),
-            )))),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::Int(42))).into(),
+            )),
             carina_core::integer_arithmetic::IntegerOp::Add,
             Value::Concrete(ConcreteValue::Int(1)),
             carina_core::integer_arithmetic::IntegerOperatorSpan::synthetic(),
@@ -5647,7 +5664,9 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
         resource_id.clone(),
         HashMap::from([(
             "name".to_string(),
-            Value::Concrete(ConcreteValue::String("created".into())),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String("created".into()))).into(),
+            )),
         )]),
     )
     .with_identifier("created-id");
@@ -5662,9 +5681,14 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
     let export_params = vec![InferredExportParam::for_test(
         "broken".to_string(),
         carina_core::static_type::ExportStaticType::Inferred(
-            carina_core::static_type::StaticType::Known(TypeExpr::Float),
+            carina_core::static_type::StaticType::Known(TypeExpr::String),
         ),
-        Some(Value::Concrete(ConcreteValue::Float(f64::NAN))),
+        Some(
+            carina_core::resource::AuthoredValue::resource_ref("created", "name", Vec::new())
+                .resolve_root_for_test()
+                .into_expanded()
+                .unwrap(),
+        ),
     )];
 
     let error = finalize_apply(
@@ -5693,8 +5717,8 @@ async fn finalize_apply_persists_resource_state_before_reporting_export_error() 
         StatePersistence::Normal,
     )
     .await
-    .expect_err("non-finite export must still be reported");
-    assert!(error.to_string().contains("non-finite"), "{error}");
+    .expect_err("post-apply secret export must still be reported");
+    assert!(error.to_string().contains("secret"), "{error}");
 
     let written = captured.lock().unwrap();
     let state = written
