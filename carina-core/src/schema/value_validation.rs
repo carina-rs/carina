@@ -73,10 +73,6 @@ impl ValueValidationFindings {
         self.local_error.as_ref()
     }
 
-    pub fn has_provider_findings(&self) -> bool {
-        !self.provider.is_empty()
-    }
-
     pub(super) fn local_errors(&self) -> impl Iterator<Item = &TypeError> {
         self.local_error.iter().chain(&self.additional_local_errors)
     }
@@ -255,6 +251,24 @@ impl<'a> CheckedValue<'a> {
         }
     }
 
+    /// Container context applies equally to every undecided branch's CLI
+    /// error. Path-tagged LSP findings keep their precise child locations.
+    fn wrap_local_errors(mut self, wrap: impl Fn(TypeError) -> TypeError) -> Self {
+        if let LocalOutcome::Rejected {
+            primary: (_, error),
+        } = &mut self.local
+        {
+            *error = wrap(error.clone());
+        }
+        self.findings.additional_local_errors = self
+            .findings
+            .additional_local_errors
+            .into_iter()
+            .map(wrap)
+            .collect();
+        self
+    }
+
     fn retain_primary_finding(&mut self) {
         if let LocalOutcome::Rejected { primary } = &self.local
             && self.findings.local.is_empty()
@@ -364,6 +378,46 @@ pub(crate) fn validate_custom_type_leaf<'a, R>(
         .canonical_leaf(declaration.declared_type(), value, checked.local.fit())
         .map_err(|failure| *failure.error)?;
     Ok(validated(proof))
+}
+
+/// Annotation values use state-text enum spelling, including string values
+/// from module and function arguments. Resolve that spelling in the validation
+/// owner before entering the same leaf walk and proof construction. Numeric
+/// bridge text is decoded before local range checks and provider dispatch.
+pub(crate) fn validate_custom_type_annotation_leaf<'a, R>(
+    declaration: crate::parser::IdentifiedCustomTypeDeclaration<'a>,
+    value: &Value,
+    validated: impl FnOnce(Option<LocallyValidatedCustomType<'a>>) -> R,
+) -> Result<R, TypeError> {
+    let normalized = match (declaration.declared_type().raw_shape(), value) {
+        (RawShape::Enum { .. }, Value::Concrete(ConcreteValue::String(text))) => {
+            Some(Value::Concrete(ConcreteValue::CanonicalEnum(
+                crate::resource::EnumValueResolver::new(declaration.declared_type())
+                    .resolve_state_text(text.expose_plaintext())
+                    .map_err(|error| {
+                        crate::provider::CustomTypeCanonicalizationError::EnumResolution {
+                            identity: declaration.identity().clone(),
+                            error: Box::new(error),
+                        }
+                        .into_type_error()
+                    })?,
+            )))
+        }
+        (
+            RawShape::Int { .. } | RawShape::Float { .. },
+            Value::Concrete(ConcreteValue::EnumIdentifier(raw)),
+        ) => Some(
+            crate::provider::bridge_text_to_typed_value(
+                declaration.scalar_kind(),
+                raw.as_str().into(),
+            )
+            .map_err(|error| TypeError::ValidationFailed {
+                message: crate::executor::render_error_chain(&error).into(),
+            })?,
+        ),
+        _ => None,
+    };
+    validate_custom_type_leaf(declaration, normalized.as_ref().unwrap_or(value), validated)
 }
 
 struct CanonicalLeafError<'a> {
@@ -647,13 +701,15 @@ impl<'a> ValueValidator<'a> {
                             },
                         ),
                     };
-                    if let Some(error) = child.local.error().cloned() {
+                    let child = child.wrap_local_errors(|error| {
                         // Unknown/writability errors are already anchored to their field.
-                        let error = if field.is_none() {
+                        if field.is_none() {
                             error
                         } else {
                             error.at_struct_field(key)
-                        };
+                        }
+                    });
+                    if let Some(error) = child.local.error().cloned() {
                         checked.reject(path, error);
                     }
                     checked.findings.local.extend(child.findings.local);
@@ -701,6 +757,7 @@ impl<'a> ValueValidator<'a> {
                 let mut fits = Vec::new();
                 let mut exactness = FitExactness::GENERIC_MAP;
                 let mut first_value_error = None;
+                let mut additional_value_errors = Vec::new();
                 for (map_key, map_value) in map {
                     let next_path = path.push_field(map_key.clone());
                     let key_value: Value<P, B> = lift_map_key(key, map_key, self.defs);
@@ -730,17 +787,29 @@ impl<'a> ValueValidator<'a> {
                         child.findings.local.iter().any(|(_, error)| {
                             !matches!(error, TypeError::FieldGroupViolation { .. })
                         });
+                    if let Some(error) = child.local.error().cloned().filter(|_| has_coarse_error) {
+                        // The collector's coarse diagnostic always uses
+                        // MapValueError, even when the primary inner error
+                        // is a field group with its own precise path.
+                        first_value_error.get_or_insert(TypeError::MapValueError {
+                            key: map_key.clone(),
+                            inner: Box::new(error),
+                        });
+                    }
+                    let child = child.wrap_local_errors(|error| error.at_map_value(map_key));
+                    // Ordinary map entries retain the collector's first-error
+                    // precedence. Undecided branches each retain a finding;
+                    // field groups already have precise findings below.
+                    additional_value_errors.extend(
+                        child
+                            .findings
+                            .additional_local_errors
+                            .iter()
+                            .filter(|error| !matches!(error, TypeError::FieldGroupViolation { .. }))
+                            .cloned(),
+                    );
                     if let Some(error) = child.local.error().cloned() {
-                        checked.reject(path, error.clone().at_map_value(map_key));
-                        if has_coarse_error {
-                            // The collector's coarse diagnostic always uses
-                            // MapValueError, even when the primary inner error
-                            // is a field group with its own precise path.
-                            first_value_error.get_or_insert(TypeError::MapValueError {
-                                key: map_key.clone(),
-                                inner: Box::new(error),
-                            });
-                        }
+                        checked.reject(path, error);
                     }
                     checked
                         .findings
@@ -767,6 +836,11 @@ impl<'a> ValueValidator<'a> {
                 if let Some(error) = first_value_error {
                     checked.findings.local.push((path.clone(), error));
                 }
+                checked.findings.local.extend(
+                    additional_value_errors
+                        .into_iter()
+                        .map(|error| (path.clone(), error)),
+                );
                 checked.local = checked
                     .local
                     .map(|_| Fit::with_kind(exactness, attr, FitKind::Map(fits)));
@@ -805,7 +879,9 @@ impl<'a> ValueValidator<'a> {
         let mut children = Vec::new();
         let mut child_fits = Vec::new();
         for (i, value) in items.iter().enumerate() {
-            let child = self.walk(inner, value, &path.push_index(i), ancestry, &mut Vec::new());
+            let child = self
+                .walk(inner, value, &path.push_index(i), ancestry, &mut Vec::new())
+                .wrap_local_errors(|error| error.at_list_index(i));
             let (fit, error) = match child.local {
                 LocalOutcome::Accepted(fit) => (Some(fit), None),
                 LocalOutcome::Rejected {
@@ -853,7 +929,7 @@ impl<'a> ValueValidator<'a> {
             } else if let Some(i) = index
                 && let Some(error) = &children[i].0
             {
-                checked.reject(path, error.clone().at_list_index(i));
+                checked.reject(path, error.clone());
             }
         }
         for (_, findings) in children {
@@ -1144,6 +1220,141 @@ mod tests {
 
     fn text(value: &str) -> Value {
         Value::Concrete(ConcreteValue::String(value.into()))
+    }
+
+    #[test]
+    fn issue_4276_round4_nested_module_if_wraps_every_branch_error() {
+        let leaf = AT::refined_string(None, None, Some((None, Some(5))), None);
+        let branch = Value::Deferred(DeferredValue::ModuleIf(Box::new(
+            crate::parser::DeferredValueIf::new(
+                crate::parser::DeferredIfCondition::new(
+                    crate::parser::ParsedValue::resource_ref("gate", "flag", Vec::new()),
+                    "child/main.crn".into(),
+                    2,
+                ),
+                Value::Concrete(ConcreteValue::String("aaaaaa".into())),
+                Value::Concrete(ConcreteValue::String("bbbbbbb".into())),
+            ),
+        )));
+        for (ty, value, context) in [
+            (
+                AT::list(leaf.clone()),
+                Value::Concrete(ConcreteValue::List(vec![branch.clone()])),
+                "List item at index 0",
+            ),
+            (
+                AT::struct_(
+                    "Named",
+                    vec![PatternStructField::optional("name", leaf.clone()).build()],
+                ),
+                Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                    "name".into(),
+                    branch.clone(),
+                )]))),
+                "Struct field 'name'",
+            ),
+            (
+                AT::map(leaf.clone()),
+                Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                    "name".into(),
+                    branch.clone(),
+                )]))),
+                "Map value for key 'name'",
+            ),
+            (
+                AT::list(AT::map(leaf)),
+                Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    ConcreteValue::Map(indexmap::IndexMap::from([("name".into(), branch)])),
+                )])),
+                "List item at index 0: Map value for key 'name'",
+            ),
+        ] {
+            let findings =
+                validate_value_locally(&ty, &value, &BTreeMap::new(), FieldAncestry::WRITABLE);
+            assert_eq!(
+                findings
+                    .into_errors()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                vec![
+                    format!(
+                        "{context}: Invalid value 'aaaaaa': length 6 is outside allowed range [, 5]"
+                    ),
+                    format!(
+                        "{context}: Invalid value 'bbbbbbb': length 7 is outside allowed range [, 5]"
+                    ),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn issue_4276_round4_raw_resolver_entry_guards_local_validation() {
+        let ty = AT::refined_string(
+            Some(TypeIdentity::bare("Short")),
+            None,
+            Some((None, Some(5))),
+            None,
+        );
+        let declaration = crate::parser::IdentifiedCustomTypeDeclaration::new(&ty).unwrap();
+        let calls = std::sync::Mutex::new(Vec::new());
+        let resolver = |_: crate::parser::CustomTypeValidationTarget<'_>, value: &Value| {
+            calls.lock().unwrap().push(value.clone());
+            Ok(())
+        };
+        let target = crate::parser::CustomTypeValidationTarget::Declaration {
+            owner: "test",
+            declaration,
+        };
+        let result = crate::parser::validate_custom_type_value(&resolver, target, &text("aaaaaa"));
+        assert!(matches!(
+            result,
+            Err(crate::parser::CustomTypeValidationError::InvalidDeclarationValue { .. })
+        ));
+        assert!(calls.lock().unwrap().is_empty());
+        crate::parser::validate_custom_type_value(&resolver, target, &text("ok")).unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec![text("ok")]);
+    }
+
+    #[test]
+    fn issue_4276_round4_resolver_implements_only_proof_dispatch() {
+        struct Resolver(std::sync::Mutex<Vec<String>>);
+        impl crate::parser::CustomTypeResolver for Resolver {
+            fn validate_validated(
+                &self,
+                owner: &str,
+                proof: LocallyValidatedCustomType<'_>,
+            ) -> Result<(), crate::parser::CustomTypeValidationError> {
+                assert_eq!(owner, "test");
+                assert_eq!(proof.declaration().identity(), &TypeIdentity::bare("Short"));
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(proof.canonical().as_str().to_string());
+                Ok(())
+            }
+        }
+        let ty = AT::refined_string(
+            Some(TypeIdentity::bare("Short")),
+            None,
+            Some((None, Some(5))),
+            None,
+        );
+        let target = crate::parser::CustomTypeValidationTarget::Declaration {
+            owner: "test",
+            declaration: crate::parser::IdentifiedCustomTypeDeclaration::new(&ty).unwrap(),
+        };
+        let resolver = Resolver(Default::default());
+        let error = crate::parser::validate_custom_type_value(&resolver, target, &text("aaaaaa"))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "test rejected `Short`: Invalid Short value 'aaaaaa': length 6 is outside allowed range [, 5]"
+        );
+        assert!(resolver.0.lock().unwrap().is_empty());
+        crate::parser::validate_custom_type_value(&resolver, target, &text("ok")).unwrap();
+        assert_eq!(*resolver.0.lock().unwrap(), vec!["ok"]);
     }
 
     #[test]

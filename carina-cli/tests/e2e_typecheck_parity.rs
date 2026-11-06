@@ -34,6 +34,9 @@ use carina_lsp::document::Document;
 use tempfile::TempDir;
 use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
 
+#[path = "e2e_typecheck_parity/round4.rs"]
+mod round4;
+
 // ============================================================================
 // Fixture + helpers (mirror carina-lsp/tests/e2e_typecheck.rs)
 // ============================================================================
@@ -6196,12 +6199,16 @@ fn issue_4276_round2_a_local_union_lsp_keeps_one_arms_provider_findings() {
             ("providers.crn", "provider awsccmock {}\n"),
             ("main.crn", source),
         ]);
+        let mut expected = vec![local];
+        if !tie {
+            // MissingRequired retains both main's container warning and
+            // resource-level error, independently of provider findings.
+            expected.push(local);
+        }
+        expected.push("awsccmock rejected `VpcId`: Invalid vpc_id 'bad': must start with 'vpc-'");
         assert_eq!(
             single_value_walk_lsp_value_findings(single_value_walk_m01_factories(ty), &fixture),
-            vec![
-                local,
-                "awsccmock rejected `VpcId`: Invalid vpc_id 'bad': must start with 'vpc-'"
-            ]
+            expected,
         );
     }
 }

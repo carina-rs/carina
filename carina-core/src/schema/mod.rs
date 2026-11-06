@@ -228,10 +228,12 @@ mod resolved_attr_type;
 mod resolved_union_members;
 mod type_identity;
 mod value_validation;
-pub(crate) use value_validation::validate_custom_type_leaf;
 pub use value_validation::{
     LocallyValidatedCustomType, ResourceValueValidation, ValidatedCustomTypeLookup,
     ValueValidationFindings,
+};
+pub(crate) use value_validation::{
+    validate_custom_type_annotation_leaf, validate_custom_type_leaf,
 };
 
 pub use assignability::{AssignmentSink, SinkAuthority, TypeAssignability, TypeAssignmentDeferral};

@@ -1609,7 +1609,7 @@ mod provider_config_tests {
     ) -> crate::parser::CustomTypeValidatorFn {
         let resolver = crate::provider::FactoryCustomTypeResolver::new(factories);
         Box::new(move |target, value| {
-            crate::parser::CustomTypeResolver::validate(&resolver, target, value)
+            crate::parser::validate_custom_type_value(&resolver, target, value)
         })
     }
 
@@ -1749,7 +1749,7 @@ mod provider_config_tests {
         let factories: Vec<Box<dyn ProviderFactory>> = Vec::new();
         let validator = crate::provider::FactoryCustomTypeResolver::new(factories.as_slice());
 
-        let error = crate::parser::CustomTypeResolver::validate(
+        let error = crate::parser::validate_custom_type_value(
             &validator,
             crate::parser::CustomTypeValidationTarget::Declaration {
                 owner: "missing",

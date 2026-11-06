@@ -2069,7 +2069,17 @@ mod tests {
                         )
                     })
                 }),
-            ),
+            )
+            .with_declarations_for_test(std::collections::BTreeMap::from([(
+                "test".into(),
+                vec![crate::schema::CompiledAttributeType::enum_(
+                    identity.clone(),
+                    None,
+                    Vec::new(),
+                    None,
+                    None,
+                )],
+            )])),
             ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
 
@@ -2163,7 +2173,11 @@ mod tests {
                         .push(canonical.to_string());
                     Ok(())
                 }),
-            ),
+            )
+            .with_declarations_for_test(std::collections::BTreeMap::from([(
+                "test".into(),
+                vec![declared_type.clone()],
+            )])),
             ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
         let schema_type = TypeExpr::SchemaType {
@@ -2374,7 +2388,14 @@ mod tests {
                     ));
                     Ok(())
                 }),
-            ),
+            )
+            .with_declarations_for_test(std::collections::BTreeMap::from([
+                (
+                    "bare-provider".into(),
+                    vec![enum_type(bare_identity.clone())],
+                ),
+                ("test".into(), vec![enum_type(schema_identity.clone())]),
+            ])),
             ..crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty())
         };
         let value = Value::Concrete(ConcreteValue::String("enabled".into()));

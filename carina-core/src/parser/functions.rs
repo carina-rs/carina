@@ -761,7 +761,8 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
         .flatten();
     if let Some(projection) = projection.as_ref() {
         if let Some(declaration) = super::IdentifiedCustomTypeDeclaration::new(projection) {
-            config.custom_type_resolver().validate(
+            super::validate_custom_type_value(
+                config.custom_type_resolver(),
                 super::CustomTypeValidationTarget::Declaration {
                     owner: owned.provider_names().next().expect("nonempty owners"),
                     declaration,
@@ -784,9 +785,11 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
                 )?;
         }
     } else {
-        config
-            .custom_type_resolver()
-            .validate(super::CustomTypeValidationTarget::Annotation(owned), &value)?;
+        super::validate_custom_type_value(
+            config.custom_type_resolver(),
+            super::CustomTypeValidationTarget::Annotation(owned),
+            &value,
+        )?;
     }
     // The resolved witness can cross a catalog boundary (including serde).
     // Retain its constraints even when the current catalog is less restrictive.
