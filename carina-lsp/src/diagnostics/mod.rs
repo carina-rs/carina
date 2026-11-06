@@ -1498,7 +1498,7 @@ impl DiagnosticRun<'_> {
                             *value = evaluated;
                         }
                     }
-                    let value_validation = validated_schema.validate_values_with_resolver(
+                    let mut value_validation = validated_schema.validate_values_with_resolver(
                         &resolved_attrs,
                         &|attr| resource_quoted_string_attrs.contains(attr),
                         self.provider_context.catalog().custom_type_resolver(),
@@ -1576,7 +1576,6 @@ impl DiagnosticRun<'_> {
                                 .effective_attribute(canonical_name)
                                 .expect("validated schema attributes must have effective views");
                             let effective_type = effective_attribute.value_type();
-                            let value_findings = value_validation.attribute(attr_name);
                             // The shared resource-level validator below owns read-only
                             // assignments. Skip type and authoring guidance here so it
                             // emits the single writability diagnostic, matching core.
@@ -1656,11 +1655,33 @@ impl DiagnosticRun<'_> {
                             // structured diagnostic path. Union attributes stay in
                             // the guarded match below so deferred values keep #2847's
                             // behavior and static values are validated only once.
+                            // Reuse a report only for the value it actually checked.
+                            // Authored containers and assignment expressions can
+                            // differ from the statically evaluated resource value.
+                            let mut cached_findings = value_validation.take_attribute(attr_name);
+                            let mut findings_for = |value: &Value| {
+                                if resolved_attrs.get(attr_name).is_some_and(|cached_value| {
+                                    validation::same_validation_input(cached_value, value)
+                                }) && let Some(findings) = cached_findings.take()
+                                {
+                                    findings
+                                } else {
+                                    effective_type.validate_findings(value)
+                                }
+                            };
+                            let attr_findings = findings_for(attr_value);
+                            let assignment_value =
+                                judged_expression.assignment_value(typecheck_value);
+                            let assignment_findings =
+                                (!validation::same_validation_input(assignment_value, attr_value))
+                                    .then(|| findings_for(assignment_value));
+                            let value_findings =
+                                assignment_findings.as_ref().unwrap_or(&attr_findings);
                             if matches!(
                                 effective_type.shape(),
                                 carina_core::schema::Shape::Enum { .. }
                             ) && let Some(diag) = build_enum_diagnostic(
-                                value_findings.and_then(|findings| findings.local_error()),
+                                attr_findings.local_error(),
                                 attr_name,
                                 resource_quoted_string_attrs.contains(attr_name),
                                 doc,
@@ -1720,10 +1741,7 @@ impl DiagnosticRun<'_> {
                                     Some(tagged.to_string())
                                 }
                             };
-                            let type_error = match (
-                                attr_shape,
-                                judged_expression.assignment_value(typecheck_value),
-                            ) {
+                            let type_error = match (attr_shape, assignment_value) {
                                 // Bool type should not receive String
                                 (
                                     carina_core::schema::Shape::Bool,
@@ -1754,7 +1772,7 @@ impl DiagnosticRun<'_> {
                                 // classify binding kinds independently.
                                 (_, value @ Value::Deferred(DeferredValue::Coalesce { .. })) => {
                                     value_findings
-                                        .and_then(|findings| findings.local_error())
+                                        .local_error()
                                         .cloned()
                                         .map(|error| error.with_attribute(attr_name).to_string())
                                         .or_else(|| {
@@ -1846,10 +1864,8 @@ impl DiagnosticRun<'_> {
                                 // namespace-shape fallback) — surface the
                                 // plain message so the user still sees a
                                 // diagnostic, just without the quick-fix.
-                                (carina_core::schema::Shape::Enum { .. }, _value) => value_findings
-                                    .and_then(|findings| findings.local_error())
-                                    .cloned()
-                                    .map(|e| {
+                                (carina_core::schema::Shape::Enum { .. }, _value) => {
+                                    value_findings.local_error().cloned().map(|e| {
                                         let tagged = e.with_attribute(attr_name);
                                         let reshaped =
                                             if resource_quoted_string_attrs.contains(attr_name) {
@@ -1858,7 +1874,8 @@ impl DiagnosticRun<'_> {
                                                 tagged
                                             };
                                         reshaped.to_string()
-                                    }),
+                                    })
+                                }
                                 // The shared whole-schema pass below validates identified
                                 // scalars with the owner-bound lookup. Doing it here as well
                                 // would execute native or bridged callbacks twice per edit.
@@ -1916,7 +1933,7 @@ impl DiagnosticRun<'_> {
                                         ) =>
                                 {
                                     value_findings
-                                        .and_then(|findings| findings.local_error())
+                                        .local_error()
                                         .cloned()
                                         .and_then(&mut diagnose_schema_error)
                                 }
@@ -1970,8 +1987,7 @@ impl DiagnosticRun<'_> {
                                         doc,
                                         rref,
                                         attr_name,
-                                        value_findings
-                                            .map_or(&[], |findings| findings.local_findings()),
+                                        attr_findings.into_local_findings(),
                                     );
                                 if reported_duplicate {
                                     reported_attribute_diagnostics
@@ -1984,7 +2000,7 @@ impl DiagnosticRun<'_> {
 
                     // Render the report produced by the single owner-bound walk.
                     {
-                        for (provider_finding, error) in value_validation.errors() {
+                        for (_, error) in value_validation.errors() {
                             let error = error.clone();
                             if let carina_core::schema::TypeError::MissingRequired { name } = &error
                                 && pending_resource_sinks.iter().any(
@@ -2025,20 +2041,17 @@ impl DiagnosticRun<'_> {
                             }
                             // Skip errors that are already reported with precise positions
                             // by the attribute-level checks above, including intrinsic secrets.
-                            if !provider_finding
-                                && matches!(
-                                    &error,
-                                    carina_core::schema::TypeError::FieldGroupViolation { path, .. }
-                                        if !path.is_empty()
-                                )
-                            {
+                            if matches!(
+                                &error,
+                                carina_core::schema::TypeError::FieldGroupViolation { path, .. }
+                                    if !path.is_empty()
+                            ) {
                                 continue;
                             }
                             // Statically evaluated expressions may first become known
                             // in this pass. Suppress list refinements only when
                             // the attribute pass emitted them.
-                            if !provider_finding
-                                && is_duplicate_list_error(&error)
+                            if is_duplicate_list_error(&error)
                                 && error.attribute_name().is_some_and(|attribute| {
                                     let canonical = bn_map
                                         .get(attribute)
@@ -2049,7 +2062,7 @@ impl DiagnosticRun<'_> {
                             {
                                 continue;
                             }
-                            if !provider_finding && !is_duplicate_list_error(&error)
+                            if !is_duplicate_list_error(&error)
                                 && matches!(
                                     &error,
                                     carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
@@ -2066,10 +2079,9 @@ impl DiagnosticRun<'_> {
                             {
                                 continue;
                             }
-                            if !provider_finding
-                                && error.attribute_name().is_some_and(|name| {
-                                    reported_attribute_diagnostics.contains(name)
-                                })
+                            if error
+                                .attribute_name()
+                                .is_some_and(|name| reported_attribute_diagnostics.contains(name))
                             {
                                 continue;
                             }

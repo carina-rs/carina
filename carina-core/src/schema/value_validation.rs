@@ -69,16 +69,12 @@ impl ValueValidationFindings {
         self.local_error.map_or(Ok(()), Err)
     }
 
-    pub(super) fn into_local_findings(self) -> Vec<(FieldPath, TypeError)> {
+    pub fn into_local_findings(self) -> Vec<(FieldPath, TypeError)> {
         self.local
     }
 
     pub fn local_error(&self) -> Option<&TypeError> {
         self.local_error.as_ref()
-    }
-
-    pub fn local_findings(&self) -> &[(FieldPath, TypeError)] {
-        &self.local
     }
 
     fn first_error(&self) -> Option<&TypeError> {
@@ -113,12 +109,12 @@ pub struct ResourceValueValidation {
 }
 
 impl ResourceValueValidation {
-    pub fn attribute(&self, name: &str) -> Option<&ValueValidationFindings> {
-        self.attributes.get(name)
+    pub fn take_attribute(&mut self, name: &str) -> Option<ValueValidationFindings> {
+        self.attributes.remove(name)
     }
 
-    /// The boolean identifies provider findings, which retain their own
-    /// diagnostic even when another leaf in the attribute failed locally.
+    /// The boolean identifies provider findings. Renderers apply their usual
+    /// diagnostic deduplication to both local and provider errors.
     pub fn errors(&self) -> impl Iterator<Item = (bool, &TypeError)> {
         self.errors
             .iter()
@@ -141,6 +137,20 @@ impl ResourceValueValidation {
 
 struct CheckedValue<'a> {
     fit: Option<Fit<'a>>,
+    findings: ValueValidationFindings,
+}
+
+impl InsideSecret for CheckedValue<'_> {
+    fn inside_secret(self) -> Self {
+        Self {
+            fit: self.fit,
+            findings: self.findings.inside_secret(),
+        }
+    }
+}
+
+struct UnionFailure<'a> {
+    local_fit: Option<UnionFit<'a>>,
     findings: ValueValidationFindings,
 }
 
@@ -211,19 +221,14 @@ pub(super) fn validate_value_with_lookup<P: PlaceholderKind, B: BindingAddress>(
     attr: &CompiledAttributeType,
     value: &Value<P, B>,
     defs: &BTreeMap<String, CompiledAttributeType>,
+    ancestry: FieldAncestry,
     lookup: CustomTypeLookup<'_>,
 ) -> ValueValidationFindings {
     ValueValidator {
         defs,
         lookup: Some(lookup),
     }
-    .walk(
-        attr,
-        value,
-        &FieldPath::new(),
-        FieldAncestry::WRITABLE,
-        &mut Vec::new(),
-    )
+    .walk(attr, value, &FieldPath::new(), ancestry, &mut Vec::new())
     .findings
 }
 
@@ -250,7 +255,12 @@ pub(crate) fn validate_custom_type_leaf<'a, R>(
         return Err(error.clone());
     }
     let proof = validator
-        .canonical_leaf(declaration.declared_type(), value, checked.fit.as_ref())
+        .canonical_leaf(
+            declaration.declared_type(),
+            value,
+            checked.fit.as_ref(),
+            !has_native_validator(declaration.declared_type()),
+        )
         .map_err(|failure| *failure.error)?;
     Ok(validated(proof))
 }
@@ -274,23 +284,17 @@ impl<'a> ValueValidator<'a> {
             let checked = inner.try_project_plaintext(|value| {
                 let checked = self.walk(attr, value, path, ancestry.inside_secret(), visited);
                 if checked.findings.first_error().is_some() {
-                    Err(Box::new(checked.findings))
+                    Err(Box::new(checked))
                 } else {
-                    Ok(checked.fit)
+                    Ok(checked)
                 }
             });
-            return match checked {
-                Ok(Some(fit)) => {
-                    CheckedValue::accepted(attr, fit.exactness, FitKind::Secret(Box::new(fit)))
-                }
-                Ok(None) => CheckedValue {
-                    fit: None,
-                    findings: Default::default(),
-                },
-                Err(findings) => CheckedValue {
-                    fit: None,
-                    findings: *findings,
-                },
+            let checked = checked.unwrap_or_else(|checked| *checked);
+            return CheckedValue {
+                fit: checked
+                    .fit
+                    .map(|fit| Fit::with_kind(fit.exactness, attr, FitKind::Secret(Box::new(fit)))),
+                findings: checked.findings,
             };
         }
         if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
@@ -371,9 +375,18 @@ impl<'a> ValueValidator<'a> {
                         fit: Box::new(selected.fit),
                     },
                 ),
-                Err(findings) => CheckedValue {
-                    fit: None,
-                    findings: *findings,
+                Err(failure) => CheckedValue {
+                    fit: failure.local_fit.map(|selected| {
+                        Fit::with_kind(
+                            selected.fit.exactness,
+                            attr,
+                            FitKind::Union {
+                                member: selected.member,
+                                fit: Box::new(selected.fit),
+                            },
+                        )
+                    }),
+                    findings: failure.findings,
                 },
             };
         }
@@ -480,7 +493,8 @@ impl<'a> ValueValidator<'a> {
                 let mut exactness = FitExactness::EXACT;
                 for (key, value) in map {
                     let child_path = path.push_field(key.clone());
-                    let child = match struct_field_for_key(fields, key, ancestry) {
+                    let field = struct_field_for_key(fields, key, ancestry);
+                    let child = match field {
                         Some(field) => match validate_struct_field_assignment(field, key, ancestry)
                         {
                             Some(error) => CheckedValue::rejected(&child_path, error),
@@ -503,7 +517,7 @@ impl<'a> ValueValidator<'a> {
                     };
                     if let Some(error) = child.findings.local_error {
                         // Unknown/writability errors are already anchored to their field.
-                        let error = if struct_field_for_key(fields, key, ancestry).is_none() {
+                        let error = if field.is_none() {
                             error
                         } else {
                             error.at_struct_field(key)
@@ -555,8 +569,18 @@ impl<'a> ValueValidator<'a> {
                 for (map_key, map_value) in map {
                     let next_path = path.push_field(map_key.clone());
                     let key_value: Value<P, B> = lift_map_key(key, map_key, self.defs);
-                    let key_checked =
-                        self.walk(key, &key_value, &next_path, ancestry, &mut Vec::new());
+                    // Map keys have local constraints, but main dispatches only values.
+                    let key_checked = ValueValidator {
+                        defs: self.defs,
+                        lookup: None,
+                    }
+                    .walk(
+                        key,
+                        &key_value,
+                        &next_path,
+                        ancestry,
+                        &mut Vec::new(),
+                    );
                     if let Some(error) = key_checked.findings.local_error {
                         let error = TypeError::MapKeyError {
                             key: map_key.clone(),
@@ -568,10 +592,6 @@ impl<'a> ValueValidator<'a> {
                             .get_or_insert_with(|| error.clone());
                         checked.findings.local.push((next_path.clone(), error));
                     }
-                    checked
-                        .findings
-                        .provider
-                        .extend(key_checked.findings.provider);
                     let child =
                         self.walk(value_type, map_value, &next_path, ancestry, &mut Vec::new());
                     let has_coarse_error =
@@ -725,27 +745,31 @@ impl<'a> ValueValidator<'a> {
         path: &FieldPath,
         ancestry: FieldAncestry,
         visited: &mut Vec<&'a str>,
-    ) -> Result<UnionFit<'a>, Box<ValueValidationFindings>> {
-        let mut best: Option<(&CompiledAttributeType, CheckedValue<'a>)> = None;
+    ) -> Result<UnionFit<'a>, Box<UnionFailure<'a>>> {
+        let mut best_local: Option<UnionFit<'a>> = None;
+        let mut provider_accepted = false;
         let mut failure: Option<BestUnionMemberFailures> = None;
         let mut provider_failure = false;
         let mut provider_only_errors: Option<Vec<(FieldPath, TypeError)>> = None;
         let mut sibling_provider_errors = Vec::new();
         for member in members {
-            let checked = self.walk(member, value, path, ancestry, visited);
-            if checked.accepts() {
-                if best
-                    .as_ref()
-                    .is_none_or(|(_, current)| checked.fit > current.fit)
-                {
-                    best = Some((member, checked));
-                }
-                if best.as_ref().is_some_and(|(_, checked)| {
-                    checked
-                        .fit
-                        .as_ref()
-                        .is_some_and(|fit| fit.exactness.is_maximal())
-                }) {
+            let mut checked = self.walk(member, value, path, ancestry, visited);
+            let accepts = checked.accepts();
+            let maximal = checked
+                .fit
+                .as_ref()
+                .is_some_and(|fit| fit.exactness.is_maximal());
+            // Local structure and uniqueness use the best local fit even if
+            // that arm is rejected by its provider. Union acceptance also
+            // requires an arm whose provider checks succeeded.
+            if let Some(fit) = checked.fit.take()
+                && best_local.as_ref().is_none_or(|current| fit > current.fit)
+            {
+                best_local = Some(UnionFit { member, fit });
+            }
+            if accepts {
+                provider_accepted = true;
+                if maximal {
                     break;
                 }
                 continue;
@@ -807,17 +831,20 @@ impl<'a> ValueValidator<'a> {
                 }
             }
         }
-        if let Some((member, CheckedValue { fit: Some(fit), .. })) = best {
-            return Ok(UnionFit { member, fit });
+        if provider_accepted && let Some(best) = best_local {
+            return Ok(best);
         }
         // Keep main's complete provider error set when the best shape tier
         // contains only locally accepted arms. Within that tier, preserve its
         // smallest-set/declaration-order choice instead of inventing a new
         // Union message or dropping sibling provider findings.
         if let Some(provider) = provider_only_errors {
-            return Err(Box::new(ValueValidationFindings {
-                provider,
-                ..Default::default()
+            return Err(Box::new(UnionFailure {
+                local_fit: best_local,
+                findings: ValueValidationFindings {
+                    provider,
+                    ..Default::default()
+                },
             }));
         }
         let error = match (failure, value.as_concrete()) {
@@ -847,7 +874,10 @@ impl<'a> ValueValidator<'a> {
             CheckedValue::rejected(path, error)
         };
         checked.findings.provider.extend(sibling_provider_errors);
-        Err(Box::new(checked.findings))
+        Err(Box::new(UnionFailure {
+            local_fit: best_local,
+            findings: checked.findings,
+        }))
     }
 
     fn leaf<P: PlaceholderKind, B: BindingAddress>(
@@ -895,10 +925,11 @@ impl<'a> ValueValidator<'a> {
             fit: Some(fit),
             findings: Default::default(),
         };
+        let requires_provider = self.lookup.is_some() && !has_native_validator(attr);
         if let Some(lookup) = self.lookup
-            && !has_native_validator(attr)
+            && requires_provider
         {
-            match self.canonical_leaf(attr, value, checked.fit.as_ref()) {
+            match self.canonical_leaf(attr, value, checked.fit.as_ref(), requires_provider) {
                 Ok(Some(proof)) => {
                     if proof.requires_provider()
                         && let Err(error) = lookup.validate(proof)
@@ -923,7 +954,13 @@ impl<'a> ValueValidator<'a> {
         attr: &'a CompiledAttributeType,
         value: &Value<P, B>,
         fit: Option<&Fit<'a>>,
+        requires_provider: bool,
     ) -> Result<Option<LocallyValidatedCustomType<'a>>, CanonicalLeafError<'a>> {
+        // Native validation already ran. No dispatch means no value expansion
+        // or canonical spelling is needed, including for standalone annotations.
+        if !requires_provider {
+            return Ok(None);
+        }
         let Some(declaration) = crate::parser::IdentifiedCustomTypeDeclaration::new(attr) else {
             return Ok(None);
         };
@@ -932,7 +969,6 @@ impl<'a> ValueValidator<'a> {
         if matches!(&attr.kind, AttrTypeKind::Reference { .. }) {
             return Ok(None);
         }
-        let requires_provider = !has_native_validator(attr);
         let value = if let Some(Fit {
             kind: FitKind::Enum { canonical, .. },
             ..

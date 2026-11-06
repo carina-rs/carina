@@ -6,26 +6,63 @@ use carina_core::parser::{AnalysisResourceRef, Located};
 use carina_core::schema::{FieldPath, FieldPathStep, TypeError, ValidatedResourceSchema};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-impl DiagnosticEngine {
-    // Preserve the original renderer fixtures without adding validation to
-    // the production rendering path.
-    #[cfg(test)]
-    pub(super) fn validate_container_value(
-        &self,
-        doc: &Document,
-        resource: &AnalysisResourceRef<'_>,
-        attr_name: &str,
-        value: &super::Value,
-        effective_type: &carina_core::schema::EffectiveType<'_>,
-    ) -> (Vec<Diagnostic>, bool) {
-        self.render_container_findings(
-            doc,
-            resource,
-            attr_name,
-            &effective_type.validate_collect(value),
-        )
-    }
+/// Runtime equality ignores string provenance and equates some enum/string
+/// spellings. Cached diagnostics require the same authored representation.
+pub(super) fn same_validation_input(left: &super::Value, right: &super::Value) -> bool {
+    use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 
+    if std::ptr::eq(left, right) {
+        return true;
+    }
+    match (left, right) {
+        (
+            Value::Concrete(ConcreteValue::String(left)),
+            Value::Concrete(ConcreteValue::String(right)),
+        ) => left == right && left.is_diagnostic_sensitive() == right.is_diagnostic_sensitive(),
+        (
+            Value::Concrete(ConcreteValue::List(left)),
+            Value::Concrete(ConcreteValue::List(right)),
+        ) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| same_validation_input(left, right))
+        }
+        (Value::Concrete(ConcreteValue::Map(left)), Value::Concrete(ConcreteValue::Map(right))) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|((left_key, left), (right_key, right))| {
+                        left_key == right_key && same_validation_input(left, right)
+                    })
+        }
+        (
+            Value::Deferred(DeferredValue::Secret(left)),
+            Value::Deferred(DeferredValue::Secret(right)),
+        ) => left.visit(|left| right.visit(|right| same_validation_input(left, right))),
+        (
+            Value::Deferred(DeferredValue::Coalesce {
+                value: left,
+                default: left_default,
+            }),
+            Value::Deferred(DeferredValue::Coalesce {
+                value: right,
+                default: right_default,
+            }),
+        ) => {
+            same_validation_input(left, right) && same_validation_input(left_default, right_default)
+        }
+        (Value::Concrete(left_value), Value::Concrete(right_value)) => {
+            std::mem::discriminant(left_value) == std::mem::discriminant(right_value)
+                && left == right
+        }
+        _ => false,
+    }
+}
+
+impl DiagnosticEngine {
     /// Attach each cached path-tagged error to the
     /// authored key, list element, or nearest authored computed parent.
     pub(super) fn render_container_findings(
@@ -33,22 +70,16 @@ impl DiagnosticEngine {
         doc: &Document,
         resource: &AnalysisResourceRef<'_>,
         attr_name: &str,
-        findings: &[(FieldPath, TypeError)],
+        findings: Vec<(FieldPath, TypeError)>,
     ) -> (Vec<Diagnostic>, bool) {
         let mut diagnostics = Vec::new();
         let mut reported_duplicate = false;
         for (path, error) in findings {
-            let error = error.clone();
             let is_duplicate = super::is_duplicate_list_error(&error);
             let is_item_error = path
                 .steps()
                 .iter()
                 .any(|step| matches!(step, FieldPathStep::Index(_)));
-            let location = if is_duplicate {
-                resource.attribute_value_location(attr_name, path)
-            } else {
-                resource.attribute_path_location(attr_name, path)
-            };
             let attribute = if is_item_error
                 && !is_duplicate
                 && !matches!(&error, TypeError::FieldGroupViolation { .. })
@@ -70,16 +101,16 @@ impl DiagnosticEngine {
             } else {
                 error.to_string()
             };
-            let finding = Located::new(location.clone(), error);
-            let diagnostic = if path.is_empty()
+            let use_value_location = path.is_empty()
                 && (is_duplicate
-                    || crate::code_action::enum_diagnostic_data_for_error(finding.detail())
-                        .is_some())
-            {
-                let finding = Located::new(
-                    resource.attribute_value_location(attr_name, path).clone(),
-                    finding.detail().clone(),
-                );
+                    || crate::code_action::enum_diagnostic_data_for_error(&error).is_some());
+            let location = if is_duplicate || use_value_location {
+                resource.attribute_value_location(attr_name, &path)
+            } else {
+                resource.attribute_path_location(attr_name, &path)
+            };
+            let finding = Located::new(location.clone(), error);
+            let diagnostic = if use_value_location {
                 render_schema_diagnostic(
                     doc,
                     &finding,

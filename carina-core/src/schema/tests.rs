@@ -33,6 +33,160 @@ use crate::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
 
+#[test]
+fn issue_4276_known_provider_populated_ancestry_keeps_required_fields_inert() {
+    let schema = PatternResourceSchema::new("test.Output")
+        .attribute(
+            PatternAttributeSchema::provider_populated(
+                "output",
+                PatternAttributeType::struct_(
+                    "Output",
+                    vec![
+                        PatternStructField::required("eventual", PatternAttributeType::string())
+                            .build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let attributes = HashMap::from([(
+        "output".into(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+    )]);
+    // main enters through EffectiveAttribute::validate with ProviderPopulated ancestry.
+    assert_eq!(
+        schema.validate_known_values_with_origins_and_lookup(&attributes, &|_| false, no_lookup()),
+        Ok(())
+    );
+    assert_eq!(
+        schema.validate_selected_known_values_with_origins_and_lookup(
+            &attributes,
+            &HashSet::from(["output".into()]),
+            &|_| false,
+            no_lookup(),
+        ),
+        Ok(())
+    );
+}
+
+#[test]
+fn issue_4276_known_provider_populated_ancestry_rejects_nested_assignment() {
+    let schema = PatternResourceSchema::new("test.Output")
+        .attribute(
+            PatternAttributeSchema::provider_populated(
+                "output",
+                PatternAttributeType::struct_(
+                    "Output",
+                    vec![
+                        PatternStructField::optional("value", PatternAttributeType::string())
+                            .build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .validate()
+        .unwrap();
+    let attributes = HashMap::from([(
+        "output".into(),
+        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+            "value".into(),
+            string_value("provider value"),
+        )]))),
+    )]);
+    let expected = schema
+        .effective_attribute("output")
+        .unwrap()
+        .validate(&attributes["output"])
+        .unwrap_err()
+        .with_attribute("output");
+    assert_eq!(
+        schema.validate_known_values_with_origins_and_lookup(&attributes, &|_| false, no_lookup()),
+        Err(vec![expected])
+    );
+}
+
+#[test]
+fn issue_4276_provider_failure_keeps_union_child_fit_for_unique_lists() {
+    let element = AttributeType::union(vec![
+        AttributeType::refined_string(Some(TypeIdentity::bare("Remote")), None, None, None),
+        AttributeType::refined_string(Some(TypeIdentity::bare("OtherRemote")), None, None, None),
+    ]);
+    let ty = RootlessType::new(AttributeType::refined_list(
+        element,
+        true,
+        None,
+        ListElements::Unique,
+    ));
+    let value = Value::Concrete(ConcreteValue::List(vec![
+        string_value("same"),
+        string_value("same"),
+    ]));
+    // main checks uniqueness with the local Union fit before running providers.
+    let local = ty.validate(&value).unwrap_err();
+    assert!(matches!(
+        local,
+        TypeError::DuplicateListElement {
+            index: 1,
+            first_index: 0,
+            ..
+        }
+    ));
+    let lookup = |_: &AttributeType, _: &Value| {
+        Err(TypeError::ValidationFailed {
+            message: "remote rejection".into(),
+        })
+    };
+    let errors = ty.validate_with_lookup(&value, &lookup).unwrap_err();
+    assert_eq!(errors.first(), Some(&local), "{errors:?}");
+    assert_eq!(
+        errors.len(),
+        3,
+        "the duplicate and both provider failures must survive: {errors:?}"
+    );
+}
+
+#[test]
+fn issue_4276_map_keys_are_local_and_only_values_reach_provider() {
+    let key = AttributeType::refined_string(
+        Some(TypeIdentity::bare("Key")),
+        Some(CompiledPattern::try_new("^key$").unwrap()),
+        None,
+        None,
+    );
+    let value_type =
+        AttributeType::refined_string(Some(TypeIdentity::bare("Entry")), None, None, None);
+    let ty = RootlessType::new(AttributeType::map_with_key(key, value_type));
+    let value = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "key".into(),
+        string_value("entry"),
+    )])));
+    let calls = std::sync::Mutex::new(Vec::new());
+    let lookup = |declaration: &AttributeType, _: &Value| {
+        let identity = crate::provider::identified_custom_type_identity(declaration).unwrap();
+        calls.lock().unwrap().push(identity.kind.clone());
+        Err(TypeError::ValidationFailed {
+            message: format!("{} rejected", identity.kind).into(),
+        })
+    };
+    let errors = ty.validate_with_lookup(&value, &lookup).unwrap_err();
+    assert_eq!(*calls.lock().unwrap(), vec!["Entry"]);
+    assert_eq!(
+        errors.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        vec!["Validation failed: Entry rejected"]
+    );
+    let invalid_key = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+        "bad".into(),
+        string_value("entry"),
+    )])));
+    assert!(matches!(
+        ty.validate(&invalid_key),
+        Err(TypeError::MapKeyError { .. })
+    ));
+}
+
 fn map_entries(count: usize) -> Value {
     Value::Concrete(ConcreteValue::Map(
         (0..count)
@@ -15409,7 +15563,7 @@ fn validate_skips_value_unknown_for_primitive_types() {
 #[test]
 fn walk_custom_lookup_skips_value_unknown() {
     // Custom-typed attributes (e.g. AWS resource-id types like `vpc_id`)
-    // run through `walk_custom_lookup` instead of `validate`. Skip
+    // use the combined local/provider validation entry. Skip
     // `Value::Deferred(DeferredValue::Unknown)` here too, otherwise a custom-typed attribute
     // bound from a for-expression element fails plan with
     // `expected vpc_id, got unknown`.
@@ -15426,21 +15580,19 @@ fn walk_custom_lookup_skips_value_unknown() {
         None,
     );
 
-    let mut errors = Vec::new();
-    walk_custom_lookup(
-        &custom_type,
-        &LoopValue::Deferred(LoopDeferredValue::Placeholder(
-            crate::resource::LoopSlot::Value,
-        )),
-        Some("vpc_id"),
-        &|_, _| {
-            Err(TypeError::ValidationFailed {
-                message: "should never be called".into(),
-            })
-        },
-        crate::schema::empty_defs_for_schema_walks(),
-        &mut errors,
-    );
+    let errors = RootlessType::new(custom_type)
+        .validate_with_lookup(
+            &LoopValue::Deferred(LoopDeferredValue::Placeholder(
+                crate::resource::LoopSlot::Value,
+            )),
+            &|_: &AttributeType, _: &Value| {
+                Err(TypeError::ValidationFailed {
+                    message: "should never be called".into(),
+                })
+            },
+        )
+        .err()
+        .unwrap_or_default();
     assert!(
         errors.is_empty(),
         "Value::Deferred(DeferredValue::Unknown) must not invoke the custom validator, got: {errors:?}"
@@ -15584,15 +15736,13 @@ fn union_walk_custom_lookup_succeeds_when_any_member_accepts() {
         }
     };
 
-    let mut errors = Vec::new();
-    walk_custom_lookup(
-        &union,
-        &Value::Concrete(ConcreteValue::String("anything".into())),
-        Some("attr"),
-        &lookup,
-        crate::schema::empty_defs_for_schema_walks(),
-        &mut errors,
-    );
+    let errors = RootlessType::new(union)
+        .validate_with_lookup(
+            &Value::Concrete(ConcreteValue::String("anything".into())),
+            &lookup,
+        )
+        .err()
+        .unwrap_or_default();
     assert!(
         errors.is_empty(),
         "Union must succeed when any member accepts; got errors: {errors:?}"
@@ -15618,15 +15768,13 @@ fn union_walk_custom_lookup_emits_smallest_error_set_when_all_fail() {
         })
     };
 
-    let mut errors = Vec::new();
-    walk_custom_lookup(
-        &union,
-        &Value::Concrete(ConcreteValue::String("anything".into())),
-        Some("attr"),
-        &lookup,
-        crate::schema::empty_defs_for_schema_walks(),
-        &mut errors,
-    );
+    let errors = RootlessType::new(union)
+        .validate_with_lookup(
+            &Value::Concrete(ConcreteValue::String("anything".into())),
+            &lookup,
+        )
+        .err()
+        .unwrap_or_default();
     assert_eq!(
         errors.len(),
         1,
@@ -15669,15 +15817,13 @@ fn union_walk_custom_lookup_cidr_accepts_ipv4_when_lookup_routes_correctly() {
         }
     };
 
-    let mut errors = Vec::new();
-    walk_custom_lookup(
-        &cidr,
-        &Value::Concrete(ConcreteValue::String("10.0.0.0/8".into())),
-        Some("cidr"),
-        &lookup,
-        crate::schema::empty_defs_for_schema_walks(),
-        &mut errors,
-    );
+    let errors = RootlessType::new(cidr)
+        .validate_with_lookup(
+            &Value::Concrete(ConcreteValue::String("10.0.0.0/8".into())),
+            &lookup,
+        )
+        .err()
+        .unwrap_or_default();
     assert!(
         errors.is_empty(),
         "Union<ipv4_cidr, ipv6_cidr> must accept `10.0.0.0/8`; got: {errors:?}"

@@ -8157,17 +8157,36 @@ fn validate_custom_type_annotation(
             crate::schema::LocallyValidatedCustomType<'_>,
         )> = None;
         for declaration in declarations {
-            let canonical = crate::schema::validate_custom_type_leaf(
-                crate::parser::IdentifiedCustomTypeDeclaration::new(declaration)
-                    .expect("indexed declaration is identified"),
-                value,
-                |proof| proof,
-            )
-            .map_err(|error| CustomTypeValidationError::InvalidDeclarationValue {
-                owner: owner.clone(),
-                identity: identity.clone(),
-                error: Box::new(error),
-            })?;
+            // Reference identities are indexed for annotations but have no
+            // provider validation capability. Preserve their offline checks.
+            if matches!(declaration.raw_shape(), RawShape::Reference { .. }) {
+                declaration
+                    .validate_identified_scalar_value(value)
+                    .map_err(|error| CustomTypeValidationError::InvalidDeclarationValue {
+                        owner: owner.clone(),
+                        identity: identity.clone(),
+                        error: Box::new(error),
+                    })?;
+                continue;
+            }
+            let identified = crate::parser::IdentifiedCustomTypeDeclaration::new(declaration)
+                .ok_or_else(|| CustomTypeValidationError::InvalidDeclarationValue {
+                    owner: owner.clone(),
+                    identity: identity.clone(),
+                    error: Box::new(
+                        CustomTypeCanonicalizationError::UnidentifiedDeclaration {
+                            type_name: declaration.type_name(),
+                        }
+                        .into_type_error(),
+                    ),
+                })?;
+            let canonical =
+                crate::schema::validate_custom_type_leaf(identified, value, |proof| proof)
+                    .map_err(|error| CustomTypeValidationError::InvalidDeclarationValue {
+                        owner: owner.clone(),
+                        identity: identity.clone(),
+                        error: Box::new(error),
+                    })?;
 
             if enum_definition_signature(declaration).is_some()
                 && let Some(proof) = &canonical
@@ -9257,6 +9276,58 @@ mod tests {
         ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
             Box::pin(async { Err(ProviderError::internal("not used")) })
         }
+    }
+
+    #[test]
+    fn issue_4276_annotation_reference_stays_offline() {
+        use crate::parser::{CustomTypeValidationError, OwnedTypeIdentity};
+        let identity = TypeIdentity::bare("Reference");
+        let declaration = AttributeType::reference(identity.clone(), None, Some((Some(3), None)));
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(ConfigOnlyCustomTypeFactory)];
+        let index = BTreeMap::from([(
+            "config-owner".into(),
+            OwnerCustomTypeIndex {
+                factory_index: 0,
+                declarations: BTreeMap::from([(identity.clone(), vec![declaration])]),
+            },
+        )]);
+        let owned =
+            OwnedTypeIdentity::provider("config-owner", identity, RefinedScalarKind::String);
+        // main validates Reference constraints locally and never creates a provider bridge.
+        assert_eq!(
+            validate_custom_type_annotation(&factories, &index, &owned, &string_value("valid")),
+            Ok(())
+        );
+        assert!(matches!(
+            validate_custom_type_annotation(&factories, &index, &owned, &string_value("x")),
+            Err(CustomTypeValidationError::InvalidDeclarationValue { .. })
+        ));
+    }
+
+    #[test]
+    fn issue_4276_annotation_unidentified_index_returns_typed_error() {
+        use crate::parser::{CustomTypeValidationError, OwnedTypeIdentity};
+        let identity = TypeIdentity::bare("Indexed");
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(ConfigOnlyCustomTypeFactory)];
+        let index = BTreeMap::from([(
+            "config-owner".into(),
+            OwnerCustomTypeIndex {
+                factory_index: 0,
+                declarations: BTreeMap::from([(identity.clone(), vec![AttributeType::string()])]),
+            },
+        )]);
+        let owned =
+            OwnedTypeIdentity::provider("config-owner", identity, RefinedScalarKind::String);
+        let result =
+            validate_custom_type_annotation(&factories, &index, &owned, &string_value("value"));
+        // main's local declaration check/canonicalizer returns a typed failure here.
+        assert!(
+            matches!(
+                result,
+                Err(CustomTypeValidationError::InvalidDeclarationValue { .. })
+            ),
+            "{result:?}"
+        );
     }
 
     #[test]

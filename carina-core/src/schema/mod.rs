@@ -513,28 +513,6 @@ fn attributes_without_placeholders<P: PlaceholderKind, B: BindingAddress>(
         .collect()
 }
 
-// Keep the original lookup fixtures on the complete validator. This adapter
-// has no traversal of its own and is absent from production builds.
-#[cfg(test)]
-fn walk_custom_lookup<P: PlaceholderKind, B: BindingAddress>(
-    attr: &CompiledAttributeType,
-    value: &Value<P, B>,
-    attribute: Option<&str>,
-    lookup: &(impl Fn(&CompiledAttributeType, &Value) -> Result<(), TypeError> + Send + Sync),
-    defs: &BTreeMap<String, CompiledAttributeType>,
-    errors: &mut Vec<TypeError>,
-) {
-    errors.extend(
-        value_validation::validate_value_with_lookup(attr, value, defs, lookup)
-            .into_errors()
-            .into_iter()
-            .map(|error| match attribute {
-                Some(attribute) => error.with_attribute(attribute),
-                None => error,
-            }),
-    );
-}
-
 pub type EnumParts<'a> = (
     &'a TypeIdentity,
     Option<&'a [String]>,
@@ -1855,6 +1833,7 @@ impl RootlessType {
             &self.schema.root,
             value,
             &self.schema.defs,
+            FieldAncestry::WRITABLE,
             lookup,
         )
         .into_errors();
@@ -2100,19 +2079,11 @@ impl Schema {
         attr: &PatternAttributeType<Compiled>,
         value: &Value<P, B>,
     ) -> Result<(), TypeError> {
-        validate_attr_with_defs(attr, value, &self.defs)
+        validate_attr_with_defs(attr, value, &self.defs, FieldAncestry::WRITABLE)
     }
 }
 
-fn validate_attr_with_defs<P: PlaceholderKind, B: BindingAddress>(
-    attr: &PatternAttributeType<Compiled>,
-    value: &Value<P, B>,
-    defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
-) -> Result<(), TypeError> {
-    validate_attr_with_defs_and_ancestry(attr, value, defs, FieldAncestry::WRITABLE)
-}
-
-pub(crate) fn validate_attr_with_defs_and_ancestry<P: PlaceholderKind, B: BindingAddress>(
+pub(crate) fn validate_attr_with_defs<P: PlaceholderKind, B: BindingAddress>(
     attr: &PatternAttributeType<Compiled>,
     value: &Value<P, B>,
     defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
@@ -3236,7 +3207,12 @@ impl PatternAttributeType<Compiled> {
         &self,
         value: &Value<P, B>,
     ) -> Result<(), TypeError> {
-        validate_attr_with_defs(self, value, empty_defs_for_schema_walks())
+        validate_attr_with_defs(
+            self,
+            value,
+            empty_defs_for_schema_walks(),
+            FieldAncestry::WRITABLE,
+        )
     }
 
     /// Validate a non-container value after the ancestry-aware structural
@@ -3310,7 +3286,12 @@ impl PatternAttributeType<Compiled> {
                 | AttrTypeKind::Float { .. }
                 | AttrTypeKind::Enum { .. }
         ));
-        validate_attr_with_defs(self, value, empty_defs_for_schema_walks())
+        validate_attr_with_defs(
+            self,
+            value,
+            empty_defs_for_schema_walks(),
+            FieldAncestry::WRITABLE,
+        )
     }
 
     /// Validate a primitive (`String`/`Int`/`Float`/`Bool`/`Duration`) value.
@@ -8452,7 +8433,20 @@ impl<'a> EffectiveType<'a> {
         &self,
         value: &Value<P, B>,
     ) -> Result<(), TypeError> {
-        validate_attr_with_defs_and_ancestry(self.attr_type, value, self.defs, self.field_ancestry)
+        validate_attr_with_defs(self.attr_type, value, self.defs, self.field_ancestry)
+    }
+
+    /// Retain the primary error and all diagnostic paths for this exact value.
+    pub fn validate_findings<P: PlaceholderKind, B: BindingAddress>(
+        &self,
+        value: &Value<P, B>,
+    ) -> ValueValidationFindings {
+        value_validation::validate_value_locally(
+            self.attr_type,
+            value,
+            self.defs,
+            self.field_ancestry,
+        )
     }
 
     /// Validate an authored value and retain paths for every diagnostic.
@@ -8460,13 +8454,7 @@ impl<'a> EffectiveType<'a> {
         &self,
         value: &Value<P, B>,
     ) -> Vec<(FieldPath, TypeError)> {
-        value_validation::validate_value_locally(
-            self.attr_type,
-            value,
-            self.defs,
-            self.field_ancestry,
-        )
-        .into_local_findings()
+        self.validate_findings(value).into_local_findings()
     }
 
     /// Canonicalize provider or persisted state without discarding the
@@ -14665,6 +14653,7 @@ impl PatternResourceSchema<Compiled> {
                     &schema.attr_type,
                     value,
                     &self.defs,
+                    FieldAncestry::from_input_mode(effective_attribute.effective_input_mode()),
                     lookup,
                 );
                 if let Some(error) = findings.local_error() {
