@@ -670,8 +670,8 @@ fn value_serde_round_trip() {
     let values = vec![
         Value::Concrete(ConcreteValue::String("hello".into())),
         Value::Concrete(ConcreteValue::Int(42)),
-        Value::Concrete(ConcreteValue::Float(2.5)),
-        Value::Concrete(ConcreteValue::Float(-0.5)),
+        Value::Concrete(ConcreteValue::Float(crate::finite(2.5))),
+        Value::Concrete(ConcreteValue::Float(crate::finite(-0.5))),
         Value::Concrete(ConcreteValue::Bool(true)),
         Value::Concrete(ConcreteValue::List(vec![
             Value::Concrete(ConcreteValue::String("a".into())),
@@ -2897,8 +2897,8 @@ fn canonical_hash_consistency() {
     let v3 = Value::Concrete(ConcreteValue::Int(43));
     assert_ne!(v1.canonical_hash(), v3.canonical_hash());
 
-    let positive_zero = Value::Concrete(ConcreteValue::Float(0.0));
-    let negative_zero = Value::Concrete(ConcreteValue::Float(-0.0));
+    let positive_zero = Value::Concrete(ConcreteValue::Float(crate::finite(0.0)));
+    let negative_zero = Value::Concrete(ConcreteValue::Float(crate::finite(-0.0)));
     assert!(positive_zero.semantically_equal(&negative_zero));
     assert_eq!(
         positive_zero.canonical_hash(),
@@ -3608,7 +3608,7 @@ fn visit_resource_refs_on_leaf_variants_calls_nothing() {
     for v in [
         Value::Concrete(ConcreteValue::String("s".into())),
         Value::Concrete(ConcreteValue::Int(1)),
-        Value::Concrete(ConcreteValue::Float(1.0)),
+        Value::Concrete(ConcreteValue::Float(crate::finite(1.0))),
         Value::Concrete(ConcreteValue::Bool(true)),
     ] {
         let mut count = 0;
@@ -3624,7 +3624,7 @@ fn canonicalize_leaves_simple_values_alone() {
     for v in [
         Value::Concrete(ConcreteValue::String("s".into())),
         Value::Concrete(ConcreteValue::Int(1)),
-        Value::Concrete(ConcreteValue::Float(1.5)),
+        Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
         Value::Concrete(ConcreteValue::Bool(true)),
         Value::root_resource_ref("vpc", "id", vec![]),
     ] {
@@ -3663,7 +3663,10 @@ fn canonicalize_unwraps_single_scalar_expr_interpolation() {
     let cases: Vec<(Value, &str)> = vec![
         (Value::Concrete(ConcreteValue::String("foo".into())), "foo"),
         (Value::Concrete(ConcreteValue::Int(42)), "42"),
-        (Value::Concrete(ConcreteValue::Float(1.5)), "1.5"),
+        (
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
+            "1.5",
+        ),
         (Value::Concrete(ConcreteValue::Bool(true)), "true"),
     ];
     for (inner, expected) in cases {
@@ -4146,7 +4149,10 @@ fn as_concrete_returns_projection_for_concrete_variants() {
     let cases: Vec<(Value, &'static str)> = vec![
         (Value::Concrete(ConcreteValue::String("x".into())), "String"),
         (Value::Concrete(ConcreteValue::Int(1)), "Int"),
-        (Value::Concrete(ConcreteValue::Float(1.5)), "Float"),
+        (
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
+            "Float",
+        ),
         (Value::Concrete(ConcreteValue::Bool(true)), "Bool"),
         (
             Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(60))),

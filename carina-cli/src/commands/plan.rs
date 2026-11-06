@@ -7208,6 +7208,85 @@ mod load_upstream_states_tests {
     }
 
     #[tokio::test]
+    async fn load_upstream_states_preserves_finite_float_bits_under_both_policies() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.crn"),
+            r#"backend local { path = "carina.state.json" }"#,
+        )
+        .unwrap();
+        let upstream_states = vec![UpstreamState {
+            binding: absolute_binding("orgs"),
+            source: dir.path().to_path_buf(),
+        }];
+        for raw in [-0.0, 0.0, f64::MAX] {
+            write_state(
+                dir.path(),
+                &[("ratio", serde_json::to_value(crate::finite(raw)).unwrap())],
+            );
+            for policy in [
+                UpstreamMissingStatePolicy::Strict,
+                UpstreamMissingStatePolicy::Lenient,
+            ] {
+                let bindings = load_upstream_states(
+                    &crate::test_support::TestCommandRuntime::new(),
+                    &upstream_states,
+                    &ResolvedPath::new(dir.path().parent().unwrap()).unwrap(),
+                    &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+                    &mut HashSet::new(),
+                    policy,
+                )
+                .await
+                .unwrap();
+                let Value::Concrete(ConcreteValue::Float(value)) = bindings["orgs"]["ratio"] else {
+                    panic!("expected float")
+                };
+                assert_eq!(value.get().to_bits(), raw.to_bits());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn load_upstream_states_rejects_float_overflow_under_both_policies_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("main.crn"),
+            r#"backend local { path = "carina.state.json" }"#,
+        )
+        .unwrap();
+        write_state(dir.path(), &[("ratio", serde_json::json!("RAW_FLOAT"))]);
+        let state_path = dir
+            .path()
+            .join(carina_state::LocalBackend::DEFAULT_STATE_FILE);
+        let template = fs::read_to_string(&state_path).unwrap();
+        let upstream_states = vec![UpstreamState {
+            binding: absolute_binding("orgs"),
+            source: dir.path().to_path_buf(),
+        }];
+        for raw in ["1e999", "-1e999", "[1e999]", r#"{"nested":-1e999}"#] {
+            let bytes = template.replace("\"RAW_FLOAT\"", raw).into_bytes();
+            fs::write(&state_path, &bytes).unwrap();
+            for policy in [
+                UpstreamMissingStatePolicy::Strict,
+                UpstreamMissingStatePolicy::Lenient,
+            ] {
+                let error = load_upstream_states(
+                    &crate::test_support::TestCommandRuntime::new(),
+                    &upstream_states,
+                    &ResolvedPath::new(dir.path().parent().unwrap()).unwrap(),
+                    &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+                    &mut HashSet::new(),
+                    policy,
+                )
+                .await
+                .unwrap_err();
+                assert!(matches!(error, AppError::Backend(_)), "{error}");
+                assert_eq!(fs::read(&state_path).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn load_upstream_states_uses_locked_backend_while_migration_is_pending() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(

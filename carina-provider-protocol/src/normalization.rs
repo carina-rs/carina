@@ -20,7 +20,7 @@ use crate::types::ResourceId;
 pub enum NormalizationValue {
     Bool(bool),
     Int(i64),
-    Float(f64),
+    Float(crate::FiniteF64),
     String(String),
     StringList(Vec<String>),
     List(Vec<Self>),
@@ -209,58 +209,38 @@ impl From<NormalizationError> for crate::types::ProviderError {
 
 impl NormalizationValue {
     /// Encode a complex normalization value; ordinary JSON codecs do not use this.
-    pub fn to_json(&self, id: &ResourceId, attribute: &str) -> Result<String, NormalizationError> {
-        fn encode(
-            value: &NormalizationValue,
-            id: &ResourceId,
-            attribute: &str,
-            path: &mut Vec<NormalizationPathSegment>,
-        ) -> Result<serde_json::Value, NormalizationError> {
-            Ok(match value {
+    pub fn to_json(&self) -> String {
+        fn encode(value: &NormalizationValue) -> serde_json::Value {
+            match value {
                 NormalizationValue::Bool(value) => (*value).into(),
                 NormalizationValue::Int(value) => (*value).into(),
-                NormalizationValue::Float(value) => serde_json::Number::from_f64(*value)
-                    .map(serde_json::Value::Number)
-                    .ok_or_else(|| {
-                        NormalizationError::new(
-                            id.clone(),
-                            attribute,
-                            NormalizationErrorKind::Conversion,
-                        )
-                        .with_path(path.clone())
-                    })?,
+                NormalizationValue::Float(value) => {
+                    serde_json::Value::Number(value.to_json_number())
+                }
                 NormalizationValue::String(value) => value.clone().into(),
                 NormalizationValue::StringList(values) => {
                     serde_json::Value::Array(values.iter().cloned().map(Into::into).collect())
                 }
                 NormalizationValue::Deferred(slot) => serde_json::json!({"$carina_deferred": slot}),
                 NormalizationValue::List(values) => {
-                    let mut result = Vec::with_capacity(values.len());
-                    for (index, value) in values.iter().enumerate() {
-                        path.push(NormalizationPathSegment::Index(index));
-                        result.push(encode(value, id, attribute, path)?);
-                        path.pop();
-                    }
-                    serde_json::Value::Array(result)
+                    serde_json::Value::Array(values.iter().map(encode).collect())
                 }
-                NormalizationValue::Map(values) => {
-                    let mut result = serde_json::Map::new();
-                    for (key, value) in values {
-                        path.push(NormalizationPathSegment::Key(key.clone()));
-                        let encoded = encode(value, id, attribute, path)?;
-                        path.pop();
-                        let key = if key.starts_with('$') {
-                            format!("${key}")
-                        } else {
-                            key.clone()
-                        };
-                        result.insert(key, encoded);
-                    }
-                    serde_json::Value::Object(result)
-                }
-            })
+                NormalizationValue::Map(values) => serde_json::Value::Object(
+                    values
+                        .iter()
+                        .map(|(key, value)| {
+                            let key = if key.starts_with('$') {
+                                format!("${key}")
+                            } else {
+                                key.clone()
+                            };
+                            (key, encode(value))
+                        })
+                        .collect(),
+                ),
+            }
         }
-        Ok(encode(self, id, attribute, &mut Vec::new())?.to_string())
+        encode(self).to_string()
     }
 
     /// Decode normalization JSON without collapsing duplicate object keys.
@@ -337,6 +317,7 @@ impl NormalizationValue {
 // Objects retain their entries until duplicate keys have been rejected. Parsing
 // into serde_json::Value first would silently discard duplicate handle markers.
 enum RawJson {
+    Float(crate::FiniteF64),
     Scalar(serde_json::Value),
     List(Vec<Self>),
     Map(Vec<(String, Self)>),
@@ -360,9 +341,9 @@ impl<'de> serde::Deserialize<'de> for RawJson {
                 Ok(RawJson::Scalar(value.into()))
             }
             fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
-                serde_json::Number::from_f64(value)
-                    .map(|value| RawJson::Scalar(serde_json::Value::Number(value)))
-                    .ok_or_else(|| E::custom("unsupported number"))
+                crate::FiniteF64::new(value)
+                    .map(RawJson::Float)
+                    .map_err(E::custom)
             }
             fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
                 Ok(RawJson::Scalar(value.into()))
@@ -408,13 +389,16 @@ impl RawJson {
         let error =
             |kind| NormalizationError::new(id.clone(), attribute, kind).with_path(path.clone());
         Ok(match self {
+            Self::Float(value) => NormalizationValue::Float(value),
             Self::Scalar(serde_json::Value::Bool(value)) => NormalizationValue::Bool(value),
             Self::Scalar(serde_json::Value::String(value)) => NormalizationValue::String(value),
             Self::Scalar(serde_json::Value::Number(value)) => {
                 if let Some(value) = value.as_i64() {
                     NormalizationValue::Int(value)
                 } else if let Some(value) = value.as_f64() {
-                    NormalizationValue::Float(value)
+                    NormalizationValue::Float(crate::FiniteF64::new(value).map_err(|source| {
+                        error(NormalizationErrorKind::Conversion).with_source(source)
+                    })?)
                 } else {
                     return Err(error(NormalizationErrorKind::Conversion));
                 }
@@ -545,7 +529,7 @@ mod tests {
                 ]),
             ),
         ]));
-        let json = value.to_json(&id(), "rules").unwrap();
+        let json = value.to_json();
         assert!(json.contains("\"$$carina_deferred\""));
         assert_eq!(
             NormalizationValue::from_json(&json, &id(), "rules").unwrap(),
@@ -621,7 +605,7 @@ mod tests {
                         } else {
                             f64::from(self.next() as i16) / 8.0
                         };
-                        NormalizationValue::Float(value)
+                        NormalizationValue::Float(crate::finite(value))
                     }
                     3 => {
                         let text = STRINGS[self.choose(STRINGS.len())];
@@ -667,9 +651,7 @@ mod tests {
         for case in 0..5_000_u64 {
             let seed = 0x4194_5eed_d011_a425_u64.wrapping_add(case);
             let original = SplitMix64(seed).tree(4);
-            let json = original
-                .to_json(&resource_id, "generated")
-                .unwrap_or_else(|error| panic!("seed={seed:#018x}: encode failed: {error}"));
+            let json = original.to_json();
             let decoded = NormalizationValue::from_json(&json, &resource_id, "generated")
                 .unwrap_or_else(|error| {
                     panic!("seed={seed:#018x}: decode failed: {error}; JSON={json}")

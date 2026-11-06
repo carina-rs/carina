@@ -927,18 +927,6 @@ impl CarinaProvider for MockProcessProvider {
         if identifier.as_str() == "__mock_read_error__" {
             return Err(Self::operation_error("read", id));
         }
-        if identifier.as_str() == "__mock_non_finite_read__" {
-            return Ok(ReadOutcome::Found {
-                state: AppliedState {
-                    id: id.clone(),
-                    identifier: identifier.clone(),
-                    attributes: BTreeMap::from([(
-                        "values".to_string(),
-                        Value::List(vec![Value::Float(f64::NAN)]),
-                    )]),
-                },
-            });
-        }
 
         let mut states = self.states.lock().unwrap();
         let key = identifier.as_str().to_string();
@@ -1029,12 +1017,15 @@ impl CarinaProvider for MockProcessProvider {
         let sent = Self::sent_attributes(&request.resource.attributes);
         let canonical_identifier = Self::canonical_identifier(&request.resource.attributes);
         if unencodable_created {
-            let (identifier, mut attributes) = self.create_done(request, None);
-            attributes.insert(
-                "__mock_unencodable__".to_string(),
-                Value::List(vec![Value::Float(f64::NAN)]),
-            );
-            return Ok(attempt.issued(identifier, sent).succeeded(attributes));
+            let (identifier, _attributes) = self.create_done(request, None);
+            let token = CreateOperation {
+                remaining: 100,
+                polls_served: UNENCODABLE_CREATE_TOKEN_POLLS,
+                mode: CreateMode::Pending,
+            };
+            return Ok(attempt
+                .issued(identifier, sent)
+                .pending(CreateToken::Operation(token), 1));
         }
         if unencodable_pending || unencodable_pending_issued {
             let token = CreateOperation {

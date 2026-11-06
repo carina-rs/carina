@@ -1984,7 +1984,7 @@ mod provider_config_tests {
         for value in [
             Value::Concrete(ConcreteValue::Int(60)),
             Value::Concrete(ConcreteValue::Int(-61)),
-            Value::Concrete(ConcreteValue::Float(1.25)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.25))),
         ] {
             lookup(&admit_declaration(declaration.clone()), &value)
                 .expect("numeric scalar must bridge");

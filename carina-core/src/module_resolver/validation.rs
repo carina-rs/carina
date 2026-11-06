@@ -1083,7 +1083,7 @@ fn compare_values<P: PlaceholderKind, B: BindingAddress>(
     if let (Value::Concrete(left), Value::Concrete(right)) = (left, right)
         && let Some(pair) = NumericPair::new(left, right)
     {
-        return Ok(ordering_satisfies(op, pair.partial_cmp()));
+        return Ok(ordering_satisfies(op, pair.cmp()));
     }
     match (left, right) {
         (
@@ -1114,19 +1114,19 @@ fn compare_values<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
-fn ordering_satisfies(op: &CompareOp, ordering: Option<Ordering>) -> bool {
+fn ordering_satisfies(op: &CompareOp, ordering: Ordering) -> bool {
     match op {
-        CompareOp::Gte => matches!(ordering, Some(Ordering::Greater | Ordering::Equal)),
-        CompareOp::Lte => matches!(ordering, Some(Ordering::Less | Ordering::Equal)),
-        CompareOp::Gt => ordering == Some(Ordering::Greater),
-        CompareOp::Lt => ordering == Some(Ordering::Less),
-        CompareOp::Eq => ordering == Some(Ordering::Equal),
-        CompareOp::Ne => ordering != Some(Ordering::Equal),
+        CompareOp::Gte => matches!(ordering, Ordering::Greater | Ordering::Equal),
+        CompareOp::Lte => matches!(ordering, Ordering::Less | Ordering::Equal),
+        CompareOp::Gt => ordering == Ordering::Greater,
+        CompareOp::Lt => ordering == Ordering::Less,
+        CompareOp::Eq => ordering == Ordering::Equal,
+        CompareOp::Ne => ordering != Ordering::Equal,
     }
 }
 
-fn compare_ordered<T: PartialOrd>(left: &T, op: &CompareOp, right: &T) -> Result<bool, String> {
-    Ok(ordering_satisfies(op, left.partial_cmp(right)))
+fn compare_ordered<T: Ord>(left: &T, op: &CompareOp, right: &T) -> Result<bool, String> {
+    Ok(ordering_satisfies(op, left.cmp(right)))
 }
 
 fn compare_equality<T: PartialEq>(
@@ -1189,17 +1189,17 @@ mod tests {
         for (left, right, expected) in [
             (
                 ValidateExpr::Int(9_007_199_254_740_993),
-                ValidateExpr::Float(9_007_199_254_740_992.0),
+                ValidateExpr::Float(crate::finite(9_007_199_254_740_992.0)),
                 [true, false, true, false, false, true],
             ),
             (
-                ValidateExpr::Float(9_007_199_254_740_992.0),
+                ValidateExpr::Float(crate::finite(9_007_199_254_740_992.0)),
                 ValidateExpr::Int(9_007_199_254_740_993),
                 [false, true, false, true, false, true],
             ),
             (
                 ValidateExpr::Int(i64::MAX),
-                ValidateExpr::Float(9_223_372_036_854_775_808.0),
+                ValidateExpr::Float(crate::finite(9_223_372_036_854_775_808.0)),
                 [false, true, false, true, false, true],
             ),
             (
@@ -1240,38 +1240,6 @@ mod tests {
                 } else {
                     assert!(
                         matches!(result, ConstraintEvaluation::Violated(_)),
-                        "{expression:?}: {result:?}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn require_exact_numeric_nan_only_ne_is_true() {
-        for number in [ValidateExpr::Int(3), ValidateExpr::Float(3.0)] {
-            for (left, right) in [
-                (number.clone(), ValidateExpr::Float(f64::NAN)),
-                (ValidateExpr::Float(f64::NAN), number),
-            ] {
-                for op in [
-                    CompareOp::Gt,
-                    CompareOp::Lt,
-                    CompareOp::Gte,
-                    CompareOp::Lte,
-                    CompareOp::Eq,
-                    CompareOp::Ne,
-                ] {
-                    let expected = matches!(op, CompareOp::Ne);
-                    let expression = ValidateExpr::Compare {
-                        lhs: Box::new(left.clone()),
-                        op,
-                        rhs: Box::new(right.clone()),
-                    };
-                    let result = evaluate_constraint(&expression, &HashMap::new(), "NaN ordering");
-                    assert_eq!(
-                        matches!(result, ConstraintEvaluation::Satisfied),
-                        expected,
                         "{expression:?}: {result:?}"
                     );
                 }

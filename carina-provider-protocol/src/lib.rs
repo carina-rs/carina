@@ -452,6 +452,11 @@ pub const PERSISTED_SECRET_KEY: &str = "$secret";
 pub use types::*;
 
 #[cfg(test)]
+pub(crate) fn finite(value: f64) -> FiniteF64 {
+    FiniteF64::new(value).unwrap()
+}
+
+#[cfg(test)]
 mod operation_poll_tests {
     use std::cell::{Cell, RefCell};
     use std::future::{Future, ready};

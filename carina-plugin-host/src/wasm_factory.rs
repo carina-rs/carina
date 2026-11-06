@@ -5942,10 +5942,12 @@ impl WasmProvider {
         failure: wasm_convert::IdentifierReportedReadDecodeFailure,
     ) -> (AppliedIdentifier, Option<Sent>, Observation, ProviderError) {
         let (identifier, sent, declared_error, decode_error) = failure.into_parts();
-        let read_error =
-            wasm_value_decode_provider_error(operation, decode_error).for_resource(id.clone());
-        let error =
-            declared_error.unwrap_or_else(|| ProviderError::from_wire(read_error.to_wire()));
+        let decode_error = Arc::new(decode_error);
+        let read_error = wasm_value_decode_provider_error(operation, Arc::clone(&decode_error))
+            .for_resource(id.clone());
+        let error = declared_error.unwrap_or_else(|| {
+            wasm_value_decode_provider_error(operation, decode_error).for_resource(id.clone())
+        });
         (identifier, sent, Observation::ReadFailed(read_error), error)
     }
 
@@ -7759,11 +7761,7 @@ impl ProviderNormalizer for WasmProviderNormalizer {
                         wasm_value_encode_provider_error("normalize_desired", error)
                     })
                 })?;
-            let sent = desired_normalization::encode(&batch).map_err(|error| {
-                desired_normalization_provider_error(resources, error, |error| {
-                    wasm_value_encode_provider_error("normalize_desired", error)
-                })
-            })?;
+            let sent = desired_normalization::encode(&batch);
             // Acquire and drop the guarded store in this future; never nest block_on.
             let result = {
                 let locked = instance.acquire("normalize_desired").await?;
@@ -8109,16 +8107,16 @@ mod tests {
     }
 
     #[test]
-    fn normalization_operation_wrapper_preserves_sources_and_renders_float_once() {
+    fn normalization_operation_wrapper_preserves_sources_and_renders_cause_once() {
         use carina_provider_protocol::normalization::{NormalizationError, NormalizationErrorKind};
         use std::error::Error;
         let id = carina_provider_protocol::types::ResourceId {
             provider: "mock".into(),
             resource_type: "example".into(),
-            identity: "float-error".into(),
+            identity: "duration-error".into(),
         };
         let source = NormalizationError::new(id, "value", NormalizationErrorKind::Conversion)
-            .with_source(carina_core::protocol_convert::ProtocolConvertError::NonFiniteFloat);
+            .with_source(carina_core::protocol_convert::ProtocolConvertError::DurationOutOfRange);
         let error = wasm_value_encode_provider_error("normalize_desired", source);
         let normalization = error
             .detail()
@@ -8136,7 +8134,7 @@ mod tests {
         );
         let rendered = error.to_string();
         let reason =
-            carina_core::protocol_convert::ProtocolConvertError::NonFiniteFloat.to_string();
+            carina_core::protocol_convert::ProtocolConvertError::DurationOutOfRange.to_string();
         assert_eq!(rendered.matches(&reason).count(), 1, "{rendered}");
     }
 
@@ -8162,12 +8160,14 @@ mod tests {
             let error = if encoding {
                 resources[1].attributes.insert(
                     "value".into(),
-                    Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                    Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                        u64::MAX,
+                    ))),
                 );
                 NormalizationBatch::new(&resources).err().unwrap()
             } else {
                 let batch = NormalizationBatch::new(&resources).unwrap();
-                let mut returned = desired_normalization::encode(&batch).unwrap();
+                let mut returned = desired_normalization::encode(&batch);
                 returned[1].attributes[0].1 = wit_types::DesiredValue::MapVal("[]".into());
                 desired_normalization::apply(&mut resources, batch, returned).unwrap_err()
             };
@@ -12600,7 +12600,9 @@ mod tests {
             &factory,
             IndexMap::from([(
                 "extra".into(),
-                Value::Concrete(ConcreteValue::Float(f64::NAN)),
+                Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                    u64::MAX,
+                ))),
             )]),
         )
         .unwrap_err();
@@ -12609,7 +12611,7 @@ mod tests {
         };
         assert!(matches!(
             wire.conversion_error(),
-            carina_core::protocol_convert::ProtocolConvertError::NonFiniteFloat
+            carina_core::protocol_convert::ProtocolConvertError::DurationOutOfRange
         ));
         assert_eq!(wire.attribute(), "extra");
         assert_eq!(
@@ -12620,7 +12622,7 @@ mod tests {
         );
         assert_eq!(
             error.to_string(),
-            "provider mock configuration: attribute `extra` cannot cross the provider wire: non-finite float cannot cross the provider protocol"
+            "provider mock configuration: attribute `extra` cannot cross the provider wire: duration in seconds does not fit the provider protocol integer domain"
         );
         assert!(std::error::Error::source(&error).is_none());
         assert!(factory.shared_instances.lock().await.is_empty());

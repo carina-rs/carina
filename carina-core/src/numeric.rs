@@ -2,14 +2,16 @@
 
 use std::cmp::Ordering;
 
+use crate::FiniteF64;
 use crate::resource::{BindingAddress, ConcreteValue, ValueKind};
 
 const I64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
 const I64_UPPER_BOUND_F64: f64 = 9_223_372_036_854_775_808.0;
 
 /// Return the integer only when the float represents an in-range integer exactly.
-pub(crate) fn float_as_exact_i64(f: f64) -> Option<i64> {
-    if !f.is_finite() || f.fract() != 0.0 || !(I64_MIN_F64..I64_UPPER_BOUND_F64).contains(&f) {
+pub(crate) fn float_as_exact_i64(f: FiniteF64) -> Option<i64> {
+    let f = f.get();
+    if f.fract() != 0.0 || !(I64_MIN_F64..I64_UPPER_BOUND_F64).contains(&f) {
         return None;
     }
 
@@ -19,41 +21,40 @@ pub(crate) fn float_as_exact_i64(f: f64) -> Option<i64> {
 }
 
 /// Compare without rounding the integer, including at the i64 boundaries.
-pub(crate) fn compare_int_float(i: i64, f: f64) -> Option<Ordering> {
-    if f.is_nan() {
-        return None;
-    }
+pub(crate) fn compare_int_float(i: i64, f: FiniteF64) -> Ordering {
+    let f = f.get();
     if f >= I64_UPPER_BOUND_F64 {
-        return Some(Ordering::Less);
+        return Ordering::Less;
     }
     if f < I64_MIN_F64 {
-        return Some(Ordering::Greater);
+        return Ordering::Greater;
     }
 
     // Truncation is an integral float in [-2^63, 2^63), so the cast is exact.
     let truncated = f.trunc() as i64;
-    Some(match i.cmp(&truncated) {
+    match i.cmp(&truncated) {
         Ordering::Equal if f.fract() > 0.0 => Ordering::Less,
         Ordering::Equal if f.fract() < 0.0 => Ordering::Greater,
         ordering => ordering,
-    })
+    }
 }
 
 /// Convert only integers that have an exact float representation.
-pub(crate) fn int_to_exact_f64(i: i64) -> Option<f64> {
+pub(crate) fn int_to_exact_f64(i: i64) -> Option<FiniteF64> {
     // The exact comparison below permits returning this candidate only if no rounding occurred.
     #[allow(clippy::cast_precision_loss)]
     let float = i as f64;
-    (compare_int_float(i, float) == Some(Ordering::Equal)).then_some(float)
+    let float = FiniteF64::new(float).expect("an i64 cast is always finite");
+    (compare_int_float(i, float) == Ordering::Equal).then_some(float)
 }
 
 /// Classify numeric operands while retaining their original representations.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum NumericPair {
     Ints(i64, i64),
-    Floats(f64, f64),
-    IntFloat(i64, f64),
-    FloatInt(f64, i64),
+    Floats(FiniteF64, FiniteF64),
+    IntFloat(i64, FiniteF64),
+    FloatInt(FiniteF64, i64),
 }
 
 impl NumericPair {
@@ -78,12 +79,12 @@ impl NumericPair {
         }
     }
 
-    pub(crate) fn partial_cmp(&self) -> Option<Ordering> {
+    pub(crate) fn cmp(&self) -> Ordering {
         match *self {
-            Self::Ints(left, right) => Some(left.cmp(&right)),
-            Self::Floats(left, right) => left.partial_cmp(&right),
+            Self::Ints(left, right) => left.cmp(&right),
+            Self::Floats(left, right) => left.cmp(&right),
             Self::IntFloat(left, right) => compare_int_float(left, right),
-            Self::FloatInt(left, right) => compare_int_float(right, left).map(Ordering::reverse),
+            Self::FloatInt(left, right) => compare_int_float(right, left).reverse(),
         }
     }
 }
@@ -98,34 +99,27 @@ mod tests {
     #[test]
     fn compare_int_float_exact_numeric_table() {
         for (integer, float, expected) in [
-            (9_007_199_254_740_991, 9_007_199_254_740_992.0, Some(Less)),
-            (9_007_199_254_740_992, 9_007_199_254_740_992.0, Some(Equal)),
-            (
-                9_007_199_254_740_993,
-                9_007_199_254_740_992.0,
-                Some(Greater),
-            ),
-            (-9_007_199_254_740_993, -9_007_199_254_740_992.0, Some(Less)),
-            (i64::MAX, 9_223_372_036_854_775_808.0, Some(Less)),
-            (i64::MAX, 9_223_372_036_854_774_784.0, Some(Greater)),
-            (i64::MIN, -9_223_372_036_854_775_808.0, Some(Equal)),
-            (i64::MIN + 1, -9_223_372_036_854_775_808.0, Some(Greater)),
-            (i64::MIN, -9_223_372_036_854_777_856.0, Some(Greater)),
-            (3, 3.5, Some(Less)),
-            (4, 3.5, Some(Greater)),
-            (-3, -3.5, Some(Greater)),
-            (-4, -3.5, Some(Less)),
-            (0, 0.5, Some(Less)),
-            (0, -0.5, Some(Greater)),
-            (0, f64::from_bits(1), Some(Less)),
-            (0, -f64::from_bits(1), Some(Greater)),
-            (0, -0.0, Some(Equal)),
-            (0, f64::NAN, None),
-            (i64::MAX, f64::INFINITY, Some(Less)),
-            (i64::MIN, f64::NEG_INFINITY, Some(Greater)),
+            (9_007_199_254_740_991, 9_007_199_254_740_992.0, Less),
+            (9_007_199_254_740_992, 9_007_199_254_740_992.0, Equal),
+            (9_007_199_254_740_993, 9_007_199_254_740_992.0, Greater),
+            (-9_007_199_254_740_993, -9_007_199_254_740_992.0, Less),
+            (i64::MAX, 9_223_372_036_854_775_808.0, Less),
+            (i64::MAX, 9_223_372_036_854_774_784.0, Greater),
+            (i64::MIN, -9_223_372_036_854_775_808.0, Equal),
+            (i64::MIN + 1, -9_223_372_036_854_775_808.0, Greater),
+            (i64::MIN, -9_223_372_036_854_777_856.0, Greater),
+            (3, 3.5, Less),
+            (4, 3.5, Greater),
+            (-3, -3.5, Greater),
+            (-4, -3.5, Less),
+            (0, 0.5, Less),
+            (0, -0.5, Greater),
+            (0, f64::from_bits(1), Less),
+            (0, -f64::from_bits(1), Greater),
+            (0, -0.0, Equal),
         ] {
             assert_eq!(
-                compare_int_float(integer, float),
+                compare_int_float(integer, crate::finite(float)),
                 expected,
                 "{integer} vs {float:?}"
             );
@@ -146,11 +140,12 @@ mod tests {
             (3.5, None),
             (-3.5, None),
             (f64::from_bits(1), None),
-            (f64::NAN, None),
-            (f64::INFINITY, None),
-            (f64::NEG_INFINITY, None),
         ] {
-            assert_eq!(float_as_exact_i64(float), expected, "{float:?}");
+            assert_eq!(
+                float_as_exact_i64(crate::finite(float)),
+                expected,
+                "{float:?}"
+            );
         }
     }
 
@@ -170,7 +165,11 @@ mod tests {
             (i64::MIN, Some(-9_223_372_036_854_775_808.0)),
             (i64::MIN + 1, None),
         ] {
-            assert_eq!(int_to_exact_f64(integer), expected, "{integer}");
+            assert_eq!(
+                int_to_exact_f64(integer),
+                expected.map(crate::finite),
+                "{integer}"
+            );
         }
     }
 
@@ -180,44 +179,37 @@ mod tests {
             (
                 ConcreteValue::Int(i64::MAX),
                 ConcreteValue::Int(i64::MAX - 1),
-                Some(Greater),
+                Greater,
             ),
             (
-                ConcreteValue::Float(3.0),
-                ConcreteValue::Float(3.5),
-                Some(Less),
+                ConcreteValue::Float(crate::finite(3.0)),
+                ConcreteValue::Float(crate::finite(3.5)),
+                Less,
             ),
             (
                 ConcreteValue::Int(9_007_199_254_740_993),
-                ConcreteValue::Float(9_007_199_254_740_992.0),
-                Some(Greater),
+                ConcreteValue::Float(crate::finite(9_007_199_254_740_992.0)),
+                Greater,
             ),
             (
-                ConcreteValue::Float(9_223_372_036_854_775_808.0),
+                ConcreteValue::Float(crate::finite(9_223_372_036_854_775_808.0)),
                 ConcreteValue::Int(i64::MAX),
-                Some(Greater),
+                Greater,
             ),
-            (
-                ConcreteValue::Float(f64::NAN),
-                ConcreteValue::Float(0.0),
-                None,
-            ),
-            (ConcreteValue::Int(0), ConcreteValue::Float(f64::NAN), None),
-            (ConcreteValue::Float(f64::NAN), ConcreteValue::Int(0), None),
         ] {
             assert_eq!(
-                NumericPair::new(&left, &right).unwrap().partial_cmp(),
+                NumericPair::new(&left, &right).unwrap().cmp(),
                 expected,
                 "{left:?} vs {right:?}"
             );
             assert_eq!(
-                NumericPair::new(&right, &left).unwrap().partial_cmp(),
-                expected.map(std::cmp::Ordering::reverse)
+                NumericPair::new(&right, &left).unwrap().cmp(),
+                expected.reverse()
             );
         }
         for other in [ConcreteValue::Bool(true), ConcreteValue::String("3".into())] {
             assert!(NumericPair::new(&ConcreteValue::Int(3), &other).is_none());
-            assert!(NumericPair::new(&other, &ConcreteValue::Float(3.0)).is_none());
+            assert!(NumericPair::new(&other, &ConcreteValue::Float(crate::finite(3.0))).is_none());
         }
     }
 }

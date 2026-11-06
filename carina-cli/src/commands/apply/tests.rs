@@ -4832,6 +4832,7 @@ async fn saved_plan_apply_reconstructs_and_dispatches_deferred_data_source_read(
             .expect("consumer has applied attributes")
             .get("comment"),
         carina_core::value::json_to_dsl_value(&serde_json::json!("target"))
+            .unwrap()
             .map(|value| value.to_snapshot()),
         "consumer must receive the value published by the apply-time read"
     );
@@ -6470,6 +6471,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
             .expect("target has applied attributes")
             .get("path"),
         carina_core::value::json_to_dsl_value(&serde_json::json!("/"))
+            .unwrap()
             .map(|value| value.to_snapshot()),
         "fixture must mirror AWS read-back defaults that are absent from config"
     );
@@ -6479,6 +6481,7 @@ async fn post_apply_plan_refreshes_existing_resource_data_source_and_is_idempote
             .expect("target has applied attributes")
             .get("max_session_duration"),
         carina_core::value::json_to_dsl_value(&serde_json::json!(3600))
+            .unwrap()
             .map(|value| value.to_snapshot()),
         "fixture must mirror AWS read-back defaults that are absent from config"
     );
@@ -8436,6 +8439,7 @@ fn build_state_after_apply_finds_write_only_with_provider_prefix() {
             .expect("saved resource has applied attributes")
             .get("ipv4_netmask_length"),
         carina_core::value::json_to_dsl_value(&serde_json::Value::String("16".to_string()))
+            .unwrap()
             .map(|value| value.to_snapshot()),
         "write-only attribute should be persisted in state"
     );
@@ -9000,6 +9004,7 @@ fn move_plus_update_keeps_post_update_attributes() {
             .expect("new row has applied attributes")
             .get("value"),
         carina_core::value::json_to_dsl_value(&serde_json::Value::String("prod".to_string()))
+            .unwrap()
             .map(|value| value.to_snapshot()),
         "Move must not overwrite Update's post-apply value",
     );
@@ -9101,6 +9106,7 @@ fn move_alone_carries_attributes_via_managed_current() {
             .expect("new row has applied attributes")
             .get("bucket_name"),
         carina_core::value::json_to_dsl_value(&serde_json::Value::String("my-bucket".to_string(),))
+            .unwrap()
             .map(|value| value.to_snapshot()),
     );
 }

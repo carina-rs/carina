@@ -10362,7 +10362,7 @@ fn argument_type_mismatch_error_escapes_string_literal_value() {
 
 #[test]
 fn argument_type_mismatch_error_preserves_float_fraction() {
-    let value = Value::Concrete(ConcreteValue::Float(1.0));
+    let value = Value::Concrete(ConcreteValue::Float(crate::finite(1.0)));
 
     let msg = module_argument_type_error("count", TypeExpr::Int, value);
 

@@ -1021,7 +1021,7 @@ fn numeric_pairing_hash(value: &Value) -> Option<u64> {
             if let Some(integer) = float_as_exact_i64(*value) {
                 Some(pairing_component_hash(0x06, &integer))
             } else {
-                Some(pairing_component_hash(0x07, &value.to_bits()))
+                Some(pairing_component_hash(0x07, &value.get().to_bits()))
             }
         }
         _ => None,
@@ -1228,9 +1228,9 @@ mod tests {
     #[test]
     fn numeric_pairing_hash_exact_numeric_i64_boundary() {
         assert_ne!(
-            numeric_pairing_hash(&Value::Concrete(ConcreteValue::Float(
+            numeric_pairing_hash(&Value::Concrete(ConcreteValue::Float(crate::finite(
                 9_223_372_036_854_775_808.0
-            ))),
+            )))),
             numeric_pairing_hash(&Value::Concrete(ConcreteValue::Int(i64::MAX))),
         );
     }
@@ -1244,7 +1244,7 @@ mod tests {
             (i64::MIN, -9_223_372_036_854_775_808.0),
         ] {
             assert_eq!(
-                numeric_pairing_hash(&Value::Concrete(ConcreteValue::Float(float))),
+                numeric_pairing_hash(&Value::Concrete(ConcreteValue::Float(crate::finite(float)))),
                 numeric_pairing_hash(&Value::Concrete(ConcreteValue::Int(integer))),
             );
         }

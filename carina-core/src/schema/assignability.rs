@@ -410,7 +410,7 @@ impl<'a, R: PatternForm> TypeInSchema<'a, R> {
 enum NominalScalarConstraints {
     String(Option<(Option<u64>, Option<u64>)>),
     Int(Option<(Option<i64>, Option<i64>)>),
-    Float(Option<(Option<f64>, Option<f64>)>),
+    Float(Option<(Option<crate::FiniteF64>, Option<crate::FiniteF64>)>),
 }
 
 impl NominalScalarConstraints {

@@ -53,7 +53,7 @@ pub(crate) fn builtin_max<B: BindingAddress>(
 
 /// Select the first value if the exact comparison yields `prefer_first`.
 /// On equal comparisons, treat Float(-0.0) as smaller than +0 (including Int(0)),
-/// selecting the second for remaining ties. Reject NaN operands.
+/// selecting the second for remaining ties.
 fn compare_values<B: BindingAddress>(
     a: &Value<NoPlaceholder, B>,
     b: &Value<NoPlaceholder, B>,
@@ -72,13 +72,9 @@ fn compare_values<B: BindingAddress>(
             value_type_name(b)
         )
     })?;
-    // NaN can reach here only from provider values today; once carina#4257 makes
-    // ConcreteValue::Float finite-only, this branch goes away.
-    let ordering = pair
-        .partial_cmp()
-        .ok_or_else(|| format!("{func_name}() argument is NaN"))?;
+    let ordering = pair.cmp();
     let choose_first = if ordering == Ordering::Equal {
-        let is_negative_zero = |value: &Value<NoPlaceholder, B>| matches!(value, Value::Concrete(ConcreteValue::Float(f)) if *f == 0.0 && f.is_sign_negative());
+        let is_negative_zero = |value: &Value<NoPlaceholder, B>| matches!(value, Value::Concrete(ConcreteValue::Float(f)) if f.get() == 0.0 && f.get().is_sign_negative());
         match (is_negative_zero(a), is_negative_zero(b)) {
             (true, false) => prefer_first == Ordering::Less,
             (false, true) => prefer_first == Ordering::Greater,
@@ -115,15 +111,15 @@ mod tests {
         let Value::Concrete(ConcreteValue::Float(actual)) = result else {
             panic!("expected Float, got {result:?}");
         };
-        assert_eq!(actual.to_bits(), expected.to_bits());
+        assert_eq!(actual.get().to_bits(), expected.to_bits());
     }
 
     #[test]
     fn min_positive_zero_then_negative_zero() {
         assert_signed_zero_result(
             "min",
-            ConcreteValue::Float(0.0),
-            ConcreteValue::Float(-0.0),
+            ConcreteValue::Float(crate::finite(0.0)),
+            ConcreteValue::Float(crate::finite(-0.0)),
             -0.0,
         );
     }
@@ -132,8 +128,8 @@ mod tests {
     fn min_negative_zero_then_positive_zero() {
         assert_signed_zero_result(
             "min",
-            ConcreteValue::Float(-0.0),
-            ConcreteValue::Float(0.0),
+            ConcreteValue::Float(crate::finite(-0.0)),
+            ConcreteValue::Float(crate::finite(0.0)),
             -0.0,
         );
     }
@@ -142,8 +138,8 @@ mod tests {
     fn max_positive_zero_then_negative_zero() {
         assert_signed_zero_result(
             "max",
-            ConcreteValue::Float(0.0),
-            ConcreteValue::Float(-0.0),
+            ConcreteValue::Float(crate::finite(0.0)),
+            ConcreteValue::Float(crate::finite(-0.0)),
             0.0,
         );
     }
@@ -152,8 +148,8 @@ mod tests {
     fn max_negative_zero_then_positive_zero() {
         assert_signed_zero_result(
             "max",
-            ConcreteValue::Float(-0.0),
-            ConcreteValue::Float(0.0),
+            ConcreteValue::Float(crate::finite(-0.0)),
+            ConcreteValue::Float(crate::finite(0.0)),
             0.0,
         );
     }
@@ -163,7 +159,7 @@ mod tests {
         assert_signed_zero_result(
             "min",
             ConcreteValue::Int(0),
-            ConcreteValue::Float(-0.0),
+            ConcreteValue::Float(crate::finite(-0.0)),
             -0.0,
         );
     }
@@ -172,7 +168,7 @@ mod tests {
     fn min_negative_zero_then_int_zero() {
         assert_signed_zero_result(
             "min",
-            ConcreteValue::Float(-0.0),
+            ConcreteValue::Float(crate::finite(-0.0)),
             ConcreteValue::Int(0),
             -0.0,
         );
@@ -183,7 +179,7 @@ mod tests {
         assert_signed_zero_result(
             "max",
             ConcreteValue::Int(0),
-            ConcreteValue::Float(-0.0),
+            ConcreteValue::Float(crate::finite(-0.0)),
             0.0,
         );
     }
@@ -192,75 +188,10 @@ mod tests {
     fn max_negative_zero_then_int_zero() {
         assert_signed_zero_result(
             "max",
-            ConcreteValue::Float(-0.0),
+            ConcreteValue::Float(crate::finite(-0.0)),
             ConcreteValue::Int(0),
             0.0,
         );
-    }
-
-    #[test]
-    fn min_nan_then_float() {
-        let error = evaluate_builtin(
-            "min",
-            &[
-                Value::Concrete(ConcreteValue::Float(f64::NAN)),
-                Value::Concrete(ConcreteValue::Float(1.0)),
-            ],
-        )
-        .unwrap_err();
-        assert_eq!(error, "min() argument is NaN");
-    }
-
-    #[test]
-    fn min_float_then_nan() {
-        let error = evaluate_builtin(
-            "min",
-            &[
-                Value::Concrete(ConcreteValue::Float(1.0)),
-                Value::Concrete(ConcreteValue::Float(f64::NAN)),
-            ],
-        )
-        .unwrap_err();
-        assert_eq!(error, "min() argument is NaN");
-    }
-
-    #[test]
-    fn max_nan_then_int() {
-        let error = evaluate_builtin(
-            "max",
-            &[
-                Value::Concrete(ConcreteValue::Float(f64::NAN)),
-                Value::Concrete(ConcreteValue::Int(9_007_199_254_740_993)),
-            ],
-        )
-        .unwrap_err();
-        assert_eq!(error, "max() argument is NaN");
-    }
-
-    #[test]
-    fn max_int_then_nan() {
-        let error = evaluate_builtin(
-            "max",
-            &[
-                Value::Concrete(ConcreteValue::Int(9_007_199_254_740_993)),
-                Value::Concrete(ConcreteValue::Float(f64::NAN)),
-            ],
-        )
-        .unwrap_err();
-        assert_eq!(error, "max() argument is NaN");
-    }
-
-    #[test]
-    fn min_two_nans() {
-        let error = evaluate_builtin(
-            "min",
-            &[
-                Value::Concrete(ConcreteValue::Float(f64::NAN)),
-                Value::Concrete(ConcreteValue::Float(f64::NAN)),
-            ],
-        )
-        .unwrap_err();
-        assert_eq!(error, "min() argument is NaN");
     }
 
     #[test]
@@ -313,12 +244,12 @@ mod tests {
     fn min_exact_numeric_mixed() {
         let args = [
             Value::Concrete(ConcreteValue::Int(9_007_199_254_740_993)),
-            Value::Concrete(ConcreteValue::Float(9_007_199_254_740_992.0)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(9_007_199_254_740_992.0))),
         ];
         for args in [args.clone(), [args[1].clone(), args[0].clone()]] {
             assert_eq!(
                 evaluate_builtin("min", &args).unwrap(),
-                Value::Concrete(ConcreteValue::Float(9_007_199_254_740_992.0)),
+                Value::Concrete(ConcreteValue::Float(crate::finite(9_007_199_254_740_992.0))),
             );
         }
     }
@@ -332,7 +263,7 @@ mod tests {
         ] {
             let args = [
                 Value::Concrete(ConcreteValue::Int(integer)),
-                Value::Concrete(ConcreteValue::Float(float)),
+                Value::Concrete(ConcreteValue::Float(crate::finite(float))),
             ];
             for args in [args.clone(), [args[1].clone(), args[0].clone()]] {
                 let error = evaluate_builtin(name, &args).unwrap_err();
@@ -349,12 +280,12 @@ mod tests {
     fn max_exact_numeric_representable_winner() {
         let args = [
             Value::Concrete(ConcreteValue::Int(9_007_199_254_740_992)),
-            Value::Concrete(ConcreteValue::Float(1.5)),
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.5))),
         ];
         for args in [args.clone(), [args[1].clone(), args[0].clone()]] {
             assert_eq!(
                 evaluate_builtin("max", &args).unwrap(),
-                Value::Concrete(ConcreteValue::Float(9_007_199_254_740_992.0)),
+                Value::Concrete(ConcreteValue::Float(crate::finite(9_007_199_254_740_992.0))),
             );
         }
     }
@@ -405,12 +336,15 @@ mod tests {
         let result = evaluate_builtin(
             "min",
             &[
-                Value::Concrete(ConcreteValue::Float(2.5)),
-                Value::Concrete(ConcreteValue::Float(1.0)),
+                Value::Concrete(ConcreteValue::Float(crate::finite(2.5))),
+                Value::Concrete(ConcreteValue::Float(crate::finite(1.0))),
             ],
         )
         .unwrap();
-        assert_eq!(result, Value::Concrete(ConcreteValue::Float(1.0)));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.0)))
+        );
     }
 
     #[test]
@@ -419,11 +353,14 @@ mod tests {
             "min",
             &[
                 Value::Concrete(ConcreteValue::Int(1)),
-                Value::Concrete(ConcreteValue::Float(2.5)),
+                Value::Concrete(ConcreteValue::Float(crate::finite(2.5))),
             ],
         )
         .unwrap();
-        assert_eq!(result, Value::Concrete(ConcreteValue::Float(1.0)));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::Float(crate::finite(1.0)))
+        );
     }
 
     #[test]
@@ -431,12 +368,15 @@ mod tests {
         let result = evaluate_builtin(
             "min",
             &[
-                Value::Concrete(ConcreteValue::Float(3.5)),
+                Value::Concrete(ConcreteValue::Float(crate::finite(3.5))),
                 Value::Concrete(ConcreteValue::Int(2)),
             ],
         )
         .unwrap();
-        assert_eq!(result, Value::Concrete(ConcreteValue::Float(2.0)));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::Float(crate::finite(2.0)))
+        );
     }
 
     #[test]
@@ -540,12 +480,15 @@ mod tests {
         let result = evaluate_builtin(
             "max",
             &[
-                Value::Concrete(ConcreteValue::Float(2.5)),
-                Value::Concrete(ConcreteValue::Float(1.0)),
+                Value::Concrete(ConcreteValue::Float(crate::finite(2.5))),
+                Value::Concrete(ConcreteValue::Float(crate::finite(1.0))),
             ],
         )
         .unwrap();
-        assert_eq!(result, Value::Concrete(ConcreteValue::Float(2.5)));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::Float(crate::finite(2.5)))
+        );
     }
 
     #[test]
@@ -554,11 +497,14 @@ mod tests {
             "max",
             &[
                 Value::Concrete(ConcreteValue::Int(1)),
-                Value::Concrete(ConcreteValue::Float(2.5)),
+                Value::Concrete(ConcreteValue::Float(crate::finite(2.5))),
             ],
         )
         .unwrap();
-        assert_eq!(result, Value::Concrete(ConcreteValue::Float(2.5)));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::Float(crate::finite(2.5)))
+        );
     }
 
     #[test]
@@ -566,12 +512,15 @@ mod tests {
         let result = evaluate_builtin(
             "max",
             &[
-                Value::Concrete(ConcreteValue::Float(3.5)),
+                Value::Concrete(ConcreteValue::Float(crate::finite(3.5))),
                 Value::Concrete(ConcreteValue::Int(2)),
             ],
         )
         .unwrap();
-        assert_eq!(result, Value::Concrete(ConcreteValue::Float(3.5)));
+        assert_eq!(
+            result,
+            Value::Concrete(ConcreteValue::Float(crate::finite(3.5)))
+        );
     }
 
     #[test]

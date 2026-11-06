@@ -926,7 +926,7 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
                 Value::Concrete(ConcreteValue::Float(f)),
                 Value::Concrete(ConcreteValue::Int(i)),
                 crate::schema::Shape::Float { .. } | crate::schema::Shape::Int { .. },
-            ) => compare_int_float(*i, *f) == Some(Ordering::Equal),
+            ) => compare_int_float(*i, *f) == Ordering::Equal,
 
             // Preserve provider/API-to-DSL transform equality first, then
             // consult the identity's reference form under this initialized
@@ -1035,7 +1035,7 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
                         )
                     }) =>
                     {
-                        compare_int_float(*i, *f) == Some(Ordering::Equal)
+                        compare_int_float(*i, *f) == Ordering::Equal
                     }
                     _ => types.any_on_path(&mut current_path, |member, member_path| {
                         type_aware_equal_on_path(
@@ -1303,7 +1303,7 @@ fn is_type_default(
         }
         (Value::Concrete(ConcreteValue::Int(0)), Some(crate::schema::Shape::Int { .. })) => true,
         (Value::Concrete(ConcreteValue::Float(f)), Some(crate::schema::Shape::Float { .. }))
-            if *f == 0.0 =>
+            if f.get() == 0.0 =>
         {
             true
         }

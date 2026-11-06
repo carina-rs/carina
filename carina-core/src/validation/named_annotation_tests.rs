@@ -240,8 +240,14 @@ fn numeric_annotation_intersections_preserve_effective_ranges() {
         ),
         (
             vec![
-                DraftType::refined_float(Some(identity()), Some((Some(-0.5), Some(64.5)))),
-                DraftType::refined_float(Some(identity()), Some((Some(8.5), Some(128.5)))),
+                DraftType::refined_float(
+                    Some(identity()),
+                    Some((Some(crate::finite(-0.5)), Some(crate::finite(64.5)))),
+                ),
+                DraftType::refined_float(
+                    Some(identity()),
+                    Some((Some(crate::finite(8.5)), Some(crate::finite(128.5)))),
+                ),
             ],
             "range 8.5..=64.5",
         ),
@@ -309,8 +315,14 @@ fn empty_intersections_are_explicit_and_reject_values_and_assignments() {
             DraftType::refined_int(Some(identity()), Some((Some(8), Some(12)))),
         ],
         vec![
-            DraftType::refined_float(Some(identity()), Some((Some(1.0), Some(4.0)))),
-            DraftType::refined_float(Some(identity()), Some((Some(8.0), Some(12.0)))),
+            DraftType::refined_float(
+                Some(identity()),
+                Some((Some(crate::finite(1.0)), Some(crate::finite(4.0)))),
+            ),
+            DraftType::refined_float(
+                Some(identity()),
+                Some((Some(crate::finite(8.0)), Some(crate::finite(12.0)))),
+            ),
         ],
     ] {
         let snapshot = snapshot(vec![("p", declarations)]);
@@ -767,33 +779,6 @@ fn review_unloaded_resolution_waits_for_provider_config_declarations() {
             .validate(&text("A".repeat(80)))
             .is_err()
     );
-}
-
-#[test]
-fn review_nonfinite_float_endpoints_are_rejected_during_schema_admission() {
-    for endpoint in [f64::NEG_INFINITY, f64::INFINITY, f64::NAN] {
-        for range in [(Some(endpoint), None), (None, Some(endpoint))] {
-            let schema = ResourceSchema::new("Values").attribute(
-                AttributeSchema::optional(
-                    "value",
-                    DraftType::refined_float(Some(identity()), Some(range)),
-                )
-                .build(),
-            );
-            assert!(
-                schema.validate().is_err(),
-                "admitted nonfinite range {range:?}"
-            );
-            assert!(
-                ValidatedConfigSchema::validate(BTreeMap::from([(
-                    "value".into(),
-                    DraftType::refined_float(Some(identity()), Some(range))
-                ),]))
-                .is_err(),
-                "admitted nonfinite config range {range:?}"
-            );
-        }
-    }
 }
 
 #[test]

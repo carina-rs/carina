@@ -5,6 +5,7 @@
 pub use carina_core as core;
 pub use carina_provider_protocol as protocol;
 pub use carina_provider_protocol::types;
+pub use carina_provider_protocol::{FiniteF64, NonFiniteFloatError};
 
 pub mod aws_credentials;
 
@@ -203,7 +204,7 @@ pub fn dispatch_custom_type_validation(
     cache: &ProviderSchemaCache,
     identity: &TypeIdentity,
     canonical_text: &str,
-) -> Result<(), String> {
+) -> Result<(), core::provider::CustomTypeDispatchError> {
     let core_identity = carina_core::schema::TypeIdentity::new(
         (!identity.provider.is_empty()).then(|| identity.provider.clone()),
         identity.segments.clone(),
@@ -1617,6 +1618,11 @@ fn read_back_without_identifier(id: &ResourceId) -> ProviderError {
         code: Some("READ_BACK_WITHOUT_IDENTIFIER".to_string()),
         request_id: None,
     }
+}
+
+#[cfg(test)]
+pub(crate) fn finite(value: f64) -> carina_provider_protocol::FiniteF64 {
+    carina_provider_protocol::FiniteF64::new(value).unwrap()
 }
 
 #[cfg(test)]
