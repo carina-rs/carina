@@ -5,7 +5,9 @@ use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::effect::{DeferredReplaceDelete, Effect, NonEmptyDeletes, TemporaryName};
+use crate::effect::{
+    DeferredReplaceDelete, DeletedInstanceKey, Effect, NonEmptyDeletes, TemporaryName,
+};
 use crate::plan::{
     CreateBeforeDestroyError, ReplacementCannotCoexistError, SchemaNotRegisteredError,
 };
@@ -567,11 +569,60 @@ pub struct AdmittedReplacementEffects<
 }
 pub(crate) type PreparedReplacementNames = Vec<(crate::resource::ResourceId, TemporaryName)>;
 
+/// Unadmitted naming/history inputs survive independently of display rows.
+/// Historical values are keyed by the entire provider generation, never by
+/// the desired target or by the current row's address alone.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ReplacementInputs {
+    pub(crate) old_instances: Vec<OldInstanceSnapshot>,
+    pub(crate) prepared_names: PreparedReplacementNames,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct OldInstanceSnapshot {
+    pub(crate) instance: DeletedInstanceKey,
+    pub(crate) attributes: HashMap<String, SnapshotValue>,
+}
+
+impl ReplacementInputs {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.old_instances.is_empty() && self.prepared_names.is_empty()
+    }
+
+    pub(crate) fn record_old(&mut self, old: &DeferredReplaceDelete) {
+        let instance = old.instance_key();
+        self.old_instances
+            .retain(|previous| previous.instance != instance);
+        self.old_instances.push(OldInstanceSnapshot {
+            instance,
+            attributes: old.previous_attributes.clone(),
+        });
+    }
+
+    pub(crate) fn previous(
+        &self,
+        instance: &DeletedInstanceKey,
+    ) -> Option<HashMap<String, SnapshotValue>> {
+        self.old_instances
+            .iter()
+            .find(|old| &old.instance == instance)
+            .map(|old| old.attributes.clone())
+    }
+
+    pub(crate) fn contains_redacted_secret_placeholders(&self) -> bool {
+        self.old_instances.iter().any(|old| {
+            old.attributes
+                .values()
+                .any(crate::value::contains_redacted_secret)
+        })
+    }
+}
+
 impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
     pub fn resolve(
         effects: &[Effect<S, P>],
         registry: &SchemaRegistry,
-        previous: impl Fn(&ResolvedResourceId) -> HashMap<String, SnapshotValue>,
+        previous: impl Fn(&DeletedInstanceKey) -> HashMap<String, SnapshotValue>,
     ) -> Result<Self, ReplacementAdmissionError> {
         Self::resolve_with_prepared_names(
             effects,
@@ -584,7 +635,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
     pub(crate) fn resolve_with_prepared_names(
         effects: &[Effect<S, P>],
         registry: &SchemaRegistry,
-        previous: impl Fn(&ResolvedResourceId) -> HashMap<String, SnapshotValue>,
+        previous: impl Fn(&DeletedInstanceKey) -> HashMap<String, SnapshotValue>,
         associations: &HashMap<ResolvedResourceId, HashSet<ResolvedResourceId>>,
         prepared_names: &HashMap<ResolvedResourceId, TemporaryName>,
     ) -> Result<Self, ReplacementAdmissionError> {
@@ -600,7 +651,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
     fn resolve_with_context(
         effects: &[Effect<S, P>],
         registry: &SchemaRegistry,
-        previous: impl Fn(&ResolvedResourceId) -> HashMap<String, SnapshotValue>,
+        previous: impl Fn(&DeletedInstanceKey) -> HashMap<String, SnapshotValue>,
         associations: &HashMap<ResolvedResourceId, HashSet<ResolvedResourceId>>,
         prepared_names: &HashMap<ResolvedResourceId, TemporaryName>,
         required: &HashMap<ResolvedResourceId, String>,
@@ -659,7 +710,11 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                             dependencies: dependencies.clone(),
                             explicit_dependencies: explicit_dependencies.clone(),
                             blocked_by_updates: blocked_by_updates.clone(),
-                            previous_attributes: previous(&target.resolved_id()),
+                            previous_attributes: previous(&DeletedInstanceKey::new(
+                                id.as_inner().clone(),
+                                generation.clone(),
+                                identifier.as_str(),
+                            )),
                         })
                     }
                     _ => None,
@@ -739,9 +794,11 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                 .entry(replacement.target.clone())
                 .or_default()
                 .extend(replacement.deletes.iter().map(|old| old.id.clone()));
-            previous.insert(
-                replacement.target.clone(),
-                replacement.deletes[0].previous_attributes.clone(),
+            previous.extend(
+                replacement
+                    .deletes
+                    .iter()
+                    .map(|old| (old.instance_key(), old.previous_attributes.clone())),
             );
         }
         for request in requests {
@@ -750,9 +807,11 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                 .entry(target.clone())
                 .or_default()
                 .extend(request.deletes.iter().map(|old| old.id.clone()));
-            previous.insert(
-                target.clone(),
-                request.deletes[0].previous_attributes.clone(),
+            previous.extend(
+                request
+                    .deletes
+                    .iter()
+                    .map(|old| (old.instance_key(), old.previous_attributes.clone())),
             );
             if let Some(dependent) = request.required_by() {
                 required.insert(target, dependent.to_owned());
@@ -812,22 +871,36 @@ impl<S: Clone> AdmittedReplacementEffects<S> {
         self.scheduling.order_edges(&self.effects, deps)
     }
     pub(crate) fn expand_deferred_replacements(self) -> (Self, Vec<(usize, usize)>, Vec<usize>) {
-        let expanded = crate::executor::parallel::expand_deferred_replace_effects(&self.effects);
+        let mut effects = Vec::with_capacity(self.effects.len());
+        let mut deferred_replace_delete_deps = Vec::new();
+        let mut source_effect_indices = Vec::with_capacity(self.effects.len());
         let mut remap = vec![None; self.effects.len()];
-        for (index, source) in expanded.source_effect_indices.iter().enumerate() {
-            remap[*source] = Some(index);
+        for (source, effect) in self.effects.into_iter().enumerate() {
+            if let Effect::DeferredReplace(payload) = &effect {
+                let first_delete = effects.len();
+                for old in payload.deletes.iter() {
+                    effects.push(old.to_delete_effect());
+                    source_effect_indices.push(source);
+                }
+                let gate = effects.len();
+                deferred_replace_delete_deps
+                    .extend((first_delete..gate).map(|delete| (gate, delete)));
+            }
+            remap[source] = Some(effects.len());
+            effects.push(effect);
+            source_effect_indices.push(source);
         }
         let mut scheduling = self.scheduling;
         scheduling.remap(&remap);
         (
             Self {
-                effects: expanded.effects,
+                effects,
                 scheduling,
                 temporary_names: self.temporary_names,
                 writeback: self.writeback,
             },
-            expanded.deferred_replace_delete_deps,
-            expanded.source_effect_indices,
+            deferred_replace_delete_deps,
+            source_effect_indices,
         )
     }
 }
@@ -1057,6 +1130,237 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert("", schema.validate().unwrap());
         registry
+    }
+
+    #[test]
+    fn review4_4283_materialized_admission_uses_each_old_generations_snapshot() {
+        let schemas = registry(UniqueNameSpec::Attribute("name".into()));
+        let mut request = fixture(true);
+        request
+            .deletes
+            .iter_mut()
+            .next()
+            .unwrap()
+            .previous_attributes = HashMap::from([("name".into(), string("current-B"))]);
+        let mut deposed = request.deletes[0].clone();
+        deposed.generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+        deposed.identifier = crate::effect::fixture_applied_identifier("deposed-A");
+        deposed.previous_attributes = HashMap::from([("name".into(), string("stable"))]);
+        request.deletes =
+            NonEmptyDeletes::try_new(vec![request.deletes[0].clone(), deposed]).unwrap();
+        let effects: Vec<Effect> = request
+            .deletes
+            .iter()
+            .map(|old| old.to_delete_effect())
+            .collect();
+        let existing =
+            AdmittedReplacementEffects::resolve(&effects, &schemas, |_| HashMap::new()).unwrap();
+        let admitted = existing
+            .with_materialized(
+                vec![Effect::Create(request.target().clone())],
+                vec![request],
+                &schemas,
+            )
+            .unwrap();
+        let replacement = &admitted.writeback()[0];
+        assert_eq!(
+            replacement.old_instances()[0].previous_attributes["name"],
+            string("current-B")
+        );
+        assert_eq!(
+            replacement.old_instances()[1].previous_attributes["name"],
+            string("stable")
+        );
+        let prepared = &admitted.temporary_names()[0].1;
+        assert_eq!(prepared.original_value, "stable");
+        assert_ne!(prepared.temporary_value, "stable");
+        let readmitted = admitted
+            .with_materialized(Vec::new(), Vec::new(), &schemas)
+            .unwrap();
+        assert_eq!(readmitted.temporary_names(), admitted.temporary_names());
+        assert_eq!(
+            readmitted.writeback()[0].old_instances(),
+            replacement.old_instances()
+        );
+    }
+
+    #[test]
+    fn review4_4283_recovery_prepared_name_survives_without_display_metadata() {
+        let schemas = registry(UniqueNameSpec::Attribute("name".into()));
+        let request = fixture(true);
+        let mut delete = request.deletes[0].to_delete_effect();
+        if let Effect::Delete { generation, .. } = &mut delete {
+            *generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+        }
+        let mut plan = crate::plan::Plan::new();
+        plan.add(delete);
+        plan.add(Effect::Create(request.target().clone()));
+        plan.prepare_replacements(&schemas).unwrap();
+        assert!(plan.replace_display_info().next().is_none());
+        let expected = plan.effects()[1].clone();
+        let original = plan.permanent_name_overrides[0].clone();
+        assert_eq!(original.original_value.as_deref(), Some("stable"));
+        plan.prepare_replacements(&schemas).unwrap();
+        assert_eq!(
+            plan.effects()[1],
+            expected,
+            "planning must reuse the prepared name"
+        );
+        let wire: crate::plan::UnresolvedSavedPlan =
+            serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        let loaded = wire.resolve_with_schemas(&schemas).unwrap();
+        assert_eq!(
+            serde_json::to_value(&loaded.effects()[1]).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        assert_eq!(loaded.permanent_name_overrides, vec![original]);
+        let execution = loaded.admit_replacement_effects(&schemas).unwrap();
+        assert_eq!(execution.effects()[1], loaded.effects()[1]);
+        assert_eq!(execution.temporary_names()[0].1.original_value, "stable");
+    }
+
+    #[test]
+    fn review4_4283_plan_and_saved_plan_check_the_deposed_name() {
+        let schemas = registry(UniqueNameSpec::Attribute("name".into()));
+        let mut request = fixture(true);
+        request
+            .deletes
+            .iter_mut()
+            .next()
+            .unwrap()
+            .previous_attributes = HashMap::from([("name".into(), string("current-B"))]);
+        let mut deposed = request.deletes[0].clone();
+        deposed.generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+        deposed.identifier = crate::effect::fixture_applied_identifier("deposed-A");
+        deposed.previous_attributes = HashMap::from([("name".into(), string("stable"))]);
+        let checked = resolve_replacement(request, &schemas).unwrap();
+        assert!(
+            checked.temporary_name().is_none(),
+            "A is distinct from current B"
+        );
+        let mut plan = crate::plan::Plan::new();
+        plan.add_replacement(crate::plan::ReplacementGroup {
+            replacement: checked,
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["name".into()])
+                .unwrap(),
+            cascade_ref_hints: Vec::new(),
+            permanent_name_override: None,
+            consumer_updates: Default::default(),
+        });
+        plan.add_delete(deposed.clone());
+        plan.prepare_replacements(&schemas).unwrap();
+        let admitted = plan.admit_replacement_effects(&schemas).unwrap();
+        assert_eq!(admitted.writeback()[0].old_instances()[1], deposed);
+        let expected = admitted.temporary_names().clone();
+        assert_eq!(expected[0].1.original_value, "stable");
+        let dto = crate::plan::UnresolvedSavedPlan::from(crate::plan::SavedPlan::from(
+            plan.to_snapshot(),
+        ));
+        let loaded = serde_json::from_str::<crate::plan::UnresolvedSavedPlan>(
+            &serde_json::to_string(&dto).unwrap(),
+        )
+        .unwrap()
+        .resolve_with_schemas(&schemas)
+        .unwrap();
+        let readmitted = loaded.admit_replacement_effects(&schemas).unwrap();
+        assert_eq!(readmitted.temporary_names(), &expected);
+        assert_eq!(
+            readmitted.writeback()[0].old_instances(),
+            admitted.writeback()[0].old_instances()
+        );
+        let mut request = ReplacementRequest::new(
+            match &readmitted.effects()[0] {
+                Effect::Create(target) => target.clone(),
+                _ => panic!("expected create"),
+            },
+            readmitted.writeback()[0].old_instances().clone(),
+        )
+        .with_prepared_name(Some(expected[0].1.clone()));
+        request
+            .deletes
+            .iter_mut()
+            .nth(1)
+            .unwrap()
+            .previous_attributes
+            .insert("name".into(), string(&expected[0].1.temporary_value));
+        assert!(
+            matches!(
+                resolve_replacement(request, &schemas),
+                Err(CreateBeforeDestroyError::InvalidPreparedReplacementName(_))
+            ),
+            "prepared names must be checked against the deposed generation too"
+        );
+    }
+
+    #[test]
+    fn review4_4283_generation_snapshots_preserve_their_own_secret_evidence() {
+        let mut old = fixture(false).deletes[0].clone();
+        let secret = |text| {
+            Value::Deferred(crate::resource::DeferredValue::Secret(
+                Box::new(string(text)).into(),
+            ))
+        };
+        old.previous_attributes = HashMap::from([("secret".into(), secret("current-secret"))]);
+        let current = crate::resource::SnapshotState::existing(
+            old.id.as_inner().clone(),
+            old.previous_attributes.clone(),
+        );
+        let current_guide = crate::value::redact_secrets_in_state(&current).unwrap();
+        let deposed_guide =
+            crate::value::redact_secrets_in_state(&crate::resource::SnapshotState::existing(
+                old.id.as_inner().clone(),
+                HashMap::from([("secret".into(), secret("deposed-secret"))]),
+            ))
+            .unwrap();
+        let mut deposed = old.clone();
+        deposed.generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+        deposed.identifier = crate::effect::fixture_applied_identifier("deposed-secret-id");
+        deposed.previous_attributes = deposed_guide.attributes.clone();
+        let id = old.id.as_inner().clone();
+        let mut plan = crate::plan::Plan::new();
+        plan.add_delete(old);
+        plan.add_delete(deposed);
+        let redacted = crate::value::redact_secrets_in_plan_with_desired_and_historical(
+            &plan,
+            &HashMap::<
+                crate::resource::ResourceId,
+                Resource<crate::resource::ModuleSource, crate::resource::SnapshotLeaf>,
+            >::new(),
+            &HashMap::from([(id.clone(), current_guide.clone())]),
+        )
+        .unwrap();
+        assert!(redacted.contains_redacted_secret_placeholders());
+        assert_eq!(
+            redacted.replacement_inputs.old_instances[0].attributes,
+            current_guide.attributes
+        );
+        assert_eq!(
+            redacted.replacement_inputs.old_instances[1].attributes,
+            deposed_guide.attributes
+        );
+        let json = serde_json::to_string(&redacted).unwrap();
+        assert!(!json.contains("current-secret"));
+        assert!(!json.contains("deposed-secret\""));
+        let wire: crate::plan::UnresolvedSavedPlan = serde_json::from_str(&json).unwrap();
+        assert!(wire.contains_redacted_secret_placeholders());
+        let restored = crate::value::rehydrate_plan_historical_secrets_from_verified_states(
+            &redacted,
+            &HashMap::from([(id.clone(), current_guide)]),
+            &HashMap::from([(id, current.clone())]),
+        )
+        .unwrap();
+        assert_eq!(
+            restored.replacement_inputs.old_instances[0].attributes,
+            current.attributes
+        );
+        assert_eq!(
+            restored.replacement_inputs.old_instances[1].attributes,
+            deposed_guide.attributes
+        );
+        let mut removed = restored;
+        removed.retain(|_| false);
+        assert!(removed.replacement_inputs.is_empty());
+        assert!(!removed.contains_redacted_secret_placeholders());
     }
 
     #[test]

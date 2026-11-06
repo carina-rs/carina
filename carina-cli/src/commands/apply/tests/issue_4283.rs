@@ -8,6 +8,7 @@ struct Cloud(Arc<Mutex<CloudRecords>>);
 #[derive(Default)]
 struct CloudRecords {
     coexisting_child: bool,
+    attribute_child: bool,
     fail_child_delete: bool,
     child_generation: usize,
     live: HashMap<String, HashMap<String, Value>>,
@@ -60,6 +61,7 @@ impl ProviderFactory for Factory {
         .unwrap()
     }
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+        let cloud = self.0.0.lock().unwrap();
         vec![
             ResourceSchema::new("test.Parent")
                 .attribute(
@@ -91,11 +93,11 @@ impl ProviderFactory for Factory {
                 .with_coexisting_replacement()
                 .validate()
                 .unwrap(),
-            child_schema(self.0.0.lock().unwrap().coexisting_child),
+            child_schema(cloud.coexisting_child, cloud.attribute_child),
         ]
     }
 }
-fn child_schema(coexisting: bool) -> carina_core::schema::ValidatedResourceSchema {
+fn child_schema(coexisting: bool, attribute: bool) -> carina_core::schema::ValidatedResourceSchema {
     let schema = ResourceSchema::new("test.Child")
         .attribute(
             AttributeSchema::required("name", AttributeType::string())
@@ -107,7 +109,9 @@ fn child_schema(coexisting: bool) -> carina_core::schema::ValidatedResourceSchem
                 .create_only()
                 .build(),
         );
-    if coexisting {
+    if attribute {
+        schema.with_unique_name_attribute("name")
+    } else if coexisting {
         schema.with_coexisting_replacement()
     } else {
         schema.with_conflicting_replacement()
@@ -175,7 +179,9 @@ impl Provider for Mock {
         } else {
             // Equivalent child generations overwrite one record, just like Route53 UPSERT.
             let mut cloud = self.0.0.lock().unwrap();
-            let key = if cloud.coexisting_child {
+            let key = if cloud.attribute_child {
+                format!("dns:{}", value_string(&attrs["name"]).unwrap())
+            } else if cloud.coexisting_child {
                 cloud.child_generation += 1;
                 format!("dns:{}", cloud.child_generation)
             } else {
@@ -367,6 +373,45 @@ async fn destroy(fixture: &ApplyCancellationFixture, cloud: &Cloud) {
     .await
     .unwrap();
 }
+async fn apply_saved(fixture: &ApplyCancellationFixture, cloud: &Cloud, saved_plan: PlanFile) {
+    // Exercise actual wire decoding and schema resolution, not a clone of a live plan.
+    let json = serde_json::to_string(&saved_plan).unwrap();
+    let decoded: PlanFile = serde_json::from_str(&json).unwrap();
+    let source = ResolvedPath::new(fixture.config_path()).unwrap();
+    let bound = ProviderBoundPlanFile::for_test(
+        inspected_saved_plan(decoded),
+        providers(fixture, cloud).into_complete().unwrap(),
+        &source,
+    )
+    .unwrap();
+    let backend = fixture.backend_handle();
+    let outcome = run_apply_from_plan_locked_owned(
+        fixture.runtime().color_mode(),
+        bound,
+        fixture.provider_context(),
+        true,
+        backend.clone(),
+        StateLock::disabled_for_test(),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("p.plan"),
+            source_dir: fixture.config_path(),
+        },
+        &source,
+        fixture.cancel_token(),
+        &fixture.observer_factory(),
+        NonZeroUsize::new(2).unwrap(),
+        false,
+    )
+    .await;
+    finish_lock_command(
+        fixture.runtime().color_mode(),
+        backend.as_ref(),
+        outcome,
+        &fixture.cancel_token(),
+    )
+    .await
+    .unwrap();
+}
 async fn convergence(saved: bool) {
     Box::pin(convergence_with_binding(saved, true)).await;
 }
@@ -384,43 +429,7 @@ async fn convergence_with_binding(saved: bool, bound: bool) {
     }
     let saved_plan = plan(&fixture, &cloud).await;
     if saved {
-        // Exercise actual wire decoding and schema resolution, not a clone of a live plan.
-        let json = serde_json::to_string(&saved_plan).unwrap();
-        let decoded: PlanFile = serde_json::from_str(&json).unwrap();
-        let source = ResolvedPath::new(fixture.config_path()).unwrap();
-        let bound = ProviderBoundPlanFile::for_test(
-            inspected_saved_plan(decoded),
-            providers(&fixture, &cloud).into_complete().unwrap(),
-            &source,
-        )
-        .unwrap();
-        let backend = fixture.backend_handle();
-        let outcome = run_apply_from_plan_locked_owned(
-            fixture.runtime().color_mode(),
-            bound,
-            fixture.provider_context(),
-            true,
-            backend.clone(),
-            StateLock::disabled_for_test(),
-            ApplyTarget::SavedPlan {
-                plan_file: Path::new("p.plan"),
-                source_dir: fixture.config_path(),
-            },
-            &source,
-            fixture.cancel_token(),
-            &fixture.observer_factory(),
-            NonZeroUsize::new(2).unwrap(),
-            false,
-        )
-        .await;
-        finish_lock_command(
-            fixture.runtime().color_mode(),
-            backend.as_ref(),
-            outcome,
-            &fixture.cancel_token(),
-        )
-        .await
-        .unwrap();
+        apply_saved(&fixture, &cloud, saved_plan).await;
     } else {
         apply(&fixture, &cloud).await;
     }
@@ -590,4 +599,119 @@ async fn review2_4283_legacy_unbound_runtime_writeback_retires_old_address() {
     );
     assert_ne!(children[0].identity.as_str(), "_options[0]");
     assert!(plan(&fixture, &cloud).await.plan.effects().is_empty());
+}
+
+#[tokio::test]
+async fn review4_4283_attribute_child_with_deposed_name_live() {
+    Box::pin(attribute_child_with_deposed_name(false)).await;
+}
+
+#[tokio::test]
+async fn review4_4283_attribute_child_with_deposed_name_saved() {
+    Box::pin(attribute_child_with_deposed_name(true)).await;
+}
+
+async fn attribute_child_with_deposed_name(saved: bool) {
+    let fixture = ApplyCancellationFixture::new().with_raw_config("");
+    let cloud = Cloud::default();
+    cloud.0.lock().unwrap().attribute_child = true;
+    write_config(&fixture, "old");
+    apply(&fixture, &cloud).await;
+    let mut state = fixture.read_state().await;
+    let old = state
+        .resources()
+        .iter()
+        .find(|row| row.resource_type == "test.Child")
+        .unwrap()
+        .clone();
+    let id = ResourceId::with_provider_identity("awscc", "test.Child", old.identity.clone(), None);
+    let mut attributes = cloud.0.lock().unwrap().live["dns:_validation.example"].clone();
+    attributes.insert("name".into(), string_value("current-B"));
+    cloud
+        .0
+        .lock()
+        .unwrap()
+        .live
+        .insert("dns:current-B".into(), attributes.clone());
+    let mut child = carina_state::ResourceState::from_provider_state(
+        "test.Child",
+        old.identity.clone(),
+        "awscc",
+        &State::<NoPlaceholder>::existing(id, attributes).with_identifier("dns:current-B"),
+    )
+    .unwrap();
+    child.binding = old.binding.clone();
+    child.explicit = old.explicit.clone();
+    child.dependency_bindings = old.dependency_bindings.clone();
+    child.directives = old.directives.clone();
+    child
+        .deposed
+        .push(carina_state::DeposedInstance::from_persisted_json(
+            carina_state::DeposedKey::new_unique(),
+            "dns:_validation.example".into(),
+            None,
+            old.persisted_attributes().unwrap().to_decoded_json(),
+            old.dependency_bindings.clone(),
+        ));
+    state.upsert_resource(child).unwrap();
+    fixture.write_state(&state);
+    write_config(&fixture, "new");
+    let path = fixture.config_path().join("main.crn");
+    let source = std::fs::read_to_string(&path).unwrap().replace(
+        "name = opt.name",
+        "directives { create_before_destroy = true }\n    name = opt.name",
+    );
+    std::fs::write(path, source).unwrap();
+    cloud.0.lock().unwrap().operations.clear();
+    if saved {
+        let saved_plan = plan(&fixture, &cloud).await;
+        apply_saved(&fixture, &cloud, saved_plan).await;
+    } else {
+        apply(&fixture, &cloud).await;
+    }
+    let state = fixture.read_state().await;
+    let child = state
+        .resources()
+        .iter()
+        .find(|row| row.resource_type == "test.Child")
+        .unwrap();
+    let identifier = child.identifier().unwrap().as_str();
+    assert_ne!(
+        identifier, "dns:_validation.example",
+        "the deposed generation still owns A during Create"
+    );
+    assert_ne!(identifier, "dns:current-B");
+    assert!(child.deposed.is_empty());
+    assert_eq!(
+        child.name_overrides["name"].original_value.as_deref(),
+        Some("_validation.example")
+    );
+    {
+        let cloud = cloud.0.lock().unwrap();
+        assert!(
+            cloud.live.contains_key(identifier),
+            "old deletion removed the new physical record: {:?}",
+            cloud.operations
+        );
+        let position = |op: &str| {
+            cloud
+                .operations
+                .iter()
+                .position(|actual| actual == op)
+                .unwrap()
+        };
+        let create = position(&format!("create:{identifier}"));
+        assert!(position("create:parent-new") < create);
+        assert!(
+            create < position("delete:dns:_validation.example"),
+            "operations: {:?}",
+            cloud.operations
+        );
+        assert!(create < position("delete:dns:current-B"));
+        assert!(position("delete:dns:_validation.example") < position("delete:parent-old"));
+    }
+    assert!(plan(&fixture, &cloud).await.plan.effects().is_empty());
+    destroy(&fixture, &cloud).await;
+    assert!(cloud.0.lock().unwrap().live.is_empty());
+    assert!(fixture.read_state().await.resources().is_empty());
 }

@@ -2017,7 +2017,7 @@ fn build_destroy_delete_effects(
                 continue;
             }
             let (effects, row_errors) = crate::wiring::deposed_delete_effects_for_row(row, &[]);
-            delete_effects.extend(effects);
+            delete_effects.extend(effects.iter().map(|old| old.to_delete_effect()));
             errors.extend(row_errors);
         }
     }

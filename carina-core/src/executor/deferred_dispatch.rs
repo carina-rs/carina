@@ -427,13 +427,13 @@ fn admit_materialized<S: Clone>(
     existing: &crate::replacement::AdmittedReplacementEffects<S>,
 ) -> Result<crate::replacement::AdmittedReplacementEffects<S>, DeferredCreateFailure> {
     let mut replacements = Vec::new();
-    let (old_instances, is_unbound) = match effect {
+    let (absorbed_old, is_unbound) = match effect {
         Effect::DeferredReplace(payload) => (
             &payload.deletes[..],
             matches!(payload.template.target(), DeferredForTarget::Unbound { .. }),
         ),
         Effect::DeferredCreate(payload) => (
-            ordinary_old,
+            &[][..],
             matches!(payload.template.target(), DeferredForTarget::Unbound { .. }),
         ),
         _ => unreachable!("only deferred gates materialize children"),
@@ -442,8 +442,11 @@ fn admit_materialized<S: Clone>(
         let Effect::Create(resource) = child else {
             continue;
         };
-        let old = old_instances
+        let mut seen = std::collections::HashSet::new();
+        let old = absorbed_old
             .iter()
+            .chain(ordinary_old)
+            .filter(|old| seen.insert(old.instance_key()))
             .filter(|old| {
                 resource.id == *old.id
                     || (is_unbound

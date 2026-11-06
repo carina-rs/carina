@@ -6097,7 +6097,7 @@ fn deposed_delete_waits_for_update_that_dropped_prior_reference() {
 
 #[test]
 fn deposed_delete_waits_for_the_rows_in_flight_create() {
-    use carina_core::effect::{Effect, EffectGeneration};
+    use carina_core::effect::EffectGeneration;
     use carina_core::provider::Sent;
     use carina_state::state::{DeposedInstance, DeposedKey, ResourceState};
     use std::collections::HashMap;
@@ -6132,7 +6132,7 @@ fn deposed_delete_waits_for_the_rows_in_flight_create() {
 
     assert!(errors.is_empty());
     let [
-        Effect::Delete {
+        carina_core::effect::DeferredReplaceDelete {
             generation: EffectGeneration::Deposed(actual_key),
             blocked_by_updates,
             ..

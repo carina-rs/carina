@@ -9279,7 +9279,7 @@ pub fn add_deposed_delete_effects(
     for row in state_file.resources() {
         let (effects, errors) = deposed_delete_effects_for_row(row, moved_pairs);
         for effect in effects {
-            plan.add(effect);
+            plan.add_delete(effect);
         }
         for error in errors {
             plan.add_error(error);
@@ -9294,7 +9294,10 @@ pub fn add_deposed_delete_effects(
 pub(crate) fn deposed_delete_effects_for_row(
     row: &carina_state::ResourceState,
     moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
-) -> (Vec<Effect>, Vec<PlanError>) {
+) -> (
+    Vec<carina_core::effect::DeferredReplaceDelete>,
+    Vec<PlanError>,
+) {
     let mut effects = Vec::with_capacity(row.deposed.len());
     let mut errors = Vec::new();
     let row_id = resolved_state_row_id(row, row.directives.provider_instance.clone());
@@ -9321,7 +9324,7 @@ pub(crate) fn deposed_delete_effects_for_row(
             deposed.identifier.as_str(),
             row.identifier().map(AppliedIdentifier::as_str),
         ) {
-            Ok(identifier) => effects.push(Effect::Delete {
+            Ok(identifier) => effects.push(carina_core::effect::DeferredReplaceDelete {
                 id,
                 identifier,
                 generation: EffectGeneration::Deposed(deposed.key.clone()),
@@ -9330,6 +9333,7 @@ pub(crate) fn deposed_delete_effects_for_row(
                 dependencies: deposed.dependency_bindings.clone(),
                 explicit_dependencies: ResolvedDependencies::default(),
                 blocked_by_updates: blocked_by_current_resume.clone(),
+                previous_attributes: deposed.persisted_attributes().to_values(),
             }),
             Err(error) => errors.push(*error),
         }

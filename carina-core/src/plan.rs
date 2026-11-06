@@ -15,14 +15,14 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
-    ChangedCreateOnly, Effect, EffectGeneration, EffectWithSource, MoveAuthority, TemporaryName,
-    UnresolvedSavedEffect,
+    ChangedCreateOnly, DeferredReplaceDelete, DeletedInstanceKey, Effect, EffectGeneration,
+    EffectWithSource, MoveAuthority, TemporaryName, UnresolvedSavedEffect,
 };
 use crate::hint::ProjectCommand;
 use crate::module_resolver::ModuleConstraintDiagnostic;
 use crate::name_override::NameOverride;
 use crate::provider::{AppliedIdentifier, Timestamp};
-use crate::replacement::{CheckedReplacement, ReplacementScheduling};
+use crate::replacement::{CheckedReplacement, ReplacementInputs, ReplacementScheduling};
 #[cfg(test)]
 use crate::resource::Directives;
 pub use crate::resource::PreventDestroySource;
@@ -703,6 +703,8 @@ pub struct Plan<S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
     effects: Vec<EffectWithSource<S, V>>,
     #[serde(skip)]
     replacements: ReplacementScheduling,
+    #[serde(default, skip_serializing_if = "ReplacementInputs::is_empty")]
+    pub(crate) replacement_inputs: Box<ReplacementInputs>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ignored_change_summaries: Vec<IgnoredChangeSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -725,6 +727,7 @@ pub struct Plan<S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
 impl<S: PartialEq, V: PlanValueKind> PartialEq for Plan<S, V> {
     fn eq(&self, other: &Self) -> bool {
         self.effects == other.effects
+            && self.replacement_inputs == other.replacement_inputs
             && self.ignored_change_summaries == other.ignored_change_summaries
             && self.replace_display == other.replace_display
             && self.permanent_name_overrides == other.permanent_name_overrides
@@ -739,6 +742,7 @@ impl<S, V: PlanValueKind> Default for Plan<S, V> {
         Self {
             effects: Vec::new(),
             replacements: ReplacementScheduling::default(),
+            replacement_inputs: Box::default(),
             ignored_change_summaries: Vec::new(),
             replace_display: Vec::new(),
             permanent_name_overrides: Vec::new(),
@@ -757,6 +761,8 @@ pub type SnapshotPlan<S = ModuleSource> = Plan<S, SnapshotLeaf>;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnresolvedSavedPlan {
     effects: Vec<UnresolvedSavedEffect>,
+    #[serde(default, skip_serializing_if = "ReplacementInputs::is_empty")]
+    replacement_inputs: Box<ReplacementInputs>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     ignored_change_summaries: Vec<IgnoredChangeSummary>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -778,6 +784,7 @@ impl From<SavedPlan> for UnresolvedSavedPlan {
             effects,
             ignored_change_summaries,
             replace_display,
+            replacement_inputs,
             permanent_name_overrides,
             errors,
             abandoned_deposed,
@@ -790,6 +797,7 @@ impl From<SavedPlan> for UnresolvedSavedPlan {
                 .collect(),
             ignored_change_summaries,
             replace_display,
+            replacement_inputs,
             permanent_name_overrides,
             errors,
             abandoned_deposed,
@@ -834,6 +842,9 @@ impl UnresolvedSavedPlan {
                     .values()
                     .any(crate::value::contains_redacted_secret)
             })
+            || self
+                .replacement_inputs
+                .contains_redacted_secret_placeholders()
     }
 
     /// Endpoint indices are wire intents, without admitted display order.
@@ -862,6 +873,7 @@ impl UnresolvedSavedPlan {
             effects,
             ignored_change_summaries,
             replace_display,
+            replacement_inputs,
             permanent_name_overrides,
             errors,
             abandoned_deposed,
@@ -876,6 +888,7 @@ impl UnresolvedSavedPlan {
             effects,
             ignored_change_summaries,
             replace_display,
+            replacement_inputs,
             permanent_name_overrides,
             errors,
             abandoned_deposed,
@@ -894,6 +907,7 @@ impl<V: PlanValueKind> From<Plan<ModuleSource, V>> for Plan<SavedModuleSource, V
             effects,
             ignored_change_summaries,
             replace_display,
+            replacement_inputs,
             permanent_name_overrides,
             errors,
             abandoned_deposed,
@@ -904,6 +918,7 @@ impl<V: PlanValueKind> From<Plan<ModuleSource, V>> for Plan<SavedModuleSource, V
             effects: effects.into_iter().map(EffectWithSource::from).collect(),
             ignored_change_summaries,
             replace_display,
+            replacement_inputs,
             permanent_name_overrides,
             errors,
             abandoned_deposed,
@@ -932,6 +947,14 @@ impl Plan {
         let previous_attributes = group.replacement.old_instances()[0]
             .previous_attributes
             .clone();
+        for old in group.replacement.old_instances() {
+            self.replacement_inputs.record_old(old);
+        }
+        if let Some(name) = &temporary_name {
+            self.replacement_inputs
+                .prepared_names
+                .push((group.replacement.target().id.clone(), name.clone()));
+        }
         let offset = self.effects.len();
         let (create_idx, delete_idx) = if create_before_destroy {
             (offset, offset + 1)
@@ -999,6 +1022,7 @@ impl<S, V: PlanValueKind> Plan<S, V> {
             effects: _,
             ignored_change_summaries,
             replace_display,
+            replacement_inputs,
             permanent_name_overrides,
             errors,
             abandoned_deposed,
@@ -1011,6 +1035,7 @@ impl<S, V: PlanValueKind> Plan<S, V> {
             effects,
             ignored_change_summaries,
             replace_display,
+            replacement_inputs,
             permanent_name_overrides,
             errors,
             abandoned_deposed,
@@ -1020,6 +1045,20 @@ impl<S, V: PlanValueKind> Plan<S, V> {
 
     pub fn add(&mut self, effect: Effect<S, V>) {
         self.effects.push(effect);
+    }
+
+    /// Retain the generation's own snapshot alongside its delete endpoint.
+    /// The snapshot is replacement input even when no display row exists yet.
+    pub fn add_delete(&mut self, old: DeferredReplaceDelete) {
+        self.replacement_inputs.record_old(&old);
+        self.effects.push(old.to_delete_effect());
+    }
+
+    pub(crate) fn previous_delete_attributes(
+        &self,
+        instance: &DeletedInstanceKey,
+    ) -> Option<HashMap<String, SnapshotValue>> {
+        self.replacement_inputs.previous(instance)
     }
 
     pub(crate) fn prepare_replacements(
@@ -1033,6 +1072,7 @@ impl<S, V: PlanValueKind> Plan<S, V> {
             self.admit_replacement_effects(schemas)?.into_parts();
         self.effects = effects;
         self.replacements = replacements;
+        self.replacement_inputs.prepared_names = temporary_names.clone();
         for (id, name) in temporary_names {
             for display in &mut self.replace_display {
                 if self
@@ -1105,29 +1145,17 @@ impl<S, V: PlanValueKind> Plan<S, V> {
             }
         }
         let prepared_names = self
-            .replace_display
+            .replacement_inputs
+            .prepared_names
             .iter()
-            .filter_map(|entry| {
-                let name = entry.temporary_name.as_ref()?;
-                let target = self.effects.get(entry.create_idx)?;
-                Some((
-                    ResolvedResourceId::new(target.resource_id().clone()),
-                    name.clone(),
-                ))
-            })
+            .map(|(id, name)| (ResolvedResourceId::new(id.clone()), name.clone()))
             .collect();
         crate::replacement::AdmittedReplacementEffects::resolve_with_prepared_names(
             &effects,
             registry,
-            |id| {
-                self.replace_display
-                    .iter()
-                    .find(|entry| {
-                        self.effects
-                            .get(entry.create_idx)
-                            .is_some_and(|effect| effect.resource_id() == id.as_inner())
-                    })
-                    .map(|entry| entry.previous_attributes.clone())
+            |instance| {
+                self.replacement_inputs
+                    .previous(instance)
                     .unwrap_or_default()
             },
             &associations,
@@ -1256,6 +1284,7 @@ impl<S, V: PlanValueKind> Plan<S, V> {
             effects,
             ignored_change_summaries: _ignored_change_summaries,
             replace_display,
+            replacement_inputs,
             permanent_name_overrides: _permanent_name_overrides,
             errors: _errors,
             abandoned_deposed: _abandoned_deposed,
@@ -1279,6 +1308,7 @@ impl<S, V: PlanValueKind> Plan<S, V> {
                     .values()
                     .any(crate::value::contains_redacted_secret)
             })
+            || replacement_inputs.contains_redacted_secret_placeholders()
     }
 
     /// Replacement display metadata for decomposed Create/Delete replacement pairs.
@@ -1416,6 +1446,37 @@ impl<S, V: PlanValueKind> Plan<S, V> {
 
         self.effects = retained;
         self.replacements.remap(&old_to_new);
+        let old_instances: HashSet<_> = self
+            .effects
+            .iter()
+            .flat_map(|effect| match effect {
+                Effect::Delete {
+                    id,
+                    identifier,
+                    generation,
+                    ..
+                } => vec![DeletedInstanceKey::new(
+                    id.as_inner().clone(),
+                    generation.clone(),
+                    identifier.as_str(),
+                )],
+                Effect::DeferredReplace(payload) => payload
+                    .deletes
+                    .iter()
+                    .map(DeferredReplaceDelete::instance_key)
+                    .collect(),
+                _ => Vec::new(),
+            })
+            .collect();
+        self.replacement_inputs
+            .old_instances
+            .retain(|old| old_instances.contains(&old.instance));
+        self.replacement_inputs.prepared_names.retain(|(id, _)| {
+            self.effects.iter().any(|effect| {
+                matches!(effect, Effect::Create(_) | Effect::ResumeCreate { .. })
+                    && effect.resource_id() == id
+            })
+        });
         self.replace_display = self
             .replace_display
             .drain(..)

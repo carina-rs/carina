@@ -12892,6 +12892,7 @@ async fn conflicting_deferred_case(
         Ok(())
     });
     provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
 
     let mut cert = Resource::new("test", "cert");
     cert.binding = Some(absolute_binding("cert"));
@@ -12965,6 +12966,22 @@ async fn conflicting_deferred_case(
             }
         }
     }
+    // A top-level historical generation must obey the same expansion, admission,
+    // and failed-delete barriers as the current generation absorbed above.
+    plan.add(Effect::Delete {
+        id: ResolvedResourceId::new(validation_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("deposed-validation"),
+        generation: EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique()),
+        directives: Default::default(),
+        binding: Some(absolute_binding(if map {
+            "validation_records.stable"
+        } else {
+            "validation_records[0]"
+        })),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+    });
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "",
@@ -13217,6 +13234,167 @@ async fn review_4283_anonymous_delete_waits_for_forbidden_cbd_admission() {
         provider.calls()
     );
     assert!(result.managed_current.contains_key(&child_id));
+}
+
+#[tokio::test]
+async fn review4_4283_deposed_delete_waits_for_forbidden_deferred_admission() {
+    deposed_deferred_admission(false, false, false).await;
+}
+
+#[tokio::test]
+async fn review4_4283_deposed_delete_waits_for_admitted_deferred_create_first() {
+    deposed_deferred_admission(true, true, false).await;
+}
+
+#[tokio::test]
+async fn review4_4283_bound_deposed_deletes_wait_for_both_deferred_gate_variants() {
+    for coexisting in [false, true] {
+        for absorbed in [false, true] {
+            deposed_deferred_admission(coexisting, absorbed, true).await;
+        }
+    }
+}
+
+async fn deposed_deferred_admission(coexisting: bool, absorbed: bool, bound: bool) {
+    let (mut template, bindings, mut schemas, child) = if bound {
+        let mut bindings = ResolvedBindings::default();
+        let state =
+            cert_state_for_deferred_replace_deadlock(&ResourceId::with_identity("test", "cert"));
+        bindings.set_with_completeness(
+            "cert",
+            state
+                .attributes
+                .into_iter()
+                .map(|(key, value)| (key, value.to_value_at("fixture").unwrap()))
+                .collect(),
+            crate::binding_index::BindingValueSource::Upstream,
+            crate::binding_index::BindingCompleteness::Complete,
+        );
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("test")
+                .with_conflicting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        (
+            validation_deferred_for_expression(),
+            bindings,
+            schemas,
+            Resource::new("test", "validation_records[0]")
+                .with_root_binding("validation_records[0]"),
+        )
+    } else {
+        anonymous_deferred_collision_fixture()
+    };
+    template.template_directives_mut().create_before_destroy =
+        crate::resource::LoopDirective::Resolved(true);
+    if coexisting {
+        schemas.insert(
+            &child.id.provider,
+            PatternResourceSchema::new(child.id.resource_type.clone())
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "identity_input",
+                        PatternAttributeType::string(),
+                    )
+                    .create_only()
+                    .build(),
+                )
+                .with_coexisting_replacement()
+                .validate()
+                .unwrap(),
+        );
+    }
+    let child_id = child.id.clone();
+    let old = DeferredReplaceDelete {
+        generation: EffectGeneration::Current,
+        id: ResolvedResourceId::new(child_id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("old-current"),
+        directives: Default::default(),
+        binding: child.binding.clone(),
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: HashMap::new(),
+    };
+    let mut deposed = old.clone();
+    deposed.generation = EffectGeneration::Deposed(crate::resource::DeposedKey::new_unique());
+    deposed.identifier = crate::effect::fixture_applied_identifier("old-deposed");
+    let mut plan = Plan::new();
+    plan.add(deposed.to_delete_effect());
+    let compiled = if bound {
+        let configuration = crate::parser::ExpandedParsedFile {
+            upstream_states: vec![crate::parser::UpstreamState {
+                binding: absolute_binding("cert"),
+                source: "../cert".into(),
+            }],
+            ..Default::default()
+        };
+        let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
+        let (template, dependencies) = graph.compile_deferred_for(template).unwrap();
+        crate::effect::DeferredCreatePayload::new(Box::new(template), dependencies)
+    } else {
+        crate::test_support::compiled_loop(Box::new(template))
+    };
+    if absorbed {
+        plan.add(Effect::DeferredReplace(Box::new(
+            crate::effect::DeferredReplacePayload::new(
+                NonEmptyDeletes::try_new(vec![old]).unwrap(),
+                compiled.template,
+                compiled.dependency_template,
+            ),
+        )));
+    } else {
+        plan.add(old.to_delete_effect());
+        plan.add(Effect::DeferredCreate(compiled));
+    }
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    provider.push_delete(Ok(()));
+    provider.push_create(Ok(
+        State::existing(child_id.clone(), HashMap::new()).with_identifier("new-child")
+    ));
+    let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
+        plan: &plan,
+        provider_check_inputs: ProviderCheckInputs::Authored,
+        compositions: &[],
+        bindings,
+        managed_current: HashMap::new(),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: NonZeroUsize::new(1).unwrap(),
+        precompleted_success_count: 0,
+        checkpoint_sink: ExecutionCheckpointSink::noop(),
+    };
+    let observer = MockObserver::new();
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let calls = provider.calls();
+    if !coexisting {
+        assert_eq!(result.failure_count(), 1, "events: {:?}", observer.events());
+        assert!(
+            calls.is_empty(),
+            "deposed child was deleted before admission: {calls:?}"
+        );
+        assert!(result.successfully_deleted.is_empty());
+    } else {
+        assert_eq!(result.failure_count(), 0, "events: {:?}", observer.events());
+        assert_eq!(calls.len(), 3, "calls: {calls:?}");
+        assert_eq!(
+            calls[0],
+            ("create".into(), child_id.to_string()),
+            "every old generation must wait for the admitted Create: {calls:?}"
+        );
+        assert_eq!(result.replacement_writeback[0].old_instances().len(), 2);
+    }
 }
 
 #[test]

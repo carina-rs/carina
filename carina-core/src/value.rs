@@ -4678,6 +4678,20 @@ pub fn redact_secrets_in_plan_with_desired_and_historical<D>(
         .collect::<Result<_, SerializationError>>()?;
     let mut redacted = plan.clone().with_value_stage(redacted_effects);
 
+    for old in &mut redacted.replacement_inputs.old_instances {
+        // Only current-generation snapshots can use current-row evidence.
+        // Deposed values already carry their own persisted secret shape.
+        let historical = old
+            .instance
+            .generation()
+            .is_current()
+            .then(|| historical.get(old.instance.id()))
+            .flatten();
+        old.attributes = redact_historical_attributes(&old.attributes, |key| {
+            historical.and_then(|state| state.attributes.get(key))
+        })?;
+    }
+
     let create_ids = create_effect_ids(&redacted);
     for metadata in redacted.replace_display_mut() {
         let resource_id = create_ids.get(metadata.create_idx).and_then(Option::as_ref);
@@ -4983,6 +4997,19 @@ pub fn rehydrate_plan_historical_secrets_from_verified_states<
         })
         .collect::<Result<Vec<_>, SecretRehydrationSiteError>>()?;
     *out.effects_mut() = effects;
+
+    for old in &mut out.replacement_inputs.old_instances {
+        if old.instance.generation().is_current()
+            && old.attributes.values().any(contains_redacted_secret)
+        {
+            let (redacted, verified) = state_evidence(old.instance.id())?;
+            let saved = crate::resource::SnapshotState::existing(
+                old.instance.id().clone(),
+                old.attributes.clone(),
+            );
+            old.attributes = restore_state(&saved, redacted, verified)?.attributes;
+        }
+    }
 
     let create_ids = create_effect_ids(&out);
     for metadata in out.replace_display_mut() {

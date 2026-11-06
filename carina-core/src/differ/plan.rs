@@ -1433,7 +1433,7 @@ fn create_plan_parts(
         let explicit_dependencies = persisted_directives.depends_on.to_resolved_dependencies();
         let mut dependencies = state.dependency_bindings.clone();
         dependencies.extend_projected(&persisted_directives.depends_on);
-        plan.add(Effect::Delete {
+        plan.add_delete(DeferredReplaceDelete {
             id: ResolvedResourceId::new(id.clone()),
             identifier,
             generation: crate::effect::EffectGeneration::Current,
@@ -1442,6 +1442,7 @@ fn create_plan_parts(
             dependencies,
             explicit_dependencies,
             blocked_by_updates: ResolvedDependencies::default(),
+            previous_attributes: state.attributes.clone(),
         });
     }
 

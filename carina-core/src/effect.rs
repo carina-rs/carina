@@ -149,7 +149,7 @@ impl EffectInstanceKey {
 /// Unlike [`EffectInstanceKey`], this carries the full [`ResourceId`] so result
 /// accounting cannot conflate resources whose identity strings collide across
 /// providers, types, or provider instances.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DeletedInstanceKey {
     id: ResourceId,
     generation: EffectGeneration,
@@ -254,11 +254,19 @@ impl PriorInstanceDestroyDependencies {
 }
 
 impl DeferredReplaceDelete {
+    pub(crate) fn instance_key(&self) -> DeletedInstanceKey {
+        DeletedInstanceKey::new(
+            self.id.as_inner().clone(),
+            self.generation.clone(),
+            self.identifier.as_str(),
+        )
+    }
+
     pub fn prior_instance_destroy_dependencies(&self) -> PriorInstanceDestroyDependencies {
         PriorInstanceDestroyDependencies(self.dependencies.clone())
     }
 
-    pub fn to_delete_effect<S>(&self) -> Effect<S> {
+    pub fn to_delete_effect<S, P: crate::resource::PlanValueKind>(&self) -> Effect<S, P> {
         Effect::Delete {
             id: self.id.clone(),
             identifier: self.identifier.clone(),

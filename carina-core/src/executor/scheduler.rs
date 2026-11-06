@@ -7,10 +7,7 @@ use crate::resource::ResolvedResourceId;
 
 use super::deferred_dispatch::{DeferredDispatchResult, PureMetaCtx, dispatch_deferred_create};
 use super::parallel::apply_deferred_gate_deps;
-use crate::effect::deps::{
-    DependencyAnalysis, DependencyAnalysisFailure, UnresolvedRequiredDependency,
-    relax_update_update_edges,
-};
+use crate::effect::deps::{UnresolvedRequiredDependency, relax_update_update_edges};
 
 pub(super) struct SchedulerDeps {
     pub(super) deps_of: HashMap<usize, HashSet<usize>>,
@@ -101,19 +98,8 @@ pub(super) fn build_scheduler_deps<'a, S: Clone>(
     unresolved_resources: impl IntoIterator<Item = &'a ResolvedResourceId>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) -> SchedulerDeps {
-    finish_scheduler_deps(
-        admitted.effects(),
-        admitted.dependency_analysis(unresolved_resources),
-        deferred_replace_delete_deps,
-    )
-}
-
-fn finish_scheduler_deps<S>(
-    effects: &[Effect<S>],
-    analysis: Result<DependencyAnalysis, DependencyAnalysisFailure>,
-    deferred_replace_delete_deps: &[(usize, usize)],
-) -> SchedulerDeps {
-    let (mut analysis, unresolved) = match analysis {
+    let effects = admitted.effects();
+    let (mut analysis, unresolved) = match admitted.dependency_analysis(unresolved_resources) {
         Ok(analysis) => (analysis, Vec::new()),
         Err(failure) => failure.into_parts(),
     };

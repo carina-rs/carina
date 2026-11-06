@@ -182,6 +182,15 @@ fn v42_deferred_replacement_admission_requests_round_trip() {
         "fixtures/module_binding_wire_compat/carina.update-delete.v42.plan.json"
     ));
     let wire = assert_json_value_round_trip::<PlanFile>(&fixture);
+    let snapshots = wire["plan"]["replacement_inputs"]["old_instances"]
+        .as_array()
+        .unwrap();
+    assert_eq!(snapshots.len(), 4);
+    for snapshot in snapshots {
+        assert_eq!(snapshot["instance"]["generation"], "Current");
+        assert!(snapshot["instance"]["identifier"].is_string());
+        assert!(snapshot["attributes"]["name"].is_object());
+    }
     let decoded: PlanFile = serde_json::from_str(&fixture).unwrap();
     let replacements = decoded
         .plan

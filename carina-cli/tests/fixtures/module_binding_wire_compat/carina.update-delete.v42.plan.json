@@ -992,7 +992,88 @@
           }
         }
       }
-    ]
+    ],
+    "replacement_inputs": {
+      "old_instances": [
+        {
+          "instance": {
+            "id": {
+              "provider": "mock",
+              "resource_type": "test.resource",
+              "identity": "looped[0].nested.leaf"
+            },
+            "generation": "Current",
+            "identifier": "mock-id"
+          },
+          "attributes": {
+            "identifier": {
+              "String": "loop-nested-id"
+            },
+            "name": {
+              "String": "loop-nested"
+            }
+          }
+        },
+        {
+          "instance": {
+            "id": {
+              "provider": "mock",
+              "resource_type": "test.resource",
+              "identity": "direct.nested.leaf"
+            },
+            "generation": "Current",
+            "identifier": "mock-id"
+          },
+          "attributes": {
+            "identifier": {
+              "String": "direct-nested-id"
+            },
+            "name": {
+              "String": "direct-nested"
+            }
+          }
+        },
+        {
+          "instance": {
+            "id": {
+              "provider": "mock",
+              "resource_type": "test.resource",
+              "identity": "direct.deferred_source"
+            },
+            "generation": "Current",
+            "identifier": "mock-id"
+          },
+          "attributes": {
+            "name": {
+              "String": "direct-deferred-source"
+            },
+            "identifier": {
+              "String": "direct-deferred-source-id"
+            }
+          }
+        },
+        {
+          "instance": {
+            "id": {
+              "provider": "mock",
+              "resource_type": "test.resource",
+              "identity": "looped[0].deferred_source"
+            },
+            "generation": "Current",
+            "identifier": "mock-id"
+          },
+          "attributes": {
+            "identifier": {
+              "String": "loop-deferred-source-id"
+            },
+            "name": {
+              "String": "loop-deferred-source"
+            }
+          }
+        }
+      ],
+      "prepared_names": []
+    }
   },
   "sorted_resources": [
     {

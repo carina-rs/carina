@@ -16,7 +16,7 @@ mod deferred_dispatch;
 pub mod normalized;
 #[cfg(test)]
 mod normalized_tests;
-pub(crate) mod parallel;
+mod parallel;
 pub mod provider_ready;
 #[cfg(test)]
 mod provider_wire_tests;

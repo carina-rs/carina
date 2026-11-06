@@ -37,65 +37,15 @@ use super::{
 #[cfg(test)]
 use super::{ExecutionInput, ProviderCheckInputs};
 
-pub(crate) struct ExpandedEffects<S> {
-    pub(crate) effects: Vec<Effect<S>>,
-    pub(crate) deferred_replace_delete_deps: Vec<(usize, usize)>,
-    pub(crate) source_effect_indices: Vec<usize>,
-}
-
-pub(crate) fn expand_deferred_replace_effects<S: Clone>(
-    plan_effects: &[Effect<S>],
-) -> ExpandedEffects<S> {
-    let mut effects = Vec::with_capacity(plan_effects.len());
-    let mut deferred_replace_delete_deps = Vec::new();
-    let mut source_effect_indices = Vec::with_capacity(plan_effects.len());
-
-    for (source_effect_idx, effect) in plan_effects.iter().enumerate() {
-        if let Effect::DeferredReplace(payload) = effect {
-            let mut delete_indices = Vec::with_capacity(payload.deletes.len());
-            for delete in payload.deletes.iter() {
-                let delete_idx = effects.len();
-                effects.push(delete.to_delete_effect());
-                source_effect_indices.push(source_effect_idx);
-                delete_indices.push(delete_idx);
-            }
-            let gate_idx = effects.len();
-            effects.push(effect.clone());
-            source_effect_indices.push(source_effect_idx);
-            deferred_replace_delete_deps.extend(
-                delete_indices
-                    .into_iter()
-                    .map(|delete_idx| (gate_idx, delete_idx)),
-            );
-        } else {
-            effects.push(effect.clone());
-            source_effect_indices.push(source_effect_idx);
-        }
-    }
-
-    ExpandedEffects {
-        effects,
-        deferred_replace_delete_deps,
-        source_effect_indices,
-    }
-}
-
 pub(super) fn apply_deferred_gate_deps<S>(
     effects: &[Effect<S>],
     deps_of: &mut HashMap<usize, HashSet<usize>>,
     deferred_replace_delete_deps: &[(usize, usize)],
 ) {
-    // Every same-kind unbound gate may materialize a replacement for an
-    // anonymous row. Keep those candidate rows live until all such gates
-    // materialize and admit their children successfully.
+    // A deferred gate may pair any old generation with a materialized child.
+    // Keep every candidate live until materialization and admission succeed.
     for (delete_idx, effect) in effects.iter().enumerate() {
-        let Effect::Delete {
-            id,
-            generation: crate::effect::EffectGeneration::Current,
-            binding: None,
-            ..
-        } = effect
-        else {
+        let Effect::Delete { id, binding, .. } = effect else {
             continue;
         };
         if !deps_of.contains_key(&delete_idx) {
@@ -107,10 +57,14 @@ pub(super) fn apply_deferred_gate_deps<S>(
                 Effect::DeferredReplace(payload) => payload.template.as_ref(),
                 _ => continue,
             };
-            if matches!(
+            let bound_candidate = binding.as_ref().is_none_or(|binding| {
+                crate::differ::binding_matches_deferred_template(binding, template.target())
+            }) || matches!(candidate, Effect::DeferredReplace(payload) if payload.deletes.iter().any(|old| old.id == *id));
+            if (matches!(
                 template.target(),
                 crate::parser::DeferredForTarget::Unbound { .. }
-            ) && template.template_resource_id().provider == id.provider
+            ) || bound_candidate)
+                && template.template_resource_id().provider == id.provider
                 && template.template_resource_id().resource_type == id.resource_type
                 && template.template_resource_id().provider_instance == id.provider_instance
             {
@@ -727,14 +681,14 @@ pub(super) async fn execute_effects_sequential<
                     Effect::Delete {
                         id,
                         identifier,
-                        generation: crate::effect::EffectGeneration::Current,
+                        generation,
                         directives,
                         binding,
                         dependencies,
                         explicit_dependencies,
                         blocked_by_updates,
                     } => Some(crate::effect::DeferredReplaceDelete {
-                        generation: crate::effect::EffectGeneration::Current,
+                        generation: generation.clone(),
                         id: id.clone(),
                         identifier: identifier.clone(),
                         directives: directives.clone(),
@@ -742,15 +696,29 @@ pub(super) async fn execute_effects_sequential<
                         dependencies: dependencies.clone(),
                         explicit_dependencies: explicit_dependencies.clone(),
                         blocked_by_updates: blocked_by_updates.clone(),
-                        previous_attributes: accumulated
-                            .result()
-                            .managed_current
-                            .get(id.as_inner())
-                            .and_then(|current| match current {
-                                crate::resource::Current::Present(present) => {
-                                    Some(present.state().to_snapshot().attributes)
+                        previous_attributes: input
+                            .plan
+                            .previous_delete_attributes(&crate::effect::DeletedInstanceKey::new(
+                                id.as_inner().clone(),
+                                generation.clone(),
+                                identifier.as_str(),
+                            ))
+                            .or_else(|| {
+                                if !generation.is_current() {
+                                    return None;
                                 }
-                                _ => None,
+                                accumulated
+                                    .result()
+                                    .managed_current
+                                    .get(id.as_inner())
+                                    .and_then(|current| match current {
+                                        crate::resource::Current::Present(present)
+                                            if present.identifier() == identifier =>
+                                        {
+                                            Some(present.state().to_snapshot().attributes)
+                                        }
+                                        _ => None,
+                                    })
                             })
                             .unwrap_or_default(),
                     }),
@@ -1489,7 +1457,7 @@ mod tests {
     }
 
     #[test]
-    fn all_same_kind_unbound_deferred_gates_wait_for_anonymous_delete() {
+    fn anonymous_delete_waits_for_all_same_kind_unbound_deferred_gates() {
         let deleted_id = crate::resource::ResolvedResourceId::with_provider_identity(
             "mock",
             "test.Child",
@@ -1522,8 +1490,9 @@ mod tests {
 
         apply_deferred_gate_deps(&effects, &mut deps_of, &[]);
 
-        assert_eq!(deps_of.get(&1), Some(&HashSet::from([0])));
-        assert_eq!(deps_of.get(&2), Some(&HashSet::from([0])));
+        assert_eq!(deps_of.get(&0), Some(&HashSet::from([1, 2])));
+        assert_eq!(deps_of.get(&1), Some(&HashSet::new()));
+        assert_eq!(deps_of.get(&2), Some(&HashSet::new()));
     }
 
     fn fixture_id(binding: &str) -> crate::resource::ResolvedResourceId {
