@@ -124,7 +124,7 @@ impl Windows {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Occurrence {
     possible: bool,
     mandatory: bool,
@@ -145,6 +145,7 @@ struct Summary {
     exact_keys: bool,
 }
 
+#[derive(Clone, Copy)]
 struct Query<'a> {
     predicate: &'a InputPredicate<crate::schema::CompiledPattern>,
     limit: usize,
@@ -167,6 +168,12 @@ impl<'a> Query<'a> {
             supported_window: limit <= MAX_WINDOW,
         }
     }
+}
+
+fn any_of(summaries: impl IntoIterator<Item = Summary>, query: &Query<'_>) -> Option<Summary> {
+    summaries
+        .into_iter()
+        .reduce(|a, b| a.alternatives(b, query))
 }
 
 impl Summary {
@@ -196,10 +203,7 @@ impl Summary {
                     && alphabet.subset(&Characters::from_set(left))
                     && alphabet.subset(&Characters::from_set(right)),
             },
-            _ => Occurrence {
-                possible: false,
-                mandatory: false,
-            },
+            _ => Occurrence::default(),
         };
         let bad_character = match query.predicate {
             InputPredicate::AllowedChars(set) => {
@@ -354,10 +358,7 @@ impl Summary {
 fn token_occurrence(window: &[Characters], token: &str, ignore_ascii_case: bool) -> Occurrence {
     let chars = token.chars().collect::<Vec<_>>();
     if window.len() < chars.len() {
-        return Occurrence {
-            possible: false,
-            mandatory: false,
-        };
+        return Occurrence::default();
     }
     let mut possible = true;
     let mut mandatory = true;
@@ -380,10 +381,7 @@ fn token_occurrence(window: &[Characters], token: &str, ignore_ascii_case: bool)
 fn crossing_occurrences(a: &Windows, b: &Windows, query: &Query<'_>) -> Occurrence {
     use InputPredicate::*;
     if !matches!(query.predicate, NoSubstring(_) | NoAdjacent { .. }) {
-        return Occurrence {
-            possible: false,
-            mandatory: false,
-        };
+        return Occurrence::default();
     }
     if !query.supported_window {
         return Occurrence {
@@ -401,10 +399,7 @@ fn crossing_occurrences(a: &Windows, b: &Windows, query: &Query<'_>) -> Occurren
                 NoSubstring(token) => {
                     let joined = a.iter().chain(b).cloned().collect::<Vec<_>>();
                     let size = token.as_str().chars().count();
-                    let mut found = Occurrence {
-                        possible: false,
-                        mandatory: false,
-                    };
+                    let mut found = Occurrence::default();
                     for start in 0..a.len() {
                         if start + size <= a.len() || start + size > joined.len() {
                             continue;
@@ -416,18 +411,16 @@ fn crossing_occurrences(a: &Windows, b: &Windows, query: &Query<'_>) -> Occurren
                     }
                     found
                 }
-                NoAdjacent { left, right } => a.last().zip(b.first()).map_or(
-                    Occurrence {
-                        possible: false,
-                        mandatory: false,
-                    },
-                    |(a, b)| Occurrence {
-                        possible: !a.disjoint(&Characters::from_set(left))
-                            && !b.disjoint(&Characters::from_set(right)),
-                        mandatory: a.subset(&Characters::from_set(left))
-                            && b.subset(&Characters::from_set(right)),
-                    },
-                ),
+                NoAdjacent { left, right } => {
+                    a.last()
+                        .zip(b.first())
+                        .map_or(Occurrence::default(), |(a, b)| Occurrence {
+                            possible: !a.disjoint(&Characters::from_set(left))
+                                && !b.disjoint(&Characters::from_set(right)),
+                            mandatory: a.subset(&Characters::from_set(left))
+                                && b.subset(&Characters::from_set(right)),
+                        })
+                }
                 _ => unreachable!(),
             };
             result.possible |= found.possible;
@@ -484,11 +477,18 @@ fn path_may_be_absent<'a>(
 }
 
 impl Estimator<'_> {
-    fn value<P: ValueKind>(&mut self, value: &Value<P>, depth: usize) -> Summary {
+    fn spend(&mut self, depth: usize) -> bool {
         if depth >= MAX_DEPTH || self.steps >= MAX_STEPS {
-            return Summary::unknown(&self.query);
+            return false;
         }
         self.steps += 1;
+        true
+    }
+
+    fn value<P: ValueKind>(&mut self, value: &Value<P>, depth: usize) -> Summary {
+        if !self.spend(depth) {
+            return Summary::unknown(&self.query);
+        }
         match peel_secret(value) {
             Value::Concrete(ConcreteValue::String(value)) => {
                 Summary::literal(value.expose_plaintext(), &self.query)
@@ -525,10 +525,9 @@ impl Estimator<'_> {
         keys: bool,
         depth: usize,
     ) -> Summary {
-        if depth >= MAX_DEPTH || self.steps >= MAX_STEPS {
+        if !self.spend(depth) {
             return Summary::unknown(&self.query);
         }
-        self.steps += 1;
         let Some(types) = self.types else {
             return Summary::unknown(&self.query);
         };
@@ -587,10 +586,9 @@ impl Estimator<'_> {
         keys: bool,
         depth: usize,
     ) -> Summary {
-        if depth >= MAX_DEPTH || self.steps >= MAX_STEPS {
+        if !self.spend(depth) {
             return Summary::unknown(&self.query);
         }
-        self.steps += 1;
         let value = peel_secret(value);
         if let Value::Deferred(DeferredValue::ResourceRef { path: reference }) = value {
             return self.reference(reference, path, keys, depth + 1);
@@ -635,11 +633,11 @@ impl Estimator<'_> {
                 else {
                     return Summary::unknown(&self.query);
                 };
-                let mut summary = keys
-                    .iter()
-                    .map(|key| Summary::literal(key, &self.query))
-                    .reduce(|a, b| a.alternatives(b, &self.query))
-                    .unwrap_or_else(|| Summary::literal("", &self.query));
+                let mut summary = any_of(
+                    keys.iter().map(|key| Summary::literal(key, &self.query)),
+                    &self.query,
+                )
+                .unwrap_or_else(|| Summary::literal("", &self.query));
                 summary.finite = Some(keys);
                 summary.exact_keys = true;
                 return summary;
@@ -657,10 +655,9 @@ impl Estimator<'_> {
         keys: bool,
         depth: usize,
     ) -> Summary {
-        if depth >= MAX_DEPTH || self.steps >= MAX_STEPS {
+        if !self.spend(depth) {
             return Summary::unknown(&self.query);
         }
-        self.steps += 1;
         match ty.kind() {
             AttrTypeKind::Ref(name) => defs
                 .get(name)
@@ -695,11 +692,11 @@ impl Estimator<'_> {
                     else {
                         return Summary::unknown(&self.query);
                     };
-                    summary = keys
-                        .iter()
-                        .map(|key| Summary::literal(key, &self.query))
-                        .reduce(|a, b| a.alternatives(b, &self.query))
-                        .unwrap_or_else(|| Summary::unknown(&self.query));
+                    summary = any_of(
+                        keys.iter().map(|key| Summary::literal(key, &self.query)),
+                        &self.query,
+                    )
+                    .unwrap_or_else(|| Summary::unknown(&self.query));
                 }
                 summary.may_be_absent |=
                     LengthInterval::from_bounds(constraints.length().as_ref()).min == 0;
@@ -730,11 +727,13 @@ impl Estimator<'_> {
                 values: Some(values),
                 ..
             }
-            | AttrTypeKind::StringLiteralSet { values } => values
-                .iter()
-                .map(|value| Summary::literal(value, &self.query))
-                .reduce(|a, b| a.alternatives(b, &self.query))
-                .unwrap_or_else(|| Summary::unknown(&self.query)),
+            | AttrTypeKind::StringLiteralSet { values } => any_of(
+                values
+                    .iter()
+                    .map(|value| Summary::literal(value, &self.query)),
+                &self.query,
+            )
+            .unwrap_or_else(|| Summary::unknown(&self.query)),
             AttrTypeKind::Enum {
                 base, values: None, ..
             } => self.declared(base, defs, false, depth + 1),
@@ -744,15 +743,14 @@ impl Estimator<'_> {
                 let RawShape::Union(members) = ty.raw_shape() else {
                     unreachable!()
                 };
-                let mut result = None;
-                for member in members {
-                    let next = self.declared(member, defs, false, depth + 1);
-                    result = Some(match result {
-                        Some(prev) => Summary::alternatives(prev, next, &self.query),
-                        None => next,
-                    });
-                }
-                result.unwrap_or_else(|| Summary::unknown(&self.query))
+                let query = self.query;
+                any_of(
+                    members
+                        .iter()
+                        .map(|member| self.declared(member, defs, false, depth + 1)),
+                    &query,
+                )
+                .unwrap_or_else(|| Summary::unknown(&query))
             }
             _ => Summary::unknown(&self.query),
         }
@@ -760,68 +758,65 @@ impl Estimator<'_> {
 }
 
 /// Private entry point: no arbitrary value/type API can bypass a WriteSite.
-pub(super) fn estimate(site: &WriteSite<'_>, rule: &InputRule<Compiled>) -> InputVerdict {
+pub(super) fn estimate(
+    site: &WriteSite<'_>,
+    rule: &InputRule<Compiled>,
+    path: &[String],
+) -> InputVerdict {
     if matches!(
         rule.predicate(),
         InputPredicate::Matches(_) | InputPredicate::NotMatches(_)
     ) {
         return InputVerdict::Undecided;
     }
-    let query = Query::new(rule.predicate());
     let mut estimator = Estimator {
         types: site.types,
         literal_key_type: site
             .schema
-            .effective_type_at_attribute_path(
-                &rule
-                    .path()
-                    .segments()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>(),
-            )
+            .effective_type_at_attribute_path(path)
             .ok()
             .and_then(|node| match node.shape() {
                 crate::schema::Shape::Map { key, .. } => Some((key, node.defs())),
                 _ => None,
             }),
-        query,
+        query: Query::new(rule.predicate()),
         steps: 0,
     };
-    let path = rule
-        .path()
-        .segments()
-        .map(|name| PathSegment::Field { name: name.into() })
-        .collect::<Vec<_>>();
-    let PathSegment::Field { name } = &path[0] else {
-        unreachable!()
-    };
-    let keys = matches!(rule.target(), InputRuleTarget::MapKeys(_));
-    let omitted = match &site.authored {
+    match &site.authored {
         Some(AuthoredAttributes::Resource(attributes)) => {
-            omitted_optional(attributes, &path, site.schema)
+            from_authored(attributes, path, site.schema, &mut estimator, rule)
         }
         Some(AuthoredAttributes::Template(attributes)) => {
-            omitted_optional(attributes, &path, site.schema)
+            from_authored(attributes, path, site.schema, &mut estimator, rule)
         }
-        None => false,
-    };
-    if omitted {
+        None => InputVerdict::Undecided,
+    }
+}
+
+fn from_authored<P: ValueKind>(
+    attributes: &IndexMap<String, Value<P>>,
+    path: &[String],
+    schema: &ValidatedResourceSchema,
+    estimator: &mut Estimator<'_>,
+    rule: &InputRule<Compiled>,
+) -> InputVerdict {
+    if omitted_optional(attributes, path, schema) {
         return InputVerdict::Proven;
     }
-    let summary = match &site.authored {
-        Some(AuthoredAttributes::Resource(attributes)) => attributes
-            .get(name)
-            .map(|value| estimator.at_path(value, &path[1..], keys, 0)),
-        Some(AuthoredAttributes::Template(attributes)) => attributes
-            .get(name)
-            .map(|value| estimator.at_path(value, &path[1..], keys, 0)),
-        None => None,
-    };
-    let Some(summary) = summary else {
+    let Some(value) = attributes.get(rule.path().root()) else {
         return InputVerdict::Undecided;
     };
-    // Exact map keys obey existential failure (one bad key rejects the map).
-    // Concrete map projections have already been checked by normal evaluation.
+    let tail = path[1..]
+        .iter()
+        .map(|name| PathSegment::Field { name: name.clone() })
+        .collect::<Vec<_>>();
+    let summary = estimator.at_path(
+        value,
+        &tail,
+        matches!(rule.target(), InputRuleTarget::MapKeys(_)),
+        0,
+    );
+    // A concrete map's exact keys obey existential failure.
     decide(summary, rule, &estimator.query)
 }
 
@@ -852,20 +847,15 @@ fn key_spelling_is_stable(
     }
 }
 
-fn omitted_optional<P: ValueKind>(
+pub(super) fn omitted_optional<P: ValueKind>(
     mut fields: &IndexMap<String, Value<P>>,
-    path: &[PathSegment],
+    path: &[String],
     schema: &ValidatedResourceSchema,
 ) -> bool {
-    let mut names = Vec::new();
-    for step in path {
-        let PathSegment::Field { name } = step else {
-            return false;
-        };
-        names.push(name.clone());
+    for (index, name) in path.iter().enumerate() {
         let Some(value) = fields.get(name) else {
             return schema
-                .effective_node_at_path(&names)
+                .effective_node_at_path(&path[..=index])
                 .is_some_and(|node| node.effective_input_mode() == InputMode::Optional);
         };
         match peel_secret(value) {
@@ -1045,24 +1035,9 @@ fn window_can_be_ipv4(window: &[Characters]) -> bool {
 }
 
 fn violation(rule: &InputRule<Compiled>) -> InputViolation {
-    use InputPredicate::*;
-    let reason = match rule.predicate() {
-        Length { .. } => InputViolationReason::Length,
-        AllowedChars(_) => InputViolationReason::AllowedChars,
-        FirstChar(_) => InputViolationReason::FirstChar,
-        LastChar(_) => InputViolationReason::LastChar,
-        NoSubstring(_) => InputViolationReason::NoSubstring,
-        NoPrefix(_) => InputViolationReason::NoPrefix,
-        NoSuffix(_) => InputViolationReason::NoSuffix,
-        ForbiddenPrefix { .. } => InputViolationReason::ForbiddenPrefix,
-        NoAdjacent { .. } => InputViolationReason::NoAdjacent,
-        NotIpv4 => InputViolationReason::NotIpv4,
-        Matches(_) => InputViolationReason::Matches,
-        NotMatches(_) => InputViolationReason::NotMatches,
-    };
     InputViolation {
         path: rule.path().clone(),
         code: rule.code().clone(),
-        reason,
+        reason: rule.predicate().violation_reason(),
     }
 }

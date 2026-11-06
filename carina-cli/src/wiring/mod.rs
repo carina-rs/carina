@@ -7063,7 +7063,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     )
                     .await?;
                 let mut state_block_result = Ok(());
-                let plan = prepared.value.finish_with_desired_ids(resolved_desired_ids.ids.iter(), |plan| {
+                let plan = prepared.value.finish(resolved_desired_ids.ids.iter(), |plan| {
                     add_deposed_delete_effects(plan, state_file, &addressed.moved_pairs);
                     block_deletes_on_prior_consumer_updates(plan, &directives_map);
                     override_aware_resources.apply_plan_stability(
@@ -7103,19 +7103,10 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     .cloned()
                     .map(UnresolvedResource::from_pre_resolve)
                     .collect::<Vec<_>>();
-                let input_types = carina_core::input_rules::InputTypeContext::from_sources(
+                let input_types = carina_core::input_rules::InputTypeContext::from_compositions(
                     &input_sources,
                     &data_sources_for_plan,
-                    compositions.iter().filter_map(|composition| {
-                        let binding = composition.binding.clone()?;
-                        let outputs = composition.signature.attributes
-                            .iter()
-                            .filter_map(|(name, output)| {
-                                output.value().map(|value| (name.clone(), value))
-                            })
-                            .collect();
-                        Some((binding, outputs))
-                    }),
+                    carina_core::input_rules::InputCompositions::Live(&compositions),
                     &wait_aliases,
                     context.schemas(),
                 ).with_default_tags(

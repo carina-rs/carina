@@ -50,6 +50,7 @@ fn evaluate_schema(
     let finalized = fixture::finalize(plan);
     let current = std::collections::HashMap::new();
     for site in finalized.write_sites(&registry, &current) {
+        let site = site.unwrap();
         for rule in site.applicable_rules() {
             match rule.evaluate() {
                 InputVerdict::Proven => {}

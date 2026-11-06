@@ -1210,6 +1210,17 @@ impl PatchOp {
 }
 
 impl UpdatePatch {
+    /// Desired values actually sent by this patch, including reasserted inputs.
+    pub(crate) fn sent_projection(&self) -> IndexMap<String, Value> {
+        self.ops
+            .iter()
+            .filter_map(|op| {
+                op.sent_value()
+                    .map(|value| (op.key().to_owned(), value.clone()))
+            })
+            .collect()
+    }
+
     pub(crate) fn sent_attributes(&self) -> SentAttributes {
         SentAttributes::from_update_patch(self)
     }

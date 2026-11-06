@@ -777,3 +777,76 @@ fn input_rules_do_not_reject_import_desired_values_that_are_never_written() {
     assert!(saved.contains("\"Import\""));
     assert!(!saved.contains("\"Create\""));
 }
+
+#[test]
+fn saved_input_readmission_reports_drift_before_violating_value() {
+    let fixture = Fixture::new();
+    fs::write(
+        fixture.0.path().join("main.crn"),
+        "let seed = mock.test.resource { name = 'seed' comment = 'old' }\n",
+    )
+    .unwrap();
+    let output = fixture.run(&["apply", "--auto-approve"]);
+    assert!(output.status.success(), "{}", text(&output));
+    fs::write(fixture.0.path().join("main.crn"), "let seed = mock.test.resource { name = 'seed' comment = 'old' }\nlet producer = mock.test.resource { name = 'short' }\nlet consumer = mock.test.estimated_input { name = producer.identifier }\n").unwrap();
+    let output = fixture.run(&["plan", "--refresh=false", "--out", "plan.json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let path = fixture.0.path().join("plan.json");
+    let mut plan: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let consumer = plan["plan"]["effects"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .filter_map(|effect| effect.get_mut("Create"))
+        .find(|resource| resource["id"]["resource_type"] == "test.estimated_input")
+        .unwrap();
+    consumer["attributes"]["name"] = serde_json::json!({"String": "too-long-for-the-input-rule"});
+    fs::write(&path, serde_json::to_vec_pretty(&plan).unwrap()).unwrap();
+    let mock_path = fixture.0.path().join("mock-state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&mock_path).unwrap()).unwrap();
+    let seed = state["states"]
+        .as_object_mut()
+        .unwrap()
+        .values_mut()
+        .find(|resource| resource["name"] == "seed")
+        .unwrap();
+    seed["comment"] = serde_json::json!("drifted");
+    fs::write(&mock_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+    let before = fs::read(fixture.0.path().join("carina.state.json")).unwrap();
+    let output = fixture.run(&["apply", "--auto-approve", "plan.json"]);
+    assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+    assert!(
+        text(&output).contains("Infrastructure drift detected"),
+        "{}",
+        text(&output)
+    );
+    assert!(
+        !text(&output).contains("cannot create"),
+        "{}",
+        text(&output)
+    );
+    assert_eq!(
+        fs::read(fixture.0.path().join("carina.state.json")).unwrap(),
+        before
+    );
+}
+
+#[test]
+fn saved_input_unknown_module_output_remains_pending_until_dispatch() {
+    let fixture = Fixture::new();
+    fs::create_dir(fixture.0.path().join("module")).unwrap();
+    fs::write(fixture.0.path().join("module/main.crn"), "let source = mock.test.resource { name = 'short' }\nattributes { name = source.identifier }\n").unwrap();
+    fs::write(fixture.0.path().join("main.crn"), "let module = use { source = './module' }\nlet output = module {}\nlet consumer = mock.test.estimated_input { name = output.name }\n").unwrap();
+    let output = fixture.run(&["plan", "--refresh=false", "--out", "plan.json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        text(&output).contains("input check pending until apply"),
+        "{}",
+        text(&output)
+    );
+    let output = fixture.run(&["apply", "--auto-approve", "plan.json"]);
+    assert!(output.status.success(), "{}", text(&output));
+    let state = fs::read_to_string(fixture.0.path().join("mock-state.json")).unwrap();
+    assert!(state.contains("short-id"), "{state}");
+}

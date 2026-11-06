@@ -109,7 +109,8 @@ impl FinalizedWrite<CreateRequest> {
             .check_inputs(schemas, current)
             .map_err(WriteInputError::Admission)?;
         let mut checks =
-            ExecutionInputChecks::new(checked.execution_input_checks(), checked.effects(), &[0]);
+            ExecutionInputChecks::new(checked.execution_input_checks(), checked.effects(), &[0])
+                .map_err(|error| WriteInputError::Discharge(EffectFailureKind::execution(error)))?;
         let attributes = self
             .request
             .resource()
@@ -136,17 +137,9 @@ impl FinalizedWrite<UpdateRequest> {
             .check_inputs(schemas, current)
             .map_err(WriteInputError::Admission)?;
         let mut checks =
-            ExecutionInputChecks::new(checked.execution_input_checks(), checked.effects(), &[0]);
-        let attributes = self
-            .request
-            .patch()
-            .ops
-            .iter()
-            .filter_map(|op| {
-                op.sent_value()
-                    .map(|value| (op.key().to_owned(), value.clone()))
-            })
-            .collect();
+            ExecutionInputChecks::new(checked.execution_input_checks(), checked.effects(), &[0])
+                .map_err(|error| WriteInputError::Discharge(EffectFailureKind::execution(error)))?;
+        let attributes = self.request.patch().sent_projection().into_iter().collect();
         let writeback = SecretPreservingAttributes::from_provider_values(&attributes, &attributes);
         let id = self.request.from().id.clone();
         checks
@@ -161,7 +154,7 @@ impl FinalizedWrite<UpdateRequest> {
 #[derive(Debug)]
 struct PreparationReceipt {
     slot: EffectSlot,
-    children: Vec<Arc<PreparationReceipt>>,
+    _children: Vec<Arc<PreparationReceipt>>,
     deletes: Vec<EffectSlot>,
     // Paired deletes only guard creates. Keeping this same immutable request
     // alive in the receipt makes each permit retain it through Delete itself.
@@ -213,7 +206,10 @@ impl DeleteTarget {
             identifier,
             generation,
             directives,
-            ..
+            binding: _,
+            dependencies: _,
+            explicit_dependencies: _,
+            blocked_by_updates: _,
         } = effect
         else {
             return None;
@@ -289,7 +285,9 @@ pub(super) async fn prepare_cohort<S: Clone>(
     let mut requests = Vec::with_capacity(children.len());
     for (ordinal, child) in children.iter().enumerate() {
         let Effect::Create(resource) = child else {
-            unreachable!("materialized write")
+            return Err(EffectFailureKind::message(
+                "materialized cohort contains a non-create effect",
+            ));
         };
         let (ready, writeback) = super::basic::resolve_resource(
             Ok(CheckInput::Authored(resource.as_inner().clone())),
@@ -335,25 +333,17 @@ impl WriteCheck {
         id: &ResourceId,
         attributes: &IndexMap<String, Value>,
         schemas: &SchemaRegistry,
-        update: bool,
     ) -> Result<(), EffectFailureKind> {
         let Some(admission) = &self.admission else {
             return Ok(());
         };
         let token = DischargeToken(());
-        let site =
-            executor_write_site(&token, admission, id, attributes, schemas).ok_or_else(|| {
+        let site = executor_write_site(&token, admission, id, attributes, schemas)
+            .map_err(EffectFailureKind::execution)?
+            .ok_or_else(|| {
                 EffectFailureKind::message("input rule schema unavailable at dispatch")
             })?;
         for applicable in site.applicable_rules() {
-            // Update requests carry only sent values. An omitted top-level
-            // attribute is neither desired input nor a write to that path.
-            if update
-                && !attributes
-                    .contains_key(applicable.path().segments().next().expect("nonempty path"))
-            {
-                continue;
-            }
             match applicable.evaluate() {
                 InputVerdict::Proven => {}
                 InputVerdict::Violation(violation) => {
@@ -380,7 +370,6 @@ impl WriteCheck {
             &request.resource().id,
             &request.resource().attributes,
             schemas,
-            false,
         )?;
         let resource_id = request.resource().id.clone();
         let request = Arc::new(request);
@@ -391,7 +380,7 @@ impl WriteCheck {
             writeback,
             receipt: Arc::new(PreparationReceipt {
                 slot: self.slot,
-                children: Vec::new(),
+                _children: Vec::new(),
                 deletes: self.deletes,
                 _create_request: Some(retained_request),
             }),
@@ -405,23 +394,15 @@ impl WriteCheck {
         writeback: SecretPreservingAttributes,
         schemas: &SchemaRegistry,
     ) -> Result<PreparedWrite<UpdateRequest>, EffectFailureKind> {
-        let attributes = request
-            .patch()
-            .ops
-            .iter()
-            .filter_map(|op| {
-                op.sent_value()
-                    .map(|value| (op.key().to_owned(), value.clone()))
-            })
-            .collect();
-        self.discharge(id, &attributes, schemas, true)?;
+        let attributes = request.patch().sent_projection();
+        self.discharge(id, &attributes, schemas)?;
         Ok(PreparedWrite {
             request: Arc::new(request),
             resource_id: id.clone(),
             writeback,
             receipt: Arc::new(PreparationReceipt {
                 slot: self.slot,
-                children: Vec::new(),
+                _children: Vec::new(),
                 deletes: self.deletes,
                 _create_request: None,
             }),
@@ -438,7 +419,7 @@ impl WriteCheck {
         }
         let receipt = Arc::new(PreparationReceipt {
             slot: self.slot.clone(),
-            children: writes
+            _children: writes
                 .iter()
                 .map(|write| Arc::clone(&write.receipt))
                 .collect(),
@@ -472,12 +453,8 @@ impl<R> PreparedWrite<R> {
         R: Clone,
     {
         let Self {
-            request,
-            writeback,
-            receipt,
-            ..
+            request, writeback, ..
         } = self;
-        drop(receipt);
         (Arc::unwrap_or_clone(request), writeback)
     }
     pub(super) fn delete_permits(&self) -> Vec<DeletePermit> {
@@ -492,12 +469,31 @@ impl<R> PreparedWrite<R> {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(super) enum InputCheckConstructionError {
+    #[error("input-check source count {sources} does not match {effects} expanded effects")]
+    SourceCount { sources: usize, effects: usize },
+    #[error("sealed write slot {source_index} is missing or ambiguous after deferred expansion")]
+    WriteSlot { source_index: usize },
+    #[error(
+        "sealed delete slot {source_index}, absorbed index {absorbed_index}, is missing after deferred expansion"
+    )]
+    DeleteSlot {
+        source_index: usize,
+        absorbed_index: usize,
+    },
+    #[error("expanded write slot {index} has duplicate input checks")]
+    DuplicateWrite { index: usize },
+    #[error("expanded delete slot {index} is paired with multiple input checks")]
+    DuplicateDelete { index: usize },
+}
+
 /// Runtime mapping from sealed plan slots to expanded scheduler slots. All
 /// pairings below use indices; names and ResourceId equality never grant permits.
 pub(super) struct ExecutionInputChecks {
     run: Arc<()>,
-    checks: HashMap<usize, PendingInputObligation>,
-    paired: HashMap<usize, Vec<usize>>,
+    pub(super) checks: HashMap<usize, PendingInputObligation>,
+    pub(super) paired: HashMap<usize, Vec<usize>>,
     required_deletes: HashMap<usize, usize>,
     permits: HashMap<usize, DeletePermit>,
     consumed: HashSet<usize>,
@@ -512,7 +508,13 @@ impl ExecutionInputChecks {
         checks: Vec<PendingInputObligation>,
         effects: &[Effect<S>],
         sources: &[usize],
-    ) -> Self {
+    ) -> Result<Self, InputCheckConstructionError> {
+        if sources.len() != effects.len() {
+            return Err(InputCheckConstructionError::SourceCount {
+                sources: sources.len(),
+                effects: effects.len(),
+            });
+        }
         let mut result = Self {
             run: Arc::new(()),
             checks: HashMap::new(),
@@ -530,14 +532,33 @@ impl ExecutionInputChecks {
         };
         for check in checks {
             let source = check.target().effect_index();
-            let write = sources
-                .iter()
-                .enumerate()
-                .find_map(|(idx, &original)| {
-                    (original == source && !matches!(effects[idx], Effect::Delete { .. }))
+            let mut writes =
+                sources
+                    .iter()
+                    .zip(effects)
+                    .enumerate()
+                    .filter_map(|(idx, (&original, effect))| {
+                        (original == source
+                            && matches!(
+                                effect,
+                                Effect::Create(_)
+                                    | Effect::ResumeCreate { .. }
+                                    | Effect::Update { .. }
+                                    | Effect::DeferredCreate(_)
+                                    | Effect::DeferredReplace(_)
+                            ))
                         .then_some(idx)
-                })
-                .expect("sealed write slot survives deferred expansion");
+                    });
+            let write = writes
+                .next()
+                .ok_or(InputCheckConstructionError::WriteSlot {
+                    source_index: source,
+                })?;
+            if writes.next().is_some() {
+                return Err(InputCheckConstructionError::WriteSlot {
+                    source_index: source,
+                });
+            }
             for delete in check.paired_deletes() {
                 let candidates: Vec<_> = sources
                     .iter()
@@ -548,13 +569,23 @@ impl ExecutionInputChecks {
                         .then_some(idx)
                     })
                     .collect();
-                let delete_idx = candidates[delete.absorbed_index().unwrap_or(0)];
+                let absorbed_index = delete.absorbed_index().unwrap_or(0);
+                let delete_idx = *candidates.get(absorbed_index).ok_or(
+                    InputCheckConstructionError::DeleteSlot {
+                        source_index: delete.effect_index(),
+                        absorbed_index,
+                    },
+                )?;
                 result.paired.entry(write).or_default().push(delete_idx);
-                assert!(result.required_deletes.insert(delete_idx, write).is_none());
+                if result.required_deletes.insert(delete_idx, write).is_some() {
+                    return Err(InputCheckConstructionError::DuplicateDelete { index: delete_idx });
+                }
             }
-            result.checks.insert(write, check);
+            if result.checks.insert(write, check).is_some() {
+                return Err(InputCheckConstructionError::DuplicateWrite { index: write });
+            }
         }
-        result
+        Ok(result)
     }
 
     fn slot(&self, index: usize) -> EffectSlot {
@@ -585,46 +616,30 @@ impl ExecutionInputChecks {
     }
 
     pub(super) fn register_prepared_child(&mut self, index: usize) {
+        // The scheduler appends this child at effects.len(), after all sealed
+        // slots and preparation nodes. Its index cannot have been consumed.
         assert!(self.consumed.insert(index));
     }
 
-    pub(super) fn preparation_pairs<S>(&self, effects: &[Effect<S>]) -> Vec<(usize, Vec<usize>)> {
-        let mut pairs: Vec<_> = self
-            .paired
-            .iter()
-            .filter_map(|(&write, deletes)| {
-                matches!(effects[write], Effect::Create(_)).then_some((write, deletes.clone()))
-            })
-            .collect();
-        pairs.sort_by_key(|(write, _)| *write);
-        pairs
-    }
-
-    pub(super) fn replacement_templates<S>(&self, effects: &[Effect<S>]) -> HashSet<usize> {
-        self.checks
-            .keys()
-            .copied()
-            .filter(|&index| matches!(effects[index], Effect::DeferredReplace(_)))
-            .collect()
-    }
-
-    pub(super) fn publish_permits(&mut self, permits: Vec<DeletePermit>) {
+    pub(super) fn publish_permits(
+        &mut self,
+        permits: Vec<DeletePermit>,
+    ) -> Result<(), EffectFailureKind> {
         for permit in permits {
-            assert!(Arc::ptr_eq(&self.run, &permit.delete.run));
-            assert!(Arc::ptr_eq(&self.run, &permit.prepared.slot.run));
-            assert_eq!(permit.prepared.slot.child, None);
             let index = permit.delete.index;
-            assert_eq!(
-                self.required_deletes.get(&index),
-                Some(&permit.prepared.slot.index)
-            );
-            // Touch the cohort's retained receipts: its lifetime covers all
-            // children, including requests waiting behind a Delete.
-            for child in &permit.prepared.children {
-                assert!(Arc::ptr_eq(&self.run, &child.slot.run));
+            if !Arc::ptr_eq(&self.run, &permit.delete.run)
+                || !Arc::ptr_eq(&self.run, &permit.prepared.slot.run)
+                || permit.prepared.slot.child.is_some()
+                || self.required_deletes.get(&index) != Some(&permit.prepared.slot.index)
+                || self.permits.contains_key(&index)
+            {
+                return Err(EffectFailureKind::message(
+                    "paired delete input permit slot mismatch",
+                ));
             }
-            assert!(self.permits.insert(index, permit).is_none());
+            self.permits.insert(index, permit);
         }
+        Ok(())
     }
 
     pub(super) fn authorize_delete(
@@ -657,6 +672,79 @@ impl ExecutionInputChecks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_discharge_invalid_plan_mapping_returns_error_without_panicking() {
+        use crate::schema::{
+            InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleScope,
+            PatternAttributeSchema, PatternAttributeType, PatternResourceSchema,
+        };
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("test")
+                .attribute(
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .build(),
+                )
+                .input_rule(InputRule::value(
+                    InputRuleScope::CreateOnly,
+                    InputPath::new("name").unwrap(),
+                    InputRuleCode::new("test.name").unwrap(),
+                    InputPredicate::NotIpv4,
+                ))
+                .validate()
+                .unwrap(),
+        );
+        let resource = crate::resource::ResolvedResource::resolve_raw_fixture(
+            crate::resource::Resource::new("test", "example"),
+            &schemas,
+        )
+        .unwrap();
+        let mut plan = Plan::new();
+        plan.add_replacement(crate::plan::ReplacementGroup {
+            delete: crate::plan::ReplacementDelete {
+                id: resource.resolved_id(),
+                identifier: AppliedIdentifier::new("old").unwrap(),
+                directives: Default::default(),
+                binding: None,
+                dependencies: Default::default(),
+                explicit_dependencies: Default::default(),
+            },
+            create: resource,
+            create_before_destroy: false,
+            changed_create_only: crate::effect::ChangedCreateOnly::new(vec!["generation".into()])
+                .unwrap(),
+            cascade_ref_hints: vec![],
+            temporary_name: None,
+            permanent_name_override: None,
+            consumer_updates: Default::default(),
+            previous_attributes: Default::default(),
+        });
+        let checked = FinalizedPlan::new(plan)
+            .check_inputs(&schemas, &HashMap::new())
+            .unwrap();
+        let checks = checked.execution_input_checks();
+        for (effects, sources, obligations) in [
+            (vec![], vec![], checks.clone()),
+            (checked.effects().to_vec(), vec![], checks.clone()),
+            (vec![checked.effects()[1].clone()], vec![1], checks.clone()),
+            (
+                checked.effects().to_vec(),
+                vec![0, 1],
+                [checks.clone(), checks.clone()].concat(),
+            ),
+        ] {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ExecutionInputChecks::new(obligations, &effects, &sources)
+            }));
+            assert!(
+                outcome.is_ok(),
+                "invalid plan mapping must be a typed error"
+            );
+            assert!(outcome.unwrap().is_err());
+        }
+    }
 
     #[test]
     fn input_discharge_finalized_requests_check_create_and_update_scopes() {
@@ -763,7 +851,7 @@ mod tests {
     #[test]
     fn input_discharge_delete_permit_cannot_release_another_slot_or_be_reused() {
         let effects: Vec<Effect> = Vec::new();
-        let mut checks = ExecutionInputChecks::new(Vec::new(), &effects, &[]);
+        let mut checks = ExecutionInputChecks::new(Vec::new(), &effects, &[]).unwrap();
         // No names enter this authorization test: each delete has a distinct
         // effect slot even if their resource and generation were identical.
         checks.required_deletes.extend([(1, 0), (2, 3)]);
@@ -777,7 +865,9 @@ mod tests {
         checks.delete_targets.insert(2, target);
         checks.paired.insert(0, vec![1]);
         let cohort = checks.take_write(0).unwrap();
-        checks.publish_permits(cohort.cohort_permits::<CreateRequest>(&[]));
+        checks
+            .publish_permits(cohort.cohort_permits::<CreateRequest>(&[]))
+            .unwrap();
         assert!(checks.authorize_delete(2).is_err());
         assert!(checks.authorize_delete(1).is_ok());
         assert!(checks.authorize_delete(1).is_err());
@@ -787,11 +877,11 @@ mod tests {
     #[test]
     fn input_discharge_delete_permit_cannot_cross_execution_identity() {
         let effects: Vec<Effect> = Vec::new();
-        let mut first = ExecutionInputChecks::new(Vec::new(), &effects, &[]);
+        let mut first = ExecutionInputChecks::new(Vec::new(), &effects, &[]).unwrap();
         first.paired.insert(0, vec![1]);
         let cohort = first.take_write(0).unwrap();
         let permit = cohort.cohort_permits::<CreateRequest>(&[]).pop().unwrap();
-        let mut second = ExecutionInputChecks::new(Vec::new(), &effects, &[]);
+        let mut second = ExecutionInputChecks::new(Vec::new(), &effects, &[]).unwrap();
         second.required_deletes.insert(1, 0);
         // Deliberately corrupt the private store to exercise its final check.
         second.permits.insert(1, permit);

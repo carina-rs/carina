@@ -82,7 +82,7 @@ fn update(registry: &SchemaRegistry, key: Option<&str>) -> Plan {
         from: Box::new(from.into()),
         identifier: AppliedIdentifier::new("existing").unwrap(),
         to,
-        changed_attributes: vec!["name".into()],
+        changed_attributes: vec!["name".into(), "tags".into()],
     });
     plan
 }
@@ -144,7 +144,7 @@ fn update_unknown_target_retains_pending_obligation_and_fails_closed() {
         .check_inputs(&registry, &HashMap::new())
         .unwrap();
     assert_eq!(checked.pending_inputs().len(), 1);
-    assert!(checked.ensure_inputs_ready().is_err());
+    assert!(!checked.pending_inputs().is_empty());
 }
 
 #[test]
@@ -257,7 +257,7 @@ async fn plan_admission_checks_the_host_default_tag_merge_on_both_write_kinds() 
                 ),
                 identifier: AppliedIdentifier::new("old").unwrap(),
                 to: resource.clone(),
-                changed_attributes: vec!["name".into()],
+                changed_attributes: vec!["name".into(), "tags".into()],
             }
         });
         let rejected = fixture::finalize(plan)

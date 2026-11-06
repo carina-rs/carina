@@ -55,7 +55,7 @@ fn checked(
         plan,
         deferred: ResolvedDeferredCreateTargets::default(),
     }
-    .finish(|_| {})
+    .finish(std::iter::empty(), |_| {})
     .check_inputs(&schemas(), current)
 }
 
@@ -259,13 +259,6 @@ fn creation_admission_optional_absence_is_exempt_but_unknown_is_pending() {
         plan.add(Effect::Create(resource(value)));
         let checked = checked(plan, &HashMap::new()).unwrap();
         assert_eq!(!checked.pending_inputs().is_empty(), pending);
-        assert_eq!(checked.ensure_inputs_ready().is_err(), pending);
-        if pending {
-            assert_eq!(
-                checked.ensure_inputs_ready().unwrap_err().to_string(),
-                "input check pending; apply-time discharge not implemented"
-            );
-        }
     }
 }
 
@@ -277,7 +270,6 @@ fn creation_admission_deferred_template_retains_exact_slot_obligation() {
     let checked = checked(plan, &HashMap::new()).unwrap();
     assert_eq!(checked.pending_inputs().len(), 1);
     assert_eq!(checked.pending_inputs()[0].target().effect_index(), 0);
-    assert!(checked.ensure_inputs_ready().is_err());
 }
 
 #[test]
@@ -291,7 +283,6 @@ fn creation_admission_deferred_template_literal_name_leaves_no_obligation() {
     plan.add(Effect::DeferredCreate(payload));
     let checked = checked(plan, &HashMap::new()).unwrap();
     assert!(checked.pending_inputs().is_empty());
-    assert!(checked.ensure_inputs_ready().is_ok());
 }
 
 fn deferred_payload() -> DeferredCreatePayload {
@@ -338,7 +329,10 @@ fn creation_admission_deferred_replace_retains_all_absorbed_delete_slots() {
     let checked = checked(plan, &HashMap::new()).unwrap();
     assert_eq!(checked.pending_inputs().len(), 1);
     let obligation = &checked.pending_inputs()[0];
-    assert!(obligation.target().is_template());
+    assert!(matches!(
+        checked.effects()[obligation.target().effect_index()],
+        Effect::DeferredReplace(_)
+    ));
     assert_eq!(obligation.paired_deletes().len(), 2);
     assert_eq!(
         obligation
@@ -352,7 +346,6 @@ fn creation_admission_deferred_replace_retains_all_absorbed_delete_slots() {
         obligation.paired_deletes()[0].instance(),
         obligation.paired_deletes()[1].instance()
     );
-    assert!(checked.ensure_inputs_ready().is_err());
 }
 
 #[test]
@@ -364,7 +357,10 @@ fn creation_admission_delete_first_pending_is_paired_with_exact_delete() {
     .unwrap();
     let obligation = &checked.pending_inputs()[0];
     assert_eq!(obligation.target().effect_index(), 1);
-    assert_eq!(obligation.paired_delete().unwrap().effect_index(), 0);
+    assert_eq!(
+        obligation.paired_deletes().first().unwrap().effect_index(),
+        0
+    );
 }
 
 #[test]
@@ -391,7 +387,7 @@ fn creation_admission_required_absence_stays_pending() {
         plan,
         deferred: ResolvedDeferredCreateTargets::default(),
     }
-    .finish(|_| {})
+    .finish(std::iter::empty(), |_| {})
     .check_inputs(&schemas, &HashMap::new())
     .unwrap();
     assert_eq!(plan.pending_inputs().len(), 1);
@@ -414,8 +410,8 @@ fn creation_admission_slots_are_scoped_to_the_exact_finalized_plan() {
         second.pending_inputs()[0].target()
     );
     assert_ne!(
-        first.pending_inputs()[0].paired_delete(),
-        second.pending_inputs()[0].paired_delete()
+        first.pending_inputs()[0].paired_deletes().first(),
+        second.pending_inputs()[0].paired_deletes().first()
     );
     let cloned = first.clone();
     assert_eq!(
@@ -475,7 +471,7 @@ fn creation_admission_collects_all_diagnostics_in_stable_resource_path_code_orde
             plan,
             deferred: Default::default(),
         }
-        .finish(|_| {})
+        .finish(std::iter::empty(), |_| {})
         .check_inputs(&schemas, &HashMap::new())
         .unwrap_err()
         .errors()
@@ -525,7 +521,7 @@ fn creation_admission_nested_absence_unknown_and_secret_values_remain_distinct()
             plan,
             deferred: Default::default(),
         }
-        .finish(|_| {})
+        .finish(std::iter::empty(), |_| {})
         .check_inputs(&schemas, &HashMap::new())
     };
     assert!(make(None).unwrap().pending_inputs().is_empty());
@@ -775,10 +771,10 @@ fn input_scope_classification_table_covers_every_effect_variant() {
                 plan,
                 deferred: Default::default(),
             }
-            .finish(|_| {});
+            .finish(std::iter::empty(), |_| {});
             let count = finalized
                 .write_sites(&schemas, &current)
-                .map(|site| site.applicable_rules().count())
+                .map(|site| site.unwrap().applicable_rules().count())
                 .sum::<usize>();
             let expected = match scope {
                 InputRuleScope::CreateOnly => *create_count,
@@ -791,11 +787,12 @@ fn input_scope_classification_table_covers_every_effect_variant() {
                 plan: replacement(cbd, resource.clone()),
                 deferred: Default::default(),
             }
-            .finish(|_| {});
+            .finish(std::iter::empty(), |_| {});
             let current = HashMap::new();
             let sites = finalized
                 .write_sites(&schemas, &current)
-                .collect::<Vec<_>>();
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
             assert_eq!(sites.len(), 1);
             assert_eq!(
                 sites[0].context(),
@@ -881,7 +878,7 @@ fn issue_3900_actual_generated_temporary_name_exceeding_length_rejects_plan() {
         plan,
         deferred: Default::default(),
     }
-    .finish(|_| {})
+    .finish(std::iter::empty(), |_| {})
     .check_inputs(&schemas, &HashMap::new())
     .unwrap_err();
     assert!(

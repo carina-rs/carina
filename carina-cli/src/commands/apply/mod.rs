@@ -261,33 +261,8 @@ async fn prepare_bootstrap_creation(
     }
 }
 
-async fn create_checked_auto_bootstrap_bucket(
-    color_mode: crate::output_style::ColorMode,
-    resource: Resource,
-    context: BootstrapCreateContext<'_>,
-) -> Result<(), AppError> {
-    let context = BootstrapCreateContext {
-        normalizer: &carina_core::provider::NoopNormalizer,
-        ..context
-    };
-    crate::wiring::settle_type_checks(
-        carina_core::validation::deferred_types::TypeCheckSession::run_async(
-            context.provider_context,
-            async |session| {
-                // The backend sends this exact bucket name itself. Use a no-op
-                // normalizer so a provider rewrite cannot certify a different name.
-                let _prepared =
-                    prepare_bootstrap_creation(color_mode, resource, &context, session).await?;
-                context
-                    .backend
-                    .create_bucket()
-                    .await
-                    .map_err(AppError::Backend)
-            },
-        )
-        .await,
-        AppError::Validation,
-    )
+async fn create_auto_bootstrap_bucket(backend: &dyn StateBackend) -> Result<(), AppError> {
+    backend.create_bucket().await.map_err(AppError::Backend)
 }
 
 async fn create_checked_bootstrap_resource(
@@ -1926,46 +1901,12 @@ async fn run_apply_with_observer_factory(
                         "Auto-creating state bucket: {}",
                         bucket_name.cyan(color_mode)
                     );
+                    create_auto_bootstrap_bucket(backend.as_ref()).await?;
+                    println!("  {} Created state bucket", "✓".green(color_mode));
+
                     let backend_provider_name = backend
                         .provider_name()
                         .ok_or("Backend does not specify a provider name")?;
-                    let backend_resource_type = backend
-                        .resource_type()
-                        .ok_or("Backend does not specify a resource type")?;
-                    let bootstrap_provider_inputs = load_apply_provider_inputs(
-                        runtime,
-                        validated_config.resources().parsed(),
-                        base_dir,
-                        provider_context,
-                    )
-                    .await?;
-                    let resource = Resource::with_provider(
-                        backend_provider_name,
-                        backend_resource_type,
-                        "_backend_bootstrap",
-                        None,
-                    )
-                    .with_attribute(
-                        "bucket",
-                        Value::Concrete(carina_core::resource::ConcreteValue::String(
-                            bucket_name.clone().into(),
-                        )),
-                    );
-                    create_checked_auto_bootstrap_bucket(
-                        color_mode,
-                        resource,
-                        BootstrapCreateContext {
-                            provider_context: validated_config.context().provider_context(),
-                            backend: backend.as_ref(),
-                            parsed: validated_config.resources().parsed(),
-                            provider_configs: bootstrap_provider_inputs.configs(),
-                            normalizer: &carina_core::provider::NoopNormalizer,
-                            factories: validated_config.context().factories(),
-                            schemas: validated_config.context().schemas(),
-                        },
-                    )
-                    .await?;
-                    println!("  {} Created state bucket", "✓".green(color_mode));
 
                     // Append resource definition to backend file
                     let target_file = backend_file.as_ref().unwrap_or(project);
@@ -4066,13 +4007,23 @@ async fn run_apply_from_plan_locked_owned(
             )
             .await?;
 
-            // Retain the drift report while historical values are rehydrated.
-            // Admission must precede even the migration write on drift abort.
             let DriftCheckResult {
                 drift_messages,
                 mut actual_states,
                 mut verified_planned_states,
             } = drift_check;
+
+            if let Some(drift_messages) = drift_messages {
+                // Preserve the historical migration-on-drift behavior. A
+                // non-drift rejection still cannot write state before admission.
+                if (pending_migration.is_some() || removed_legacy_data_source_rows)
+                    && let Some(state) = state_file.as_mut()
+                    && !state.requires_legacy_dependency_migration()
+                {
+                    mid_run_writer.write_schema_migration(state).await?;
+                }
+                return Err(render_saved_plan_drift(color_mode, &drift_messages, apply_target));
+            }
 
             let scope_checked_plan = validated_plan
                 .verify_historical(
@@ -4081,16 +4032,7 @@ async fn run_apply_from_plan_locked_owned(
                     &historical_addresses,
                     apply_target,
                 )
-                .await
-                .map_err(|error| {
-                    // Drift still owns the abort when a vanished historical
-                    // value cannot be rehydrated. No admission or migration
-                    // write is possible on this error path.
-                    match &drift_messages {
-                        Some(messages) => render_saved_plan_drift(color_mode, messages, apply_target),
-                        None => error,
-                    }
-                })?;
+                .await?;
             let (rehydrated_plan_file, provider) = scope_checked_plan.into_parts();
             let wiring = rehydrated_plan_file.context();
 
@@ -4159,17 +4101,10 @@ async fn run_apply_from_plan_locked_owned(
                     unresolved_resources[&ResolvedResourceId::new(resource.id.clone())].clone()
                 })
                 .collect::<Vec<_>>();
-            let input_types = carina_core::input_rules::InputTypeContext::from_sources(
+            let input_types = carina_core::input_rules::InputTypeContext::from_compositions(
                 &input_sources,
                 &[],
-                plan_compositions.iter().filter_map(|composition| {
-                    let binding = composition.binding.clone()?;
-                    let outputs = composition.signature.attributes
-                        .iter()
-                        .map(|(name, output)| (name.clone(), output.to_value()))
-                        .collect();
-                    Some((binding, outputs))
-                }),
+                carina_core::input_rules::InputCompositions::Saved(plan_compositions),
                 &wait_aliases,
                 wiring.schemas(),
             ).with_data_sources(
@@ -4188,17 +4123,13 @@ async fn run_apply_from_plan_locked_owned(
                 })?;
             let plan = checked_plan_file.plan();
 
-            // Keep the historical migration-on-drift behavior, but only after
-            // input admission, using the heartbeat's serialized lock owner.
+            // Persist migrations only after successful re-admission, using
+            // the heartbeat's serialized lock owner.
             if (pending_migration.is_some() || removed_legacy_data_source_rows)
                 && let Some(state) = state_file.as_mut()
                 && !state.requires_legacy_dependency_migration()
             {
                 mid_run_writer.write_schema_migration(state).await?;
-            }
-
-            if let Some(drift_messages) = drift_messages {
-                return Err(render_saved_plan_drift(color_mode, &drift_messages, apply_target));
             }
 
             println!("  {} No drift detected.", "✓".green(color_mode));

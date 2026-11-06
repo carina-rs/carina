@@ -986,12 +986,8 @@ async fn prepare_update_request_for_dispatch<S: Clone>(
     // to update it.
     let mut effective_changed: Vec<String> = changed_attributes.to_vec();
     let resolved_resource = resolved_to.as_resource();
-    let schema = match managed_update_schema(preparation.schemas(), resolved_resource) {
-        Ok(schema) => schema,
-        Err(error) => {
-            return Err(EffectFailureKind::execution(error));
-        }
-    };
+    let schema = managed_update_schema(preparation.schemas(), resolved_resource)
+        .map_err(EffectFailureKind::execution)?;
     let owner_schema = preparation
         .schemas()
         .get_for(resolved_resource)
@@ -1038,32 +1034,22 @@ async fn prepare_update_request_for_dispatch<S: Clone>(
         );
         let additional = crate::references::ReferencePreparation::default()
             .apply_time(&resolved_to, &masked, owner_schema, ctx.comparison_provider)
-            .await;
-        match additional {
-            Ok(additional) => effective_changed.extend(additional.value),
-            Err(error) => {
-                let failure = match error {
-                    crate::differ::ApplyTimeComparisonError::Secret(error) => {
-                        EffectFailureKind::execution(error)
-                    }
-                    crate::differ::ApplyTimeComparisonError::CreateOnly(error) => {
-                        EffectFailureKind::execution(error)
-                    }
-                    crate::differ::ApplyTimeComparisonError::Reference(error) => {
-                        EffectFailureKind::provider(error)
-                    }
-                };
-                return Err(failure);
-            }
-        }
+            .await
+            .map_err(|error| match error {
+                crate::differ::ApplyTimeComparisonError::Secret(error) => {
+                    EffectFailureKind::execution(error)
+                }
+                crate::differ::ApplyTimeComparisonError::CreateOnly(error) => {
+                    EffectFailureKind::execution(error)
+                }
+                crate::differ::ApplyTimeComparisonError::Reference(error) => {
+                    EffectFailureKind::provider(error)
+                }
+            })?;
+        effective_changed.extend(additional.value);
     }
-    let request =
-        match UpdateRequest::checked(from.clone(), &effective_changed, &resolved_to, schema) {
-            Ok(request) => request,
-            Err(error) => {
-                return Err(EffectFailureKind::execution(error));
-            }
-        };
+    let request = UpdateRequest::checked(from.clone(), &effective_changed, &resolved_to, schema)
+        .map_err(EffectFailureKind::execution)?;
     check.prepare_update(
         &to.id,
         request,

@@ -35,6 +35,7 @@ fn estimate(predicate: InputPredicate<String>, value: Value) -> InputVerdict {
     let resource =
         Resource::with_provider("mock", "Target", "target", None).with_attribute("name", value);
     let site = classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+        .unwrap()
         .unwrap();
     site.applicable_rules().next().unwrap().evaluate()
 }
@@ -249,6 +250,7 @@ fn typed_target_estimate(
         Resource::with_provider("mock", "Target", "target", None).with_attribute("name", value);
     let mut site =
         classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+            .unwrap()
             .unwrap();
     site.types = Some(&types.facts);
     // Exercise the estimator for map literals too (a template effect has no
@@ -889,7 +891,9 @@ fn estimate_in_context<S>(
     let resource =
         Resource::with_provider("mock", "Target", "target", None).with_attribute("name", value);
     let mut site =
-        classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), schemas).unwrap();
+        classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), schemas)
+            .unwrap()
+            .unwrap();
     site.types = Some(&types.facts);
     site.applicable_rules().next().unwrap().evaluate()
 }
@@ -1172,6 +1176,7 @@ fn estimator_default_tags_are_checked_through_the_host_merge_for_unknown_maps() 
                 .unwrap();
         let mut site =
             classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&target), &schemas)
+                .unwrap()
                 .unwrap();
         site.types = Some(&types.facts);
         assert_eq!(
@@ -1224,6 +1229,7 @@ fn estimator_deferred_template_uses_retained_literals_and_defers_loop_slots() {
             },
             &registry,
         )
+        .unwrap()
         .unwrap();
         assert_eq!(
             outcome(site.applicable_rules().next().unwrap().evaluate()),
@@ -1336,6 +1342,7 @@ fn estimator_literal_map_keys_use_the_provider_api_spelling() {
     crate::value::canonicalize_resources_with_schemas(&mut normalized, &schemas).unwrap();
     let concrete =
         classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&normalized[0]), &schemas)
+            .unwrap()
             .unwrap();
     assert_eq!(
         outcome(concrete.applicable_rules().next().unwrap().evaluate()),
@@ -1343,6 +1350,7 @@ fn estimator_literal_map_keys_use_the_provider_api_spelling() {
     );
     let mut site =
         classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+            .unwrap()
             .unwrap();
     site.attributes = None;
     assert_eq!(
@@ -1383,6 +1391,7 @@ fn estimator_literal_map_keys_use_the_provider_api_spelling() {
             .with_attribute("tags", reference());
         let mut site =
             classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&target), &schemas)
+                .unwrap()
                 .unwrap();
         site.types = Some(&types.facts);
         assert_eq!(
@@ -1507,4 +1516,75 @@ fn estimator_homogeneous_summaries_never_contradict_generated_witnesses() {
             }
         }
     }
+}
+
+#[test]
+fn estimator_unknown_composition_output_stays_pending_in_live_and_saved_contexts() {
+    use crate::resource::{
+        CompositionSourceIdentityResolver, LiveComposition, LiveCompositionAttribute,
+        LiveCompositionSignature, ResolvedResourceId, SavedModuleSource,
+    };
+    let registry = target_registry();
+    let unknown = Value::Deferred(DeferredValue::Unknown(
+        crate::resource::ApplyTimeUnknown::PendingReRead(
+            crate::resource::PendingReRead::not_found(),
+        ),
+    ));
+    let live = LiveComposition {
+        id: ResolvedResourceId::new(ResourceId::with_identity("_virtual", "module")),
+        signature: LiveCompositionSignature {
+            arguments: Default::default(),
+            attributes: IndexMap::from([(
+                "name".into(),
+                LiveCompositionAttribute::from_value(unknown, None),
+            )]),
+            pending_constraints: vec![],
+        },
+        binding: Some(binding("module")),
+        dependency_bindings: Default::default(),
+        module_name: "module".into(),
+        instance: "module".into(),
+        call_path: Default::default(),
+        quoted_string_attrs: Default::default(),
+        declaration: Default::default(),
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let mut resolver = CompositionSourceIdentityResolver::new(
+        &crate::paths::ResolvedPath::new(temp.path()).unwrap(),
+    )
+    .unwrap();
+    let saved = live
+        .clone()
+        .into_saved_with_resolver(&mut resolver)
+        .unwrap();
+    let live_types = InputTypeContext::<ModuleSource>::from_compositions(
+        &[],
+        &[],
+        InputCompositions::Live(&[live]),
+        &[],
+        &registry,
+    );
+    let saved_types = InputTypeContext::<SavedModuleSource>::from_compositions(
+        &[],
+        &[],
+        InputCompositions::Saved(&[saved]),
+        &[],
+        &registry,
+    );
+    assert_eq!(
+        estimate_in_context(
+            path_reference("module", "name", vec![]),
+            &registry,
+            &live_types
+        ),
+        InputVerdict::Undecided
+    );
+    assert_eq!(
+        estimate_in_context(
+            path_reference("module", "name", vec![]),
+            &registry,
+            &saved_types
+        ),
+        InputVerdict::Undecided
+    );
 }

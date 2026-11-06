@@ -668,7 +668,7 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
         &crate::references::prepare_empty_for_tests(),
     )
     .unwrap()
-    .finish(|_| {});
+    .finish(std::iter::empty(), |_| {});
 
     assert!(plan.effects().is_empty());
     assert_eq!(plan.errors().len(), 1);

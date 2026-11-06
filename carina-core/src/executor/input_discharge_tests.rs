@@ -30,6 +30,81 @@ fn string(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.into()))
 }
 
+#[tokio::test]
+async fn input_discharge_enum_identifier_is_proven_on_its_wire_string() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "name",
+                    PatternAttributeType::enum_(
+                        crate::schema::enum_identity("Name", None),
+                        Some(vec!["valid-name".into(), "192.168.1.1".into()]),
+                        vec![
+                            ("valid-name".into(), "valid".into()),
+                            ("192.168.1.1".into(), "invalid".into()),
+                        ],
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .input_rule(InputRule::value(
+                InputRuleScope::CreateOnly,
+                InputPath::new("name").unwrap(),
+                InputRuleCode::new("test.name.not_ipv4").unwrap(),
+                InputPredicate::NotIpv4,
+            ))
+            .validate()
+            .unwrap(),
+    );
+    for (identifier, valid) in [("valid", true), ("invalid", false)] {
+        let resource =
+            resolved_fixture_resources(vec![Resource::new("test", "enum").with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::enum_identifier(identifier)),
+            )])
+            .remove(0);
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resource.clone()));
+        let admission = FinalizedPlan::new(plan.clone()).check_inputs(&schemas, &HashMap::new());
+        if valid {
+            assert!(admission.unwrap().pending_inputs().is_empty());
+            let provider = MockProvider::new();
+            provider.push_create(Ok(ok_state(&resource.id)));
+            let (result, events) = run(
+                &provider,
+                plan,
+                &schemas,
+                HashMap::new(),
+                Default::default(),
+                &NoopNormalizer,
+            )
+            .await;
+            assert_eq!(
+                (result.success_count, result.failure_count()),
+                (1, 0),
+                "{events:?}"
+            );
+            assert_eq!(
+                crate::protocol_convert::try_core_to_protocol_value(
+                    &provider.captured_create_resources()[0].attributes["name"]
+                )
+                .unwrap(),
+                carina_provider_protocol::Value::String("valid-name".into())
+            );
+        } else {
+            assert!(matches!(
+                admission.unwrap_err().errors()[0].kind,
+                crate::plan::PlanErrorKind::InputRule { .. }
+            ));
+        }
+    }
+}
+
 fn source() -> Resource {
     let mut resource = Resource::new("test", "source");
     resource.binding = Some(absolute_binding("source"));
@@ -597,6 +672,10 @@ async fn input_discharge_every_write_update_uses_runtime_value() {
             to: target,
             changed_attributes: vec!["name".into()],
         });
+        let admission = FinalizedPlan::new(plan.clone())
+            .check_inputs(&schemas, &HashMap::new())
+            .unwrap();
+        assert_eq!(admission.pending_inputs().len(), 1);
         let (result, events) = run(
             &provider,
             plan,
@@ -622,6 +701,118 @@ async fn input_discharge_every_write_update_uses_runtime_value() {
             assert!(requests.is_empty());
             assert_eq!(result.failures()[0].kind().label(), "input rule violation");
         }
+    }
+}
+
+#[tokio::test]
+async fn input_discharge_update_only_checks_sent_paths() {
+    for write_only in [false, true] {
+        let mut schemas = SchemaRegistry::new();
+        let name = PatternAttributeSchema::optional("name", PatternAttributeType::string());
+        schemas.insert(
+            "",
+            PatternResourceSchema::new("test")
+                .attribute(if write_only {
+                    name.write_only().build()
+                } else {
+                    name.build()
+                })
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "tags",
+                        PatternAttributeType::map(PatternAttributeType::string()),
+                    )
+                    .build(),
+                )
+                .input_rule(InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("name").unwrap(),
+                    InputRuleCode::new("test.name.not_ipv4").unwrap(),
+                    InputPredicate::NotIpv4,
+                ))
+                .validate()
+                .unwrap(),
+        );
+        let resource = resolved_fixture_resources(vec![
+            Resource::new("test", "patch")
+                .with_attribute("name", string("192.168.1.1"))
+                .with_attribute(
+                    "tags",
+                    Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                        "safe".into(),
+                        string("updated"),
+                    )]))),
+                ),
+        ])
+        .remove(0);
+        let from = State::existing(
+            resource.id.clone(),
+            crate::test_support::snapshot_attributes(HashMap::from([
+                ("name".into(), string("192.168.1.1")),
+                (
+                    "tags".into(),
+                    Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                        "safe".into(),
+                        string("old"),
+                    )]))),
+                ),
+            ])),
+        )
+        .with_identifier("old-id");
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(from.clone()),
+            identifier: AppliedIdentifier::new("old-id").unwrap(),
+            to: resource.clone(),
+            changed_attributes: vec!["tags".into()],
+        });
+        let admission = FinalizedPlan::new(plan.clone()).check_inputs(&schemas, &HashMap::new());
+        if write_only {
+            assert!(
+                matches!(
+                    admission.unwrap_err().errors()[0].kind,
+                    crate::plan::PlanErrorKind::InputRule { .. }
+                ),
+                "Reassert sends the unchanged name"
+            );
+        } else {
+            assert!(admission.unwrap().pending_inputs().is_empty());
+            let provider = MockProvider::new();
+            provider.push_update(Ok(ok_state(&resource.id)));
+            let (result, events) = run(
+                &provider,
+                plan,
+                &schemas,
+                HashMap::new(),
+                Default::default(),
+                &NoopNormalizer,
+            )
+            .await;
+            assert_eq!(
+                (result.success_count, result.failure_count()),
+                (1, 0),
+                "{events:?}"
+            );
+            let requests = provider.captured_update_requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].patch().ops.len(), 1);
+            assert_eq!(requests[0].patch().ops[0].key(), "tags");
+        }
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(from),
+            identifier: AppliedIdentifier::new("old-id").unwrap(),
+            to: resource,
+            changed_attributes: vec!["name".into()],
+        });
+        assert!(matches!(
+            FinalizedPlan::new(plan)
+                .check_inputs(&schemas, &HashMap::new())
+                .unwrap_err()
+                .errors()[0]
+                .kind,
+            crate::plan::PlanErrorKind::InputRule { .. }
+        ));
     }
 }
 
@@ -984,4 +1175,140 @@ async fn input_discharge_genuine_preparation_cycle_releases_no_delete() {
         4,
         "internal preparation must not produce duplicate failures: {events:?}"
     );
+}
+
+#[tokio::test]
+async fn input_discharge_failed_cohort_preparation_advances_progress() {
+    struct ProgressObserver(Mutex<Vec<usize>>);
+    impl ExecutionObserver for ProgressObserver {
+        fn on_event(&self, event: &ExecutionEvent) {
+            if let ExecutionEvent::EffectFailed { progress, .. } = event {
+                self.0.lock().unwrap().push(progress.completed);
+            }
+        }
+    }
+    for replace in [false, true] {
+        let schemas = schemas(InputRuleScope::CreateOnly);
+        let mut plan = Plan::new();
+        plan.add(loop_effect(replace));
+        let checked = FinalizedPlan::new(plan)
+            .check_inputs(&schemas, &HashMap::new())
+            .unwrap();
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_with_completeness(
+            "source",
+            HashMap::from([(
+                "items".into(),
+                Value::Concrete(ConcreteValue::List(vec![string("192.168.1.1")])),
+            )]),
+            crate::binding_index::BindingValueSource::Local,
+            crate::binding_index::BindingCompleteness::Complete,
+        );
+        let origins = HashMap::from([(
+            ResolvedResourceId::new(source().id.clone()),
+            UnresolvedResource::from_pre_resolve(source()),
+        )]);
+        let observer = ProgressObserver(Mutex::new(vec![]));
+        let provider = MockProvider::new();
+        let result = completed_result(
+            execute_plan(
+                &provider,
+                ExecutionInput {
+                    plan: &checked,
+                    provider_context: crate::parser::ProviderContext::clone(
+                        &crate::parser::LoadedProviderContext::empty_for_test(),
+                    ),
+                    provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+                        resource_origins: &origins,
+                        data_source_origins: &[],
+                    },
+                    compositions: &[],
+                    bindings,
+                    managed_current: HashMap::new(),
+                    data_source_values: ExecutableDataSourceValues::empty(),
+                    normalizer: &NoopNormalizer,
+                    provider_configs: &[],
+                    factories: &[],
+                    schemas: &schemas,
+                    parallelism: NonZeroUsize::new(8).unwrap(),
+                    precompleted_success_count: 0,
+                    checkpoint_sink: ExecutionCheckpointSink::noop(),
+                },
+                &observer,
+                uncancelled_shutdown(),
+            )
+            .await,
+        );
+        assert_eq!(result.failure_count(), 1);
+        assert_eq!(result.failures()[0].kind().label(), "input rule violation");
+        assert!(provider.calls().is_empty());
+        assert_eq!(
+            *observer.0.lock().unwrap(),
+            [1],
+            "the failed template counts as completed"
+        );
+    }
+}
+
+#[tokio::test]
+async fn input_discharge_invalid_check_construction_aborts_all_dispatch() {
+    use crate::executor::input_discharge::InputCheckConstructionError;
+    let schemas = schemas(InputRuleScope::CreateOnly);
+    let resources = resolved_fixture_resources(vec![
+        Resource::new("test", "first"),
+        Resource::new("test", "second"),
+    ]);
+    let mut plan = Plan::new();
+    for resource in resources {
+        plan.add(Effect::Create(resource));
+    }
+    let checked = FinalizedPlan::new(plan)
+        .check_inputs(&schemas, &HashMap::new())
+        .unwrap();
+    let provider = MockProvider::new();
+    let observer = MockObserver::new();
+    let result = crate::validation::deferred_types::with_session_for_test(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        |session| {
+            let mut input = ExecutionInput {
+                plan: &checked,
+                provider_context: crate::parser::ProviderContext::clone(
+                    &crate::parser::LoadedProviderContext::empty_for_test(),
+                ),
+                provider_check_inputs: ProviderCheckInputs::Authored,
+                compositions: &[],
+                bindings: Default::default(),
+                managed_current: HashMap::new(),
+                data_source_values: ExecutableDataSourceValues::empty(),
+                normalizer: &NoopNormalizer,
+                provider_configs: &[],
+                factories: &[],
+                schemas: &schemas,
+                parallelism: NonZeroUsize::new(8).unwrap(),
+                precompleted_success_count: 0,
+                checkpoint_sink: ExecutionCheckpointSink::noop(),
+            }
+            .in_session(session);
+            input.input_checks.push(input.input_checks[1].clone());
+            futures::executor::block_on(parallel::execute_effects_sequential(
+                &provider,
+                &crate::provider::ProviderRouter::new(),
+                &mut input,
+                &observer,
+                &uncancelled_shutdown(),
+            ))
+            .0
+        },
+    );
+    assert_eq!((result.success_count, result.failure_count()), (0, 1));
+    assert!(provider.calls().is_empty());
+    let EffectFailureKind::Execution { error } = result.failures()[0].kind() else {
+        panic!("typed execution failure required")
+    };
+    assert!(matches!(
+        error
+            .as_error()
+            .downcast_ref::<InputCheckConstructionError>(),
+        Some(InputCheckConstructionError::DuplicateWrite { .. })
+    ));
 }

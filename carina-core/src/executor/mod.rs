@@ -1468,6 +1468,7 @@ pub enum FailureReport<'a, S> {
         kind: EffectFailureKind,
         context: FailureEventContext<'a>,
     },
+    InputChecks(ReportedError),
     ModuleConstraint(Box<ModuleConstraintFailure>),
     ModuleConstraintResolution(crate::module_resolver::ModuleConstraintResolutionError),
 }
@@ -1484,6 +1485,13 @@ impl FailureSink {
                 kind,
                 context,
             } => (EffectFailure::new(effect, kind), Some((effect, context))),
+            FailureReport::InputChecks(error) => (
+                EffectFailure {
+                    endpoint: None,
+                    kind: EffectFailureKind::Execution { error },
+                },
+                None,
+            ),
             FailureReport::ModuleConstraint(failure) => {
                 (EffectFailure::module_constraint(failure), None)
             }

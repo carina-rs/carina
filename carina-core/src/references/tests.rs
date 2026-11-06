@@ -486,7 +486,7 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
         .expect("cascade comparison must participate in reference recording");
     let plan = prepared
         .value
-        .finish(|_| {})
+        .finish(std::iter::empty(), |_| {})
         .check_inputs(&fixture.registry, &HashMap::new())
         .unwrap();
     preparation

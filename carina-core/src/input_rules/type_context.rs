@@ -22,6 +22,35 @@ pub(super) enum Declaration {
     Outputs(IndexMap<String, Value>),
 }
 
+/// Composition expressions retained by the live or saved planning phase.
+/// Both forms use the resource module's common execution-value projection.
+pub enum InputCompositions<'a> {
+    Live(&'a [crate::resource::LiveComposition]),
+    Saved(&'a [crate::resource::SavedComposition<crate::resource::NoPlaceholder>]),
+}
+
+impl InputCompositions<'_> {
+    fn outputs(&self) -> impl Iterator<Item = (AbsoluteBindingAddress, IndexMap<String, Value>)> {
+        use crate::resource::CompositionRuntimeRef;
+        let (live, saved) = match self {
+            Self::Live(compositions) => (*compositions, &[][..]),
+            Self::Saved(compositions) => (&[][..], *compositions),
+        };
+        live.iter()
+            .map(CompositionRuntimeRef::Live)
+            .chain(saved.iter().map(CompositionRuntimeRef::Saved))
+            .filter_map(|composition| {
+                Some((
+                    composition.binding_address()?.clone(),
+                    composition
+                        .attributes()
+                        .map(|(name, value)| (name.clone(), value))
+                        .collect(),
+                ))
+            })
+    }
+}
+
 /// Immutable types and authored expressions for one plan. Both live
 /// `ModuleSource` and `SavedModuleSource` resources can build this context.
 /// Composition outputs are expressions, so forwarded declarations keep their
@@ -47,6 +76,23 @@ impl<S> InputTypeContext<S> {
             facts: TypeFacts::default(),
             source: PhantomData,
         }
+    }
+
+    /// Build live and saved contexts through the same composition projection.
+    pub fn from_compositions(
+        resources: &[UnresolvedResource<S>],
+        data_sources: &[DataSource<S>],
+        compositions: InputCompositions<'_>,
+        wait_aliases: &[WaitAliasSpec],
+        schemas: &SchemaRegistry,
+    ) -> Self {
+        Self::from_sources(
+            resources,
+            data_sources,
+            compositions.outputs(),
+            wait_aliases,
+            schemas,
+        )
     }
 
     pub fn from_sources(
@@ -125,13 +171,7 @@ impl<S> InputTypeContext<S> {
                     .with_attribute("tags", Value::Concrete(ConcreteValue::Map(IndexMap::new())))
             })
             .collect::<Vec<_>>();
-        let mut possible = mandatory
-            .iter()
-            .map(|resource| {
-                crate::resource::Resource::from_id(resource.id.clone())
-                    .with_attribute("tags", Value::Concrete(ConcreteValue::Map(IndexMap::new())))
-            })
-            .collect::<Vec<_>>();
+        let mut possible = mandatory.clone();
         for config in configs {
             crate::provider::merge_default_tags(config, &mut mandatory, schemas)?;
             let mut all_keys = config.clone();

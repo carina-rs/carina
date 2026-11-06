@@ -184,11 +184,21 @@ impl<'a> CascadeDependents<'a> {
 /// fn bypass(builder: PendingCascadePlan) -> Plan { builder.plan }
 /// ```
 ///
+/// Finalization always requires the complete desired-ID set, including
+/// unchanged resources that have no effect in the plan.
+///
+/// ```compile_fail,E0061
+/// use carina_core::differ::PendingCascadePlan;
+/// fn omit_desired_ids(builder: PendingCascadePlan) {
+///     let _ = builder.finish(|_| {});
+/// }
+/// ```
+///
 /// ```compile_fail,E0382
 /// use carina_core::differ::PendingCascadePlan;
 /// fn finish_twice(builder: PendingCascadePlan) {
-///     let first = builder.finish(|_| {});
-///     let second = builder.finish(|_| {});
+///     let first = builder.finish(std::iter::empty(), |_| {});
+///     let second = builder.finish(std::iter::empty(), |_| {});
 /// }
 /// ```
 #[must_use = "finish planning to emit the retained deferred targets"]
@@ -201,11 +211,7 @@ impl PendingCascadePlan {
     /// Complete the remaining planning steps, then emit the very same deferred
     /// targets already consulted during CBD promotion. The callback sees only
     /// the diff plan, preserving the historical ancillary-effect ordering.
-    pub fn finish(self, complete: impl FnOnce(&mut Plan)) -> crate::input_rules::FinalizedPlan {
-        self.finish_with_desired_ids(std::iter::empty(), complete)
-    }
-
-    pub fn finish_with_desired_ids<'a>(
+    pub fn finish<'a>(
         self,
         desired_ids: impl IntoIterator<Item = &'a ResolvedResourceId>,
         complete: impl FnOnce(&mut Plan),
@@ -246,15 +252,7 @@ pub fn finalize_update_request(
     request: crate::provider::UpdateRequest,
 ) -> crate::executor::FinalizedWrite<crate::provider::UpdateRequest> {
     let mut desired = Resource::from_id(request.from().id.clone());
-    desired.attributes = request
-        .patch()
-        .ops
-        .iter()
-        .filter_map(|op| {
-            op.sent_value()
-                .map(|value| (op.key().to_owned(), value.clone()))
-        })
-        .collect();
+    desired.attributes = request.patch().sent_projection();
     let mut plan = Plan::default();
     plan.add(Effect::Update {
         from: Box::new(request.from().clone()),

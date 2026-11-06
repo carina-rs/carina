@@ -21,7 +21,7 @@ pub fn finalize(plan: carina_core::plan::Plan) -> carina_core::input_rules::Fina
         &carina_core::references::prepare_empty_for_tests(),
     )
     .unwrap()
-    .finish(|final_plan| *final_plan = plan)
+    .finish(std::iter::empty(), |final_plan| *final_plan = plan)
 }
 
 pub fn checked(plan: carina_core::plan::Plan) -> carina_core::input_rules::InputCheckedPlan {

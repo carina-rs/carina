@@ -514,14 +514,25 @@ pub(super) async fn execute_effects_sequential<
         source_effect_indices,
     } = expand_deferred_replace_effects(input.plan.effects());
     let mut effects = expanded_effects;
-    let mut input_checks = ExecutionInputChecks::new(
+    let mut input_checks = match ExecutionInputChecks::new(
         std::mem::take(&mut input.input_checks),
         &effects,
         &source_effect_indices,
-    );
+    ) {
+        Ok(checks) => checks,
+        Err(error) => {
+            accumulated.mutate(|result| {
+                result.failures.record(
+                    observer,
+                    super::FailureReport::InputChecks(super::ReportedError::new(error)),
+                )
+            });
+            return (accumulated.finish(&input.checkpoint_sink), false);
+        }
+    };
     let mut prepared_requests: HashMap<usize, PreparedBasicRequest> = HashMap::new();
-    let mut prepared_materializations: HashMap<usize, Vec<Effect<S>>> = HashMap::new();
-    let mut prepared_children: HashMap<usize, Vec<PreparedBasicRequest>> = HashMap::new();
+    let mut prepared_cohorts: HashMap<usize, (Vec<Effect<S>>, Vec<PreparedBasicRequest>)> =
+        HashMap::new();
     let mut total = count_runtime_effects(&effects, &input.data_source_values);
     let completed = AtomicUsize::new(0);
 
@@ -581,10 +592,7 @@ pub(super) async fn execute_effects_sequential<
         &deferred_replace_delete_deps,
     );
 
-    let replacement_templates = input_checks.replacement_templates(&effects);
-    let preparation_pairs = input_checks.preparation_pairs(&effects);
-    let preparation_nodes =
-        PreparationNodes::install(&mut effects, preparation_pairs, replacement_templates);
+    let preparation_nodes = PreparationNodes::install(&mut effects, &input_checks);
     preparation_nodes.dependencies(&effects, &mut deps_of);
 
     // Build effect index -> binding name mapping for resolving dependency names
@@ -769,12 +777,16 @@ pub(super) async fn execute_effects_sequential<
                     type_checks,
                 },
             };
-            let was_prepared = prepared_materializations.contains_key(&idx);
-            let meta = if let Some(children) = prepared_materializations.remove(&idx) {
-                PureMetaOutcome::Materialized(children)
+            let (meta, prepared) = if let Some((children, requests)) = prepared_cohorts.remove(&idx)
+            {
+                (PureMetaOutcome::Materialized(children), Some(requests))
             } else {
-                try_dispatch_pure_meta(&effect, &accumulated.result().bindings, &dispatch_ctx)
+                (
+                    try_dispatch_pure_meta(&effect, &accumulated.result().bindings, &dispatch_ctx),
+                    None,
+                )
             };
+            let was_prepared = prepared.is_some();
             match meta {
                 PureMetaOutcome::NotPureMeta => {}
                 PureMetaOutcome::Failed(failure) => {
@@ -826,9 +838,7 @@ pub(super) async fn execute_effects_sequential<
                         break;
                     }
                     if input_checks.has_rules(idx) {
-                        let check = input_checks
-                            .take_write(idx)
-                            .expect("template prepared exactly once");
+                        let check = input_checks.take_write(idx);
                         let snapshot = accumulated.result().bindings.clone();
                         let module_gate = &module_gate;
                         let configs = input.provider_configs;
@@ -845,19 +855,22 @@ pub(super) async fn execute_effects_sequential<
                                 schemas,
                                 type_checks,
                             );
-                            let outcome =
-                                super::input_discharge::prepare_cohort(check, children, &context)
-                                    .await;
+                            let outcome = match check {
+                                Ok(check) => {
+                                    super::input_discharge::prepare_cohort(
+                                        check, children, &context,
+                                    )
+                                    .await
+                                }
+                                Err(failure) => Err(failure),
+                            };
                             (idx, SingleEffectResult::Materialized { outcome })
                         });
                         continue;
                     }
                     if !children.is_empty() {
                         total += count_actionable_effects(&children);
-                        let mut prepared = prepared_children
-                            .remove(&idx)
-                            .unwrap_or_default()
-                            .into_iter();
+                        let mut prepared = prepared.unwrap_or_default().into_iter();
                         for child in children {
                             let child_idx = effects.len();
                             if let Effect::Create(resource) = &child {
@@ -1304,61 +1317,52 @@ pub(super) async fn execute_effects_sequential<
         };
         completed_indices.insert(finished_idx);
 
+        let mut fail_preparation = |preparation, write, failure| {
+            failed_indices.extend([preparation, write]);
+            completed_indices.extend([preparation, write]);
+            dispatched.extend([preparation, write]);
+            record_effect_failure(
+                &mut accumulated,
+                observer,
+                &effects[write],
+                failure,
+                FailureEventContext {
+                    recovery: None,
+                    duration: std::time::Duration::ZERO,
+                    progress: ProgressInfo {
+                        completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
+                        total,
+                    },
+                },
+            );
+        };
+
         // Process the result and update shared state immediately
         match effect_result {
-            SingleEffectResult::Preparation { write, outcome } => match outcome {
-                Ok(prepared) => {
-                    input_checks.publish_permits(prepared.delete_permits());
-                    prepared_requests.insert(write, prepared);
+            SingleEffectResult::Preparation { write, outcome } => {
+                match outcome.and_then(|prepared| {
+                    input_checks.publish_permits(prepared.delete_permits())?;
+                    Ok(prepared)
+                }) {
+                    Ok(prepared) => {
+                        prepared_requests.insert(write, prepared);
+                    }
+                    Err(failure) => fail_preparation(finished_idx, write, failure),
                 }
-                Err(failure) => {
-                    failed_indices.extend([finished_idx, write]);
-                    completed_indices.insert(write);
-                    dispatched.insert(write);
-                    record_effect_failure(
-                        &mut accumulated,
-                        observer,
-                        &effects[write],
-                        failure,
-                        FailureEventContext {
-                            recovery: None,
-                            duration: std::time::Duration::ZERO,
-                            progress: ProgressInfo {
-                                completed: completed.fetch_add(1, Ordering::Relaxed) + 1,
-                                total,
-                            },
-                        },
-                    );
-                }
-            },
-            SingleEffectResult::Materialized { outcome } => match outcome {
-                Ok(cohort) => {
-                    let (children, prepared, permits) = cohort.into_parts();
-                    input_checks.publish_permits(permits);
-                    prepared_children.insert(finished_idx, prepared);
-                    prepared_materializations.insert(finished_idx, children);
+            }
+            SingleEffectResult::Materialized { outcome } => match outcome.and_then(|cohort| {
+                let (children, prepared, permits) = cohort.into_parts();
+                input_checks.publish_permits(permits)?;
+                Ok((children, prepared))
+            }) {
+                Ok((children, prepared)) => {
+                    prepared_cohorts.insert(finished_idx, (children, prepared));
                     // Re-enter the materialization handler only to append the
                     // already prepared cohort and rebuild scheduler edges.
                     dispatched.remove(&finished_idx);
                     completed_indices.remove(&finished_idx);
                 }
-                Err(failure) => {
-                    failed_indices.insert(finished_idx);
-                    record_effect_failure(
-                        &mut accumulated,
-                        observer,
-                        &effects[finished_idx],
-                        failure,
-                        FailureEventContext {
-                            recovery: None,
-                            duration: std::time::Duration::ZERO,
-                            progress: ProgressInfo {
-                                completed: completed.load(Ordering::Relaxed),
-                                total,
-                            },
-                        },
-                    );
-                }
+                Err(failure) => fail_preparation(finished_idx, finished_idx, failure),
             },
             SingleEffectResult::Basic(basic) => {
                 let completion = process_basic_result(

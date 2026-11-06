@@ -30,18 +30,28 @@ pub(super) struct PreparationNodes {
 impl PreparationNodes {
     pub(super) fn install<S: Clone>(
         effects: &mut Vec<Effect<S>>,
-        pairs: Vec<(usize, Vec<usize>)>,
-        replacement_templates: HashSet<usize>,
+        input_checks: &super::input_discharge::ExecutionInputChecks,
     ) -> Self {
         let mut nodes = Self {
-            replacement_templates,
+            replacement_templates: input_checks
+                .checks
+                .keys()
+                .copied()
+                .filter(|&index| matches!(effects[index], Effect::DeferredReplace(_)))
+                .collect(),
             ..Self::default()
         };
-        for (write, deletes) in pairs {
+        let mut pairs = input_checks
+            .paired
+            .iter()
+            .filter(|(write, _)| matches!(effects[**write], Effect::Create(_)))
+            .collect::<Vec<_>>();
+        pairs.sort_by_key(|(write, _)| *write);
+        for (&write, deletes) in pairs {
             let preparation = effects.len();
             effects.push(effects[write].clone());
             nodes.writes.insert(preparation, write);
-            nodes.pairs.push((preparation, write, deletes));
+            nodes.pairs.push((preparation, write, deletes.clone()));
         }
         nodes
     }

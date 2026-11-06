@@ -177,6 +177,14 @@ impl InputPath {
     pub fn segments(&self) -> std::str::Split<'_, char> {
         self.0.split('.')
     }
+    pub(crate) fn attribute_segments(&self) -> Vec<String> {
+        self.segments().map(str::to_owned).collect()
+    }
+    pub(crate) fn root(&self) -> &str {
+        self.segments()
+            .next()
+            .expect("validated nonempty input path")
+    }
 }
 
 impl fmt::Display for InputPath {
@@ -211,6 +219,28 @@ pub enum InputPredicate<P> {
     NotIpv4,
     Matches(P),
     NotMatches(P),
+}
+
+impl<P> InputPredicate<P> {
+    pub(crate) fn violation_reason(&self) -> InputViolationReason {
+        match self {
+            Self::Length { min: _, max: _ } => InputViolationReason::Length,
+            Self::AllowedChars(_) => InputViolationReason::AllowedChars,
+            Self::FirstChar(_) => InputViolationReason::FirstChar,
+            Self::LastChar(_) => InputViolationReason::LastChar,
+            Self::NoSubstring(_) => InputViolationReason::NoSubstring,
+            Self::NoPrefix(_) => InputViolationReason::NoPrefix,
+            Self::ForbiddenPrefix {
+                prefix: _,
+                ignore_ascii_case: _,
+            } => InputViolationReason::ForbiddenPrefix,
+            Self::NoSuffix(_) => InputViolationReason::NoSuffix,
+            Self::NoAdjacent { left: _, right: _ } => InputViolationReason::NoAdjacent,
+            Self::NotIpv4 => InputViolationReason::NotIpv4,
+            Self::Matches(_) => InputViolationReason::Matches,
+            Self::NotMatches(_) => InputViolationReason::NotMatches,
+        }
+    }
 }
 
 /// The closed set of write scopes. Adding a scope requires updating the

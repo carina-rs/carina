@@ -7450,7 +7450,10 @@ fn bootstrap_test_backend() -> (tempfile::TempDir, Box<dyn StateBackend>) {
     (temp, backend)
 }
 
-struct BootstrapWriteFailureBackend;
+#[derive(Default)]
+struct BootstrapWriteFailureBackend {
+    create_calls: AtomicUsize,
+}
 
 #[async_trait::async_trait]
 impl StateBackend for BootstrapWriteFailureBackend {
@@ -7509,6 +7512,7 @@ impl StateBackend for BootstrapWriteFailureBackend {
     }
 
     async fn create_bucket(&self) -> carina_state::BackendResult<()> {
+        self.create_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -7762,10 +7766,13 @@ async fn declared_state_bucket_successful_create_seed_write_failure_is_actionabl
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Success,
     };
-    let error =
-        bootstrap_declared_state_bucket(color_mode, &provider, &BootstrapWriteFailureBackend)
-            .await
-            .expect_err("a successful create followed by a seed write failure must be actionable");
+    let error = bootstrap_declared_state_bucket(
+        color_mode,
+        &provider,
+        &BootstrapWriteFailureBackend::default(),
+    )
+    .await
+    .expect_err("a successful create followed by a seed write failure must be actionable");
 
     let AppError::StateBucketSeed(seed) = &error else {
         panic!("seed write failure lost its bootstrap context: {error:?}");
@@ -8317,7 +8324,7 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
-            backend: &BootstrapWriteFailureBackend,
+            backend: &BootstrapWriteFailureBackend::default(),
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
@@ -12265,4 +12272,48 @@ fn saved_plan_reloaded_resolved_data_source_retains_folded_module_dependency() {
         classified.contains_key(&id),
         "a folded module data-source input must remain deferred after saved-plan reload",
     );
+}
+
+#[tokio::test]
+async fn auto_create_backend_bucket_does_not_require_provider_schema() {
+    let backend = BootstrapWriteFailureBackend::default();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "other",
+        PatternResourceSchema::new("other").validate().unwrap(),
+    );
+    assert!(
+        schemas
+            .get(
+                "aws",
+                "s3.Bucket",
+                carina_core::schema::SchemaKind::Resource
+            )
+            .is_none()
+    );
+    create_auto_bootstrap_bucket(&backend).await.unwrap();
+    assert_eq!(backend.create_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn auto_create_backend_bucket_is_outside_provider_input_admission() {
+    let backend = BootstrapWriteFailureBackend::default();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        PatternResourceSchema::new("s3.Bucket")
+            .attribute(
+                PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+            )
+            .input_rule(carina_core::schema::InputRule::value(
+                carina_core::schema::InputRuleScope::CreateOnly,
+                carina_core::schema::InputPath::new("bucket").unwrap(),
+                carina_core::schema::InputRuleCode::new("bucket.not_ipv4").unwrap(),
+                carina_core::schema::InputPredicate::NotIpv4,
+            ))
+            .validate()
+            .unwrap(),
+    );
+    create_auto_bootstrap_bucket(&backend).await.unwrap();
+    assert_eq!(backend.create_calls.load(Ordering::SeqCst), 1);
 }

@@ -10043,7 +10043,7 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
         &crate::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed")
-    .finish(|_| {});
+    .finish(std::iter::empty(), |_| {});
     assert_eq!(plan.replace_display_info().count(), 2);
 
     let deps = build_dependency_analysis(
