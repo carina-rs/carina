@@ -37,19 +37,6 @@ use super::{
 #[cfg(test)]
 use super::{ExecutionInput, ProviderCheckInputs};
 
-pub(super) fn apply_deferred_gate_deps<S: Clone>(
-    admitted: &crate::replacement::AdmittedReplacementEffects<S>,
-    deps_of: &mut HashMap<usize, HashSet<usize>>,
-) {
-    for gate in 0..admitted.effects().len() {
-        for delete in admitted.deferred_delete_candidates(gate) {
-            if let Some(dependencies) = deps_of.get_mut(&delete) {
-                dependencies.insert(gate);
-            }
-        }
-    }
-}
-
 pub(super) fn is_runtime_dispatchable<S: Clone>(
     effect: &Effect<S>,
     data_source_values: &crate::data_source_value::ExecutableDataSourceValues<S>,
@@ -386,21 +373,9 @@ pub(super) async fn execute_effects_sequential<
     let module_gate = input.compositions.module_constraint_gate();
     let type_checks = input.type_checks;
 
-    let continuations = accumulated
-        .result()
-        .managed_current
-        .iter()
-        .filter_map(|(id, current)| match current {
-            crate::resource::Current::CreateInFlight(pending) => {
-                Some((id.clone(), pending.clone()))
-            }
-            _ => None,
-        })
-        .collect();
-    let admitted = input.plan.admitted_effects();
+    let admitted = input.plan.schedule(&accumulated.result().managed_current);
     accumulated.record_replacement_metadata(&admitted);
-    let (admitted, _, _) = admitted.expand_deferred_replacements();
-    let mut admitted = admitted.schedule(&continuations);
+    let (mut admitted, _, _) = admitted.expand_deferred_replacements();
     let mut effects = admitted.effects();
     let mut materialization_requirements = crate::replacement::create_first_requirements(effects);
     let mut total = count_runtime_effects(effects, &input.data_source_values);
@@ -722,7 +697,7 @@ pub(super) async fn execute_effects_sequential<
                             }
                             actionable_indices.push(child_idx);
                         }
-                        admitted = combined.schedule(&continuations);
+                        admitted = admitted.with_materialized(combined);
                         effects = admitted.effects();
                         materialization_requirements =
                             crate::replacement::create_first_requirements(effects);
@@ -1381,12 +1356,10 @@ mod tests {
             |_| HashMap::new(),
         )
         .unwrap();
-        let mut deps_of = HashMap::from([
-            (0, HashSet::new()),
-            (1, HashSet::new()),
-            (2, HashSet::new()),
-        ]);
-        apply_deferred_gate_deps(&admitted, &mut deps_of);
+        let deps_of = admitted
+            .dependency_analysis(std::iter::empty())
+            .unwrap()
+            .into_deps_of();
         assert_eq!(deps_of[&0], HashSet::from([1]));
         assert!(
             deps_of[&2].is_empty(),
@@ -1420,19 +1393,16 @@ mod tests {
                 unbound_deferred_template_in("b.crn"),
             ))),
         ];
-        let mut deps_of = HashMap::from([
-            (0usize, HashSet::new()),
-            (1usize, HashSet::new()),
-            (2usize, HashSet::new()),
-        ]);
-
         let admitted = crate::replacement::AdmittedReplacementEffects::resolve(
             &effects,
             &SchemaRegistry::new(),
             |_| HashMap::new(),
         )
         .unwrap();
-        apply_deferred_gate_deps(&admitted, &mut deps_of);
+        let deps_of = admitted
+            .dependency_analysis(std::iter::empty())
+            .unwrap()
+            .into_deps_of();
 
         assert_eq!(deps_of.get(&0), Some(&HashSet::from([1, 2])));
         assert_eq!(deps_of.get(&1), Some(&HashSet::new()));

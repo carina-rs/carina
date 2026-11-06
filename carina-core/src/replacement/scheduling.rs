@@ -12,30 +12,30 @@ use super::{AdmittedReplacementEffects, ContinuationOrder};
 /// Permission to send a create for one admitted target and generation set.
 /// Only admitted scheduling can construct it; it cannot be deserialized.
 ///
+/// The permit exposes the target that dispatch needs; replacement history
+/// belongs to the admitted schedule rather than the dispatch capability.
+///
+/// ```compile_fail,E0599
+/// use carina_core::replacement::CreatePermit;
+/// fn history(permit: &CreatePermit) {
+///     permit.old_instances();
+/// }
+/// ```
+///
 /// ```compile_fail,E0451
 /// use carina_core::replacement::CreatePermit;
 /// let permit = CreatePermit {
-///     binding: todo!(),
+///     target: todo!(),
 /// };
 /// ```
 #[derive(Debug, Clone)]
 pub struct CreatePermit {
-    binding: Arc<CreateBinding>,
-}
-
-#[derive(Debug)]
-struct CreateBinding {
-    target: ResourceId,
-    old_instances: Vec<DeletedInstanceKey>,
+    target: Arc<ResourceId>,
 }
 
 impl CreatePermit {
     pub fn target(&self) -> &ResourceId {
-        &self.binding.target
-    }
-
-    pub fn old_instances(&self) -> &[DeletedInstanceKey] {
-        &self.binding.old_instances
+        &self.target
     }
 }
 
@@ -160,6 +160,15 @@ impl<S> ScheduledEffect<S> {
 }
 
 /// The basic executor accepts only these capability-bearing endpoints.
+///
+/// Raw effects cannot narrow into a provider-dispatch endpoint.
+///
+/// ```compile_fail,E0599
+/// use carina_core::effect::Effect;
+/// fn narrow(effect: &Effect) {
+///     effect.as_basic();
+/// }
+/// ```
 pub(crate) enum ScheduledBasicEffect<'a, S> {
     Create {
         effect: &'a Effect<S>,
@@ -214,20 +223,28 @@ impl<S> Deref for ScheduledEffects<S> {
 }
 
 impl<S: Clone> ScheduledEffects<S> {
+    pub(crate) fn expand_deferred_replacements(
+        self,
+    ) -> (Self, std::collections::HashSet<usize>, Vec<usize>) {
+        let (admitted, teardowns, sources) = self.admitted.expand_deferred_replacements();
+        (
+            Self {
+                admitted,
+                continuations: self.continuations,
+            },
+            teardowns,
+            sources,
+        )
+    }
+
+    pub(crate) fn with_materialized(&self, admitted: AdmittedReplacementEffects<S>) -> Self {
+        admitted.schedule(&self.continuations)
+    }
+
     pub fn effect(&self, index: usize) -> ScheduledEffect<S> {
         let effect = self.admitted.effects[index].clone();
         let create_permit = || CreatePermit {
-            binding: Arc::new(CreateBinding {
-                target: effect.resource_id().clone(),
-                old_instances: self
-                    .admitted
-                    .scheduling
-                    .replacements
-                    .iter()
-                    .find(|replacement| replacement.create == index)
-                    .map(|replacement| replacement.order.old_instances.clone())
-                    .unwrap_or_default(),
-            }),
+            target: Arc::new(effect.resource_id().clone()),
         };
         let permission = match &effect {
             Effect::Create(_) => Permission::Create(create_permit()),
@@ -291,8 +308,73 @@ impl<S: Clone> AdmittedReplacementEffects<S> {
     }
 }
 
+/// A continuation-specialized schedule bound to its admitted source plan.
+/// Only [`crate::plan::AdmittedPlan::schedule`] can construct this value.
+/// Consumers obtain plan metadata through [`Self::plan`], so they cannot pair
+/// scheduling decisions with another plan's effects or display metadata.
+///
+/// The source plan cannot be replaced while keeping the schedule:
+///
+/// ```compile_fail,E0616
+/// use carina_core::{plan::AdmittedPlan, replacement::ScheduledPlan};
+/// fn retarget<'a>(scheduled: &mut ScheduledPlan<'a>, other: &'a AdmittedPlan) {
+///     scheduled.plan = other;
+/// }
+/// ```
+///
+/// An unrelated effects schedule cannot be attached to the source plan:
+///
+/// ```compile_fail,E0616
+/// use carina_core::replacement::{ScheduledEffects, ScheduledPlan};
+/// fn swap(scheduled: &mut ScheduledPlan<'_>, other: ScheduledEffects) {
+///     scheduled.effects = other;
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct ScheduledPlan<'plan, S = crate::resource::ModuleSource> {
+    plan: &'plan crate::plan::AdmittedPlan<S>,
+    effects: ScheduledEffects<S>,
+}
+
+impl<'plan, S> ScheduledPlan<'plan, S> {
+    pub fn plan(&self) -> &'plan crate::plan::AdmittedPlan<S> {
+        self.plan
+    }
+}
+
+impl<S> Deref for ScheduledPlan<'_, S> {
+    type Target = ScheduledEffects<S>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.effects
+    }
+}
+
+impl<S: Clone> ScheduledPlan<'_, S> {
+    pub(crate) fn expand_deferred_replacements(
+        self,
+    ) -> (Self, std::collections::HashSet<usize>, Vec<usize>) {
+        let (effects, teardowns, sources) = self.effects.expand_deferred_replacements();
+        (
+            Self {
+                plan: self.plan,
+                effects,
+            },
+            teardowns,
+            sources,
+        )
+    }
+
+    pub(crate) fn with_materialized(&self, admitted: AdmittedReplacementEffects<S>) -> Self {
+        Self {
+            plan: self.plan,
+            effects: self.effects.with_materialized(admitted),
+        }
+    }
+}
+
 impl<S: Clone> crate::plan::AdmittedPlan<S> {
-    pub fn schedule(&self, current: &HashMap<ResourceId, Current>) -> ScheduledEffects<S> {
+    pub fn schedule(&self, current: &HashMap<ResourceId, Current>) -> ScheduledPlan<'_, S> {
         let continuations = current
             .iter()
             .filter_map(|(id, current)| match current {
@@ -300,7 +382,10 @@ impl<S: Clone> crate::plan::AdmittedPlan<S> {
                 _ => None,
             })
             .collect();
-        self.admitted_effects().schedule(&continuations)
+        ScheduledPlan {
+            plan: self,
+            effects: self.admitted_effects().schedule(&continuations),
+        }
     }
 }
 
@@ -376,14 +461,15 @@ mod tests {
                 .schedule(&HashMap::new());
         let permit = scheduled.effect(0).into_create_permit().unwrap();
         assert_eq!(permit.target(), target.as_inner());
-        assert_eq!(permit.old_instances().len(), old.len());
+        let graph = scheduled.dependency_analysis(std::iter::empty()).unwrap();
+        assert_eq!(graph.deps_of(0).unwrap(), &(1..=old.len()).collect());
         for (index, (id, generation)) in old.iter().enumerate() {
             let key = DeletedInstanceKey::new(
                 id.as_inner().clone(),
                 generation.clone(),
                 "old-provider-id",
             );
-            assert!(permit.old_instances().contains(&key));
+            assert!(graph.deps_of(0).unwrap().contains(&(index + 1)));
             let endpoint = scheduled.effect(index + 1);
             let Some(ScheduledBasicEffect::Delete { permit, .. }) = endpoint.as_basic() else {
                 panic!("old generation must have a scheduled Delete capability");
@@ -450,7 +536,10 @@ mod tests {
                 } => {
                     assert!(!identified);
                     assert_eq!(permit.target(), target.as_inner());
-                    assert_eq!(permit.old_instances().len(), 1);
+                    assert_eq!(
+                        graph.deps_of(0).unwrap(),
+                        &std::collections::HashSet::from([1])
+                    );
                 }
                 _ => panic!("continuation must carry exactly its admitted execution capability"),
             }

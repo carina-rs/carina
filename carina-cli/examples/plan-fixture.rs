@@ -193,7 +193,7 @@ fn main() -> ExitCode {
             images.file(),
             images.inline(),
             PlanImageInput {
-                plan: &plan,
+                scheduled: &plan.schedule(&fp.managed_current),
                 desired_resources: &fp.desired_resources,
                 unresolved_resources: &fp.unresolved_resources,
                 compositions: &fp.compositions,

@@ -400,7 +400,10 @@ fn exported_plan_scheduler_edges_match_the_real_executor_scheduler() {
         }
         plan.prepare_replacements(&COEXISTING_TEST_SCHEMAS).unwrap();
         let actual = build_plan_scheduler_dependency_edges(
-            &plan.admit(&COEXISTING_TEST_SCHEMAS).unwrap(),
+            &plan
+                .admit(&COEXISTING_TEST_SCHEMAS)
+                .unwrap()
+                .schedule(&Default::default()),
             &borrowed,
         );
 

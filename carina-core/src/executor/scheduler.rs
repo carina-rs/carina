@@ -6,8 +6,7 @@ use crate::parser::CompiledDeferredForExpression as DeferredForExpression;
 use crate::resource::ResolvedResourceId;
 
 use super::deferred_dispatch::{PureMetaCtx, dispatch_deferred_create};
-use super::parallel::apply_deferred_gate_deps;
-use crate::effect::deps::{UnresolvedRequiredDependency, relax_update_update_edges};
+use crate::effect::deps::UnresolvedRequiredDependency;
 
 pub(super) struct SchedulerDeps {
     pub(super) deps_of: HashMap<usize, HashSet<usize>>,
@@ -97,14 +96,11 @@ pub(super) fn build_scheduler_deps<'a, S: Clone>(
     admitted: &crate::replacement::AdmittedReplacementEffects<S>,
     unresolved_resources: impl IntoIterator<Item = &'a ResolvedResourceId>,
 ) -> SchedulerDeps {
-    let effects = admitted.effects();
-    let (mut analysis, unresolved) = match admitted.dependency_analysis(unresolved_resources) {
+    let (analysis, unresolved) = match admitted.dependency_analysis(unresolved_resources) {
         Ok(analysis) => (analysis, Vec::new()),
         Err(failure) => failure.into_parts(),
     };
-    relax_update_update_edges(effects, &mut analysis);
-    let mut deps_of = analysis.into_deps_of();
-    apply_deferred_gate_deps(admitted, &mut deps_of);
+    let deps_of = analysis.into_deps_of();
     SchedulerDeps {
         deps_of,
         unresolved,

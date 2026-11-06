@@ -21,7 +21,7 @@ use crate::provider::{
     ProviderRouter, ReadBackEnd, ReadRequest, ResumeCreateRequest, ResumeFailureKind,
     ResumeOutcomeKind, UpdateRequest,
 };
-use crate::replacement::{ScheduledBasicEffect as BasicEffect, ScheduledResume};
+use crate::replacement::{ScheduledBasicEffect, ScheduledResume};
 use crate::resolver::resolve_ref_value;
 #[cfg(test)]
 use crate::resource::Resource;
@@ -901,14 +901,14 @@ pub(super) struct BasicEffectCtx<'a, S> {
 
 /// Execute a single Create, Update, or Delete effect.
 ///
-/// Takes an admitted scheduling endpoint. Raw `Effect::as_basic` values
+/// Takes an admitted scheduling endpoint. Raw effects
 /// cannot enter this boundary: creates, resends and old-generation Deletes
 /// must carry the capabilities minted by replacement admission.
 ///
 /// Returns a started result whose token must be consumed to emit the terminal
 /// event before callers process its state changes.
 pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
-    basic: BasicEffect<'effect, S>,
+    basic: ScheduledBasicEffect<'effect, S>,
     ctx: &BasicEffectCtx<'_, S>,
     in_flight_start: InFlightStart<S>,
     observer: &'observer dyn ExecutionObserver<S>,
@@ -927,7 +927,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
     let mut started_effect = in_flight_start.emit_started(observer, effect, progress);
 
     let outcome = match basic {
-        BasicEffect::Create {
+        ScheduledBasicEffect::Create {
             resource, permit, ..
         } => {
             let check_input = ctx
@@ -1020,7 +1020,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 },
             }
         }
-        BasicEffect::ResumeCreate {
+        ScheduledBasicEffect::ResumeCreate {
             resource, resume, ..
         } => {
             let check_input = ctx
@@ -1167,7 +1167,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 },
             }
         }
-        BasicEffect::Update {
+        ScheduledBasicEffect::Update {
             from,
             identifier,
             to,
@@ -1352,7 +1352,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                 },
             }
         }
-        BasicEffect::Delete {
+        ScheduledBasicEffect::Delete {
             directives, permit, ..
         } => {
             let id = permit.id();

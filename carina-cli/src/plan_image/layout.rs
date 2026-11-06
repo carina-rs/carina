@@ -2318,7 +2318,8 @@ mod tests {
             &[],
         );
         build_model(PlanImageInput {
-            plan: &crate::test_support::admit_fixture_plan(plan, None),
+            scheduled: &crate::test_support::admit_fixture_plan(plan, None)
+                .schedule(&Default::default()),
             desired_resources: &desired,
             unresolved_resources: &unresolved,
             compositions: &[],
@@ -2334,7 +2335,11 @@ mod tests {
             .expect("fixture mock inputs must be valid");
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         build_model(PlanImageInput {
-            plan: &crate::test_support::admit_fixture_plan(&fixture.plan, Some(&fixture.schemas)),
+            scheduled: &crate::test_support::admit_fixture_plan(
+                &fixture.plan,
+                Some(&fixture.schemas),
+            )
+            .schedule(&Default::default()),
             desired_resources: &fixture.desired_resources,
             unresolved_resources: &fixture.unresolved_resources,
             compositions: &fixture.compositions,
@@ -2442,8 +2447,12 @@ mod tests {
         }
     }
 
-    fn aggregated_effect_node(plan: &Plan, effect_idx: usize) -> GraphNodeId {
-        let replacement_deletes: HashMap<_, _> = plan
+    fn aggregated_effect_node(
+        scheduled: &carina_core::replacement::ScheduledPlan<'_>,
+        effect_idx: usize,
+    ) -> GraphNodeId {
+        let replacement_deletes: HashMap<_, _> = scheduled
+            .plan()
             .replace_display_info()
             .map(|replacement| (replacement.delete_idx, replacement.create_idx))
             .collect();
@@ -2473,8 +2482,10 @@ mod tests {
             );
         }
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
+        let plan = crate::test_support::admit_fixture_plan(&fixture.plan, Some(&fixture.schemas));
+        let scheduled = plan.schedule(&fixture.managed_current);
         let model = build_model(PlanImageInput {
-            plan: &crate::test_support::admit_fixture_plan(&fixture.plan, Some(&fixture.schemas)),
+            scheduled: &scheduled,
             desired_resources: &fixture.desired_resources,
             unresolved_resources: &fixture.unresolved_resources,
             compositions: &fixture.compositions,
@@ -2488,15 +2499,13 @@ mod tests {
             .zip(&fixture.unresolved_resources)
             .map(|(resolved, unresolved)| (resolved.resolved_id(), unresolved))
             .collect();
-        let replacement_delete_indices: HashSet<_> = fixture
-            .plan
+        let replacement_delete_indices: HashSet<_> = scheduled
+            .plan()
             .replace_display_info()
             .map(|replacement| replacement.delete_idx)
             .collect();
-        let scheduler_edges = carina_core::executor::build_plan_scheduler_dependency_edges(
-            &crate::test_support::admit_fixture_plan(&fixture.plan, Some(&fixture.schemas)),
-            &unresolved,
-        );
+        let scheduler_edges =
+            carina_core::executor::build_plan_scheduler_dependency_edges(&scheduled, &unresolved);
         if fixture_name == "deferred_for_with_paired_destroy" {
             assert!(scheduler_edges.iter().any(|(from, to)| {
                 from.phase == PlanSchedulerPhase::DeferredReplaceTeardown
@@ -2513,8 +2522,8 @@ mod tests {
                 {
                     return None;
                 }
-                let from = aggregated_effect_node(&fixture.plan, from.effect_index);
-                let to = aggregated_effect_node(&fixture.plan, to.effect_index);
+                let from = aggregated_effect_node(&scheduled, from.effect_index);
+                let to = aggregated_effect_node(&scheduled, to.effect_index);
                 (from != to
                     && model
                         .node(&from)
@@ -3444,7 +3453,11 @@ mod tests {
         .expect("fixture mock inputs must be valid");
         let summary = crate::fixture_plan::build_fixture_plan_change_summary(&fixture);
         let model = build_model(PlanImageInput {
-            plan: &crate::test_support::admit_fixture_plan(&fixture.plan, Some(&fixture.schemas)),
+            scheduled: &crate::test_support::admit_fixture_plan(
+                &fixture.plan,
+                Some(&fixture.schemas),
+            )
+            .schedule(&Default::default()),
             desired_resources: &fixture.desired_resources,
             unresolved_resources: &fixture.unresolved_resources,
             compositions: &fixture.compositions,

@@ -6227,7 +6227,7 @@ pub(crate) async fn run_plan_using(
             file: image,
             inline: inline_image,
             input: PlanImageInput {
-                plan: planned,
+                scheduled: &planned.schedule(&ctx.managed_current),
                 desired_resources: &ctx.sorted_resources,
                 unresolved_resources: &ctx.unresolved_resources,
                 compositions: &ctx.compositions,
@@ -8574,7 +8574,8 @@ mod run_plan_out_tests {
                 file: Some(&image_target),
                 inline: None,
                 input: PlanImageInput {
-                    plan: &crate::test_support::admit_fixture_plan(&plan, None),
+                    scheduled: &crate::test_support::admit_fixture_plan(&plan, None)
+                        .schedule(&Default::default()),
                     desired_resources: &desired_resources,
                     unresolved_resources: &unresolved_resources,
                     compositions: &compositions,
@@ -8637,7 +8638,8 @@ mod run_plan_out_tests {
                         theme: Theme::Light,
                     }),
                     input: PlanImageInput {
-                        plan: &crate::test_support::admit_fixture_plan(&plan, None),
+                        scheduled: &crate::test_support::admit_fixture_plan(&plan, None)
+                            .schedule(&Default::default()),
                         desired_resources: &desired_resources,
                         unresolved_resources: &unresolved_resources,
                         compositions: &compositions,

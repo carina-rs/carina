@@ -487,22 +487,32 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
         &mut self,
         requirements: &HashMap<ResolvedResourceId, String>,
     ) {
+        self.require_create_first_with_lineage(
+            requirements,
+            &crate::replacement::ReplacementLineage::default(),
+        );
+    }
+    pub(crate) fn require_create_first_with_lineage(
+        &mut self,
+        requirements: &HashMap<ResolvedResourceId, String>,
+        lineage: &crate::replacement::ReplacementLineage,
+    ) {
         self.preview = None;
-        if let Some(dependent) = requirements.get(self.id()) {
+        if let Some(dependent) = lineage.required_by(self.id(), requirements) {
             self.request
-                .require_create_first_in_place(dependent.clone());
+                .require_create_first_in_place(dependent.to_owned());
         }
         for old in self.request.deletes.iter() {
-            if let Some(dependent) = requirements.get(&old.id) {
+            let target = self.projected_target_id(&old.id);
+            if let Some(dependent) = lineage.required_by(&target, requirements) {
                 if let Some((_, previous)) = self
                     .required_children
                     .iter_mut()
-                    .find(|(id, _)| id == &old.id)
+                    .find(|(id, _)| crate::replacement::same_state_row(id, &target))
                 {
-                    *previous = dependent.clone();
+                    *previous = dependent.to_owned();
                 } else {
-                    self.required_children
-                        .push((old.id.clone(), dependent.clone()));
+                    self.required_children.push((target, dependent.to_owned()));
                 }
             }
         }
@@ -511,9 +521,19 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
         self.request.required_by().or_else(|| {
             self.required_children
                 .iter()
-                .find(|(child, _)| child == id)
+                .find(|(child, _)| crate::replacement::same_state_row(child, id))
                 .map(|(_, dependent)| dependent.as_str())
         })
+    }
+
+    fn projected_target_id(&self, old: &ResolvedResourceId) -> ResolvedResourceId {
+        let template = self.template.template_resource_id();
+        ResolvedResourceId::with_provider_identity(
+            template.provider.clone(),
+            template.resource_type.clone(),
+            old.identity().clone(),
+            template.provider_instance.clone(),
+        )
     }
     pub fn preflight(
         &mut self,
@@ -568,14 +588,8 @@ impl<S, V: PlanValueKind> DeferredReplacePayload<S, V> {
             crate::replacement::ReplacementRequest<crate::resource::ResolvedResource<S, V>>,
         > = Vec::new();
         for old in self.request.deletes.iter() {
-            let required_by = self.required_by_child(&old.id);
-            let template_id = self.template.template_resource_id();
-            let target_id = ResolvedResourceId::with_provider_identity(
-                template_id.provider.clone(),
-                template_id.resource_type.clone(),
-                old.id.identity().clone(),
-                template_id.provider_instance.clone(),
-            );
+            let target_id = self.projected_target_id(&old.id);
+            let required_by = self.required_by_child(&target_id);
             if let Some(request) = requests
                 .iter_mut()
                 .find(|request| request.target().resolved_id() == target_id)
@@ -1405,7 +1419,7 @@ pub enum EffectWithSource<S, V: PlanValueKind = NoPlaceholder> {
     /// Stop treating omitted keys of a keyed partial-update list as authored.
     ///
     /// This effect is applied only to locked local state. It is deliberately
-    /// excluded from [`BasicEffect`] so it cannot enter a provider call path.
+    /// excluded from scheduled basic effects so it cannot enter a provider call path.
     ReleaseListKeys {
         id: ResolvedResourceId,
         attribute: String,
@@ -1883,59 +1897,11 @@ impl<S, V: PlanValueKind> AsRef<EffectWithSource<S, V>> for EffectWithSource<S, 
     }
 }
 
-/// A type-level narrowing of [`Effect`] to the variants the basic
-/// executor (`execute_basic_effect`) actually handles: `Create`,
-/// `Update`, and `Delete`.
-///
-/// The basic executor was previously typed on `&Effect` and used a
-/// `_ => unreachable!("execute_basic_effect called with non-basic
-/// effect")` arm to reject `Read`/`Import`/`Remove`/`Move`/
-/// `ReleaseListKeys`/`Wait`. Callers' filters were the *only* thing keeping non-basic
-/// effects out; a single missed filter (#3164) panicked apply at
-/// runtime and left the state lock acquired.
-///
-/// `BasicEffect` makes that contract live in the type system instead.
-/// The only way to obtain one is [`Effect::as_basic`], which returns
-/// `None` for every non-basic variant. `execute_basic_effect` takes
-/// `BasicEffect<'a>` directly and exhaustively matches its three arms —
-/// no `unreachable!()` is needed, and adding a new `Effect` variant
-/// won't compile until the call sites decide whether the variant is
-/// "basic" or routed elsewhere.
-///
-/// Variants borrow from the source `&'a Effect` so the basic executor
-/// can still forward the original effect into `ExecutionEvent::*`
-/// observer calls.
-#[derive(Debug)]
-pub enum BasicEffect<'a, S = ModuleSource, V: PlanValueKind = NoPlaceholder> {
-    Create {
-        effect: &'a EffectWithSource<S, V>,
-        resource: &'a ResolvedResource<S, V>,
-    },
-    ResumeCreate {
-        effect: &'a EffectWithSource<S, V>,
-        resource: &'a ResolvedResource<S, V>,
-    },
-    Update {
-        effect: &'a EffectWithSource<S, V>,
-        from: &'a crate::resource::SnapshotState,
-        identifier: &'a AppliedIdentifier,
-        to: &'a ResolvedResource<S, V>,
-        changed_attributes: &'a [String],
-    },
-    Delete {
-        effect: &'a EffectWithSource<S, V>,
-        id: &'a ResourceId,
-        identifier: &'a AppliedIdentifier,
-        generation: &'a EffectGeneration,
-        directives: &'a Directives,
-    },
-}
-
 /// Type-level capability for applying a keyed-list release to locked state.
 ///
 /// The fields are private and this value can only be minted by
 /// [`Effect::as_release_list_keys`]. State writeback accepts this type rather
-/// than `&Effect`, while provider executors accept [`BasicEffect`]; the two
+/// than `&Effect`, while provider executors accept scheduled basic effects; the two
 /// paths are disjoint by construction.
 #[derive(Debug, Clone, Copy)]
 pub struct ReleaseListKeysEffect<'a> {
@@ -1960,21 +1926,6 @@ impl<'a> ReleaseListKeysEffect<'a> {
 
     pub fn key_field(self) -> &'a FieldName {
         self.key_field
-    }
-}
-
-impl<'a, S, V: PlanValueKind> BasicEffect<'a, S, V> {
-    /// Returns the source `&Effect` this `BasicEffect` was narrowed
-    /// from. Used by `execute_basic_effect` to forward the original
-    /// effect to `ExecutionEvent::*` observer calls without storing it
-    /// twice.
-    pub fn as_effect(&self) -> &'a EffectWithSource<S, V> {
-        match *self {
-            BasicEffect::Create { effect, .. }
-            | BasicEffect::ResumeCreate { effect, .. }
-            | BasicEffect::Update { effect, .. }
-            | BasicEffect::Delete { effect, .. } => effect,
-        }
     }
 }
 
@@ -2274,81 +2225,6 @@ impl<S, V: PlanValueKind> EffectWithSource<S, V> {
             Effect::Wait { .. } => ">",
             Effect::DeferredCreate(_) => "+",
             Effect::DeferredReplace(payload) => payload.display_glyph(),
-        }
-    }
-
-    /// Narrow this effect to a [`BasicEffect`] if it is one of the
-    /// variants the basic executor handles (`Create`, `Update`,
-    /// `Delete`). Returns `None` for `Read`, `Import`,
-    /// `Remove`, `Move`, `ReleaseListKeys`, and `Wait` — those route through other
-    /// executor paths or are state-only (applied by the CLI's
-    /// `execute_state_only_effects` step).
-    ///
-    /// This is the *only* way to construct a `BasicEffect`, so the
-    /// basic executor's "this is a Create/Update/Delete" contract
-    /// lives in the type system rather than in caller-side filters.
-    /// See [`BasicEffect`] for the rationale (#3164).
-    ///
-    /// Guard: `BasicEffect` has no `From<&Effect>` or other public
-    /// constructor — callers must route through `as_basic()` and
-    /// handle the `None` case. A bare `&Effect` does not coerce to
-    /// `BasicEffect`:
-    ///
-    /// ```compile_fail,E0277
-    /// use carina_core::effect::{BasicEffect, Effect};
-    /// use carina_core::resource::{ResolvedResource, Resource};
-    /// let effect: Effect = Effect::Create(ResolvedResource::new(Resource::new("test", "x").into_value_snapshot()));
-    /// // Was: a missed filter could pass a non-basic `&Effect` straight
-    /// // into `execute_basic_effect` and trip `unreachable!()` at apply
-    /// // time (carina#3164). The conversion no longer exists.
-    /// let _: BasicEffect = (&effect).into();
-    /// ```
-    pub fn as_basic(&self) -> Option<BasicEffect<'_, S, V>> {
-        match self {
-            Effect::Create(resource) => Some(BasicEffect::Create {
-                effect: self,
-                resource,
-            }),
-            Effect::ResumeCreate {
-                resource,
-                started_at: _started_at,
-            } => Some(BasicEffect::ResumeCreate {
-                effect: self,
-                resource,
-            }),
-            Effect::Update {
-                from,
-                identifier,
-                to,
-                changed_attributes,
-            } => Some(BasicEffect::Update {
-                effect: self,
-                from,
-                identifier,
-                to,
-                changed_attributes,
-            }),
-            Effect::Delete {
-                id,
-                identifier,
-                generation,
-                directives,
-                ..
-            } => Some(BasicEffect::Delete {
-                effect: self,
-                id,
-                identifier,
-                generation,
-                directives,
-            }),
-            Effect::Read { .. }
-            | Effect::Import { .. }
-            | Effect::Remove { .. }
-            | Effect::Move { .. }
-            | Effect::ReleaseListKeys { .. }
-            | Effect::Wait { .. }
-            | Effect::DeferredCreate(_)
-            | Effect::DeferredReplace(_) => None,
         }
     }
 
@@ -2776,11 +2652,13 @@ impl<S, V: PlanValueKind> EffectWithSource<S, V> {
         match self {
             Effect::Delete {
                 dependencies,
+                explicit_dependencies,
                 blocked_by_updates,
                 ..
             } => {
                 let mut edges: Vec<ScheduleEdge> = dependencies
                     .iter()
+                    .chain(explicit_dependencies.iter())
                     .cloned()
                     .map(ScheduleEdge::BlockedByIfDelete)
                     .collect();
@@ -3437,7 +3315,14 @@ mod tests {
     #[test]
     fn deferred_create_as_basic_returns_none() {
         let effect = deferred_create_effect();
-        assert!(effect.as_basic().is_none());
+        let scheduled = crate::replacement::AdmittedReplacementEffects::resolve(
+            &[effect],
+            &crate::schema::SchemaRegistry::new(),
+            |_| Default::default(),
+        )
+        .unwrap()
+        .schedule(&Default::default());
+        assert!(scheduled.effect(0).as_basic().is_none());
     }
 
     #[test]
@@ -4082,7 +3967,7 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
-    /// `as_basic()` must return `Some` for the three variants the
+    /// Scheduled `as_basic()` must return `Some` for the three variants the
     /// basic executor handles, and `None` for every other variant.
     /// This is the carina#3164 type-level contract: filters used to
     /// be caller-side, and a missed filter (Move slipping into the
@@ -4091,6 +3976,16 @@ mod tests {
     fn as_basic_narrows_to_create_update_and_delete_only() {
         use crate::resource::State as ResState;
 
+        use crate::replacement::{AdmittedReplacementEffects, ScheduledBasicEffect};
+        let schedule = |effect| {
+            AdmittedReplacementEffects::resolve(
+                &[effect],
+                &crate::schema::SchemaRegistry::new(),
+                |_| Default::default(),
+            )
+            .unwrap()
+            .schedule(&Default::default())
+        };
         let rid = ResourceId::with_identity("test", "x");
 
         // Basic variants must narrow.
@@ -4098,8 +3993,8 @@ mod tests {
             Resource::new("test", "x").into_value_snapshot(),
         ));
         assert!(matches!(
-            create.as_basic(),
-            Some(BasicEffect::Create { .. })
+            schedule(create).effect(0).as_basic(),
+            Some(ScheduledBasicEffect::Create { .. })
         ));
 
         let update: Effect = Effect::Update {
@@ -4111,8 +4006,8 @@ mod tests {
             changed_attributes: vec![],
         };
         assert!(matches!(
-            update.as_basic(),
-            Some(BasicEffect::Update { .. })
+            schedule(update).effect(0).as_basic(),
+            Some(ScheduledBasicEffect::Update { .. })
         ));
 
         let delete: Effect = Effect::Delete {
@@ -4126,8 +4021,8 @@ mod tests {
             blocked_by_updates: Default::default(),
         };
         assert!(matches!(
-            delete.as_basic(),
-            Some(BasicEffect::Delete { .. })
+            schedule(delete).effect(0).as_basic(),
+            Some(ScheduledBasicEffect::Delete { .. })
         ));
 
         // Non-basic variants must not. If a new variant is added and
@@ -4176,8 +4071,8 @@ mod tests {
             ("Wait", wait),
         ] {
             assert!(
-                e.as_basic().is_none(),
-                "{label} must not narrow to BasicEffect"
+                schedule(e).effect(0).as_basic().is_none(),
+                "{label} must not narrow to ScheduledBasicEffect"
             );
         }
     }

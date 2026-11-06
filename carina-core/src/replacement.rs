@@ -16,12 +16,15 @@ use crate::resource::{
 };
 use crate::schema::{SchemaKind, SchemaRegistry, UniqueNameSpec};
 
+#[cfg(test)]
+#[path = "replacement/plan_scheduling_tests.rs"]
+mod plan_scheduling_tests;
 #[path = "replacement/scheduling.rs"]
 mod scheduling;
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub use scheduling::create_permit_for_test;
-pub use scheduling::{CreatePermit, ScheduledEffect, ScheduledEffects};
+pub use scheduling::{CreatePermit, ScheduledEffect, ScheduledEffects, ScheduledPlan};
 pub(crate) use scheduling::{ScheduledBasicEffect, ScheduledResume};
 
 /// State rows own all their provider generations. Routing aliases belong to
@@ -51,11 +54,27 @@ fn row_on_route(
 }
 
 #[derive(Default)]
-struct ReplacementLineage {
+pub(crate) struct ReplacementLineage {
     sources: HashMap<StateRowLineage, HashSet<StateRowLineage>>,
 }
 
 impl ReplacementLineage {
+    pub(crate) fn required_by<'a>(
+        &self,
+        target: &ResolvedResourceId,
+        requirements: &'a HashMap<ResolvedResourceId, String>,
+    ) -> Option<&'a str> {
+        requirements
+            .get(target)
+            .or_else(|| {
+                requirements
+                    .iter()
+                    .find(|(required, _)| self.owns(target, required))
+                    .map(|(_, dependent)| dependent)
+            })
+            .map(String::as_str)
+    }
+
     fn associate(&mut self, target: &ResolvedResourceId, old: &ResolvedResourceId) {
         self.sources
             .entry(StateRowLineage::of(target))
@@ -449,119 +468,42 @@ fn new_dependencies<S, P: PlanValueKind>(
 /// Candidate order changes for the current graph. A cycle can have several
 /// delete-first pairs; admission must try one permissible change and rebuild
 /// this graph before deciding that any rejected candidate is mandatory.
-fn cycle_promotions<S, P: PlanValueKind>(
-    effects: &[Effect<S, P>],
-    lineage: &ReplacementLineage,
-    requirements: &HashMap<ResolvedResourceId, String>,
+fn cycle_promotions<S: Clone, P: PlanValueKind>(
+    admitted: &AdmittedReplacementEffects<S, P>,
 ) -> Vec<(ResolvedResourceId, String)> {
-    let new_dependencies = new_dependencies(effects);
-    let creates: HashMap<_, _> = effects
-        .iter()
-        .enumerate()
-        .filter_map(|(index, effect)| match effect {
-            Effect::Create(resource) | Effect::ResumeCreate { resource, .. } => {
-                Some((resource.resolved_id(), index))
-            }
-            _ => None,
-        })
-        .collect();
-    let deletes: Vec<_> = effects
-        .iter()
-        .enumerate()
-        .filter_map(|(index, effect)| match effect {
-            Effect::Delete { id, .. } => Some((id.clone(), index)),
-            _ => None,
-        })
-        .collect();
-    let mut pairs: Vec<_> = creates
-        .iter()
-        .flat_map(|(target, &create)| {
-            deletes
-                .iter()
-                .filter(move |(old, _)| lineage.owns(target, old))
-                .map(move |(_, delete)| (target.clone(), create, *delete))
-        })
-        .collect();
-    pairs.sort_by_key(|(_, create, delete)| (*create, *delete));
-    let runs_before_cleanup = |target: &ResolvedResourceId, index: usize| {
-        matches!(&effects[index], Effect::Create(resource) | Effect::ResumeCreate { resource, .. } if resource.directives.create_before_destroy)
-            || requirements.contains_key(target)
+    // Admission and dispatch consume this same graph, including deferred gates,
+    // Reads, persisted dependencies, and the checked replacement windows.
+    let analysis = match admitted.dependency_analysis(std::iter::empty()) {
+        Ok(analysis) => analysis,
+        Err(failure) => failure.into_parts().0,
     };
-    let mut edges: HashMap<usize, HashSet<usize>> = HashMap::new();
-    for (index, dependencies) in new_dependencies.iter().enumerate() {
-        for dependency in dependencies.iter() {
-            if let Some(&upstream) = creates.get(dependency) {
-                edges.entry(index).or_default().insert(upstream);
+    let edges = analysis.into_deps_of();
+    let mut promotions = Vec::new();
+    for replacement in &admitted.scheduling.replacements {
+        let create = replacement.create;
+        for &delete in &replacement.deletes {
+            let target = &replacement.order.target;
+            if replacement.order.runs_before_cleanup()
+                || !dependency_reaches(&edges, delete, create)
+            {
+                continue;
             }
-        }
-    }
-    for &(_, delete) in &deletes {
-        if let Effect::Delete {
-            dependencies,
-            explicit_dependencies,
-            blocked_by_updates,
-            ..
-        } = &effects[delete]
-        {
-            let mut old_dependencies = dependencies.to_resolved_dependencies();
-            old_dependencies.extend(explicit_dependencies.iter().cloned());
-            for old_dependency in old_dependencies {
-                for (_, upstream_delete) in deletes.iter().filter(|(id, _)| id == &old_dependency) {
-                    edges.entry(*upstream_delete).or_default().insert(delete);
-                }
-            }
-            for consumer in blocked_by_updates.iter() {
-                if let Some(&consumer) = creates.get(consumer) {
-                    if pairs
-                        .iter()
-                        .any(|(_, create, old)| *create == consumer && *old == delete)
-                    {
-                        continue;
-                    }
-                    edges.entry(delete).or_default().insert(consumer);
-                }
-            }
-        }
-    }
-    for (target, create, delete) in &pairs {
-        if runs_before_cleanup(target, *create) {
-            edges.entry(*delete).or_default().insert(*create);
-            for (consumer, dependencies) in new_dependencies.iter().enumerate() {
-                if consumer == *create || !dependencies.contains(target) {
-                    continue;
-                }
-                edges.entry(*delete).or_default().insert(consumer);
-                for (child, child_create, child_delete) in &pairs {
-                    if *child_create == consumer && !runs_before_cleanup(child, consumer) {
-                        edges.entry(*child_delete).or_default().insert(*create);
-                    }
-                }
-            }
-        } else {
-            edges.entry(*create).or_default().insert(*delete);
-        }
-    }
-    pairs
-        .iter()
-        .filter(|(target, create, delete)| {
-            !runs_before_cleanup(target, *create) && dependency_reaches(&edges, *delete, *create)
-        })
-        .map(|(target, create, delete)| {
             let dependent = edges
-                .get(delete)
+                .get(&delete)
                 .into_iter()
                 .flatten()
                 .copied()
-                .filter(|candidate| {
-                    effects[*candidate].resource_id() != target.as_inner()
-                        && dependency_reaches(&edges, *candidate, *create)
+                .filter(|&candidate| {
+                    admitted.effects[candidate].resource_id() != target.as_inner()
+                        && dependency_reaches(&edges, candidate, create)
                 })
                 .min()
-                .map(|index| effects[index].resource_id().to_string())
+                .map(|index| admitted.effects[index].resource_id().to_string())
                 .unwrap_or_else(|| target.to_string());
-            (target.clone(), dependent)
-        })
-        .collect()
+            promotions.push((target.clone(), dependent));
+        }
+    }
+    promotions
 }
 
 fn dependency_reaches(edges: &HashMap<usize, HashSet<usize>>, start: usize, target: usize) -> bool {
@@ -772,10 +714,10 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                 if matches!(&effects[index], Effect::ResumeCreate { .. }) {
                     request.naming = ReplacementNaming::Continuation;
                 }
-                if let Some(dependent) = requirements.get(&target.resolved_id()) {
+                if let Some(dependent) = lineage.required_by(&target.resolved_id(), &requirements) {
                     request = request.require_create_first(dependent);
                 }
-                checked_replacements.push((index, admit(request)?));
+                checked_replacements.push((Some(index), admit(request)?));
             }
         }
 
@@ -791,14 +733,28 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
         for (index, checked) in &checked_replacements {
             known
                 .scheduling
-                .insert(checked.clone().into_scheduling(), &effects, *index);
+                .insert(checked.clone().into_scheduling(), &effects, index.unwrap());
         }
-        let mut known_effects = effects.clone();
-        for gate in 0..effects.len() {
+        // Expand absorbed teardowns before projecting creates, so their gate
+        // barriers are present exactly once in the admission graph as well.
+        let (mut known, _, _) = known.expand_deferred_replacements();
+        // Projecting a known child must not detach it from the gate that
+        // admits it at runtime. Capture those edges before adding previews.
+        for gate in 0..known.effects.len() {
+            for delete in known.deferred_delete_candidates(gate) {
+                known
+                    .scheduling
+                    .gate_barriers
+                    .entry(delete)
+                    .or_default()
+                    .insert(gate);
+            }
+        }
+        for gate in 0..known.effects.len() {
             let Some(mut preview) = known.deferred_preflight_preview(gate, &previous) else {
                 continue;
             };
-            preview.require_create_first_for_dependencies(&requirements);
+            preview.require_create_first_with_lineage(&requirements, &lineage);
             for request in preview.preflight_requests() {
                 if checked_replacements.iter().any(|(_, checked)| {
                     checked.target().resolved_id() == request.target().resolved_id()
@@ -807,23 +763,26 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                 }
                 for old in request.deletes.iter() {
                     let delete = old.to_delete_effect();
-                    if !known_effects.iter().any(|effect| {
+                    if !known.effects.iter().any(|effect| {
                         matches!(effect, Effect::Delete { .. })
                             && effect.instance_key() == delete.instance_key()
                     }) {
-                        known_effects.push(delete);
+                        known.effects.push(delete);
                     }
                 }
                 let checked = admit(request)?;
-                let index = known_effects.len();
-                known_effects.push(Effect::Create(checked.target().clone()));
-                checked_replacements.push((index, checked));
+                let index = known.effects.len();
+                known.effects.push(Effect::Create(checked.target().clone()));
+                known
+                    .scheduling
+                    .insert(checked.clone().into_scheduling(), &known.effects, index);
+                checked_replacements.push((None, checked));
             }
         }
         // Each successful iteration permanently promotes one distinct pair.
         // Rejected candidates never change the graph or consume a retry.
         for _ in 0..checked_replacements.len() {
-            let promotions = cycle_promotions(&known_effects, &lineage, &requirements);
+            let promotions = cycle_promotions(&known);
             if promotions.is_empty() {
                 break;
             }
@@ -841,6 +800,20 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
                         .require_create_first(&dependent),
                 ) {
                     Ok(replacement) => {
+                        let bound = known
+                            .scheduling
+                            .replacements
+                            .iter_mut()
+                            .find(|bound| bound.order.target == target)
+                            .expect("cycle candidate is in the shared admission graph");
+                        bound.order = replacement.clone().into_scheduling();
+                        known.effects[bound.create] = match &known.effects[bound.create] {
+                            Effect::ResumeCreate { started_at, .. } => Effect::ResumeCreate {
+                                resource: replacement.target().clone(),
+                                started_at: started_at.clone(),
+                            },
+                            _ => Effect::Create(replacement.target().clone()),
+                        };
                         *checked = replacement;
                         requirements.insert(target, dependent);
                         promoted = true;
@@ -856,9 +829,9 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
             }
         }
         for (index, checked) in checked_replacements {
-            if index >= effects.len() {
+            let Some(index) = index else {
                 continue;
-            }
+            };
             if let Some(name) = checked.temporary_name() {
                 temporary_names.push((checked.target().id.clone(), name.clone()));
             }
@@ -882,7 +855,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
             let Some(mut preview) = admitted.deferred_preflight_preview(gate, &previous) else {
                 continue;
             };
-            preview.require_create_first_for_dependencies(&requirements);
+            preview.require_create_first_with_lineage(&requirements, &lineage);
             preview
                 .preflight(registry)
                 .map_err(|cause| ReplacementAdmissionError {
@@ -1099,7 +1072,7 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
     }
 }
 
-impl<S: Clone> AdmittedReplacementEffects<S> {
+impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
     pub fn dependency_analysis<'a>(
         &self,
         unresolved: impl IntoIterator<Item = &'a ResolvedResourceId>,
@@ -1113,7 +1086,13 @@ impl<S: Clone> AdmittedReplacementEffects<S> {
         &self,
         deps: &mut HashMap<usize, HashSet<usize>>,
     ) -> HashSet<(usize, usize)> {
-        self.scheduling.order_edges(&self.effects, deps)
+        let pairs = self.scheduling.order_edges(&self.effects, deps);
+        for gate in 0..self.effects.len() {
+            for delete in self.deferred_delete_candidates(gate) {
+                deps.entry(delete).or_default().insert(gate);
+            }
+        }
+        pairs
     }
     pub(crate) fn expand_deferred_replacements(self) -> (Self, HashSet<usize>, Vec<usize>) {
         let mut effects = Vec::with_capacity(self.effects.len());
@@ -1234,6 +1213,7 @@ struct BoundReplacement {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ReplacementScheduling {
     replacements: Vec<BoundReplacement>,
+    gate_barriers: HashMap<usize, HashSet<usize>>,
 }
 impl ReplacementScheduling {
     pub(crate) fn is_create_first(&self, target: &crate::resource::ResourceId) -> bool {
@@ -1297,6 +1277,18 @@ impl ReplacementScheduling {
         self.insert(checked.into_scheduling(), effects, create);
     }
     pub(crate) fn remap(&mut self, indices: &[Option<usize>]) {
+        self.gate_barriers = self
+            .gate_barriers
+            .iter()
+            .filter_map(|(delete, gates)| {
+                let delete = indices.get(*delete).copied().flatten()?;
+                let gates = gates
+                    .iter()
+                    .filter_map(|gate| indices.get(*gate).copied().flatten())
+                    .collect();
+                Some((delete, gates))
+            })
+            .collect();
         self.replacements.retain_mut(|replacement| {
             let Some(create) = indices.get(replacement.create).copied().flatten() else {
                 return false;
@@ -1310,11 +1302,14 @@ impl ReplacementScheduling {
             !replacement.deletes.is_empty()
         });
     }
-    pub(crate) fn order_edges<S>(
+    pub(crate) fn order_edges<S, P: PlanValueKind>(
         &self,
-        effects: &[impl AsRef<Effect<S>>],
+        effects: &[impl AsRef<Effect<S, P>>],
         deps: &mut HashMap<usize, HashSet<usize>>,
     ) -> HashSet<(usize, usize)> {
+        for (&delete, gates) in &self.gate_barriers {
+            deps.entry(delete).or_default().extend(gates);
+        }
         let mut admitted_pairs = HashSet::new();
         for replacement in &self.replacements {
             let create = replacement.create;

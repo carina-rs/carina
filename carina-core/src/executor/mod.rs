@@ -62,12 +62,30 @@ pub struct PlanSchedulerEndpoint {
 /// endpoint phase preserves whether an edge touches an absorbed teardown.
 /// Dependency-analysis failures retain their partial edge graph, matching the
 /// scheduler's behavior for unaffected effects.
+///
+/// Continuations must be specialized before projecting a diagram:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::build_plan_scheduler_dependency_edges, plan::AdmittedPlan};
+/// fn unspecialized(plan: &AdmittedPlan) {
+///     build_plan_scheduler_dependency_edges(plan, &Default::default());
+/// }
+/// ```
+///
+/// An effects-only schedule has no admitted plan to project back to:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::build_plan_scheduler_dependency_edges, replacement::ScheduledEffects};
+/// fn unattached(scheduled: &ScheduledEffects) {
+///     build_plan_scheduler_dependency_edges(scheduled, &Default::default());
+/// }
+/// ```
 pub fn build_plan_scheduler_dependency_edges(
-    plan: &crate::plan::AdmittedPlan,
+    scheduled: &crate::replacement::ScheduledPlan<'_>,
     unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
 ) -> BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)> {
     let (admitted, deferred_replace_teardowns, source_effect_indices) =
-        plan.admitted_effects().expand_deferred_replacements();
+        scheduled.clone().expand_deferred_replacements();
     let scheduler::SchedulerDeps { deps_of, .. } =
         scheduler::build_scheduler_deps(&admitted, unresolved_resources.keys());
 

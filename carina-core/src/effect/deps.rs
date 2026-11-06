@@ -4,7 +4,7 @@ use crate::effect::{Effect, EffectInstanceKey, ScheduleEdge};
 use crate::non_empty::NonEmptyVec;
 #[cfg(test)]
 use crate::resource::ResourceId;
-use crate::resource::{ResolvedDependencies, ResolvedResourceId, Resource};
+use crate::resource::{PlanValueKind, ResolvedDependencies, ResolvedResourceId, Resource};
 
 #[derive(Debug, Clone)]
 pub struct UnresolvedResource<S = crate::resource::ModuleSource>(
@@ -132,7 +132,7 @@ pub(crate) struct WritesSet {
 }
 
 impl WritesSet {
-    pub(crate) fn from_update<S>(effect: &Effect<S>) -> Option<Self> {
+    pub(crate) fn from_update<S, P: PlanValueKind>(effect: &Effect<S, P>) -> Option<Self> {
         let Effect::Update {
             changed_attributes, ..
         } = effect
@@ -464,10 +464,10 @@ impl DependencyAnalyzer {
             .push(UnresolvedRequiredDependency { effect_index, id });
     }
 
-    fn record_unresolved_delete_ordering<S>(
+    fn record_unresolved_delete_ordering<S, P: PlanValueKind>(
         &self,
         analysis: &mut DependencyAnalysis,
-        effect: &Effect<S>,
+        effect: &Effect<S, P>,
         dependency: ResolvedResourceId,
     ) {
         let Effect::Delete { id, generation, .. } = effect else {
@@ -482,7 +482,7 @@ impl DependencyAnalyzer {
             });
     }
 
-    fn collect_from_schedule_edges<S, E: AsRef<Effect<S>>>(
+    fn collect_from_schedule_edges<S, P: PlanValueKind, E: AsRef<Effect<S, P>>>(
         &self,
         effects: &[E],
         edges: Vec<ScheduleEdge>,
@@ -616,22 +616,28 @@ where
     )
 }
 
-pub(crate) fn build_admitted_effect_dependency_analysis<'a, S: Clone>(
-    admitted: &crate::replacement::AdmittedReplacementEffects<S>,
+pub(crate) fn build_admitted_effect_dependency_analysis<'a, S: Clone, P: PlanValueKind>(
+    admitted: &crate::replacement::AdmittedReplacementEffects<S, P>,
     unresolved_resource_ids: impl IntoIterator<Item = &'a ResolvedResourceId>,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
     let mut edges = HashMap::new();
     let pairs = admitted.order_edges(&mut edges);
-    build_effect_dependency_analysis_impl(
+    let mut result = build_effect_dependency_analysis_impl(
         admitted.effects(),
         unresolved_resource_ids,
         ScheduleInputs::Apply,
         edges,
         pairs,
-    )
+    );
+    let analysis = match &mut result {
+        Ok(analysis) => analysis,
+        Err(failure) => failure.0.as_mut(),
+    };
+    relax_update_update_edges(admitted.effects(), analysis);
+    result
 }
 
-fn build_effect_dependency_analysis_impl<'a, S, E>(
+fn build_effect_dependency_analysis_impl<'a, S, P: PlanValueKind, E>(
     effects: &[E],
     unresolved_resource_ids: impl IntoIterator<Item = &'a ResolvedResourceId>,
     inputs: ScheduleInputs<'_>,
@@ -639,7 +645,7 @@ fn build_effect_dependency_analysis_impl<'a, S, E>(
     admitted_pairs: HashSet<(usize, usize)>,
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure>
 where
-    E: AsRef<Effect<S>>,
+    E: AsRef<Effect<S, P>>,
 {
     let mut known_graph_ids = unresolved_resource_ids
         .into_iter()
@@ -786,7 +792,7 @@ where
     }
 }
 
-pub fn relax_update_update_edges<S, E: AsRef<Effect<S>>>(
+pub fn relax_update_update_edges<S, P: PlanValueKind, E: AsRef<Effect<S, P>>>(
     effects: &[E],
     analysis: &mut DependencyAnalysis,
 ) {
