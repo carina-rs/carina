@@ -1898,13 +1898,13 @@ mod tests {
             fn validate_config(
                 &self,
                 _: &carina_core::provider::CanonicalProviderConfigAttributes,
+                _session: &carina_core::provider::ProviderValidationInputs,
             ) -> carina_core::provider::ProviderResult<()> {
                 Ok(())
             }
             fn create_provider(
                 &self,
-                _: Option<&str>,
-                _: &carina_core::provider::ProviderReadyConfig,
+                _: &carina_core::provider::ProviderSession,
                 _: carina_core::provider::InitializeOutcomeMint,
             ) -> carina_core::provider::BoxFuture<
                 '_,
@@ -2730,3 +2730,7 @@ mod explicit_pattern_mode_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "../../carina-core/tests/support/provider_text.rs"]
+mod provider_text_fixtures;

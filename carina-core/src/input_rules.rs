@@ -906,7 +906,7 @@ impl std::fmt::Display for AuthoredInputFinding {
 pub fn check_authored_inputs<E, P, T, D, B>(
     parsed: &crate::parser::File<E, P, T, D, B>,
     schemas: &SchemaRegistry,
-) -> crate::provider::ProviderResult<Vec<AuthoredInputFinding>>
+) -> crate::provider::HostResult<Vec<AuthoredInputFinding>>
 where
     P: crate::resource::PlaceholderKind,
     T: crate::resource::PlaceholderKind,
@@ -969,7 +969,7 @@ where
     for resource in &resources {
         if let Some(site) =
             classify_write_site::<ModuleSource>(WriteSiteSource::Authored(resource), schemas)
-                .map_err(|error| crate::provider::ProviderError::invalid_input(error.to_string()))?
+                .map_err(|error| crate::provider::HostError::invalid_input(error.to_string()))?
         {
             for rule in site.applicable_rules() {
                 if let InputVerdict::Violation(violation) = rule.evaluate() {

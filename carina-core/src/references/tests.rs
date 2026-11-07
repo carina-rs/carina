@@ -197,14 +197,17 @@ impl Fixture {
         let mut router = ProviderRouter::new();
         router.add_provider(
             "test".into(),
-            InitializedProvider::unavailable(Box::new(TableProvider {
-                table,
-                calls: calls.clone(),
-                barrier: None,
-                result_count: None,
-                fail_batch: false,
-                updates: updates.clone(),
-            })),
+            InitializedProvider::for_test(
+                Box::new(TableProvider {
+                    table,
+                    calls: calls.clone(),
+                    barrier: None,
+                    result_count: None,
+                    fail_batch: false,
+                    updates: updates.clone(),
+                }),
+                crate::provider::ReferenceScope::Unavailable,
+            ),
         );
         let mut registry = SchemaRegistry::new();
         registry.insert("test", schema(create_only, false));
@@ -631,17 +634,20 @@ async fn round8_unordered_pairing_changes_control_flow_in_exactly_one_replay() {
     let mut fixture = round5_list_fixture(false, false);
     fixture.router.add_provider(
         "test".into(),
-        InitializedProvider::unavailable(Box::new(TableProvider {
-            table: HashMap::from([
-                ("alias/a".into(), resolved("arn:A")),
-                ("alias/b".into(), resolved("arn:B")),
-            ]),
-            calls: fixture.calls.clone(),
-            barrier: None,
-            result_count: None,
-            fail_batch: false,
-            updates: fixture.updates.clone(),
-        })),
+        InitializedProvider::for_test(
+            Box::new(TableProvider {
+                table: HashMap::from([
+                    ("alias/a".into(), resolved("arn:A")),
+                    ("alias/b".into(), resolved("arn:B")),
+                ]),
+                calls: fixture.calls.clone(),
+                barrier: None,
+                result_count: None,
+                fail_batch: false,
+                updates: fixture.updates.clone(),
+            }),
+            crate::provider::ReferenceScope::Unavailable,
+        ),
     );
     let list = |entries: &[(&str, &str)]| {
         Value::Concrete(ConcreteValue::List(
@@ -854,14 +860,17 @@ async fn round9_used_whole_batch_error_is_typed_through_the_planner_and_not_retr
     );
     fixture.router.add_provider(
         "test".into(),
-        InitializedProvider::unavailable(Box::new(TableProvider {
-            table: HashMap::new(),
-            calls: fixture.calls.clone(),
-            barrier: None,
-            result_count: None,
-            fail_batch: true,
-            updates: fixture.updates.clone(),
-        })),
+        InitializedProvider::for_test(
+            Box::new(TableProvider {
+                table: HashMap::new(),
+                calls: fixture.calls.clone(),
+                barrier: None,
+                result_count: None,
+                fail_batch: true,
+                updates: fixture.updates.clone(),
+            }),
+            crate::provider::ReferenceScope::Unavailable,
+        ),
     );
     let mut preparation = ReferencePreparation::default();
     for _ in 0..2 {
@@ -952,14 +961,17 @@ async fn round8_whole_batch_errors_are_cached_for_each_value_and_judged_on_use()
     );
     fixture.router.add_provider_instance(
         ProviderInstanceKey::new("test", Some("other".into())),
-        InitializedProvider::unavailable(Box::new(TableProvider {
-            table: HashMap::new(),
-            calls: fixture.calls.clone(),
-            barrier: None,
-            result_count: None,
-            fail_batch: true,
-            updates: fixture.updates.clone(),
-        })),
+        InitializedProvider::for_test(
+            Box::new(TableProvider {
+                table: HashMap::new(),
+                calls: fixture.calls.clone(),
+                barrier: None,
+                result_count: None,
+                fail_batch: true,
+                updates: fixture.updates.clone(),
+            }),
+            crate::provider::ReferenceScope::Unavailable,
+        ),
     );
     let references = fixture
         .prepare()
@@ -1436,14 +1448,17 @@ async fn resolution_cache_is_per_run_and_includes_type_and_provider_instance() {
     );
     fixture.router.add_provider_instance(
         ProviderInstanceKey::new("test", Some("other".into())),
-        InitializedProvider::unavailable(Box::new(TableProvider {
-            table: HashMap::from([("alias/live".into(), resolved("key/b"))]),
-            calls: fixture.calls.clone(),
-            barrier: None,
-            result_count: None,
-            fail_batch: false,
-            updates: fixture.updates.clone(),
-        })),
+        InitializedProvider::for_test(
+            Box::new(TableProvider {
+                table: HashMap::from([("alias/live".into(), resolved("key/b"))]),
+                calls: fixture.calls.clone(),
+                barrier: None,
+                result_count: None,
+                fail_batch: false,
+                updates: fixture.updates.clone(),
+            }),
+            crate::provider::ReferenceScope::Unavailable,
+        ),
     );
     let mut other = fixture.desired[0].as_resource().clone();
     other.id.provider_instance = Some("other".into());
@@ -2090,14 +2105,17 @@ async fn native_reference_batches_reject_short_and_long_results() {
             Fixture::new(string("alias/live"), string("key/a"), HashMap::new(), false);
         fixture.router.add_provider(
             "test".into(),
-            InitializedProvider::unavailable(Box::new(TableProvider {
-                table: HashMap::new(),
-                calls: fixture.calls.clone(),
-                barrier: None,
-                result_count: Some(count),
-                fail_batch: false,
-                updates: fixture.updates.clone(),
-            })),
+            InitializedProvider::for_test(
+                Box::new(TableProvider {
+                    table: HashMap::new(),
+                    calls: fixture.calls.clone(),
+                    barrier: None,
+                    result_count: Some(count),
+                    fail_batch: false,
+                    updates: fixture.updates.clone(),
+                }),
+                crate::provider::ReferenceScope::Unavailable,
+            ),
         );
         let error = fixture
             .prepare()
@@ -2622,13 +2640,16 @@ impl ProviderFactory for ReferenceValidationFactory {
         )
         .unwrap()
     }
-    fn validate_config(&self, _: &CanonicalProviderConfigAttributes) -> ProviderResult<()> {
+    fn validate_config(
+        &self,
+        _: &CanonicalProviderConfigAttributes,
+        _session: &crate::provider::ProviderValidationInputs,
+    ) -> ProviderResult<()> {
         Ok(())
     }
     fn create_provider(
         &self,
-        _: Option<&str>,
-        _: &crate::executor::ProviderReadyConfig,
+        _: &crate::provider::ProviderSession,
         _: InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         unimplemented!()
@@ -2637,6 +2658,7 @@ impl ProviderFactory for ReferenceValidationFactory {
         &self,
         _: &TypeIdentity,
         _: &CanonicalCustomTypeValue,
+        _session: &crate::provider::ProviderValidationInputs,
     ) -> ProviderResult<()> {
         *self.calls.lock().unwrap() += 1;
         Ok(())
@@ -2699,14 +2721,17 @@ async fn round2_provider_instance_batches_run_concurrently() {
     for instance in [None, Some("other".to_string())] {
         fixture.router.add_provider_instance(
             ProviderInstanceKey::new("test", instance.clone()),
-            InitializedProvider::unavailable(Box::new(TableProvider {
-                table: HashMap::from([("alias/live".into(), resolved("key/a"))]),
-                calls: fixture.calls.clone(),
-                barrier: Some(barrier.clone()),
-                result_count: None,
-                fail_batch: false,
-                updates: fixture.updates.clone(),
-            })),
+            InitializedProvider::for_test(
+                Box::new(TableProvider {
+                    table: HashMap::from([("alias/live".into(), resolved("key/a"))]),
+                    calls: fixture.calls.clone(),
+                    barrier: Some(barrier.clone()),
+                    result_count: None,
+                    fail_batch: false,
+                    updates: fixture.updates.clone(),
+                }),
+                crate::provider::ReferenceScope::Unavailable,
+            ),
         );
     }
     let mut other = fixture.desired[0].as_resource().clone();
@@ -3420,7 +3445,7 @@ async fn round5_provisional_errors_and_decisions_are_discarded_until_a_clean_run
                         if equal {
                             Ok("clean")
                         } else {
-                            Err(ProviderError::invalid_input(
+                            Err(crate::provider::HostError::invalid_input(
                                 "provisional decision must never escape",
                             )
                             .into())
@@ -3442,17 +3467,20 @@ async fn round5_dangling_saved_leaf_does_not_annotate_a_different_list_element()
     let mut fixture = round5_list_fixture(false, false);
     fixture.router.add_provider(
         "test".into(),
-        InitializedProvider::unavailable(Box::new(TableProvider {
-            table: HashMap::from([(
-                "alias/deleted".into(),
-                Ok(wire::ReferenceOutcome::NotFound(error())),
-            )]),
-            calls: fixture.calls.clone(),
-            barrier: None,
-            result_count: None,
-            fail_batch: false,
-            updates: fixture.updates.clone(),
-        })),
+        InitializedProvider::for_test(
+            Box::new(TableProvider {
+                table: HashMap::from([(
+                    "alias/deleted".into(),
+                    Ok(wire::ReferenceOutcome::NotFound(error())),
+                )]),
+                calls: fixture.calls.clone(),
+                barrier: None,
+                result_count: None,
+                fail_batch: false,
+                updates: fixture.updates.clone(),
+            }),
+            crate::provider::ReferenceScope::Unavailable,
+        ),
     );
     let list = |first: &str, second: &str| {
         Value::Concrete(ConcreteValue::List(vec![
@@ -3563,17 +3591,20 @@ async fn round5_projected_list_notes_keep_the_current_operand_origin() {
     let mut fixture = round5_list_fixture(false, false);
     fixture.router.add_provider(
         "test".into(),
-        InitializedProvider::unavailable(Box::new(TableProvider {
-            table: HashMap::from([(
-                "alias/deleted".into(),
-                Ok(wire::ReferenceOutcome::NotFound(error())),
-            )]),
-            calls: fixture.calls.clone(),
-            barrier: None,
-            result_count: None,
-            fail_batch: false,
-            updates: fixture.updates.clone(),
-        })),
+        InitializedProvider::for_test(
+            Box::new(TableProvider {
+                table: HashMap::from([(
+                    "alias/deleted".into(),
+                    Ok(wire::ReferenceOutcome::NotFound(error())),
+                )]),
+                calls: fixture.calls.clone(),
+                barrier: None,
+                result_count: None,
+                fail_batch: false,
+                updates: fixture.updates.clone(),
+            }),
+            crate::provider::ReferenceScope::Unavailable,
+        ),
     );
     let desired = Value::Concrete(ConcreteValue::List(vec![round5_entry(
         "key/new",

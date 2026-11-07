@@ -8,7 +8,7 @@ use crate::effect::deps::{
     ScheduleInputs, build_effect_dependency_analysis,
 };
 use crate::plan::AdmittedPlan;
-use crate::provider::{DeleteAttempt, Provider, ProviderResult};
+use crate::provider::{DeleteAttempt, HostProvider, HostResult};
 use crate::replacement::ScheduledPlan;
 use crate::resource::ModuleSource;
 use crate::schema::SchemaRegistry;
@@ -21,16 +21,16 @@ use super::scheduler::{ScheduledBasicEffect, build_scheduler_deps, release_ready
 /// authorize a provider delete.
 ///
 /// ```compile_fail,E0061
-/// use carina_core::{executor::dispatch_delete, provider::{Provider, AppliedIdentifier, DeleteRequest}, resource::ResourceId};
-/// fn bypass(provider: &dyn Provider, id: &ResourceId, identifier: &AppliedIdentifier, request: DeleteRequest) {
+/// use carina_core::{executor::dispatch_delete, provider::{HostProvider, AppliedIdentifier, DeleteRequest}, resource::ResourceId};
+/// fn bypass(provider: &dyn HostProvider, id: &ResourceId, identifier: &AppliedIdentifier, request: DeleteRequest) {
 ///     let _ = dispatch_delete(provider, id, identifier, request);
 /// }
 /// ```
-pub async fn dispatch_delete<P: Provider + ?Sized>(
+pub async fn dispatch_delete<P: HostProvider + ?Sized>(
     provider: &P,
     permit: DeletePermit,
     schemas: &SchemaRegistry,
-) -> ProviderResult<()> {
+) -> HostResult<()> {
     provider.delete(DeleteAttempt::new(permit, schemas)).await
 }
 
@@ -92,11 +92,11 @@ pub struct DeleteCompletion {
 }
 
 impl ScheduledDelete {
-    pub async fn dispatch<P: Provider + ?Sized>(
+    pub async fn dispatch<P: HostProvider + ?Sized>(
         self,
         provider: &P,
         schemas: &SchemaRegistry,
-    ) -> (ProviderResult<()>, DeleteCompletion) {
+    ) -> (HostResult<()>, DeleteCompletion) {
         let result = dispatch_delete(provider, self.permit, schemas).await;
         let mut completion = self.completion;
         completion.failed = result.is_err();

@@ -42,11 +42,13 @@
 //! regression guard so a future stale-pin recurrence is diagnosed as
 //! a provider-pin problem, not a differ bug.
 
+#[path = "support/provider_text.rs"]
+mod text_fixtures;
 use std::collections::HashMap;
 
 use carina_core::differ::{Diff, diff_for_test as diff};
 use carina_core::explicit::ExplicitFields;
-use carina_core::provider::{InitializedProvider, ProviderRouter};
+use carina_core::provider::ProviderRouter;
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::schema::{
     ResourceSchema, SchemaRegistry, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
@@ -138,7 +140,7 @@ fn carina3122_live_distribution_readback_defaults_are_projected_away() {
     let mut providers = ProviderRouter::new();
     providers.add_provider(
         "awscc".to_string(),
-        InitializedProvider::unavailable(Box::new(ProviderRouter::new())),
+        text_fixtures::initialized(text_fixtures::idle_provider()),
     );
     let comparison = providers
         .comparison_context_for(

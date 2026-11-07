@@ -1536,7 +1536,7 @@ impl ModuleSignature {
                 format!(
                     "{}{}{}",
                     c.yellow,
-                    crate::provider_text::ProviderText::new(path.to_string()),
+                    crate::provider_text::DiagnosticText::new(path.to_string()),
                     c.reset
                 )
             }
@@ -1544,7 +1544,7 @@ impl ModuleSignature {
                 format!(
                     "{}{}{}",
                     c.green,
-                    crate::provider_text::ProviderText::new(path.to_string()),
+                    crate::provider_text::DiagnosticText::new(path.to_string()),
                     c.reset
                 )
             }
@@ -1573,7 +1573,7 @@ impl ModuleSignature {
                         if i > 0 {
                             out.push_str(", ");
                         }
-                        out.push_str(crate::provider_text::ProviderText::new(name).as_str());
+                        out.push_str(crate::provider_text::DiagnosticText::new(name).as_str());
                         out.push_str(": ");
                         out.push_str(&self.format_type_expr(ty, c));
                         out.push_str(c.green);
@@ -1595,7 +1595,7 @@ impl ModuleSignature {
             | TypeExpr::Union(_) => format!(
                 "{}{}{}",
                 c.green,
-                crate::provider_text::ProviderText::new(type_expr.to_string()),
+                crate::provider_text::DiagnosticText::new(type_expr.to_string()),
                 c.reset
             ),
         }

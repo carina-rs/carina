@@ -23,6 +23,8 @@
 //! a multi-file caller dir + multi-file module dir, exercising the real
 //! merged-parse + module-expansion path the CLI runs.
 
+#[path = "support/provider_text.rs"]
+mod text_fixtures;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -39,9 +41,9 @@ use carina_core::executor::{
 use carina_core::module_resolver::resolve_modules_providerless as resolve_modules;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
-    AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, InitializedProvider,
-    NoopNormalizer, Provider, ProviderInstanceKey, ProviderResult, ProviderRouter, ReadOutcome,
-    ReadRequest, UpdateOutcome, UpdateRequest,
+    AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, NoopNormalizer,
+    Provider, ProviderInstanceKey, ProviderResult, ProviderRouter, ReadOutcome, ReadRequest,
+    UpdateOutcome, UpdateRequest,
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{
@@ -185,7 +187,10 @@ fn fixture_provider(resources: &[Resource]) -> ProviderRouter {
     for route in routes {
         provider.add_provider_instance(
             route,
-            InitializedProvider::unavailable(Box::new(MockProvider)),
+            text_fixtures::initialized_with_scope(
+                Box::new(MockProvider),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ),
         );
     }
     provider

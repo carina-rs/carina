@@ -10,7 +10,7 @@ use tower_lsp::lsp_types::{
 use carina_core::builtins;
 use carina_core::parser::{TypeExpr, snake_to_pascal};
 use carina_core::paths::{CanonicalPath, ResolvedPath};
-use carina_core::provider_text::ProviderText;
+use carina_core::provider_text::DiagnosticText;
 use carina_core::resource::EnumValueResolver;
 use carina_core::schema::{
     AssignmentSink, CompiledAttributeType as AttributeType, EffectiveType, SchemaRegistry, Shape,
@@ -277,7 +277,7 @@ pub(super) enum InScopeBindingMode<'a> {
 /// the original label's insertion, filtering and ordering defaults explicitly
 /// whenever sanitization changes it.
 pub(super) fn format_completion_display(mut item: CompletionItem) -> CompletionItem {
-    let label = ProviderText::new(&item.label).to_string();
+    let label = DiagnosticText::new(&item.label).to_string();
     if label != item.label {
         let raw_label = std::mem::replace(&mut item.label, label);
         item.filter_text.get_or_insert_with(|| raw_label.clone());
@@ -288,7 +288,7 @@ pub(super) fn format_completion_display(mut item: CompletionItem) -> CompletionI
     }
     item.detail = item
         .detail
-        .map(|detail| ProviderText::new(detail).to_string());
+        .map(|detail| DiagnosticText::new(detail).to_string());
     item
 }
 

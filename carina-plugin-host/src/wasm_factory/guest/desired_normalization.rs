@@ -1,6 +1,6 @@
 //! The normalization-only WIT bridge. Ordinary value codecs remain separate.
 
-use crate::wasm_factory::version_checked_bindings::{WitDesiredResource, wit_types as wit};
+use super::version_checked_bindings::{WitDesiredResource, wit_types as wit};
 use carina_core::desired::NormalizationBatch;
 use carina_core::resource::{AbsoluteBindingAddress, NoPlaceholder, Resource};
 use carina_provider_protocol::normalization::{

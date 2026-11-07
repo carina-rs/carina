@@ -372,14 +372,14 @@ impl<E> CanonicalResourcePair<E> {
             NoPlaceholder,
             AbsoluteBindingAddress,
         >],
-        normalizer: &dyn carina_core::provider::ProviderNormalizer,
+        normalizer: &dyn carina_core::provider::HostNormalizer,
         schemas: &carina_core::schema::SchemaRegistry,
-    ) -> carina_core::provider::ProviderResult<()> {
+    ) -> carina_core::provider::HostResult<()> {
         carina_core::value::canonicalize_data_sources_with_schemas(
             &mut self.parsed.data_sources,
             schemas,
         )?;
-        carina_core::executor::normalized::apply_desired_normalization_slice(
+        carina_core::executor::normalized::apply_host_desired_normalization_slice(
             &mut self.parsed.resources,
             provider_configs,
             normalizer,

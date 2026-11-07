@@ -15,16 +15,16 @@ impl ProviderFactory for BoundaryFactory {
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> ProviderResult<()> {
         Ok(())
     }
     fn create_provider(
         &self,
-        binding: Option<&str>,
-        config: &carina_core::provider::ProviderReadyConfig,
+        config: &carina_core::provider::ProviderSession,
         mint: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
-        TypedRefMockFactory.create_provider(binding, config, mint)
+        TypedRefMockFactory.create_provider(config, mint)
     }
     fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
         carina_core::schema::ValidatedProviderSchemaWitness::new(

@@ -28,12 +28,12 @@ use carina_core::parser::BackendConfig;
 use carina_core::parser::ProviderContext;
 use carina_core::resource::{BindingAddress, PlaceholderKind};
 use carina_core::upstream_exports::UpstreamRefDiagnostic;
+#[cfg(test)]
+use carina_state::BackendError;
 use carina_state::{
     BackendConfig as StateBackendConfig, BackendDrift, BackendLock, BackendSelection,
     MutationBackendSelection, ResolvedReadBackend, VerifiedMutationBackendSelection,
 };
-#[cfg(test)]
-use carina_state::{BackendError, StateBackend};
 
 pub use carina_state::{BackendDriftStatus, inspect_backend_drift};
 
@@ -182,8 +182,10 @@ fn upstream_backend_drift_warning(drift: &BackendDrift, source: &Path) -> String
 }
 
 /// Build a local backend through carina-state's feature-gated test utility.
-#[cfg(test)]
-pub(crate) fn local_backend_for_test(path: impl AsRef<Path>) -> Box<dyn StateBackend> {
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) fn local_backend_for_test(
+    path: impl AsRef<Path>,
+) -> Box<dyn carina_state::StateBackend> {
     carina_state::local_backend_for_test(path.as_ref().to_path_buf())
 }
 
@@ -1854,14 +1856,14 @@ child { values = [source] }
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> carina_core::provider::BoxFuture<
             '_,
@@ -1884,8 +1886,7 @@ child { values = [source] }
 
         fn create_normalizer(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
         ) -> carina_core::provider::BoxFuture<
             '_,
             carina_core::provider::ProviderResult<

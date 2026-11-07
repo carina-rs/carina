@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use crate::provider_text::{ProviderText, ProviderTextBuilder};
+use crate::provider_text::{DiagnosticText, DiagnosticTextBuilder};
 
 use super::{PatternMatch, PatternSpec};
 
@@ -38,7 +38,7 @@ impl<'a> PatternSpecDisplay<'a> {
         self
     }
 
-    pub(crate) fn push_to(self, text: &mut ProviderTextBuilder) {
+    pub(crate) fn push_to(self, text: &mut DiagnosticTextBuilder) {
         match self.source {
             SourceDisplay::Slashes => {
                 text.push_str("/");
@@ -62,8 +62,8 @@ impl<'a> PatternSpecDisplay<'a> {
         }
     }
 
-    fn text(self) -> ProviderText {
-        let mut text = ProviderTextBuilder::default();
+    fn text(self) -> DiagnosticText {
+        let mut text = DiagnosticTextBuilder::default();
         self.push_to(&mut text);
         text.finish()
     }

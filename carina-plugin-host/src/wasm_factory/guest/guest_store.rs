@@ -1,4 +1,7 @@
-use std::fmt;
+use carina_core::provider::{ProviderPlan, ProviderValidationInputs};
+use carina_core::provider_text::{
+    GuestInputInventory, GuestInputStore, GuestStoreData, RedactionSet,
+};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,13 +12,10 @@ use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::WasiHttpCtx;
 use wasmtime_wasi_http::p2::{WasiHttpCtxView, WasiHttpView};
 
-use super::{
-    AllowListHttpHooks, CallEgressRecorder, GuestNetwork, HttpTestRoute, ProviderLabel,
-    build_sandboxed_wasi_ctx,
-};
+use super::{AllowListHttpHooks, CallEgressRecorder, GuestNetwork, HttpTestRoute, ProviderLabel};
 
 /// Period between increments of the wasmtime engine epoch.
-pub(super) const EPOCH_TICK_INTERVAL: Duration = Duration::from_secs(1);
+pub(in crate::wasm_factory) const EPOCH_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Maximum total guest computation consumed by one guest call in production.
 const GUEST_COMPUTE_BUDGET: Duration = Duration::from_secs(30);
@@ -62,33 +62,17 @@ impl GuestCallBudget {
     }
 
     #[cfg(test)]
-    pub(super) const fn compute(self) -> Duration {
+    pub(in crate::wasm_factory) const fn compute(self) -> Duration {
         self.compute
     }
 
     #[cfg(test)]
-    pub(super) const fn wall(self) -> Duration {
+    pub(in crate::wasm_factory) const fn wall(self) -> Duration {
         self.wall
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) struct WallBudgetExceeded {
-    wall: Duration,
-}
-
-impl fmt::Display for WallBudgetExceeded {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "guest call exceeded its {}s wall-clock budget (time spent in host I/O counts toward \
-             it; check network connectivity to the provider's endpoints)",
-            self.wall.as_secs_f64()
-        )
-    }
-}
-
-impl std::error::Error for WallBudgetExceeded {}
+pub(in crate::wasm_factory) use super::super::diagnostics::WallBudgetExceeded;
 
 struct GuestComputeState {
     remaining: Duration,
@@ -124,16 +108,19 @@ impl GuestStoreState {
     }
 }
 
-pub(super) struct HostState {
+pub(in crate::wasm_factory) type HostState = GuestStoreData<HostRuntimeState>;
+
+pub(in crate::wasm_factory) struct HostRuntimeState {
     wasi_ctx: WasiCtx,
     http_ctx: Option<WasiHttpCtx>,
     table: ResourceTable,
     http_hooks: AllowListHttpHooks,
     limits: StoreLimits,
     guest: GuestStoreState,
+    stderr: super::guest_stderr::GuestStderr,
 }
 
-impl WasiView for HostState {
+impl WasiView for HostRuntimeState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
             ctx: &mut self.wasi_ctx,
@@ -142,7 +129,7 @@ impl WasiView for HostState {
     }
 }
 
-impl WasiHttpView for HostState {
+impl WasiHttpView for HostRuntimeState {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView {
             ctx: self
@@ -164,10 +151,12 @@ impl WasiHttpView for HostState {
 /// complete live-instance slot (store plus bindings) with a typed poisoned
 /// state while its mutex is held; unshared initialization paths discard the
 /// store directly.
-pub(super) struct GuestStore {
+pub(in crate::wasm_factory) struct GuestStore {
     #[cfg(any(test, feature = "test-utils"))]
     deadline_observer: Option<super::PollObserverForTest>,
-    store: Store<HostState>,
+    store: GuestInputStore<HostRuntimeState>,
+    next_secrets: Option<ProviderValidationInputs>,
+    config_secrets: Option<ProviderValidationInputs>,
 }
 
 impl GuestStore {
@@ -180,7 +169,7 @@ impl GuestStore {
     /// budget, so epochs accumulated during a long host wait cannot interrupt
     /// it, but that nested interval is not subtracted from the remaining
     /// compute time.
-    pub(super) fn new(
+    pub(in crate::wasm_factory) fn new(
         engine: &Engine,
         label: Arc<ProviderLabel>,
         network: GuestNetwork,
@@ -191,7 +180,7 @@ impl GuestStore {
         Self::new_with_http_test_route(engine, label, network, http_ctx, limits, budget, None)
     }
 
-    pub(super) fn new_with_http_test_route(
+    pub(in crate::wasm_factory) fn new_with_http_test_route(
         engine: &Engine,
         label: Arc<ProviderLabel>,
         network: GuestNetwork,
@@ -200,17 +189,30 @@ impl GuestStore {
         budget: GuestCallBudget,
         http_test_route: Option<HttpTestRoute>,
     ) -> Self {
-        let wasi_ctx = build_sandboxed_wasi_ctx(network.runtime_capabilities());
-        let http_hooks = AllowListHttpHooks::with_test_route(label, network, http_test_route);
-        let host_state = HostState {
-            wasi_ctx,
+        let stderr = super::guest_stderr::GuestStderr::new(super::host_stderr());
+        let inputs = ProviderPlan::state_only()
+            .session("", None, None)
+            .guest_inventory();
+        let capabilities = network.runtime_capabilities().cloned();
+        let mut http_hooks = AllowListHttpHooks::with_test_route(label, network, http_test_route);
+        http_hooks.stderr = stderr.clone();
+        let host_state = HostRuntimeState {
+            wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
             http_ctx,
             table: ResourceTable::new(),
             http_hooks,
             limits,
             guest: GuestStoreState::new(budget),
+            stderr: stderr.clone(),
         };
-        let mut store = Store::new(engine, host_state);
+        let mut store = GuestStoreData::new_store(engine, host_state, inputs);
+        let wasi_ctx = super::build_sandboxed_wasi_ctx_with_stderr(
+            store.data(),
+            capabilities.as_ref(),
+            |key| std::env::var(key).ok(),
+            stderr,
+        );
+        store.data_mut().wasi_ctx = wasi_ctx;
         store.limiter(|state| &mut state.limits);
         store.call_hook(|mut store, transition| {
             let now = Instant::now();
@@ -255,7 +257,37 @@ impl GuestStore {
             #[cfg(any(test, feature = "test-utils"))]
             deadline_observer: None,
             store,
+            next_secrets: None,
+            config_secrets: None,
         }
+    }
+
+    pub(in crate::wasm_factory) fn set_input_inventory(&mut self, inputs: GuestInputInventory) {
+        self.store.data_mut().set_input_inventory(inputs);
+    }
+
+    pub(in crate::wasm_factory) fn set_configuration_secrets(
+        &mut self,
+        secrets: ProviderValidationInputs,
+    ) {
+        self.config_secrets = Some(secrets.clone());
+        self.set_secrets(secrets);
+    }
+
+    pub(in crate::wasm_factory) fn set_secrets(&mut self, secrets: ProviderValidationInputs) {
+        self.next_secrets = Some(secrets);
+    }
+
+    /// Runtime cache identity is the supplied session, while the instance
+    /// inventory also retains host credentials and previously observed inputs.
+    pub(in crate::wasm_factory) fn configuration_secrets(
+        &self,
+    ) -> Option<ProviderValidationInputs> {
+        self.config_secrets.clone()
+    }
+
+    pub(in crate::wasm_factory) fn known_secrets(&self) -> Option<RedactionSet> {
+        self.store.data().stderr.known_secrets()
     }
 
     /// Run guest code under this store's wall-clock budget.
@@ -264,7 +296,7 @@ impl GuestStore {
     /// closure cannot outlive the timeout future. The timeout is observed at
     /// await points; it cannot interrupt a host import that blocks its runtime
     /// thread synchronously.
-    pub(super) async fn call<'s, T, F>(
+    pub(in crate::wasm_factory) async fn call<'s, T, F>(
         &'s mut self,
         f: impl FnOnce(&'s mut Store<HostState>) -> F,
     ) -> Result<T, WallBudgetExceeded>
@@ -272,6 +304,23 @@ impl GuestStore {
         T: 'static,
         F: Future<Output = T> + 's,
     {
+        let secrets = self
+            .next_secrets
+            .take()
+            .or_else(|| self.config_secrets.clone());
+        let inputs = self.store.data().input_inventory();
+        let source = secrets.clone().unwrap_or_else(|| {
+            ProviderPlan::state_only()
+                .session("", None, None)
+                .guest_inputs()
+        });
+        let _input_call = inputs.observe(&source);
+        let _stderr_call = (secrets.is_some() || !inputs.is_empty()).then(|| {
+            self.store
+                .data()
+                .stderr
+                .begin_inventory_call(&source, inputs)
+        });
         self.call_with_start(tokio::time::Instant::now(), f).await
     }
 
@@ -316,20 +365,20 @@ impl GuestStore {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    pub(super) fn set_deadline_observer_for_test(
+    pub(in crate::wasm_factory) fn set_deadline_observer_for_test(
         &mut self,
         observer: Option<super::PollObserverForTest>,
     ) {
         self.deadline_observer = observer;
     }
 
-    pub(super) fn begin_create_call(&mut self, recorder: CallEgressRecorder) {
+    pub(in crate::wasm_factory) fn begin_create_call(&mut self, recorder: CallEgressRecorder) {
         let active = &mut self.store.data_mut().http_hooks.call_egress;
         assert!(active.is_none(), "guest calls cannot overlap on one store");
         *active = Some(recorder);
     }
 
-    pub(super) fn finish_create_call(&mut self) {
+    pub(in crate::wasm_factory) fn finish_create_call(&mut self) {
         let active = &mut self.store.data_mut().http_hooks.call_egress;
         assert!(
             active.take().is_some(),
@@ -338,18 +387,26 @@ impl GuestStore {
     }
 
     #[cfg(any(test, feature = "test-utils"))]
-    pub(super) fn set_budget(&mut self, budget: GuestCallBudget) {
+    pub(in crate::wasm_factory) fn set_budget(&mut self, budget: GuestCallBudget) {
         self.store.data_mut().guest.budget = budget;
     }
 
     #[cfg(test)]
-    pub(super) fn set_epoch_deadline_for_test(&mut self, ticks: u64) {
+    pub(in crate::wasm_factory) fn set_epoch_deadline_for_test(&mut self, ticks: u64) {
         self.store.set_epoch_deadline(ticks);
     }
 }
 
-impl HostState {
-    pub(super) fn network(&self) -> &GuestNetwork {
+// confinement-allow-return: Outbound credential wire handoff; only opaque SecretPayload inputs reach this adapter.
+pub(in crate::wasm_factory) fn handoff_credential(
+    store: &HostState,
+    value: &super::super::GuestCredential,
+) -> String {
+    super::super::handoff_credential(store, value)
+}
+
+impl HostRuntimeState {
+    pub(in crate::wasm_factory) fn network(&self) -> &GuestNetwork {
         &self.http_hooks.network
     }
 }

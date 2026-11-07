@@ -7,9 +7,9 @@
 //!
 //! ```compile_fail,E0308
 //! use carina_core::{effect::{Effect, EffectGeneration}, executor::{DeleteScheduler, DeleteRelease},
-//!     plan::Plan, provider::{AppliedIdentifier, Provider},
+//!     plan::Plan, provider::{AppliedIdentifier, HostProvider},
 //!     resource::{ResourceId, ResolvedResourceId, DeposedKey}, schema::SchemaRegistry};
-//! async fn forged_delete(provider: &dyn Provider, schemas: &SchemaRegistry) {
+//! async fn forged_delete(provider: &dyn HostProvider, schemas: &SchemaRegistry) {
 //!     let mut plan = Plan::new();
 //!     plan.add(Effect::Delete {
 //!         id: ResolvedResourceId::try_new(ResourceId::with_provider_identity("p", "Bucket", "chosen", None)).unwrap(),
@@ -51,9 +51,9 @@
 //!
 //! ```compile_fail,E0624
 //! use carina_core::{executor::{prepare_initial_delete, dispatch_delete}, parser::ExpandedInferredFile,
-//!     provider::{AppliedIdentifier, Provider}, resource::Resource,
+//!     provider::{AppliedIdentifier, HostProvider}, resource::Resource,
 //!     resolved_graph::resolve_expanded_graph, schema::SchemaRegistry};
-//! async fn forged_bucket(provider: &dyn Provider, schemas: &SchemaRegistry) {
+//! async fn forged_bucket(provider: &dyn HostProvider, schemas: &SchemaRegistry) {
 //!     let resource = Resource::with_provider("p", "Bucket", "chosen", None);
 //!     let graph = resolve_expanded_graph(ExpandedInferredFile::default().into()).unwrap();
 //!     let plan = graph.initial_delete_plan(resource, AppliedIdentifier::new("chosen-id").unwrap(), schemas)

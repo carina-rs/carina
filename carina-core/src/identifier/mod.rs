@@ -3679,7 +3679,7 @@ fn desired_comparable_values<'attribute, S, D, E>(
             Ok(Some(value)) => DesiredCreateOnlyValue::Resolved(value),
             Err(UnresolvedReason::NotComparable) => {
                 tracing::debug!(
-                    attribute = %crate::provider_text::ProviderText::new(attribute),
+                    attribute = %crate::provider_text::DiagnosticText::new(attribute),
                     reason = "value has no stable comparison form",
                     "stable value is not available for identity comparison"
                 );
@@ -3687,8 +3687,8 @@ fn desired_comparable_values<'attribute, S, D, E>(
             }
             Err(UnresolvedReason::Type(error)) => {
                 tracing::debug!(
-                    attribute = %crate::provider_text::ProviderText::new(attribute),
-                    error = %crate::provider_text::ProviderText::new(error.to_string()),
+                    attribute = %crate::provider_text::DiagnosticText::new(attribute),
+                    error = %crate::provider_text::DiagnosticText::new(error.to_string()),
                     "stable value is not available for identity comparison"
                 );
                 DesiredCreateOnlyValue::Unresolved

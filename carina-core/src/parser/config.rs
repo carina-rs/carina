@@ -571,12 +571,12 @@ pub enum CustomTypeValidationError {
     Rejected {
         owner: String,
         identity: TypeIdentity,
-        message: crate::provider_text::ProviderText,
+        message: crate::provider_text::DiagnosticText,
     },
     ProviderRejected {
         owner: String,
         identity: TypeIdentity,
-        error: std::sync::Arc<crate::provider::ProviderError>,
+        error: std::sync::Arc<crate::provider::HostError>,
         masked: bool,
     },
     InvalidDeclarationValue {
@@ -604,7 +604,7 @@ pub enum CustomTypeValidationError {
 
 impl std::fmt::Display for CustomTypeValidationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use crate::provider_text::ProviderText;
+        use crate::provider_text::DiagnosticText;
         match self {
             Self::ProvidersNotLoaded => formatter.write_str("provider custom types are not loaded"),
             Self::Rejected {
@@ -614,8 +614,8 @@ impl std::fmt::Display for CustomTypeValidationError {
             } => write!(
                 formatter,
                 "{owner} rejected `{identity}`: {message}",
-                owner = ProviderText::new(owner),
-                identity = ProviderText::new(identity.to_string())
+                owner = DiagnosticText::new(owner),
+                identity = DiagnosticText::new(identity.to_string())
             ),
             Self::ProviderRejected {
                 owner,
@@ -628,15 +628,15 @@ impl std::fmt::Display for CustomTypeValidationError {
                         formatter,
                         "{owner} rejected `{identity}`: {} failed validation",
                         crate::schema::SECRET_VALUE_MASK,
-                        owner = ProviderText::new(owner),
-                        identity = ProviderText::new(identity.to_string())
+                        owner = DiagnosticText::new(owner),
+                        identity = DiagnosticText::new(identity.to_string())
                     )
                 } else {
                     write!(
                         formatter,
                         "{owner} rejected `{identity}`: {error}",
-                        owner = ProviderText::new(owner),
-                        identity = ProviderText::new(identity.to_string())
+                        owner = DiagnosticText::new(owner),
+                        identity = DiagnosticText::new(identity.to_string())
                     )
                 }
             }
@@ -647,15 +647,15 @@ impl std::fmt::Display for CustomTypeValidationError {
             } => write!(
                 formatter,
                 "{owner} rejected `{identity}`: {error}",
-                owner = ProviderText::new(owner),
-                identity = ProviderText::new(identity.to_string())
+                owner = DiagnosticText::new(owner),
+                identity = DiagnosticText::new(identity.to_string())
             ),
             Self::MissingDeclaration { owner, identity } => {
                 write!(
                     formatter,
                     "{owner} has no declaration for `{identity}`",
-                    owner = ProviderText::new(owner),
-                    identity = ProviderText::new(identity.to_string())
+                    owner = DiagnosticText::new(owner),
+                    identity = DiagnosticText::new(identity.to_string())
                 )
             }
             Self::ConflictingEnumDefinitions {
@@ -665,9 +665,9 @@ impl std::fmt::Display for CustomTypeValidationError {
             } => write!(
                 formatter,
                 "enum `{identity}` has conflicting variants or aliases in owners `{first_owner}` and `{second_owner}`",
-                identity = ProviderText::new(identity.to_string()),
-                first_owner = ProviderText::new(first_owner),
-                second_owner = ProviderText::new(second_owner)
+                identity = DiagnosticText::new(identity.to_string()),
+                first_owner = DiagnosticText::new(first_owner),
+                second_owner = DiagnosticText::new(second_owner)
             ),
             Self::ConflictingEnumSpelling {
                 identity,
@@ -678,11 +678,11 @@ impl std::fmt::Display for CustomTypeValidationError {
             } => write!(
                 formatter,
                 "enum `{identity}` resolves to `{first_spelling}` for owner `{first_owner}` but `{second_spelling}` for owner `{second_owner}`",
-                identity = ProviderText::new(identity.to_string()),
-                first_spelling = ProviderText::new(first_spelling),
-                first_owner = ProviderText::new(first_owner),
-                second_spelling = ProviderText::new(second_spelling),
-                second_owner = ProviderText::new(second_owner)
+                identity = DiagnosticText::new(identity.to_string()),
+                first_spelling = DiagnosticText::new(first_spelling),
+                first_owner = DiagnosticText::new(first_owner),
+                second_spelling = DiagnosticText::new(second_spelling),
+                second_owner = DiagnosticText::new(second_owner)
             ),
         }
     }
@@ -804,7 +804,7 @@ impl PartialEq for CustomTypeValidationError {
 }
 
 impl CustomTypeValidationError {
-    pub fn provider_error(&self) -> Option<&crate::provider::ProviderError> {
+    pub fn provider_error(&self) -> Option<&crate::provider::HostError> {
         match self {
             Self::ProviderRejected { error, .. } => Some(error),
             _ => None,
@@ -827,7 +827,7 @@ pub(crate) fn fixture_custom_type_rejection(
     CustomTypeValidationError::Rejected {
         owner: owner.to_string(),
         identity: target.identity().clone(),
-        message: crate::provider_text::ProviderText::new(message),
+        message: crate::provider_text::DiagnosticText::new(message),
     }
 }
 

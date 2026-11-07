@@ -9,7 +9,7 @@ use carina_core::parser::{
     SavedProviderConfigs,
 };
 type ExecutableSavedPlan = carina_core::saved_replay::AdmittedSavedPlanReplay;
-use carina_core::provider::{PersistedAttributes, Provider, ProviderRouter, ReadRequest};
+use carina_core::provider::{HostProvider, PersistedAttributes, ProviderRouter, ReadRequest};
 use carina_core::resource::{
     Current, DataSource, NoPlaceholder, ResolvedResourceId, Resource, ResourceId, SavedComposition,
     SavedDataSource, SavedModuleSource, SavedResource, SnapshotLeaf, SnapshotState as State, Value,
@@ -18,7 +18,7 @@ use carina_state::{RefreshRows, RefreshableCurrent, ResourceState, StateFile};
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
-    MovedOrigins, PlanFile, PlanSchemaReferences, PlanWaitBinding, RecordedProviderArtifact,
+    DecodedPlanFile, MovedOrigins, PlanSchemaReferences, PlanWaitBinding, RecordedProviderArtifact,
     RecordedProviderScopes, ReloadedCurrentStateEntry, ReloadedPlanFile, ResolvedProviderInputs,
     SavedPlanResource, UnresolvedReloadedPlanFile, UpstreamSource, recorded_provider_artifacts,
 };
@@ -77,7 +77,7 @@ fn planned_secret_hashes<D>(
 pub(crate) type HistoricalResourceAddresses = MovedOrigins;
 
 struct HistoricalStateVerifier<'a> {
-    provider: &'a dyn Provider,
+    provider: &'a dyn HostProvider,
     actual_states: &'a mut HashMap<ResourceId, State>,
     verified_planned_states: &'a mut HashMap<ResourceId, State>,
     apply_target: ApplyTarget<'a>,
@@ -149,12 +149,12 @@ pub(super) enum InspectedPlanFile {
 /// Decoded placeholder-free plan. It still cannot expose managed current
 /// state until its in-flight markers are reconciled under the state lock.
 pub(super) struct VerifiedPlanFile {
-    plan_file: PlanFile,
+    plan_file: DecodedPlanFile,
     schema_references: PlanSchemaReferences,
 }
 
 impl InspectedPlanFile {
-    pub(super) fn inspect(plan_file: PlanFile) -> Self {
+    pub(super) fn inspect(plan_file: DecodedPlanFile) -> Self {
         let schema_references = plan_file.referenced_schema_types();
         if plan_file.contains_redacted_secret_placeholders() {
             Self::NeedsSecretVerification(PendingPlanFile {
@@ -478,7 +478,7 @@ fn check_loaded_providers(
 /// Deserialized saved plan whose typed placeholders still need fresh desired
 /// values. There is intentionally no accessor for the inner plan.
 pub(super) struct PendingPlanFile {
-    plan_file: PlanFile,
+    plan_file: DecodedPlanFile,
     schema_references: PlanSchemaReferences,
 }
 
@@ -755,6 +755,13 @@ impl ValidatedDesiredPlan {
         self.plan.provider_configs()
     }
 
+    pub(super) fn provider_plan(&self) -> carina_core::provider::ProviderPlan {
+        match &self.plan {
+            DesiredPlanFile::Verified(plan) => plan.plan_file.provider_plan(),
+            DesiredPlanFile::NeedsHistoricalVerification(plan) => plan.plan_file.provider_plan(),
+        }
+    }
+
     pub(super) fn sorted_resources(&self) -> &[SavedPlanResource] {
         self.plan.sorted_resources()
     }
@@ -785,7 +792,7 @@ impl ValidatedDesiredPlan {
 
     async fn verify_historical(
         self,
-        provider: &dyn Provider,
+        provider: &dyn HostProvider,
         actual_states: &mut HashMap<ResourceId, State>,
         verified_planned_states: &mut HashMap<ResourceId, State>,
         historical_addresses: &HistoricalResourceAddresses,
@@ -935,7 +942,7 @@ impl DesiredPlanFile {
     /// saved-plan capability while retaining the schema-check proof.
     pub(super) async fn verify_historical(
         self,
-        provider: &dyn Provider,
+        provider: &dyn HostProvider,
         actual_states: &mut HashMap<ResourceId, State>,
         verified_planned_states: &mut HashMap<ResourceId, State>,
         historical_addresses: &HistoricalResourceAddresses,
@@ -997,7 +1004,7 @@ impl DesiredVerifiedPlanFile {
     /// return the rehydrated payload to the outer executor-gate transition.
     async fn verify_historical(
         mut self,
-        provider: &dyn Provider,
+        provider: &dyn HostProvider,
         actual_states: &mut HashMap<ResourceId, State>,
         verified_planned_states: &mut HashMap<ResourceId, State>,
         historical_addresses: &HistoricalResourceAddresses,
@@ -1256,8 +1263,8 @@ mod tests {
     #[cfg(test)]
     use carina_core::plan::Plan;
     use carina_core::provider::{
-        BoxFuture, InitializedProvider, ProviderFactory, ProviderInstanceKey, ProviderResult,
-        ProviderRouter, ReferenceScope,
+        BoxFuture, ProviderFactory, ProviderInstanceKey, ProviderResult, ProviderRouter,
+        ReferenceScope,
     };
     use carina_core::resource::{
         BindingAddress, ConcreteValue, Current, DataSource, DeferredValue, NoPlaceholder,
@@ -1300,14 +1307,14 @@ mod tests {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
@@ -1478,7 +1485,7 @@ mod tests {
         for (binding, scope) in scopes {
             provider.add_provider_instance(
                 ProviderInstanceKey::new("test", Some(binding.to_string())),
-                InitializedProvider::for_test(
+                crate::provider_text_fixtures::initialized_with_scope(
                     Box::new(
                         carina_provider_mock::ConfiguredBuiltinMock::new(
                             carina_provider_mock::MockBehavior::default(),
@@ -1521,7 +1528,7 @@ mod tests {
         let InspectedPlanFile::Verified(VerifiedPlanFile {
             plan_file,
             schema_references,
-        }) = InspectedPlanFile::inspect(plan)
+        }) = InspectedPlanFile::inspect(plan.decode_for_test())
         else {
             panic!("artifact fixture unexpectedly contains secret placeholders")
         };
@@ -1563,6 +1570,7 @@ mod tests {
         let plan_file = contents
             .record_for_test(&builtin_context(), Vec::new())
             .expect("test plan provider evidence must be valid")
+            .decode_for_test()
             .reload_in_flight_from_locked_state(Some(&locked_state))
             .expect("reload saved move plan")
             .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
@@ -1634,6 +1642,7 @@ mod tests {
         let plan_file = contents
             .record_for_test(&builtin_context(), Vec::new())
             .expect("test plan provider evidence must be valid")
+            .decode_for_test()
             .reload_in_flight_from_locked_state(Some(&locked_state))
             .expect("reload saved move plan")
             .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
@@ -2001,8 +2010,9 @@ mod tests {
                     plan_file,
                     planned_secret_hashes: HashMap::new(),
                 });
+            let provider = crate::provider_text_fixtures::boundary(provider);
             let executable = Box::pin(pending.verify_historical(
-                provider.as_ref(),
+                &provider,
                 &mut HashMap::new(),
                 &mut HashMap::new(),
                 &origins,
@@ -2084,6 +2094,7 @@ mod tests {
         }
         .record_for_test(&builtin_context(), Vec::new())
         .expect("test plan provider evidence must be valid")
+        .decode_for_test()
         .reload_in_flight_from_locked_state(None)
         .expect("reload saved plan")
         .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
@@ -2100,11 +2111,13 @@ mod tests {
 
         let rehydrated = pending
             .verify_historical(
-                &carina_provider_mock::ConfiguredBuiltinMock::new(
-                    carina_provider_mock::MockBehavior::default(),
-                    carina_provider_mock::MockScope::memory(),
-                )
-                .create_provider(),
+                &crate::provider_text_fixtures::boundary(Box::new(
+                    carina_provider_mock::ConfiguredBuiltinMock::new(
+                        carina_provider_mock::MockBehavior::default(),
+                        carina_provider_mock::MockScope::memory(),
+                    )
+                    .create_provider(),
+                )),
                 &mut actual_states,
                 &mut verified_planned_states,
                 &HistoricalResourceAddresses::from_plan(&plan),

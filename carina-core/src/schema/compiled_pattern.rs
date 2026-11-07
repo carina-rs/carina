@@ -14,7 +14,7 @@ use std::{
 
 use super::{PatternMatch, PatternSpec, PatternSpecDisplay};
 
-use crate::provider_text::{ProviderText, ProviderTextBuilder};
+use crate::provider_text::{DiagnosticText, DiagnosticTextBuilder};
 use regex_syntax::ast::{self, Ast};
 
 // Match the regex crate's authored-source budget, checked before any rewrite.
@@ -109,7 +109,7 @@ impl CompiledPattern {
                 regex,
             })
             .map_err(|error| {
-                let mut diagnostic = ProviderTextBuilder::default();
+                let mut diagnostic = DiagnosticTextBuilder::default();
                 diagnostic.push_str("invalid string pattern ");
                 PatternSpecDisplay::new(spec)
                     .quoted()
@@ -232,7 +232,7 @@ pub struct PatternCompileError {
     spec: PatternSpec,
     /// Typed parser, dialect or regex compiler diagnostic rendered by this error.
     pub reason: PatternCompileErrorSource,
-    diagnostic: ProviderText,
+    diagnostic: DiagnosticText,
 }
 
 impl Eq for PatternCompileError {}

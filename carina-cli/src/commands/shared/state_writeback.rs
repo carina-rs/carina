@@ -19,7 +19,7 @@ use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesF
 #[cfg(test)]
 use carina_core::provider::SentRecord;
 use carina_core::provider::{
-    AppliedIdentifier, ComparisonResolutionError, IdentifiedCreate, InFlightCreate,
+    AppliedIdentifier, ComparisonResolutionError, HostIdentifiedCreate, InFlightCreate,
     InFlightPersistence, PersistedAttributes, ProviderRouter, ResolvedComparisonTable,
     UnknownCreateOutcome,
 };
@@ -858,7 +858,7 @@ enum UpsertSource<'a> {
         state: &'a SnapshotState,
         request: &'a AcceptedRequest,
     },
-    Observed(&'a IdentifiedCreate),
+    Observed(&'a HostIdentifiedCreate),
     CreateInFlight(&'a InFlightCreate),
     Imported(&'a SnapshotState),
     CurrentPresent(&'a SnapshotState),
@@ -2529,13 +2529,16 @@ mod apply_state_save_tests {
         let mut provider = ProviderRouter::new();
         provider.add_provider(
             "mock".to_string(),
-            carina_core::provider::InitializedProvider::unavailable(Box::new(
-                carina_provider_mock::ConfiguredBuiltinMock::new(
-                    carina_provider_mock::MockBehavior::default(),
-                    carina_provider_mock::MockScope::memory(),
-                )
-                .create_provider(),
-            )),
+            crate::provider_text_fixtures::initialized_with_scope(
+                Box::new(
+                    carina_provider_mock::ConfiguredBuiltinMock::new(
+                        carina_provider_mock::MockBehavior::default(),
+                        carina_provider_mock::MockScope::memory(),
+                    )
+                    .create_provider(),
+                ),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ),
         );
 
         let result = ApplyStateSaveInputs::new(
@@ -2559,7 +2562,7 @@ mod apply_state_save_tests {
     #[tokio::test]
     async fn writeback_pairs_reference_lists_with_prepared_identity_evidence() {
         use carina_core::explicit::ExplicitFields;
-        use carina_core::provider::{InitializedProvider, RawSavedAttrs};
+        use carina_core::provider::RawSavedAttrs;
         use carina_core::schema::{AttributeSchema, AttributeType, StructField};
         let schema = carina_core::schema::ResourceSchema::new("keys.Resource")
             .attribute(
@@ -2601,9 +2604,10 @@ mod apply_state_save_tests {
         let mut provider = ProviderRouter::new();
         provider.add_provider(
             "mock".into(),
-            InitializedProvider::unavailable(Box::new(
-                runtime.builtin_mock().unwrap().create_provider(),
-            )),
+            crate::provider_text_fixtures::initialized_with_scope(
+                Box::new(runtime.builtin_mock().unwrap().create_provider()),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ),
         );
         let rules = |key: &str, default: bool| {
             let mut fields = indexmap::IndexMap::from([(
@@ -2796,7 +2800,7 @@ mod apply_state_save_tests {
         id: &ResourceId,
         attributes: HashMap<String, Value>,
         sent: carina_core::provider::Sent,
-    ) -> carina_core::provider::IdentifiedCreate {
+    ) -> carina_core::provider::HostIdentifiedCreate {
         crate::fixture_identified_create(id, attributes, sent)
     }
 

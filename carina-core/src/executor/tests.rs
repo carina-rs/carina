@@ -1,4 +1,5 @@
 use super::*;
+use crate::provider::Provider;
 #[path = "input_discharge_tests.rs"]
 mod input_discharge_tests;
 use crate::schema::{
@@ -285,6 +286,10 @@ static COEXISTING_TEST_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
         "",
         PatternResourceSchema::new("test")
             .with_coexisting_replacement()
+            .attribute(
+                PatternAttributeSchema::optional("computed", PatternAttributeType::string())
+                    .build(),
+            )
             .validate()
             .unwrap(),
     );
@@ -620,7 +625,12 @@ async fn scheduler_delete_retry_keeps_ancestors_blocked() {
     let Some(DeleteRelease::Ready(delete)) = scheduler.release(0).unwrap() else {
         panic!("leaf ready")
     };
-    let (result, completion) = delete.dispatch(&provider, &schemas).await;
+    let (result, completion) = delete
+        .dispatch(
+            &crate::provider::ProviderBoundary::fixture(&provider),
+            &schemas,
+        )
+        .await;
     assert!(result.is_err());
     assert!(scheduler.release(1).unwrap().is_none());
     assert!(
@@ -636,7 +646,12 @@ async fn scheduler_delete_retry_keeps_ancestors_blocked() {
         let Some(DeleteRelease::Ready(delete)) = scheduler.release(index).unwrap() else {
             panic!("next delete ready")
         };
-        let (result, completion) = delete.dispatch(&provider, &schemas).await;
+        let (result, completion) = delete
+            .dispatch(
+                &crate::provider::ProviderBoundary::fixture(&provider),
+                &schemas,
+            )
+            .await;
         result.unwrap();
         scheduler.complete(completion).unwrap();
     }
@@ -657,7 +672,12 @@ async fn scheduler_delete_failure_skips_ancestors_without_dispatch() {
     let Some(DeleteRelease::Ready(delete)) = scheduler.release(0).unwrap() else {
         panic!("leaf ready")
     };
-    let (result, completion) = delete.dispatch(&provider, &schemas).await;
+    let (result, completion) = delete
+        .dispatch(
+            &crate::provider::ProviderBoundary::fixture(&provider),
+            &schemas,
+        )
+        .await;
     assert!(result.is_err());
     scheduler.complete(completion).unwrap();
     for index in 1..3 {
@@ -712,8 +732,18 @@ async fn scheduler_delete_rejects_foreign_completion_without_changing_readiness(
     let Some(DeleteRelease::Ready(second_delete)) = second.release(0).unwrap() else {
         panic!("second leaf ready");
     };
-    let (_, foreign) = first_delete.dispatch(&provider, &schemas).await;
-    let (result, own) = second_delete.dispatch(&provider, &schemas).await;
+    let (_, foreign) = first_delete
+        .dispatch(
+            &crate::provider::ProviderBoundary::fixture(&provider),
+            &schemas,
+        )
+        .await;
+    let (result, own) = second_delete
+        .dispatch(
+            &crate::provider::ProviderBoundary::fixture(&provider),
+            &schemas,
+        )
+        .await;
     result.unwrap();
     assert!(matches!(
         second.complete(foreign),
@@ -738,7 +768,12 @@ async fn scheduler_delete_rejects_retry_of_successful_attempt() {
     let Some(DeleteRelease::Ready(delete)) = scheduler.release(0).unwrap() else {
         panic!("leaf ready");
     };
-    let (result, completion) = delete.dispatch(&provider, &schemas).await;
+    let (result, completion) = delete
+        .dispatch(
+            &crate::provider::ProviderBoundary::fixture(&provider),
+            &schemas,
+        )
+        .await;
     result.unwrap();
     assert!(matches!(
         scheduler.retry(completion),
@@ -1520,9 +1555,11 @@ static TEST_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
     let mut registry = SchemaRegistry::new();
     registry.insert(
         "",
-        (PatternResourceSchema::new("test"))
-            .validate()
-            .expect("schema fixture must be valid"),
+        (PatternResourceSchema::new("test").attribute(
+            PatternAttributeSchema::optional("computed", PatternAttributeType::string()).build(),
+        ))
+        .validate()
+        .expect("schema fixture must be valid"),
     );
     registry
 });
@@ -1690,13 +1727,13 @@ impl ProviderFactory for AliasFactory {
     fn validate_config(
         &self,
         _attributes: &crate::provider::CanonicalProviderConfigAttributes,
+        _session: &crate::provider::ProviderValidationInputs,
     ) -> crate::provider::ProviderResult<()> {
         Ok(())
     }
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &crate::provider::ProviderReadyConfig,
+        _config: &crate::provider::ProviderSession,
         _initialize_outcome: crate::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
         unreachable!("test factory does not create providers")
@@ -2521,7 +2558,7 @@ async fn unsettled_loaded_type_check_blocks_create_dispatch() {
                 checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
             };
             execute_runtime_plan(
-                &provider,
+                &crate::provider::ProviderBoundary::fixture(&provider),
                 &comparison_provider,
                 input.in_session(type_checks),
                 &observer,
@@ -2992,10 +3029,13 @@ fn effect_failure_display_includes_the_complete_typed_source_chain() {
 #[test]
 fn preparation_provider_failure_preserves_the_original_source_chain() {
     let effect = create_effect(make_resource("preparation", &[]));
-    let error = ProviderPreparationError::from(ProviderError::internal_caused_by(
-        "normalization failed",
-        std::io::Error::other("normalizer root detail"),
-    ));
+    let error = ProviderPreparationError::from(
+        ProviderError::internal_caused_by(
+            "normalization failed",
+            std::io::Error::other("normalizer root detail"),
+        )
+        .with_secrets(&crate::provider_text::RedactionSet::for_test(&[])),
+    );
     let failure = EffectFailure::new(&effect, EffectFailureKind::execution(error));
     assert!(
         failure.to_string().contains("normalizer root detail"),
@@ -3331,9 +3371,12 @@ async fn resume_dispatch_validates_resent_sent_against_checked_request() {
             let request = crate::provider::ResumeCreateRequest::new(pending, permit)
                 .expect("fixture continuation and request share a route");
 
-            let failure = crate::executor::dispatch_resume_create(&provider, request)
-                .await
-                .expect_err("resent pending fixture returns a classified failure");
+            let failure = crate::executor::dispatch_resume_create(
+                &crate::provider::ProviderBoundary::fixture(&provider),
+                request,
+            )
+            .await
+            .expect_err("resent pending fixture returns a classified failure");
             let crate::provider::ResumeFailureKind::InFlight { pending, error } =
                 failure.into_kind()
             else {
@@ -4044,7 +4087,7 @@ async fn invalid_resolved_value_is_rejected_before_provider_normalization() {
         bindings: ResolvedBindings::default(),
         managed_current: HashMap::new(),
         data_source_values: ExecutableDataSourceValues::empty(),
-        normalizer: &MustNotNormalizeInvalidValue,
+        normalizer: &crate::provider::ConfiguredNormalizer::fixture(&MustNotNormalizeInvalidValue),
         provider_configs: &[],
         factories: &[],
         schemas: &schemas,
@@ -4288,7 +4331,7 @@ async fn execute_plan_missing_update_schema_fails_before_provider_update() {
             let comparison_provider = crate::provider::ProviderRouter::new();
             let result = completed_result(
                 execute_runtime_plan(
-                    &provider,
+                    &crate::provider::ProviderBoundary::fixture(&provider),
                     &comparison_provider,
                     input.in_session(session),
                     &observer,
@@ -6823,7 +6866,7 @@ async fn partial_create_records_state_and_diagnostic() {
     let resource = make_resource("a", &[]);
     let rid = resource.id.clone();
     let diagnostic = crate::provider::PartialReadDiagnostic::new(
-        "mock partial create".to_string(),
+        "mock partial create".into(),
         vec!["computed".to_string()],
     )
     .expect("missing attributes are non-empty");
@@ -6833,7 +6876,7 @@ async fn partial_create_records_state_and_diagnostic() {
 
     provider.push_create_outcome(Ok(crate::provider::CreateOutcome::partial_success(
         applied_state_for_test(ok_state(&rid)),
-        "mock partial create".to_string(),
+        "mock partial create".into(),
         vec!["computed".to_string()],
     )));
 
@@ -6904,7 +6947,7 @@ async fn test_apply_renormalizes_after_resolution() {
         bindings: ResolvedBindings::default(),
         managed_current: HashMap::new(),
         data_source_values: ExecutableDataSourceValues::empty(),
-        normalizer: &CanonicalizingNormalizer,
+        normalizer: &crate::provider::ConfiguredNormalizer::fixture(&CanonicalizingNormalizer),
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
@@ -7011,7 +7054,7 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
         bindings,
         managed_current: HashMap::new(),
         data_source_values: ExecutableDataSourceValues::empty(),
-        normalizer: &CanonicalizingNormalizer,
+        normalizer: &crate::provider::ConfiguredNormalizer::fixture(&CanonicalizingNormalizer),
         provider_configs: &[],
         factories: &[],
         schemas: &schemas,
@@ -7493,7 +7536,7 @@ async fn test_apply_renormalizes_update_path() {
         bindings: ResolvedBindings::default(),
         managed_current: HashMap::new(),
         data_source_values: ExecutableDataSourceValues::empty(),
-        normalizer: &CanonicalizingNormalizer,
+        normalizer: &crate::provider::ConfiguredNormalizer::fixture(&CanonicalizingNormalizer),
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
@@ -8109,7 +8152,7 @@ async fn test_apply_effective_changed_skips_secret_shape_divergence() {
         bindings: ResolvedBindings::default(),
         managed_current: HashMap::new(),
         data_source_values: ExecutableDataSourceValues::empty(),
-        normalizer: &SecretListToScalarNormalizer,
+        normalizer: &crate::provider::ConfiguredNormalizer::fixture(&SecretListToScalarNormalizer),
         provider_configs: &[],
         factories: &[],
         schemas: &AUGMENT_COMPARISON_SCHEMAS,
@@ -8170,7 +8213,7 @@ async fn test_apply_renormalizes_nested_value_under_ref_bearing_resource() {
         bindings: ResolvedBindings::default(),
         managed_current: HashMap::new(),
         data_source_values: ExecutableDataSourceValues::empty(),
-        normalizer: &CanonicalizingNormalizer,
+        normalizer: &crate::provider::ConfiguredNormalizer::fixture(&CanonicalizingNormalizer),
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
@@ -8430,7 +8473,7 @@ async fn test_async_normalizer_does_not_self_deadlock_on_apply_path() {
         bindings: ResolvedBindings::default(),
         managed_current: HashMap::new(),
         data_source_values: ExecutableDataSourceValues::empty(),
-        normalizer: &normalizer,
+        normalizer: &crate::provider::ConfiguredNormalizer::fixture(&normalizer),
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
@@ -12438,7 +12481,7 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
         bindings: ResolvedBindings::default(),
         managed_current: HashMap::new(),
         data_source_values: ExecutableDataSourceValues::empty(),
-        normalizer: &normalizer,
+        normalizer: &crate::provider::ConfiguredNormalizer::fixture(&normalizer),
         provider_configs: &[],
         factories: &[],
         schemas: &TEST_SCHEMAS,
@@ -13047,7 +13090,7 @@ fn throttling_error_uses_wire_message_before_display_truncation() {
     for marker in ["ThrottlingException", "Rate exceeded"] {
         let mut wire = ProviderError::api_error("request failed").to_wire();
         wire.message = format!("{} {marker}", "x".repeat(9 * 1024));
-        let error = ProviderError::from_wire(wire);
+        let error = ProviderError::from_wire(wire).into_host_for_test();
 
         assert!(!error.to_string().contains(marker));
         assert!(is_throttling_error(&error), "missing raw marker {marker}");

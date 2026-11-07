@@ -22,7 +22,7 @@ use carina_core::plan_tree::{
     deferred_for_detail_rows, deferred_for_display_name, deferred_for_source, deferred_for_verb,
     extract_compact_hint,
 };
-use carina_core::provider::{ProviderResult, ProviderRouter};
+use carina_core::provider::{HostResult, ProviderRouter};
 #[cfg(test)]
 use carina_core::resource::Value;
 use carina_core::resource::{ModuleSource, ResourceId};
@@ -379,7 +379,7 @@ pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &ProviderRouter,
     comparisons: carina_core::detail_rows::DetailComparisons<'_>,
-) -> ProviderResult<()> {
+) -> HostResult<()> {
     print!(
         "{}",
         format_plan_with_delete_instances(
@@ -410,7 +410,7 @@ pub(crate) fn print_planned_plan(
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &ProviderRouter,
-) -> ProviderResult<()> {
+) -> HostResult<()> {
     match planned {
         crate::wiring::PlannedPlan::Rendered { display, .. } => print_prepared_plan(
             color_mode,
@@ -449,7 +449,7 @@ pub fn print_prepared_plan(
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &ProviderRouter,
-) -> ProviderResult<()> {
+) -> HostResult<()> {
     print!(
         "{}",
         format_prepared_plan(
@@ -476,7 +476,7 @@ pub fn format_prepared_plan(
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &ProviderRouter,
-) -> ProviderResult<String> {
+) -> HostResult<String> {
     let detail = match display.detail() {
         carina_core::detail_rows::DetailLevel::Full => DetailLevel::Full,
         carina_core::detail_rows::DetailLevel::Explicit => DetailLevel::Explicit,
@@ -517,7 +517,7 @@ pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Siz
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &ProviderRouter,
     comparisons: carina_core::detail_rows::DetailComparisons<'_>,
-) -> ProviderResult<String> {
+) -> HostResult<String> {
     let historical = historical_display.historical_display(plan);
     format_plan_display(
         color_mode,
@@ -543,7 +543,7 @@ fn format_plan_display<S>(
     prev_explicit: Option<&HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &ProviderRouter,
-) -> ProviderResult<String> {
+) -> HostResult<String> {
     let plan = display.plan();
     let mut out = String::new();
 
@@ -754,7 +754,7 @@ pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?S
     detail: DetailLevel,
     historical_display: &D,
     provider: &ProviderRouter,
-) -> ProviderResult<String> {
+) -> HostResult<String> {
     let mut out = String::new();
 
     if plan.effects().is_empty() {
@@ -844,7 +844,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
         is_last: bool,
         prefix: &str,
         parent_binding: Option<&str>,
-    ) -> ProviderResult<bool> {
+    ) -> HostResult<bool> {
         if self.printed.contains(&idx) {
             return Ok(false);
         }
@@ -1321,7 +1321,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
         is_last: bool,
         prefix: &str,
         parent_binding: Option<&str>,
-    ) -> ProviderResult<bool> {
+    ) -> HostResult<bool> {
         match item {
             ChildRenderItem::Normal(idx) => {
                 self.format_effect_tree(color_mode, *idx, indent, is_last, prefix, parent_binding)
@@ -1393,7 +1393,7 @@ impl<'a, S> TreeRenderContext<'a, S> {
         color_mode: crate::output_style::ColorMode,
         items: &[ChildRenderItem],
         options: ChildRenderOptions<'_>,
-    ) -> ProviderResult<bool> {
+    ) -> HostResult<bool> {
         for item in items {
             self.consume_suppressed_item(item);
         }
@@ -1478,7 +1478,7 @@ fn format_plan_tree<'a, S>(
     prev_explicit: Option<&'a HashMap<ResourceId, carina_core::explicit::ExplicitFields>>,
     expansion_trace: Option<&carina_core::resource::ExpansionTrace>,
     provider: &'a ProviderRouter,
-) -> ProviderResult<String> {
+) -> HostResult<String> {
     let plan = display.plan();
     // Build dependency graph from effects
     let graph = build_dependency_graph(plan);

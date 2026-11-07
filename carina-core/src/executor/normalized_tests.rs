@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 
 use indexmap::IndexMap;
 
-use crate::executor::normalized::{apply_desired_normalization, apply_desired_normalization_slice};
+use crate::executor::normalized::{
+    apply_host_desired_normalization, apply_host_desired_normalization_slice,
+};
 use crate::parser::ExpandedProviderConfig as ProviderConfig;
 use crate::provider::{
     BoxFuture, NoopNormalizer, ProviderError, ProviderNormalizer, ProviderResult, ready_noop,
@@ -102,16 +104,19 @@ async fn normalized_resource_rejects_block_aliases_returned_by_provider_normaliz
         )])),
     };
 
-    let error = apply_desired_normalization(
+    let error = apply_host_desired_normalization(
         Resource::<crate::resource::ModuleSource>::with_provider("test", "thing", "example", None),
         &[],
-        &normalizer,
+        &crate::provider::ConfiguredNormalizer::fixture(&normalizer),
         &schemas,
     )
     .await
     .expect_err("provider normalizers must return canonical attribute names");
 
-    assert!(matches!(error, ProviderError::InvalidInput(_)));
+    {
+        use crate::provider::HostError as ProviderError;
+        assert!(matches!(error, ProviderError::InvalidInput(_)));
+    }
     let message = error.to_string();
     assert!(message.contains("block-name alias `rule` reached the provider boundary"));
     assert!(message.contains("canonical attribute `rules`"));
@@ -156,16 +161,19 @@ async fn normalized_resource_rejects_nested_block_aliases_returned_by_provider_n
         )])),
     };
 
-    let error = apply_desired_normalization(
+    let error = apply_host_desired_normalization(
         Resource::<crate::resource::ModuleSource>::with_provider("test", "thing", "example", None),
         &[],
-        &normalizer,
+        &crate::provider::ConfiguredNormalizer::fixture(&normalizer),
         &schemas,
     )
     .await
     .expect_err("nested provider-normalizer aliases must be rejected");
 
-    assert!(matches!(error, ProviderError::InvalidInput(_)));
+    {
+        use crate::provider::HostError as ProviderError;
+        assert!(matches!(error, ProviderError::InvalidInput(_)));
+    }
     assert!(error.to_string().contains("block-name alias `condition`"));
     assert!(error.to_string().contains("`rules[0].condition`"));
     assert!(
@@ -229,10 +237,10 @@ async fn normalization_error_stops_later_stages() {
         .expect("schema fixture must be valid"),
     );
 
-    let error = apply_desired_normalization_slice(
+    let error = apply_host_desired_normalization_slice(
         &mut resources,
         &[provider_config(default_tags)],
-        &FailingNormalizer,
+        &crate::provider::ConfiguredNormalizer::fixture(&FailingNormalizer),
         &schemas,
     )
     .await
@@ -265,7 +273,7 @@ async fn invalid_default_tag_fails_normalization_without_mutating_resources() {
     let original = resources.clone();
     let schemas = order_schema();
 
-    let error = apply_desired_normalization_slice(
+    let error = apply_host_desired_normalization_slice(
         &mut resources,
         &[provider_config(default_tags)],
         &NoopNormalizer,
@@ -305,7 +313,7 @@ async fn unresolved_enum_default_tag_fails_before_mutating_resources() {
         vec![Resource::with_provider("test", "thing", "example", None)];
     let original = resources.clone();
 
-    let error = apply_desired_normalization_slice(
+    let error = apply_host_desired_normalization_slice(
         &mut resources,
         &[provider_config(default_tags)],
         &NoopNormalizer,
@@ -440,10 +448,10 @@ async fn desired_normalization_runs_stages_in_order() {
     default_tags.insert("ManagedBy".to_string(), string_value("carina"));
     let schemas = order_schema();
 
-    let normalized = apply_desired_normalization(
+    let normalized = apply_host_desired_normalization(
         resource,
         &[provider_config(default_tags)],
-        &normalizer,
+        &crate::provider::ConfiguredNormalizer::fixture(&normalizer),
         &schemas,
     )
     .await
@@ -531,9 +539,14 @@ async fn desired_normalization_lifts_guest_string_alias_to_api_enum() {
     );
     let resource: Resource = Resource::with_provider("test", "thing", "example", None);
 
-    let normalized = apply_desired_normalization(resource, &[], &StringAliasNormalizer, &schemas)
-        .await
-        .unwrap();
+    let normalized = apply_host_desired_normalization(
+        resource,
+        &[],
+        &crate::provider::ConfiguredNormalizer::fixture(&StringAliasNormalizer),
+        &schemas,
+    )
+    .await
+    .unwrap();
 
     assert!(matches!(
         normalized.as_resource().get_attr("mode"),
@@ -594,9 +607,14 @@ async fn desired_normalization_rejects_guest_dotted_string_without_shape_strippi
     );
     let resource: Resource = Resource::with_provider("test", "thing", "example", None);
 
-    let error = apply_desired_normalization(resource, &[], &DottedStringNormalizer, &schemas)
-        .await
-        .expect_err("guest strings must resolve by literal membership, never dotted shape");
+    let error = apply_host_desired_normalization(
+        resource,
+        &[],
+        &crate::provider::ConfiguredNormalizer::fixture(&DottedStringNormalizer),
+        &schemas,
+    )
+    .await
+    .expect_err("guest strings must resolve by literal membership, never dotted shape");
 
     assert!(error.to_string().contains("test.thing.Mode.allow"));
     assert!(error.detail().cause().is_some());
@@ -609,7 +627,7 @@ async fn desired_normalization_merges_non_empty_provider_default_tags() {
     default_tags.insert("ManagedBy".to_string(), string_value("carina"));
     let schemas = order_schema();
 
-    let normalized = apply_desired_normalization(
+    let normalized = apply_host_desired_normalization(
         resource,
         &[
             provider_config(IndexMap::new()),
@@ -644,7 +662,7 @@ async fn desired_normalization_merges_default_tags_into_ref_bearing_tags() {
     );
     let default_tags = IndexMap::from([("ManagedBy".to_string(), string_value("carina"))]);
 
-    let normalized = apply_desired_normalization(
+    let normalized = apply_host_desired_normalization(
         resource,
         &[provider_config(default_tags)],
         &NoopNormalizer,
@@ -693,9 +711,10 @@ async fn desired_normalization_resolves_enum_alias_nested_with_resource_ref() {
             ("peer".to_string(), peer_ref.clone()),
         ]))),
     );
-    let normalized = apply_desired_normalization(resource, &[], &NoopNormalizer, &order_schema())
-        .await
-        .unwrap();
+    let normalized =
+        apply_host_desired_normalization(resource, &[], &NoopNormalizer, &order_schema())
+            .await
+            .unwrap();
 
     let Some(Value::Concrete(ConcreteValue::Map(settings))) =
         normalized.as_resource().get_attr("settings")
@@ -741,7 +760,7 @@ async fn desired_normalization_scopes_default_tags_to_provider_instance() {
         .expect("schema fixture must be valid"),
     );
 
-    apply_desired_normalization_slice(
+    apply_host_desired_normalization_slice(
         &mut resources,
         &[default_config, second_config],
         &NoopNormalizer,
@@ -822,7 +841,7 @@ async fn desired_normalization_skips_tags_that_are_not_maps_of_strings() {
         .expect("schema fixture must be valid"),
     );
 
-    apply_desired_normalization_slice(
+    apply_host_desired_normalization_slice(
         &mut resources,
         &[provider_config(default_tags)],
         &NoopNormalizer,
@@ -894,10 +913,14 @@ async fn apply_desired_normalization_passes_deferred_values_to_in_process_normal
         )),
     );
 
-    let normalized =
-        apply_desired_normalization(resource, &[], &InspectingNormalizer, &SchemaRegistry::new())
-            .await
-            .unwrap();
+    let normalized = apply_host_desired_normalization(
+        resource,
+        &[],
+        &crate::provider::ConfiguredNormalizer::fixture(&InspectingNormalizer),
+        &SchemaRegistry::new(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(
         normalized.as_resource().get_attr("role_arn"),
@@ -977,10 +1000,10 @@ async fn desired_normalization_slice_canonicalizes_and_runs_stages_on_full_resou
     let schemas = order_schema();
     let mut resources = vec![resource];
 
-    apply_desired_normalization_slice(
+    apply_host_desired_normalization_slice(
         &mut resources,
         &[provider_config(default_tags)],
-        &normalizer,
+        &crate::provider::ConfiguredNormalizer::fixture(&normalizer),
         &schemas,
     )
     .await
@@ -1026,10 +1049,11 @@ async fn apply_desired_normalization_is_idempotent() {
     let mut resource: Resource = Resource::new("test", "thing");
     resource.set_attr("name", string_value("v1"));
 
-    let first = apply_desired_normalization(resource, &[], &NoopNormalizer, &SchemaRegistry::new())
-        .await
-        .unwrap();
-    let second = apply_desired_normalization(
+    let first =
+        apply_host_desired_normalization(resource, &[], &NoopNormalizer, &SchemaRegistry::new())
+            .await
+            .unwrap();
+    let second = apply_host_desired_normalization(
         first.as_resource().clone(),
         &[],
         &NoopNormalizer,
@@ -1039,4 +1063,170 @@ async fn apply_desired_normalization_is_idempotent() {
     .unwrap();
 
     assert_eq!(first.as_resource(), second.as_resource());
+}
+
+#[tokio::test]
+async fn review_a2_guest_enum_error_is_bound_by_executor_preparation() {
+    const SECRET: &str = "guest-private-enum-review";
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        PatternResourceSchema::new("thing")
+            .attribute(
+                PatternAttributeSchema::optional("password", PatternAttributeType::string())
+                    .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "mode",
+                    PatternAttributeType::enum_(
+                        crate::schema::enum_identity("Mode", Some("test.thing")),
+                        Some(vec!["Allow".to_owned()]),
+                        Vec::new(),
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let resource = Resource::with_provider("test", "thing", "example", None).with_attribute(
+        "password",
+        Value::Deferred(DeferredValue::Secret(Box::new(string_value(SECRET)).into())),
+    );
+    let raw = AttributeReturningNormalizer {
+        name: "mode",
+        value: string_value(SECRET),
+    };
+    let session = crate::provider::prepare_provider_session(
+        "test",
+        None,
+        None,
+        std::slice::from_ref(&resource),
+        &[],
+    );
+    let normalizer =
+        crate::provider::ConfiguredNormalizer::fixture_with_session(&raw, &session, &schemas);
+    let bindings = crate::binding_index::ResolvedBindings::default();
+    let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |type_checks| {
+            let context = crate::executor::ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                &normalizer,
+                &[],
+                &schemas,
+                type_checks,
+            );
+            let error = crate::executor::prepare_create_request(resource, &context)
+                .await
+                .unwrap_err();
+            let text = error.to_string();
+            assert!(
+                !text.contains(SECRET),
+                "guest-derived core cause leaked through executor preparation: {text}"
+            );
+            assert!(
+                text.contains("(secret)"),
+                "guest enum reason was lost: {text}"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn round5_dispatch_normalizer_collects_a_late_scalar_secret_before_ingress() {
+    struct Echo;
+    impl crate::provider::ProviderNormalizer for Echo {
+        fn normalize_desired<'a>(
+            &'a self,
+            resources: &'a mut [crate::resource::ProviderResource],
+        ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
+            let Value::Concrete(ConcreteValue::Int(value)) = resources[0].attributes["numeric"]
+            else {
+                panic!("normalizer must receive its usual plaintext shape")
+            };
+            Box::pin(async move {
+                Err(crate::provider::ProviderError::api_error(format!(
+                    "normalizer echoed {value}"
+                )))
+            })
+        }
+        fn normalize_state<'a>(
+            &'a self,
+            _: &'a mut crate::provider::StateTransformMap,
+        ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
+            crate::provider::ready_noop()
+        }
+        fn hydrate_read_state<'a>(
+            &'a self,
+            _: &'a mut crate::provider::StateTransformMap,
+            _: &'a crate::provider::SavedAttrs,
+        ) -> crate::provider::BoxFuture<'a, crate::provider::ProviderResult<()>> {
+            crate::provider::ready_noop()
+        }
+    }
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        PatternResourceSchema::new("thing")
+            .attribute(
+                PatternAttributeSchema::optional("numeric", PatternAttributeType::int()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let mut desired = Resource::with_provider("test", "thing", "example", None).with_attribute(
+        "numeric",
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref("source", "computed", vec![])).into(),
+        )),
+    );
+    let session = crate::provider::prepare_provider_session(
+        "test",
+        None,
+        None,
+        std::slice::from_ref(&desired),
+        &[],
+    );
+    desired.attributes.insert(
+        "numeric".into(),
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Concrete(ConcreteValue::Int(93842))).into(),
+        )),
+    );
+    let normalizer =
+        crate::provider::ConfiguredNormalizer::fixture_with_session(&Echo, &session, &schemas);
+    let bindings = Default::default();
+    let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
+    crate::validation::deferred_types::with_session_for_test_async(
+        &crate::parser::LoadedProviderContext::empty_for_test(),
+        async |checks| {
+            let context = crate::executor::ProviderPreparationContext::new(
+                &bindings,
+                &gate,
+                &[],
+                &normalizer,
+                &[],
+                &schemas,
+                checks,
+            );
+            let text = crate::executor::prepare_create_request(desired, &context)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !text.contains("93842"),
+                "normalizer leaked late scalar: {text}"
+            );
+            assert!(text.contains("normalizer echoed (secret)"), "{text}");
+        },
+    )
+    .await;
 }

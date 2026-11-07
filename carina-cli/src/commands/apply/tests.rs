@@ -523,10 +523,12 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
         .expect("load mock HTTP WASM provider")
         .with_http_test_route("phase-test.invalid", server_address);
     let fresh_ready = mock_http_ready_config(&fresh_factory);
-    let fresh_initialized = fresh_factory
-        .create_initialized_provider(None, &fresh_ready)
-        .await
-        .expect("initialize mock HTTP provider");
+    let fresh_initialized = carina_core::provider::ProviderBoundary::initialize(
+        &fresh_factory,
+        &carina_core::provider::ProviderPlan::state_only().session("aws", None, Some(&fresh_ready)),
+    )
+    .await
+    .expect("initialize mock HTTP provider");
     let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(fresh_factory)];
     let mut schemas = carina_core::provider::collect_schemas(&factories);
     schemas.insert("mock_http", mock_http_replacement_schema());
@@ -599,10 +601,16 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
         .expect("load replacement mock HTTP WASM provider")
         .with_http_test_route("phase-test.invalid", server_address);
     let replacement_ready = mock_http_ready_config(&replacement_factory);
-    let replacement_initialized = replacement_factory
-        .create_initialized_provider(None, &replacement_ready)
-        .await
-        .expect("initialize replacement mock HTTP provider");
+    let replacement_initialized = carina_core::provider::ProviderBoundary::initialize(
+        &replacement_factory,
+        &carina_core::provider::ProviderPlan::state_only().session(
+            "aws",
+            None,
+            Some(&replacement_ready),
+        ),
+    )
+    .await
+    .expect("initialize replacement mock HTTP provider");
     let mut replacement_provider = ProviderRouter::new();
     replacement_provider.add_provider("mock_http".to_string(), replacement_initialized);
 
@@ -910,7 +918,7 @@ async fn migrated_legacy_reserved_attributes_do_not_report_saved_plan_drift() {
             planned_state,
         )],
         &HistoricalResourceAddresses::from_plan(&Plan::new()),
-        &ApplyTimeReadProvider { shared },
+        &crate::provider_text_fixtures::boundary(Box::new(ApplyTimeReadProvider { shared })),
         None,
         &carina_core::schema::SchemaRegistry::new(),
         ApplyTarget::Project(Path::new(".")),
@@ -992,7 +1000,7 @@ fn expanded_provider_configs(
 }
 
 fn inspected_saved_plan(plan_file: PlanFile) -> InspectedPlanFile {
-    InspectedPlanFile::inspect(plan_file)
+    InspectedPlanFile::inspect(plan_file.decode_for_test())
 }
 
 trait IntoValidatedTestSchema {
@@ -1911,6 +1919,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     .expect("test plan provider evidence must be valid");
 
     let plan_file = plan_file
+        .decode_for_test()
         .reload_in_flight_from_locked_state(None)
         .expect("test plan should cross the locked-state reload boundary")
         .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
@@ -1960,6 +1969,40 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
         std::error::Error::source(&identity_error)
             .is_some_and(|source| source.downcast_ref::<std::io::Error>().is_some()),
         "apply dropped the composition identity io source",
+    );
+}
+
+#[tokio::test]
+async fn saved_configuration_decode_failure_returns_command_error_without_panicking() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let temp = tempfile::tempdir().unwrap();
+    let mut document: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/module_binding_wire_compat/carina.v43.plan.json"
+    ))
+    .unwrap();
+    document["sorted_resources"] = serde_json::json!("invalid saved configuration");
+    let path = temp.path().join("invalid-configuration.plan.json");
+    std::fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+    let error = run_apply_from_plan(
+        &runtime,
+        &carina_core::paths::ResolvedPath::new(&path).unwrap(),
+        &path,
+        true,
+        true,
+        NonZeroUsize::new(1).unwrap(),
+        false,
+        &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        carina_core::shutdown::ShutdownToken::running(),
+    )
+    .await
+    .expect_err("a malformed saved configuration is a command error");
+    let AppError::CorruptPlanFile(error) = error else {
+        panic!("saved configuration decoding lost its typed error: {error:?}");
+    };
+    assert_eq!(error.json_error().json_path(), "sorted_resources");
+    assert_eq!(
+        error.json_error().classify(),
+        serde_json::error::Category::Data
     );
 }
 
@@ -2423,14 +2466,14 @@ impl ProviderFactory for FailBCreateFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
@@ -2441,8 +2484,7 @@ impl ProviderFactory for FailBCreateFactory {
 
     fn create_normalizer(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -2752,9 +2794,14 @@ async fn state_bucket_bootstrap_prepares_resolved_upstream_provider_config() {
         )],
         inputs.configs().as_provider_configs(),
     );
-    create_state_bucket_bootstrap_provider(&ctx, inputs.configs(), "test")
-        .await
-        .expect("bootstrap must construct the provider from resolved inputs");
+    create_state_bucket_bootstrap_provider(
+        &ctx,
+        inputs.configs(),
+        "test",
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .await
+    .expect("bootstrap must construct the provider from resolved inputs");
 
     assert_eq!(
         received_role_arn.lock().unwrap().as_ref(),
@@ -3226,14 +3273,14 @@ impl ProviderFactory for ApplyTimeReadFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         let shared = self.shared.clone();
@@ -3245,8 +3292,7 @@ impl ProviderFactory for ApplyTimeReadFactory {
 
     fn create_normalizer(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -3434,14 +3480,14 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         let shared = self.shared.clone();
@@ -3453,8 +3499,7 @@ impl ProviderFactory for ApplyCascadeAwsccFactory {
 
     fn create_normalizer(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -7281,8 +7326,9 @@ enum BootstrapCreateBehavior {
     InFlight,
 }
 
+#[derive(Clone)]
 struct BootstrapRecordingProvider {
-    create_calls: AtomicUsize,
+    create_calls: Arc<AtomicUsize>,
     behavior: BootstrapCreateBehavior,
 }
 
@@ -7340,7 +7386,7 @@ impl Provider for BootstrapRecordingProvider {
                 let identifier = AppliedIdentifier::new("state-bucket")
                     .expect("fixture identifier is non-empty");
                 let diagnostic = carina_core::provider::PartialReadDiagnostic::new(
-                    "bootstrap read incomplete".to_string(),
+                    "bootstrap read incomplete".into(),
                     vec!["versioning".to_string()],
                 )
                 .expect("fixture diagnostic has a missing attribute");
@@ -7542,7 +7588,11 @@ async fn bootstrap_declared_state_bucket(
 
     create_checked_bootstrap_resource_for_test(
         color_mode,
-        provider,
+        &crate::provider_text_fixtures::boundary_with_components(
+            Box::new(provider.clone()),
+            Box::new(NoopNormalizer),
+            &schemas,
+        ),
         resource.clone(),
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -7563,7 +7613,7 @@ async fn bootstrap_declared_state_bucket(
 async fn declared_state_bucket_bootstrap_success_seeds_protected_provider_state() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: AtomicUsize::new(0).into(),
         behavior: BootstrapCreateBehavior::Success,
     };
     let (_temp, backend) = bootstrap_test_backend();
@@ -7599,7 +7649,7 @@ async fn declared_state_bucket_bootstrap_success_seeds_protected_provider_state(
 async fn declared_state_bucket_bootstrap_partial_success_seeds_partial_read_state() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: AtomicUsize::new(0).into(),
         behavior: BootstrapCreateBehavior::PartialSuccess,
     };
     let (_temp, backend) = bootstrap_test_backend();
@@ -7641,7 +7691,7 @@ fn provider_text_partial_state_bucket_warning_sanitizes_guest_text() {
     let raw = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";
     let diagnostic =
         carina_core::provider::PartialReadDiagnostic::new(raw.into(), vec![raw.into()]).unwrap();
-    let identifier = carina_core::provider_text::ProviderText::new(raw);
+    let identifier = carina_core::provider_text::DiagnosticText::new(raw);
     let rendered = format_partial_state_bucket_create_warning(
         crate::output_style::ColorMode::Plain,
         &identifier,
@@ -7656,7 +7706,7 @@ fn partial_state_bucket_warning_color_spans_do_not_cross_newlines() {
     let color_mode = crate::output_style::ColorMode::Ansi;
 
     let diagnostic = carina_core::provider::PartialReadDiagnostic::new(
-        "bootstrap read incomplete".to_string(),
+        "bootstrap read incomplete".into(),
         vec!["versioning".to_string()],
     )
     .expect("fixture diagnostic has a missing attribute");
@@ -7702,7 +7752,7 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
     use carina_core::effect::Effect;
 
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: AtomicUsize::new(0).into(),
         behavior: BootstrapCreateBehavior::Success,
     };
     let (_temp, backend) = bootstrap_test_backend();
@@ -7759,7 +7809,7 @@ async fn declared_state_bucket_bootstrap_seed_prevents_phantom_create_plan() {
 async fn declared_state_bucket_successful_create_seed_write_failure_is_actionable() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: AtomicUsize::new(0).into(),
         behavior: BootstrapCreateBehavior::Success,
     };
     let error = bootstrap_declared_state_bucket(
@@ -7804,9 +7854,10 @@ async fn declared_state_bucket_successful_create_seed_write_failure_is_actionabl
 async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: AtomicUsize::new(0).into(),
         behavior: BootstrapCreateBehavior::Success,
     };
+    let provider = std::sync::Arc::new(provider);
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
         "bucket",
@@ -7839,7 +7890,7 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
     let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
     let error = create_checked_bootstrap_resource_for_test(
         color_mode,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -7891,7 +7942,7 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
 async fn creation_constrained_state_bucket_bootstrap_is_admitted_before_dispatch() {
     use carina_core::schema::{InputPath, InputPredicate, InputRule, InputRuleCode};
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: Arc::new(AtomicUsize::new(0)),
         behavior: BootstrapCreateBehavior::Success,
     };
     let resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
@@ -7919,7 +7970,7 @@ async fn creation_constrained_state_bucket_bootstrap_is_admitted_before_dispatch
     let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
     let result = create_checked_bootstrap_resource_for_test(
         crate::output_style::ColorMode::Plain,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(provider.clone())),
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -7941,9 +7992,10 @@ async fn creation_constrained_state_bucket_bootstrap_is_admitted_before_dispatch
 async fn state_bucket_provider_error_keeps_typed_terminal_error() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: AtomicUsize::new(0).into(),
         behavior: BootstrapCreateBehavior::NotCreated,
     };
+    let provider = std::sync::Arc::new(provider);
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
         "bucket",
@@ -7963,7 +8015,7 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
         color_mode,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -7993,9 +8045,10 @@ async fn state_bucket_provider_error_keeps_typed_terminal_error() {
 async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: AtomicUsize::new(0).into(),
         behavior: BootstrapCreateBehavior::Success,
     };
+    let provider = std::sync::Arc::new(provider);
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
         "bucket",
@@ -8020,7 +8073,7 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
     let (_temp, backend) = bootstrap_test_backend();
     let result = create_checked_bootstrap_resource_for_test(
         color_mode,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -8048,9 +8101,10 @@ async fn violating_module_constraint_blocks_state_bucket_bootstrap_create() {
 async fn bootstrap_create_identified_seeds_observed_state_before_error() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: AtomicUsize::new(0).into(),
         behavior: BootstrapCreateBehavior::IdentifierReported,
     };
+    let provider = std::sync::Arc::new(provider);
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
         "bucket",
@@ -8075,7 +8129,7 @@ async fn bootstrap_create_identified_seeds_observed_state_before_error() {
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
         color_mode,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -8142,9 +8196,10 @@ async fn bootstrap_create_identified_seeds_observed_state_before_error() {
 async fn bootstrap_unobserved_create_identified_seeds_identifier_and_partial_read_before_error() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: AtomicUsize::new(0).into(),
         behavior: BootstrapCreateBehavior::IdentifierReportedNotFound,
     };
+    let provider = std::sync::Arc::new(provider);
     let resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
         "bucket",
         Value::Concrete(ConcreteValue::String("state-bucket".into())),
@@ -8163,7 +8218,7 @@ async fn bootstrap_unobserved_create_identified_seeds_identifier_and_partial_rea
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
         color_mode,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -8234,9 +8289,10 @@ async fn bootstrap_unobserved_create_identified_seeds_identifier_and_partial_rea
 async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: AtomicUsize::new(0).into(),
         behavior: BootstrapCreateBehavior::InFlight,
     };
+    let provider = std::sync::Arc::new(provider);
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None);
     resource.set_attr(
         "bucket",
@@ -8256,7 +8312,7 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
         color_mode,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -8305,9 +8361,10 @@ async fn bootstrap_in_flight_failure_seeds_pending_state_before_error() {
 async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
     let color_mode = crate::output_style::ColorMode::Plain;
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: AtomicUsize::new(0).into(),
         behavior: BootstrapCreateBehavior::InFlight,
     };
+    let provider = std::sync::Arc::new(provider);
     let resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
         "bucket",
         Value::Concrete(ConcreteValue::String("state-bucket".into())),
@@ -8324,7 +8381,7 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
     let provider_configs = empty_resolved_provider_configs();
     let error = create_checked_bootstrap_resource_for_test(
         color_mode,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -12328,7 +12385,7 @@ pub(super) mod issue_4283;
 #[tokio::test]
 async fn round3_bootstrap_default_tag_keys_are_plan_diagnostics() {
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: Arc::new(AtomicUsize::new(0)),
         behavior: BootstrapCreateBehavior::Success,
     };
     let resource: Resource =
@@ -12365,7 +12422,7 @@ async fn round3_bootstrap_default_tag_keys_are_plan_diagnostics() {
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
         crate::output_style::ColorMode::Plain,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(provider.clone())),
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -12390,7 +12447,7 @@ async fn round3_bootstrap_default_tag_keys_are_plan_diagnostics() {
 #[tokio::test]
 async fn round2_bootstrap_rejects_unknown_dependency_before_dispatch() {
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: Arc::new(AtomicUsize::new(0)),
         behavior: BootstrapCreateBehavior::Success,
     };
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
@@ -12455,8 +12512,9 @@ async fn round2_bootstrap_rejects_unknown_dependency_before_dispatch() {
                     session,
                 );
                 let permit = prepare_bootstrap_permit(&checked, &preparation).await?;
+                let boundary = crate::provider_text_fixtures::boundary(Box::new(provider.clone()));
                 let (create, _cancellation) =
-                    carina_core::executor::dispatch_create(&provider, permit);
+                    carina_core::executor::dispatch_create(&boundary, permit);
                 create
                     .await
                     .expect("fixture provider succeeds if erroneously released");
@@ -12475,7 +12533,7 @@ async fn round2_bootstrap_rejects_unknown_dependency_before_dispatch() {
 #[tokio::test]
 async fn bootstrap_rejects_unknown_authored_binding_through_real_entrypoint() {
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: Arc::new(AtomicUsize::new(0)),
         behavior: BootstrapCreateBehavior::Success,
     };
     let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
@@ -12502,7 +12560,7 @@ async fn bootstrap_rejects_unknown_authored_binding_through_real_entrypoint() {
     let configs = empty_resolved_provider_configs();
     let error = create_checked_bootstrap_resource_for_test(
         crate::output_style::ColorMode::Plain,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(provider.clone())),
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -12530,7 +12588,7 @@ async fn bootstrap_rejects_unknown_authored_binding_through_real_entrypoint() {
 #[tokio::test]
 async fn bootstrap_unresolved_reference_returns_typed_preparation_error() {
     let provider = BootstrapRecordingProvider {
-        create_calls: AtomicUsize::new(0),
+        create_calls: Arc::new(AtomicUsize::new(0)),
         behavior: BootstrapCreateBehavior::Success,
     };
     let string = |text: &str| Value::Concrete(ConcreteValue::String(text.into()));
@@ -12569,7 +12627,7 @@ async fn bootstrap_unresolved_reference_returns_typed_preparation_error() {
     let (_temp, backend) = bootstrap_test_backend();
     let error = create_checked_bootstrap_resource_for_test(
         crate::output_style::ColorMode::Plain,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(provider.clone())),
         bucket,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),

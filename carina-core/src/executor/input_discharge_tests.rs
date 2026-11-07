@@ -203,11 +203,12 @@ async fn round2_initial_create_after_normalization(
     crate::validation::deferred_types::with_session_for_test_async(
         &crate::parser::LoadedProviderContext::empty_for_test(),
         async |session| {
+            let host_normalizer = crate::provider::ConfiguredNormalizer::fixture(&normalizer);
             let context = ProviderPreparationContext::new(
                 &bindings,
                 &gate,
                 &[],
-                &normalizer,
+                &host_normalizer,
                 &[],
                 &runtime_schemas,
                 session,
@@ -497,7 +498,7 @@ async fn run_with_configs(
             bindings,
             managed_current: current,
             data_source_values: ExecutableDataSourceValues::empty(),
-            normalizer,
+            normalizer: &crate::provider::ConfiguredNormalizer::fixture(normalizer),
             provider_configs: configs,
             factories: &[],
             schemas,
@@ -1394,7 +1395,7 @@ async fn input_discharge_invalid_check_construction_aborts_all_dispatch() {
             .in_session(session);
             input.input_checks.push(input.input_checks[1].clone());
             futures::executor::block_on(parallel::execute_effects_sequential(
-                &provider,
+                &crate::provider::ProviderBoundary::fixture(&provider),
                 &crate::provider::ProviderRouter::new(),
                 &mut input,
                 &observer,

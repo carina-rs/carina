@@ -13,7 +13,7 @@ use carina_core::plan_tree::{
     build_dependency_graph, build_single_parent_tree, deferred_for_detail_rows,
     deferred_for_display_name, deferred_for_verb, extract_compact_hint,
 };
-use carina_core::provider::{ProviderResult, ProviderRouter};
+use carina_core::provider::{HostResult, ProviderRouter};
 use carina_core::resource::ResourceId;
 use carina_core::schema::SchemaRegistry;
 use ratatui::widgets::ListState;
@@ -127,7 +127,7 @@ impl App {
         prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
         provider: &ProviderRouter,
         comparisons: carina_core::detail_rows::DetailComparisons<'_>,
-    ) -> ProviderResult<Self> {
+    ) -> HostResult<Self> {
         Self::from_display(
             PlanDisplay::unprepared(plan, historical_display, comparisons),
             schemas,
@@ -141,7 +141,7 @@ impl App {
         schemas: &SchemaRegistry,
         prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
         provider: &ProviderRouter,
-    ) -> ProviderResult<Self> {
+    ) -> HostResult<Self> {
         let plan = display.plan();
         let replacement_display: Vec<_> = plan.replace_display_info().collect();
         let replacement_create_info: HashMap<_, _> = replacement_display
@@ -162,7 +162,7 @@ impl App {
                     provider,
                 )
             })
-            .collect::<ProviderResult<Vec<_>>>()?;
+            .collect::<HostResult<Vec<_>>>()?;
         Ok(Self::from_nodes(plan, nodes, replacement_display))
     }
 
@@ -807,7 +807,7 @@ fn effect_to_node<S, V: carina_core::resource::PlanValueKind>(
     replacement_info: Option<ReplaceDisplayInfo<'_>>,
     prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
     provider: &ProviderRouter,
-) -> ProviderResult<TreeNode> {
+) -> HostResult<TreeNode> {
     let mut detail_rows = display
         .detail_rows(
             index,

@@ -1,7 +1,4 @@
-pub mod wasm_convert;
 pub mod wasm_factory;
-
-mod desired_normalization;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use wasm_factory::GuestCallBudget;
@@ -16,3 +13,7 @@ pub use wasm_factory::{
 pub(crate) fn finite(value: f64) -> carina_provider_protocol::FiniteF64 {
     carina_provider_protocol::FiniteF64::new(value).unwrap()
 }
+
+#[cfg(test)]
+#[path = "../../carina-core/tests/support/provider_text.rs"]
+mod provider_text_fixtures;

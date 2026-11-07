@@ -170,6 +170,52 @@ impl std::ops::Deref for TestCommandRuntime {
     }
 }
 
+/// Exercise the real CLI progress renderer from integration tests without
+/// exposing the private observer or duplicating its formatting.
+pub async fn execute_live_plan_with_cli_observer_for_test(
+    provider: &dyn carina_core::provider::HostProvider,
+    input: carina_core::executor::LiveExecutionInput<'_>,
+    project: &std::path::Path,
+) -> carina_core::executor::ExecutionOutcome {
+    let observer =
+        crate::commands::shared::observer::CliObserver::new(ColorMode::Plain, input.plan, project);
+    carina_core::executor::execute_live_plan_for_test(
+        provider,
+        input,
+        &observer,
+        carina_core::shutdown::ShutdownToken::running(),
+    )
+    .await
+}
+
+/// Run the real plan/refresh pipeline with native fixture providers.
+pub async fn run_refreshing_plan_with_factories(
+    runtime: &CommandRuntime,
+    path: &std::path::Path,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
+) -> Result<bool, crate::error::AppError> {
+    crate::commands::plan::run_plan_using(
+        runtime,
+        path,
+        None,
+        None,
+        None,
+        crate::DetailLevel::None,
+        false,
+        true,
+        false,
+        false,
+        false,
+        &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
+        |runtime, providers, _| {
+            Ok(crate::wiring::ProviderLoad::for_test_with_provider_phase(
+                runtime, factories, providers,
+            ))
+        },
+    )
+    .await
+}
+
 /// Run the full plan command with injected factories and `--refresh=false`.
 pub async fn run_plan_with_factories(
     runtime: &CommandRuntime,
@@ -183,6 +229,32 @@ pub async fn run_plan_with_factories(
         None,
         None,
         crate::DetailLevel::None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        &carina_core::parser::ProviderContext::new(runtime.environment().clone()),
+        |runtime, providers, _| {
+            Ok(crate::wiring::ProviderLoad::for_test_with_provider_phase(
+                runtime, factories, providers,
+            ))
+        },
+    )
+    .await
+}
+pub async fn run_detailed_plan_with_factories(
+    runtime: &CommandRuntime,
+    path: &std::path::Path,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
+) -> Result<bool, crate::error::AppError> {
+    crate::commands::plan::run_plan_using(
+        runtime,
+        path,
+        None,
+        None,
+        None,
+        crate::DetailLevel::Full,
         false,
         false,
         false,
@@ -289,6 +361,8 @@ pub(crate) fn empty_state_block_targets() -> crate::wiring::ResolvedStateBlockTa
         removed_from: carina_state::ResolvedRemovedClaims::resolve(&[], None),
     }
 }
+
+pub use crate::provider_text_fixtures::{boundary, normalizer};
 #[cfg(test)]
 #[path = "../../carina-core/tests/support/creation.rs"]
 pub(crate) mod creation_fixture;

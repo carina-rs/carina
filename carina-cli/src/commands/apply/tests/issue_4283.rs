@@ -29,13 +29,13 @@ impl ProviderFactory for Factory {
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _: &carina_core::provider::ProviderValidationInputs,
     ) -> ProviderResult<()> {
         Ok(())
     }
     fn create_provider(
         &self,
-        _: Option<&str>,
-        _: &carina_core::provider::ProviderReadyConfig,
+        _: &carina_core::provider::ProviderSession,
         _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         let cloud = self.0.clone();
@@ -46,8 +46,7 @@ impl ProviderFactory for Factory {
     }
     fn create_normalizer(
         &self,
-        _: Option<&str>,
-        _: &carina_core::provider::ProviderReadyConfig,
+        _: &carina_core::provider::ProviderSession,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -666,6 +665,7 @@ pub(in crate::commands::apply) async fn saved_plan_conversion_fixture(
     .unwrap();
     let decoded: PlanFile = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
     let resolved = decoded
+        .decode_for_test()
         .reload_in_flight_from_locked_state(state.as_ref())
         .unwrap()
         .resolve_with_schemas(loaded.context().schemas())

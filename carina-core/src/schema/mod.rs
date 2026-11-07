@@ -210,7 +210,7 @@ pub use input_rules::{
     InputRuleScope, InputRuleTarget, InputViolation, InputViolationReason, NonEmptyString,
 };
 
-use crate::provider_text::{ProviderString, ProviderText, ProviderTextBuilder};
+use crate::provider_text::{DiagnosticText, DiagnosticTextBuilder, ProviderKey};
 use crate::resource::InsideSecret;
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -330,7 +330,7 @@ impl FieldGroupKind {
 pub enum FieldGroupError {
     #[error("field groups require at least two fields, got {actual}")]
     TooFewFields { actual: usize },
-    #[error("field group contains duplicate field `{}`", ProviderText::new(name))]
+    #[error("field group contains duplicate field `{}`", DiagnosticText::new(name))]
     DuplicateField { name: String },
 }
 
@@ -419,7 +419,7 @@ impl fmt::Display for RefEncountered {
         write!(
             f,
             "unresolved AttributeType::Ref(\"{}\") has no defs in scope",
-            ProviderText::new(&self.name)
+            DiagnosticText::new(&self.name)
         )
     }
 }
@@ -755,7 +755,7 @@ pub struct PatternStructField<R: PatternForm = Draft> {
     /// Whether user input for this field is optional, required, or forbidden.
     declared_input_mode: InputMode,
     /// Description of this field
-    pub(crate) description: Option<ProviderText>,
+    pub(crate) description: Option<DiagnosticText>,
     /// Provider-side property name (e.g., "IpProtocol")
     pub(crate) provider_name: Option<String>,
     /// Alternative block name for repeated block syntax (e.g., "transition" for "transitions")
@@ -967,7 +967,7 @@ macro_rules! impl_user_input_struct_field_builder {
             }
 
             pub fn with_description(mut self, description: impl Into<String>) -> Self {
-                self.field.description = Some(ProviderText::new(description));
+                self.field.description = Some(DiagnosticText::new(description));
                 self
             }
 
@@ -1038,7 +1038,7 @@ impl<R: PatternForm> CreateOnlyOptionalStructFieldBuilder<R> {
 
 impl<R: PatternForm> ProviderPopulatedStructFieldBuilder<R> {
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
-        self.field.description = Some(ProviderText::new(description));
+        self.field.description = Some(DiagnosticText::new(description));
         self
     }
 
@@ -3471,7 +3471,7 @@ impl PatternAttributeType<Compiled> {
                 extra_message: validation_result
                     .and_then(Result::err)
                     .map(validation_error_message)
-                    .map(ProviderText::new),
+                    .map(DiagnosticText::new),
             });
         }
 
@@ -3725,8 +3725,8 @@ impl std::fmt::Display for MismatchTypeNames {
         write!(
             f,
             "expected {}, got {}",
-            ProviderText::new(self.expected()),
-            ProviderText::new(self.actual())
+            DiagnosticText::new(self.expected()),
+            DiagnosticText::new(self.actual())
         )
     }
 }
@@ -6040,8 +6040,8 @@ fn format_pattern_mismatch(
     pattern: &PatternSpec,
     attribute: Option<&str>,
     type_name: Option<&str>,
-) -> ProviderText {
-    let mut text = ProviderTextBuilder::default();
+) -> DiagnosticText {
+    let mut text = DiagnosticTextBuilder::default();
     text.push_str(&format_invalid_value_intro(value, attribute, type_name));
     text.push_str(": does not match required pattern ");
     PatternSpecDisplay::new(pattern).push_to(&mut text);
@@ -6080,7 +6080,7 @@ impl DslSpelling {
 
 impl fmt::Display for DslSpelling {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        ProviderText::new(&self.0).fmt(f)
+        DiagnosticText::new(&self.0).fmt(f)
     }
 }
 
@@ -6213,7 +6213,7 @@ impl ExpectedEnumVariant {
 
 impl fmt::Display for ExpectedEnumVariant {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        ProviderText::new(self.dsl_spelling()).fmt(f)
+        DiagnosticText::new(self.dsl_spelling()).fmt(f)
     }
 }
 
@@ -6538,7 +6538,7 @@ impl DiagnosticValue {
             Self::Masked => SECRET_VALUE_MASK.to_string(),
             Self::TypeOnlyString => "string".to_string(),
         };
-        ProviderText::new(text).to_string()
+        DiagnosticText::new(text).to_string()
     }
 }
 
@@ -6713,7 +6713,7 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error(
         "`{}` was interpreted as the `{binding_kind}` binding; if you meant the enum `{}` value, write `{qualified}`",
-        ProviderText::new(name), ProviderText::new(&r#enum.kind)
+        DiagnosticText::new(name), DiagnosticText::new(&r#enum.kind)
     )]
 pub struct BindingShadowsEnumMemberError {
     pub name: String,
@@ -6743,7 +6743,7 @@ pub enum TypeError {
 
     #[error(
         "{}",
-        ProviderText::new(format_invalid_enum(value, *value_kind, attribute.as_deref(), type_name.as_deref(), expected))
+        DiagnosticText::new(format_invalid_enum(value, *value_kind, attribute.as_deref(), type_name.as_deref(), expected))
     )]
     InvalidEnumVariant {
         value: DiagnosticValue,
@@ -6778,7 +6778,7 @@ pub enum TypeError {
 
     #[error(
         "{}",
-        ProviderText::new(format_length_out_of_range(value, *length, *min, *max, attribute.as_deref(), type_name.as_deref()))
+        DiagnosticText::new(format_length_out_of_range(value, *length, *min, *max, attribute.as_deref(), type_name.as_deref()))
     )]
     LengthOutOfRange {
         value: DiagnosticValue,
@@ -6792,7 +6792,7 @@ pub enum TypeError {
     #[error(
         "Duplicate list element {} at index {index} (first at index {first_index}){}",
         value.render_enum_value(InvalidEnumValueKind::Identifier),
-        attribute.as_ref().map(|name| format!(" for '{}'", ProviderText::new(name))).unwrap_or_default()
+        attribute.as_ref().map(|name| format!(" for '{}'", DiagnosticText::new(name))).unwrap_or_default()
     )]
     DuplicateListElement {
         value: DiagnosticValue,
@@ -6810,7 +6810,7 @@ pub enum TypeError {
     /// See #2094.
     #[error(
         "{}",
-        ProviderText::new(format_string_literal_expected_enum(user_typed, attribute.as_deref(), type_name, expected, extra_message.as_deref()))
+        DiagnosticText::new(format_string_literal_expected_enum(user_typed, attribute.as_deref(), type_name, expected, extra_message.as_deref()))
     )]
     StringLiteralExpectedEnum {
         /// The string the user typed between the quotes, or a secret mask.
@@ -6832,11 +6832,11 @@ pub enum TypeError {
         /// path, where the validator does not enumerate variants. When
         /// `expected` is non-empty, this field is silently ignored by
         /// the renderer; callers should not set both at once.
-        extra_message: Option<ProviderText>,
+        extra_message: Option<DiagnosticText>,
     },
 
     #[error("Validation failed: {message}")]
-    ValidationFailed { message: ProviderText },
+    ValidationFailed { message: DiagnosticText },
 
     #[error("{error}")]
     CustomTypeValidation {
@@ -6846,30 +6846,30 @@ pub enum TypeError {
 
     #[error("Resource validation failed: {message}")]
     ResourceValidationFailed {
-        message: ProviderText,
+        message: DiagnosticText,
         /// Optional attribute name for precise diagnostic positioning.
         attribute: Option<String>,
     },
 
-    #[error("Required attribute '{}' is missing", ProviderText::new(name))]
+    #[error("Required attribute '{}' is missing", DiagnosticText::new(name))]
     MissingRequired { name: String },
 
-    #[error("{}", ProviderText::new(format_field_group_violation(path, group)))]
+    #[error("{}", DiagnosticText::new(format_field_group_violation(path, group)))]
     FieldGroupViolation { path: FieldPath, group: FieldGroup },
 
     #[error(
         "Attribute '{}' is populated by the provider and cannot be set",
-        ProviderText::new(name)
+        DiagnosticText::new(name)
     )]
     ReadOnlyAttribute { name: String },
 
-    #[error("Unknown attribute '{}'{}", ProviderText::new(name), suggestion.as_ref().map(|s| format!(", did you mean '{}'?", ProviderText::new(s))).unwrap_or_default())]
+    #[error("Unknown attribute '{}'{}", DiagnosticText::new(name), suggestion.as_ref().map(|s| format!(", did you mean '{}'?", DiagnosticText::new(s))).unwrap_or_default())]
     UnknownAttribute {
         name: String,
         suggestion: Option<String>,
     },
 
-    #[error("Unknown field '{}' in {}{}", ProviderText::new(field), ProviderText::new(struct_name), suggestion.as_ref().map(|s| format!(", did you mean '{}'?", ProviderText::new(s))).unwrap_or_default())]
+    #[error("Unknown field '{}' in {}{}", DiagnosticText::new(field), DiagnosticText::new(struct_name), suggestion.as_ref().map(|s| format!(", did you mean '{}'?", DiagnosticText::new(s))).unwrap_or_default())]
     UnknownStructField {
         struct_name: String,
         field: String,
@@ -6878,7 +6878,7 @@ pub enum TypeError {
 
     #[error(
         "{}",
-        ProviderText::new(format_union_struct_mismatch(reason, supplied_fields, alternatives))
+        DiagnosticText::new(format_union_struct_mismatch(reason, supplied_fields, alternatives))
     )]
     UnionStructMismatch {
         /// Classification consumed by the concise renderer.
@@ -6898,13 +6898,13 @@ pub enum TypeError {
     #[error("List item at index {index}: {inner}")]
     ListItemError { index: usize, inner: Box<TypeError> },
 
-    #[error("Map key '{}': {inner}", ProviderText::new(key))]
+    #[error("Map key '{}': {inner}", DiagnosticText::new(key))]
     MapKeyError { key: String, inner: Box<TypeError> },
 
-    #[error("Map value for key '{}': {inner}", ProviderText::new(key))]
+    #[error("Map value for key '{}': {inner}", DiagnosticText::new(key))]
     MapValueError { key: String, inner: Box<TypeError> },
 
-    #[error("Struct field '{}': {inner}", ProviderText::new(field))]
+    #[error("Struct field '{}': {inner}", DiagnosticText::new(field))]
     StructFieldError {
         field: String,
         inner: Box<TypeError>,
@@ -6912,7 +6912,7 @@ pub enum TypeError {
 
     #[error(
         "'{0}' cannot use block syntax; use map assignment: {0} = {{ ... }}",
-        ProviderText::new(attribute)
+        DiagnosticText::new(attribute)
     )]
     BlockSyntaxNotAllowed { attribute: String },
 }
@@ -7282,7 +7282,7 @@ pub struct CompletionValue {
     /// The value to insert (e.g., "aws.vpc.InstanceTenancy.default")
     pub value: String,
     /// Description shown in completion popup
-    pub description: ProviderText,
+    pub description: DiagnosticText,
 }
 
 /// Canonical name of a field in a struct-valued schema node.
@@ -7341,7 +7341,7 @@ impl CompletionValue {
     pub fn new(value: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
             value: value.into(),
-            description: ProviderText::new(description),
+            description: DiagnosticText::new(description),
         }
     }
 }
@@ -7423,7 +7423,7 @@ pub struct PatternAttributeSchema<R: PatternForm = Draft> {
     /// Whether user input for this attribute is optional, required, or forbidden.
     pub(crate) input_mode: InputMode,
     pub(crate) default: Option<Value>,
-    pub(crate) description: Option<ProviderText>,
+    pub(crate) description: Option<DiagnosticText>,
     /// Completion values for this attribute (used by LSP)
     pub(crate) completions: Option<Vec<CompletionValue>>,
     /// Provider-side property name (e.g., "VpcId" for AWS Cloud Control)
@@ -7673,7 +7673,7 @@ macro_rules! impl_user_input_attribute_builder {
             }
 
             pub fn with_description(mut self, description: impl Into<String>) -> Self {
-                self.attribute.description = Some(ProviderText::new(description));
+                self.attribute.description = Some(DiagnosticText::new(description));
                 self
             }
 
@@ -7779,7 +7779,7 @@ impl<R: PatternForm> CreateOnlyOptionalAttributeSchemaBuilder<R> {
 
 impl<R: PatternForm> ProviderPopulatedAttributeSchemaBuilder<R> {
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
-        self.attribute.description = Some(ProviderText::new(description));
+        self.attribute.description = Some(DiagnosticText::new(description));
         self
     }
 
@@ -7820,13 +7820,13 @@ pub enum SchemaKind {
 pub enum AttributePathTypeError {
     #[error("attribute path cannot be empty")]
     Empty,
-    #[error("unknown top-level attribute `{}`", ProviderText::new(attribute))]
+    #[error("unknown top-level attribute `{}`", DiagnosticText::new(attribute))]
     UnknownAttribute { attribute: String },
     #[error(
         "unknown field `{}` on struct `{}` after `{}`",
-        ProviderText::new(field),
-        ProviderText::new(struct_name),
-        ProviderText::new(parent_path)
+        DiagnosticText::new(field),
+        DiagnosticText::new(struct_name),
+        DiagnosticText::new(parent_path)
     )]
     UnknownStructField {
         parent_path: String,
@@ -7835,8 +7835,8 @@ pub enum AttributePathTypeError {
     },
     #[error(
         "cannot traverse `{}` because it has type {}; only struct fields and map values can be traversed",
-        ProviderText::new(path),
-        ProviderText::new(type_name)
+        DiagnosticText::new(path),
+        DiagnosticText::new(type_name)
     )]
     CannotTraverse { path: String, type_name: String },
 }
@@ -7943,7 +7943,7 @@ pub struct PatternResourceSchema<R: PatternForm = Draft> {
     pub(crate) resource_type: String,
     pub(crate) attributes: BTreeMap<String, PatternAttributeSchema<R>>,
     duplicate_attributes: Vec<String>,
-    pub(crate) description: Option<ProviderText>,
+    pub(crate) description: Option<DiagnosticText>,
     /// Cross-attribute validation, including its fingerprintable source.
     pub(crate) validation: ResourceValidation,
     /// Scoped desired-input rules; only classified write sites may evaluate them.
@@ -8029,8 +8029,8 @@ impl ResourceValidation {
 /// `field_groups[0]` or `defs.Tag.key` as a resource attribute.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SchemaValidationIssueLocation {
-    Attribute(ProviderString),
-    Definition(ProviderString),
+    Attribute(ProviderKey),
+    Definition(ProviderKey),
     FieldGroup(usize),
     InputRule(usize),
     UniqueName,
@@ -8092,8 +8092,8 @@ struct SchemaDefinitionIssue {
     input_rule_error: Option<InputRuleError>,
     pattern_error: Option<PatternCompileError>,
     location: SchemaValidationIssueLocation,
-    path: ProviderString,
-    message: ProviderText,
+    path: ProviderKey,
+    message: DiagnosticText,
 }
 
 impl fmt::Display for SchemaDefinitionIssue {
@@ -8115,7 +8115,7 @@ fn fmt_schema_issues(issues: &[SchemaDefinitionIssue], f: &mut fmt::Formatter<'_
 /// Error returned when a resource-schema draft fails whole-schema validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourceSchemaValidationError {
-    resource_type: ProviderString,
+    resource_type: ProviderKey,
     issues: Vec<SchemaDefinitionIssue>,
 }
 
@@ -9220,13 +9220,13 @@ impl fmt::Display for ProviderSchemaValidationError {
             Self::BuiltinTypeCollision { identity } => write!(
                 formatter,
                 "custom type `{identity}` conflicts with the built-in declaration; use the core types constructor (including its scalar kind and validator) or choose a different identity",
-                identity = ProviderText::new(identity.to_string())
+                identity = DiagnosticText::new(identity.to_string())
             ),
             Self::MissingScalarKind { identity } => {
                 write!(
                     formatter,
                     "custom type `{identity}` has no scalar bridge kind",
-                    identity = ProviderText::new(identity.to_string())
+                    identity = DiagnosticText::new(identity.to_string())
                 )
             }
             Self::ConflictingScalarKinds {
@@ -9236,12 +9236,12 @@ impl fmt::Display for ProviderSchemaValidationError {
             } => write!(
                 formatter,
                 "custom type `{identity}` is bound to both {first_kind} and {second_kind} within one provider",
-                identity = ProviderText::new(identity.to_string())
+                identity = DiagnosticText::new(identity.to_string())
             ),
             Self::DanglingReferenceForm { identity } => write!(
                 formatter,
                 "reference form identity `{identity}` is not declared by this provider",
-                identity = ProviderText::new(identity.to_string())
+                identity = DiagnosticText::new(identity.to_string())
             ),
             Self::NonStringReferenceForm {
                 identity,
@@ -9249,27 +9249,27 @@ impl fmt::Display for ProviderSchemaValidationError {
             } => write!(
                 formatter,
                 "reference form identity `{identity}` is declared as {declaration}, not refined String",
-                identity = ProviderText::new(identity.to_string())
+                identity = DiagnosticText::new(identity.to_string())
             ),
             Self::DanglingAssignabilityEndpoint { identity } => write!(
                 formatter,
                 "assignability endpoint `{}` is not declared by this provider",
-                ProviderText::new(identity.to_string())
+                DiagnosticText::new(identity.to_string())
             ),
             Self::EnumAssignabilityEndpoint { identity } => write!(
                 formatter,
                 "assignability endpoint `{}` is an Enum; only provider-defined scalar String, Int, or Float identities are supported",
-                ProviderText::new(identity.to_string())
+                DiagnosticText::new(identity.to_string())
             ),
             Self::ReferenceAssignabilityEndpoint { identity } => write!(
                 formatter,
                 "assignability endpoint `{}` is a Reference; only provider-defined scalar String, Int, or Float identities are supported",
-                ProviderText::new(identity.to_string())
+                DiagnosticText::new(identity.to_string())
             ),
             Self::BuiltinAssignabilityEndpoint { identity } => write!(
                 formatter,
                 "assignability endpoint `{}` is a core built-in identity; only provider-defined scalar String, Int, or Float identities are supported",
-                ProviderText::new(identity.to_string())
+                DiagnosticText::new(identity.to_string())
             ),
             Self::AssignabilityScalarKindMismatch {
                 source,
@@ -9279,24 +9279,24 @@ impl fmt::Display for ProviderSchemaValidationError {
             } => write!(
                 formatter,
                 "assignability edge `{} -> {}` has different scalar kinds: {source_kind} and {sink_kind}",
-                ProviderText::new(source.to_string()),
-                ProviderText::new(sink.to_string())
+                DiagnosticText::new(source.to_string()),
+                DiagnosticText::new(sink.to_string())
             ),
             Self::SelfAssignabilityEdge { identity } => write!(
                 formatter,
                 "assignability edge for `{}` points to itself",
-                ProviderText::new(identity.to_string())
+                DiagnosticText::new(identity.to_string())
             ),
             Self::DuplicateAssignabilityEdge { source, sink } => write!(
                 formatter,
                 "duplicate assignability edge `{} -> {}`",
-                ProviderText::new(source.to_string()),
-                ProviderText::new(sink.to_string())
+                DiagnosticText::new(source.to_string()),
+                DiagnosticText::new(sink.to_string())
             ),
             Self::AssignabilityCycle { cycle } => write!(
                 formatter,
                 "assignability cycle: {}",
-                ProviderText::new(
+                DiagnosticText::new(
                     cycle
                         .iter()
                         .map(ToString::to_string)
@@ -9756,7 +9756,7 @@ fn push_schema_issue(
         pattern_error: None,
         path: location.raw_path().into(),
         location: location.clone(),
-        message: ProviderText::new(message),
+        message: DiagnosticText::new(message),
     });
 }
 
@@ -11330,7 +11330,7 @@ impl<R: PatternForm> PatternResourceSchema<R> {
     }
 
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
-        self.description = Some(ProviderText::new(desc));
+        self.description = Some(DiagnosticText::new(desc));
         self
     }
 
@@ -11588,9 +11588,9 @@ impl fmt::Display for BlockNameConflict {
         write!(
             f,
             "{}: cannot use both '{}' and '{}' (they refer to the same attribute)",
-            ProviderText::new(&self.resource_id),
-            ProviderText::new(&self.alias),
-            ProviderText::new(&self.canonical)
+            DiagnosticText::new(&self.resource_id),
+            DiagnosticText::new(&self.alias),
+            DiagnosticText::new(&self.canonical)
         )
     }
 }
@@ -13838,12 +13838,12 @@ impl fmt::Display for SchemaRegistryError {
             } => write!(
                 formatter,
                 "schema owner `{}` has conflicting witness-backed reference-form tables",
-                ProviderText::new(owner)
+                DiagnosticText::new(owner)
             ),
             Self::ConflictingAssignabilityEdges { owner } => write!(
                 formatter,
                 "schema owner `{}` has conflicting witness-backed assignability edges",
-                ProviderText::new(owner)
+                DiagnosticText::new(owner)
             ),
         }
     }

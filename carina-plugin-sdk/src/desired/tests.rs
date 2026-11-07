@@ -1,3 +1,4 @@
+use crate::provider_text_fixtures::*;
 async fn with_type_checks<T>(
     producer: impl for<'s> AsyncFnOnce(
         &'s carina_core::validation::deferred_types::TypeCheckSession<'s>,
@@ -17,10 +18,13 @@ async fn with_type_checks<T>(
 use super::*;
 use carina_core::protocol_convert::ProtocolConvertError;
 use carina_core::resource::{ApplyTimeUnknown, ConcreteValue, DeferredValue, Value};
-use std::error::Error;
 
-fn native_cause(error: &NativeProviderError) -> &DesiredNormalizationError {
-    error.detail().cause().unwrap().downcast_ref().unwrap()
+fn native_cause(
+    error: &NativeProviderError,
+) -> carina_core::provider_text::RedactedNormalizationCause<'_> {
+    // Keep the fixture boundary alive while existing assertions inspect its typed source.
+    let host = Box::leak(Box::new(error.clone().into_host_for_test()));
+    host.detail().cause().unwrap().normalization().unwrap()
 }
 
 fn string(value: &str) -> Value {

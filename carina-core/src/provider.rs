@@ -24,14 +24,19 @@ pub use carina_provider_protocol::types::{
     AppliedIdentifier, CreateProgress, EmptyAppliedIdentifier, PendingToken, ReferenceScope,
     ReferenceScopeError, ReferenceScopeField, ReferenceScopeValues, Sent,
 };
-use carina_provider_protocol::types::{
+pub use carina_provider_protocol::types::{
     ProviderError as WireProviderError, ProviderErrorKind as WireProviderErrorKind,
 };
 
 use crate::binding_index::SecretPreservingAttributes;
 use crate::effect::PlanOp;
 use crate::parser::{ProviderConfig, StateBlockAddress};
-use crate::provider_text::{ProviderDiagnostic, ProviderString, ProviderText};
+#[cfg(test)]
+use crate::provider_text::OpaqueFixtureDisplay as _;
+use crate::provider_text::{
+    Bound, Diagnostic, DiagnosticSource, DiagnosticText, ErrorText, ProviderDiagnostic,
+    ProviderErrorText, ProviderKey, ProviderText, RedactionSet, TextState, Unbound,
+};
 pub use crate::resource::ProviderDirectiveSchema;
 use crate::resource::{
     CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker, PendingReRead,
@@ -52,6 +57,12 @@ use crate::value::{
 use crate::wait::BindingPattern;
 use crate::wait::predicate::AttrPath;
 
+#[cfg(test)]
+pub(crate) use crate::provider_text::boundary::prepare_provider_session;
+pub use crate::provider_text::boundary::{
+    ProviderBoundary, ProviderPlan, ProviderSession, ProviderValidationInputs,
+};
+
 pub use crate::executor::provider_ready::{
     CanonicalProviderConfigAttributes, ProviderReady, ProviderReadyConfig, ProviderReadyDataSource,
     ProviderReadyResource,
@@ -67,6 +78,32 @@ pub use crate::provider_wire::{
 pub(crate) fn fixture_applied_identifier(identifier: impl Into<String>) -> AppliedIdentifier {
     AppliedIdentifier::new(identifier).expect("fixture provider identifier must be non-empty")
 }
+
+pub type ProviderError = ProviderFailure<Unbound>;
+pub type HostError = ProviderFailure<Bound>;
+pub type ErrorDetail = OperationErrorDetail<Unbound>;
+pub type HostErrorDetail = OperationErrorDetail<Bound>;
+pub type ProviderErrorResourceId = ErrorResourceId<Unbound>;
+pub type HostCreateOutcome = CreateOutcome<Bound>;
+pub type HostCreateOutcomeKind = CreateOutcomeKind<Bound>;
+pub type HostUpdateOutcome = UpdateOutcome<Bound>;
+pub type HostUpdateOutcomeKind = UpdateOutcomeKind<Bound>;
+pub type HostPartialReadDiagnostic = PartialReadDiagnostic<Bound>;
+pub type HostCreateObservation = CreateObservation<Bound>;
+pub type HostUnobservedReason = UnobservedReason<Bound>;
+pub type HostIdentifiedCreate = IdentifiedCreate<Bound>;
+pub type HostCreateFailure = CreateFailure<Bound>;
+pub type HostCreateFailureKind = CreateFailureKind<Bound>;
+pub type HostResumeOutcome = ResumeOutcome<Bound>;
+pub type HostResumeOutcomeKind = ResumeOutcomeKind<Bound>;
+pub type HostCompletedResume = CompletedResume<Bound>;
+pub type HostPartialResume = PartialResume<Bound>;
+pub type HostResumeFailure = ResumeFailure<Bound>;
+pub type HostResumeFailureKind = ResumeFailureKind<Bound>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("provider reported a missing attribute absent from the resource schema")]
+pub struct UnknownMissingAttribute;
 
 /// Contextual metadata attached to every [`ProviderError`] variant.
 ///
@@ -88,17 +125,18 @@ pub(crate) fn fixture_applied_identifier(identifier: impl Into<String>) -> Appli
 ///     ..ErrorDetail::default()
 /// };
 /// ```
-#[derive(Debug, Default)]
-pub struct ErrorDetail {
+#[derive(Default, Clone)]
+pub struct OperationErrorDetail<S: TextState = Unbound> {
     /// Human-readable message.
-    message: ProviderText,
+    message: ErrorText<S>,
     /// Retry policy captured before diagnostic text is escaped or truncated.
     throttling: ThrottlingClassification,
+    pub transient: bool,
     /// Resource the error pertains to, if known.
-    pub resource_id: Option<Box<ProviderErrorResourceId>>,
+    pub resource_id: Option<Box<ErrorResourceId<S>>>,
     /// Underlying terminal cause. Flattened to a string when the error crosses
     /// the WIT boundary.
-    cause: Option<ProviderDiagnostic>,
+    cause: Option<Diagnostic<S>>,
     /// Host-side policy marker. This is deliberately not transported over the
     /// provider protocol because guests cannot originate host lifecycle state.
     host_cause: Option<HostErrorCause>,
@@ -107,14 +145,14 @@ pub struct ErrorDetail {
     /// where the name is known but no specific resource is in scope.
     /// Display ignores this field; CLI renderers can read it to label
     /// structured output.
-    pub provider_name: Option<ProviderText>,
+    pub provider_name: Option<ErrorText<S>>,
     /// Service-qualified cloud-API operation that failed, e.g.
     /// `"iam.ListRoles"`, `"s3.HeadBucket"`. Populating this field —
     /// or any of the sibling `status` / `code` / `request_id`
     /// fields — flips `Display` into the multi-line, labeled render
     /// shape introduced in carina#3242; see
     /// [`ErrorDetail::has_structured_cloud_fields`] for the exact gate.
-    pub operation: Option<ProviderText>,
+    pub operation: Option<ErrorText<S>>,
     /// HTTP status code from the cloud-API response, when the error
     /// came from an HTTP-based service call.
     pub status: Option<u16>,
@@ -123,18 +161,38 @@ pub struct ErrorDetail {
     /// share a status (HTTP 403 covers `AccessDenied`,
     /// `InvalidAccessKeyId`, `SignatureDoesNotMatch`, etc.), so both
     /// belong in the rendered output.
-    code: Option<ProviderText>,
+    code: Option<ErrorText<S>>,
     /// Correlation id from the cloud-API response (AWS
     /// `x-amzn-RequestId`, GCP `X-Goog-Request-Id`, Azure
     /// `x-ms-request-id`, …). Operators paste this into support
     /// tickets so the provider can look up server-side logs.
-    pub request_id: Option<ProviderText>,
+    pub request_id: Option<ErrorText<S>>,
 }
 
-#[derive(Debug, Default)]
+impl<S: TextState> fmt::Debug for OperationErrorDetail<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !S::BOUND {
+            return f.write_str("ErrorDetail(<provider text>)");
+        }
+        f.debug_struct("ErrorDetail")
+            .field("message", &self.message)
+            .field("resource_id", &self.resource_id)
+            .field("cause", &self.cause)
+            .field("provider_name", &self.provider_name)
+            .field("operation", &self.operation)
+            .field("status", &self.status)
+            .field("code", &self.code)
+            .field("request_id", &self.request_id)
+            .finish()
+    }
+}
+
+#[derive(Debug, Default, Clone)]
 struct ThrottlingClassification {
     message_or_cause: bool,
     code: bool,
+    delete_dependency: bool,
+    dependency_code: bool,
 }
 
 impl ThrottlingClassification {
@@ -143,6 +201,9 @@ impl ThrottlingClassification {
             message_or_cause: has_throttling_marker(message)
                 || cause.is_some_and(has_throttling_marker),
             code: code.is_some_and(has_throttling_marker),
+            delete_dependency: has_delete_dependency_marker(message)
+                || cause.is_some_and(has_delete_dependency_marker),
+            dependency_code: code.is_some_and(has_delete_dependency_marker),
         }
     }
 
@@ -151,41 +212,57 @@ impl ThrottlingClassification {
     }
 }
 
-fn has_throttling_marker(text: &str) -> bool {
+pub(crate) fn has_throttling_marker(text: &str) -> bool {
     text.contains("ThrottlingException") || text.contains("Rate exceeded")
 }
 
+pub(crate) fn has_delete_dependency_marker(text: &str) -> bool {
+    [
+        "DependencyViolation",
+        "has dependent object",
+        "has a dependent object",
+        "resource has dependencies",
+        "mapped public address",
+        "Failed to detach",
+    ]
+    .iter()
+    .any(|pattern| text.contains(pattern))
+}
+
 /// Original resource identity with a sanitized diagnostic header.
-#[derive(PartialEq, Eq)]
-pub struct ProviderErrorResourceId(ResourceId);
+#[derive(Clone)]
+pub struct ErrorResourceId<S: TextState = Unbound> {
+    id: ResourceId,
+    text: ErrorText<S>,
+}
 
-impl ProviderErrorResourceId {
-    /// Borrow the original id for identity comparisons and wire encoding.
+impl<S: TextState> PartialEq for ErrorResourceId<S> {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl<S: TextState> Eq for ErrorResourceId<S> {}
+impl<S: TextState> ErrorResourceId<S> {
+    /// Borrow the semantic identity for matching; diagnostic formatting uses
+    /// the separately protected provider text.
     pub fn as_resource_id(&self) -> &ResourceId {
-        &self.0
+        &self.id
     }
 }
-
-impl From<ResourceId> for ProviderErrorResourceId {
+impl<S: TextState> From<ResourceId> for ErrorResourceId<S> {
     fn from(id: ResourceId) -> Self {
-        Self(id)
+        let text = ErrorText::<S>::new(format!("{}.{}", id.resource_type, id.identity_display()));
+        Self { id, text }
     }
 }
-
-impl std::fmt::Display for ProviderErrorResourceId {
+impl std::fmt::Display for ErrorResourceId<Bound> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        ProviderText::new(format!(
-            "{}.{}",
-            self.0.resource_type,
-            self.0.identity_display()
-        ))
-        .fmt(f)
+        self.text.fmt(f)
     }
 }
-
-impl std::fmt::Debug for ProviderErrorResourceId {
+impl<S: TextState> std::fmt::Debug for ErrorResourceId<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        std::fmt::Debug::fmt(&self.to_string(), f)
+        std::fmt::Debug::fmt(&self.text, f)
     }
 }
 /// Host-only classification for errors produced by provider lifecycle policy.
@@ -255,154 +332,236 @@ pub enum ProviderErrorKind {
 ///     std::io::Error::other("x"),
 /// );
 /// ```
-#[derive(Debug)]
-pub enum ProviderError {
+#[derive(Debug, Clone)]
+pub enum ProviderFailure<S: TextState = Unbound> {
     /// User-supplied input is invalid (bad attribute value, schema
     /// violation, configuration mismatch). Not retriable.
-    InvalidInput(Box<ErrorDetail>),
+    InvalidInput(Box<OperationErrorDetail<S>>),
     /// The cloud API rejected the request (HTTP 4xx/5xx, server-side
     /// error). May be retriable depending on the cause.
-    ApiError(Box<ErrorDetail>),
+    ApiError(Box<OperationErrorDetail<S>>),
     /// Resource was not found at the cloud API. `read` returns this
     /// instead of an empty state when the underlying resource has been
     /// deleted out-of-band. `delete` returns this when the resource is
     /// already gone.
-    NotFound(Box<ErrorDetail>),
+    NotFound(Box<OperationErrorDetail<S>>),
     /// Operation timed out before completing. Retriable with backoff.
-    Timeout(Box<ErrorDetail>),
+    Timeout(Box<OperationErrorDetail<S>>),
     /// Provider-internal failure (panic, unexpected state, missing
     /// schema entry, etc.). Should be escalated as a bug rather than
     /// retried.
-    Internal(Box<ErrorDetail>),
+    Internal(Box<OperationErrorDetail<S>>),
 }
 
-impl std::fmt::Display for ProviderError {
+impl std::fmt::Display for ProviderFailure<Bound> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let detail = self.detail();
-
-        // Header line: always the `[type.name] message` form when a
-        // resource id is attached, plain message otherwise. Shared
-        // between the structured multi-line render and the single-line
-        // cause render so non-AWS errors keep the same shape.
-        if let Some(ref id) = detail.resource_id {
-            write!(f, "[{id}] {}", detail.context())?;
-        } else {
-            write!(f, "{}", detail.context())?;
-        }
-
-        // carina#3242: when any of the structured cloud-API fields are
-        // populated, render the multi-line labeled shape and skip the
-        // single-line cause form (the structured fields carry the same
-        // information without the SDK-internal scaffolding). When all
-        // four are `None`, fall through to the single-line cause form so
-        // non-cloud errors render
-        // exactly as they did before.
-        if detail.has_structured_cloud_fields() {
-            return render_structured_cloud_fields(f, detail);
-        }
-
-        // Construction captures and sanitizes the complete typed cause chain.
-        // The original typed cause remains available for inspection.
-        if let Some(cause) = &detail.cause {
-            write!(f, ": {cause}")?;
-        }
-        Ok(())
+        DiagnosticText::new(self.host_diagnostic_text()).fmt(f)
     }
 }
+impl std::error::Error for ProviderFailure<Bound> {}
 
-/// Render the multi-line, labeled cloud-API error shape introduced in
-/// carina#3242. The header line has already been written by the caller;
-/// this function writes only the indented label lines that follow.
-///
-/// Field order is fixed: `operation`, then `status`/`code` (combined on
-/// one line because they're semantically a pair), then `request_id`,
-/// then `cause` if present. Optional fields are skipped entirely when
-/// absent — no placeholder `(unknown)` lines.
-///
-/// `cause` is appended **even when the structured fields are present**
-/// because transport-level failures (DNS, TLS handshake, network
-/// timeout) carry their diagnostic only in the terminal cause — there was
-/// no HTTP response, so `status` / `code` / `request_id` aren't set,
-/// but `operation` may still be. Without appending `cause`, the
-/// operator would see `[s3.Bucket.foo] Failed / operation: s3.HeadBucket`
-/// with no hint that the underlying error was `connection refused`.
-fn render_structured_cloud_fields(
-    f: &mut std::fmt::Formatter<'_>,
-    detail: &ErrorDetail,
-) -> std::fmt::Result {
-    if let Some(ref op) = detail.operation {
-        write!(f, "\n  operation: {op}")?;
-    }
-    match (detail.status, detail.code.as_deref()) {
-        (Some(s), Some(c)) => write!(f, "\n  status: {s} {c}")?,
-        (Some(s), None) => write!(f, "\n  status: {s}")?,
-        (None, Some(c)) => write!(f, "\n  code: {c}")?,
-        (None, None) => {}
-    }
-    if let Some(ref id) = detail.request_id {
-        write!(f, "\n  request_id: {id}")?;
-    }
-    if let Some(cause) = &detail.cause {
-        write!(f, "\n  cause: {cause}")?;
-    }
-    Ok(())
-}
-
-// `ProviderError` is a terminal diagnostic: Display renders its complete
-// typed cause. Exposing that cause again through Error::source would
-// make every ordinary chain walker repeat it. The typed cause remains
-// available through `detail().cause()` and is flattened by `to_wire()`.
-impl std::error::Error for ProviderError {}
-
-impl From<crate::value::EnumCanonicalizationError> for ProviderError {
+impl<S: TextState> From<crate::value::EnumCanonicalizationError> for ProviderFailure<S> {
     fn from(error: crate::value::EnumCanonicalizationError) -> Self {
-        Self::invalid_input_caused_by("Failed to canonicalize enum value", error)
+        Self::from_diagnostic(
+            ProviderErrorKind::InvalidInput,
+            "Failed to canonicalize enum value",
+            Diagnostic::capture_host_or_provider(error),
+        )
     }
 }
 
-impl ProviderError {
+impl<S: TextState> ProviderFailure<S> {
+    pub(crate) fn diagnostic_text(&self) -> ProviderText {
+        let detail = self.detail();
+        let mut text = ProviderText::default();
+        if let Some(id) = &detail.resource_id {
+            text.append_host("[");
+            text.append(&id.text.opaque());
+            text.append_host("] ");
+        }
+        text.append(&detail.message.opaque());
+        if detail.has_structured_cloud_fields() {
+            if let Some(operation) = &detail.operation {
+                text.append_host("\n  operation: ");
+                text.append(&operation.opaque());
+            }
+            match (detail.status, &detail.code) {
+                (Some(status), Some(code)) => {
+                    text.append_host("\n  status: ");
+                    text.append_status(status);
+                    text.append_host(" ");
+                    text.append(&code.opaque());
+                }
+                (Some(status), None) => {
+                    text.append_host("\n  status: ");
+                    text.append_status(status);
+                }
+                (None, Some(code)) => {
+                    text.append_host("\n  code: ");
+                    text.append(&code.opaque());
+                }
+                _ => {}
+            }
+            if let Some(request_id) = &detail.request_id {
+                text.append_host("\n  request_id: ");
+                text.append(&request_id.opaque());
+            }
+            if let Some(cause) = &detail.cause {
+                text.append_host("\n  cause: ");
+                text.append(&cause.opaque());
+            }
+        } else if let Some(cause) = &detail.cause {
+            text.append_host(": ");
+            text.append(&cause.opaque());
+        }
+        text
+    }
+    pub(crate) fn segmented_text(&self) -> ErrorText<S> {
+        let detail = self.detail();
+        let mut text = ErrorText::<S>::default();
+        if let Some(id) = &detail.resource_id {
+            text.append_host("[");
+            text.append(&id.text);
+            text.append_host("] ");
+        }
+        text.append(&detail.message);
+        if detail.has_structured_cloud_fields() {
+            if let Some(operation) = &detail.operation {
+                text.append_host("\n  operation: ");
+                text.append(operation);
+            }
+            if let Some(status) = detail.status {
+                text.append_host(format!("\n  status: {status}"));
+            }
+            if let Some(code) = &detail.code {
+                text.append_host(if detail.status.is_some() {
+                    " "
+                } else {
+                    "\n  code: "
+                });
+                text.append(code);
+            }
+            if let Some(request_id) = &detail.request_id {
+                text.append_host("\n  request_id: ");
+                text.append(request_id);
+            }
+            if let Some(cause) = &detail.cause {
+                text.append_host("\n  cause: ");
+                text.append(cause.text());
+            }
+        } else if let Some(cause) = &detail.cause {
+            text.append_host(": ");
+            text.append(cause.text());
+        }
+        text
+    }
+    fn host_diagnostic_text(&self) -> String {
+        let detail = self.detail();
+        let mut text = String::new();
+        if let Some(id) = &detail.resource_id {
+            text.push('[');
+            text.push_str(id.text.redacted_str());
+            text.push_str("] ");
+        }
+        text.push_str(detail.message.redacted_str());
+        if detail.has_structured_cloud_fields() {
+            if let Some(operation) = &detail.operation {
+                text.push_str("\n  operation: ");
+                text.push_str(operation.redacted_str());
+            }
+            match (detail.status, &detail.code) {
+                (Some(status), Some(code)) => {
+                    text.push_str(&format!("\n  status: {} ", status));
+                    text.push_str(code.redacted_str());
+                }
+                (Some(status), None) => text.push_str(&format!("\n  status: {}", status)),
+                (None, Some(code)) => {
+                    text.push_str("\n  code: ");
+                    text.push_str(code.redacted_str());
+                }
+                _ => {}
+            }
+            if let Some(request_id) = &detail.request_id {
+                text.push_str("\n  request_id: ");
+                text.push_str(request_id.redacted_str());
+            }
+            if let Some(cause) = &detail.cause {
+                text.push_str("\n  cause: ");
+                text.push_str(cause.redacted_str());
+            }
+        } else if let Some(cause) = &detail.cause {
+            text.push_str(": ");
+            text.push_str(cause.redacted_str());
+        }
+        text
+    }
+
+    /// Preserve an already captured opaque source instead of formatting it.
+    pub fn from_diagnostic(
+        kind: ProviderErrorKind,
+        context: &'static str,
+        cause: Diagnostic<S>,
+    ) -> Self {
+        let detail = Box::new(OperationErrorDetail::from_diagnostic(context, cause));
+        match kind {
+            ProviderErrorKind::InvalidInput => Self::InvalidInput(detail),
+            ProviderErrorKind::ApiError => Self::ApiError(detail),
+            ProviderErrorKind::NotFound => Self::NotFound(detail),
+            ProviderErrorKind::Timeout => Self::Timeout(detail),
+            ProviderErrorKind::Internal => Self::Internal(detail),
+        }
+    }
+
     /// Borrow the inner [`ErrorDetail`] regardless of variant.
-    pub fn detail(&self) -> &ErrorDetail {
+    pub fn detail(&self) -> &OperationErrorDetail<S> {
         match self {
-            ProviderError::InvalidInput(d)
-            | ProviderError::ApiError(d)
-            | ProviderError::NotFound(d)
-            | ProviderError::Timeout(d)
-            | ProviderError::Internal(d) => d,
+            ProviderFailure::InvalidInput(d)
+            | ProviderFailure::ApiError(d)
+            | ProviderFailure::NotFound(d)
+            | ProviderFailure::Timeout(d)
+            | ProviderFailure::Internal(d) => d,
         }
     }
 
     /// Mutably borrow the inner [`ErrorDetail`] regardless of variant.
-    pub fn detail_mut(&mut self) -> &mut ErrorDetail {
+    pub fn detail_mut(&mut self) -> &mut OperationErrorDetail<S> {
         match self {
-            ProviderError::InvalidInput(d)
-            | ProviderError::ApiError(d)
-            | ProviderError::NotFound(d)
-            | ProviderError::Timeout(d)
-            | ProviderError::Internal(d) => d,
+            ProviderFailure::InvalidInput(d)
+            | ProviderFailure::ApiError(d)
+            | ProviderFailure::NotFound(d)
+            | ProviderFailure::Timeout(d)
+            | ProviderFailure::Internal(d) => d,
         }
     }
 
     /// Variant name as a static string (used by serialization layers).
     pub fn variant_name(&self) -> &'static str {
         match self {
-            ProviderError::InvalidInput(_) => "invalid_input",
-            ProviderError::ApiError(_) => "api_error",
-            ProviderError::NotFound(_) => "not_found",
-            ProviderError::Timeout(_) => "timeout",
-            ProviderError::Internal(_) => "internal",
+            ProviderFailure::InvalidInput(_) => "invalid_input",
+            ProviderFailure::ApiError(_) => "api_error",
+            ProviderFailure::NotFound(_) => "not_found",
+            ProviderFailure::Timeout(_) => "timeout",
+            ProviderFailure::Internal(_) => "internal",
         }
     }
 
     /// Typed error classification for retry and diagnostic policy.
     pub const fn kind(&self) -> ProviderErrorKind {
         match self {
-            ProviderError::InvalidInput(_) => ProviderErrorKind::InvalidInput,
-            ProviderError::ApiError(_) => ProviderErrorKind::ApiError,
-            ProviderError::NotFound(_) => ProviderErrorKind::NotFound,
-            ProviderError::Timeout(_) => ProviderErrorKind::Timeout,
-            ProviderError::Internal(_) => ProviderErrorKind::Internal,
+            ProviderFailure::InvalidInput(_) => ProviderErrorKind::InvalidInput,
+            ProviderFailure::ApiError(_) => ProviderErrorKind::ApiError,
+            ProviderFailure::NotFound(_) => ProviderErrorKind::NotFound,
+            ProviderFailure::Timeout(_) => ProviderErrorKind::Timeout,
+            ProviderFailure::Internal(_) => ProviderErrorKind::Internal,
         }
+    }
+
+    pub fn with_transient(mut self, transient: bool) -> Self {
+        self.detail_mut().transient = transient;
+        self
+    }
+    pub fn is_transient(&self) -> bool {
+        self.detail().transient
     }
 
     /// Whether the original message, code or cause identifies throttling.
@@ -411,72 +570,69 @@ impl ProviderError {
         self.detail().throttling.is_throttled()
     }
 
+    /// Delete dependency policy is captured before diagnostic redaction.
+    pub fn is_delete_dependency(&self) -> bool {
+        self.detail().throttling.delete_dependency || self.detail().throttling.dependency_code
+    }
+
     /// User-supplied input is invalid.
     pub fn invalid_input(message: impl Into<String>) -> Self {
-        ProviderError::InvalidInput(Box::new(ErrorDetail::new(message)))
+        ProviderFailure::InvalidInput(Box::new(OperationErrorDetail::new(message)))
     }
 
     /// The cloud API rejected the request.
     pub fn api_error(message: impl Into<String>) -> Self {
-        ProviderError::ApiError(Box::new(ErrorDetail::new(message)))
+        ProviderFailure::ApiError(Box::new(OperationErrorDetail::new(message)))
     }
 
     /// Resource was not found at the cloud API.
     pub fn not_found(message: impl Into<String>) -> Self {
-        ProviderError::NotFound(Box::new(ErrorDetail::new(message)))
+        ProviderFailure::NotFound(Box::new(OperationErrorDetail::new(message)))
     }
 
     /// Operation timed out.
     pub fn timeout(message: impl Into<String>) -> Self {
-        ProviderError::Timeout(Box::new(ErrorDetail::new(message)))
+        ProviderFailure::Timeout(Box::new(OperationErrorDetail::new(message)))
     }
 
     /// Provider-internal failure / unexpected state.
     pub fn internal(message: impl Into<String>) -> Self {
-        ProviderError::Internal(Box::new(ErrorDetail::new(message)))
+        ProviderFailure::Internal(Box::new(OperationErrorDetail::new(message)))
     }
 
     /// User-supplied input is invalid because of a typed source error.
     ///
     /// `context` is deliberately static: dynamic data belongs in a typed
     /// cause, so its rendered text cannot also be copied into the message.
-    pub fn invalid_input_caused_by(
-        context: &'static str,
-        cause: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        ProviderError::InvalidInput(Box::new(ErrorDetail::caused_by(context, cause)))
+    pub fn invalid_input_caused_by(context: &'static str, cause: impl DiagnosticSource<S>) -> Self {
+        ProviderFailure::InvalidInput(Box::new(OperationErrorDetail::caused_by(context, cause)))
     }
 
     /// The cloud API rejected the request because of a typed source error.
-    pub fn api_error_caused_by(
-        context: &'static str,
-        cause: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        ProviderError::ApiError(Box::new(ErrorDetail::caused_by(context, cause)))
+    pub fn api_error_caused_by(context: &'static str, cause: impl DiagnosticSource<S>) -> Self {
+        ProviderFailure::ApiError(Box::new(OperationErrorDetail::caused_by(context, cause)))
     }
 
     /// A resource was not found because of a typed source error.
-    pub fn not_found_caused_by(
-        context: &'static str,
-        cause: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        ProviderError::NotFound(Box::new(ErrorDetail::caused_by(context, cause)))
+    pub fn not_found_caused_by(context: &'static str, cause: impl DiagnosticSource<S>) -> Self {
+        ProviderFailure::NotFound(Box::new(OperationErrorDetail::caused_by(context, cause)))
     }
 
     /// An operation timed out because of a typed source error.
-    pub fn timeout_caused_by(
-        context: &'static str,
-        cause: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        ProviderError::Timeout(Box::new(ErrorDetail::caused_by(context, cause)))
+    pub fn timeout_caused_by(context: &'static str, cause: impl DiagnosticSource<S>) -> Self {
+        ProviderFailure::Timeout(Box::new(OperationErrorDetail::caused_by(context, cause)))
     }
 
     /// A provider-internal operation failed because of a typed source error.
-    pub fn internal_caused_by(
-        context: &'static str,
-        cause: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
-        ProviderError::Internal(Box::new(ErrorDetail::caused_by(context, cause)))
+    ///
+    /// An arbitrary error cannot become bound host text through this context.
+    ///
+    /// ```compile_fail,E0277
+    /// use carina_core::provider::HostError;
+    /// let error = HostError::internal_caused_by("ctx", std::io::Error::other("guest password"));
+    /// ```
+    pub fn internal_caused_by(context: &'static str, cause: impl DiagnosticSource<S>) -> Self {
+        ProviderFailure::Internal(Box::new(OperationErrorDetail::caused_by(context, cause)))
     }
 
     /// Encode this error for the provider protocol/WIT boundary.
@@ -484,89 +640,59 @@ impl ProviderError {
     /// The complete typed cause chain is flattened into a string because the
     /// wire format cannot carry `dyn Error`. The returned type is the exact
     /// protocol record consumed by guest SDK encoders.
-    pub fn to_wire(&self) -> WireProviderError {
-        let ErrorDetail {
-            message,
-            throttling: _throttling,
-            resource_id,
-            cause,
-            host_cause: _host_cause,
-            provider_name,
-            operation,
-            status,
-            code,
-            request_id,
-        } = self.detail();
-        let kind = match self {
-            ProviderError::InvalidInput(_) => WireProviderErrorKind::InvalidInput,
-            ProviderError::ApiError(_) => WireProviderErrorKind::ApiError,
-            ProviderError::NotFound(_) => WireProviderErrorKind::NotFound,
-            ProviderError::Timeout(_) => WireProviderErrorKind::Timeout,
-            ProviderError::Internal(_) => WireProviderErrorKind::Internal,
+    fn to_wire_inner(&self) -> WireProviderError {
+        let detail = self.detail();
+        let kind = match self.kind() {
+            ProviderErrorKind::InvalidInput => WireProviderErrorKind::InvalidInput,
+            ProviderErrorKind::ApiError => WireProviderErrorKind::ApiError,
+            ProviderErrorKind::NotFound => WireProviderErrorKind::NotFound,
+            ProviderErrorKind::Timeout => WireProviderErrorKind::Timeout,
+            ProviderErrorKind::Internal => WireProviderErrorKind::Internal,
         };
-        WireProviderError {
+        let mut wire = WireProviderError {
             kind,
-            message: message.to_string(),
-            resource_id: resource_id
-                .as_deref()
-                .map(|id| crate::protocol_convert::resource_id_to_protocol(id.as_resource_id())),
-            cause: cause.as_ref().map(ToString::to_string),
-            provider_name: provider_name.as_ref().map(ToString::to_string),
-            operation: operation.as_ref().map(ToString::to_string),
-            status: *status,
-            code: code.as_ref().map(ToString::to_string),
-            request_id: request_id.as_ref().map(ToString::to_string),
+            message: String::new(),
+            resource_id: detail
+                .resource_id
+                .as_ref()
+                .filter(|_| S::BOUND || cfg!(target_arch = "wasm32"))
+                .map(|id| {
+                    let mut wire =
+                        crate::protocol_convert::resource_id_to_protocol(id.as_resource_id());
+                    if let Some(secrets) = id.text.known_secrets() {
+                        let redact = |text: String| {
+                            secrets.redact(&ProviderText::new(text)).as_str().to_owned()
+                        };
+                        wire.provider = redact(wire.provider);
+                        wire.resource_type = redact(wire.resource_type);
+                        wire.identity = redact(wire.identity);
+                    }
+                    wire
+                }),
+            cause: None,
+            provider_name: None,
+            operation: None,
+            status: detail.status,
+            code: None,
+            request_id: None,
+        };
+        crate::provider_text::ErrorWireText {
+            message: &detail.message,
+            cause: detail.cause.as_ref(),
+            provider_name: detail.provider_name.as_ref(),
+            operation: detail.operation.as_ref(),
+            code: detail.code.as_ref(),
+            request_id: detail.request_id.as_ref(),
         }
-    }
-
-    /// Decode untrusted provider data received through the protocol/WIT boundary.
-    ///
-    /// This is the only sanctioned entry point for a wire record containing
-    /// both a runtime-built message and flattened cause string. It preserves
-    /// sanitized text for diagnostics; it does not provide the static
-    /// context guarantees of the typed `*_caused_by` constructors.
-    pub fn from_wire(error: WireProviderError) -> Self {
-        let WireProviderError {
-            kind,
-            message,
-            resource_id,
-            cause,
-            provider_name,
-            operation,
-            status,
-            code,
-            request_id,
-        } = error;
-        let resource_id = resource_id
-            .map(|id| Box::new(crate::protocol_convert::protocol_to_resource_id(&id).into()));
-        let throttling =
-            ThrottlingClassification::from_raw(&message, code.as_deref(), cause.as_deref());
-        let detail = Box::new(ErrorDetail {
-            message: message.into(),
-            throttling,
-            resource_id,
-            cause: cause.map(|cause| ProviderDiagnostic::new(FlattenedWireCause(cause.into()))),
-            // Host lifecycle markers are intentionally not part of the wire
-            // record and untrusted guest errors cannot acquire one on decode.
-            host_cause: None,
-            provider_name: provider_name.map(ProviderText::new),
-            operation: operation.map(ProviderText::new),
-            status,
-            code: code.map(ProviderText::new),
-            request_id: request_id.map(ProviderText::new),
-        });
-        match kind {
-            WireProviderErrorKind::InvalidInput => ProviderError::InvalidInput(detail),
-            WireProviderErrorKind::ApiError => ProviderError::ApiError(detail),
-            WireProviderErrorKind::NotFound => ProviderError::NotFound(detail),
-            WireProviderErrorKind::Timeout => ProviderError::Timeout(detail),
-            WireProviderErrorKind::Internal => ProviderError::Internal(detail),
-        }
+        .write(&mut wire);
+        wire
     }
 
     /// Attach a resource id to the inner detail.
     pub fn for_resource(mut self, id: ResourceId) -> Self {
-        self.detail_mut().resource_id = Some(Box::new(id.into()));
+        let id: ErrorResourceId<S> = id.into();
+        self.detail_mut().resource_id = Some(Box::new(id));
+
         self
     }
 
@@ -575,7 +701,8 @@ impl ProviderError {
     /// `create_provider` / provider init failures). Used by the CLI
     /// renderer to label structured account-guard output.
     pub fn for_provider(mut self, provider_name: impl Into<String>) -> Self {
-        self.detail_mut().provider_name = Some(ProviderText::new(provider_name));
+        self.detail_mut().provider_name = Some(self.new_host_field(provider_name.into()));
+
         self
     }
 
@@ -585,13 +712,15 @@ impl ProviderError {
     /// [`Self::with_request_id`] — flips `Display` into the multi-line
     /// labeled render shape introduced in carina#3242.
     pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
-        self.detail_mut().operation = Some(ProviderText::new(operation));
+        self.detail_mut().operation = Some(self.new_host_field(operation.into()));
+
         self
     }
 
     /// Attach the HTTP status code from the cloud-API response.
     pub fn with_status(mut self, status: u16) -> Self {
         self.detail_mut().status = Some(status);
+
         self
     }
 
@@ -599,83 +728,72 @@ impl ProviderError {
     /// (e.g. `"AccessDenied"`, `"NoSuchBucket"`).
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
         let code = code.into();
+        let text = self.new_host_field(code.clone());
         let detail = self.detail_mut();
         detail.throttling.code = has_throttling_marker(&code);
-        detail.code = Some(ProviderText::new(code));
+        detail.throttling.dependency_code = has_delete_dependency_marker(&code);
+        detail.code = Some(text);
+
         self
     }
 
     /// Attach the correlation id from the cloud-API response so the
     /// operator can paste it into support tickets.
     pub fn with_request_id(mut self, request_id: impl Into<String>) -> Self {
-        self.detail_mut().request_id = Some(ProviderText::new(request_id));
+        self.detail_mut().request_id = Some(self.new_host_field(request_id.into()));
+
         self
     }
 
     /// Attach a host-only lifecycle classification.
     pub fn with_host_cause(mut self, cause: HostErrorCause) -> Self {
         self.detail_mut().host_cause = Some(cause);
+
         self
     }
 
     /// Replace only diagnostic text while preserving the error variant,
     /// structured metadata, typed cause, and host lifecycle classification.
     pub(crate) fn with_redacted_message(mut self, message: impl Into<String>) -> Self {
-        self.detail_mut().message = ProviderText::new(message);
+        self.detail_mut().message = self.new_host_field(message.into());
+
         self
+    }
+    fn new_host_field(&self, text: String) -> ErrorText<S> {
+        ErrorText::<S>::new(text)
     }
 }
 
-impl ErrorDetail {
+impl<S: TextState> OperationErrorDetail<S> {
     pub fn new(message: impl Into<String>) -> Self {
         let message = message.into();
         Self {
             throttling: ThrottlingClassification::from_raw(&message, None, None),
-            message: ProviderText::new(message),
+            message: ErrorText::<S>::new(message),
             ..Self::default()
         }
     }
 
-    fn caused_by(
-        context: &'static str,
-        cause: impl std::error::Error + Send + Sync + 'static,
-    ) -> Self {
+    fn caused_by(context: &'static str, cause: impl DiagnosticSource<S>) -> Self {
+        Self::from_diagnostic(context, Diagnostic::<S>::new(cause))
+    }
+
+    fn from_diagnostic(context: &'static str, cause: Diagnostic<S>) -> Self {
         let mut throttling = ThrottlingClassification::from_raw(context, None, None);
-        let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&cause);
-        while let Some(error) = source {
-            if let Some(diagnostic) = error.downcast_ref::<ProviderDiagnostic>() {
-                source = Some(diagnostic.error());
-                continue;
-            }
-            throttling.message_or_cause |= match error.downcast_ref::<ProviderError>() {
-                Some(error) => error.is_throttled(),
-                None => has_throttling_marker(&error.to_string()),
-            };
-            source = error.source();
-        }
+        throttling.message_or_cause |= cause.has_throttling_marker();
+        throttling.delete_dependency |= cause.has_delete_dependency_marker();
+        let message = ErrorText::<S>::new(context);
         Self {
-            message: context.into(),
+            message,
             throttling,
-            cause: Some(ProviderDiagnostic::new(cause)),
+            cause: Some(cause),
             ..Self::default()
         }
-    }
-
-    /// Static context for a caused error, or the complete message for a
-    /// message-only error.
-    pub fn context(&self) -> &str {
-        &self.message
-    }
-
-    /// Sanitized application-level code for diagnostics. Set it with
-    /// [`ProviderError::with_code`] so raw-text retry classification stays valid.
-    pub fn code(&self) -> Option<&str> {
-        self.code.as_deref()
     }
 
     /// Typed source error, when this detail was built by a cause-bearing path.
-    pub fn cause(&self) -> Option<&(dyn std::error::Error + Send + Sync + 'static)> {
-        self.cause.as_ref().map(ProviderDiagnostic::error)
+    pub fn cause(&self) -> Option<&Diagnostic<S>> {
+        self.cause.as_ref()
     }
 
     /// Host-side lifecycle classification, when the host attached one.
@@ -703,9 +821,23 @@ impl ErrorDetail {
     }
 }
 
+impl OperationErrorDetail<Bound> {
+    /// Static context for a caused error, or the complete message for a
+    /// message-only error.
+    pub fn context(&self) -> &str {
+        &self.message
+    }
+
+    /// Sanitized application-level code for diagnostics. Set it with
+    /// [`ProviderError::with_code`] so raw-text retry classification stays valid.
+    pub fn code(&self) -> Option<&str> {
+        self.code.as_deref()
+    }
+}
+
 /// Synthetic typed source for a flattened cause received over WIT.
 #[derive(Debug)]
-struct FlattenedWireCause(ProviderText);
+struct FlattenedWireCause(String);
 
 impl std::fmt::Display for FlattenedWireCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -715,7 +847,8 @@ impl std::fmt::Display for FlattenedWireCause {
 
 impl std::error::Error for FlattenedWireCause {}
 
-pub type ProviderResult<T> = Result<T, ProviderError>;
+pub type ProviderResult<T, S = Unbound> = Result<T, ProviderFailure<S>>;
+pub type HostResult<T> = ProviderResult<T, Bound>;
 
 /// Top-level desired attributes proven to have been sent by one provider
 /// operation.
@@ -931,6 +1064,7 @@ pub struct UpdateRequest {
     patch: WireReady<UpdatePatch>,
     /// Effective directives resolved from the managed resource schema.
     directives: ProviderDirectives,
+    diagnostic_values: Vec<Value>,
 }
 
 impl UpdateRequest {
@@ -942,10 +1076,22 @@ impl UpdateRequest {
     ) -> Result<Self, crate::executor::ProviderPreparationError> {
         let patch = build_update_patch(changed_attributes, resource, &from, schema)?;
         let patch = WireReady::try_new(patch, ProviderWireTarget::Resource(resource.id.clone()))?;
+        let diagnostic_values = patch
+            .as_inner()
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                PatchOp::Add { key, value }
+                | PatchOp::Replace { key, value }
+                | PatchOp::Reassert { key, value } => Some(resource.diagnostic_value(key, value)),
+                PatchOp::Remove { .. } => None,
+            })
+            .collect();
         Ok(Self {
             from,
             patch,
             directives: *resource.directives(),
+            diagnostic_values,
         })
     }
 
@@ -957,6 +1103,10 @@ impl UpdateRequest {
     /// Patch derived from the checked desired resource.
     pub fn patch(&self) -> &UpdatePatch {
         self.patch.as_inner()
+    }
+
+    pub(crate) fn diagnostic_values(&self) -> impl Iterator<Item = &Value> {
+        self.diagnostic_values.iter()
     }
 
     /// The checked projection consumed by provider transport adapters.
@@ -1156,7 +1306,7 @@ pub enum PatchOp {
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error(
     "resource '{resource}' cannot send attribute '{attribute}' because ignored write-only path '{path}' must be preserved, but its current value cannot be known",
-    resource = ProviderText::new(resource.to_string()), attribute = ProviderText::new(attribute), path = ProviderText::new(path.to_string())
+    resource = DiagnosticText::new(resource.to_string()), attribute = DiagnosticText::new(attribute), path = DiagnosticText::new(path.to_string())
 )]
 pub struct IgnoredWriteOnlyValueError {
     resource: Box<ResourceId>,
@@ -1506,7 +1656,7 @@ impl std::fmt::Display for PersistedAttributeDecodeError {
         write!(
             f,
             "{}",
-            ProviderText::new(format!(
+            DiagnosticText::new(format!(
                 "persisted attribute {:?} is not valid persisted JSON",
                 self.attribute_key
             ))
@@ -1532,7 +1682,7 @@ impl std::fmt::Display for PersistedWireValueError {
         write!(
             f,
             "{}",
-            ProviderText::new(format!(
+            DiagnosticText::new(format!(
                 "persisted wire attribute {:?} cannot be encoded",
                 self.attribute_key
             ))
@@ -2282,47 +2432,63 @@ pub(crate) fn fixture_read_outcome_for_identifier<P: StateValueLeaf>(
 /// }
 /// ```
 #[derive(Debug)]
-pub struct CreateOutcome {
-    kind: CreateOutcomeKind,
+pub struct CreateOutcome<S: TextState = Unbound> {
+    kind: CreateOutcomeKind<S>,
     read_back_end: ReadBackEnd,
 }
 
 /// Read-only classification exposed by an opaque [`CreateOutcome`].
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub enum CreateOutcomeKind {
+pub enum CreateOutcomeKind<S: TextState = Unbound> {
     /// Create completed and the returned state is complete.
     Success { state: AppliedState },
     /// Create completed but the provider could not fully observe state.
     PartialSuccess {
         state: AppliedState,
-        diagnostic: PartialReadDiagnostic,
+        diagnostic: PartialReadDiagnostic<S>,
     },
 }
 
 /// Result of a provider update operation.
 #[derive(Debug, Clone)]
-pub struct UpdateOutcome {
-    kind: UpdateOutcomeKind,
+pub struct UpdateOutcome<S: TextState = Unbound> {
+    kind: UpdateOutcomeKind<S>,
     read_back_end: ReadBackEnd,
 }
 
 /// Read-only classification exposed by an opaque [`UpdateOutcome`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum UpdateOutcomeKind {
+#[serde(bound(
+    serialize = "PartialReadDiagnostic<S>: Serialize",
+    deserialize = "PartialReadDiagnostic<S>: Deserialize<'de>"
+))]
+pub enum UpdateOutcomeKind<S: TextState = Unbound> {
     /// Update completed and the returned state is complete.
     Success { state: AppliedState },
     /// Update completed but the provider could not fully observe state.
     PartialSuccess {
         state: AppliedState,
-        diagnostic: PartialReadDiagnostic,
+        diagnostic: PartialReadDiagnostic<S>,
     },
 }
 
 /// Diagnostic details for a partial post-mutation read.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PartialReadDiagnostic {
-    pub(crate) reason: ProviderString,
-    pub(crate) missing_attributes: Vec<ProviderString>,
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(bound(
+    serialize = "ErrorText<S>: Serialize",
+    deserialize = "ErrorText<S>: Deserialize<'de>"
+))]
+pub struct PartialReadDiagnostic<S: TextState = Unbound> {
+    pub(crate) reason: ErrorText<S>,
+    pub(crate) missing_attributes: Vec<ProviderKey>,
+}
+
+impl<S: TextState> fmt::Debug for PartialReadDiagnostic<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PartialReadDiagnostic")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Validated UTC RFC3339 timestamp used only to describe when a persisted
@@ -2790,23 +2956,23 @@ impl SentRecord {
 /// What carina-core knows about a create for which the provider reported an
 /// identifier.
 #[derive(Debug)]
-pub enum CreateObservation {
+pub enum CreateObservation<S: TextState = Unbound> {
     /// The read-back found the resource.
     Observed(AppliedState),
     /// The resource could not be observed after the identifier was reported.
-    Unobserved(UnobservedReason),
+    Unobserved(UnobservedReason<S>),
 }
 
 /// Why a create with a provider-reported identifier could not be observed.
 #[derive(Debug)]
-pub enum UnobservedReason {
+pub enum UnobservedReason<S: TextState = Unbound> {
     /// The read-back reported that the identifier did not resolve.
     NotFound,
     /// The read-back itself failed.
-    ReadFailed(ProviderError),
+    ReadFailed(ProviderFailure<S>),
 }
 
-impl std::fmt::Display for UnobservedReason {
+impl std::fmt::Display for UnobservedReason<Bound> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => f.write_str("provider read after create returned not found"),
@@ -2817,20 +2983,20 @@ impl std::fmt::Display for UnobservedReason {
 
 /// A provider-reported identifier, its observation, and the accepted create's sent values.
 #[derive(Debug)]
-pub struct IdentifiedCreate {
+pub struct IdentifiedCreate<S: TextState = Unbound> {
     id: ResourceId,
     identifier: AppliedIdentifier,
-    observation: CreateObservation,
+    observation: CreateObservation<S>,
     sent: SentRecord,
-    partial_read: Option<Box<PartialReadDiagnostic>>,
+    partial_read: Option<Box<PartialReadDiagnostic<S>>>,
     resolved_desired_attributes: Option<SecretPreservingAttributes>,
 }
 
-impl IdentifiedCreate {
+impl<S: TextState> IdentifiedCreate<S> {
     fn new(
         id: ResourceId,
         identifier: AppliedIdentifier,
-        observation: Observation,
+        observation: Observation<S>,
         sent: SentRecord,
     ) -> Self {
         let observation = match observation {
@@ -2848,7 +3014,7 @@ impl IdentifiedCreate {
     fn from_create_observation(
         id: ResourceId,
         identifier: AppliedIdentifier,
-        observation: CreateObservation,
+        observation: CreateObservation<S>,
         sent: SentRecord,
     ) -> Self {
         Self {
@@ -2868,7 +3034,7 @@ impl IdentifiedCreate {
     pub fn from_in_flight_for_test(
         pending: InFlightCreate,
         identifier: AppliedIdentifier,
-        observation: CreateObservation,
+        observation: CreateObservation<S>,
     ) -> Self {
         identified_from_resume(pending, identifier, observation)
     }
@@ -2881,7 +3047,7 @@ impl IdentifiedCreate {
         &self.identifier
     }
 
-    pub fn observation(&self) -> &CreateObservation {
+    pub fn observation(&self) -> &CreateObservation<S> {
         &self.observation
     }
 
@@ -2889,16 +3055,16 @@ impl IdentifiedCreate {
         &self.sent
     }
 
-    pub fn partial_read_diagnostic(&self) -> Option<&PartialReadDiagnostic> {
+    pub fn partial_read_diagnostic(&self) -> Option<&PartialReadDiagnostic<S>> {
         self.partial_read.as_deref()
     }
 
     /// Resolved desired values and send evidence retained by the accepted
     /// create observation.
-    pub fn sent_desired_attributes_for<'a, S, D>(
+    pub fn sent_desired_attributes_for<'a, M, D>(
         &'a self,
         fallback_resource: &'a Resource<
-            S,
+            M,
             crate::resource::NoPlaceholder,
             crate::resource::AbsoluteBindingAddress,
             D,
@@ -2919,7 +3085,7 @@ impl IdentifiedCreate {
         self
     }
 
-    fn with_partial_read(mut self, diagnostic: PartialReadDiagnostic) -> Self {
+    fn with_partial_read(mut self, diagnostic: PartialReadDiagnostic<S>) -> Self {
         self.partial_read = Some(Box::new(diagnostic));
         self
     }
@@ -2927,7 +3093,7 @@ impl IdentifiedCreate {
     /// Attach a partial read-back diagnostic in cross-crate tests.
     #[cfg(feature = "test-utils")]
     #[doc(hidden)]
-    pub fn with_partial_read_for_test(self, diagnostic: PartialReadDiagnostic) -> Self {
+    pub fn with_partial_read_for_test(self, diagnostic: PartialReadDiagnostic<S>) -> Self {
         self.with_partial_read(diagnostic)
     }
 
@@ -2935,17 +3101,30 @@ impl IdentifiedCreate {
         self.resolved_desired_attributes.as_ref()
     }
 
-    pub fn into_parts(self) -> (ResourceId, AppliedIdentifier, CreateObservation, SentRecord) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        ResourceId,
+        AppliedIdentifier,
+        CreateObservation<S>,
+        SentRecord,
+    ) {
         (self.id, self.identifier, self.observation, self.sent)
     }
 
-    pub(crate) fn post_error_note(&self) -> ProviderText {
+    pub(crate) fn post_error_note(&self) -> DiagnosticText {
         match &self.observation {
             CreateObservation::Observed(_state) => {
                 "resource created; recorded in state, the next apply completes it".into()
             }
             CreateObservation::Unobserved(reason) => {
-                let reason = reason.to_string().replace('\n', "\n  ");
+                let reason = match reason {
+                    UnobservedReason::NotFound => {
+                        "provider read after create returned not found".to_owned()
+                    }
+                    UnobservedReason::ReadFailed(error) => error.host_diagnostic_text(),
+                }
+                .replace('\n', "\n  ");
                 format!(
                     "{} reported identifier '{}' but the resource could not be observed; recorded in state so the next plan re-checks it\n  reason: {reason}",
                     self.id.provider, self.identifier,
@@ -2964,7 +3143,9 @@ impl IdentifiedCreate {
         };
         (self, valid)
     }
+}
 
+impl IdentifiedCreate<Bound> {
     /// Materialize only the provider observation for runtime publication.
     /// Sent desired values are intentionally excluded.
     pub fn observed_state(&self) -> SnapshotState {
@@ -2981,7 +3162,7 @@ impl IdentifiedCreate {
     }
 }
 
-pub type Observation = protocol_types::Observation<ReadOutcome, ProviderError>;
+pub type Observation<S = Unbound> = protocol_types::Observation<ReadOutcome, ProviderFailure<S>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PendingRecord {
@@ -3149,7 +3330,10 @@ impl InFlightCreate {
 
     /// Convert a continuation produced by a native provider or host adapter
     /// into the classified failure channel for an initial create.
-    pub(crate) fn into_create_failure(self, error: ProviderError) -> CreateFailure {
+    pub(crate) fn into_create_failure<S: TextState>(
+        self,
+        error: ProviderFailure<S>,
+    ) -> CreateFailure<S> {
         CreateFailure::from_kind(CreateFailureKind::InFlight {
             pending: self,
             error,
@@ -3157,7 +3341,10 @@ impl InFlightCreate {
     }
 
     /// Preserve this continuation in the classified resume failure channel.
-    pub(crate) fn into_resume_failure(self, error: ProviderError) -> ResumeFailure {
+    pub(crate) fn into_resume_failure<S: TextState>(
+        self,
+        error: ProviderFailure<S>,
+    ) -> ResumeFailure<S> {
         ResumeFailure::from_kind(ResumeFailureKind::InFlight {
             pending: self,
             error,
@@ -3682,25 +3869,25 @@ fn report_cancelled_guest_create(attempt: CreateAttempt, may_have_dispatched: bo
 
 /// Inspectable classification carried by an opaque [`CreateFailure`].
 #[derive(Debug)]
-pub enum CreateFailureKind {
+pub enum CreateFailureKind<S: TextState = Unbound> {
     /// No cloud resource remains. A `not-created` verdict means nothing was
     /// created: no request left the provider, or the cloud rejected it without
     /// creating anything.
-    NoResource(ProviderError),
+    NoResource(ProviderFailure<S>),
     /// A request may have reached the cloud, with no identifier or continuation available.
     OutcomeUnknown {
         unknown: UnknownCreateOutcome,
-        error: ProviderError,
+        error: ProviderFailure<S>,
     },
     /// The provider reported an identifier; resource existence may be unobserved.
     IdentifierReported {
-        identified: IdentifiedCreate,
-        error: ProviderError,
+        identified: IdentifiedCreate<S>,
+        error: ProviderFailure<S>,
     },
     /// A resumable continuation is available, with an optional cloud identifier.
     InFlight {
         pending: InFlightCreate,
-        error: ProviderError,
+        error: ProviderFailure<S>,
     },
 }
 
@@ -3717,9 +3904,9 @@ pub enum CreateFailureKind {
 /// let _failure = CreateFailure(kind);
 /// ```
 #[derive(Debug)]
-pub struct CreateFailure(Box<CreateFailureKind>);
+pub struct CreateFailure<S: TextState = Unbound>(Box<CreateFailureKind<S>>);
 
-impl std::fmt::Display for CreateFailure {
+impl<S: TextState> std::fmt::Display for CreateFailure<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind() {
             CreateFailureKind::NoResource(_error) => {
@@ -3741,7 +3928,7 @@ impl std::fmt::Display for CreateFailure {
     }
 }
 
-impl std::error::Error for CreateFailure {
+impl std::error::Error for CreateFailure<Bound> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self.kind() {
             CreateFailureKind::NoResource(error) => Some(error),
@@ -3761,20 +3948,20 @@ impl std::error::Error for CreateFailure {
     }
 }
 
-impl CreateFailure {
-    fn from_kind(kind: CreateFailureKind) -> Self {
+impl<S: TextState> CreateFailure<S> {
+    fn from_kind(kind: CreateFailureKind<S>) -> Self {
         Self(Box::new(kind))
     }
 
-    pub fn kind(&self) -> &CreateFailureKind {
+    pub fn kind(&self) -> &CreateFailureKind<S> {
         self.0.as_ref()
     }
 
-    pub fn into_kind(self) -> CreateFailureKind {
+    pub fn into_kind(self) -> CreateFailureKind<S> {
         *self.0
     }
 
-    pub fn provider_error(&self) -> &ProviderError {
+    pub fn provider_error(&self) -> &ProviderFailure<S> {
         match self.kind() {
             CreateFailureKind::NoResource(error) => error,
             CreateFailureKind::OutcomeUnknown {
@@ -3792,21 +3979,24 @@ impl CreateFailure {
         }
     }
 
-    pub(crate) fn identifier_reported(identified: IdentifiedCreate, error: ProviderError) -> Self {
+    pub(crate) fn identifier_reported(
+        identified: IdentifiedCreate<S>,
+        error: ProviderFailure<S>,
+    ) -> Self {
         Self::from_kind(CreateFailureKind::IdentifierReported { identified, error })
     }
 
-    pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderError) -> Self {
+    pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderFailure<S>) -> Self {
         Self::from_kind(CreateFailureKind::InFlight { pending, error })
     }
 
-    pub(crate) fn not_created_at_dispatch(error: ProviderError) -> Self {
+    pub(crate) fn not_created_at_dispatch(error: ProviderFailure<S>) -> Self {
         Self::from_kind(CreateFailureKind::NoResource(error))
     }
 
     pub(crate) fn outcome_unknown_at_dispatch(
         unknown: UnknownCreateOutcome,
-        error: ProviderError,
+        error: ProviderFailure<S>,
     ) -> Self {
         Self::from_kind(CreateFailureKind::OutcomeUnknown { unknown, error })
     }
@@ -3825,8 +4015,8 @@ impl CreateFailure {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct ResumeOutcome {
-    kind: ResumeOutcomeKind,
+pub struct ResumeOutcome<S: TextState = Unbound> {
+    kind: ResumeOutcomeKind<S>,
 }
 
 /// A resumed create that completed with an applied state.
@@ -3842,9 +4032,9 @@ pub struct ResumeOutcome {
 /// }
 /// ```
 #[derive(Debug)]
-pub struct CompletedResume(IdentifiedCreate);
+pub struct CompletedResume<S: TextState = Unbound>(IdentifiedCreate<S>);
 
-impl CompletedResume {
+impl<S: TextState> CompletedResume<S> {
     fn new(pending: InFlightCreate, identifier: AppliedIdentifier, state: AppliedState) -> Self {
         let (_state_id, _observed_identifier, attributes) = state.into_parts();
         let state =
@@ -3864,10 +4054,6 @@ impl CompletedResume {
         self.0.identifier()
     }
 
-    pub fn observed_state(&self) -> SnapshotState {
-        self.0.observed_state()
-    }
-
     pub(crate) fn with_resolved_desired_attributes(
         self,
         attributes: SecretPreservingAttributes,
@@ -3875,8 +4061,14 @@ impl CompletedResume {
         Self(self.0.with_resolved_desired_attributes(attributes))
     }
 
-    pub(crate) fn into_identified_create(self) -> IdentifiedCreate {
+    pub(crate) fn into_identified_create(self) -> IdentifiedCreate<S> {
         self.0
+    }
+}
+
+impl CompletedResume<Bound> {
+    pub fn observed_state(&self) -> SnapshotState {
+        self.0.observed_state()
     }
 }
 
@@ -3885,18 +4077,18 @@ impl CompletedResume {
 /// The completed observation retains the persisted continuation's sent-value
 /// authority; unlike a resent create, this type never invents a new `Sent`.
 #[derive(Debug)]
-pub struct PartialResume {
-    completed: CompletedResume,
-    diagnostic: PartialReadDiagnostic,
+pub struct PartialResume<S: TextState = Unbound> {
+    completed: CompletedResume<S>,
+    diagnostic: PartialReadDiagnostic<S>,
     read_back_end: ReadBackEnd,
 }
 
-impl PartialResume {
+impl<S: TextState> PartialResume<S> {
     fn new(
         pending: InFlightCreate,
         identifier: AppliedIdentifier,
         attributes: HashMap<String, Value>,
-        diagnostic: PartialReadDiagnostic,
+        diagnostic: PartialReadDiagnostic<S>,
     ) -> Self {
         let state =
             AppliedState::from_identifier(pending.id().clone(), identifier.clone(), attributes);
@@ -3915,14 +4107,8 @@ impl PartialResume {
         self.completed.identifier()
     }
 
-    pub fn diagnostic(&self) -> &PartialReadDiagnostic {
+    pub fn diagnostic(&self) -> &PartialReadDiagnostic<S> {
         &self.diagnostic
-    }
-
-    pub fn observed_state(&self) -> SnapshotState {
-        self.diagnostic
-            .clone()
-            .into_state_for_writeback(self.completed.observed_state())
     }
 
     pub(crate) fn with_resolved_desired_attributes(
@@ -3935,13 +4121,21 @@ impl PartialResume {
             read_back_end: self.read_back_end,
         }
     }
+}
+
+impl PartialResume<Bound> {
+    pub fn observed_state(&self) -> SnapshotState {
+        self.diagnostic
+            .clone()
+            .into_state_for_writeback(self.completed.observed_state())
+    }
 
     pub(crate) fn into_parts(
         self,
     ) -> (
-        IdentifiedCreate,
+        HostIdentifiedCreate,
         SnapshotState,
-        PartialReadDiagnostic,
+        HostPartialReadDiagnostic,
         ReadBackEnd,
     ) {
         let Self {
@@ -3959,29 +4153,29 @@ impl PartialResume {
 
 /// Read-only classification exposed by an opaque [`ResumeOutcome`].
 #[derive(Debug)]
-pub enum ResumeOutcomeKind {
-    Resumed(Box<CompletedResume>),
+pub enum ResumeOutcomeKind<S: TextState = Unbound> {
+    Resumed(Box<CompletedResume<S>>),
     /// The persisted create completed, but its read-back remains incomplete.
     /// This is distinct from `Resent`: no new create request or `sent` value
     /// was fabricated to finish the resumed continuation.
-    PartialSuccess(Box<PartialResume>),
-    Resent(Box<CreateOutcome>),
+    PartialSuccess(Box<PartialResume<S>>),
+    Resent(Box<CreateOutcome<S>>),
 }
 
-impl ResumeOutcome {
-    fn resumed(completed: CompletedResume) -> Self {
+impl<S: TextState> ResumeOutcome<S> {
+    fn resumed(completed: CompletedResume<S>) -> Self {
         Self {
             kind: ResumeOutcomeKind::Resumed(Box::new(completed)),
         }
     }
 
-    fn resent(outcome: CreateOutcome) -> Self {
+    fn resent(outcome: CreateOutcome<S>) -> Self {
         Self {
             kind: ResumeOutcomeKind::Resent(Box::new(outcome)),
         }
     }
 
-    fn partial(outcome: PartialResume) -> Self {
+    fn partial(outcome: PartialResume<S>) -> Self {
         Self {
             kind: ResumeOutcomeKind::PartialSuccess(Box::new(outcome)),
         }
@@ -4002,11 +4196,11 @@ impl ResumeOutcome {
         outcome
     }
 
-    pub fn kind(&self) -> &ResumeOutcomeKind {
+    pub fn kind(&self) -> &ResumeOutcomeKind<S> {
         &self.kind
     }
 
-    pub fn into_kind(self) -> ResumeOutcomeKind {
+    pub fn into_kind(self) -> ResumeOutcomeKind<S> {
         self.kind
     }
 
@@ -4021,20 +4215,20 @@ impl ResumeOutcome {
 
 /// Inspectable classification carried by an opaque [`ResumeFailure`].
 #[derive(Debug)]
-pub enum ResumeFailureKind {
+pub enum ResumeFailureKind<S: TextState = Unbound> {
     /// No cloud resource remains. A `not-created` verdict means nothing was
     /// created: no request left the provider, or the cloud rejected it without
     /// creating anything.
-    NoResource(ProviderError),
+    NoResource(ProviderFailure<S>),
     /// The provider reported an identifier; resource existence may be unobserved.
     IdentifierReported {
-        identified: IdentifiedCreate,
-        error: ProviderError,
+        identified: IdentifiedCreate<S>,
+        error: ProviderFailure<S>,
     },
     /// A resumable continuation is available, with an optional cloud identifier.
     InFlight {
         pending: InFlightCreate,
-        error: ProviderError,
+        error: ProviderFailure<S>,
     },
 }
 
@@ -4050,9 +4244,9 @@ pub enum ResumeFailureKind {
 /// let _failure = ResumeFailure(kind);
 /// ```
 #[derive(Debug)]
-pub struct ResumeFailure(Box<ResumeFailureKind>);
+pub struct ResumeFailure<S: TextState = Unbound>(Box<ResumeFailureKind<S>>);
 
-impl std::fmt::Display for ResumeFailure {
+impl<S: TextState> std::fmt::Display for ResumeFailure<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.kind() {
             ResumeFailureKind::NoResource(_error) => f.write_str("resumed create left no resource"),
@@ -4070,7 +4264,7 @@ impl std::fmt::Display for ResumeFailure {
     }
 }
 
-impl std::error::Error for ResumeFailure {
+impl std::error::Error for ResumeFailure<Bound> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self.kind() {
             ResumeFailureKind::NoResource(error) => Some(error),
@@ -4086,20 +4280,20 @@ impl std::error::Error for ResumeFailure {
     }
 }
 
-impl ResumeFailure {
-    fn from_kind(kind: ResumeFailureKind) -> Self {
+impl<S: TextState> ResumeFailure<S> {
+    fn from_kind(kind: ResumeFailureKind<S>) -> Self {
         Self(Box::new(kind))
     }
 
-    pub fn kind(&self) -> &ResumeFailureKind {
+    pub fn kind(&self) -> &ResumeFailureKind<S> {
         self.0.as_ref()
     }
 
-    pub fn into_kind(self) -> ResumeFailureKind {
+    pub fn into_kind(self) -> ResumeFailureKind<S> {
         *self.0
     }
 
-    pub fn provider_error(&self) -> &ProviderError {
+    pub fn provider_error(&self) -> &ProviderFailure<S> {
         match self.kind() {
             ResumeFailureKind::NoResource(error) => error,
             ResumeFailureKind::IdentifierReported {
@@ -4113,15 +4307,18 @@ impl ResumeFailure {
         }
     }
 
-    pub(crate) fn no_resource_from_verdict(error: ProviderError) -> Self {
+    pub(crate) fn no_resource_from_verdict(error: ProviderFailure<S>) -> Self {
         Self::from_kind(ResumeFailureKind::NoResource(error))
     }
 
-    pub(crate) fn identifier_reported(identified: IdentifiedCreate, error: ProviderError) -> Self {
+    pub(crate) fn identifier_reported(
+        identified: IdentifiedCreate<S>,
+        error: ProviderFailure<S>,
+    ) -> Self {
         Self::from_kind(ResumeFailureKind::IdentifierReported { identified, error })
     }
 
-    pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderError) -> Self {
+    pub(crate) fn in_flight(pending: InFlightCreate, error: ProviderFailure<S>) -> Self {
         Self::from_kind(ResumeFailureKind::InFlight { pending, error })
     }
 }
@@ -4438,7 +4635,7 @@ impl FinishingCreate {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("cannot resume create for {desired}; persisted operation belongs to {persisted}", desired = ProviderText::new(desired.to_string()), persisted = ProviderText::new(persisted.to_string()))]
+#[error("cannot resume create for {desired}; persisted operation belongs to {persisted}", desired = DiagnosticText::new(desired.to_string()), persisted = DiagnosticText::new(persisted.to_string()))]
 pub struct ResumeRoutingMismatch {
     persisted: Box<ResourceId>,
     desired: Box<ResourceId>,
@@ -4488,21 +4685,18 @@ pub struct PollCreateRequest {
 }
 
 impl PollCreateRequest {
-    pub(crate) fn new(
-        pending: InFlightCreate,
-        request: CreateRequest,
-    ) -> Result<Self, ProviderError> {
+    pub(crate) fn new(pending: InFlightCreate, request: CreateRequest) -> Result<Self, HostError> {
         if pending.id() != &request.resource().id {
             return Err(
-                ProviderError::internal("poll request belongs to another resource")
+                HostError::internal("poll request belongs to another resource")
                     .for_resource(pending.id().clone()),
             );
         }
         let Some(identifier) = pending.identifier().cloned() else {
-            return Err(ProviderError::internal(
-                "poll-only continuation has no provider identifier",
-            )
-            .for_resource(pending.id().clone()));
+            return Err(
+                HostError::internal("poll-only continuation has no provider identifier")
+                    .for_resource(pending.id().clone()),
+            );
         };
         Ok(Self {
             resumed: ResumedCreate {
@@ -4765,11 +4959,11 @@ impl FinishingResume {
     }
 }
 
-fn identified_from_resume(
+fn identified_from_resume<S: TextState>(
     pending: InFlightCreate,
     identifier: AppliedIdentifier,
-    observation: CreateObservation,
-) -> IdentifiedCreate {
+    observation: CreateObservation<S>,
+) -> IdentifiedCreate<S> {
     let sent = pending.sent();
     IdentifiedCreate::from_create_observation(pending.id, identifier, observation, sent)
 }
@@ -5071,8 +5265,8 @@ impl ResentPollAttempt {
     }
 }
 
-impl CreateOutcome {
-    fn provider_reported(kind: CreateOutcomeKind) -> Self {
+impl<S: TextState> CreateOutcome<S> {
+    fn provider_reported(kind: CreateOutcomeKind<S>) -> Self {
         Self {
             kind,
             read_back_end: ReadBackEnd::ProviderReported,
@@ -5097,7 +5291,7 @@ impl CreateOutcome {
         reason: String,
         missing_attributes: Vec<String>,
     ) -> Self {
-        match PartialReadDiagnostic::new(reason, missing_attributes) {
+        match PartialReadDiagnostic::from_reason(ErrorText::new(reason), missing_attributes) {
             Some(diagnostic) => {
                 Self::provider_reported(CreateOutcomeKind::PartialSuccess { state, diagnostic })
             }
@@ -5105,11 +5299,11 @@ impl CreateOutcome {
         }
     }
 
-    pub fn kind(&self) -> &CreateOutcomeKind {
+    pub fn kind(&self) -> &CreateOutcomeKind<S> {
         &self.kind
     }
 
-    pub fn into_kind(self) -> CreateOutcomeKind {
+    pub fn into_kind(self) -> CreateOutcomeKind<S> {
         self.kind
     }
 
@@ -5138,6 +5332,15 @@ impl CreateOutcome {
         }
     }
 
+    pub fn diagnostic(&self) -> Option<&PartialReadDiagnostic<S>> {
+        match &self.kind {
+            CreateOutcomeKind::Success { .. } => None,
+            CreateOutcomeKind::PartialSuccess { diagnostic, .. } => Some(diagnostic),
+        }
+    }
+}
+
+impl CreateOutcome<Bound> {
     /// Consume the outcome and produce a State ready for writeback.
     pub(crate) fn into_state_for_writeback(self) -> SnapshotState {
         match self.kind {
@@ -5147,16 +5350,9 @@ impl CreateOutcome {
             }
         }
     }
-
-    pub fn diagnostic(&self) -> Option<&PartialReadDiagnostic> {
-        match &self.kind {
-            CreateOutcomeKind::Success { .. } => None,
-            CreateOutcomeKind::PartialSuccess { diagnostic, .. } => Some(diagnostic),
-        }
-    }
 }
 
-impl UpdateOutcome {
+impl<S: TextState> UpdateOutcome<S> {
     pub fn success(state: AppliedState) -> Self {
         Self::provider_reported(UpdateOutcomeKind::Success { state })
     }
@@ -5166,7 +5362,7 @@ impl UpdateOutcome {
         reason: String,
         missing_attributes: Vec<String>,
     ) -> Self {
-        match PartialReadDiagnostic::new(reason, missing_attributes) {
+        match PartialReadDiagnostic::from_reason(ErrorText::new(reason), missing_attributes) {
             Some(diagnostic) => {
                 Self::provider_reported(UpdateOutcomeKind::PartialSuccess { state, diagnostic })
             }
@@ -5174,7 +5370,7 @@ impl UpdateOutcome {
         }
     }
 
-    fn provider_reported(kind: UpdateOutcomeKind) -> Self {
+    fn provider_reported(kind: UpdateOutcomeKind<S>) -> Self {
         Self {
             kind,
             read_back_end: ReadBackEnd::ProviderReported,
@@ -5188,11 +5384,11 @@ impl UpdateOutcome {
         outcome
     }
 
-    pub fn kind(&self) -> &UpdateOutcomeKind {
+    pub fn kind(&self) -> &UpdateOutcomeKind<S> {
         &self.kind
     }
 
-    pub fn into_kind(self) -> UpdateOutcomeKind {
+    pub fn into_kind(self) -> UpdateOutcomeKind<S> {
         self.kind
     }
 
@@ -5200,6 +5396,15 @@ impl UpdateOutcome {
         self.read_back_end
     }
 
+    pub fn diagnostic(&self) -> Option<&PartialReadDiagnostic<S>> {
+        match &self.kind {
+            UpdateOutcomeKind::Success { .. } => None,
+            UpdateOutcomeKind::PartialSuccess { diagnostic, .. } => Some(diagnostic),
+        }
+    }
+}
+
+impl UpdateOutcome<Bound> {
     /// Consume the outcome and produce a State ready for writeback.
     pub fn into_state_for_writeback(self) -> SnapshotState {
         match self.kind {
@@ -5209,41 +5414,27 @@ impl UpdateOutcome {
             }
         }
     }
-
-    pub fn diagnostic(&self) -> Option<&PartialReadDiagnostic> {
-        match &self.kind {
-            UpdateOutcomeKind::Success { .. } => None,
-            UpdateOutcomeKind::PartialSuccess { diagnostic, .. } => Some(diagnostic),
-        }
-    }
 }
 
-impl PartialReadDiagnostic {
-    pub fn new(reason: String, missing_attributes: Vec<String>) -> Option<Self> {
+impl<S: TextState> PartialReadDiagnostic<S> {
+    pub fn new(reason: S::PartialReadReason, missing_attributes: Vec<String>) -> Option<Self> {
+        Self::from_reason(S::partial_read_reason(reason), missing_attributes)
+    }
+    fn from_reason(reason: ErrorText<S>, missing_attributes: Vec<String>) -> Option<Self> {
         if missing_attributes.is_empty() {
             None
         } else {
             Some(Self {
-                reason: reason.into(),
+                reason,
                 missing_attributes: missing_attributes
                     .into_iter()
-                    .map(ProviderString::from)
+                    .map(ProviderKey::from)
                     .collect(),
             })
         }
     }
 
-    /// Bounded diagnostic projection; the original reason also feeds identity data.
-    pub fn reason(&self) -> ProviderText {
-        ProviderText::new(self.reason.as_str())
-    }
-
-    /// Original reason for persistence, transport and identity material.
-    pub fn raw_reason(&self) -> &str {
-        self.reason.as_str()
-    }
-
-    pub fn missing_attributes(&self) -> &[ProviderString] {
+    pub fn missing_attributes(&self) -> &[ProviderKey] {
         &self.missing_attributes
     }
 
@@ -5252,7 +5443,7 @@ impl PartialReadDiagnostic {
     /// The receiver's reason is kept because it represents the most recent
     /// operation that wrote the state. Missing attributes are unioned so the
     /// next plan can surface every unobserved attribute as Unknown.
-    pub fn merge_in(&mut self, other: PartialReadDiagnostic) {
+    pub fn merge_in(&mut self, other: PartialReadDiagnostic<S>) {
         for attr in other.missing_attributes {
             if !self.missing_attributes.contains(&attr) {
                 self.missing_attributes.push(attr);
@@ -5277,16 +5468,588 @@ impl PartialReadDiagnostic {
             (None, None) => None,
         }
     }
+}
+
+impl PartialReadDiagnostic<Bound> {
+    /// Bounded diagnostic projection; the original reason also feeds identity data.
+    pub fn reason(&self) -> DiagnosticText {
+        DiagnosticText::new(self.reason.redacted_str())
+    }
+
+    /// Original reason for persistence, transport and identity material.
+    pub fn raw_reason(&self) -> &str {
+        self.reason.redacted_str()
+    }
 
     pub fn into_state_for_writeback(self, mut state: SnapshotState) -> SnapshotState {
         state.partial_read = PartialReadMarker::new(
-            PendingReRead::incomplete(self.reason),
+            PendingReRead::incomplete(self.reason.redacted_str()),
             self.missing_attributes
                 .into_iter()
-                .map(ProviderString::into_string)
+                .map(ProviderKey::into_string)
                 .collect(),
         );
         state
+    }
+}
+
+impl ProviderFailure<Unbound> {
+    /// Compose provider-owned opaque text without formatting its placeholder
+    /// or granting authority to render it on the host.
+    pub fn from_text(kind: ProviderErrorKind, text: ProviderText) -> Self {
+        let throttling = ThrottlingClassification {
+            message_or_cause: text.has_throttling_marker(),
+            delete_dependency: text.has_delete_dependency_marker(),
+            ..ThrottlingClassification::default()
+        };
+        let detail = Box::new(OperationErrorDetail {
+            message: ErrorText::from_provider_text(text),
+            throttling,
+            ..OperationErrorDetail::default()
+        });
+        match kind {
+            ProviderErrorKind::InvalidInput => Self::InvalidInput(detail),
+            ProviderErrorKind::ApiError => Self::ApiError(detail),
+            ProviderErrorKind::NotFound => Self::NotFound(detail),
+            ProviderErrorKind::Timeout => Self::Timeout(detail),
+            ProviderErrorKind::Internal => Self::Internal(detail),
+        }
+    }
+
+    /// Decode untrusted provider data received through the protocol/WIT boundary.
+    ///
+    /// This is the only sanctioned entry point for a wire record containing
+    /// both a runtime-built message and flattened cause string. It preserves
+    /// sanitized text for diagnostics; it does not provide the static
+    /// context guarantees of the typed `*_caused_by` constructors.
+    pub fn from_wire(error: WireProviderError) -> Self {
+        let WireProviderError {
+            kind,
+            message,
+            resource_id,
+            cause,
+            provider_name,
+            operation,
+            status,
+            code,
+            request_id,
+        } = error;
+        let resource_id = resource_id
+            .map(|id| Box::new(crate::protocol_convert::protocol_to_resource_id(&id).into()));
+        let throttling =
+            ThrottlingClassification::from_raw(&message, code.as_deref(), cause.as_deref());
+        let detail = Box::new(OperationErrorDetail {
+            message: message.into(),
+            throttling,
+            transient: false,
+            resource_id,
+            cause: cause.map(|cause| ProviderDiagnostic::new(FlattenedWireCause(cause))),
+            // Host lifecycle markers are intentionally not part of the wire
+            // record and untrusted guest errors cannot acquire one on decode.
+            host_cause: None,
+            provider_name: provider_name.map(ProviderErrorText::new),
+            operation: operation.map(ProviderErrorText::new),
+            status,
+            code: code.map(ProviderErrorText::new),
+            request_id: request_id.map(ProviderErrorText::new),
+        });
+        match kind {
+            WireProviderErrorKind::InvalidInput => ProviderFailure::InvalidInput(detail),
+            WireProviderErrorKind::ApiError => ProviderFailure::ApiError(detail),
+            WireProviderErrorKind::NotFound => ProviderFailure::NotFound(detail),
+            WireProviderErrorKind::Timeout => ProviderFailure::Timeout(detail),
+            WireProviderErrorKind::Internal => ProviderFailure::Internal(detail),
+        }
+    }
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostError {
+        let convert = |text: ProviderErrorText| text.into_host(secrets);
+        let kind = self.kind();
+        let detail = match self {
+            Self::InvalidInput(d)
+            | Self::ApiError(d)
+            | Self::NotFound(d)
+            | Self::Timeout(d)
+            | Self::Internal(d) => *d,
+        };
+        let detail = Box::new(OperationErrorDetail {
+            message: convert(detail.message),
+            throttling: detail.throttling,
+            transient: detail.transient,
+            resource_id: detail.resource_id.map(|id| {
+                Box::new(ErrorResourceId {
+                    id: id.id,
+                    text: convert(id.text),
+                })
+            }),
+            cause: detail.cause.map(|cause| cause.with_secrets(secrets)),
+            host_cause: detail.host_cause,
+            provider_name: detail.provider_name.map(convert),
+            operation: detail.operation.map(convert),
+            status: detail.status,
+            code: detail.code.map(convert),
+            request_id: detail.request_id.map(convert),
+        });
+        match kind {
+            ProviderErrorKind::InvalidInput => HostError::InvalidInput(detail),
+            ProviderErrorKind::ApiError => HostError::ApiError(detail),
+            ProviderErrorKind::NotFound => HostError::NotFound(detail),
+            ProviderErrorKind::Timeout => HostError::Timeout(detail),
+            ProviderErrorKind::Internal => HostError::Internal(detail),
+        }
+    }
+}
+impl From<HostError> for ProviderError {
+    fn from(host: HostError) -> Self {
+        host.host_for_state()
+    }
+}
+impl ProviderFailure<Bound> {
+    pub(crate) fn host_for_state<T: TextState>(self) -> ProviderFailure<T> {
+        let kind = self.kind();
+        let detail = match self {
+            Self::InvalidInput(d)
+            | Self::ApiError(d)
+            | Self::NotFound(d)
+            | Self::Timeout(d)
+            | Self::Internal(d) => *d,
+        };
+        let detail = Box::new(OperationErrorDetail {
+            message: detail.message.host_for_state(),
+            throttling: detail.throttling,
+            transient: detail.transient,
+            resource_id: detail.resource_id.map(|id| {
+                Box::new(ErrorResourceId {
+                    id: id.id,
+                    text: id.text.host_for_state(),
+                })
+            }),
+            cause: detail.cause.map(Diagnostic::host_for_state),
+            host_cause: detail.host_cause,
+            provider_name: detail.provider_name.map(|text| text.host_for_state()),
+            operation: detail.operation.map(|text| text.host_for_state()),
+            status: detail.status,
+            code: detail.code.map(|text| text.host_for_state()),
+            request_id: detail.request_id.map(|text| text.host_for_state()),
+        });
+        match kind {
+            ProviderErrorKind::InvalidInput => ProviderFailure::InvalidInput(detail),
+            ProviderErrorKind::ApiError => ProviderFailure::ApiError(detail),
+            ProviderErrorKind::NotFound => ProviderFailure::NotFound(detail),
+            ProviderErrorKind::Timeout => ProviderFailure::Timeout(detail),
+            ProviderErrorKind::Internal => ProviderFailure::Internal(detail),
+        }
+    }
+
+    pub fn to_wire(&self) -> WireProviderError {
+        self.to_wire_inner()
+    }
+}
+impl ProviderFailure<Unbound> {
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub fn to_wire(&self) -> WireProviderError {
+        self.to_wire_inner()
+    }
+}
+impl PartialReadDiagnostic<Unbound> {
+    pub(crate) fn validate(&self, id: &ResourceId, schemas: &SchemaRegistry) -> ProviderResult<()> {
+        let schema = schemas.get(
+            &id.provider,
+            &id.resource_type,
+            crate::schema::SchemaKind::Resource,
+        );
+        if self.missing_attributes.iter().any(|name| {
+            !schema
+                .as_ref()
+                .is_some_and(|schema| schema.as_schema().attributes.contains_key(name.as_str()))
+        }) {
+            return Err(ProviderError::invalid_input_caused_by(
+                "invalid partial-read diagnostic",
+                UnknownMissingAttribute,
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostPartialReadDiagnostic {
+        PartialReadDiagnostic {
+            reason: self.reason.into_host(secrets),
+            missing_attributes: self.missing_attributes,
+        }
+    }
+}
+impl IdentifiedCreate<Unbound> {
+    fn admit(&mut self, schemas: &SchemaRegistry) -> ProviderResult<()> {
+        if let Some(diagnostic) = self.partial_read.take() {
+            diagnostic.validate(&self.id, schemas)?;
+            self.partial_read = Some(diagnostic);
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "test-utils")]
+    pub fn failure_for_test(self) -> CreateFailure {
+        CreateFailure::identifier_reported(self, ProviderError::internal("fixture"))
+    }
+
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostIdentifiedCreate {
+        IdentifiedCreate {
+            id: self.id,
+            identifier: self.identifier,
+            sent: self.sent,
+            resolved_desired_attributes: self.resolved_desired_attributes,
+            partial_read: self
+                .partial_read
+                .map(|diagnostic| Box::new(diagnostic.with_secrets(secrets))),
+            observation: match self.observation {
+                CreateObservation::Observed(state) => CreateObservation::Observed(state),
+                CreateObservation::Unobserved(UnobservedReason::NotFound) => {
+                    CreateObservation::Unobserved(UnobservedReason::NotFound)
+                }
+                CreateObservation::Unobserved(UnobservedReason::ReadFailed(error)) => {
+                    CreateObservation::Unobserved(UnobservedReason::ReadFailed(
+                        error.with_secrets(secrets),
+                    ))
+                }
+            },
+        }
+    }
+}
+impl CreateOutcome<Unbound> {
+    pub(crate) fn admit(
+        self,
+        sent: SentAttributes,
+        schemas: &SchemaRegistry,
+    ) -> Result<Self, CreateFailure> {
+        if let CreateOutcomeKind::PartialSuccess { state, diagnostic } = &self.kind
+            && let Err(error) = diagnostic.validate(&state.id, schemas)
+        {
+            let state = match self.kind {
+                CreateOutcomeKind::Success { state }
+                | CreateOutcomeKind::PartialSuccess { state, .. } => state,
+            };
+            let identified = IdentifiedCreate::new(
+                state.id.clone(),
+                state.identifier.clone(),
+                Observation::Read(ReadOutcome::found(state)),
+                SentRecord::Request(Sent::Only(sent.attributes)),
+            );
+            return Err(CreateFailure::identifier_reported(identified, error));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostCreateOutcome {
+        CreateOutcome {
+            read_back_end: self.read_back_end,
+            kind: match self.kind {
+                CreateOutcomeKind::Success { state } => CreateOutcomeKind::Success { state },
+                CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
+                    CreateOutcomeKind::PartialSuccess {
+                        state,
+                        diagnostic: diagnostic.with_secrets(secrets),
+                    }
+                }
+            },
+        }
+    }
+}
+impl UpdateOutcome<Unbound> {
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostUpdateOutcome {
+        UpdateOutcome {
+            read_back_end: self.read_back_end,
+            kind: match self.kind {
+                UpdateOutcomeKind::Success { state } => UpdateOutcomeKind::Success { state },
+                UpdateOutcomeKind::PartialSuccess { state, diagnostic } => {
+                    UpdateOutcomeKind::PartialSuccess {
+                        state,
+                        diagnostic: diagnostic.with_secrets(secrets),
+                    }
+                }
+            },
+        }
+    }
+}
+impl CreateFailure<Unbound> {
+    pub(crate) fn admit(mut self, schemas: &SchemaRegistry) -> Self {
+        if let CreateFailureKind::IdentifierReported { identified, error } = self.0.as_mut()
+            && let Err(rejected) = identified.admit(schemas)
+        {
+            *error = rejected;
+        }
+        self
+    }
+
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostCreateFailure {
+        HostCreateFailure::from_kind(match self.into_kind() {
+            CreateFailureKind::NoResource(error) => {
+                CreateFailureKind::NoResource(error.with_secrets(secrets))
+            }
+            CreateFailureKind::OutcomeUnknown { unknown, error } => {
+                CreateFailureKind::OutcomeUnknown {
+                    unknown,
+                    error: error.with_secrets(secrets),
+                }
+            }
+            CreateFailureKind::IdentifierReported { identified, error } => {
+                CreateFailureKind::IdentifierReported {
+                    identified: identified.with_secrets(secrets),
+                    error: error.with_secrets(secrets),
+                }
+            }
+            CreateFailureKind::InFlight { pending, error } => CreateFailureKind::InFlight {
+                pending,
+                error: error.with_secrets(secrets),
+            },
+        })
+    }
+}
+impl ResumeFailure<Unbound> {
+    pub(crate) fn admit(mut self, schemas: &SchemaRegistry) -> Self {
+        if let ResumeFailureKind::IdentifierReported { identified, error } = self.0.as_mut()
+            && let Err(rejected) = identified.admit(schemas)
+        {
+            *error = rejected;
+        }
+        self
+    }
+
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostResumeFailure {
+        HostResumeFailure::from_kind(match self.into_kind() {
+            ResumeFailureKind::NoResource(error) => {
+                ResumeFailureKind::NoResource(error.with_secrets(secrets))
+            }
+            ResumeFailureKind::IdentifierReported { identified, error } => {
+                ResumeFailureKind::IdentifierReported {
+                    identified: identified.with_secrets(secrets),
+                    error: error.with_secrets(secrets),
+                }
+            }
+            ResumeFailureKind::InFlight { pending, error } => ResumeFailureKind::InFlight {
+                pending,
+                error: error.with_secrets(secrets),
+            },
+        })
+    }
+}
+impl ResumeOutcome<Unbound> {
+    pub(crate) fn admit(
+        mut self,
+        sent: SentAttributes,
+        schemas: &SchemaRegistry,
+    ) -> Result<Self, ResumeFailure> {
+        let result = match &mut self.kind {
+            ResumeOutcomeKind::Resent(outcome) => {
+                if let Some(diagnostic) = outcome.diagnostic() {
+                    let id = match outcome.kind() {
+                        CreateOutcomeKind::Success { state }
+                        | CreateOutcomeKind::PartialSuccess { state, .. } => &state.id,
+                    };
+                    diagnostic.validate(id, schemas)
+                } else {
+                    Ok(())
+                }
+            }
+            ResumeOutcomeKind::Resumed(completed) => completed.0.admit(schemas),
+            ResumeOutcomeKind::PartialSuccess(partial) => partial
+                .diagnostic
+                .validate(partial.completed.0.id(), schemas),
+        };
+        if let Err(error) = result {
+            let identified = match self.kind {
+                ResumeOutcomeKind::Resumed(completed) => completed.0,
+                ResumeOutcomeKind::PartialSuccess(partial) => partial.completed.0,
+                ResumeOutcomeKind::Resent(outcome) => {
+                    let state = match outcome.into_kind() {
+                        CreateOutcomeKind::Success { state }
+                        | CreateOutcomeKind::PartialSuccess { state, .. } => state,
+                    };
+                    IdentifiedCreate::new(
+                        state.id.clone(),
+                        state.identifier.clone(),
+                        Observation::Read(ReadOutcome::found(state)),
+                        SentRecord::Request(Sent::Only(sent.attributes)),
+                    )
+                }
+            };
+            return Err(ResumeFailure::identifier_reported(identified, error));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostResumeOutcome {
+        HostResumeOutcome {
+            kind: match self.kind {
+                ResumeOutcomeKind::Resumed(completed) => ResumeOutcomeKind::Resumed(Box::new(
+                    CompletedResume(completed.0.with_secrets(secrets)),
+                )),
+                ResumeOutcomeKind::PartialSuccess(partial) => {
+                    ResumeOutcomeKind::PartialSuccess(Box::new(PartialResume {
+                        completed: CompletedResume(partial.completed.0.with_secrets(secrets)),
+                        diagnostic: partial.diagnostic.with_secrets(secrets),
+                        read_back_end: partial.read_back_end,
+                    }))
+                }
+                ResumeOutcomeKind::Resent(outcome) => {
+                    ResumeOutcomeKind::Resent(Box::new(outcome.with_secrets(secrets)))
+                }
+            },
+        }
+    }
+}
+
+// Fixtures can construct standalone outcomes without dispatching a request.
+// These adapters exist only in core's unit-test harness.
+#[cfg(test)]
+impl ProviderFailure<Unbound> {
+    #[doc(hidden)]
+    pub fn into_host_for_test(self) -> HostError {
+        self.with_secrets(&RedactionSet::for_test(&[]))
+    }
+    #[doc(hidden)]
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostError {
+        self.with_secrets(secrets)
+    }
+}
+#[cfg(test)]
+impl PartialReadDiagnostic<Unbound> {
+    #[doc(hidden)]
+    pub fn into_host_for_test(self) -> HostPartialReadDiagnostic {
+        self.with_secrets(&RedactionSet::for_test(&[]))
+    }
+    #[doc(hidden)]
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostPartialReadDiagnostic {
+        self.with_secrets(secrets)
+    }
+}
+#[cfg(test)]
+impl IdentifiedCreate<Unbound> {
+    #[doc(hidden)]
+    pub fn into_host_for_test(self) -> HostIdentifiedCreate {
+        self.with_secrets(&RedactionSet::for_test(&[]))
+    }
+    #[doc(hidden)]
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostIdentifiedCreate {
+        self.with_secrets(secrets)
+    }
+}
+#[cfg(test)]
+impl CreateOutcome<Unbound> {
+    #[doc(hidden)]
+    pub fn into_host_for_test(self) -> HostCreateOutcome {
+        self.with_secrets(&RedactionSet::for_test(&[]))
+    }
+    #[doc(hidden)]
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostCreateOutcome {
+        self.with_secrets(secrets)
+    }
+}
+#[cfg(test)]
+impl UpdateOutcome<Unbound> {
+    #[doc(hidden)]
+    pub fn into_host_for_test(self) -> HostUpdateOutcome {
+        self.with_secrets(&RedactionSet::for_test(&[]))
+    }
+    #[doc(hidden)]
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostUpdateOutcome {
+        self.with_secrets(secrets)
+    }
+}
+#[cfg(test)]
+impl CreateFailure<Unbound> {
+    #[doc(hidden)]
+    pub fn into_host_for_test(self) -> HostCreateFailure {
+        self.with_secrets(&RedactionSet::for_test(&[]))
+    }
+    #[doc(hidden)]
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostCreateFailure {
+        self.with_secrets(secrets)
+    }
+}
+#[cfg(test)]
+impl ResumeFailure<Unbound> {
+    #[doc(hidden)]
+    pub fn into_host_for_test(self) -> HostResumeFailure {
+        self.with_secrets(&RedactionSet::for_test(&[]))
+    }
+    #[doc(hidden)]
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostResumeFailure {
+        self.with_secrets(secrets)
+    }
+}
+#[cfg(test)]
+impl ResumeOutcome<Unbound> {
+    #[doc(hidden)]
+    pub fn into_host_for_test(self) -> HostResumeOutcome {
+        self.with_secrets(&RedactionSet::for_test(&[]))
+    }
+    #[doc(hidden)]
+    pub fn with_secrets_for_test(self, secrets: &RedactionSet) -> HostResumeOutcome {
+        self.with_secrets(secrets)
+    }
+}
+
+impl<P: ProviderNormalizer + ?Sized> ProviderNormalizer for &P {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [ProviderResource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        (**self).normalize_desired(resources)
+    }
+    fn normalize_state<'a>(
+        &'a self,
+        states: &'a mut StateTransformMap,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        (**self).normalize_state(states)
+    }
+    fn hydrate_read_state<'a>(
+        &'a self,
+        states: &'a mut StateTransformMap,
+        saved: &'a SavedAttrs,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        (**self).hydrate_read_state(states, saved)
+    }
+}
+
+impl<P: ProviderNormalizer + ?Sized> ProviderNormalizer for Box<P> {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [ProviderResource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        (**self).normalize_desired(resources)
+    }
+    fn normalize_state<'a>(
+        &'a self,
+        states: &'a mut StateTransformMap,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        (**self).normalize_state(states)
+    }
+    fn hydrate_read_state<'a>(
+        &'a self,
+        states: &'a mut StateTransformMap,
+        saved: &'a SavedAttrs,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        (**self).hydrate_read_state(states, saved)
+    }
+}
+impl<P: ProviderNormalizer + ?Sized> ProviderNormalizer for Arc<P> {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [ProviderResource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        (**self).normalize_desired(resources)
+    }
+    fn normalize_state<'a>(
+        &'a self,
+        states: &'a mut StateTransformMap,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        (**self).normalize_state(states)
+    }
+    fn hydrate_read_state<'a>(
+        &'a self,
+        states: &'a mut StateTransformMap,
+        saved: &'a SavedAttrs,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        (**self).hydrate_read_state(states, saved)
     }
 }
 
@@ -5300,7 +6063,7 @@ impl PartialReadDiagnostic {
 /// records of the same name in `wit/types.wit`; future per-op
 /// parameters become non-breaking record-field additions instead of
 /// trait-signature churn.
-pub trait Provider: Send + Sync {
+pub trait Provider<S: TextState = Unbound>: Send + Sync {
     /// Name of this Provider (e.g., "aws")
     fn name(&self) -> &str;
 
@@ -5309,18 +6072,13 @@ pub trait Provider: Send + Sync {
     fn resolve_references<'a>(
         &'a self,
         requests: &'a [crate::references::ReferenceRequest],
-    ) -> BoxFuture<
-        'a,
-        ProviderResult<
-            Vec<Result<crate::references::ReferenceOutcome, crate::references::ReferenceError>>,
-        >,
-    > {
+    ) -> BoxFuture<'a, crate::references::ReferenceResults<S>> {
         Box::pin(async move {
             Ok(requests
                 .iter()
                 .map(|request| {
                     Err(crate::references::ReferenceError::InvalidReference(
-                        ProviderError::invalid_input(format!(
+                        ProviderFailure::<S>::invalid_input(format!(
                             "unsupported reference identity {}",
                             request.ty
                         ))
@@ -5346,7 +6104,7 @@ pub trait Provider: Send + Sync {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>>;
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome, S>>;
 
     /// Read a data source resource.
     ///
@@ -5391,7 +6149,7 @@ pub trait Provider: Send + Sync {
     fn read_data_source(
         &self,
         resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>>;
+    ) -> BoxFuture<'_, ProviderResult<State, S>>;
 
     /// Create the resource described by `request.resource()` and return
     /// the resulting state (with `identifier` set to the cloud-side
@@ -5409,13 +6167,13 @@ pub trait Provider: Send + Sync {
         id: &ResourceId,
         request: CreateRequest,
         attempt: CreateAttempt,
-    ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>>;
+    ) -> BoxFuture<'_, Result<CreateOutcome<S>, CreateFailure<S>>>;
 
     /// Resume a create continuation loaded from state.
     fn resume_create(
         &self,
         request: ResumeCreateRequest,
-    ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>>;
+    ) -> BoxFuture<'_, Result<ResumeOutcome<S>, ResumeFailure<S>>>;
 
     /// Update an existing resource by applying `request.patch()`.
     ///
@@ -5449,7 +6207,7 @@ pub trait Provider: Send + Sync {
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
         attempt: UpdateAttempt,
-    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>>;
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome<S>, S>>;
 
     /// Delete the exact resource released by the scheduler. The attempt owns
     /// its id, cloud-side identifier, and schema-resolved request directives.
@@ -5477,11 +6235,15 @@ pub trait Provider: Send + Sync {
     ///     let _ = provider.delete(id, identifier, DeleteRequest::resolve(directives, schema));
     /// }
     /// ```
-    fn delete(&self, attempt: DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>>;
+    fn delete(&self, attempt: DeleteAttempt) -> BoxFuture<'_, ProviderResult<(), S>>;
 
     /// Permissions this provider needs to perform `op` on `id`.
     /// Empty vec means the provider declares no permissions for this resource/op pair.
-    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>>;
+    fn required_permissions(
+        &self,
+        id: &ResourceId,
+        op: PlanOp,
+    ) -> ProviderResult<Vec<S::Permission>, S>;
 
     /// Binding-name patterns for resources that can satisfy a wait on `target_id.attr_path`.
     /// Empty vec means the provider declares no satisfier hint for this target attribute.
@@ -5489,10 +6251,60 @@ pub trait Provider: Send + Sync {
         &self,
         _target_id: &ResourceId,
         _attr_path: &AttrPath,
-    ) -> ProviderResult<Vec<BindingPattern>> {
+    ) -> ProviderResult<Vec<BindingPattern>, S> {
         Ok(Vec::new())
     }
 }
+
+mod host_provider_sealed {
+    pub trait Sealed {}
+}
+/// Host CRUD interface. Every returned diagnostic has crossed its call boundary.
+pub trait HostProvider: Provider<Bound> + host_provider_sealed::Sealed {}
+impl HostProvider for ProviderBoundary<'_> {}
+impl HostProvider for ProviderRouter {}
+impl host_provider_sealed::Sealed for ProviderBoundary<'_> {}
+impl host_provider_sealed::Sealed for ProviderRouter {}
+mod host_normalizer_sealed {
+    pub trait Sealed {}
+}
+/// Host normalizer results have crossed core's fixed-session boundary.
+pub trait HostNormalizer: ProviderNormalizer<Bound> + host_normalizer_sealed::Sealed {
+    /// Core-owned route admission for desired normalization.
+    fn owns_desired(&self, id: &ResourceId) -> bool;
+}
+impl HostNormalizer for ProviderBoundary<'_> {
+    fn owns_desired(&self, id: &ResourceId) -> bool {
+        self.owns_desired(id)
+    }
+}
+impl host_normalizer_sealed::Sealed for ProviderBoundary<'_> {}
+impl HostNormalizer for ProviderRouter {
+    fn owns_desired(&self, id: &ResourceId) -> bool {
+        self.normalizers.owns_desired(id)
+    }
+}
+impl host_normalizer_sealed::Sealed for ProviderRouter {}
+impl HostNormalizer for NormalizerRouter {
+    fn owns_desired(&self, id: &ResourceId) -> bool {
+        self.normalizers
+            .iter()
+            .any(|normalizer| normalizer.owns_desired(id))
+    }
+}
+impl host_normalizer_sealed::Sealed for NormalizerRouter {}
+impl<N: ProviderNormalizer> HostNormalizer for ConfiguredNormalizer<N> {
+    fn owns_desired(&self, id: &ResourceId) -> bool {
+        self.owns(id)
+    }
+}
+impl<N: ProviderNormalizer> host_normalizer_sealed::Sealed for ConfiguredNormalizer<N> {}
+impl HostNormalizer for NoopNormalizer {
+    fn owns_desired(&self, _: &ResourceId) -> bool {
+        true
+    }
+}
+impl host_normalizer_sealed::Sealed for NoopNormalizer {}
 
 /// Convenience for a `ProviderNormalizer` method that does nothing.
 ///
@@ -5501,7 +6313,7 @@ pub trait Provider: Send + Sync {
 /// normalize this" implementation returns this explicitly — keeping the
 /// no-op a deliberate, visible choice rather than a silent default
 /// (the hazard that caused carina-rs/carina-provider-awscc#192).
-pub fn ready_noop<'a>() -> BoxFuture<'a, ProviderResult<()>> {
+pub fn ready_noop<'a, S: TextState>() -> BoxFuture<'a, ProviderResult<(), S>> {
     Box::pin(async { Ok(()) })
 }
 
@@ -5606,7 +6418,7 @@ impl<'a> IntoIterator for &'a mut StateTransformMap {
 /// converted into unnormalized values. The returned future borrows the arguments for `'a`, so
 /// callers must `.await` it before the borrow ends (they always do —
 /// the futures are never run concurrently).
-pub trait ProviderNormalizer: Send + Sync {
+pub trait ProviderNormalizer<S: TextState = Unbound>: Send + Sync {
     /// Normalize desired resource state before diffing.
     ///
     /// For example, resolves bare enum identifiers like `advanced` or
@@ -5616,7 +6428,17 @@ pub trait ProviderNormalizer: Send + Sync {
     fn normalize_desired<'a>(
         &'a self,
         resources: &'a mut [ProviderResource],
-    ) -> BoxFuture<'a, ProviderResult<()>>;
+    ) -> BoxFuture<'a, ProviderResult<(), S>>;
+
+    /// Normalize resolved dispatch inputs. Host boundaries collect annotated
+    /// values first, then give raw providers the established plaintext shape.
+    fn normalize_dispatch_desired<'a>(
+        &'a self,
+        resources: &'a mut [ProviderResource],
+    ) -> BoxFuture<'a, ProviderResult<(), S>> {
+        crate::executor::normalized::unwrap_dispatch_desired(resources);
+        self.normalize_desired(resources)
+    }
 
     /// Normalize current state values before diffing.
     ///
@@ -5629,7 +6451,7 @@ pub trait ProviderNormalizer: Send + Sync {
     fn normalize_state<'a>(
         &'a self,
         current_states: &'a mut StateTransformMap,
-    ) -> BoxFuture<'a, ProviderResult<()>>;
+    ) -> BoxFuture<'a, ProviderResult<(), S>>;
 
     /// Hydrate read state with saved attributes that APIs don't return.
     ///
@@ -5642,7 +6464,7 @@ pub trait ProviderNormalizer: Send + Sync {
         &'a self,
         current_states: &'a mut StateTransformMap,
         saved_attrs: &'a SavedAttrs,
-    ) -> BoxFuture<'a, ProviderResult<()>>;
+    ) -> BoxFuture<'a, ProviderResult<(), S>>;
 }
 
 /// Normalize state values while keeping the caller-owned route set fixed.
@@ -5650,12 +6472,12 @@ pub trait ProviderNormalizer: Send + Sync {
 /// The provider receives only the non-constructible [`StateTransformMap`]
 /// view. Changes commit atomically after a successful call; on error the
 /// caller's map is unchanged.
-pub async fn normalize_provider_states<N>(
+pub async fn normalize_provider_states<N, T: TextState>(
     normalizer: &N,
     states: &mut HashMap<ResourceId, SnapshotState>,
-) -> ProviderResult<()>
+) -> ProviderResult<(), T>
 where
-    N: ProviderNormalizer + ?Sized,
+    N: ProviderNormalizer<T> + ?Sized,
 {
     let mut transformed = StateTransformMap::from_states(states.clone());
     normalizer.normalize_state(&mut transformed).await?;
@@ -5667,13 +6489,13 @@ where
 ///
 /// Like [`normalize_provider_states`], this commits only a successful
 /// transformation and leaves the input unchanged after an error.
-pub async fn hydrate_provider_states<N>(
+pub async fn hydrate_provider_states<N, T: TextState>(
     normalizer: &N,
     states: &mut HashMap<ResourceId, SnapshotState>,
     saved_attrs: &SavedAttrs,
-) -> ProviderResult<()>
+) -> ProviderResult<(), T>
 where
-    N: ProviderNormalizer + ?Sized,
+    N: ProviderNormalizer<T> + ?Sized,
 {
     let mut transformed = StateTransformMap::from_states(states.clone());
     normalizer
@@ -5683,21 +6505,37 @@ where
     Ok(())
 }
 
+/// Host ingestion of state normalization requires an already-bound normalizer.
+pub async fn normalize_host_provider_states<N: HostNormalizer + ?Sized>(
+    normalizer: &N,
+    states: &mut HashMap<ResourceId, SnapshotState>,
+) -> HostResult<()> {
+    normalize_provider_states(normalizer, states).await
+}
+/// Host ingestion of hydration requires an already-bound normalizer.
+pub async fn hydrate_host_provider_states<N: HostNormalizer + ?Sized>(
+    normalizer: &N,
+    states: &mut HashMap<ResourceId, SnapshotState>,
+    saved_attrs: &SavedAttrs,
+) -> HostResult<()> {
+    hydrate_provider_states(normalizer, states, saved_attrs).await
+}
+
 /// A no-op normalizer for providers that don't need plan-time normalization.
 #[derive(Debug, Clone, Copy)]
 pub struct NoopNormalizer;
-impl ProviderNormalizer for NoopNormalizer {
+impl<S: TextState> ProviderNormalizer<S> for NoopNormalizer {
     fn normalize_desired<'a>(
         &'a self,
         _resources: &'a mut [ProviderResource],
-    ) -> BoxFuture<'a, ProviderResult<()>> {
+    ) -> BoxFuture<'a, ProviderResult<(), S>> {
         ready_noop()
     }
 
     fn normalize_state<'a>(
         &'a self,
         _current_states: &'a mut StateTransformMap,
-    ) -> BoxFuture<'a, ProviderResult<()>> {
+    ) -> BoxFuture<'a, ProviderResult<(), S>> {
         ready_noop()
     }
 
@@ -5705,7 +6543,7 @@ impl ProviderNormalizer for NoopNormalizer {
         &'a self,
         _current_states: &'a mut StateTransformMap,
         _saved_attrs: &'a SavedAttrs,
-    ) -> BoxFuture<'a, ProviderResult<()>> {
+    ) -> BoxFuture<'a, ProviderResult<(), S>> {
         ready_noop()
     }
 }
@@ -5822,8 +6660,8 @@ impl std::fmt::Display for DefaultTagEncodingError {
         write!(
             f,
             "key '{}' of provider '{}': {}",
-            ProviderText::new(&self.key),
-            ProviderText::new(&self.provider_name),
+            DiagnosticText::new(&self.key),
+            DiagnosticText::new(&self.provider_name),
             self.source
         )
     }
@@ -5852,7 +6690,7 @@ pub fn merge_default_tags<S, D>(
         D,
     >],
     registry: &SchemaRegistry,
-) -> ProviderResult<()> {
+) -> HostResult<()> {
     if config.default_tags.is_empty() {
         return Ok(());
     }
@@ -5885,13 +6723,16 @@ pub fn merge_default_tags<S, D>(
                 | SerializationError::UnavailableSecret(_)
                 | SerializationError::InsideSecret { .. }),
             ) => {
-                return Err(ProviderError::invalid_input_caused_by(
+                return Err(HostError::from_diagnostic(
+                    crate::provider::ProviderErrorKind::InvalidInput,
                     "failed to encode default tag",
-                    DefaultTagEncodingError {
-                        key: key.clone(),
-                        provider_name: config.name.clone(),
-                        source,
-                    },
+                    crate::provider_text::HostDiagnostic::capture_host_or_provider(
+                        DefaultTagEncodingError {
+                            key: key.clone(),
+                            provider_name: config.name.clone(),
+                            source,
+                        },
+                    ),
                 )
                 .for_provider(config.name.clone()));
             }
@@ -5965,7 +6806,7 @@ pub fn merge_default_tags<S, D>(
 /// An available scope requires the one-shot mint that core passes into the
 /// factory initialization step.
 pub struct InitializeOutcome {
-    reference_scope: ReferenceScope,
+    pub(crate) reference_scope: ReferenceScope,
 }
 
 /// Raw provider plus the opaque outcome of its initialization transition.
@@ -5975,7 +6816,7 @@ pub struct ProviderInitialization {
 }
 
 impl ProviderInitialization {
-    fn into_parts(self) -> (Box<dyn Provider>, InitializeOutcome) {
+    pub(crate) fn into_parts(self) -> (Box<dyn Provider>, InitializeOutcome) {
         (self.provider, self.outcome)
     }
 }
@@ -6004,7 +6845,7 @@ pub struct InitializeOutcomeMint {
 }
 
 impl InitializeOutcomeMint {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { _private: () }
     }
 
@@ -6040,38 +6881,76 @@ impl InitializeOutcomeMint {
 /// }
 /// ```
 pub struct InitializedProvider {
-    provider: Box<dyn Provider>,
-    reference_scope: ReferenceScope,
+    pub(crate) provider: Arc<ProviderBoundary<'static>>,
+    pub(crate) reference_scope: ReferenceScope,
 }
 
 impl InitializedProvider {
-    pub(crate) fn new(provider: Box<dyn Provider>, outcome: InitializeOutcome) -> Self {
-        Self {
-            provider,
-            reference_scope: outcome.reference_scope,
-        }
-    }
-
-    /// Construct a native provider that cannot use reference-form
-    /// equivalence. Available scope is paired only by core after the factory
-    /// initialization transition.
-    pub fn unavailable(provider: Box<dyn Provider>) -> Self {
-        Self::new(provider, InitializeOutcome::unavailable())
-    }
-
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn for_test(provider: Box<dyn Provider>, reference_scope: ReferenceScope) -> Self {
-        Self {
-            provider,
-            reference_scope,
+    pub(crate) fn for_test(provider: Box<dyn Provider>, reference_scope: ReferenceScope) -> Self {
+        struct Factory {
+            provider: std::sync::Mutex<Option<Box<dyn Provider>>>,
+            scope: ReferenceScope,
         }
+        impl ProviderFactory for Factory {
+            fn name(&self) -> &str {
+                "fixture"
+            }
+            fn display_name(&self) -> &str {
+                "Fixture"
+            }
+            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+                ValidatedConfigSchema::default()
+            }
+            fn validate_config(
+                &self,
+                _: &CanonicalProviderConfigAttributes,
+                _: &crate::provider::ProviderValidationInputs,
+            ) -> ProviderResult<()> {
+                Ok(())
+            }
+            fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+                Vec::new()
+            }
+            fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+                ValidatedProviderSchemaWitness::new(
+                    Vec::new(),
+                    ValidatedConfigSchema::default(),
+                    Default::default(),
+                    Vec::new(),
+                )
+                .unwrap()
+            }
+            fn create_provider(
+                &self,
+                _: &crate::provider::ProviderSession,
+                _: InitializeOutcomeMint,
+            ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+                let provider = self.provider.lock().unwrap().take().unwrap();
+                let reference_scope = self.scope.clone();
+                Box::pin(async move {
+                    Ok(InitializeOutcome { reference_scope }.with_provider(provider))
+                })
+            }
+        }
+        futures::executor::block_on(ProviderBoundary::initialize(
+            &Factory {
+                provider: std::sync::Mutex::new(Some(provider)),
+                scope: reference_scope,
+            },
+            &ProviderPlan::state_only().session("", None, None),
+        ))
+        .unwrap()
     }
-
+    pub fn into_boundary(self) -> ProviderBoundary<'static> {
+        Arc::try_unwrap(self.provider)
+            .unwrap_or_else(|_| unreachable!("initialized boundary is uniquely owned"))
+    }
     pub fn reference_scope(&self) -> &ReferenceScope {
         &self.reference_scope
     }
 
-    pub fn provider(&self) -> &(dyn Provider + 'static) {
+    pub fn provider(&self) -> &(dyn HostProvider + 'static) {
         self.provider.as_ref()
     }
 }
@@ -6080,71 +6959,267 @@ impl InitializedProvider {
 ///
 /// Normalizer-only loading returns this type. It deliberately has no API that
 /// can mint a [`crate::differ::ComparisonSchema`].
-pub struct NormalizerRouter {
-    normalizers: Vec<(String, Box<dyn ProviderNormalizer>)>,
+pub struct ConfiguredNormalizer<N = Box<dyn ProviderNormalizer>> {
+    pub(crate) route: Option<ProviderInstanceKey>,
+    pub(crate) provider_name: String,
+    pub(crate) ext: N,
+    pub(crate) config_secrets: RedactionSet,
+    pub(crate) schemas: SchemaRegistry,
 }
 
+impl AsRef<dyn HostNormalizer> for ConfiguredNormalizer {
+    fn as_ref(&self) -> &(dyn HostNormalizer + 'static) {
+        self
+    }
+}
+
+pub struct NormalizerRouter {
+    normalizers: Vec<Arc<dyn HostNormalizer>>,
+}
 impl Default for NormalizerRouter {
     fn default() -> Self {
         Self::new()
     }
 }
-
 impl NormalizerRouter {
     pub fn new() -> Self {
         Self {
             normalizers: Vec::new(),
         }
     }
-
-    pub fn add_normalizer(
+    pub fn add_initialized_normalizer(&mut self, normalizer: ConfiguredNormalizer) {
+        self.normalizers.push(Arc::new(normalizer));
+    }
+}
+#[cfg(test)]
+impl<N> ConfiguredNormalizer<N> {
+    pub(crate) fn fixture(ext: N) -> Self {
+        Self {
+            route: None,
+            provider_name: String::new(),
+            ext,
+            config_secrets: RedactionSet::before_request(),
+            schemas: SchemaRegistry::new(),
+        }
+    }
+    pub(crate) fn fixture_with_session(
+        ext: N,
+        session: &ProviderSession,
+        schemas: &SchemaRegistry,
+    ) -> Self {
+        Self {
+            route: None,
+            provider_name: String::new(),
+            ext,
+            config_secrets: session.redaction_set().clone(),
+            schemas: schemas.clone(),
+        }
+    }
+}
+#[cfg(test)]
+impl NormalizerRouter {
+    pub(crate) fn add_normalizer(
         &mut self,
         provider_name: impl Into<String>,
         ext: Box<dyn ProviderNormalizer>,
     ) {
-        self.normalizers.push((provider_name.into(), ext));
+        self.add_initialized_normalizer(ConfiguredNormalizer {
+            route: None,
+            provider_name: provider_name.into(),
+            ext,
+            config_secrets: RedactionSet::before_request(),
+            schemas: SchemaRegistry::new(),
+        });
+    }
+}
+#[cfg(test)]
+impl ProviderRouter {
+    pub(crate) fn add_normalizer(
+        &mut self,
+        provider_name: impl Into<String>,
+        ext: Box<dyn ProviderNormalizer>,
+    ) {
+        self.normalizers.add_normalizer(provider_name, ext);
+    }
+}
+impl<N: ProviderNormalizer> ConfiguredNormalizer<N> {
+    fn owns(&self, id: &ResourceId) -> bool {
+        self.route.as_ref().is_none_or(|route| {
+            route.provider() == id.provider
+                && route.provider_instance() == id.provider_instance.as_deref()
+        })
+    }
+    fn bind_error(&self, error: ProviderError) -> HostError {
+        error
+            .for_provider(self.provider_name.clone())
+            .with_secrets(&self.config_secrets)
+    }
+    async fn transform_states(
+        &self,
+        states: &mut StateTransformMap,
+        saved: Option<&SavedAttrs>,
+    ) -> HostResult<()> {
+        let mut selected = StateTransformMap::from_states(
+            states
+                .iter()
+                .filter(|(id, _)| self.owns(id))
+                .map(|(id, state)| (id.clone(), state.clone()))
+                .collect(),
+        );
+        if let Some(saved) = saved {
+            let saved = SavedAttrs(
+                saved
+                    .iter()
+                    .filter(|(id, _)| self.owns(id))
+                    .map(|(id, attrs)| (id.clone(), attrs.clone()))
+                    .collect(),
+            );
+            self.ext
+                .hydrate_read_state(&mut selected, &saved)
+                .await
+                .map_err(|error| self.bind_error(error))?;
+        } else {
+            self.ext
+                .normalize_state(&mut selected)
+                .await
+                .map_err(|error| self.bind_error(error))?;
+        }
+        states.0.extend(selected.into_states());
+        Ok(())
+    }
+}
+impl<N: ProviderNormalizer> ConfiguredNormalizer<N> {
+    fn normalize_desired_inner<'a>(
+        &'a self,
+        resources: &'a mut [ProviderResource],
+        dispatch: bool,
+    ) -> BoxFuture<'a, HostResult<()>> {
+        Box::pin(async move {
+            let (positions, mut selected): (Vec<_>, Vec<_>) = resources
+                .iter()
+                .enumerate()
+                .filter(|(_, resource)| self.owns(&resource.id))
+                .map(|(index, resource)| (index, resource.clone()))
+                .unzip();
+            let ids = selected
+                .iter()
+                .map(|resource| resource.id.clone())
+                .collect::<Vec<_>>();
+            self.config_secrets.extend(&RedactionSet::collect(
+                selected
+                    .iter()
+                    .flat_map(|resource| resource.attributes.values()),
+            ));
+            if dispatch {
+                crate::executor::normalized::unwrap_dispatch_desired(&mut selected);
+            }
+            self.ext
+                .normalize_desired(&mut selected)
+                .await
+                .map_err(|error| self.bind_error(error))?;
+            if ids
+                .iter()
+                .zip(&selected)
+                .any(|(id, returned)| id != &returned.id)
+            {
+                return Err(self.bind_error(ProviderError::invalid_input(
+                    "provider normalizer changed resource identity",
+                )));
+            }
+            crate::value::canonicalize_normalized_resources_with_schemas(
+                &mut selected,
+                &self.schemas,
+            )
+            .map_err(|error| self.bind_error(error.into()))?;
+            for (position, resource) in positions.into_iter().zip(selected) {
+                resources[position] = resource;
+            }
+            Ok(())
+        })
     }
 }
 
-impl ProviderNormalizer for NormalizerRouter {
+impl<N: ProviderNormalizer> ProviderNormalizer<Bound> for ConfiguredNormalizer<N> {
     fn normalize_desired<'a>(
         &'a self,
         resources: &'a mut [ProviderResource],
-    ) -> BoxFuture<'a, ProviderResult<()>> {
-        Box::pin(async move {
-            for (provider_name, ext) in &self.normalizers {
-                ext.normalize_desired(resources)
-                    .await
-                    .map_err(|error| error.for_provider(provider_name.clone()))?;
-            }
-            Ok(())
-        })
+    ) -> BoxFuture<'a, HostResult<()>> {
+        self.normalize_desired_inner(resources, false)
     }
-
+    fn normalize_dispatch_desired<'a>(
+        &'a self,
+        resources: &'a mut [ProviderResource],
+    ) -> BoxFuture<'a, HostResult<()>> {
+        self.normalize_desired_inner(resources, true)
+    }
     fn normalize_state<'a>(
         &'a self,
-        current_states: &'a mut StateTransformMap,
-    ) -> BoxFuture<'a, ProviderResult<()>> {
+        states: &'a mut StateTransformMap,
+    ) -> BoxFuture<'a, HostResult<()>> {
+        Box::pin(self.transform_states(states, None))
+    }
+    fn hydrate_read_state<'a>(
+        &'a self,
+        states: &'a mut StateTransformMap,
+        saved: &'a SavedAttrs,
+    ) -> BoxFuture<'a, HostResult<()>> {
+        Box::pin(self.transform_states(states, Some(saved)))
+    }
+}
+
+impl ProviderNormalizer<Bound> for NormalizerRouter {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [ProviderResource],
+    ) -> BoxFuture<'a, HostResult<()>> {
         Box::pin(async move {
-            for (provider_name, ext) in &self.normalizers {
-                ext.normalize_state(current_states)
-                    .await
-                    .map_err(|error| error.for_provider(provider_name.clone()))?;
+            for normalizer in &self.normalizers {
+                normalizer.normalize_desired(resources).await?;
             }
             Ok(())
         })
     }
-
+    fn normalize_dispatch_desired<'a>(
+        &'a self,
+        resources: &'a mut [ProviderResource],
+    ) -> BoxFuture<'a, HostResult<()>> {
+        Box::pin(async move {
+            for normalizer in &self.normalizers {
+                normalizer.normalize_dispatch_desired(resources).await?;
+            }
+            for resource in resources {
+                if !self
+                    .normalizers
+                    .iter()
+                    .any(|normalizer| normalizer.owns_desired(&resource.id))
+                {
+                    crate::executor::normalized::unwrap_dispatch_desired(std::slice::from_mut(
+                        resource,
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }
+    fn normalize_state<'a>(
+        &'a self,
+        states: &'a mut StateTransformMap,
+    ) -> BoxFuture<'a, HostResult<()>> {
+        Box::pin(async move {
+            for normalizer in &self.normalizers {
+                normalizer.normalize_state(states).await?;
+            }
+            Ok(())
+        })
+    }
     fn hydrate_read_state<'a>(
         &'a self,
-        current_states: &'a mut StateTransformMap,
-        saved_attrs: &'a SavedAttrs,
-    ) -> BoxFuture<'a, ProviderResult<()>> {
+        states: &'a mut StateTransformMap,
+        saved: &'a SavedAttrs,
+    ) -> BoxFuture<'a, HostResult<()>> {
         Box::pin(async move {
-            for (provider_name, ext) in &self.normalizers {
-                ext.hydrate_read_state(current_states, saved_attrs)
-                    .await
-                    .map_err(|error| error.for_provider(provider_name.clone()))?;
+            for normalizer in &self.normalizers {
+                normalizer.hydrate_read_state(states, saved).await?;
             }
             Ok(())
         })
@@ -6207,9 +7282,13 @@ impl std::fmt::Display for ComparisonResolutionError {
 
 impl std::error::Error for ComparisonResolutionError {}
 
-impl From<ComparisonResolutionError> for ProviderError {
+impl From<ComparisonResolutionError> for HostError {
     fn from(error: ComparisonResolutionError) -> Self {
-        ProviderError::internal_caused_by("Failed to resolve resource comparison", error)
+        HostError::from_diagnostic(
+            crate::provider::ProviderErrorKind::Internal,
+            "Failed to resolve resource comparison",
+            crate::provider_text::HostDiagnostic::capture_host_or_provider(error),
+        )
     }
 }
 
@@ -6505,8 +7584,13 @@ impl ProviderRouter {
         &self,
         resource: &ResourceId,
         requests: &[crate::references::ReferenceRequest],
-    ) -> ProviderResult<
-        Vec<Result<crate::references::ReferenceOutcome, crate::references::ReferenceError>>,
+    ) -> HostResult<
+        Vec<
+            Result<
+                crate::references::ReferenceOutcome<Bound>,
+                crate::references::ReferenceError<Bound>,
+            >,
+        >,
     > {
         self.get_provider_or_error(resource)?
             .resolve_references(requests)
@@ -6516,6 +7600,7 @@ impl ProviderRouter {
     /// Register the kind's default instance (resources with
     /// `provider_instance = None` route here).
     pub fn add_provider(&mut self, kind: String, provider: InitializedProvider) {
+        self.normalizers.normalizers.push(provider.provider.clone());
         self.providers
             .insert(ProviderInstanceKey::new(kind, None), provider);
     }
@@ -6530,6 +7615,7 @@ impl ProviderRouter {
         config: &ProviderConfig<P, B>,
         provider: InitializedProvider,
     ) {
+        self.normalizers.normalizers.push(provider.provider.clone());
         self.providers
             .insert(ProviderInstanceKey::from(config), provider);
     }
@@ -6542,15 +7628,12 @@ impl ProviderRouter {
         key: ProviderInstanceKey,
         provider: InitializedProvider,
     ) {
+        self.normalizers.normalizers.push(provider.provider.clone());
         self.providers.insert(key, provider);
     }
 
-    pub fn add_normalizer(
-        &mut self,
-        provider_name: impl Into<String>,
-        ext: Box<dyn ProviderNormalizer>,
-    ) {
-        self.normalizers.add_normalizer(provider_name, ext);
+    pub fn add_initialized_normalizer(&mut self, normalizer: ConfiguredNormalizer) {
+        self.normalizers.add_initialized_normalizer(normalizer);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -6560,10 +7643,10 @@ impl ProviderRouter {
     fn get_initialized_provider_or_error(
         &self,
         id: &ResourceId,
-    ) -> ProviderResult<&InitializedProvider> {
+    ) -> HostResult<&InitializedProvider> {
         let key = ProviderInstanceKey::from(id);
         self.providers.get(&key).ok_or_else(|| {
-            ProviderError::internal(match &id.provider_instance {
+            HostError::internal(match &id.provider_instance {
                 Some(binding) => format!(
                     "Unknown provider instance: {} (kind={})",
                     binding, id.provider
@@ -6573,7 +7656,7 @@ impl ProviderRouter {
         })
     }
 
-    fn get_provider_or_error(&self, id: &ResourceId) -> ProviderResult<&dyn Provider> {
+    fn get_provider_or_error(&self, id: &ResourceId) -> HostResult<&dyn HostProvider> {
         self.get_initialized_provider_or_error(id)
             .map(InitializedProvider::provider)
     }
@@ -6592,10 +7675,10 @@ impl ProviderRouter {
         &'a self,
         id: &ResourceId,
         schema: crate::schema::OwnerBoundResourceSchema<'a>,
-    ) -> ProviderResult<crate::differ::ComparisonSchema<'a>> {
+    ) -> HostResult<crate::differ::ComparisonSchema<'a>> {
         self.resolve_comparison(id, schema)
             .map(|resolved| resolved.context)
-            .map_err(ProviderError::from)
+            .map_err(HostError::from)
     }
 
     /// Resolve the owner schema and initialized provider comparison context in
@@ -6680,7 +7763,7 @@ impl ResourceComparisonResolver for ProviderRouter {
     }
 }
 
-impl Provider for ProviderRouter {
+impl Provider<Bound> for ProviderRouter {
     fn name(&self) -> &str {
         "router"
     }
@@ -6690,7 +7773,7 @@ impl Provider for ProviderRouter {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: ReadRequest,
-    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+    ) -> BoxFuture<'_, HostResult<ReadOutcome>> {
         match self.get_provider_or_error(id) {
             Ok(provider) => provider.read(id, identifier, request),
             Err(e) => Box::pin(async move { Err(e) }),
@@ -6700,7 +7783,7 @@ impl Provider for ProviderRouter {
     fn read_data_source(
         &self,
         resource: &ProviderReadyDataSource,
-    ) -> BoxFuture<'_, ProviderResult<State>> {
+    ) -> BoxFuture<'_, HostResult<State>> {
         match self.get_provider_or_error(&resource.id) {
             Ok(provider) => provider.read_data_source(resource),
             Err(e) => Box::pin(async move { Err(e) }),
@@ -6712,22 +7795,24 @@ impl Provider for ProviderRouter {
         id: &ResourceId,
         request: CreateRequest,
         attempt: CreateAttempt,
-    ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+    ) -> BoxFuture<'_, Result<HostCreateOutcome, HostCreateFailure>> {
         match self.get_provider_or_error(id) {
             Ok(provider) => provider.create(id, request, attempt),
-            Err(error) => Box::pin(async move { Err(attempt.not_created(error)) }),
+            Err(error) => {
+                Box::pin(async move { Err(HostCreateFailure::not_created_at_dispatch(error)) })
+            }
         }
     }
 
     fn resume_create(
         &self,
         request: ResumeCreateRequest,
-    ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
+    ) -> BoxFuture<'_, Result<HostResumeOutcome, HostResumeFailure>> {
         match self.get_provider_or_error(request.id()) {
             Ok(provider) => provider.resume_create(request),
             Err(error) => {
                 let pending = request.into_in_flight();
-                Box::pin(async move { Err(ResumeFailure::in_flight(pending, error)) })
+                Box::pin(async move { Err(HostResumeFailure::in_flight(pending, error)) })
             }
         }
     }
@@ -6738,21 +7823,25 @@ impl Provider for ProviderRouter {
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
         attempt: UpdateAttempt,
-    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+    ) -> BoxFuture<'_, HostResult<HostUpdateOutcome>> {
         match self.get_provider_or_error(id) {
             Ok(provider) => provider.update(id, identifier, request, attempt),
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
 
-    fn delete(&self, attempt: crate::provider::DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
+    fn delete(&self, attempt: crate::provider::DeleteAttempt) -> BoxFuture<'_, HostResult<()>> {
         match self.get_provider_or_error(attempt.id()) {
             Ok(provider) => provider.delete(attempt),
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
 
-    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
+    fn required_permissions(
+        &self,
+        id: &ResourceId,
+        op: PlanOp,
+    ) -> HostResult<Vec<crate::provider_text::RequiredPermission>> {
         self.get_provider_or_error(id)?
             .required_permissions(id, op)
             .map_err(|error| error.for_provider(id.provider.clone()))
@@ -6762,25 +7851,32 @@ impl Provider for ProviderRouter {
         &self,
         target_id: &ResourceId,
         attr_path: &AttrPath,
-    ) -> ProviderResult<Vec<BindingPattern>> {
+    ) -> HostResult<Vec<BindingPattern>> {
         self.get_provider_or_error(target_id)?
             .satisfier_hint(target_id, attr_path)
             .map_err(|error| error.for_provider(target_id.provider.clone()))
     }
 }
 
-impl ProviderNormalizer for ProviderRouter {
+impl ProviderNormalizer<Bound> for ProviderRouter {
     fn normalize_desired<'a>(
         &'a self,
         resources: &'a mut [ProviderResource],
-    ) -> BoxFuture<'a, ProviderResult<()>> {
+    ) -> BoxFuture<'a, HostResult<()>> {
         self.normalizers.normalize_desired(resources)
+    }
+
+    fn normalize_dispatch_desired<'a>(
+        &'a self,
+        resources: &'a mut [ProviderResource],
+    ) -> BoxFuture<'a, HostResult<()>> {
+        self.normalizers.normalize_dispatch_desired(resources)
     }
 
     fn normalize_state<'a>(
         &'a self,
         current_states: &'a mut StateTransformMap,
-    ) -> BoxFuture<'a, ProviderResult<()>> {
+    ) -> BoxFuture<'a, HostResult<()>> {
         self.normalizers.normalize_state(current_states)
     }
 
@@ -6788,7 +7884,7 @@ impl ProviderNormalizer for ProviderRouter {
         &'a self,
         current_states: &'a mut StateTransformMap,
         saved_attrs: &'a SavedAttrs,
-    ) -> BoxFuture<'a, ProviderResult<()>> {
+    ) -> BoxFuture<'a, HostResult<()>> {
         self.normalizers
             .hydrate_read_state(current_states, saved_attrs)
     }
@@ -7232,8 +8328,11 @@ pub trait ProviderFactory: Send + Sync {
     ///     factory.validate_config(raw).unwrap();
     /// }
     /// ```
-    fn validate_config(&self, attributes: &CanonicalProviderConfigAttributes)
-    -> ProviderResult<()>;
+    fn validate_config(
+        &self,
+        attributes: &CanonicalProviderConfigAttributes,
+        _session: &crate::provider::ProviderValidationInputs,
+    ) -> ProviderResult<()>;
 
     /// Validate a value against a provider-defined custom type after local
     /// schema constraints have run. The native default adds no extra
@@ -7263,6 +8362,7 @@ pub trait ProviderFactory: Send + Sync {
         &self,
         _identity: &TypeIdentity,
         _value: &CanonicalCustomTypeValue,
+        _session: &crate::provider::ProviderValidationInputs,
     ) -> ProviderResult<()> {
         Ok(())
     }
@@ -7279,29 +8379,14 @@ pub trait ProviderFactory: Send + Sync {
     /// Returns `Err(ProviderError)` when the provider rejects the
     /// supplied configuration (e.g., an `allowed_account_ids` mismatch
     /// detected during `init`). Callers MUST surface the inner message
-    /// verbatim — it is the user-facing error text. The sealed
+    /// through the boundary, which redacts provider-derived text. The sealed
     /// [`ProviderReadyConfig`] proves that resolution, host-side schema
     /// validation, and [`ProviderFactory::validate_config`] already ran.
     fn create_provider(
         &self,
-        binding: Option<&str>,
-        config: &ProviderReadyConfig,
+        config: &crate::provider::ProviderSession,
         initialize_outcome: InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>>;
-
-    /// Run the factory initialization transition and pair its raw provider
-    /// with the opaque outcome inside core.
-    fn create_initialized_provider(
-        &self,
-        binding: Option<&str>,
-        config: &ProviderReadyConfig,
-    ) -> BoxFuture<'_, ProviderResult<InitializedProvider>> {
-        let created = self.create_provider(binding, config, InitializeOutcomeMint::new());
-        Box::pin(async move {
-            let (provider, outcome) = created.await?.into_parts();
-            Ok(InitializedProvider::new(provider, outcome))
-        })
-    }
 
     /// Create a normalizer instance from configuration attributes.
     ///
@@ -7312,8 +8397,7 @@ pub trait ProviderFactory: Send + Sync {
     /// checked configuration witness is required as for provider creation.
     fn create_normalizer(
         &self,
-        _binding: Option<&str>,
-        _config: &ProviderReadyConfig,
+        _config: &crate::provider::ProviderSession,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -7587,7 +8671,7 @@ fn custom_validator_bridge_message(error: crate::schema::TypeError) -> String {
 #[derive(Debug)]
 pub enum CustomTypeFactoryValidationError {
     InvalidValue(crate::schema::TypeError),
-    ProviderRejected(ProviderError),
+    ProviderRejected(HostError),
 }
 
 impl fmt::Display for CustomTypeFactoryValidationError {
@@ -7623,9 +8707,14 @@ fn dispatch_validated_custom_type(
     factory: &dyn ProviderFactory,
     proof: crate::schema::LocallyValidatedCustomType<'_>,
 ) -> Result<(), CustomTypeFactoryValidationError> {
+    let session = ProviderValidationInputs::collect([proof.value()]);
     factory
-        .validate_custom_type(proof.declaration().identity(), proof.canonical())
-        .map_err(CustomTypeFactoryValidationError::ProviderRejected)
+        .validate_custom_type(proof.declaration().identity(), proof.canonical(), &session)
+        .map_err(|error| {
+            CustomTypeFactoryValidationError::ProviderRejected(
+                error.with_secrets(session.redaction_set()),
+            )
+        })
 }
 
 pub(crate) fn validate_validated_custom_type_with_factory(
@@ -8445,7 +9534,171 @@ pub(crate) fn validate_custom_type_annotation(
 
 /// Provider implementation for Box<dyn Provider>
 /// This enables dynamic dispatch for Providers
-impl Provider for Box<dyn Provider> {
+impl<P: Provider + ?Sized> Provider for Box<P> {
+    fn resolve_references<'a>(
+        &'a self,
+        requests: &'a [crate::references::ReferenceRequest],
+    ) -> BoxFuture<
+        'a,
+        ProviderResult<
+            Vec<Result<crate::references::ReferenceOutcome, crate::references::ReferenceError>>,
+        >,
+    > {
+        (**self).resolve_references(requests)
+    }
+
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        identifier: &AppliedIdentifier,
+        request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+        (**self).read(id, identifier, request)
+    }
+
+    fn read_data_source(
+        &self,
+        resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        (**self).read_data_source(resource)
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+        attempt: CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+        (**self).create(id, request, attempt)
+    }
+
+    fn resume_create(
+        &self,
+        request: ResumeCreateRequest,
+    ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
+        (**self).resume_create(request)
+    }
+
+    fn update(
+        &self,
+        id: &ResourceId,
+        identifier: &AppliedIdentifier,
+        request: UpdateRequest,
+        attempt: UpdateAttempt,
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+        (**self).update(id, identifier, request, attempt)
+    }
+
+    fn delete(&self, attempt: DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
+        (**self).delete(attempt)
+    }
+
+    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
+        (**self).required_permissions(id, op)
+    }
+
+    fn satisfier_hint(
+        &self,
+        target_id: &ResourceId,
+        attr_path: &AttrPath,
+    ) -> ProviderResult<Vec<BindingPattern>> {
+        (**self).satisfier_hint(target_id, attr_path)
+    }
+}
+
+impl<P: Provider + ?Sized> Provider for Arc<P> {
+    fn resolve_references<'a>(
+        &'a self,
+        requests: &'a [crate::references::ReferenceRequest],
+    ) -> BoxFuture<
+        'a,
+        ProviderResult<
+            Vec<Result<crate::references::ReferenceOutcome, crate::references::ReferenceError>>,
+        >,
+    > {
+        (**self).resolve_references(requests)
+    }
+
+    fn name(&self) -> &str {
+        (**self).name()
+    }
+
+    fn read(
+        &self,
+        id: &ResourceId,
+        identifier: &AppliedIdentifier,
+        request: ReadRequest,
+    ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+        (**self).read(id, identifier, request)
+    }
+
+    fn read_data_source(
+        &self,
+        resource: &ProviderReadyDataSource,
+    ) -> BoxFuture<'_, ProviderResult<State>> {
+        (**self).read_data_source(resource)
+    }
+
+    fn create(
+        &self,
+        id: &ResourceId,
+        request: CreateRequest,
+        attempt: CreateAttempt,
+    ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+        (**self).create(id, request, attempt)
+    }
+
+    fn resume_create(
+        &self,
+        request: ResumeCreateRequest,
+    ) -> BoxFuture<'_, Result<ResumeOutcome, ResumeFailure>> {
+        (**self).resume_create(request)
+    }
+
+    fn update(
+        &self,
+        id: &ResourceId,
+        identifier: &AppliedIdentifier,
+        request: UpdateRequest,
+        attempt: UpdateAttempt,
+    ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+        (**self).update(id, identifier, request, attempt)
+    }
+
+    fn delete(&self, attempt: DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
+        (**self).delete(attempt)
+    }
+
+    fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
+        (**self).required_permissions(id, op)
+    }
+
+    fn satisfier_hint(
+        &self,
+        target_id: &ResourceId,
+        attr_path: &AttrPath,
+    ) -> ProviderResult<Vec<BindingPattern>> {
+        (**self).satisfier_hint(target_id, attr_path)
+    }
+}
+
+impl<P: Provider + ?Sized> Provider for &P {
+    fn resolve_references<'a>(
+        &'a self,
+        requests: &'a [crate::references::ReferenceRequest],
+    ) -> BoxFuture<
+        'a,
+        ProviderResult<
+            Vec<Result<crate::references::ReferenceOutcome, crate::references::ReferenceError>>,
+        >,
+    > {
+        (**self).resolve_references(requests)
+    }
+
     fn name(&self) -> &str {
         (**self).name()
     }
@@ -8578,7 +9831,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         use crate::parser::SchemaTypeOwner;
         use crate::provider::{
             BoxFuture, CanonicalProviderConfigAttributes, InitializeOutcomeMint, ProviderError,
-            ProviderFactory, ProviderInitialization, ProviderReadyConfig, ProviderResult,
+            ProviderFactory, ProviderInitialization, ProviderResult,
             loaded_provider_snapshot_from_factories,
         };
         use crate::schema::{
@@ -8622,13 +9875,16 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
                 panic!("snapshot must use the aggregate witness")
             }
-            fn validate_config(&self, _: &CanonicalProviderConfigAttributes) -> ProviderResult<()> {
+            fn validate_config(
+                &self,
+                _: &CanonicalProviderConfigAttributes,
+                _session: &crate::provider::ProviderValidationInputs,
+            ) -> ProviderResult<()> {
                 Ok(())
             }
             fn create_provider(
                 &self,
-                _: Option<&str>,
-                _: &ProviderReadyConfig,
+                _: &crate::provider::ProviderSession,
                 _: InitializeOutcomeMint,
             ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
                 Box::pin(async { Err(ProviderError::internal("schema-only test")) })
@@ -8972,7 +10228,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     }
 
     fn initialized(provider: impl Provider + 'static) -> InitializedProvider {
-        InitializedProvider::unavailable(Box::new(provider))
+        InitializedProvider::for_test(Box::new(provider), ReferenceScope::Unavailable)
     }
 
     #[test]
@@ -9518,14 +10774,14 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         fn validate_config(
             &self,
             _attributes: &CanonicalProviderConfigAttributes,
+            _session: &crate::provider::ProviderValidationInputs,
         ) -> ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &crate::executor::ProviderReadyConfig,
+            _config: &crate::provider::ProviderSession,
             _initialize_outcome: crate::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
             Box::pin(async { Err(ProviderError::internal("not used")) })
@@ -9737,14 +10993,14 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         fn validate_config(
             &self,
             _attributes: &CanonicalProviderConfigAttributes,
+            _session: &crate::provider::ProviderValidationInputs,
         ) -> ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &crate::executor::ProviderReadyConfig,
+            _config: &crate::provider::ProviderSession,
             _initialize_outcome: InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
             Box::pin(async { Err(ProviderError::internal("not used")) })
@@ -9963,6 +11219,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
 
     #[test]
     fn resumed_partial_success_preserves_persisted_sent_authority() {
+        use super::HostResumeOutcomeKind as ResumeOutcomeKind;
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
         let started_at =
             Timestamp::try_from("2026-10-23T08:00:00Z").expect("fixture timestamp is valid");
@@ -9981,8 +11238,8 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             PersistedAttributes::default(),
             PersistedAttributes::default(),
         );
-        let diagnostic = PartialReadDiagnostic::new(
-            "read-back remained incomplete".to_string(),
+        let diagnostic: PartialReadDiagnostic = PartialReadDiagnostic::new(
+            "read-back remained incomplete".into(),
             vec!["computed".to_string()],
         )
         .expect("fixture has one missing attribute");
@@ -9998,6 +11255,8 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             )]),
             diagnostic.clone(),
         );
+        let diagnostic = diagnostic.into_host_for_test();
+        let outcome = outcome.into_host_for_test();
         let ResumeOutcomeKind::PartialSuccess(partial) = outcome.into_kind() else {
             panic!("resumed partial read-back must remain distinct from a resent create")
         };
@@ -10036,6 +11295,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             .0
             .not_created(ProviderError::api_error("leaf create failure"));
 
+        let failure = failure.into_host_for_test();
         assert_eq!(failure.to_string(), "create failed and left no resource");
         assert_eq!(
             failure.source().map(ToString::to_string).as_deref(),
@@ -10055,7 +11315,9 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             .await
             .classify();
 
-        let CreateFailureKind::OutcomeUnknown { unknown, error } = failure.into_kind() else {
+        let HostCreateFailureKind::OutcomeUnknown { unknown, error } =
+            failure.into_host_for_test().into_kind()
+        else {
             panic!("a sent guest call must not be classified as not_created")
         };
         assert_eq!(unknown.id(), &id);
@@ -10073,7 +11335,8 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             .await
             .classify();
 
-        let CreateFailureKind::NoResource(error) = failure.into_kind() else {
+        let HostCreateFailureKind::NoResource(error) = failure.into_host_for_test().into_kind()
+        else {
             panic!("a guest call with no dispatched request must remain not_created")
         };
         assert_eq!(error.to_string(), "guest trapped");
@@ -10102,7 +11365,8 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         drop(pending);
 
         let failure = classification.await.expect("classification task");
-        let CreateFailureKind::NoResource(error) = failure.into_kind() else {
+        let HostCreateFailureKind::NoResource(error) = failure.into_host_for_test().into_kind()
+        else {
             panic!("a host-denied pending request must not count as egress")
         };
         assert_eq!(error.to_string(), "malformed guest result");
@@ -10116,7 +11380,9 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             ProviderError::internal("returned value could not be decoded"),
         );
 
-        let CreateFailureKind::OutcomeUnknown { unknown, error } = failure.into_kind() else {
+        let HostCreateFailureKind::OutcomeUnknown { unknown, error } =
+            failure.into_host_for_test().into_kind()
+        else {
             panic!("the egress witness must mint an outcome-unknown failure")
         };
         assert_eq!(unknown.id(), &id);
@@ -10161,9 +11427,10 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     fn classified_resume_failure_display_is_context_only() {
         use std::error::Error as _;
 
-        let failure = ResumeFailure::no_resource_from_verdict(ProviderError::not_found(
-            "leaf resume failure",
-        ));
+        let failure = ResumeFailure::no_resource_from_verdict(
+            ProviderError::not_found("leaf resume failure")
+                .with_secrets(&crate::provider_text::RedactionSet::for_test(&[])),
+        );
 
         assert_eq!(failure.to_string(), "resumed create left no resource");
         assert_eq!(
@@ -10175,7 +11442,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     #[test]
     fn provider_text_post_create_note_sanitizes_provider_identifier() {
         let raw = format!("\x1b]52;c;ZXZpbA==\x07\x1b[2J{}", "x".repeat(20 * 1024));
-        let identified = IdentifiedCreate::from_create_observation(
+        let identified: IdentifiedCreate = IdentifiedCreate::from_create_observation(
             ResourceId::with_provider_identity("test", "widget", "example", None),
             AppliedIdentifier::new(&raw).unwrap(),
             CreateObservation::Unobserved(UnobservedReason::NotFound),
@@ -10191,12 +11458,13 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     #[test]
     fn create_identified_post_error_note_indents_multiline_reason() {
         let id = ResourceId::with_provider_identity("test", "widget", "example", None);
-        let identified = IdentifiedCreate::from_create_observation(
+        let identified: HostIdentifiedCreate = IdentifiedCreate::from_create_observation(
             id,
             AppliedIdentifier::new("widget-id").expect("fixture identifier is non-empty"),
-            CreateObservation::Unobserved(UnobservedReason::ReadFailed(ProviderError::api_error(
-                "read failed\nrequest id: req-123\nretry later",
-            ))),
+            CreateObservation::Unobserved(UnobservedReason::ReadFailed(
+                ProviderError::api_error("read failed\nrequest id: req-123\nretry later")
+                    .with_secrets(&crate::provider_text::RedactionSet::for_test(&[])),
+            )),
             SentRecord::Request(Sent::AllRequestAttributes),
         );
 
@@ -10222,9 +11490,12 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         let leaf_reason =
             "unresolved enum identifier `test.widget.Mode.invalid` survived canonicalization";
 
-        let provider_error = ProviderError::from(error);
+        let provider_error = HostError::from(error);
 
-        assert!(matches!(provider_error, ProviderError::InvalidInput(_)));
+        {
+            use crate::provider::HostError as ProviderError;
+            assert!(matches!(provider_error, ProviderError::InvalidInput(_)));
+        }
         assert_eq!(
             provider_error.detail().context(),
             "Failed to canonicalize enum value"
@@ -11251,23 +12522,24 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         let state = AppliedState::new(id.clone(), "mock-id", HashMap::new())
             .expect("fixture identifier is non-empty");
         let expected = State::existing(id, HashMap::new()).with_identifier("mock-id");
-        let diagnostic = PartialReadDiagnostic::new(
-            "mock partial create".to_string(),
-            vec!["dns_name".to_string()],
-        )
-        .expect("missing attributes are non-empty");
+        let diagnostic: PartialReadDiagnostic =
+            PartialReadDiagnostic::new("mock partial create".into(), vec!["dns_name".to_string()])
+                .expect("missing attributes are non-empty");
 
-        let success = CreateOutcome::fixture_success(state.clone());
+        let success: CreateOutcome = CreateOutcome::fixture_success(state.clone());
+        let success = success.into_host_for_test();
         assert_eq!(success.diagnostic(), None);
         assert_eq!(success.identifier().as_str(), "mock-id");
         assert_eq!(success.into_state_for_writeback(), expected);
 
         let partial = CreateOutcome::partial_success(
             state.clone(),
-            "mock partial create".to_string(),
+            "mock partial create".into(),
             vec!["dns_name".to_string()],
         );
 
+        let diagnostic = diagnostic.into_host_for_test();
+        let partial = partial.into_host_for_test();
         assert_eq!(partial.diagnostic(), Some(&diagnostic));
         assert_eq!(partial.identifier().as_str(), "mock-id");
         let state = partial.into_state_for_writeback();
@@ -11338,14 +12610,16 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             applied(),
             "provider returned a partial read".to_string(),
             vec!["computed".to_string()],
-        );
+        )
+        .with_secrets(&RedactionSet::for_test(&[]));
         assert_materialized(created.into_state_for_writeback(), &expected);
 
         let updated = UpdateOutcome::partial_success(
             applied(),
             "provider returned a partial read".to_string(),
             vec!["computed".to_string()],
-        );
+        )
+        .with_secrets(&RedactionSet::for_test(&[]));
         assert_materialized(updated.into_state_for_writeback(), &expected);
     }
 
@@ -11356,12 +12630,10 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             .expect("fixture identifier is non-empty");
         let expected = State::existing(id, HashMap::new()).with_identifier("mock-id");
 
-        let outcome = CreateOutcome::partial_success(
-            state.clone(),
-            "mock partial create".to_string(),
-            vec![],
-        );
+        let outcome: CreateOutcome =
+            CreateOutcome::partial_success(state.clone(), "mock partial create".into(), vec![]);
 
+        let outcome = outcome.into_host_for_test();
         assert_eq!(outcome.diagnostic(), None);
         assert_eq!(outcome.into_state_for_writeback(), expected);
     }
@@ -11384,6 +12656,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
 
     #[test]
     fn partial_read_diagnostic_merge_options_covers_all_cases() {
+        type PartialReadDiagnostic = crate::provider::HostPartialReadDiagnostic;
         let a = PartialReadDiagnostic::new(
             "rename partial".to_string(),
             vec!["rename_attr".to_string(), "shared".to_string()],
@@ -11421,12 +12694,16 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     #[test]
     fn host_deadline_provenance_is_not_provider_diagnostic_identity() {
         let provider_reported = PartialReadDiagnostic::new(
-            "read-back remained incomplete".to_string(),
+            "read-back remained incomplete".into(),
             vec!["computed".to_string()],
         )
-        .expect("missing attributes are non-empty");
+        .expect("missing attributes are non-empty")
+        .with_secrets(&RedactionSet::for_test(&[]));
         let encoded = serde_json::to_value(&provider_reported).unwrap();
-        let round_tripped: PartialReadDiagnostic = serde_json::from_value(encoded.clone()).unwrap();
+        let round_tripped: HostPartialReadDiagnostic =
+            serde_json::from_value::<PartialReadDiagnostic>(encoded.clone())
+                .unwrap()
+                .with_secrets(&RedactionSet::for_test(&[]));
 
         assert_eq!(
             encoded,
@@ -11446,7 +12723,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             .expect("the fixture identifier is non-empty");
         let mut provider_outcome = Some(UpdateOutcome::partial_success(
             state,
-            "read-back remained incomplete".to_string(),
+            "read-back remained incomplete".into(),
             vec!["computed".to_string()],
         ));
         let provider_kind = provider_outcome.as_ref().unwrap().kind().clone();
@@ -11488,6 +12765,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             "host provenance does not change the provider-reported outcome kind",
         );
 
+        let host_outcome = host_outcome.into_host_for_test();
         let writeback = host_outcome.into_state_for_writeback();
         let encoded_state = serde_json::to_string(&writeback).unwrap();
         assert!(!encoded_state.contains("HostDeadline"));
@@ -11681,10 +12959,12 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     async fn mock_provider_create_returns_existing() {
         let provider = MockProvider;
         let resource = Resource::new("test", "example");
+        let provider_boundary = crate::provider::ProviderBoundary::fixture(&provider);
         let prepared = crate::replacement::create_permit_for_test(CreateRequest::checked(
             resolved_for_test(resource),
         ));
-        let (create, _cancellation) = crate::executor::dispatch_create(&provider, prepared);
+        let (create, _cancellation) =
+            crate::executor::dispatch_create(&provider_boundary, prepared);
         let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
@@ -11764,7 +13044,8 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     fn provider_error_is_terminal_but_keeps_typed_cause() {
         use std::error::Error;
         let cause = std::io::Error::other("connection refused");
-        let err = ProviderError::api_error_caused_by("Failed to create resource", cause);
+        let err = ProviderError::api_error_caused_by("Failed to create resource", cause)
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
         assert!(err.source().is_none(), "ProviderError must be terminal");
         let cause = err
             .detail()
@@ -11776,7 +13057,8 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     #[test]
     fn provider_error_display_includes_cause() {
         let cause = std::io::Error::other("connection refused");
-        let err = ProviderError::api_error_caused_by("Failed to create resource", cause);
+        let err = ProviderError::api_error_caused_by("Failed to create resource", cause)
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
         let display = format!("{}", err);
         assert!(
             display.contains("connection refused"),
@@ -11787,7 +13069,8 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
 
     #[test]
     fn provider_error_display_without_cause() {
-        let err = ProviderError::internal("simple error");
+        let err = ProviderError::internal("simple error")
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
         let display = format!("{}", err);
         assert_eq!(display, "simple error");
     }
@@ -11854,12 +13137,15 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     #[test]
     fn provider_error_throttling_uses_raw_code_and_preserves_classification_on_redaction() {
         let raw = format!("{} ThrottlingException", "x".repeat(9 * 1024));
-        let error = ProviderError::api_error("request failed").with_code(raw.clone());
+        let error = ProviderError::api_error("request failed")
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
+            .with_code(raw.clone());
         assert!(!error.to_string().contains("ThrottlingException"));
         assert!(error.is_throttled());
         assert!(!error.with_code("AccessDenied").is_throttled());
 
         let error = ProviderError::api_error(raw)
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
             .with_redacted_message("redacted")
             .with_code("AccessDenied");
         assert_eq!(error.detail().context(), "redacted");
@@ -11940,13 +13226,15 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     fn host_error_cause_is_not_transported_over_the_provider_protocol() {
         let suspended_input = SuspendedValidationId::from_keyed_fingerprint([7_u8; 32]);
         let error = ProviderError::timeout("suspended")
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
             .with_host_cause(HostErrorCause::ValidationSuspended(suspended_input));
         assert_eq!(
             error.detail().host_cause(),
             Some(HostErrorCause::ValidationSuspended(suspended_input))
         );
 
-        let decoded = ProviderError::from_wire(error.to_wire());
+        let decoded = ProviderError::from_wire(error.to_wire())
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
 
         assert_eq!(decoded.kind(), ProviderErrorKind::Timeout);
         assert_eq!(decoded.to_string(), "suspended");
@@ -11992,7 +13280,8 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             ServiceError {
                 source: std::io::Error::other("throttled"),
             },
-        );
+        )
+        .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
 
         let rendered = error.to_string();
         assert_eq!(rendered, "request failed: service error: throttled");
@@ -12008,6 +13297,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
                 source: std::io::Error::other("throttled"),
             },
         )
+        .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
         .with_operation("s3.PutObject");
         assert_eq!(
             structured.to_string(),
@@ -12021,7 +13311,8 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             "config.token",
             crate::value::SecretRehydrationError::HashMismatch,
         );
-        let error = ProviderError::internal_caused_by("verification failed", cause);
+        let error = ProviderError::internal_caused_by("verification failed", cause)
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
         let expected =
             "verification failed: config.token: the secret changed since the plan was created";
 
@@ -12035,7 +13326,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     #[test]
     fn nested_provider_error_source_renders_leaf_once_in_display_and_wire() {
         #[derive(Debug)]
-        struct ProviderBoundaryError(ProviderError);
+        struct ProviderBoundaryError(HostError);
 
         impl std::fmt::Display for ProviderBoundaryError {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -12047,11 +13338,13 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         let inner = ProviderError::api_error_caused_by(
             "provider request failed",
             std::io::Error::other("leaf service reason"),
-        );
+        )
+        .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
         let outer = ProviderError::internal_caused_by(
             "outer provider operation failed",
             ProviderBoundaryError(inner),
-        );
+        )
+        .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
 
         let rendered = outer.to_string();
         assert_eq!(
@@ -12072,7 +13365,9 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     fn provider_error_display_with_resource_id_and_cause() {
         let cause = std::io::Error::other("timeout");
         let id = ResourceId::with_identity("s3.Bucket", "my-bucket");
-        let err = ProviderError::api_error_caused_by("Failed to read", cause).for_resource(id);
+        let err = ProviderError::api_error_caused_by("Failed to read", cause)
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
+            .for_resource(id);
         let display = format!("{}", err);
         assert!(
             display.contains("timeout"),
@@ -12095,6 +13390,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     fn provider_error_display_multi_line_when_structured_fields_populated() {
         let id = ResourceId::with_identity("iam.Roles", "admin_access_roles");
         let err = ProviderError::api_error("Failed to list IAM roles")
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
             .for_resource(id)
             .with_operation("iam.ListRoles")
             .with_status(403)
@@ -12150,6 +13446,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     #[test]
     fn provider_error_display_multi_line_status_without_code() {
         let err = ProviderError::api_error("Failed")
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
             .with_operation("s3.HeadBucket")
             .with_status(500);
         let rendered = format!("{}", err);
@@ -12165,6 +13462,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     #[test]
     fn provider_error_display_multi_line_code_without_status() {
         let err = ProviderError::api_error("Failed")
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
             .with_operation("s3.HeadBucket")
             .with_code("NoSuchBucket");
         let rendered = format!("{}", err);
@@ -12181,7 +13479,9 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     /// nothing.
     #[test]
     fn provider_error_display_multi_line_operation_only() {
-        let err = ProviderError::api_error("Failed").with_operation("iam.ListRoles");
+        let err = ProviderError::api_error("Failed")
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
+            .with_operation("iam.ListRoles");
         let rendered = format!("{}", err);
         let lines: Vec<&str> = rendered.lines().collect();
         assert_eq!(
@@ -12202,6 +13502,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     #[test]
     fn provider_error_display_multi_line_without_resource_id() {
         let err = ProviderError::api_error("Failed to list IAM roles")
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
             .with_operation("iam.ListRoles")
             .with_status(403)
             .with_code("AccessDenied");
@@ -12234,6 +13535,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     fn provider_error_display_multi_line_appends_cause_as_labeled_line() {
         let cause = std::io::Error::other("connection refused");
         let err = ProviderError::api_error_caused_by("Failed to list IAM roles", cause)
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
             .with_operation("iam.ListRoles");
         let rendered = format!("{}", err);
         let lines: Vec<&str> = rendered.lines().collect();
@@ -12272,6 +13574,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         let cause = std::io::Error::other("tls handshake failed");
         let id = ResourceId::with_identity("iam.Roles", "admin_access_roles");
         let err = ProviderError::api_error_caused_by("Failed to list IAM roles", cause)
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
             .for_resource(id)
             .with_operation("iam.ListRoles")
             .with_status(403)
@@ -12323,8 +13626,9 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             msg: "transport error",
             detail: Some(Box::new(inner)),
         };
-        let err =
-            ProviderError::api_error_caused_by("Failed", outer).with_operation("iam.ListRoles");
+        let err = ProviderError::api_error_caused_by("Failed", outer)
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]))
+            .with_operation("iam.ListRoles");
         let rendered = format!("{}", err);
         assert!(
             rendered.contains("\n  cause: transport error: dns lookup failed"),
@@ -12338,7 +13642,8 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     #[test]
     fn provider_error_display_uses_single_line_cause_when_unstructured() {
         let cause = std::io::Error::other("connection refused");
-        let err = ProviderError::api_error_caused_by("Failed to create resource", cause);
+        let err = ProviderError::api_error_caused_by("Failed to create resource", cause)
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
         let rendered = format!("{}", err);
         // The existing render is a single line with `: <cause>` appended.
         assert_eq!(
@@ -12350,21 +13655,41 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
 
     #[test]
     fn provider_error_variant_constructors() {
-        let inv = ProviderError::invalid_input("bad");
-        assert!(matches!(inv, ProviderError::InvalidInput(_)));
+        let inv = ProviderError::invalid_input("bad")
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
+        {
+            use crate::provider::HostError as ProviderError;
+            assert!(matches!(inv, ProviderError::InvalidInput(_)));
+        }
         assert_eq!(inv.to_string(), "bad");
 
-        let api = ProviderError::api_error("rejected");
-        assert!(matches!(api, ProviderError::ApiError(_)));
+        let api = ProviderError::api_error("rejected")
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
+        {
+            use crate::provider::HostError as ProviderError;
+            assert!(matches!(api, ProviderError::ApiError(_)));
+        }
 
-        let nf = ProviderError::not_found("missing");
-        assert!(matches!(nf, ProviderError::NotFound(_)));
+        let nf = ProviderError::not_found("missing")
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
+        {
+            use crate::provider::HostError as ProviderError;
+            assert!(matches!(nf, ProviderError::NotFound(_)));
+        }
 
-        let to = ProviderError::timeout("slow");
-        assert!(matches!(to, ProviderError::Timeout(_)));
+        let to = ProviderError::timeout("slow")
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
+        {
+            use crate::provider::HostError as ProviderError;
+            assert!(matches!(to, ProviderError::Timeout(_)));
+        }
 
-        let intl = ProviderError::internal("bug");
-        assert!(matches!(intl, ProviderError::Internal(_)));
+        let intl = ProviderError::internal("bug")
+            .with_secrets(&crate::provider_text::RedactionSet::for_test(&[]));
+        {
+            use crate::provider::HostError as ProviderError;
+            assert!(matches!(intl, ProviderError::Internal(_)));
+        }
     }
 
     #[test]
@@ -13190,7 +14515,10 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         let result = router.read(&id, &identifier, ReadRequest).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(err, ProviderError::Internal(_)));
+        {
+            use crate::provider::HostError as ProviderError;
+            assert!(matches!(err, ProviderError::Internal(_)));
+        }
         assert!(err.to_string().contains("Unknown provider: nonexistent"));
     }
 
@@ -13570,13 +14898,13 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             fn validate_config(
                 &self,
                 _attrs: &CanonicalProviderConfigAttributes,
+                _session: &crate::provider::ProviderValidationInputs,
             ) -> crate::provider::ProviderResult<()> {
                 Ok(())
             }
             fn create_provider(
                 &self,
-                _binding: Option<&str>,
-                _config: &ProviderReadyConfig,
+                _config: &crate::provider::ProviderSession,
                 _initialize_outcome: crate::provider::InitializeOutcomeMint,
             ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
                 Box::pin(async {
@@ -13609,7 +14937,14 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         let config =
             crate::executor::prepare_provider_ready_config(&factory, resolved_config.as_ref())
                 .unwrap();
-        let result = factory.create_initialized_provider(None, &config).await;
+        let result = ProviderBoundary::initialize(
+            &factory,
+            &crate::provider::prepare_provider_session::<
+                crate::resource::ModuleSource,
+                crate::resource::Directives,
+            >(factory.name(), None, Some(&config), &[], &[]),
+        )
+        .await;
         let err = match result {
             Ok(_) => panic!("create_provider must surface the init error"),
             Err(e) => e,
@@ -13663,19 +14998,19 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             fn validate_config(
                 &self,
                 _attrs: &CanonicalProviderConfigAttributes,
+                _session: &crate::provider::ProviderValidationInputs,
             ) -> crate::provider::ProviderResult<()> {
                 Ok(())
             }
             fn create_provider(
                 &self,
-                binding: Option<&str>,
-                _config: &ProviderReadyConfig,
+                _config: &crate::provider::ProviderSession,
                 _initialize_outcome: crate::provider::InitializeOutcomeMint,
             ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
                 self.calls
                     .lock()
                     .unwrap()
-                    .push(binding.map(|s| s.to_string()));
+                    .push(_config.binding().map(|s| s.to_string()));
                 Box::pin(async {
                     Ok(InitializeOutcome::unavailable()
                         .with_provider(Box::new(MockProvider) as Box<dyn Provider>))
@@ -13703,18 +15038,33 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         let config =
             crate::executor::prepare_provider_ready_config(&factory, resolved_config.as_ref())
                 .unwrap();
-        let _ = factory
-            .create_initialized_provider(None, &config)
-            .await
-            .unwrap();
-        let _ = factory
-            .create_initialized_provider(Some("us"), &config)
-            .await
-            .unwrap();
-        let _ = factory
-            .create_initialized_provider(Some("tokyo"), &config)
-            .await
-            .unwrap();
+        let _ = ProviderBoundary::initialize(
+            &factory,
+            &crate::provider::prepare_provider_session::<
+                crate::resource::ModuleSource,
+                crate::resource::Directives,
+            >(factory.name(), None, Some(&config), &[], &[]),
+        )
+        .await
+        .unwrap();
+        let _ = ProviderBoundary::initialize(
+            &factory,
+            &crate::provider::prepare_provider_session::<
+                crate::resource::ModuleSource,
+                crate::resource::Directives,
+            >(factory.name(), Some("us"), Some(&config), &[], &[]),
+        )
+        .await
+        .unwrap();
+        let _ = ProviderBoundary::initialize(
+            &factory,
+            &crate::provider::prepare_provider_session::<
+                crate::resource::ModuleSource,
+                crate::resource::Directives,
+            >(factory.name(), Some("tokyo"), Some(&config), &[], &[]),
+        )
+        .await
+        .unwrap();
 
         let calls = factory.calls.lock().unwrap().clone();
         assert_eq!(
@@ -13981,5 +15331,178 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
                 )
             ))
         ));
+    }
+}
+
+#[cfg(test)]
+mod provider_text_route_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Seen(Mutex<Vec<Vec<String>>>);
+    #[derive(Clone)]
+    struct Probe(Arc<Seen>);
+    fn bindings<'a>(ids: impl Iterator<Item = &'a ResourceId>) -> Vec<String> {
+        let mut values = ids
+            .map(|id| id.provider_instance.clone().unwrap_or_default())
+            .collect::<Vec<_>>();
+        values.sort();
+        values
+    }
+    impl ProviderNormalizer for Probe {
+        fn normalize_desired<'a>(
+            &'a self,
+            resources: &'a mut [ProviderResource],
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            self.0
+                .0
+                .lock()
+                .unwrap()
+                .push(bindings(resources.iter().map(|r| &r.id)));
+            let echo = resources
+                .iter()
+                .map(|r| match &r.attributes["password"] {
+                    Value::Concrete(ConcreteValue::String(value)) => value.expose_plaintext(),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            Box::pin(async move { Err(ProviderError::api_error(echo)) })
+        }
+        fn normalize_state<'a>(
+            &'a self,
+            states: &'a mut StateTransformMap,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            self.0.0.lock().unwrap().push(bindings(states.keys()));
+            ready_noop()
+        }
+        fn hydrate_read_state<'a>(
+            &'a self,
+            states: &'a mut StateTransformMap,
+            saved: &'a SavedAttrs,
+        ) -> BoxFuture<'a, ProviderResult<()>> {
+            self.0.0.lock().unwrap().push(bindings(states.keys()));
+            self.0
+                .0
+                .lock()
+                .unwrap()
+                .push(bindings(saved.iter().map(|(id, _)| id)));
+            ready_noop()
+        }
+    }
+    struct Factory(Arc<Seen>);
+    impl ProviderFactory for Factory {
+        fn name(&self) -> &str {
+            "route-probe"
+        }
+        fn display_name(&self) -> &str {
+            "Route probe"
+        }
+        fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+            Default::default()
+        }
+        fn validate_config(
+            &self,
+            _: &CanonicalProviderConfigAttributes,
+            _: &ProviderValidationInputs,
+        ) -> ProviderResult<()> {
+            Ok(())
+        }
+        fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+            Vec::new()
+        }
+        fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+            ValidatedProviderSchemaWitness::new(
+                Vec::new(),
+                ValidatedConfigSchema::default(),
+                Default::default(),
+                Vec::new(),
+            )
+            .unwrap()
+        }
+        fn create_provider(
+            &self,
+            _: &ProviderSession,
+            _: InitializeOutcomeMint,
+        ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+            unreachable!()
+        }
+        fn create_normalizer(
+            &self,
+            _: &ProviderSession,
+        ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+            let probe = Probe(self.0.clone());
+            Box::pin(async move { Ok(Box::new(probe) as Box<dyn ProviderNormalizer>) })
+        }
+    }
+    #[tokio::test]
+    async fn review_round4_normalization_routes_by_binding_before_provider_ingress() {
+        let mut desired = Vec::<Resource>::new();
+        for (binding, password) in [("first", "first-private"), ("second", "second-private")] {
+            let mut resource = Resource::with_provider("route-probe", "thing", binding, None)
+                .with_attribute(
+                    "password",
+                    Value::Concrete(ConcreteValue::String(
+                        crate::resource::ValueString::diagnostic_sensitive(password),
+                    )),
+                );
+            resource.id.provider_instance = Some(binding.into());
+            desired.push(resource);
+        }
+        let session = prepare_provider_session("route-probe", Some("first"), None, &desired, &[]);
+        let seen = Arc::new(Seen::default());
+        let normalizer = ProviderBoundary::initialize_normalizer(&Factory(seen.clone()), &session)
+            .await
+            .unwrap();
+        let mut router = NormalizerRouter::new();
+        router.add_initialized_normalizer(normalizer);
+        let mut resources = desired
+            .iter()
+            .cloned()
+            .map(Resource::into_provider_resource)
+            .collect::<Vec<_>>();
+        let error = router
+            .normalize_desired(&mut resources)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            !error.contains("second-private"),
+            "another binding's input leaked: {error}"
+        );
+        assert!(error.contains("(secret)"));
+        let mut states = StateTransformMap::from_states(
+            desired
+                .iter()
+                .map(|r| {
+                    (
+                        r.id.clone(),
+                        State::<crate::resource::NoPlaceholder>::existing(
+                            r.id.clone(),
+                            HashMap::new(),
+                        )
+                        .to_snapshot(),
+                    )
+                })
+                .collect(),
+        );
+        let saved = SavedAttrs(
+            desired
+                .iter()
+                .map(|r| (r.id.clone(), HashMap::new()))
+                .collect(),
+        );
+        router.normalize_state(&mut states).await.unwrap();
+        router
+            .hydrate_read_state(&mut states, &saved)
+            .await
+            .unwrap();
+        assert_eq!(*seen.0.lock().unwrap(), vec![vec!["first".to_owned()]; 4]);
+        assert_eq!(
+            states.len(),
+            2,
+            "routing must retain the other binding's state"
+        );
     }
 }

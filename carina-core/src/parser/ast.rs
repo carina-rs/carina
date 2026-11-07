@@ -10906,3 +10906,34 @@ impl crate::resource::InsideSecret for PlaceholderAccessError {
         self
     }
 }
+
+impl<E, T: crate::resource::ValueKind, D>
+    File<E, crate::resource::NoPlaceholder, T, D, crate::resource::AbsoluteBindingAddress>
+where
+    D: DeferredForPhaseTraversal<
+            crate::resource::NoPlaceholder,
+            T,
+            crate::resource::AbsoluteBindingAddress,
+        >,
+{
+    /// Admit the whole desired managed/data-source set, including deferred
+    /// templates and conditional branches, before provider initialization.
+    pub(crate) fn provider_plan(&self) -> crate::provider::ProviderPlan {
+        let mut plan = crate::provider::ProviderPlan::state_only();
+        for resource in self.iter_all_resources() {
+            match resource {
+                ResourceRef::Resource(resource) => {
+                    plan.include(&resource.id, resource.attributes.values())
+                }
+                ResourceRef::DataSource(source) => {
+                    plan.include(&source.id, source.attributes.values())
+                }
+                ResourceRef::Deferred { resource, .. } => {
+                    plan.include(resource.id(), resource.attributes().values())
+                }
+                ResourceRef::LiveComposition(_) => {}
+            }
+        }
+        plan
+    }
+}

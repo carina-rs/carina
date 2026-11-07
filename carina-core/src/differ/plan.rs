@@ -12,7 +12,7 @@ use crate::plan::{
     CreateBeforeDestroyError, Plan, PlanError, PlanErrorKind, PreventDestroyAction,
     ReplacementGroup,
 };
-use crate::provider::{LiftedSavedAttrs, Provider, ProviderRouter};
+use crate::provider::{LiftedSavedAttrs, ProviderRouter};
 use crate::replacement::{ReplacementRequest, resolve_replacement};
 use crate::resource::{
     AbsoluteBindingAddress, ConcreteValue, Current, Directives, PlanInputCurrent, PlanInputDesired,
@@ -894,7 +894,7 @@ pub fn create_plan(
 pub fn create_plan_for_test(
     managed: &[ResolvedResource],
     data_sources: &[ResolvedDataSource],
-    provider: &dyn crate::provider::Provider,
+    provider: &dyn crate::provider::HostProvider,
     prior_states: PlanPriorStates<'_>,
     directives_map: &HashMap<ResourceId, PersistedDirectives>,
     registry: &SchemaRegistry,
@@ -934,7 +934,7 @@ pub fn create_plan_for_test(
 pub(crate) fn create_plan_with_provider(
     managed: &[ResolvedResource],
     data_sources: &[ResolvedDataSource],
-    provider: &dyn Provider,
+    provider: &dyn crate::provider::HostProvider,
     comparison_provider: &ProviderRouter,
     prior_states: PlanPriorStates<'_>,
     directives_map: &HashMap<ResourceId, PersistedDirectives>,
@@ -1123,7 +1123,7 @@ struct PlanBuild {
 fn create_plan_parts(
     managed: &PlanInputDesiredResources<'_>,
     data_sources: &[ResolvedDataSource],
-    provider: &dyn Provider,
+    provider: &dyn crate::provider::HostProvider,
     comparison_provider: &ProviderRouter,
     current_states: &HashMap<ResourceId, PlanInputCurrent>,
     registry: &SchemaRegistry,

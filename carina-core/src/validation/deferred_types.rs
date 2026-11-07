@@ -339,7 +339,9 @@ impl<'s> TypeCheckSession<'s> {
         producer: impl for<'scope> AsyncFnOnce(&'scope TypeCheckSession<'scope>) -> T,
     ) -> ProviderTypeCheckResult<T> {
         let session = TypeCheckSession::new(catalog);
-        let output = producer(&session).await;
+        // Provider preparation and execution embed large async state machines.
+        // Keep them off each caller's stack, including while polling nested sessions.
+        let output = Box::pin(producer(&session)).await;
         ProviderTypeCheckResult::settle(&session, output)
     }
 
