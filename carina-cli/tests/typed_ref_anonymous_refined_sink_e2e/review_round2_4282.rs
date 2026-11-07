@@ -43,7 +43,10 @@ impl ProviderFactory for BoundaryFactory {
                 "test.Boundary",
                 "Name",
             )),
-            Some(PATTERN.into()),
+            Some(carina_core::schema::PatternSpec::new(
+                PATTERN,
+                carina_core::schema::PatternMatch::Full,
+            )),
             None,
             None,
         );

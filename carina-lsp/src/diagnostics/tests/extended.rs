@@ -3923,7 +3923,10 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
                 ["route53", "Record", "AliasTarget"],
                 "Route53HostedZoneId",
             )),
-            Some("^Z[A-Z0-9]+$".to_string()),
+            Some(carina_core::schema::PatternSpec::new(
+                "^Z[A-Z0-9]+$".to_string(),
+                carina_core::schema::PatternMatch::Full,
+            )),
             None,
             None,
         ),
@@ -4026,7 +4029,20 @@ fn union_attribute_with_deferred_resource_ref_emits_no_diagnostic() {
                     None,
                     None,
                 ),
-                AttributeType::refined_string(None, Some("^value-".to_string()), None, None),
+                AttributeType::refined_string(
+                    None,
+                    Some(carina_core::schema::PatternSpec::new(
+                        "^value-",
+                        carina_core::schema::PatternMatch::Substring {
+                            reason: carina_core::schema::PatternReason::new(
+                                "Deferred reference fixture deliberately accepts the value prefix",
+                            )
+                            .unwrap(),
+                        },
+                    )),
+                    None,
+                    None,
+                ),
             ]),
         )
         .build(),
@@ -11570,7 +11586,10 @@ fn lsp_custom_string_pattern_mismatch_reports_required_pattern() {
 
     let bucket_name = AttributeType::refined_string_with_validator(
         carina_core::schema::TypeIdentity::bare("BucketName"),
-        Some("^prod-[a-z0-9]+$".to_string()),
+        Some(carina_core::schema::PatternSpec::new(
+            "^prod-[a-z0-9]+$".to_string(),
+            carina_core::schema::PatternMatch::Full,
+        )),
         None,
         legacy_validator(|_| Ok(())),
         None,
@@ -17390,7 +17409,10 @@ fn reference_constraints_validate_offline_in_a_directory_configuration() {
                     "key",
                     AttributeType::reference(
                         TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference"),
-                        Some("^alias/[a-z]+$".into()),
+                        Some(carina_core::schema::PatternSpec::new(
+                            "^alias/[a-z]+$",
+                            carina_core::schema::PatternMatch::Full,
+                        )),
                         Some((Some(8), Some(12))),
                     ),
                 )

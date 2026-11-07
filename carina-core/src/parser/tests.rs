@@ -2820,7 +2820,13 @@ fn schema_type_serde_preserves_every_scalar_kind_without_registry() {
         let declaration = match kind {
             RefinedScalarKind::String => crate::schema::CompiledAttributeType::refined_string(
                 Some(identity),
-                Some(crate::schema::CompiledPattern::try_new("^[A-Z]+$").unwrap()),
+                Some(
+                    crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                        "^[A-Z]+$",
+                        crate::schema::PatternMatch::Full,
+                    ))
+                    .unwrap(),
+                ),
                 Some((Some(1), Some(64))),
                 None,
             ),
@@ -2854,7 +2860,13 @@ fn schema_type_serde_preserves_every_scalar_kind_without_registry() {
                 length, pattern, ..
             } => {
                 assert_eq!(length, Some((Some(1), Some(64))));
-                assert_eq!(pattern, Some("^[A-Z]+$"));
+                assert_eq!(
+                    pattern,
+                    Some(&crate::schema::PatternSpec::new(
+                        "^[A-Z]+$",
+                        crate::schema::PatternMatch::Full
+                    ))
+                );
             }
             crate::schema::RawShape::Int { range, .. } => {
                 assert_eq!(range, Some((Some(2), Some(42))));
@@ -2904,7 +2916,13 @@ fn schema_type_serde_requires_explicit_constraint_record_and_bounds() {
 fn schema_type_serde_bounded_declaration_validates_constraint_evidence() {
     let declaration = crate::schema::CompiledAttributeType::refined_string(
         Some(TypeIdentity::bare("Name")),
-        Some(crate::schema::CompiledPattern::try_new("^[A-Z]+$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^[A-Z]+$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         Some((Some(1), Some(64))),
         None,
     );

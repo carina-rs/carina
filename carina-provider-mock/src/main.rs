@@ -763,6 +763,9 @@ impl CarinaProvider for MockProcessProvider {
                 })
                 .validate()
                 .expect("mock process schema must be valid"),
+            carina_provider_mock::pattern_mode_schema()
+                .validate()
+                .expect("pattern mode fixture"),
             CoreResourceSchema::new("test.sdk_validator")
                 .attribute(
                     CoreAttributeSchema::optional(

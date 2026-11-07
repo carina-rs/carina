@@ -94,8 +94,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_42_for_replacement_admission_requests() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 42);
+fn saved_plan_version_is_43_for_explicit_pattern_modes() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 43);
 }
 
 #[test]

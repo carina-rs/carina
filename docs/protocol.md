@@ -1,9 +1,10 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **23**.
+The current protocol and minimum supported provider protocol are both **24**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 24 | 24 | Required typed pattern specifications with explicit Full or justified Substring matching. |
 | 23 | 23 | Required scoped desired-input rules on every resource schema. |
 | 22 | 22 | Optional entry-count bound on `Map` attribute types. |
 | 21 | 21 | Required provider-wide identity assignability declarations in the schema envelope. |
@@ -14,6 +15,32 @@ The current protocol and minimum supported provider protocol are both **23**.
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 24
+
+Every present pattern is a specification with required `regex` and `mode` fields:
+
+```json
+{"regex":"abc", "mode":{"kind":"full"}}
+```
+
+Full matches the entire value using absolute boundaries internally. The regex
+source remains exactly as authored. A substring exception requires a nonempty,
+non-whitespace reason:
+
+```json
+{"regex":"abc", "mode":{"kind":"substring", "reason":"The upstream API explicitly permits surrounding text"}}
+```
+
+These specifications are required on String, Reference, and legacy Custom
+schema records, including nested fields and provider configuration, and on
+`matches`/`not_matches` input predicates. Bare strings, missing or unknown modes,
+and missing or empty substring reasons are rejected. Providers must rebuild
+against protocol 24; the protocol-12 schema-only migration admission window is
+removed. WIT is unchanged: schema specifications travel inside JSON exports.
+
+Schema fingerprint encoding is v12. Saved-plan format is 43 so older plans fail
+with the typed unsupported-format error before schema-fingerprint verification.
 
 ## Version 23
 
@@ -85,16 +112,16 @@ validation reuses that same merge before checking desired inputs. Diagnostics
 name only the attribute, code and reason, including for secret values.
 
 The semantic schema fingerprint includes each rule's scope, target and complete
-predicate payload and remains encoding v11. Checked plans and pending obligations
+predicate payload; the current encoding is v12. Checked plans and pending obligations
 are not serialized. Saved-plan input re-admission under the apply lock remains
 an explicitly typed TODO for phase 5.
 
-`PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` remain 23. Hosts reject
-version-22 providers before ordinary schema decoding. Missing `input_rules`,
-`scope` or `target` fails closed. The explicit read-only v12 migration adapter
-supplies an empty array. The SDK's existing schema JSON export carries the
-rules; no WIT function or CRUD request field is added. AWS, AWSCC, and GitHub
-providers must rebuild against protocol 23.
+Version 23 introduced the required `input_rules`, `scope` and `target` fields.
+The current host requires protocol 24, including explicit pattern modes, and
+rejects older providers before schema decoding. The v12 migration adapter has
+been removed. The SDK's schema JSON export carries these rules; no WIT function
+or CRUD request field is added. AWS, AWSCC, and GitHub providers must rebuild
+against protocol 24.
 
 ## Version 22
 
@@ -145,9 +172,9 @@ require a path declared by every owner of the sink identity. Edges permit the
 identity conversion; the existing length and range checks still apply, and sink
 validators still run on values during validation, planning, and apply.
 
-`PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both 21. Hosts and
-providers must rebuild together. The read-only protocol-v12 migration adapter
-supplies an empty edge array for released metadata.
+Version 21 introduced this required edge array. Hosts and providers must rebuild
+together; the current minimum is 24. Protocol-12 metadata is rejected, including
+on read-only schema loading paths.
 
 ## Version 20
 

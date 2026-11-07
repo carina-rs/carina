@@ -102,9 +102,24 @@ pub struct ProviderTextBuilder {
 
 impl ProviderTextBuilder {
     pub fn push_str(&mut self, text: &str) {
+        self.push_text(text, false);
+    }
+
+    /// Append an inline diagnostic field without allowing embedded line breaks.
+    pub(crate) fn push_inline_str(&mut self, text: &str) {
+        self.push_text(text, true);
+    }
+
+    fn push_text(&mut self, text: &str, inline: bool) {
         for c in text.chars() {
             match c {
-                '\0'..='\u{8}' | '\u{b}'..='\u{1f}' | '\u{7f}'..='\u{9f}' => {
+                '\n' | '\t' if !inline => self.push_sanitized_char(c),
+                c if c.is_control() && inline => {
+                    for escaped in c.escape_debug() {
+                        self.push_sanitized_char(escaped);
+                    }
+                }
+                c if c.is_control() => {
                     for escaped in c.escape_unicode() {
                         self.push_sanitized_char(escaped);
                     }
@@ -628,7 +643,11 @@ mod tests {
     fn provider_text_pattern_mismatch_keeps_regex_data_and_sanitizes_diagnostic() {
         use crate::schema::{CompiledAttributeType, CompiledPattern, TypeError};
         let raw = format!("^\x1b{}$", "x".repeat(20 * 1024));
-        let pattern = CompiledPattern::try_new(&raw).unwrap();
+        let pattern = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+            &raw,
+            crate::schema::PatternMatch::Full,
+        ))
+        .unwrap();
         let schema = CompiledAttributeType::refined_string(None, Some(pattern.clone()), None, None);
         let value: crate::resource::Value =
             crate::resource::Value::Concrete(crate::resource::ConcreteValue::String("safe".into()));
@@ -652,8 +671,12 @@ mod tests {
         use crate::schema::{CompiledPattern, ProviderSchemaValidationError, TypeIdentity};
         let raw = format!("name\x1b[2J{}", "x".repeat(9000));
         let invalid_pattern = format!("{raw}(");
-        let error = CompiledPattern::try_new(&invalid_pattern).unwrap_err();
-        assert_eq!(error.pattern.as_str(), invalid_pattern);
+        let error = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+            &invalid_pattern,
+            crate::schema::PatternMatch::Full,
+        ))
+        .unwrap_err();
+        assert_eq!(error.as_ref().as_str(), invalid_pattern);
         assert!(!error.to_string().contains('\x1b'));
         let identity = TypeIdentity::new(Some("mock"), [raw.as_str()], "Mode");
         let error = ProviderSchemaValidationError::DanglingReferenceForm {

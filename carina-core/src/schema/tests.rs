@@ -7,8 +7,15 @@ static TEST_OWNER: std::sync::LazyLock<crate::parser::SchemaTypeOwner> =
 
 #[test]
 fn draft_assignability_preserves_invalid_patterns_and_schema_definitions() {
-    let string: PatternAttributeType =
-        PatternAttributeType::refined_string(None, Some("(?=x)".into()), None, None);
+    let string: PatternAttributeType = PatternAttributeType::refined_string(
+        None,
+        Some(crate::schema::PatternSpec::new(
+            "(?=x)",
+            crate::schema::PatternMatch::Full,
+        )),
+        None,
+        None,
+    );
     let catalog = crate::parser::ProviderCustomTypes::default();
     assert!(
         TypeInSchema::schemaless(&string).is_assignable_to(
@@ -155,7 +162,13 @@ fn issue_4276_provider_failure_keeps_union_child_fit_for_unique_lists() {
 fn issue_4276_map_keys_are_local_and_only_values_reach_provider() {
     let key = AttributeType::refined_string(
         Some(TypeIdentity::bare("Key")),
-        Some(CompiledPattern::try_new("^key$").unwrap()),
+        Some(
+            CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^key$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         None,
         None,
     );
@@ -2878,7 +2891,10 @@ fn provider_schema_rejects_conflicting_builtin_bare_declarations() {
         ),
         AttributeType::refined_string_with_validator(
             identity.clone(),
-            Some("^internal$".to_string()),
+            Some(crate::schema::PatternSpec::new(
+                "^internal$".to_string(),
+                crate::schema::PatternMatch::Full,
+            )),
             None,
             match types::email().raw_shape() {
                 RawShape::String {
@@ -5362,17 +5378,18 @@ fn with_attribute_tags_leaf_validator_failures_for_diagnostics() {
 fn custom_constraint_errors_format_type_and_attribute_context() {
     let pattern = TypeError::PatternMismatch {
         value: "it's".into(),
-        pattern: "^[a-z]+$".into(),
+        pattern: crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full)
+            .into(),
         attribute: None,
         type_name: Some("EntityDescription".to_string()),
     };
     assert_eq!(
         pattern.to_string(),
-        "Invalid EntityDescription value \"it's\": does not match required pattern /^[a-z]+$/"
+        "Invalid EntityDescription value \"it's\": does not match required pattern /^[a-z]+$/ (Full)"
     );
     assert_eq!(
         pattern.with_attribute("description").to_string(),
-        "Invalid value \"it's\" for 'description' (EntityDescription): does not match required pattern /^[a-z]+$/"
+        "Invalid value \"it's\" for 'description' (EntityDescription): does not match required pattern /^[a-z]+$/ (Full)"
     );
 
     let length = TypeError::LengthOutOfRange {
@@ -6701,7 +6718,10 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
                 "pattern",
                 PatternAttributeType::refined_string(
                     None,
-                    Some("^[a-z]+$".to_string()),
+                    Some(crate::schema::PatternSpec::new(
+                        "^[a-z]+$".to_string(),
+                        crate::schema::PatternMatch::Full,
+                    )),
                     None,
                     None,
                 ),
@@ -6826,7 +6846,13 @@ fn validate_known_values_checks_concrete_siblings_beside_deferred_leaves() {
             "names",
             AttributeType::list(AttributeType::refined_string(
                 None,
-                Some(crate::schema::CompiledPattern::try_new("^[a-z]+$").unwrap()),
+                Some(
+                    crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                        "^[a-z]+$",
+                        crate::schema::PatternMatch::Full,
+                    ))
+                    .unwrap(),
+                ),
                 None,
                 None,
             )),
@@ -6865,7 +6891,10 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
     let constrained = || {
         PatternAttributeType::refined_string(
             None,
-            Some("^allowed$".to_string()),
+            Some(crate::schema::PatternSpec::new(
+                "^allowed$".to_string(),
+                crate::schema::PatternMatch::Full,
+            )),
             Some((Some(7), Some(7))),
             None,
         )
@@ -7166,7 +7195,13 @@ fn secret_wrapped_containers_mask_user_derived_error_paths() {
     let constrained = || {
         AttributeType::refined_string(
             None,
-            Some(crate::schema::CompiledPattern::try_new("^allowed$").unwrap()),
+            Some(
+                crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                    "^allowed$",
+                    crate::schema::PatternMatch::Full,
+                ))
+                .unwrap(),
+            ),
             None,
             None,
         )
@@ -7290,7 +7325,13 @@ fn secret_pattern_mismatch_is_masked_without_literal_quotes() {
     ));
     let error = AttributeType::refined_string(
         None,
-        Some(crate::schema::CompiledPattern::try_new("^allowed$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^allowed$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         None,
         None,
     )
@@ -7301,7 +7342,7 @@ fn secret_pattern_mismatch_is_masked_without_literal_quotes() {
     let rendered = error.to_string();
     assert_eq!(
         rendered,
-        "Invalid value (secret): does not match required pattern /^allowed$/"
+        "Invalid value (secret): does not match required pattern /^allowed$/ (Full)"
     );
     assert!(!rendered.contains("'(secret)'"));
     assert!(!rendered.contains(plaintext));
@@ -9472,7 +9513,13 @@ fn make_custom_anon_pattern_and_len(
 ) -> AttributeType {
     AttributeType::refined_string(
         None,
-        pattern.map(|pattern| crate::schema::CompiledPattern::try_new(pattern).unwrap()),
+        pattern.map(|pattern| {
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                pattern,
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap()
+        }),
         length,
         None,
     )
@@ -10637,7 +10684,13 @@ fn assignable_specific_arn_flows_into_generic_arn() {
     let mk = |segments: &[&str], pattern: Option<&str>| {
         AttributeType::refined_string_with_validator(
             TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn"),
-            pattern.map(|pattern| crate::schema::CompiledPattern::try_new(pattern).unwrap()),
+            pattern.map(|pattern| {
+                crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                    pattern,
+                    crate::schema::PatternMatch::Full,
+                ))
+                .unwrap()
+            }),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
             None,
@@ -10676,7 +10729,13 @@ fn assignable_specific_arn_with_pattern_flows_into_generic_arn_with_pattern() {
     let mk = |segments: &[&str], pattern: &str| {
         AttributeType::refined_string_with_validator(
             TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn"),
-            Some(crate::schema::CompiledPattern::try_new(pattern).unwrap()),
+            Some(
+                crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                    pattern,
+                    crate::schema::PatternMatch::Full,
+                ))
+                .unwrap(),
+            ),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
             None,
@@ -10695,7 +10754,13 @@ fn assignable_specific_arn_without_pattern_flows_into_generic_arn_with_pattern()
     let mk = |segments: &[&str], pattern: Option<&str>| {
         AttributeType::refined_string_with_validator(
             TypeIdentity::new(Some("aws"), segments.to_vec(), "Arn"),
-            pattern.map(|pattern| crate::schema::CompiledPattern::try_new(pattern).unwrap()),
+            pattern.map(|pattern| {
+                crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                    pattern,
+                    crate::schema::PatternMatch::Full,
+                ))
+                .unwrap()
+            }),
             None,
             crate::schema::legacy_validator(|_| Ok(())),
             None,
@@ -11247,7 +11312,13 @@ fn typed_ref_anonymous_refined_string_assignability_matrix() {
         ] {
             let source = AttributeType::refined_string(
                 Some(TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Arn")),
-                pattern.map(|p| crate::schema::CompiledPattern::try_new(p).unwrap()),
+                pattern.map(|p| {
+                    crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                        p,
+                        crate::schema::PatternMatch::Full,
+                    ))
+                    .unwrap()
+                }),
                 length,
                 None,
             );
@@ -11683,7 +11754,13 @@ fn assignable_anon_length_both_none_compatible() {
 fn custom_carries_semantic_name_pattern_length() {
     let t = AttributeType::refined_string_with_validator(
         TypeIdentity::bare("VpcId"),
-        Some(crate::schema::CompiledPattern::try_new("^vpc-[a-f0-9]+$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^vpc-[a-f0-9]+$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         Some((Some(8), Some(21))),
         crate::schema::legacy_validator(|_| Ok(())),
         None,
@@ -11696,7 +11773,10 @@ fn custom_carries_semantic_name_pattern_length() {
             ..
         } => {
             assert_eq!(binding.identity().map(|id| id.kind.as_str()), Some("VpcId"));
-            assert_eq!(pattern.as_deref(), Some("^vpc-[a-f0-9]+$"));
+            assert_eq!(
+                pattern.as_ref().map(AsRef::as_ref),
+                Some(&PatternSpec::new("^vpc-[a-f0-9]+$", PatternMatch::Full))
+            );
             assert_eq!(*length, Some((Some(8), Some(21))));
         }
         _ => panic!("expected refined String"),
@@ -11707,7 +11787,13 @@ fn custom_carries_semantic_name_pattern_length() {
 fn custom_pattern_rejects_and_accepts_string_values() {
     let attr = AttributeType::refined_string(
         None,
-        Some(crate::schema::CompiledPattern::try_new("^[a-z]+$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^[a-z]+$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         None,
         None,
     );
@@ -11719,7 +11805,8 @@ fn custom_pattern_rejects_and_accepts_string_values() {
         err,
         TypeError::PatternMismatch {
             value: "ABC".into(),
-            pattern: "^[a-z]+$".into(),
+            pattern: crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full)
+                .into(),
             attribute: None,
             type_name: None,
         }
@@ -11738,7 +11825,10 @@ fn schema_admission_compiles_patterns_before_validating_values() {
                 "slug",
                 super::AttributeType::refined_string(
                     None,
-                    Some("^[a-z]+$".to_string()),
+                    Some(crate::schema::PatternSpec::new(
+                        "^[a-z]+$".to_string(),
+                        crate::schema::PatternMatch::Full,
+                    )),
                     None,
                     None,
                 ),
@@ -11755,7 +11845,7 @@ fn schema_admission_compiles_patterns_before_validating_values() {
     );
     assert!(matches!(
         attribute.validate(&Value::Concrete(ConcreteValue::String("ABC".into()))),
-        Err(TypeError::PatternMismatch { pattern, .. }) if pattern == "^[a-z]+$"
+        Err(TypeError::PatternMismatch { pattern, .. }) if pattern.as_ref() == &PatternSpec::new("^[a-z]+$", PatternMatch::Full)
     ));
 }
 
@@ -11768,7 +11858,10 @@ fn schema_pattern_dialect_rejects_unicode_account_ids_and_preserves_transport() 
                     "account_id",
                     super::AttributeType::refined_string(
                         None,
-                        Some(pattern.to_string()),
+                        Some(crate::schema::PatternSpec::new(
+                            pattern.to_string(),
+                            crate::schema::PatternMatch::Full,
+                        )),
                         None,
                         None,
                     ),
@@ -11791,12 +11884,12 @@ fn schema_pattern_dialect_rejects_unicode_account_ids_and_preserves_transport() 
         );
         assert!(matches!(
             attribute.validate(&Value::Concrete(ConcreteValue::String(rejected.into()))),
-            Err(TypeError::PatternMismatch { pattern, .. }) if pattern == source
+            Err(TypeError::PatternMismatch { pattern, .. }) if pattern.as_ref() == &PatternSpec::new(source, PatternMatch::Full)
         ));
         let wire = crate::protocol_convert::resource_schema_to_protocol(&admitted).unwrap();
         assert!(matches!(
             &wire.attributes["account_id"].attr_type,
-            carina_provider_protocol::types::AttributeType::String { pattern: Some(pattern), .. } if pattern == source
+            carina_provider_protocol::types::AttributeType::String { pattern: Some(pattern), .. } if pattern.as_str() == source && matches!(pattern.mode(), carina_provider_protocol::types::PatternMatch::Full)
         ));
         let decoded = crate::protocol_convert::protocol_to_resource_schema(&wire).unwrap();
         assert_eq!(
@@ -11807,7 +11900,7 @@ fn schema_pattern_dialect_rejects_unicode_account_ids_and_preserves_transport() 
             decoded.effective_attribute("account_id").unwrap().validate(
                 &Value::Concrete(ConcreteValue::String(rejected.into()))
             ),
-            Err(TypeError::PatternMismatch { pattern, .. }) if pattern == source
+            Err(TypeError::PatternMismatch { pattern, .. }) if pattern.as_ref() == &PatternSpec::new(source, PatternMatch::Full)
         ));
         assert_ne!(
             admitted.as_schema().semantic_fingerprint(),
@@ -11823,7 +11916,13 @@ fn schema_pattern_dialect_rejects_unicode_account_ids_and_preserves_transport() 
 fn custom_pattern_and_length_passes_still_run_validator() {
     let attr = AttributeType::refined_string_with_validator(
         TypeIdentity::bare("TestValidator"),
-        Some(crate::schema::CompiledPattern::try_new("^[a-z]+$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^[a-z]+$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         Some((Some(1), Some(10))),
         validator(|_| {
             Err(TypeError::ValidationFailed {
@@ -11849,7 +11948,13 @@ fn custom_pattern_rejects_wafv2_description_parentheses() {
     let pattern = r"^[a-zA-Z0-9=:#@/\-,.][a-zA-Z0-9+=:#@/\-,.\s]+[a-zA-Z0-9+=:#@/\-,.]{1,256}$";
     let attr = AttributeType::refined_string_with_validator(
         TypeIdentity::bare("EntityDescription"),
-        Some(crate::schema::CompiledPattern::try_new(pattern).unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                pattern,
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         None,
         crate::schema::legacy_validator(|_| Ok(())),
         None,
@@ -11866,7 +11971,8 @@ fn custom_pattern_rejects_wafv2_description_parentheses() {
         err,
         TypeError::PatternMismatch {
             value: "Protects the Carina Provider Registry (dev) CloudFront distribution".into(),
-            pattern: pattern.into(),
+            pattern: crate::schema::PatternSpec::new(pattern, crate::schema::PatternMatch::Full)
+                .into(),
             attribute: None,
             type_name: Some("EntityDescription".to_string()),
         }
@@ -11952,8 +12058,17 @@ fn schema_rejects_uncompilable_patterns() {
         regex::Regex::new(pattern).is_err(),
         "test must use a pattern unsupported by the regex crate"
     );
-    let invalid =
-        || super::AttributeType::refined_string(None, Some(pattern.to_string()), None, None);
+    let invalid = || {
+        super::AttributeType::refined_string(
+            None,
+            Some(crate::schema::PatternSpec::new(
+                pattern.to_string(),
+                crate::schema::PatternMatch::Full,
+            )),
+            None,
+            None,
+        )
+    };
     for (path, attr) in [
         ("value", invalid()),
         (
@@ -11987,7 +12102,7 @@ fn schema_rejects_uncompilable_patterns() {
             location,
             &SchemaValidationIssueLocation::Attribute(path.into())
         );
-        assert_eq!(source.pattern, pattern);
+        assert_eq!(source.as_ref().as_str(), pattern);
         assert!(matches!(source.reason, PatternCompileErrorSource::Parse(_)));
         assert!(std::error::Error::source(&error).is_none());
 
@@ -12001,7 +12116,7 @@ fn schema_rejects_uncompilable_patterns() {
             location,
             &SchemaValidationIssueLocation::Attribute(path.into())
         );
-        assert_eq!(source.pattern, pattern);
+        assert_eq!(source.as_ref().as_str(), pattern);
         assert!(std::error::Error::source(&error).is_none());
     }
 
@@ -12021,7 +12136,7 @@ fn schema_rejects_uncompilable_patterns() {
         location,
         &SchemaValidationIssueLocation::Definition("Pattern".into())
     );
-    assert_eq!(source.pattern, pattern);
+    assert_eq!(source.as_ref().as_str(), pattern);
 
     ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), invalid())]))
         .expect_err("config invalid regex must fail schema admission");
@@ -12029,7 +12144,17 @@ fn schema_rejects_uncompilable_patterns() {
 
 #[test]
 fn schema_reports_all_pattern_and_definition_errors() {
-    let invalid = || super::AttributeType::refined_string(None, Some("(?=x)".into()), None, None);
+    let invalid = || {
+        super::AttributeType::refined_string(
+            None,
+            Some(crate::schema::PatternSpec::new(
+                "(?=x)",
+                crate::schema::PatternMatch::Full,
+            )),
+            None,
+            None,
+        )
+    };
     let error = super::ResourceSchema::new("test.Pattern")
         .attribute(super::AttributeSchema::optional("bad", invalid()).build())
         .attribute(
@@ -12061,7 +12186,17 @@ fn schema_reports_all_pattern_and_definition_errors() {
 
 #[test]
 fn compile_pass_collects_all_nested_pattern_errors() {
-    let invalid = || super::AttributeType::refined_string(None, Some("(?=x)".into()), None, None);
+    let invalid = || {
+        super::AttributeType::refined_string(
+            None,
+            Some(crate::schema::PatternSpec::new(
+                "(?=x)",
+                crate::schema::PatternMatch::Full,
+            )),
+            None,
+            None,
+        )
+    };
     let attr = super::AttributeType::union(vec![
         super::AttributeType::map_with_key(invalid(), invalid()),
         super::AttributeType::struct_(
@@ -12110,7 +12245,17 @@ fn compile_pass_collects_all_nested_pattern_errors() {
 
 #[test]
 fn config_reports_all_pattern_and_definition_errors() {
-    let invalid = || super::AttributeType::refined_string(None, Some("(?=x)".into()), None, None);
+    let invalid = || {
+        super::AttributeType::refined_string(
+            None,
+            Some(crate::schema::PatternSpec::new(
+                "(?=x)",
+                crate::schema::PatternMatch::Full,
+            )),
+            None,
+            None,
+        )
+    };
     let error = ValidatedConfigSchema::validate(BTreeMap::from([
         ("bad".into(), invalid()),
         ("nested".into(), super::AttributeType::list(invalid())),
@@ -12136,7 +12281,10 @@ fn pattern_errors_do_not_mask_scalar_kind_errors() {
                 "string",
                 super::AttributeType::refined_string(
                     Some(identity.clone()),
-                    Some("(?=x)".into()),
+                    Some(crate::schema::PatternSpec::new(
+                        "(?=x)",
+                        crate::schema::PatternMatch::Full,
+                    )),
                     None,
                     None,
                 ),
@@ -12162,7 +12310,15 @@ fn pattern_errors_do_not_mask_scalar_kind_errors() {
 #[test]
 fn pattern_error_display_renders_regex_diagnostics_once() {
     let invalid = |pattern: &str| {
-        super::AttributeType::refined_string(None, Some(pattern.into()), None, None)
+        super::AttributeType::refined_string(
+            None,
+            Some(crate::schema::PatternSpec::new(
+                pattern,
+                crate::schema::PatternMatch::Full,
+            )),
+            None,
+            None,
+        )
     };
     let resource = super::ResourceSchema::new("test.Pattern")
         .attribute(super::AttributeSchema::optional("first", invalid("(?=x)")).build())
@@ -12214,7 +12370,13 @@ fn pattern_error_display_renders_regex_diagnostics_once() {
 fn schema_validate_attr_dispatches_to_custom_pattern_validation() {
     let attr = AttributeType::refined_string_with_validator(
         TypeIdentity::bare("Slug"),
-        Some(crate::schema::CompiledPattern::try_new("^[a-z]+$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^[a-z]+$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         None,
         crate::schema::legacy_validator(|_| Ok(())),
         None,
@@ -12228,7 +12390,8 @@ fn schema_validate_attr_dispatches_to_custom_pattern_validation() {
         err,
         TypeError::PatternMismatch {
             value: "ABC".into(),
-            pattern: "^[a-z]+$".into(),
+            pattern: crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full)
+                .into(),
             attribute: None,
             type_name: Some("Slug".to_string()),
         }
@@ -12239,7 +12402,13 @@ fn schema_validate_attr_dispatches_to_custom_pattern_validation() {
 fn custom_type_name_anonymous_pattern_only() {
     let t = AttributeType::refined_string(
         None,
-        Some(crate::schema::CompiledPattern::try_new("^foo$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^foo$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         None,
         None,
     );
@@ -12256,7 +12425,13 @@ fn custom_type_name_anonymous_length_only() {
 fn custom_type_name_anonymous_pattern_and_length() {
     let t = AttributeType::refined_string(
         None,
-        Some(crate::schema::CompiledPattern::try_new("^.*$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^.*$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         Some((Some(1), Some(64))),
         None,
     );
@@ -14533,7 +14708,13 @@ fn hosted_zone_id_union(enum_first: bool) -> AttributeType {
             ["route53", "Record", "AliasTarget"],
             "Route53HostedZoneId",
         )),
-        Some(crate::schema::CompiledPattern::try_new("^Z[A-Z0-9]+$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^Z[A-Z0-9]+$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         None,
         None,
     );
@@ -14608,7 +14789,13 @@ fn nested_union_failures_are_flattened_in_declaration_order() {
     );
     let pattern = AttributeType::refined_string(
         Some(TypeIdentity::new(Some("test"), ["nested"], "PatternValue")),
-        Some(crate::schema::CompiledPattern::try_new("^Z+$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^Z+$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         None,
         None,
     );
@@ -14657,13 +14844,25 @@ fn nested_union_failure_below_list_wrapper_is_parenthesized() {
     );
     let pattern_x = AttributeType::refined_string(
         Some(TypeIdentity::bare("PatternX")),
-        Some(crate::schema::CompiledPattern::try_new("^x$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^x$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         None,
         None,
     );
     let pattern_y = AttributeType::refined_string(
         Some(TypeIdentity::bare("PatternY")),
-        Some(crate::schema::CompiledPattern::try_new("^y$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^y$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         None,
         None,
     );
@@ -14834,7 +15033,13 @@ fn tied_map_union_reports_each_value_failure() {
 fn duplicate_tied_union_failures_collapse_to_the_verbatim_error() {
     let member = AttributeType::refined_string(
         Some(TypeIdentity::bare("HostedZoneId")),
-        Some(crate::schema::CompiledPattern::try_new("^Z[A-Z0-9]+$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^Z[A-Z0-9]+$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         None,
         None,
     );
@@ -14842,7 +15047,8 @@ fn duplicate_tied_union_failures_collapse_to_the_verbatim_error() {
     let value = Value::Concrete(ConcreteValue::String("invalid".into()));
     let expected = TypeError::PatternMismatch {
         value: "invalid".into(),
-        pattern: "^Z[A-Z0-9]+$".into(),
+        pattern: crate::schema::PatternSpec::new("^Z[A-Z0-9]+$", crate::schema::PatternMatch::Full)
+            .into(),
         attribute: None,
         type_name: Some("HostedZoneId".to_string()),
     };
@@ -14857,7 +15063,13 @@ fn unique_best_union_failure_remains_verbatim() {
     let union = AttributeType::union(vec![
         AttributeType::refined_string(
             Some(TypeIdentity::bare("HostedZoneId")),
-            Some(crate::schema::CompiledPattern::try_new("^Z[A-Z0-9]+$").unwrap()),
+            Some(
+                crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                    "^Z[A-Z0-9]+$",
+                    crate::schema::PatternMatch::Full,
+                ))
+                .unwrap(),
+            ),
             None,
             None,
         ),
@@ -14866,7 +15078,8 @@ fn unique_best_union_failure_remains_verbatim() {
     let value = Value::Concrete(ConcreteValue::String("invalid".into()));
     let expected = TypeError::PatternMismatch {
         value: "invalid".into(),
-        pattern: "^Z[A-Z0-9]+$".into(),
+        pattern: crate::schema::PatternSpec::new("^Z[A-Z0-9]+$", crate::schema::PatternMatch::Full)
+            .into(),
         attribute: None,
         type_name: Some("HostedZoneId".to_string()),
     };
@@ -17578,4 +17791,143 @@ fn unbounded_integer_range_is_assignable_to_unbounded_float_range() {
         Some(&(None, None)),
         Some(&(None, None))
     ));
+}
+
+#[test]
+fn pattern_modes_and_reasons_affect_equality_assignability_and_fingerprints() {
+    use std::collections::{BTreeSet, HashSet};
+    let specs = [
+        PatternSpec::new("abc", PatternMatch::Full),
+        PatternSpec::new(
+            "abc",
+            PatternMatch::Substring {
+                reason: PatternReason::new("API contract permits containing values").unwrap(),
+            },
+        ),
+        PatternSpec::new(
+            "abc",
+            PatternMatch::Substring {
+                reason: PatternReason::new("Another documented contract").unwrap(),
+            },
+        ),
+    ];
+    let compiled: Vec<_> = specs
+        .iter()
+        .map(|spec| CompiledPattern::try_new(spec).unwrap())
+        .collect();
+    assert_eq!(compiled.iter().collect::<HashSet<_>>().len(), 3);
+    assert_eq!(compiled.iter().collect::<BTreeSet<_>>().len(), 3);
+    let types: Vec<_> = compiled
+        .iter()
+        .map(|pattern| AttributeType::refined_string(None, Some(pattern.clone()), None, None))
+        .collect();
+    for (i, source) in types.iter().enumerate() {
+        for (j, sink) in types.iter().enumerate() {
+            assert_eq!(compiled[i] == compiled[j], i == j);
+            assert_eq!(assignable(source, sink), i == j, "{i} -> {j}");
+        }
+    }
+    let fingerprints: HashSet<_> = specs
+        .into_iter()
+        .map(|spec| {
+            super::ResourceSchema::new("test.Pattern")
+                .attribute(
+                    super::AttributeSchema::optional(
+                        "value",
+                        super::AttributeType::refined_string(None, Some(spec), None, None),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap()
+                .as_schema()
+                .semantic_fingerprint()
+        })
+        .collect();
+    assert_eq!(fingerprints.len(), 3);
+}
+
+#[test]
+fn pattern_mismatch_errors_stay_small_with_complete_specs() {
+    assert!(std::mem::size_of::<TypeError>() < 128);
+    let spec = PatternSpec::new(
+        "abc",
+        PatternMatch::Substring {
+            reason: PatternReason::new("The upstream contract permits containing text").unwrap(),
+        },
+    );
+    let error = TypeError::PatternMismatch {
+        value: "bad".into(),
+        pattern: spec.clone().into(),
+        attribute: None,
+        type_name: None,
+    };
+    let TypeError::PatternMismatch {
+        pattern,
+        value: _value,
+        attribute: _attribute,
+        type_name: _type_name,
+    } = error
+    else {
+        unreachable!();
+    };
+    assert_eq!(pattern.as_ref(), &spec);
+}
+
+#[test]
+fn pattern_reason_controls_are_escaped_in_every_diagnostic() {
+    let reason = "prefix-only\n\u{1b}[31m metadata";
+    let mode = PatternMatch::Substring {
+        reason: PatternReason::new(reason).unwrap(),
+    };
+    let spec = PatternSpec::new("abc", mode.clone());
+    let compiled = CompiledPattern::try_new(&spec).unwrap();
+    let string = AttributeType::refined_string(None, Some(compiled.clone()), None, None);
+    let reference = AttributeType::reference(
+        TypeIdentity::new(Some("test"), ["r"], "Id"),
+        Some(compiled.clone()),
+        None,
+    );
+    let declaration = AttributeType::refined_string(
+        Some(TypeIdentity::bare("PatternText")),
+        Some(compiled.clone()),
+        None,
+        None,
+    );
+    let annotation = AttributeType {
+        kind: AttrTypeKind::String {
+            binding: RefinementBinding::Annotation(
+                crate::parser::ResolvedSchemaType::from_schema_declaration("test", &declaration)
+                    .unwrap(),
+            ),
+            pattern: None,
+            length: None,
+            to_dsl: None,
+        },
+    };
+    let draft = super::AttributeType::refined_string(None, Some(spec.clone()), None, None);
+    let mismatch = string
+        .validate(&Value::Concrete(ConcreteValue::String("bad".into())))
+        .unwrap_err();
+    let invalid = CompiledPattern::try_new(&PatternSpec::new("[", mode)).unwrap_err();
+    for diagnostic in [
+        compiled.to_string(),
+        string.scalar_diagnostic_name(),
+        reference.scalar_diagnostic_name(),
+        annotation.scalar_diagnostic_name(),
+        draft.scalar_diagnostic_name(),
+        mismatch.to_string(),
+        invalid.to_string(),
+    ] {
+        assert!(
+            diagnostic.contains("prefix-only\\n\\u{1b}[31m metadata"),
+            "{diagnostic:?}"
+        );
+        assert!(!diagnostic.contains(reason), "{diagnostic:?}");
+        assert!(!diagnostic.contains('\u{1b}'), "{diagnostic:?}");
+    }
+    let PatternMatch::Substring { reason: stored } = spec.mode() else {
+        panic!("expected Substring");
+    };
+    assert_eq!(stored.as_str(), reason);
 }

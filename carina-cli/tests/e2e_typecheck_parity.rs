@@ -382,7 +382,10 @@ fn expression_typing_schemas() -> SchemaRegistry {
                             ["r"],
                             "RoleName",
                         )),
-                        Some("^[a-z]+$".into()),
+                        Some(carina_core::schema::PatternSpec::new(
+                            "^[a-z]+$",
+                            carina_core::schema::PatternMatch::Full,
+                        )),
                         None,
                         None,
                     ),
@@ -869,7 +872,10 @@ fn single_reference_interpolation_scalar_string_constraints_cli_lsp() {
                             ["r"],
                             "Digits",
                         )),
-                        Some("^[0-9]+$".into()),
+                        Some(carina_core::schema::PatternSpec::new(
+                            "^[0-9]+$",
+                            carina_core::schema::PatternMatch::Full,
+                        )),
                         Some((Some(2), Some(4))),
                         None,
                     ),
@@ -1229,7 +1235,10 @@ fn assert_module_constructed_string(
                         Some(carina_core::schema::TypeIdentity::from_schema_type(
                             "test", "iam.Role", "Name",
                         )),
-                        Some("^carina-[0-9]+-role$".into()),
+                        Some(carina_core::schema::PatternSpec::new(
+                            "^carina-[0-9]+-role$",
+                            carina_core::schema::PatternMatch::Full,
+                        )),
                         Some((Some(1), Some(16))),
                         None,
                     ),
@@ -1375,7 +1384,10 @@ fn issue_4282_split_at_named_string_list_checks_values_in_cli_and_lsp() {
             Some(carina_core::schema::TypeIdentity::from_schema_type(
                 "test", "Names", "Name",
             )),
-            Some("^[a-z]+$".into()),
+            Some(carina_core::schema::PatternSpec::new(
+                "^[a-z]+$",
+                carina_core::schema::PatternMatch::Full,
+            )),
             Some((Some(1), Some(3))),
             None,
         )
@@ -5665,7 +5677,10 @@ fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
                 ["route53", "Record", "AliasTarget"],
                 "Route53HostedZoneId",
             )),
-            Some("^Z[A-Z0-9]+$".to_string()),
+            Some(carina_core::schema::PatternSpec::new(
+                "^Z[A-Z0-9]+$".to_string(),
+                carina_core::schema::PatternMatch::Full,
+            )),
             None,
             None,
         ),
@@ -6373,7 +6388,15 @@ fn round1_union_schema(nested: bool) -> ResourceSchema {
     } else {
         AttributeType::union(vec![
             single_value_walk_m01_vpc_id_type(),
-            AttributeType::refined_string(None, Some("^x".into()), None, None),
+            AttributeType::refined_string(
+                None,
+                Some(carina_core::schema::PatternSpec::new(
+                    "^x",
+                    carina_core::schema::PatternMatch::Full,
+                )),
+                None,
+                None,
+            ),
         ])
     };
     ResourceSchema::new("test.Sink")
@@ -8222,3 +8245,119 @@ mod review_round1_4282;
 
 #[path = "e2e_typecheck_parity/review_round2_4282.rs"]
 mod review_round2_4282;
+
+#[test]
+fn pattern_modes_directory_validate_and_lsp_parity() {
+    for (attribute, value, accepted) in [
+        ("full", "xabcx", false),
+        ("substring", "xabcx", true),
+        ("full", "abc", true),
+    ] {
+        let source = format!("mock.test.pattern_modes {{ {attribute} = '{value}' }}\n");
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider mock {}\n"),
+            ("main.crn", &source),
+            ("exports.crn", "exports { marker = 'directory fixture' }\n"),
+        ]);
+        let schemas = carina_provider_mock::builtin_schemas().into_iter().fold(
+            SchemaRegistry::new(),
+            |mut registry, schema| {
+                registry.insert("mock", schema);
+                registry
+            },
+        );
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_carina"))
+            .args(["validate", fixture.path().to_str().unwrap(), "--json"])
+            .env("NO_COLOR", "1")
+            .output()
+            .expect("run production validate binary");
+        assert_eq!(
+            output.status.success(),
+            accepted,
+            "{attribute}={value}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        assert_eq!(cli.is_empty(), accepted, "{attribute}={value}: {cli:#?}");
+        assert_eq!(lsp.is_empty(), accepted, "{attribute}={value}: {lsp:#?}");
+        if !accepted {
+            assert_eq!(cli.len(), 1, "{cli:#?}");
+            assert_eq!(lsp.len(), 1, "{lsp:#?}");
+            assert_eq!(lsp[0].severity, Some(DiagnosticSeverity::ERROR));
+            assert!(
+                cli[0].contains("does not match required pattern"),
+                "{cli:#?}"
+            );
+            assert!(
+                cli[0].contains(&lsp[0].message),
+                "CLI={cli:#?}, LSP={lsp:#?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn pattern_reason_controls_are_escaped_in_cli_and_lsp_diagnostics() {
+    use carina_core::schema::{PatternMatch, PatternReason, PatternSpec, TypeIdentity};
+
+    let reason = "prefix-only\n\u{1b}[31m metadata";
+    let spec = PatternSpec::new(
+        "abc",
+        PatternMatch::Substring {
+            reason: PatternReason::new(reason).unwrap(),
+        },
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("r.pattern")
+            .attribute(
+                AttributeSchema::optional(
+                    "value",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::new(Some("test"), ["r"], "PatternText")),
+                        Some(spec),
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = engine_with_schemas(schemas.clone());
+    for source in [
+        "test.r.pattern { value = 'bad' }\n",
+        "test.r.pattern { value = \"${'bad'}\" }\n",
+    ] {
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider test {}\n"),
+            ("main.crn", source),
+            ("exports.crn", "exports { marker = 'reason diagnostic' }\n"),
+        ]);
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        let lsp = lsp_diagnostics(&engine, &fixture, "main.crn");
+        assert_eq!(cli.len(), 1, "{source}: {cli:#?}");
+        assert_eq!(lsp.len(), 1, "{source}: {lsp:#?}");
+        assert_eq!(
+            lsp[0].severity,
+            Some(DiagnosticSeverity::ERROR),
+            "{source}: {lsp:#?}"
+        );
+        assert!(
+            cli[0].contains(&lsp[0].message),
+            "CLI={cli:#?}, LSP={lsp:#?}"
+        );
+        for diagnostic in [cli[0].as_str(), lsp[0].message.as_str()] {
+            assert!(
+                diagnostic.contains("prefix-only\\n\\u{1b}[31m metadata"),
+                "{diagnostic:?}"
+            );
+            assert!(!diagnostic.contains(reason), "{diagnostic:?}");
+            assert!(!diagnostic.contains('\u{1b}'), "{diagnostic:?}");
+        }
+    }
+}

@@ -74,6 +74,45 @@ impl MockHttpProvider {
     }
 }
 
+fn pattern_mode_schema() -> carina_plugin_sdk::core::schema::ResourceSchema {
+    use carina_plugin_sdk::core::schema::{
+        AttributeSchema, AttributeType, PatternMatch, PatternReason, PatternSpec, ResourceSchema,
+    };
+    ResourceSchema::new("test.pattern_modes")
+        .attribute(
+            AttributeSchema::optional(
+                "full",
+                AttributeType::refined_string(
+                    None,
+                    Some(PatternSpec::new("abc", PatternMatch::Full)),
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
+                "substring",
+                AttributeType::refined_string(
+                    None,
+                    Some(PatternSpec::new(
+                        "abc",
+                        PatternMatch::Substring {
+                            reason: PatternReason::new(
+                                "Fixture exercises deliberate substring validation",
+                            )
+                            .unwrap(),
+                        },
+                    )),
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+}
+
 impl CarinaProvider for MockHttpProvider {
     type CreateToken = CreateToken;
     type UpdateToken = Never;
@@ -89,10 +128,12 @@ impl CarinaProvider for MockHttpProvider {
     }
 
     fn schemas(&self) -> Vec<CoreValidatedResourceSchema> {
-        vec![send_phase::schema(
-            ProbeKind::HttpWorld,
-            Some(CREATE_BEHAVIOR_ATTRIBUTE),
-        )]
+        vec![
+            send_phase::schema(ProbeKind::HttpWorld, Some(CREATE_BEHAVIOR_ATTRIBUTE)),
+            pattern_mode_schema()
+                .validate()
+                .expect("pattern mode fixture"),
+        ]
     }
 
     fn reference_forms(&self) -> carina_plugin_sdk::core::schema::ReferenceForms {

@@ -37,7 +37,11 @@ fn review3_resolved_constraint_origins_mask_secret_paths() {
     });
     let error = TypeError::PatternMismatch {
         value: "bad".into(),
-        pattern: "^ok$".into(),
+        pattern: carina_core::schema::PatternSpec::new(
+            "^ok$",
+            carina_core::schema::PatternMatch::Full,
+        )
+        .into(),
         attribute: Some("attr".into()),
         type_name: None,
     };
@@ -2512,7 +2516,11 @@ fn tied_union_error_with_attributes(first: &'static str, second: &'static str) -
             carina_core::schema::validator(move |_| {
                 Err(TypeError::PatternMismatch {
                     value: "invalid".into(),
-                    pattern: pattern.into(),
+                    pattern: carina_core::schema::PatternSpec::new(
+                        pattern,
+                        carina_core::schema::PatternMatch::Full,
+                    )
+                    .into(),
                     attribute: Some(attribute.to_string()),
                     type_name: None,
                 })
@@ -2540,7 +2548,11 @@ fn tied_union_error_with_one_unattributed_failure() -> TypeError {
         carina_core::schema::validator(|_| {
             Err(TypeError::PatternMismatch {
                 value: "invalid".into(),
-                pattern: "^first$".into(),
+                pattern: carina_core::schema::PatternSpec::new(
+                    "^first$",
+                    carina_core::schema::PatternMatch::Full,
+                )
+                .into(),
                 attribute: Some("target".to_string()),
                 type_name: None,
             })
@@ -4015,7 +4027,10 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
             "role_arn".to_string(),
             PatternAttributeType::refined_string(
                 None,
-                Some(r"^arn:aws:iam::[0-9]{12}:role/.+$".to_string()),
+                Some(carina_core::schema::PatternSpec::new(
+                    r"^arn:aws:iam::[0-9]{12}:role/.+$".to_string(),
+                    carina_core::schema::PatternMatch::Full,
+                )),
                 None,
                 None,
             ),
@@ -10248,7 +10263,7 @@ async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
                     "filter",
                     PatternAttributeType::refined_string(
                         None,
-                        Some("^good-".to_string()),
+                        Some(carina_core::schema::PatternSpec::new("^good-", carina_core::schema::PatternMatch::Substring { reason: carina_core::schema::PatternReason::new("Fixture deliberately validates only the prefix").unwrap() })),
                         None,
                         None,
                     ),
@@ -10276,7 +10291,7 @@ async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
 
     assert_eq!(
         error.to_string(),
-        "[Lookup.roles] test.Lookup.roles: value constraint failed before provider dispatch: Invalid value 'bad' for 'filter': does not match required pattern /^good-/"
+        "[Lookup.roles] test.Lookup.roles: value constraint failed before provider dispatch: Invalid value 'bad' for 'filter': does not match required pattern /^good-/ (Substring: Fixture deliberately validates only the prefix)"
     );
     let AppError::ProviderPreparation(preparation) = &error else {
         panic!("typed preparation error was erased: {error:?}");
@@ -14148,7 +14163,15 @@ mod resolved_value_constraint_gate {
             let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
                 let pattern_type = PatternAttributeType::refined_string(
                     None,
-                    Some("^good-".to_string()),
+                    Some(carina_core::schema::PatternSpec::new(
+                        "^good-",
+                        carina_core::schema::PatternMatch::Substring {
+                            reason: carina_core::schema::PatternReason::new(
+                                "Fixture deliberately validates only the prefix",
+                            )
+                            .unwrap(),
+                        },
+                    )),
                     None,
                     None,
                 );

@@ -444,7 +444,10 @@ mod tests {
                     ["route53", "Record", "AliasTarget"],
                     "Route53HostedZoneId",
                 )),
-                Some("^Z[A-Z0-9]+$".to_string()),
+                Some(carina_core::schema::PatternSpec::new(
+                    "^Z[A-Z0-9]+$".to_string(),
+                    carina_core::schema::PatternMatch::Full,
+                )),
                 None,
                 None,
             ),

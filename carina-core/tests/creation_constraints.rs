@@ -4,7 +4,11 @@ use carina_core::schema::{
     InputRuleError, NonEmptyString, ResourceSchema, StructField,
 };
 
-fn rule(path: &str, code: &str, predicate: InputPredicate<String>) -> InputRule {
+fn rule(
+    path: &str,
+    code: &str,
+    predicate: InputPredicate<carina_core::schema::PatternSpec>,
+) -> InputRule {
     InputRule::value(
         carina_core::schema::InputRuleScope::CreateOnly,
         InputPath::new(path).unwrap(),
@@ -62,7 +66,7 @@ fn evaluate_schema(
     Ok(())
 }
 
-fn compiled(predicate: InputPredicate<String>) -> CheckedRuleFixture {
+fn compiled(predicate: InputPredicate<carina_core::schema::PatternSpec>) -> CheckedRuleFixture {
     CheckedRuleFixture(
         schema(vec![rule("name", "test.rule", predicate)])
             .validate()
@@ -145,12 +149,23 @@ fn creation_primitive_vectors() {
             vec!["0.0.0.0", "192.168.1.1", "255.255.255.255"],
         ),
         (
-            InputPredicate::Matches("^\\d+$".into()),
+            InputPredicate::Matches(carina_core::schema::PatternSpec::new(
+                "^\\d+$",
+                carina_core::schema::PatternMatch::Full,
+            )),
             vec!["123"],
             vec!["", "١٢٣", "x123"],
         ),
         (
-            InputPredicate::NotMatches("bad".into()),
+            InputPredicate::NotMatches(carina_core::schema::PatternSpec::new(
+                "bad",
+                carina_core::schema::PatternMatch::Substring {
+                    reason: carina_core::schema::PatternReason::new(
+                        "Reject the forbidden token anywhere in the value",
+                    )
+                    .unwrap(),
+                },
+            )),
             vec!["", "good"],
             vec!["bad", "a-bad-b"],
         ),
@@ -360,7 +375,10 @@ fn creation_admission_rejects_invalid_paths_types_bounds_and_duplicates() {
     let error = schema(vec![rule(
         "name",
         "test.regex",
-        InputPredicate::Matches("[".into()),
+        InputPredicate::Matches(carina_core::schema::PatternSpec::new(
+            "[",
+            carina_core::schema::PatternMatch::Full,
+        )),
     )])
     .validate()
     .unwrap_err();
@@ -425,12 +443,18 @@ fn creation_protocol_round_trip_retains_every_primitive_and_empty_collection() {
         rule(
             "name",
             "test.match",
-            InputPredicate::Matches("^\\w+$".into()),
+            InputPredicate::Matches(carina_core::schema::PatternSpec::new(
+                "^\\w+$",
+                carina_core::schema::PatternMatch::Full,
+            )),
         ),
         rule(
             "name",
             "test.not_match",
-            InputPredicate::NotMatches("forbidden".into()),
+            InputPredicate::NotMatches(carina_core::schema::PatternSpec::new(
+                "forbidden",
+                carina_core::schema::PatternMatch::Full,
+            )),
         ),
     ]);
     for rules in [vec![], rules] {
@@ -508,7 +532,10 @@ fn creation_admission_accepts_string_refinements_enums_and_reference_leaves() {
     for ty in [
         AttributeType::refined_string(
             Some(identity.clone()),
-            Some("^.+$".into()),
+            Some(carina_core::schema::PatternSpec::new(
+                "^.+$",
+                carina_core::schema::PatternMatch::Full,
+            )),
             Some((Some(1), None)),
             None,
         ),

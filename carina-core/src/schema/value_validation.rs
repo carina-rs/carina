@@ -1677,7 +1677,13 @@ mod tests {
             AT::refined_string(Some(TypeIdentity::bare("VpcId")), None, None, None),
             AT::refined_string(
                 None,
-                Some(CompiledPattern::try_new("^x").unwrap()),
+                Some(
+                    CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                        "^x",
+                        crate::schema::PatternMatch::Full,
+                    ))
+                    .unwrap(),
+                ),
                 None,
                 None,
             ),

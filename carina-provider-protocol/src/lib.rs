@@ -2,6 +2,7 @@ mod finite_f64;
 mod host_pattern;
 pub mod http_trace;
 pub mod normalization;
+mod pattern_spec;
 pub mod types;
 
 pub use finite_f64::{FiniteF64, NonFiniteFloatError};
@@ -12,7 +13,7 @@ use std::time::{Duration, Instant};
 
 /// Protocol version for host-plugin communication.
 /// Increment when making breaking changes to the protocol types or methods.
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Oldest provider protocol version this host can load safely.
 pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = PROTOCOL_VERSION;

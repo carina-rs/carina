@@ -2,6 +2,10 @@
 //!
 //! These mirror carina-core types but are JSON-serializable across the process boundary.
 
+pub use crate::pattern_spec::{
+    EmptyPatternReason, PatternMatch, PatternReason, PatternSpec, PatternSpecParts,
+};
+
 use serde::de::Error as DeError;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1864,8 +1868,8 @@ pub enum InputPredicate {
         right: CharSet,
     },
     NotIpv4,
-    Matches(String),
-    NotMatches(String),
+    Matches(PatternSpec),
+    NotMatches(PatternSpec),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2066,14 +2070,14 @@ pub enum AttributeType {
     #[serde(rename = "reference")]
     Reference {
         identity: TypeIdentity,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pattern: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pattern: Option<PatternSpec>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         length: Option<(Option<u64>, Option<u64>)>,
     },
     String {
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pattern: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pattern: Option<PatternSpec>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         length: Option<(Option<u64>, Option<u64>)>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2177,8 +2181,8 @@ pub enum AttributeType {
     Custom {
         name: String,
         base: Box<AttributeType>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pattern: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pattern: Option<PatternSpec>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         length: Option<(Option<u64>, Option<u64>)>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2680,7 +2684,7 @@ mod tests {
         let json = serde_json::json!({
             "type": "reference",
             "identity": {"provider": "test", "segments": ["keys", "Key"], "kind": "Reference"},
-            "pattern": "^(alias/|key/).+$",
+            "pattern": {"regex":"^(alias/|key/).+$", "mode":{"kind":"full"}},
             "length": [1, 256]
         });
         let ty: AttributeType = serde_json::from_value(json.clone()).expect("reference schema");
@@ -3194,7 +3198,10 @@ mod tests {
         let attr = AttributeType::Custom {
             name: "awscc.wafv2.WebACL.EntityDescription".to_string(),
             base: Box::new(string_attr()),
-            pattern: Some("^[a-z]+$".to_string()),
+            pattern: Some(crate::types::PatternSpec::new(
+                "^[a-z]+$".to_string(),
+                crate::types::PatternMatch::Full,
+            )),
             length: Some((Some(1), Some(9))),
             validate: None,
             to_dsl: None,
@@ -3208,7 +3215,10 @@ mod tests {
             AttributeType::Custom {
                 pattern, length, ..
             } => {
-                assert_eq!(pattern.as_deref(), Some("^[a-z]+$"));
+                assert_eq!(
+                    pattern,
+                    Some(PatternSpec::new("^[a-z]+$", PatternMatch::Full))
+                );
                 assert_eq!(length, Some((Some(1), Some(9))));
             }
             other => panic!("expected Custom, got {:?}", other),
@@ -3219,7 +3229,10 @@ mod tests {
     fn refined_primitive_attribute_types_round_trip() {
         let attrs = [
             AttributeType::String {
-                pattern: Some("^[a-z]+$".to_string()),
+                pattern: Some(crate::types::PatternSpec::new(
+                    "^[a-z]+$".to_string(),
+                    crate::types::PatternMatch::Full,
+                )),
                 length: Some((Some(1), Some(63))),
                 validate: Some(serde_json::json!(true)),
                 to_dsl: Some(DslTransform::StripSuffix(".".to_string())),
@@ -4024,5 +4037,73 @@ mod tests {
         assert!(!request.directives.force_delete);
         assert!(!request.directives.create_before_destroy);
         assert!(!request.directives.prevent_destroy);
+    }
+}
+
+#[cfg(test)]
+mod pattern_mode_tests {
+    #[test]
+    fn pattern_spec_decode_rejects_undeclared_or_invalid_modes() {
+        for pattern in [
+            serde_json::json!("abc"),
+            serde_json::json!({"regex": "abc"}),
+            serde_json::json!({"regex": "abc", "mode": {"kind": "unknown"}}),
+            serde_json::json!({"regex": "abc", "mode": {"kind": "full", "reason": "x"}}),
+            serde_json::json!({"regex": "abc", "mode": {"kind": "substring"}}),
+            serde_json::json!({"regex": "abc", "mode": {"kind": "substring", "reason": ""}}),
+            serde_json::json!({"regex": "abc", "mode": {"kind": "substring", "reason": "  "}}),
+        ] {
+            for ty in [
+                serde_json::json!({"type": "String", "pattern": pattern}),
+                serde_json::json!({"type": "custom", "name": "test.Name", "base": {"type": "String"}, "pattern": pattern}),
+                serde_json::json!({"type": "reference", "identity": {"provider": "test", "segments": [], "kind": "Id"}, "pattern": pattern}),
+            ] {
+                assert!(
+                    serde_json::from_value::<super::AttributeType>(ty.clone()).is_err(),
+                    "admitted {ty}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod explicit_pattern_spec_tests {
+    use super::*;
+
+    #[test]
+    fn pattern_spec_roundtrips_and_predicates_require_complete_specs() {
+        for mode in [
+            PatternMatch::Full,
+            PatternMatch::Substring {
+                reason: PatternReason::new("Upstream permits containing text").unwrap(),
+            },
+        ] {
+            let spec = PatternSpec::new("abc", mode);
+            assert_eq!(
+                serde_json::from_str::<PatternSpec>(&serde_json::to_string(&spec).unwrap())
+                    .unwrap(),
+                spec
+            );
+            let predicate = serde_json::json!({"kind":"matches", "value": spec});
+            assert!(serde_json::from_value::<InputPredicate>(predicate).is_ok());
+        }
+        for pattern in [
+            serde_json::json!("abc"),
+            serde_json::json!({"regex":"abc"}),
+            serde_json::json!({"mode":{"kind":"full"}}),
+            serde_json::json!({"regex":"abc","mode":{"kind":"unknown"}}),
+            serde_json::json!({"regex":"abc","mode":{"kind":"substring","reason":""}}),
+            serde_json::json!({"regex":"abc","mode":{"kind":"substring","reason":" "}}),
+        ] {
+            for kind in ["matches", "not_matches"] {
+                assert!(
+                    serde_json::from_value::<InputPredicate>(
+                        serde_json::json!({"kind":kind,"value":pattern})
+                    )
+                    .is_err()
+                );
+            }
+        }
     }
 }

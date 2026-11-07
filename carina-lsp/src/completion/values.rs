@@ -2931,7 +2931,15 @@ mod return_type_fits_tests {
         );
         let named = AttributeType::refined_string(
             Some(TypeIdentity::new(Some("test"), ["Role"], "Name")),
-            Some(carina_core::schema::CompiledPattern::try_new("^[a-z]+$").unwrap()),
+            Some(
+                carina_core::schema::CompiledPattern::try_new(
+                    &carina_core::schema::PatternSpec::new(
+                        "^[a-z]+$",
+                        carina_core::schema::PatternMatch::Full,
+                    ),
+                )
+                .unwrap(),
+            ),
             Some((Some(1), Some(16))),
             None,
         );

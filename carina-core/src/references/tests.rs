@@ -2600,7 +2600,10 @@ impl ProviderFactory for ReferenceValidationFactory {
                         "key",
                         crate::schema::AttributeType::reference(
                             identity(),
-                            Some("^alias/[a-z]+$".into()),
+                            Some(crate::schema::PatternSpec::new(
+                                "^alias/[a-z]+$",
+                                crate::schema::PatternMatch::Full,
+                            )),
                             Some((Some(7), Some(20))),
                         ),
                     )

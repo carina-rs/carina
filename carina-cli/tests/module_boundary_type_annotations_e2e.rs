@@ -261,7 +261,10 @@ fn domain_lookup_schema() -> ResourceSchema {
 fn nested_domain_consumer_schema() -> ResourceSchema {
     let constrained_domain = AttributeType::refined_string(
         None,
-        Some(r"^[A-Za-z0-9.-]+$".to_string()),
+        Some(carina_core::schema::PatternSpec::new(
+            r"^[A-Za-z0-9.-]+$".to_string(),
+            carina_core::schema::PatternMatch::Full,
+        )),
         Some((Some(1), Some(1024))),
         None,
     );

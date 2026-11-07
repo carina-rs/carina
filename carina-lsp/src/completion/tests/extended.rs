@@ -5587,7 +5587,10 @@ fn reference_input_completion_accepts_compatible_key_output_from_a_sibling_file(
                     "arn",
                     AttributeType::refined_string(
                         Some(TypeIdentity::new(Some("test"), ["keys", "Key"], "Arn")),
-                        Some("^key/.+$".into()),
+                        Some(carina_core::schema::PatternSpec::new(
+                            "^key/.+$",
+                            carina_core::schema::PatternMatch::Full,
+                        )),
                         None,
                         None,
                     ),

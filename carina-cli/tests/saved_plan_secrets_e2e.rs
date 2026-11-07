@@ -3309,8 +3309,8 @@ fn current_saved_plan_root_and_nested_hashes_round_trip_byte_for_byte() {
     use carina_core::resource::{
         ConcreteValue, DeferredValue, SnapshotLeaf, Value as SnapshotTree,
     };
-    assert_eq!(PlanFile::CURRENT_VERSION, 42);
-    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v42.plan.json");
+    assert_eq!(PlanFile::CURRENT_VERSION, 43);
+    let fixture = include_str!("fixtures/module_binding_wire_compat/carina.v43.plan.json");
     let plan: PlanFile = serde_json::from_str(fixture).unwrap();
     assert_eq!(
         carina_core::utils::pretty_with_newline(&plan).unwrap(),
