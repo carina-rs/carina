@@ -674,10 +674,10 @@ A struct type represents a nested object with typed fields.
   protocol minimum (`MIN_SUPPORTED_PROTOCOL_VERSION`) requires it, so a host
   and provider that disagree about it
   fail at load instead of silently dropping nested write-only members. Protocol
-  24 also requires a typed pattern spec (regex plus explicit mode, and a nonempty
-  reason for Substring); convert the complete spec exhaustively, including its
-  reason. Never supply a default mode or admit a bare string, including on the
-  schema-only migration path. Adding
+  24 also requires a typed pattern spec (regex plus explicit mode, and a reason
+  containing visible text for Substring); convert the complete spec
+  exhaustively, including its reason. Never supply a default mode or admit a bare
+  string, including on the schema-only migration path. Adding
   a protocol field must break compilation until it is consciously carried
   across or explicitly bound and documented as unavailable on the destination
   side. Never use a catch-all `_` or `..` at this seam; a silently dropped field

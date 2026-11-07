@@ -7,6 +7,7 @@ pub mod types;
 
 pub use finite_f64::{FiniteF64, NonFiniteFloatError};
 pub use host_pattern::{HostPattern, HostPatternError};
+pub use pattern_spec::is_default_ignorable;
 
 use std::future::Future;
 use std::time::{Duration, Instant};

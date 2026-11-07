@@ -4,6 +4,7 @@ use std::borrow::Borrow;
 use std::fmt;
 use std::ops::Deref;
 
+use carina_provider_protocol::is_default_ignorable;
 use serde::{Deserialize, Deserializer, Serialize};
 
 /// Maximum stored diagnostic size, including a truncation marker.
@@ -114,6 +115,11 @@ impl ProviderTextBuilder {
         for c in text.chars() {
             match c {
                 '\n' | '\t' if !inline => self.push_sanitized_char(c),
+                c if inline && is_default_ignorable(c) => {
+                    for escaped in c.escape_unicode() {
+                        self.push_sanitized_char(escaped);
+                    }
+                }
                 c if inline && (c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) => {
                     for escaped in c.escape_debug() {
                         self.push_sanitized_char(escaped);

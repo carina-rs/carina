@@ -18,16 +18,44 @@ impl fmt::Display for EmptyPatternReason {
 }
 impl std::error::Error for EmptyPatternReason {}
 
-fn is_invisible_format_char(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00ad}'
-            | '\u{200b}'..='\u{200f}'
-            | '\u{202a}'..='\u{202e}'
-            | '\u{2060}'..='\u{2064}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{feff}'
-    )
+// Complete Default_Ignorable_Code_Point property from Unicode 16.0.0:
+// https://www.unicode.org/Public/16.0.0/ucd/DerivedCoreProperties.txt
+// Includes the Hangul fillers U+115F, U+1160, U+3164 and U+FFA0.
+const DEFAULT_IGNORABLE_CODE_POINT_RANGES: &[std::ops::RangeInclusive<char>] = &[
+    '\u{ad}'..='\u{ad}',
+    '\u{34f}'..='\u{34f}',
+    '\u{61c}'..='\u{61c}',
+    '\u{115f}'..='\u{1160}',
+    '\u{17b4}'..='\u{17b5}',
+    '\u{180b}'..='\u{180d}',
+    '\u{180e}'..='\u{180e}',
+    '\u{180f}'..='\u{180f}',
+    '\u{200b}'..='\u{200f}',
+    '\u{202a}'..='\u{202e}',
+    '\u{2060}'..='\u{2064}',
+    '\u{2065}'..='\u{2065}',
+    '\u{2066}'..='\u{206f}',
+    '\u{3164}'..='\u{3164}',
+    '\u{fe00}'..='\u{fe0f}',
+    '\u{feff}'..='\u{feff}',
+    '\u{ffa0}'..='\u{ffa0}',
+    '\u{fff0}'..='\u{fff8}',
+    '\u{1bca0}'..='\u{1bca3}',
+    '\u{1d173}'..='\u{1d17a}',
+    '\u{e0000}'..='\u{e0000}',
+    '\u{e0001}'..='\u{e0001}',
+    '\u{e0002}'..='\u{e001f}',
+    '\u{e0020}'..='\u{e007f}',
+    '\u{e0080}'..='\u{e00ff}',
+    '\u{e0100}'..='\u{e01ef}',
+    '\u{e01f0}'..='\u{e0fff}',
+];
+
+/// Whether a character has Unicode 16.0.0's Default_Ignorable_Code_Point property.
+pub fn is_default_ignorable(c: char) -> bool {
+    DEFAULT_IGNORABLE_CODE_POINT_RANGES
+        .iter()
+        .any(|range| range.contains(&c))
 }
 
 impl PatternReason {
@@ -36,7 +64,7 @@ impl PatternReason {
         let reason = reason.into();
         if !reason
             .chars()
-            .any(|c| !c.is_whitespace() && !c.is_control() && !is_invisible_format_char(c))
+            .any(|c| !c.is_whitespace() && !c.is_control() && !is_default_ignorable(c))
         {
             Err(EmptyPatternReason)
         } else {

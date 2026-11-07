@@ -17876,10 +17876,7 @@ fn pattern_mismatch_errors_stay_small_with_complete_specs() {
 
 #[test]
 fn pattern_reason_controls_are_escaped_in_every_diagnostic() {
-    for reason in [
-        "prefix-only\n\u{1b}[31m metadata",
-        "prefix-only\n\u{1b}[31m metadata\u{2028}\u{2029}",
-    ] {
+    fn diagnostics_for_reason(reason: &str) -> (PatternSpec, [String; 7]) {
         let mode = PatternMatch::Substring {
             reason: PatternReason::new(reason).unwrap(),
         };
@@ -17916,7 +17913,7 @@ fn pattern_reason_controls_are_escaped_in_every_diagnostic() {
             .validate(&Value::Concrete(ConcreteValue::String("bad".into())))
             .unwrap_err();
         let invalid = CompiledPattern::try_new(&PatternSpec::new("[", mode)).unwrap_err();
-        for diagnostic in [
+        let diagnostics = [
             compiled.to_string(),
             string.scalar_diagnostic_name(),
             reference.scalar_diagnostic_name(),
@@ -17924,7 +17921,15 @@ fn pattern_reason_controls_are_escaped_in_every_diagnostic() {
             draft.scalar_diagnostic_name(),
             mismatch.to_string(),
             invalid.to_string(),
-        ] {
+        ];
+        (spec, diagnostics)
+    }
+    for reason in [
+        "prefix-only\n\u{1b}[31m metadata",
+        "prefix-only\n\u{1b}[31m metadata\u{2028}\u{2029}",
+    ] {
+        let (spec, diagnostics) = diagnostics_for_reason(reason);
+        for diagnostic in diagnostics {
             assert!(
                 diagnostic.contains("prefix-only\\n\\u{1b}[31m metadata"),
                 "{diagnostic:?}"
@@ -17936,6 +17941,33 @@ fn pattern_reason_controls_are_escaped_in_every_diagnostic() {
             if reason.ends_with("\u{2028}\u{2029}") {
                 assert!(diagnostic.contains("\\u{2028}\\u{2029}"), "{diagnostic:?}");
             }
+        }
+        let PatternMatch::Substring { reason: stored } = spec.mode() else {
+            panic!("expected Substring");
+        };
+        assert_eq!(stored.as_str(), reason);
+    }
+
+    for (reason, expected) in [
+        ("ok\u{202e}", "ok\\u{202e}"),
+        ("ok\u{202a}", "ok\\u{202a}"),
+        ("ok\u{202b}", "ok\\u{202b}"),
+        ("ok\u{202c}", "ok\\u{202c}"),
+        ("ok\u{202d}", "ok\\u{202d}"),
+        ("ok\u{2066}", "ok\\u{2066}"),
+        ("ok\u{2067}", "ok\\u{2067}"),
+        ("ok\u{2068}", "ok\\u{2068}"),
+        ("ok\u{2069}", "ok\\u{2069}"),
+        ("ok\u{180e}", "ok\\u{180e}"),
+        ("ok\u{e0020}\u{e0021}", "ok\\u{e0020}\\u{e0021}"),
+        ("ok\u{fe0f}", "ok\\u{fe0f}"),
+        ("ok\u{3164}", "ok\\u{3164}"),
+        ("ok\u{034f}", "ok\\u{34f}"),
+    ] {
+        let (spec, diagnostics) = diagnostics_for_reason(reason);
+        for diagnostic in diagnostics {
+            assert!(diagnostic.contains(expected), "{reason:?}: {diagnostic:?}");
+            assert!(!diagnostic.contains(reason), "{reason:?}: {diagnostic:?}");
         }
         let PatternMatch::Substring { reason: stored } = spec.mode() else {
             panic!("expected Substring");
