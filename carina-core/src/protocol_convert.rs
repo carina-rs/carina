@@ -2960,7 +2960,7 @@ pub fn protocol_update_outcome_to_core(
             } = diagnostic;
             Ok(UpdateOutcome::partial_success(
                 protocol_applied_persisted_state_to_core(state)?,
-                reason.clone(),
+                reason.clone().into(),
                 missing_attributes.clone(),
             ))
         }

@@ -114,14 +114,17 @@ impl CarinaProvider for MockHttpProvider {
         .expect("mock HTTP provider config schema must be valid")
     }
 
-    fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {
+    fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), ProviderError> {
         if let Some(Value::String(url)) = attrs.get(VALIDATE_EGRESS_URL_ATTRIBUTE) {
             let _outcome = send_phase::wasi_http_send_phase(url, "GET", "", ProbeKind::HttpWorld);
         }
         Ok(())
     }
 
-    fn initialize(&mut self, _attrs: &BTreeMap<String, Value>) -> Result<ReferenceScope, String> {
+    fn initialize(
+        &mut self,
+        _attrs: &BTreeMap<String, Value>,
+    ) -> Result<ReferenceScope, ProviderError> {
         Ok(ReferenceScope::Unavailable)
     }
 

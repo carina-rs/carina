@@ -23,7 +23,8 @@ Since v0.5.0, the first release that checks the version, every release has set t
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
-| Main after v0.12.0 (unreleased) | 24 | 24 |
+| Main after v0.12.1 (unreleased) | 24 | 24 |
+| v0.12.1 | 23 | 23 |
 | v0.12.0 | 23 | 23 |
 | Development snapshot after v0.11.0 (unreleased) | 22 | 22 |
 | v0.11.0 | 21 | 21 |
@@ -41,7 +42,7 @@ Since v0.5.0, the first release that checks the version, every release has set t
 | v0.6.0 | 10 | 10 |
 | v0.5.0 | 10 | 10 |
 
-Protocol 24 is current on main; Carina v0.12.0 uses protocol 23, v0.11.0 uses protocol 21 and v0.10.0 uses protocol 19. Protocol 24 requires [explicit pattern match modes and reasons containing visible text for substring exceptions](/providers/writing/schemas/#attribute-types). Protocol 23 requires every resource schema to carry an `input_rules` array, `[]` when the resource declares no rules. Each rule names a scope (`create_only` or `every_write`), a typed target, a stable diagnostic code and a predicate, and Carina checks it on the inputs of the writes in that scope, never on read-back or state values. Protocol 22 added an optional entry-count bound to map attribute types, the same `length` shape that list types use. Providers built for protocol 23 or earlier must rebuild against the current SDK, including for metadata-only state migration checks.
+Protocol 24 is current on main; Carina v0.12.0 and v0.12.1 use protocol 23, v0.11.0 uses protocol 21 and v0.10.0 uses protocol 19. Protocol 24 requires [explicit pattern match modes and reasons containing visible text for substring exceptions](/providers/writing/schemas/#attribute-types). Protocol 23 requires every resource schema to carry an `input_rules` array, `[]` when the resource declares no rules. Each rule names a scope (`create_only` or `every_write`), a typed target, a stable diagnostic code and a predicate, and Carina checks it on the inputs of the writes in that scope, never on read-back or state values. Protocol 22 added an optional entry-count bound to map attribute types, the same `length` shape that list types use. Providers built for protocol 23 or earlier must rebuild against the current SDK, including for metadata-only state migration checks.
 
 The protocol 21 schema envelope requires `assignability_edges`, even when empty, and SDK providers must implement `CarinaProvider::assignability_edges`. Both endpoints must be declared by that provider as scalar String, Int, or Float identities with the same scalar kind. Enum, Reference, and core built-in identities cannot be endpoints; self edges, duplicates, and cycles are rejected. Each provider's transitive closure is retained separately, so paths never combine different providers' declarations.
 

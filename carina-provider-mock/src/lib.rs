@@ -1994,7 +1994,7 @@ impl Provider for MockProvider {
             if let Some(config) = partial_update {
                 return Ok(UpdateOutcome::partial_success(
                     state,
-                    "mock partial update".to_string(),
+                    "mock partial update".into(),
                     config.missing_attributes.clone(),
                 ));
             }

@@ -34,6 +34,9 @@ const CHILD: &str = "CARINA_4305_PROVIDER_TEXT_CHILD";
 #[path = "provider_text_secret_redaction_e2e/round5.rs"]
 mod round5;
 
+#[path = "provider_text_secret_redaction_e2e/update_partial.rs"]
+mod update_partial;
+
 #[test]
 fn review_round7_bound_error_relay_through_state_only_boundary_masks_cli_display() {
     use carina_core::provider::ProviderError;

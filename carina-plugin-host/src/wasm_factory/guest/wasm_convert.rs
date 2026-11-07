@@ -1549,7 +1549,7 @@ pub(crate) fn wit_to_core_update_outcome(
             Ok(WasmUpdateOutcome::Done(Box::new(
                 CoreUpdateOutcome::partial_success(
                     wit_to_core_applied_persisted_state(state, id)?,
-                    reason,
+                    reason.into(),
                     missing_attributes,
                 ),
             )))

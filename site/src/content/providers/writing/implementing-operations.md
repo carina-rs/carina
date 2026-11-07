@@ -92,7 +92,7 @@ impl<A: Api> CarinaProvider for WidgetProvider<A> {
     fn initialize(
         &mut self,
         _attrs: &BTreeMap<String, Value>,
-    ) -> Result<ReferenceScope, String> {
+    ) -> Result<ReferenceScope, ProviderError> {
         Ok(ReferenceScope::Unavailable)
     }
 
@@ -105,7 +105,7 @@ impl<A: Api> CarinaProvider for WidgetProvider<A> {
 When an initialized instance knows its reference namespace, return
 `ReferenceScope::available(partition, region, account)` from `initialize`.
 It returns `ReferenceScopeError` when a value is empty or contains `{` or `}`;
-map that error to `String` for the trait method. Return
+map that error to a `ProviderError` for the trait method. Return
 `ReferenceScope::Unavailable` when the namespace is not known; under
 `Unavailable`, the provider's reference forms are inert and do not expand
 short names during comparison.
