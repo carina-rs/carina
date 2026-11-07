@@ -114,7 +114,7 @@ impl ProviderTextBuilder {
         for c in text.chars() {
             match c {
                 '\n' | '\t' if !inline => self.push_sanitized_char(c),
-                c if c.is_control() && inline => {
+                c if inline && (c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) => {
                     for escaped in c.escape_debug() {
                         self.push_sanitized_char(escaped);
                     }

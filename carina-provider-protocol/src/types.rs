@@ -4042,6 +4042,70 @@ mod tests {
 
 #[cfg(test)]
 mod pattern_mode_tests {
+    const REASONS_WITHOUT_VISIBLE_TEXT: &[&str] = &[
+        "\u{1b}",
+        "\u{0}",
+        "\u{7f}",
+        "\u{85}",
+        "\u{00ad}",
+        "\u{200b}",
+        "\u{200c}",
+        "\u{200d}",
+        "\u{200e}",
+        "\u{200f}",
+        "\u{202a}",
+        "\u{202b}",
+        "\u{202c}",
+        "\u{202d}",
+        "\u{202e}",
+        "\u{2060}",
+        "\u{2061}",
+        "\u{2062}",
+        "\u{2063}",
+        "\u{2064}",
+        "\u{2066}",
+        "\u{2067}",
+        "\u{2068}",
+        "\u{2069}",
+        "\u{feff}",
+        "\u{200b}\u{feff}\u{2060}",
+        " \t\n\u{00ad}\u{1b}\u{200f}",
+    ];
+
+    #[test]
+    fn pattern_reason_requires_visible_text_and_preserves_authored_text() {
+        for reason in ["", " \t\n"]
+            .into_iter()
+            .chain(REASONS_WITHOUT_VISIBLE_TEXT.iter().copied())
+        {
+            assert_eq!(
+                super::PatternReason::new(reason),
+                Err(super::EmptyPatternReason),
+                "accepted {reason:?}"
+            );
+            assert!(
+                serde_json::from_value::<super::PatternReason>(serde_json::json!(reason)).is_err(),
+                "decoded {reason:?}"
+            );
+        }
+        assert_eq!(
+            super::EmptyPatternReason.to_string(),
+            "substring pattern reason must contain visible text"
+        );
+        for reason in ["API exception", "\u{200b}\u{feff}\u{2060}\u{1b} x \n"] {
+            let checked = super::PatternReason::new(reason).unwrap();
+            assert_eq!(checked.as_str(), reason);
+            assert_eq!(
+                serde_json::from_value::<super::PatternReason>(serde_json::json!(reason)).unwrap(),
+                checked
+            );
+            assert_eq!(
+                serde_json::to_value(&checked).unwrap(),
+                serde_json::json!(reason)
+            );
+        }
+    }
+
     #[test]
     fn pattern_spec_decode_rejects_undeclared_or_invalid_modes() {
         for pattern in [
@@ -4052,7 +4116,11 @@ mod pattern_mode_tests {
             serde_json::json!({"regex": "abc", "mode": {"kind": "substring"}}),
             serde_json::json!({"regex": "abc", "mode": {"kind": "substring", "reason": ""}}),
             serde_json::json!({"regex": "abc", "mode": {"kind": "substring", "reason": "  "}}),
-        ] {
+        ]
+        .into_iter()
+        .chain(REASONS_WITHOUT_VISIBLE_TEXT.iter().map(|reason| {
+            serde_json::json!({"regex": "abc", "mode": {"kind": "substring", "reason": reason}})
+        })) {
             for ty in [
                 serde_json::json!({"type": "String", "pattern": pattern}),
                 serde_json::json!({"type": "custom", "name": "test.Name", "base": {"type": "String"}, "pattern": pattern}),

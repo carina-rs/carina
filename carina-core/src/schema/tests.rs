@@ -17876,58 +17876,70 @@ fn pattern_mismatch_errors_stay_small_with_complete_specs() {
 
 #[test]
 fn pattern_reason_controls_are_escaped_in_every_diagnostic() {
-    let reason = "prefix-only\n\u{1b}[31m metadata";
-    let mode = PatternMatch::Substring {
-        reason: PatternReason::new(reason).unwrap(),
-    };
-    let spec = PatternSpec::new("abc", mode.clone());
-    let compiled = CompiledPattern::try_new(&spec).unwrap();
-    let string = AttributeType::refined_string(None, Some(compiled.clone()), None, None);
-    let reference = AttributeType::reference(
-        TypeIdentity::new(Some("test"), ["r"], "Id"),
-        Some(compiled.clone()),
-        None,
-    );
-    let declaration = AttributeType::refined_string(
-        Some(TypeIdentity::bare("PatternText")),
-        Some(compiled.clone()),
-        None,
-        None,
-    );
-    let annotation = AttributeType {
-        kind: AttrTypeKind::String {
-            binding: RefinementBinding::Annotation(
-                crate::parser::ResolvedSchemaType::from_schema_declaration("test", &declaration)
-                    .unwrap(),
-            ),
-            pattern: None,
-            length: None,
-            to_dsl: None,
-        },
-    };
-    let draft = super::AttributeType::refined_string(None, Some(spec.clone()), None, None);
-    let mismatch = string
-        .validate(&Value::Concrete(ConcreteValue::String("bad".into())))
-        .unwrap_err();
-    let invalid = CompiledPattern::try_new(&PatternSpec::new("[", mode)).unwrap_err();
-    for diagnostic in [
-        compiled.to_string(),
-        string.scalar_diagnostic_name(),
-        reference.scalar_diagnostic_name(),
-        annotation.scalar_diagnostic_name(),
-        draft.scalar_diagnostic_name(),
-        mismatch.to_string(),
-        invalid.to_string(),
+    for reason in [
+        "prefix-only\n\u{1b}[31m metadata",
+        "prefix-only\n\u{1b}[31m metadata\u{2028}\u{2029}",
     ] {
-        assert!(
-            diagnostic.contains("prefix-only\\n\\u{1b}[31m metadata"),
-            "{diagnostic:?}"
+        let mode = PatternMatch::Substring {
+            reason: PatternReason::new(reason).unwrap(),
+        };
+        let spec = PatternSpec::new("abc", mode.clone());
+        let compiled = CompiledPattern::try_new(&spec).unwrap();
+        let string = AttributeType::refined_string(None, Some(compiled.clone()), None, None);
+        let reference = AttributeType::reference(
+            TypeIdentity::new(Some("test"), ["r"], "Id"),
+            Some(compiled.clone()),
+            None,
         );
-        assert!(!diagnostic.contains(reason), "{diagnostic:?}");
-        assert!(!diagnostic.contains('\u{1b}'), "{diagnostic:?}");
+        let declaration = AttributeType::refined_string(
+            Some(TypeIdentity::bare("PatternText")),
+            Some(compiled.clone()),
+            None,
+            None,
+        );
+        let annotation = AttributeType {
+            kind: AttrTypeKind::String {
+                binding: RefinementBinding::Annotation(
+                    crate::parser::ResolvedSchemaType::from_schema_declaration(
+                        "test",
+                        &declaration,
+                    )
+                    .unwrap(),
+                ),
+                pattern: None,
+                length: None,
+                to_dsl: None,
+            },
+        };
+        let draft = super::AttributeType::refined_string(None, Some(spec.clone()), None, None);
+        let mismatch = string
+            .validate(&Value::Concrete(ConcreteValue::String("bad".into())))
+            .unwrap_err();
+        let invalid = CompiledPattern::try_new(&PatternSpec::new("[", mode)).unwrap_err();
+        for diagnostic in [
+            compiled.to_string(),
+            string.scalar_diagnostic_name(),
+            reference.scalar_diagnostic_name(),
+            annotation.scalar_diagnostic_name(),
+            draft.scalar_diagnostic_name(),
+            mismatch.to_string(),
+            invalid.to_string(),
+        ] {
+            assert!(
+                diagnostic.contains("prefix-only\\n\\u{1b}[31m metadata"),
+                "{diagnostic:?}"
+            );
+            assert!(!diagnostic.contains(reason), "{diagnostic:?}");
+            assert!(!diagnostic.contains('\u{1b}'), "{diagnostic:?}");
+            assert!(!diagnostic.contains('\u{2028}'), "{diagnostic:?}");
+            assert!(!diagnostic.contains('\u{2029}'), "{diagnostic:?}");
+            if reason.ends_with("\u{2028}\u{2029}") {
+                assert!(diagnostic.contains("\\u{2028}\\u{2029}"), "{diagnostic:?}");
+            }
+        }
+        let PatternMatch::Substring { reason: stored } = spec.mode() else {
+            panic!("expected Substring");
+        };
+        assert_eq!(stored.as_str(), reason);
     }
-    let PatternMatch::Substring { reason: stored } = spec.mode() else {
-        panic!("expected Substring");
-    };
-    assert_eq!(stored.as_str(), reason);
 }

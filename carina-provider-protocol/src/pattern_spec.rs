@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
-/// A documented exception to whole-value matching.
+/// A documented exception to whole-value matching, containing visible text.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct PatternReason(String);
@@ -13,15 +13,31 @@ pub struct EmptyPatternReason;
 
 impl fmt::Display for EmptyPatternReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("substring pattern reason must contain non-whitespace text")
+        f.write_str("substring pattern reason must contain visible text")
     }
 }
 impl std::error::Error for EmptyPatternReason {}
 
+fn is_invisible_format_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00ad}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{feff}'
+    )
+}
+
 impl PatternReason {
+    /// Require a visible character while preserving the authored reason verbatim.
     pub fn new(reason: impl Into<String>) -> Result<Self, EmptyPatternReason> {
         let reason = reason.into();
-        if reason.trim().is_empty() {
+        if !reason
+            .chars()
+            .any(|c| !c.is_whitespace() && !c.is_control() && !is_invisible_format_char(c))
+        {
             Err(EmptyPatternReason)
         } else {
             Ok(Self(reason))

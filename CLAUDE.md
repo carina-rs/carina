@@ -541,7 +541,7 @@ A struct type represents a nested object with typed fields.
 - **Patterns require explicit semantics.** Build a `PatternSpec::new(regex,
   PatternMatch::Full)` for whole-value constraints. Use
   `PatternMatch::Substring { reason: PatternReason::new(reason)? }` only for a
-  documented exception; reasons must contain non-whitespace text. Pass the
+  documented exception; reasons must contain visible text. Pass the
   typed spec to refined-string/reference constructors and Matches/NotMatches
   input predicates. No string-only constructor, conversion, or default mode is
   permitted. Preserve authored regex text; `CompiledPattern::try_new(&spec)`

@@ -25,8 +25,8 @@ Every present pattern is a specification with required `regex` and `mode` fields
 ```
 
 Full matches the entire value using absolute boundaries internally. The regex
-source remains exactly as authored. A substring exception requires a nonempty,
-non-whitespace reason:
+source remains exactly as authored. A substring exception requires a reason
+containing visible text:
 
 ```json
 {"regex":"abc", "mode":{"kind":"substring", "reason":"The upstream API explicitly permits surrounding text"}}
@@ -35,7 +35,7 @@ non-whitespace reason:
 These specifications are required on String, Reference, and legacy Custom
 schema records, including nested fields and provider configuration, and on
 `matches`/`not_matches` input predicates. Bare strings, missing or unknown modes,
-and missing or empty substring reasons are rejected. Providers must rebuild
+and substring reasons without visible text are rejected. Providers must rebuild
 against protocol 24; the protocol-12 schema-only migration admission window is
 removed. WIT is unchanged: schema specifications travel inside JSON exports.
 
