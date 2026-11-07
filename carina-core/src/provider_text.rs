@@ -1454,13 +1454,19 @@ impl<E: std::error::Error + Send + Sync + 'static> DiagnosticSource<Unbound> for
         ProviderDiagnostic::capture_host_or_provider(self)
     }
 }
-#[derive(Debug)]
 struct OpaqueProviderFailure(crate::provider::ProviderError);
+impl fmt::Debug for OpaqueProviderFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<provider cause>")
+    }
+}
 impl fmt::Display for OpaqueProviderFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("<provider cause>")
     }
 }
+// Raw Error walkers must stop here. Only ProviderCause::source may traverse
+// the stored diagnostic, carrying its context without exposing a formatter.
 impl std::error::Error for OpaqueProviderFailure {}
 impl diagnostic_source_sealed::Sealed<Unbound> for crate::provider::ProviderError {}
 impl DiagnosticSource<Unbound> for crate::provider::ProviderError {
@@ -1571,7 +1577,7 @@ impl<S: TextState> Diagnostic<S> {
         self.as_cause()
     }
     pub fn source_is<T: std::error::Error + 'static>(&self) -> bool {
-        self.error.source().is_some_and(|source| source.is::<T>())
+        self.source().is_some_and(|source| source.is::<T>())
     }
     pub fn downcast_ref<T: std::error::Error + 'static>(&self) -> Option<ProviderCause<'_>> {
         self.is::<T>().then(|| ProviderCause {
@@ -1580,10 +1586,7 @@ impl<S: TextState> Diagnostic<S> {
         })
     }
     pub fn source(&self) -> Option<ProviderCause<'_>> {
-        self.error.source().map(|error| ProviderCause {
-            error,
-            secrets: self.text.redaction_context(),
-        })
+        self.as_cause().source()
     }
     pub(crate) fn normalization_with_context(
         &self,
@@ -1709,6 +1712,34 @@ impl Diagnostic<Bound> {
 
 /// Type-only view of an original cause. No typed reference or raw formatter
 /// can escape; even a downcast returns this opaque view.
+///
+/// ```compile_fail,E0308
+/// use carina_core::provider_text::ProviderCause;
+/// fn typed(cause: ProviderCause<'_>) {
+///     let _: &std::io::Error = cause.downcast_ref::<std::io::Error>().unwrap();
+/// }
+/// ```
+///
+/// ```compile_fail,E0614
+/// use carina_core::provider_text::ProviderCause;
+/// fn raw<'a>(cause: &'a ProviderCause<'a>) -> &'a dyn std::error::Error {
+///     &**cause
+/// }
+/// ```
+///
+/// ```compile_fail,E0277
+/// fn display(cause: carina_core::provider_text::ProviderCause<'_>) {
+///     let _ = format!("{cause}");
+/// }
+/// ```
+///
+/// Unbound provider errors have no `Error` implementation. Their private
+/// opaque wrapper is traversable, but is not an `is::<ProviderError>` target.
+///
+/// ```compile_fail,E0277
+/// use carina_core::{provider::ProviderError, provider_text::ProviderCause};
+/// fn unbound(cause: ProviderCause<'_>) { let _ = cause.is::<ProviderError>(); }
+/// ```
 #[derive(Clone)]
 pub struct ProviderCause<'a> {
     error: &'a (dyn std::error::Error + 'static),
@@ -1726,7 +1757,43 @@ impl<'a> ProviderCause<'a> {
     pub fn downcast_ref<T: std::error::Error + 'static>(&self) -> Option<Self> {
         self.is::<T>().then(|| self.clone())
     }
+    /// Check a typed cause with a non-capturing test predicate, returning only a bool.
+    /// Returns false without calling the predicate when the type does not match.
+    ///
+    /// ```
+    /// use carina_core::provider_text::ProviderDiagnostic;
+    /// use std::io::{Error, ErrorKind};
+    ///
+    /// let diagnostic = ProviderDiagnostic::new(Error::new(ErrorKind::InvalidData, "bad policy"));
+    /// let cause = diagnostic.downcast_ref::<Error>().unwrap();
+    /// assert!(cause.matches_for_test(|error: &Error| error.kind() == ErrorKind::InvalidData));
+    /// ```
+    ///
+    /// Capturing closures cannot carry values out through this test helper.
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::provider_text::ProviderCause;
+    /// use std::io::{Error, ErrorKind};
+    ///
+    /// fn captures(cause: ProviderCause<'_>, expected: ErrorKind) {
+    ///     cause.matches_for_test::<Error>(|error| error.kind() == expected);
+    /// }
+    /// ```
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn matches_for_test<T: std::error::Error + 'static>(
+        &self,
+        predicate: fn(&T) -> bool,
+    ) -> bool {
+        self.error.downcast_ref::<T>().is_some_and(predicate)
+    }
     pub fn source(&self) -> Option<Self> {
+        if let Some(provider) = self.error.downcast_ref::<OpaqueProviderFailure>() {
+            let mut cause = provider.0.detail().cause()?.as_cause();
+            for secrets in &self.secrets.0 {
+                cause.secrets.include(secrets);
+            }
+            return Some(cause);
+        }
         self.error.source().map(|error| Self {
             error,
             secrets: self.secrets.clone(),
@@ -2215,6 +2282,92 @@ mod tests {
                 .unwrap()
                 .is::<crate::NonFiniteFloatError>()
         );
+    }
+
+    #[test]
+    fn nested_provider_error_cause_is_reachable_unbound() {
+        use crate::provider::ProviderError;
+
+        let inner = ProviderError::api_error_caused_by(
+            "inner context",
+            std::io::Error::other("private cause"),
+        );
+        let outer = ProviderError::api_error_caused_by("read error", inner);
+        let diagnostic = outer.detail().cause().unwrap();
+        let opaque = diagnostic.as_cause();
+        assert_eq!(format!("{opaque:?}"), "<provider cause>");
+        assert!(!opaque.is::<std::io::Error>());
+        let source = opaque.source().expect("nested I/O cause must be reachable");
+        assert!(source.is::<std::io::Error>());
+        assert!(source.downcast_ref::<std::io::Error>().is_some());
+        assert_eq!(format!("{source:?}"), "<provider cause>");
+        assert!(source.source().is_none());
+        assert!(diagnostic.source_is::<std::io::Error>());
+        assert!(diagnostic.source().unwrap().is::<std::io::Error>());
+        assert!(!format!("{outer:?} {diagnostic:?}").contains("private cause"));
+    }
+
+    #[test]
+    fn nested_provider_error_cause_retains_inner_and_outer_redaction_contexts() {
+        use crate::provider::ProviderError;
+
+        let inner_secrets = provider_secrets(&["inner-password"]);
+        let inner: ProviderError = ProviderError::api_error_caused_by(
+            "inner context",
+            std::io::Error::other("inner-password outer-password"),
+        )
+        .with_secrets(&inner_secrets)
+        .into();
+        let middle = ProviderError::api_error_caused_by("middle context", inner);
+        let outer = ProviderError::api_error_caused_by("read error", middle);
+        let empty = RedactionSet::for_test(&[]);
+        let diagnostic = outer.detail().cause().unwrap();
+        let nested = diagnostic
+            .as_cause()
+            .source()
+            .expect("nested provider cause");
+        let source = nested.source().expect("nested I/O cause");
+        assert!(source.is::<std::io::Error>());
+        assert_eq!(source.redact(&empty).as_str(), "(secret) outer-password");
+
+        let outer_secrets = provider_secrets(&["outer-password"]);
+        let host = outer.with_secrets(&outer_secrets);
+        let diagnostic = host.detail().cause().unwrap();
+        let source = diagnostic.source().unwrap().source().unwrap();
+        assert!(source.is::<std::io::Error>());
+        assert_eq!(source.redact(&empty).as_str(), "(secret) (secret)");
+        let rendered = format!(
+            "{host} {host:?} {diagnostic} {diagnostic:?} {source:?} {}",
+            serde_json::to_string(&host.to_wire()).unwrap(),
+        );
+        assert!(rendered.contains("inner context"));
+        for secret in ["inner-password", "outer-password"] {
+            assert!(!rendered.contains(secret), "secret escaped a nested cause");
+        }
+    }
+
+    #[test]
+    fn nested_provider_error_raw_source_walk_stays_opaque() {
+        use crate::provider::ProviderError;
+
+        let secrets = provider_secrets(&["private cause"]);
+        let inner = ProviderError::api_error_caused_by(
+            "inner context",
+            std::io::Error::other("private cause"),
+        );
+        let diagnostic = ProviderDiagnostic::new(inner).with_secrets(&secrets);
+        let stored = diagnostic.error.as_ref();
+        assert_eq!(stored.to_string(), "<provider cause>");
+        assert!(!format!("{stored:?}").contains("private cause"));
+        assert!(stored.source().is_none());
+        assert!(std::error::Error::source(&diagnostic).is_none());
+        assert!(diagnostic.source_is::<std::io::Error>());
+
+        let inner =
+            ProviderError::api_error_caused_by("inner context", crate::NonFiniteFloatError::NaN);
+        let diagnostic = ProviderDiagnostic::new(inner).with_secrets(&secrets);
+        assert!(diagnostic.source_is::<crate::NonFiniteFloatError>());
+        assert!(std::error::Error::source(&diagnostic).is_none());
     }
 
     #[test]

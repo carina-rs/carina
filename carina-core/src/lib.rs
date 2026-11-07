@@ -14,6 +14,9 @@ pub use user_dirs::TestUserDirs;
 pub use user_dirs::{UserDirs, UserDirsError};
 pub use value_description::ValueDescription;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
+
 pub mod binding_index;
 #[cfg(test)]
 mod binding_index_split_tests;
