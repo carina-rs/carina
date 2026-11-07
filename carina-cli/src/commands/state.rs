@@ -20,9 +20,11 @@ use carina_core::plan::Plan;
 use carina_core::plan::{
     CreateOutcomeUnknownAbsentResolution, create_outcome_unknown_absent_resolution,
 };
+#[cfg(test)]
+use carina_core::provider::AppliedIdentifier;
 use carina_core::provider::{
-    self as provider_mod, AppliedIdentifier, InFlightCreate, PersistedAttributes, Provider,
-    ProviderError, ProviderNormalizer, ProviderRouter, RawSavedAttrs, UnknownCreateOutcome,
+    self as provider_mod, InFlightCreate, PersistedAttributes, Provider, ProviderError,
+    ProviderNormalizer, ProviderRouter, RawSavedAttrs, UnknownCreateOutcome,
 };
 use carina_core::resource::{
     AbsoluteBindingAddress, Current, DataSource, ResolvedDataSource, ResolvedResource,
@@ -1583,18 +1585,6 @@ async fn run_state_bucket_delete(
     // Delete the bucket resource (identifier is the bucket name)
     // Backend bucket is provider-default; named-instance routing is
     // a DSL concern that doesn't apply to the implicit state bucket.
-    ResourceIdentity::try_from(bucket_name.to_string()).map_err(|error| {
-        AppError::InvalidStateBucketIdentity {
-            bucket_name: bucket_name.to_string(),
-            error,
-        }
-    })?;
-    AppliedIdentifier::new(bucket_name).map_err(|error| {
-        AppError::InvalidStateBucketProviderIdentifier {
-            bucket_name: bucket_name.to_string(),
-            error,
-        }
-    })?;
     let schemas = validated_config.context().schemas();
     let permit = state_bucket_delete_permit(
         schemas,
@@ -1623,13 +1613,27 @@ fn state_bucket_delete_permit(
     provider: &str,
     resource_type: &str,
 ) -> Result<carina_core::executor::DeletePermit, AppError> {
+    use carina_core::resolved_graph::{BackendResourceError, ExpandedGraphResolutionError};
     let admitted =
         carina_core::resolved_graph::ResolvedInitialDeletePlan::from_backend_configuration(
             configuration,
             provider,
             resource_type,
             schemas,
-        )?
+        )
+        .map_err(|error| match error {
+            // Core owns validation. Its nonempty identifier check detects the
+            // same empty identity formerly checked by this command; preserve
+            // the command's established diagnostic without validating twice.
+            ExpandedGraphResolutionError::BackendResource(
+                BackendResourceError::Identifier(_)
+                | BackendResourceError::Identity(carina_core::resource::ResourceIdentityError::Empty),
+            ) => AppError::InvalidStateBucketIdentity {
+                bucket_name: String::new(),
+                error: carina_core::resource::ResourceIdentityError::Empty,
+            },
+            error => error.into(),
+        })?
         .admit(schemas)?;
     carina_core::executor::prepare_initial_delete(&admitted).ok_or_else(|| {
         AppError::Config("State bucket delete is not ready for scheduler dispatch".to_owned())
@@ -3618,6 +3622,23 @@ mod tests {
             Some(&Value::Concrete(ConcreteValue::String(
                 "arn:aws:iam::123456789012:role/upstream".into()
             )))
+        );
+    }
+
+    #[test]
+    fn state_bucket_delete_retains_empty_identity_diagnostic() {
+        let result = state_bucket_delete_permit(
+            &SchemaRegistry::new(),
+            &bucket_delete_configuration(""),
+            "mock",
+            "test.Bucket",
+        );
+        let Err(error) = result else {
+            panic!("an empty bucket must be rejected");
+        };
+        assert_eq!(
+            error.to_string(),
+            "State bucket name '' is not a valid resource identity: resource identity cannot be empty"
         );
     }
 

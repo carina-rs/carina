@@ -1062,6 +1062,9 @@ pub enum AppError {
     #[error(transparent)]
     PendingResourceIdentity(#[from] carina_core::resource::PendingResourceIdentityError),
 
+    #[error(transparent)]
+    DestroyPlan(#[from] carina_core::planning_state::DestroyPlanError),
+
     /// A post-expansion handle or dependency operand could not be mapped to
     /// one complete scheduler address.
     #[error(transparent)]

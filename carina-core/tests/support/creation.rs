@@ -23,7 +23,6 @@ fn fixture_schemas(plan: &carina_core::plan::Plan) -> carina_core::schema::Schem
         schemas.insert(
             &id.provider,
             PatternResourceSchema::new(&id.resource_type)
-                .with_coexisting_replacement()
                 .validate()
                 .unwrap(),
         );

@@ -9305,9 +9305,9 @@ pub(crate) fn deposed_delete_effects_for_row(
     Vec<carina_core::effect::DeferredReplaceDelete>,
     Vec<PlanError>,
 ) {
-    let bytes = serde_json::to_vec(std::slice::from_ref(row)).unwrap();
-    let rows =
-        carina_core::planning_state::PlanningStateRows::from_state_rows_json(&bytes).unwrap();
+    let mut state = StateFile::new();
+    state.upsert_resource(row.clone()).unwrap();
+    let rows = state.planning_rows();
     carina_core::planning_state::deposed_delete_effects_for_row(&rows[0], moved_pairs)
 }
 

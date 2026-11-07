@@ -10,6 +10,138 @@ use carina_core::schema::{
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+#[test]
+fn destroy_keeps_an_undeleted_identifierless_orphan_as_an_ordering_target() {
+    use carina_core::{executor::DeleteScheduler, planning_state::DestroyPlan};
+    let kept_id = ResolvedResourceId::with_provider_identity("mock", "test.Bucket", "kept", None);
+    let mut target =
+        ResourceState::try_applied("test.Bucket", "target", "mock", "target-id").unwrap();
+    target.dependency_bindings =
+        PersistedDestroyDependencies::from_test_dependencies([kept_id.clone()]);
+    let kept = ResourceState::from_provider_state(
+        "test.Bucket",
+        "kept",
+        "mock",
+        &SnapshotState::existing(kept_id.as_inner().clone(), HashMap::new()),
+    )
+    .unwrap();
+    let mut state = StateFile::new();
+    state.upsert_resource(target).unwrap();
+    state.upsert_resource(kept).unwrap();
+    let resource = Resource::with_provider("mock", "test.Bucket", "target", None);
+    let current = HashMap::from([
+        (
+            resource.id.clone(),
+            state.build_state_for_resource(&resource.id),
+        ),
+        (
+            kept_id.as_inner().clone(),
+            state.build_state_for_resource(kept_id.as_inner()),
+        ),
+    ]);
+    let mut configuration = carina_core::parser::ExpandedInferredFile::default();
+    configuration.resources.push(resource.clone());
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
+    let rows = state.planning_rows_after_refresh(&current);
+    let plan = DestroyPlan::from_state(
+        &[&resource],
+        &current,
+        &rows,
+        &graph,
+        &HashSet::new(),
+        &SchemaRegistry::new(),
+    )
+    .unwrap();
+    let scheduler = DeleteScheduler::for_destroy(&plan).unwrap();
+    assert!(
+        scheduler.analysis().unresolved_delete_ordering().is_empty(),
+        "main retains every undeleted current row, including an identifierless protected orphan"
+    );
+}
+
+#[test]
+fn destroy_refresh_projection_uses_the_stored_route_observation() {
+    use carina_core::effect::{Effect, EffectGeneration};
+    use carina_core::planning_state::DestroyPlan;
+    let make_current = |route: &str, identifier: &str| {
+        let id =
+            ResourceId::with_provider_identity("mock", "test.Bucket", "stored", Some(route.into()));
+        let state = SnapshotState::existing(id.clone(), HashMap::new()).with_identifier(identifier);
+        (id, Current::from_snapshot(state))
+    };
+    let current = HashMap::from([
+        make_current("east", "canonical-east"),
+        make_current("west", "canonical-west"),
+    ]);
+    // Choose the second key so a routing-agnostic first match is always wrong,
+    // regardless of the HashMap's random iteration order.
+    let id = current.keys().nth(1).unwrap().clone();
+    let Current::Present(expected) = &current[&id] else {
+        unreachable!()
+    };
+    let mut row =
+        ResourceState::try_applied("test.Bucket", "stored", "mock", "persisted-id").unwrap();
+    row.directives.provider_instance = id.provider_instance.clone();
+    let mut state = StateFile::new();
+    state.upsert_resource(row).unwrap();
+    let before = serde_json::to_value(&state).unwrap();
+    let resource = Resource::from_id(id.clone());
+    let mut configuration = carina_core::parser::ExpandedInferredFile::default();
+    configuration.resources.push(resource.clone());
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
+    let rows = state.planning_rows_after_refresh(&current);
+    let plan = DestroyPlan::from_state(
+        &[&resource],
+        &current,
+        &rows,
+        &graph,
+        &HashSet::new(),
+        &SchemaRegistry::new(),
+    )
+    .unwrap();
+    assert!(matches!(plan.plan().effects(), [Effect::Delete {
+        id: target, identifier, generation: EffectGeneration::Current, ..
+    }] if target.as_inner() == &id && identifier == expected.identifier()));
+    assert_eq!(
+        serde_json::to_value(&state).unwrap(),
+        before,
+        "planning must not persist refresh or change serial"
+    );
+}
+
+#[test]
+fn destroy_refresh_projection_preserves_persisted_deposed_error_context() {
+    let mut row =
+        ResourceState::try_applied("test.Bucket", "stored", "mock", "persisted-id").unwrap();
+    row.deposed.push(DeposedInstance::from_persisted_json(
+        DeposedKey::new_unique(),
+        String::new(),
+        None,
+        HashMap::new(),
+        Default::default(),
+    ));
+    let state = StateFile::from_unchecked_resources_for_test(vec![row]);
+    let id = ResourceId::with_provider_identity("mock", "test.Bucket", "stored", None);
+    let current = HashMap::from([(
+        id.clone(),
+        Current::from_snapshot(
+            SnapshotState::existing(id, HashMap::new()).with_identifier("canonical-id"),
+        ),
+    )]);
+    let rows = state.planning_rows_after_refresh(&current);
+    let (effects, errors) =
+        carina_core::planning_state::deposed_delete_effects_for_row(&rows[0], &[]);
+    assert!(effects.is_empty());
+    assert!(
+        matches!(&errors[..], [carina_core::plan::PlanError {
+        kind: carina_core::plan::PlanErrorKind::MissingDeposedProviderIdentifier {
+            current_identifier: Some(identifier), ..
+        }, ..
+    }] if identifier.as_str() == "persisted-id"),
+        "refresh must preserve main's persisted-generation diagnostic context"
+    );
+}
+
 // Capture an attempt only after a real provider-ready request has passed
 // admission and discharge. This helper is private to state writeback tests.
 fn create_attempt_for_test(id: ResourceId) -> carina_core::provider::CreateAttempt {

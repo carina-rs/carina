@@ -857,8 +857,9 @@ impl<S: Clone, V: PlanValueKind> AdmittedPlan<S, V> {
     }
 }
 
-/// Deserialized saved-plan effects before managed resources have crossed the
-/// fingerprint-checked schema-resolution boundary.
+/// Effects decoded from a user-supplied saved-plan file, before schema resolution.
+/// The CLI checks source authenticity, lineage, serial and schema fingerprints.
+/// Deserialization alone does not establish those checks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnresolvedSavedPlan {
     effects: Vec<UnresolvedSavedEffect>,

@@ -1,4 +1,6 @@
-//! Saved recording and replay retain core source witnesses through serialization and restoration.
+//! Saved recording and replay retain core planning values through serialization and restoration.
+//! Saved-plan files are user input. The CLI checks lineage, serial and fingerprints;
+//! core resolves their effects and retains that source through scheduling.
 use crate::input_rules::{
     FinalizedPlan, InputAdmissionFailure, InputCheckedPlan, InputTypeContext,
 };
@@ -70,12 +72,9 @@ impl<V: PlanValueKind> SavedPlanReplay<V> {
     ) {
         self.plan.rebase_ignored_update_sources(actual);
     }
-    pub fn into_plan(self) -> Plan<SavedModuleSource, V> {
-        self.plan
-    }
 }
 
-/// Replacement admission preserves the decoded saved source rather than accepting a Plan.
+/// Replacement admission preserves the decoded saved-plan value through scheduling.
 #[derive(Debug, Clone)]
 pub struct AdmittedSavedPlanReplay {
     plan: AdmittedPlan<SavedModuleSource>,

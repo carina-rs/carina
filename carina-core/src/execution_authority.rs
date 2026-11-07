@@ -1,4 +1,7 @@
-//! Execution authority comes from core planning, never caller-authored effects.
+//! Permits come from scheduler releases of plans core builds from state rows,
+//! parsed/validated configuration or saved-plan values. The CLI authenticates
+//! those inputs and checks lineage, serial and fingerprints. Core takes write
+//! targets and ordering inputs from those source values.
 //!
 //! A hand-built delete, including a deposed generation, cannot enter destroy:
 //!
@@ -23,7 +26,9 @@
 //! }
 //! ```
 //!
-//! A raw create cannot be laundered through bootstrap graph resolution:
+//! Bootstrap creation must use a target selected from the supplied configuration.
+//! This pins the absence of a public constructor taking an independent resource;
+//! it does not establish the authenticity of the configuration value:
 //!
 //! ```compile_fail
 //! use carina_core::{effect::Effect, executor::{prepare_initial_create, ProviderPreparationContext},
@@ -41,7 +46,8 @@
 //! }
 //! ```
 //!
-//! State-bucket deletion cannot take a caller-selected resource and identifier:
+//! The public backend constructor derives its target from the supplied configuration.
+//! These doctests pin private raw-resource entry points, not source authenticity:
 //!
 //! ```compile_fail
 //! use carina_core::{executor::{prepare_initial_delete, dispatch_delete}, parser::ExpandedInferredFile,
@@ -99,7 +105,8 @@
 //! }
 //! ```
 //!
-//! Saved replay has no conversion from a caller's plan or mutable effect access:
+//! Saved replay has no direct Plan conversion or mutable effect access. Saved
+//! files remain user input and can be deserialized; the CLI verifies them:
 //!
 //! ```compile_fail,E0277
 //! use carina_core::{plan::Plan, saved_replay::SavedPlanReplay, resource::SavedModuleSource};
@@ -112,17 +119,19 @@
 //! fn append(replay: &mut SavedPlanReplay, effect: Effect<SavedModuleSource>) { replay.add(effect); }
 //! ```
 //!
-//! State-row projections cannot be assembled from a chosen id and identifier:
+//! Struct literals cannot access the private row fields. Typed state owners
+//! supply their values; private fields do not authenticate those values:
 //!
 //! ```compile_fail,E0451
 //! use carina_core::{planning_state::PlanningStateRow, provider::AppliedIdentifier, resource::ResolvedResourceId};
 //! fn forged(id: ResolvedResourceId, identifier: AppliedIdentifier) -> PlanningStateRow {
-//!     PlanningStateRow { id, identifier: Some(identifier), create_in_flight: false,
+//!     PlanningStateRow { id, identifier: Some(identifier.clone()), persisted_identifier: Some(identifier), current_kind: carina_core::planning_state::PlanningCurrentKind::Applied,
 //!         binding: None, directives: Default::default(), dependency_bindings: Default::default(), deposed: Vec::new() }
 //! }
 //! ```
 //!
-//! A caller cannot choose a different backend field as the bucket identifier:
+//! The backend constructor has no separate bucket-field selector. It reads the
+//! bucket field of the supplied configuration, whose authenticity the CLI checks:
 //!
 //! ```compile_fail,E0061
 //! use carina_core::{resolved_graph::ResolvedInitialDeletePlan, executor::prepare_initial_delete,

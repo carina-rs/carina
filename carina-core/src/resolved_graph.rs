@@ -76,10 +76,33 @@ pub enum ExpandedGraphResolutionError {
     },
     #[error("bootstrap resource {id} is absent from the parsed configuration")]
     MissingBootstrapResource { id: Box<ResourceId> },
-    #[error("{0}")]
-    BackendResource(String),
+    #[error(transparent)]
+    BackendResource(BackendResourceError),
     #[error(transparent)]
     Resource(#[from] crate::resource::ResolvedResourceError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BackendResourceError {
+    #[error("Backend has no resolved bucket name")]
+    MissingBucket,
+    #[error("invalid backend bucket provider identifier")] // error-chain: caller-renders-sources
+    Identifier(#[source] crate::provider::EmptyAppliedIdentifier),
+    #[error("invalid backend bucket resource identity")] // error-chain: caller-renders-sources
+    Identity(#[source] crate::resource::ResourceIdentityError),
+    #[error(
+        "No managed resource schema registered for state bucket type '{provider}.{resource_type}'"
+    )]
+    MissingSchema {
+        provider: String,
+        resource_type: String,
+    },
+}
+
+impl From<BackendResourceError> for ExpandedGraphResolutionError {
+    fn from(error: BackendResourceError) -> Self {
+        Self::BackendResource(error)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -315,7 +338,9 @@ pub struct AdmittedInitialDeletePlan {
 
 impl ResolvedInitialDeletePlan {
     /// Derive the implicit bucket's target and identifier from the backend configuration.
-    /// Provider and resource type describe the backend implementation, not a physical target.
+    /// The CLI authenticates and validates this configuration value. Provider and
+    /// resource type select the backend implementation; the bucket field supplies
+    /// both the write target and its physical identifier.
     pub fn from_backend_configuration(
         configuration: &crate::parser::ExpandedInferredFile,
         provider: &str,
@@ -330,15 +355,11 @@ impl ResolvedInitialDeletePlan {
                 Value::Concrete(ConcreteValue::String(name)) => Some(name.expose_plaintext()),
                 _ => None,
             })
-            .ok_or_else(|| {
-                ExpandedGraphResolutionError::BackendResource(
-                    "Backend has no resolved bucket name".to_owned(),
-                )
-            })?;
+            .ok_or(BackendResourceError::MissingBucket)?;
         let identifier = crate::provider::AppliedIdentifier::new(name)
-            .map_err(|error| ExpandedGraphResolutionError::BackendResource(error.to_string()))?;
-        let identity = ResourceIdentity::try_from(name.to_owned())
-            .map_err(|error| ExpandedGraphResolutionError::BackendResource(error.to_string()))?;
+            .map_err(BackendResourceError::Identifier)?;
+        let identity =
+            ResourceIdentity::try_from(name.to_owned()).map_err(BackendResourceError::Identity)?;
         let resource = Resource::from_id(ResourceId::with_provider_identity(
             provider,
             resource_type,
@@ -349,9 +370,11 @@ impl ResolvedInitialDeletePlan {
             .get(provider, resource_type, crate::schema::SchemaKind::Resource)
             .is_none()
         {
-            return Err(ExpandedGraphResolutionError::BackendResource(format!(
-                "No managed resource schema registered for state bucket type '{provider}.{resource_type}'"
-            )));
+            return Err(BackendResourceError::MissingSchema {
+                provider: provider.to_owned(),
+                resource_type: resource_type.to_owned(),
+            }
+            .into());
         }
         let mut bucket_configuration = crate::parser::ExpandedInferredFile::default();
         bucket_configuration.resources.push(resource.clone());
@@ -371,7 +394,9 @@ impl ResolvedInitialDeletePlan {
 }
 
 impl ResolvedInitialCreatePlan {
-    /// Select the bootstrap target from the parsed configuration and retain its own graph.
+    /// Select the bootstrap target and ordering from the supplied configuration.
+    /// The CLI authenticates and validates the configuration; this constructor
+    /// retains its graph and does not accept a separate resource value.
     pub fn from_configuration(
         configuration: crate::parser::ExpandedInferredFile,
         id: &ResourceId,
@@ -1851,6 +1876,37 @@ impl crate::resource::InsideSecret for ExpandedGraphResolutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_identifier_error_retains_typed_source() {
+        use std::error::Error;
+        let configuration = crate::parser::ExpandedInferredFile {
+            backend: Some(crate::parser::BackendConfig {
+                backend_type: "s3".into(),
+                attributes: HashMap::from([(
+                    "bucket".into(),
+                    Value::Concrete(ConcreteValue::String("".into())),
+                )]),
+                attribute_spans: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let error = ResolvedInitialDeletePlan::from_backend_configuration(
+            &configuration,
+            "mock",
+            "test.Bucket",
+            &SchemaRegistry::new(),
+        )
+        .unwrap_err();
+        let mut source = error.source();
+        while let Some(error) = source {
+            if error.is::<crate::provider::EmptyAppliedIdentifier>() {
+                return;
+            }
+            source = error.source();
+        }
+        panic!("the backend error chain must preserve EmptyAppliedIdentifier");
+    }
 
     #[test]
     fn review2_f8_dependency_resolution_inventory_protects_secret_binding_errors() {

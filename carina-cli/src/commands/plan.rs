@@ -903,8 +903,11 @@ pub(crate) type SavedPlanResource = Resource<
     (),
 >;
 
-impl From<PlanFileContents> for PlanFileContents<SavedModuleSource> {
-    fn from(contents: PlanFileContents) -> Self {
+impl<P, Q> From<PlanFileContents<ModuleSource, P>> for PlanFileContents<SavedModuleSource, Q>
+where
+    P: Into<Q>,
+{
+    fn from(contents: PlanFileContents<ModuleSource, P>) -> Self {
         let PlanFileContents {
             version,
             carina_version,
@@ -986,6 +989,7 @@ impl From<PlanFileContents<SavedModuleSource>> for UnresolvedPlanFileContents {
 }
 
 impl UnresolvedPlanFileContents {
+    #[cfg(any(test, feature = "test-utils"))]
     fn with_wire_plan(
         contents: PlanFileContents<SavedModuleSource>,
         wire_plan: UnresolvedSavedPlan,
@@ -1720,8 +1724,7 @@ impl Deref for PlanFile {
 /// Raw `PlanFileContents` remains a transport/fixture type and cannot record a
 /// production plan. No mutable or deserialization seam exposes this owner.
 struct CheckedPlanFileContents {
-    snapshot: PlanFileContents,
-    wire_plan: UnresolvedSavedPlan,
+    contents: UnresolvedPlanFileContents,
 }
 
 impl CheckedPlanFileContents {
@@ -1730,11 +1733,10 @@ impl CheckedPlanFileContents {
         validated: &ValidatedConfig<crate::wiring::ExpandedPlanContext<E>>,
         persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        self.snapshot.record_checked_with_context(
+        self.contents.record_checked_with_context(
             validated.context(),
             &validated.resources().provider,
             persisted_directive_changes,
-            self.wire_plan,
         )
     }
 }
@@ -1775,17 +1777,21 @@ impl PlanFileContents {
         provider: &ProviderRouter,
         persisted_directive_changes: Vec<PersistedDirectiveChange>,
     ) -> Result<PlanFile, ProviderEvidenceError> {
-        let wire_plan: carina_core::plan::SavedPlan = self.plan.clone().into();
-        let wire_plan = UnresolvedSavedPlan::from(wire_plan);
-        self.record_checked_with_context(ctx, provider, persisted_directive_changes, wire_plan)
+        let saved: PlanFileContents<SavedModuleSource> = self.into();
+        UnresolvedPlanFileContents::from(saved).record_checked_with_context(
+            ctx,
+            provider,
+            persisted_directive_changes,
+        )
     }
+}
 
+impl UnresolvedPlanFileContents {
     fn record_checked_with_context(
         self,
         ctx: &WiringContext,
         provider: &ProviderRouter,
         persisted_directive_changes: Vec<PersistedDirectiveChange>,
-        wire_plan: UnresolvedSavedPlan,
     ) -> Result<PlanFile, ProviderEvidenceError> {
         let references = self.referenced_schema_types();
         let available_providers = ctx.provider_artifacts().keys().cloned().collect();
@@ -1797,9 +1803,8 @@ impl PlanFileContents {
             provider,
             &expected_instances,
         )?;
-        let saved: PlanFileContents<SavedModuleSource> = self.into();
         Ok(PlanFile {
-            contents: UnresolvedPlanFileContents::with_wire_plan(saved, wire_plan),
+            contents: self,
             evidence,
             persisted_directive_changes,
             wire_order: None,
@@ -1839,129 +1844,8 @@ impl UnresolvedPlanFileContents {
     }
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl<S, V: PlanValueKind> PlanFileContents<S, Plan<S, V>, V> {
-    pub(crate) fn referenced_schema_types(&self) -> PlanSchemaReferences {
-        fn insert(
-            references: &mut BTreeSet<PlanSchemaReference>,
-            id: &ResourceId,
-            kind: SchemaKind,
-        ) {
-            references.insert(PlanSchemaReference {
-                provider: id.provider.clone(),
-                kind,
-                resource_type: id.resource_type.clone(),
-            });
-        }
-
-        let mut references = BTreeSet::new();
-        for effect in self.plan.effects() {
-            match effect {
-                Effect::Read { resource } => {
-                    insert(&mut references, &resource.id, SchemaKind::DataSource);
-                }
-                Effect::Create(resource) => {
-                    insert(&mut references, &resource.id, SchemaKind::Resource);
-                }
-                Effect::ResumeCreate {
-                    resource,
-                    started_at: _started_at,
-                } => {
-                    insert(&mut references, &resource.id, SchemaKind::Resource);
-                }
-                Effect::Update {
-                    from,
-                    identifier: _identifier,
-                    to,
-                    changed_attributes: _changed_attributes,
-                } => {
-                    insert(&mut references, &from.id, SchemaKind::Resource);
-                    insert(&mut references, &to.id, SchemaKind::Resource);
-                }
-                Effect::Delete {
-                    id,
-                    identifier: _identifier,
-                    generation: _generation,
-                    directives: _directives,
-                    binding: _binding,
-                    dependencies: _dependencies,
-                    explicit_dependencies: _explicit_dependencies,
-                    blocked_by_updates: _blocked_by_updates,
-                } => {
-                    insert(&mut references, id, SchemaKind::Resource);
-                }
-                Effect::Import {
-                    id,
-                    identifier: _identifier,
-                } => {
-                    insert(&mut references, id, SchemaKind::Resource);
-                }
-                Effect::Remove { id } => {
-                    insert(&mut references, id, SchemaKind::Resource);
-                }
-                Effect::DeferredCreate(payload) => {
-                    insert(
-                        &mut references,
-                        payload.template.template_resource_id(),
-                        SchemaKind::Resource,
-                    );
-                }
-                Effect::Move { from, to, .. } => {
-                    insert(&mut references, from, SchemaKind::Resource);
-                    insert(&mut references, to, SchemaKind::Resource);
-                }
-                Effect::ReleaseListKeys { id, .. } => {
-                    insert(&mut references, id, SchemaKind::Resource);
-                }
-                Effect::Wait {
-                    id: _id,
-                    target_id,
-                    until: _until,
-                    until_surface: _until_surface,
-                    timeout: _timeout,
-                    interval: _interval,
-                    explicit_dependencies: _explicit_dependencies,
-                } => {
-                    insert(
-                        &mut references,
-                        target_id.id().as_inner(),
-                        SchemaKind::Resource,
-                    );
-                }
-                Effect::DeferredReplace(payload) => {
-                    insert(
-                        &mut references,
-                        payload.template.template_resource_id(),
-                        SchemaKind::Resource,
-                    );
-                    for delete in &payload.deletes {
-                        insert(&mut references, &delete.id, SchemaKind::Resource);
-                    }
-                }
-            }
-        }
-
-        for resource in &self.sorted_resources {
-            insert(&mut references, &resource.id, SchemaKind::Resource);
-        }
-        for resource in &self.unresolved_resources {
-            insert(&mut references, &resource.id, SchemaKind::Resource);
-        }
-        for data_source in self.data_sources.iter().chain(&self.data_source_origins) {
-            insert(&mut references, &data_source.id, SchemaKind::DataSource);
-        }
-        for saved in &self.data_source_values {
-            insert(&mut references, &saved.id, SchemaKind::DataSource);
-        }
-        for current in &self.current_states {
-            let CurrentStateEntry::Managed {
-                id,
-                current: _current,
-            } = current;
-            insert(&mut references, id, SchemaKind::Resource);
-        }
-        PlanSchemaReferences(references)
-    }
-
     fn expected_provider_instances(
         &self,
         available_providers: &BTreeSet<String>,
@@ -5195,7 +5079,7 @@ pub(crate) fn build_plan_file_from_parts<E, R>(
             crate::wiring::PlanOutcome::Diagnostics(_) => panic!("cannot save a diagnostic plan"),
         },
     )?
-    .snapshot
+    .contents
     .record_for_test(validated_config, directive_changes)
     .map_err(PlanSaveError::from)
 }
@@ -5377,10 +5261,9 @@ fn build_plan_file_contents<E>(
 
     let recorded =
         checked.record_snapshot(&redacted_desired_resources, &redacted_managed_states)?;
-    let recorded_plan = recorded.plan().clone();
     let wire_plan = recorded.into_wire();
 
-    let contents = PlanFileContents {
+    let contents = PlanFileContents::<ModuleSource, UnresolvedSavedPlan> {
         // carina#4283: bumped 41→42 — retain replacement history and dependency
         // requirements; loading re-admits requests against the target schema.
         // carina#4275: bumped 40→41 — secret(...) has no ordinary FunctionCall
@@ -5505,7 +5388,7 @@ fn build_plan_file_contents<E>(
         state_serial: state_file.as_ref().map(|s| s.serial),
         provider_configs,
         backend_config,
-        plan: recorded_plan,
+        plan: wire_plan,
         sorted_resources: redacted_sorted_resources,
         sorted_value_destroy_dependencies: ctx
             .sorted_resources
@@ -5620,8 +5503,7 @@ fn build_plan_file_contents<E>(
             .collect(),
     };
     Ok(CheckedPlanFileContents {
-        snapshot: contents,
-        wire_plan,
+        contents: contents.into(),
     })
 }
 

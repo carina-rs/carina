@@ -1,6 +1,7 @@
 #[cfg(test)]
 use carina_core::config_loader::get_base_dir;
-use carina_core::effect::deps::KeptDestroyTargets;
+use carina_core::planning_state::{StateRowKey, state_row_key_from_parts};
+#[cfg(test)]
 use carina_core::resource::ResolvedResource;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -43,7 +44,9 @@ use carina_core::shutdown::{
 };
 #[cfg(test)]
 use carina_state::LockInfo;
-use carina_state::{StateBackend, StateFile};
+use carina_state::StateBackend;
+#[cfg(test)]
+use carina_state::StateFile;
 
 use carina_core::parser::ProviderContext;
 
@@ -873,29 +876,13 @@ async fn run_destroy_locked_owned(
             .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
             .map(|id| state_row_key_from_id(&id)),
     );
-    let resolved_resources_to_destroy = resources_to_destroy
-        .iter()
-        .map(|resource| destroy_graph.resolve_resource((*resource).clone(), ctx.schemas()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let destroyed_ids: HashSet<_> = resolved_resources_to_destroy
-        .iter()
-        .map(ResolvedResource::resolved_id)
-        .collect();
-    let kept_targets: KeptDestroyTargets = parsed
-        .data_sources
-        .iter()
-        .filter_map(|data_source| ResolvedResourceId::try_new(data_source.id.clone()))
-        .chain(
-            all_resources
-                .iter()
-                .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone())),
-        )
-        .filter(|id| !destroyed_ids.contains(id))
-        .collect();
-    let rows = state_file.as_ref().map(StateFile::planning_rows).unwrap_or_default();
+    // Main permits a provider read to canonicalize an identifier. Record those
+    // authenticated observations in a planning copy, leaving persisted state
+    // and its checkpoint/recovery behavior unchanged.
+    let rows = state_file.as_ref().map(|state| state.planning_rows_after_refresh(&managed_current)).unwrap_or_default();
     let execution_plan = match carina_core::planning_state::DestroyPlan::from_state(
         &resources_to_destroy, &managed_current, &rows, destroy_graph,
-        &protected_row_keys, kept_targets, ctx.schemas(),
+        &protected_row_keys, ctx.schemas(),
     ) {
         Ok(plan) => plan,
         Err(carina_core::planning_state::DestroyPlanError::State(errors)) => {
@@ -906,6 +893,7 @@ async fn run_destroy_locked_owned(
         }
         Err(carina_core::planning_state::DestroyPlanError::Graph(error)) => return Err(error.into()),
         Err(carina_core::planning_state::DestroyPlanError::Admission(error)) => return Err(error.into()),
+        Err(error @ carina_core::planning_state::DestroyPlanError::IdentifierMismatch { .. }) => return Err(error.into()),
     };
     let delete_effects = execution_plan.plan().effects();
     let mut delete_scheduler = DeleteScheduler::for_destroy(&execution_plan)
@@ -1877,11 +1865,37 @@ fn build_destroy_delete_effects(
     state: Option<&StateFile>,
     protected: &HashSet<StateRowKey>,
 ) -> (Vec<Effect>, Vec<PlanError>) {
-    let rows = state.map(StateFile::planning_rows).unwrap_or_default();
+    // Legacy unit fixtures supply current observations separately. Assemble
+    // their authoritative rows here, without exposing a production bypass.
+    let mut source = state.cloned().unwrap_or_default();
+    for resource in resources {
+        let stored = source.find_resource_for_id(&resource.id).cloned();
+        let mut row = match current.get(&resource.id) {
+            Some(Current::Present(present)) => carina_state::ResourceState::try_applied(
+                resource.id.resource_type.clone(),
+                resource.identity().clone(),
+                resource.id.provider.clone(),
+                present.identifier().as_str(),
+            )
+            .unwrap(),
+            _ => carina_state::ResourceState::new(
+                resource.id.resource_type.clone(),
+                resource.identity().clone(),
+                resource.id.provider.clone(),
+            ),
+        };
+        if let Some(stored) = stored {
+            row.deposed = stored.deposed;
+            row.directives = stored.directives;
+            row.dependency_bindings = stored.dependency_bindings;
+        }
+        row.directives.provider_instance = resource.id.provider_instance.clone();
+        row.binding = resource.binding.clone();
+        source.upsert_resource(row).unwrap();
+    }
+    let rows = source.planning_rows();
     carina_core::planning_state::build_destroy_delete_effects(resources, current, &rows, protected)
 }
-
-type StateRowKey = (String, String, String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DestroyPlanCounts {
@@ -1999,14 +2013,6 @@ fn finish_interrupted_destroy_outcomes(
 
 fn state_row_key_from_id(id: &ResolvedResourceId) -> StateRowKey {
     state_row_key_from_parts(&id.provider, &id.resource_type, id.identity_str())
-}
-
-fn state_row_key_from_parts(provider: &str, resource_type: &str, identity: &str) -> StateRowKey {
-    (
-        provider.to_string(),
-        resource_type.to_string(),
-        identity.to_string(),
-    )
 }
 
 fn topological_delete_order(

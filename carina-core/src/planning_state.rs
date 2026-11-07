@@ -17,15 +17,26 @@ use std::collections::{HashMap, HashSet};
 pub struct PlanningStateRow {
     id: ResolvedResourceId,
     identifier: Option<AppliedIdentifier>,
-    create_in_flight: bool,
+    persisted_identifier: Option<AppliedIdentifier>,
+    current_kind: PlanningCurrentKind,
     binding: Option<AbsoluteBindingAddress>,
     directives: PersistedDirectives,
     dependency_bindings: PersistedDestroyDependencies,
     deposed: Vec<PlanningDeposedRow>,
 }
 
+/// Lifecycle classification copied from the authoritative current state row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanningCurrentKind {
+    None,
+    Applied,
+    MissingIdentifier,
+    CreateInFlight,
+    CreateOutcomeUnknown,
+}
+
 #[derive(Debug, Clone)]
-struct PlanningDeposedRow {
+pub struct PlanningDeposedRow {
     key: DeposedKey,
     identifier: String,
     provider_instance: Option<String>,
@@ -33,8 +44,9 @@ struct PlanningDeposedRow {
     attributes: HashMap<String, SnapshotValue>,
 }
 
-/// State rows decoded by core from the persisted resource-row representation.
-/// Rows have no public field constructor, deserializer or mutable access.
+/// Immutable state-row values supplied by the state owner for core planning.
+/// The CLI is responsible for authenticating their source. Core derives write
+/// targets and persisted ordering from these values, not parallel arguments.
 #[derive(Debug, Clone, Default)]
 pub struct PlanningStateRows(Vec<PlanningStateRow>);
 impl std::ops::Deref for PlanningStateRows {
@@ -44,103 +56,78 @@ impl std::ops::Deref for PlanningStateRows {
     }
 }
 
-#[derive(serde::Deserialize)]
-struct EncodedPlanningRow {
-    provider: String,
-    resource_type: String,
-    identity: crate::resource::ResourceIdentity,
-    current: EncodedPlanningCurrent,
-    #[serde(default)]
-    binding: Option<AbsoluteBindingAddress>,
-    #[serde(default)]
-    directives: PersistedDirectives,
-    #[serde(default)]
-    dependency_bindings: std::collections::BTreeSet<ResolvedResourceId>,
-    #[serde(default)]
-    deposed: Vec<EncodedPlanningDeposed>,
+impl FromIterator<PlanningStateRow> for PlanningStateRows {
+    fn from_iter<T: IntoIterator<Item = PlanningStateRow>>(rows: T) -> Self {
+        Self(rows.into_iter().collect())
+    }
 }
-#[derive(serde::Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum EncodedPlanningCurrent {
-    None,
-    Applied { identifier: AppliedIdentifier },
-    CreateInFlight,
-    CreateOutcomeUnknown,
-    MissingIdentifier,
+
+impl PlanningStateRow {
+    /// Project typed persisted fields. Source authenticity is the state owner's responsibility.
+    pub fn from_persisted(
+        id: ResolvedResourceId,
+        identifier: Option<AppliedIdentifier>,
+        current_kind: PlanningCurrentKind,
+        binding: Option<AbsoluteBindingAddress>,
+        directives: PersistedDirectives,
+        dependency_bindings: PersistedDestroyDependencies,
+        deposed: Vec<PlanningDeposedRow>,
+    ) -> Self {
+        Self {
+            id,
+            persisted_identifier: identifier.clone(),
+            identifier,
+            current_kind,
+            binding,
+            directives,
+            dependency_bindings,
+            deposed,
+        }
+    }
+
+    /// Include an authenticated read observation in the source row before planning.
+    /// The state owner supplies its routing and identifier; the persisted identifier
+    /// remains available for historical-generation diagnostics.
+    pub fn with_current_observation(
+        mut self,
+        id: ResolvedResourceId,
+        identifier: Option<AppliedIdentifier>,
+    ) -> Self {
+        self.id = id;
+        self.current_kind = if identifier.is_some() {
+            PlanningCurrentKind::Applied
+        } else {
+            PlanningCurrentKind::None
+        };
+        self.identifier = identifier;
+        self
+    }
 }
-#[derive(serde::Deserialize)]
-struct EncodedPlanningDeposed {
-    key: DeposedKey,
-    identifier: String,
-    #[serde(default)]
-    provider_instance: Option<String>,
-    #[serde(default)]
-    dependency_bindings: std::collections::BTreeSet<ResolvedResourceId>,
-    attributes: HashMap<String, serde_json::Value>,
-}
-impl PlanningStateRows {
-    /// Decode the authoritative stored rows, retaining old-generation routing,
-    /// dependency projections and typed persisted attributes.
-    pub fn from_state_rows_json(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        use serde::de::Error as _;
-        let rows: Vec<EncodedPlanningRow> = serde_json::from_slice(bytes)?;
-        rows.into_iter()
-            .map(|row| {
-                let id = ResolvedResourceId::try_new(ResourceId::with_provider_identity(
-                    row.provider,
-                    row.resource_type,
-                    row.identity,
-                    row.directives.provider_instance.clone(),
-                ))
-                .ok_or_else(|| {
-                    serde_json::Error::custom("persisted resource row requires a complete address")
-                })?;
-                let create_in_flight =
-                    matches!(row.current, EncodedPlanningCurrent::CreateInFlight);
-                let identifier = match row.current {
-                    EncodedPlanningCurrent::Applied { identifier } => Some(identifier),
-                    _ => None,
-                };
-                let deposed = row
-                    .deposed
-                    .into_iter()
-                    .map(|old| {
-                        Ok(PlanningDeposedRow {
-                            key: old.key,
-                            identifier: old.identifier,
-                            provider_instance: old.provider_instance,
-                            dependency_bindings: PersistedDestroyDependencies::decode_persisted(
-                                old.dependency_bindings,
-                            )
-                            .map_err(serde_json::Error::custom)?,
-                            attributes: crate::provider::PersistedAttributes::from_encoded(
-                                old.attributes,
-                            )
-                            .map_err(serde_json::Error::custom)?
-                            .to_values(),
-                        })
-                    })
-                    .collect::<Result<Vec<_>, serde_json::Error>>()?;
-                Ok(PlanningStateRow {
-                    id,
-                    identifier,
-                    create_in_flight,
-                    binding: row.binding,
-                    directives: row.directives,
-                    dependency_bindings: PersistedDestroyDependencies::decode_persisted(
-                        row.dependency_bindings,
-                    )
-                    .map_err(serde_json::Error::custom)?,
-                    deposed,
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map(Self)
+
+impl PlanningDeposedRow {
+    pub fn from_persisted(
+        key: DeposedKey,
+        identifier: String,
+        provider_instance: Option<String>,
+        dependency_bindings: PersistedDestroyDependencies,
+        attributes: HashMap<String, SnapshotValue>,
+    ) -> Self {
+        Self {
+            key,
+            identifier,
+            provider_instance,
+            dependency_bindings,
+            attributes,
+        }
     }
 }
 
 pub type StateRowKey = (String, String, String);
-fn state_row_key_from_parts(provider: &str, resource_type: &str, identity: &str) -> StateRowKey {
+pub fn state_row_key_from_parts(
+    provider: &str,
+    resource_type: &str,
+    identity: &str,
+) -> StateRowKey {
     (
         provider.to_owned(),
         resource_type.to_owned(),
@@ -164,17 +151,20 @@ pub enum DestroyPlanError {
     Admission(#[from] crate::replacement::ReplacementAdmissionError),
     #[error("invalid destroy state")]
     State(Vec<PlanError>),
+    #[error("refreshed identifier for {id} does not match its authoritative state row")]
+    IdentifierMismatch { id: Box<ResolvedResourceId> },
 }
 
 impl DestroyPlan {
-    #[allow(clippy::too_many_arguments)]
+    /// Select state-row addresses for deletion. Resource fields other than the
+    /// address are ignored: targets come from rows and ordering from rows and
+    /// the retained configuration graph. The CLI authenticates these sources.
     pub fn from_state<E, D>(
         resources: &[&Resource],
         current: &HashMap<ResourceId, Current>,
         rows: &PlanningStateRows,
         graph: &crate::resolved_graph::ResolvedExpandedGraph<E, D>,
         protected: &HashSet<StateRowKey>,
-        kept_targets: KeptDestroyTargets,
         schemas: &SchemaRegistry,
     ) -> Result<Self, DestroyPlanError> {
         let missing_rows = resources
@@ -196,10 +186,67 @@ impl DestroyPlan {
         if !missing_rows.is_empty() {
             return Err(DestroyPlanError::State(missing_rows));
         }
-        let resolved = resources
+        let mut resolved = Vec::with_capacity(resources.len());
+        for resource in resources {
+            let row = rows
+                .iter()
+                .find(|row| {
+                    row.id.provider == resource.id.provider
+                        && row.id.resource_type == resource.id.resource_type
+                        && Some(row.id.identity_str()) == resource.id.identity_str()
+                })
+                .expect("target rows were checked above");
+            if let Some(Current::Present(present)) = current.get(&resource.id)
+                && row.identifier.as_ref() != Some(present.identifier())
+            {
+                return Err(DestroyPlanError::IdentifierMismatch {
+                    id: Box::new(row.id.clone()),
+                });
+            }
+            let mut source = graph
+                .configuration()
+                .resources
+                .iter()
+                .find(|candidate| {
+                    candidate.id.provider == row.id.provider
+                        && candidate.id.resource_type == row.id.resource_type
+                        && candidate.id.identity_str() == Some(row.id.identity_str())
+                })
+                .cloned()
+                .unwrap_or_else(|| {
+                    let mut orphan = Resource::from_id(row.id.as_inner().clone());
+                    orphan.directives = (&row.directives).into();
+                    orphan.binding = row.binding.clone();
+                    orphan
+                });
+            source.id = row.id.as_inner().clone();
+            source.directives.provider_instance = row.id.provider_instance.clone();
+            resolved.push(graph.resolve_resource(source, schemas)?);
+        }
+        let destroyed_ids = resolved
             .iter()
-            .map(|resource| graph.resolve_resource((*resource).clone(), schemas))
-            .collect::<Result<Vec<_>, _>>()?;
+            .map(ResolvedResource::resolved_id)
+            .collect::<HashSet<_>>();
+        let kept_targets = graph
+            .configuration()
+            .resources
+            .iter()
+            .map(|resource| &resource.id)
+            .chain(
+                graph
+                    .configuration()
+                    .data_sources
+                    .iter()
+                    .map(|source| &source.id),
+            )
+            .filter_map(|id| ResolvedResourceId::try_new(id.clone()))
+            .chain(
+                rows.iter()
+                    .filter(|row| row.current_kind != PlanningCurrentKind::None)
+                    .map(|row| row.id.clone()),
+            )
+            .filter(|id| !destroyed_ids.contains(id))
+            .collect();
         let (effects, errors) = build_destroy_delete_effects(&resolved, current, rows, protected);
         if !errors.is_empty() {
             return Err(DestroyPlanError::State(errors));
@@ -292,8 +339,24 @@ pub fn build_destroy_delete_effects(
     let mut delete_effects = Vec::with_capacity(resources_to_destroy.len());
     let mut errors = Vec::new();
     for resource in resources_to_destroy {
+        let Some(row) = rows.iter().find(|row| row.id == resource.resolved_id()) else {
+            errors.push(PlanError::new(
+                resource.id.clone(),
+                crate::plan::PlanErrorKind::MissingProviderIdentifier,
+            ));
+            continue;
+        };
         let identifier = match managed_current.get(&resource.id) {
-            Some(Current::Present(present)) => present.identifier().clone(),
+            Some(Current::Present(_)) => match &row.identifier {
+                Some(identifier) => identifier.clone(),
+                None => {
+                    errors.push(PlanError::new(
+                        resource.id.clone(),
+                        crate::plan::PlanErrorKind::MissingProviderIdentifier,
+                    ));
+                    continue;
+                }
+            },
             Some(Current::Absent(_state)) => {
                 errors.push(PlanError::new(
                     resource.id.clone(),
@@ -330,17 +393,11 @@ pub fn build_destroy_delete_effects(
         let mut dependencies = resource.persisted_value_destroy_dependencies().clone();
         dependencies.extend_projected(resource.persisted_explicit_destroy_dependencies());
         let mut explicit_dependencies = resource.explicit_dependencies().clone();
-        if let Some(row) = rows.iter().find(|row| {
-            row.id.provider == resource.id.provider
-                && row.id.resource_type == resource.id.resource_type
-                && row.id.identity_str() == resource.identity_str()
-        }) {
-            dependencies.extend_projected(&row.dependency_bindings);
-            dependencies.extend_projected(&row.directives.depends_on);
-            explicit_dependencies.extend(row.directives.depends_on.iter().cloned());
-        }
+        dependencies.extend_projected(&row.dependency_bindings);
+        dependencies.extend_projected(&row.directives.depends_on);
+        explicit_dependencies.extend(row.directives.depends_on.iter().cloned());
         delete_effects.push(Effect::Delete {
-            id: resource.resolved_id(),
+            id: row.id.clone(),
             identifier,
             generation: EffectGeneration::Current,
             directives: resource.directives.clone(),
@@ -374,7 +431,7 @@ pub fn deposed_delete_effects_for_row(
     let mut effects = Vec::with_capacity(row.deposed.len());
     let mut errors = Vec::new();
     let row_id = row.id.clone();
-    let blocked_by_current_resume = if row.create_in_flight {
+    let blocked_by_current_resume = if row.current_kind == PlanningCurrentKind::CreateInFlight {
         std::iter::once(
             moved_pairs
                 .iter()
@@ -396,7 +453,9 @@ pub fn deposed_delete_effects_for_row(
             id.as_inner(),
             &deposed.key,
             deposed.identifier.as_str(),
-            row.identifier.as_ref().map(AppliedIdentifier::as_str),
+            row.persisted_identifier
+                .as_ref()
+                .map(AppliedIdentifier::as_str),
         ) {
             Ok(identifier) => effects.push(crate::effect::DeferredReplaceDelete {
                 id,
@@ -417,6 +476,7 @@ pub fn deposed_delete_effects_for_row(
 
 mod sealed {
     pub trait StatePlanEdits {}
+    #[cfg(any(test, feature = "test-utils"))]
     impl StatePlanEdits for crate::plan::Plan {}
     impl StatePlanEdits for super::PlanFinalization<'_> {}
 }
@@ -467,59 +527,178 @@ impl PlanFinalization<'_> {
     }
 }
 
-macro_rules! state_edits {
-    ($ty:ty, $this:ident, $plan:expr) => {
-        impl StatePlanEdits for $ty {
-            fn add_state_effect(&mut self, effect: StateOnlyEffect) {
-                let $this = self;
-                ($plan).add(effect.0);
+impl StatePlanEdits for PlanFinalization<'_> {
+    fn add_state_effect(&mut self, effect: StateOnlyEffect) {
+        self.plan.add(effect.0);
+    }
+    fn add_error(&mut self, error: PlanError) {
+        self.plan.add_error(error);
+    }
+    fn retain(&mut self, keep: impl FnMut(&Effect) -> bool) {
+        self.plan.retain(keep);
+    }
+    fn retain_errors(&mut self, keep: impl FnMut(&PlanError) -> bool) {
+        self.plan.retain_errors(keep);
+    }
+    fn suppress_current_deletes(&mut self, ids: &HashSet<ResourceId>) {
+        self.plan.suppress_current_deletes(ids);
+    }
+    fn abandon_deposed_generation(&mut self, id: ResolvedResourceId, key: DeposedKey) {
+        self.plan.abandon_deposed_generation(id, key);
+    }
+    fn add_deposed_rows(
+        &mut self,
+        rows: &PlanningStateRows,
+        moved: &[(ResolvedResourceId, ResolvedResourceId)],
+    ) {
+        for row in rows.iter() {
+            let (effects, errors) = deposed_delete_effects_for_row(row, moved);
+            for effect in effects {
+                self.plan.add_delete(effect);
             }
-            fn add_error(&mut self, error: PlanError) {
-                let $this = self;
-                ($plan).add_error(error);
-            }
-            fn retain(&mut self, keep: impl FnMut(&Effect) -> bool) {
-                let $this = self;
-                ($plan).retain(keep);
-            }
-            fn retain_errors(&mut self, keep: impl FnMut(&PlanError) -> bool) {
-                let $this = self;
-                ($plan).retain_errors(keep);
-            }
-            fn suppress_current_deletes(&mut self, ids: &HashSet<ResourceId>) {
-                let $this = self;
-                ($plan).suppress_current_deletes(ids);
-            }
-            fn abandon_deposed_generation(&mut self, id: ResolvedResourceId, key: DeposedKey) {
-                let $this = self;
-                ($plan).abandon_deposed_generation(id, key);
-            }
-            fn add_deposed_rows(
-                &mut self,
-                rows: &PlanningStateRows,
-                moved: &[(ResolvedResourceId, ResolvedResourceId)],
-            ) {
-                let $this = self;
-                let plan: &mut Plan = $plan;
-                for row in rows.iter() {
-                    let (effects, errors) = deposed_delete_effects_for_row(row, moved);
-                    for effect in effects {
-                        plan.add_delete(effect);
-                    }
-                    for error in errors {
-                        plan.add_error(error);
-                    }
-                }
+            for error in errors {
+                self.plan.add_error(error);
             }
         }
-    };
+    }
 }
-state_edits!(Plan, plan, plan);
-state_edits!(PlanFinalization<'_>, view, &mut *view.plan);
+
+#[cfg(any(test, feature = "test-utils"))]
+impl StatePlanEdits for Plan {
+    fn add_state_effect(&mut self, effect: StateOnlyEffect) {
+        self.add(effect.0);
+    }
+    fn add_error(&mut self, error: PlanError) {
+        self.add_error(error);
+    }
+    fn retain(&mut self, keep: impl FnMut(&Effect) -> bool) {
+        self.retain(keep);
+    }
+    fn retain_errors(&mut self, keep: impl FnMut(&PlanError) -> bool) {
+        self.retain_errors(keep);
+    }
+    fn suppress_current_deletes(&mut self, ids: &HashSet<ResourceId>) {
+        self.suppress_current_deletes(ids);
+    }
+    fn abandon_deposed_generation(&mut self, id: ResolvedResourceId, key: DeposedKey) {
+        self.abandon_deposed_generation(id, key);
+    }
+    fn add_deposed_rows(
+        &mut self,
+        rows: &PlanningStateRows,
+        moved: &[(ResolvedResourceId, ResolvedResourceId)],
+    ) {
+        for row in rows.iter() {
+            let (effects, errors) = deposed_delete_effects_for_row(row, moved);
+            for effect in effects {
+                self.add_delete(effect);
+            }
+            for error in errors {
+                self.add_error(error);
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn applied_rows(resource: &Resource) -> PlanningStateRows {
+        PlanningStateRows(vec![PlanningStateRow {
+            id: ResolvedResourceId::try_new(resource.id.clone()).unwrap(),
+            identifier: Some(AppliedIdentifier::new("persisted-id").unwrap()),
+            persisted_identifier: Some(AppliedIdentifier::new("persisted-id").unwrap()),
+            current_kind: PlanningCurrentKind::Applied,
+            binding: resource.binding.clone(),
+            directives: Default::default(),
+            dependency_bindings: Default::default(),
+            deposed: Vec::new(),
+        }])
+    }
+
+    #[test]
+    fn destroy_rejects_current_identifier_different_from_authoritative_row() {
+        let resource = Resource::with_provider("mock", "test.Bucket", "stored", None);
+        let rows = applied_rows(&resource);
+        let graph = crate::resolved_graph::resolve_expanded_graph(
+            crate::parser::ExpandedInferredFile {
+                resources: vec![resource.clone()],
+                ..Default::default()
+            }
+            .into(),
+        )
+        .unwrap();
+        let state = crate::resource::SnapshotState::existing(resource.id.clone(), HashMap::new())
+            .with_identifier("other-physical-id");
+        let result = DestroyPlan::from_state(
+            &[&resource],
+            &HashMap::from([(resource.id.clone(), Current::from_snapshot(state))]),
+            &rows,
+            &graph,
+            &Default::default(),
+            &SchemaRegistry::new(),
+        );
+        assert!(
+            result.is_err(),
+            "a genuine row must not authorize deleting a parallel current's other identifier"
+        );
+    }
+
+    #[test]
+    fn destroy_uses_graph_dependencies_instead_of_parallel_resource() {
+        let mut resource = Resource::with_provider("mock", "test.Bucket", "stored", None);
+        resource.binding = Some(crate::resource::absolute_binding_address_for_test("stored"));
+        let rows = applied_rows(&resource);
+        let mut configuration = crate::parser::ExpandedInferredFile::default();
+        configuration.resources.push(resource.clone());
+        configuration.resources.push(
+            Resource::with_provider("mock", "test.Bucket", "kept", None).with_root_binding("kept"),
+        );
+        let graph = crate::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
+        resource.dependencies.depends_on =
+            [crate::resource::absolute_binding_address_for_test("kept")]
+                .into_iter()
+                .collect();
+        let state = crate::resource::SnapshotState::existing(resource.id.clone(), HashMap::new())
+            .with_identifier("persisted-id");
+        let plan = DestroyPlan::from_state(
+            &[&resource],
+            &HashMap::from([(resource.id.clone(), Current::from_snapshot(state))]),
+            &rows,
+            &graph,
+            &Default::default(),
+            &SchemaRegistry::new(),
+        )
+        .unwrap();
+        let [
+            Effect::Delete {
+                dependencies,
+                explicit_dependencies,
+                ..
+            },
+        ] = plan.plan().effects()
+        else {
+            panic!("expected one delete");
+        };
+        assert!(
+            dependencies.is_empty(),
+            "caller-authored ordering must not enter the core plan"
+        );
+        assert!(explicit_dependencies.is_empty());
+        assert_eq!(
+            plan.kept_targets,
+            [ResolvedResourceId::with_provider_identity(
+                "mock",
+                "test.Bucket",
+                "kept",
+                None,
+            )]
+            .into_iter()
+            .collect(),
+            "kept targets must come from the graph"
+        );
+    }
 
     #[test]
     fn destroy_requires_persisted_source_row() {
@@ -539,7 +718,6 @@ mod tests {
             &Default::default(),
             &graph,
             &Default::default(),
-            Default::default(),
             &schemas,
         );
         assert!(
