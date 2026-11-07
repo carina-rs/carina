@@ -12,18 +12,18 @@ The host and the provider talk through a versioned protocol. `carina-provider-pr
 Every time Carina starts a provider, for `validate`, `plan`, `apply` or any other command that uses it, it checks that version first and refuses to go further if it is out of range. `carina init` only downloads and records the provider without starting it, so a mismatch shows up at the first command after `init`:
 
 ```text
-provider 'hello' was built against protocol version 21 but this host requires at least version 22; rebuild the provider against the current carina protocol
+provider 'hello' was built against protocol version 23 but this host requires at least version 24; rebuild the provider against the current carina protocol
 ```
 
 ```text
-provider 'hello' was built against protocol version 23 but this host supports up to version 22; upgrade carina to load this provider
+provider 'hello' was built against protocol version 25 but this host supports up to version 24; upgrade carina to load this provider
 ```
 
 Since v0.5.0, the first release that checks the version, every release has set the minimum equal to the protocol version it speaks, so a provider has to be built for exactly the protocol version of the Carina that loads it:
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
-| Main after v0.11.0 (unreleased) | 22 | 22 |
+| Main after v0.11.0 (unreleased) | 24 | 24 |
 | v0.11.0 | 21 | 21 |
 | Development snapshot after v0.10.0 (unreleased) | 20 | 20 |
 | v0.10.0 | 19 | 19 |
@@ -39,16 +39,18 @@ Since v0.5.0, the first release that checks the version, every release has set t
 | v0.6.0 | 10 | 10 |
 | v0.5.0 | 10 | 10 |
 
-Protocol 22 is current on main; Carina v0.11.0 uses protocol 21 and v0.10.0 uses protocol 19. Protocol 22 adds an optional entry-count bound to map attribute types, the same `length` shape that list types use. Carina checks it during validation, planning, and LSP diagnostics. Providers built for protocol 21 or earlier must rebuild against the current SDK.
+Protocol 24 is current on main; Carina v0.11.0 uses protocol 21 and v0.10.0 uses protocol 19. Protocol 24 requires [explicit pattern match modes and nonempty reasons for substring exceptions](/providers/writing/schemas/#attribute-types). Protocol 23 added scoped desired-input rules. Protocol 22 added an optional entry-count bound to map attribute types, the same `length` shape that list types use. Carina checks it during validation, planning, and LSP diagnostics. Providers built for protocol 23 or earlier must rebuild against the current SDK, including for metadata-only state migration checks.
 
 The protocol 21 schema envelope requires `assignability_edges`, even when empty, and SDK providers must implement `CarinaProvider::assignability_edges`. Both endpoints must be declared by that provider as scalar String, Int, or Float identities with the same scalar kind. Enum, Reference, and core built-in identities cannot be endpoints; self edges, duplicates, and cycles are rejected. Each provider's transitive closure is retained separately, so paths never combine different providers' declarations.
 
 Assignment first checks structural identity. When identities differ, a provider attribute uses its sink owner's edges. Type annotations and module boundaries require a path declared by every owner of the sink identity. The existing length and range checks still apply, and sink validators still run on values during validation, planning, and apply.
 
-Protocols 14 through 21 came before protocol 22, and their changes remain part of it:
+Protocols 14 through 23 came before protocol 24, and their changes remain part of it:
 
 | Protocol | Change |
 |----------------------|--------|
+| 23 | Required scoped desired-input rules on resource schemas. |
+| 22 | Optional entry-count bounds on map attribute types. |
 | 21 | Required provider-wide identity assignability declarations in the schema envelope. |
 | 20 | Create-outcome names describe cloud knowledge: `not-created`, `identifier-reported`, `no-resource`, and `unchanged`; identifier-bearing records are `create-identified` and `resume-identified`. |
 | 19 | Desired normalization uses structural trees with per-leaf, exactly-once deferred handles; CRUD encoding is unchanged. |

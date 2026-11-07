@@ -153,7 +153,9 @@ Cloud metadata addresses are withheld from every provider kind. The host may use
 
 ## Protocol version
 
-The provider protocol is versioned. The current development version is 22, and the host also requires at least 22. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.11.0 speaks version 21; v0.10.0 speaks version 19; v0.7.0 through v0.9.0 speak version 12. Protocol 22 adds an optional entry-count bound to map attribute types. Protocol 21 requires provider-wide identity assignability declarations in the schema envelope and the SDK's `assignability_edges` method, including explicit empty collections. Providers built for protocol 21 or earlier must be rebuilt for this main checkout.
+The provider protocol is versioned. The current development version is 24, and the host also requires at least 24. The SDK records the version it was built with in the provider's `info` response, so you do not set it yourself. Carina v0.11.0 speaks version 21; v0.10.0 speaks version 19; v0.7.0 through v0.9.0 speak version 12. Protocol 22 added an optional entry-count bound to map attribute types. Protocol 21 introduced provider-wide identity assignability declarations in the schema envelope and the SDK's `assignability_edges` method, including explicit empty collections. Providers built for protocol 23 or earlier must be rebuilt for this main checkout.
+
+Protocol 24 requires [explicit pattern match modes, with nonempty reasons for substring exceptions](/providers/writing/schemas/#attribute-types).
 
 When the versions do not match, the host refuses to load the provider and tells you which side to update: rebuild the provider against the current SDK, or upgrade Carina. [docs/protocol.md](https://github.com/carina-rs/carina/blob/main/docs/protocol.md) records what each version changed, and [Versioning and Compatibility](/providers/writing/versioning/) explains what to do when the version changes.
 
