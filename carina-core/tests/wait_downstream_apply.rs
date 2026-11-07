@@ -509,7 +509,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         provider_context: carina_core::parser::ProviderContext::clone(
             provider_types.provider_context(),
         ),
-        plan: &creation_fixture::checked(plan.clone()),
+        plan: &creation_fixture::checked(plan.clone(), &registry),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &[],
@@ -717,7 +717,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         provider_context: carina_core::parser::ProviderContext::clone(
             provider_types.provider_context(),
         ),
-        plan: &creation_fixture::checked(plan.clone()),
+        plan: &creation_fixture::checked(plan.clone(), &registry),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &[],

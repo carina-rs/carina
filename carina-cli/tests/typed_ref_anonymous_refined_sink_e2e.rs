@@ -597,7 +597,7 @@ fn apply_unknown_outputs(attributes: &str, output: Value, port: i64) -> Executio
         creates: Mutex::new(Vec::new()),
     };
     let input = LiveExecutionInput {
-        plan: &creation_fixture::checked(fixture.plan.clone()),
+        plan: &creation_fixture::checked(fixture.plan.clone(), &fixture.schemas),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &origins,
             data_source_origins: &[],

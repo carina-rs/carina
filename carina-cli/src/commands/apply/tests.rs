@@ -467,7 +467,7 @@ async fn execute_mock_http_plan(
             provider_context: carina_core::parser::ProviderContext::clone(
                 &carina_core::parser::LoadedProviderContext::empty_for_test(),
             ),
-            plan: &crate::test_support::creation_fixture::checked(plan.clone()),
+            plan: &crate::test_support::creation_fixture::checked(plan.clone(), schemas),
             provider_check_inputs: carina_core::executor::ProviderCheckInputs::Authored,
             compositions: &[],
             bindings: Default::default(),

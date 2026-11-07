@@ -3686,7 +3686,7 @@ mod historical_display_tests {
         for detail in [crate::DetailLevel::Full, crate::DetailLevel::Explicit] {
             let display = preparation
                 .display(
-                    crate::test_support::creation_fixture::checked(plan.clone()),
+                    crate::test_support::creation_fixture::checked(plan.clone(), &schemas),
                     &references,
                     historical.clone(),
                     detail.to_core(),
@@ -8221,7 +8221,9 @@ mod run_plan_out_tests {
         let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: Box::new(crate::test_support::creation_fixture::checked(plan)),
+                plan: Box::new(
+                    crate::test_support::creation_fixture::checked_with_derived_schemas(plan),
+                ),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -8636,7 +8638,10 @@ mod run_plan_out_tests {
         let parsed = resolve_file_for_test(parsed, tmp.path());
         let ctx = crate::wiring::PlanContext {
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: Box::new(crate::test_support::creation_fixture::checked(Plan::new())),
+                plan: Box::new(crate::test_support::creation_fixture::checked(
+                    Plan::new(),
+                    &carina_core::schema::SchemaRegistry::new(),
+                )),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -8737,7 +8742,10 @@ mod run_plan_out_tests {
         let parsed = carina_core::parser::ExpandedParsedFile::default();
         let ctx = crate::wiring::PlanContext {
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: Box::new(crate::test_support::creation_fixture::checked(Plan::new())),
+                plan: Box::new(crate::test_support::creation_fixture::checked(
+                    Plan::new(),
+                    &carina_core::schema::SchemaRegistry::new(),
+                )),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -8810,7 +8818,10 @@ mod run_plan_out_tests {
             legacy_dependency_classification: None,
             migrated_legacy_state: None,
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: Box::new(crate::test_support::creation_fixture::checked(Plan::new())),
+                plan: Box::new(crate::test_support::creation_fixture::checked(
+                    Plan::new(),
+                    &carina_core::schema::SchemaRegistry::new(),
+                )),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
@@ -8896,7 +8907,10 @@ mod run_plan_out_tests {
             legacy_dependency_classification: None,
             migrated_legacy_state: None,
             plan: crate::wiring::PlanOutcome::Planned(crate::wiring::PlannedPlan::Unrendered {
-                plan: Box::new(crate::test_support::creation_fixture::checked(Plan::new())),
+                plan: Box::new(crate::test_support::creation_fixture::checked(
+                    Plan::new(),
+                    &carina_core::schema::SchemaRegistry::new(),
+                )),
                 references: carina_core::references::prepare_empty_for_tests(),
             }),
             provider: ProviderRouter::new(),
