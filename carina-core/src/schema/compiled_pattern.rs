@@ -17,11 +17,17 @@ use super::{PatternMatch, PatternSpec, PatternSpecDisplay};
 use crate::provider_text::{ProviderText, ProviderTextBuilder};
 use regex_syntax::ast::{self, Ast};
 
-// Match the regex crate's source budget. Dialect boundary groups add one
-// level; the Full envelope adds a group and concatenation. Only internal
-// compilation receives that slack; authored source is checked first.
+// Match the regex crate's authored-source budget, checked before any rewrite.
 const SOURCE_NEST_LIMIT: u32 = 250;
-const COMPILED_NEST_LIMIT: u32 = SOURCE_NEST_LIMIT + 3;
+// ASCII classes can add a bracketed node (Ast::ClassBracketed or
+// ClassSetItem::Bracketed) and ClassSetItem::Union. Word-boundary rewrites
+// add only one Group on a separate assertion branch, so they do not stack.
+const MAX_DIALECT_NEST_OVERHEAD: u32 = 1 + 1;
+// The Full envelope \A(?:p)\z adds Group and Concat; its assertions are leaves.
+const FULL_ENVELOPE_NEST_OVERHEAD: u32 = 1 + 1;
+// Only internal compilation and inspection receive the combined slack.
+const COMPILED_NEST_LIMIT: u32 =
+    SOURCE_NEST_LIMIT + MAX_DIALECT_NEST_OVERHEAD + FULL_ENVELOPE_NEST_OVERHEAD;
 
 mod sealed {
     pub trait Sealed {}
@@ -967,19 +973,56 @@ mod wrapper_budget_tests {
 
     #[test]
     fn full_wrapper_preserves_the_authored_nesting_budget() {
-        for (leaf, depth, value) in [("a", 250, "a"), (r"\bA\b", 248, "A")] {
+        for (leaf, depth, value) in [
+            ("a", 250, "a"),
+            (r"\bA\b", 248, "A"),
+            (r"\bA\b", 249, "A"),
+            (r"\B-\B", 249, "-"),
+            (r"\w", 250, "A"),
+            (r"\W", 250, "-"),
+            (r"\d", 250, "7"),
+            (r"\D", 250, "A"),
+            (r"[\w]", 249, "A"),
+            (r"[\W]", 249, "-"),
+            (r"[\d]", 249, "7"),
+            (r"[\D]", 249, "A"),
+            (r"[a\w]", 248, "A"),
+            (r"[a\W]", 248, "-"),
+            (r"[\w&&\w]", 248, "A"),
+            (r"\b\w\b", 249, "A"),
+        ] {
             let source = format!("{}{leaf}{}", "(".repeat(depth), ")".repeat(depth));
             regex::Regex::new(&source).expect("authored source fits the regex nesting budget");
+            let deeper_source = format!("({source})");
+            let deeper_source_is_valid = regex::Regex::new(&deeper_source).is_ok();
             for mode in [
                 PatternMatch::Full,
                 PatternMatch::Substring {
                     reason: PatternReason::new("Nesting-budget parity probe").unwrap(),
                 },
             ] {
-                let pattern = CompiledPattern::try_new(&PatternSpec::new(&source, mode))
-                    .expect("internal groups must not consume the authored budget");
+                let pattern = CompiledPattern::try_new(&PatternSpec::new(&source, mode.clone()))
+                    .unwrap_or_else(|error| {
+                        panic!("{leaf:?}, {depth} groups: internal rewrites must not consume the authored budget: {error}")
+                    });
                 assert!(pattern.is_match(value));
                 assert_eq!(pattern.as_str(), source);
+                let deeper = CompiledPattern::try_new(&PatternSpec::new(&deeper_source, mode));
+                assert_eq!(
+                    deeper.is_ok(),
+                    deeper_source_is_valid,
+                    "{leaf:?}, {} groups: both modes must obey the authored-source budget",
+                    depth + 1
+                );
+                if !deeper_source_is_valid {
+                    let error = deeper.unwrap_err();
+                    assert_eq!(error.as_ref().as_str(), deeper_source);
+                    assert!(matches!(
+                        &error.reason,
+                        PatternCompileErrorSource::Parse(parse)
+                            if matches!(parse.kind(), ast::ErrorKind::NestLimitExceeded(SOURCE_NEST_LIMIT))
+                    ));
+                }
             }
         }
     }
