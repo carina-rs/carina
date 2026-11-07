@@ -1353,6 +1353,17 @@ impl PatchOp {
 }
 
 impl UpdatePatch {
+    /// Desired values actually sent by this patch, including reasserted inputs.
+    pub(crate) fn sent_projection(&self) -> IndexMap<String, Value> {
+        self.ops
+            .iter()
+            .filter_map(|op| {
+                op.sent_value()
+                    .map(|value| (op.key().to_owned(), value.clone()))
+            })
+            .collect()
+    }
+
     pub(crate) fn sent_attributes(&self) -> SentAttributes {
         SentAttributes::from_update_patch(self)
     }
@@ -4305,6 +4316,83 @@ impl<S: TextState> ResumeFailure<S> {
     }
 }
 
+/// Provider-facing update witness, minted only when dispatch consumes the
+/// exact request that passed input discharge. It cannot be copied or forged.
+///
+/// ```compile_fail,E0624
+/// use carina_core::{provider::UpdateAttempt, replacement::UpdatePermit};
+/// fn forge(permit: UpdatePermit) { let _ = UpdateAttempt::new(permit); }
+/// ```
+/// ```compile_fail,E0423
+/// use carina_core::provider::UpdateAttempt;
+/// let attempt = UpdateAttempt(());
+/// ```
+pub struct UpdateAttempt {
+    _permit: crate::replacement::UpdatePermit,
+}
+
+impl std::fmt::Debug for UpdateAttempt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateAttempt").finish_non_exhaustive()
+    }
+}
+
+impl UpdateAttempt {
+    pub(crate) fn new(permit: crate::replacement::UpdatePermit) -> Self {
+        Self { _permit: permit }
+    }
+}
+
+/// Provider-facing delete authority for one scheduler-released attempt.
+/// It owns the permit, including any paired creates' input-discharge receipts.
+/// Deletes have no desired values and therefore no input rules of their own.
+///
+/// ```compile_fail,E0624
+/// use carina_core::{provider::DeleteAttempt, executor::DeletePermit, schema::SchemaRegistry};
+/// fn forge(permit: DeletePermit, schemas: &SchemaRegistry) {
+///     let _ = DeleteAttempt::new(permit, schemas);
+/// }
+/// ```
+/// ```compile_fail,E0451
+/// use carina_core::provider::DeleteAttempt;
+/// let attempt = DeleteAttempt { permit: todo!(), request: todo!() };
+/// ```
+pub struct DeleteAttempt {
+    permit: crate::executor::DeletePermit,
+    request: DeleteRequest,
+}
+
+impl fmt::Debug for DeleteAttempt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeleteAttempt")
+            .field("id", self.id())
+            .finish_non_exhaustive()
+    }
+}
+
+impl DeleteAttempt {
+    pub(crate) fn new(permit: crate::executor::DeletePermit, schemas: &SchemaRegistry) -> Self {
+        let request = DeleteRequest::from_resolved(schemas.resolve_directives(
+            permit.id(),
+            crate::schema::SchemaKind::Resource,
+            permit.directives(),
+        ));
+        Self { permit, request }
+    }
+
+    pub fn id(&self) -> &ResourceId {
+        self.permit.id()
+    }
+
+    pub fn identifier(&self) -> &AppliedIdentifier {
+        self.permit.identifier()
+    }
+
+    pub fn request(&self) -> &DeleteRequest {
+        &self.request
+    }
+}
+
 /// Provider-facing initial-create witness. Its constructor is core-private;
 /// implementations can only consume the value supplied by the executor.
 ///
@@ -4322,8 +4410,15 @@ impl<S: TextState> ResumeFailure<S> {
 ///     error: ProviderError,
 /// ) -> CreateFailure {
 ///     let _issued = attempt.issued(identifier, Sent::AllRequestAttributes);
-///     CreateAttempt::new(ResourceId::new("p", "t", "n")).0.not_created(error)
+///     CreateAttempt::new(ResourceId::with_provider_identity("p", "t", "n", None)).0.not_created(error)
 /// }
+/// ```
+///
+/// Test utilities do not expose a witness constructor either:
+///
+/// ```compile_fail,E0599
+/// use carina_core::{provider::CreateAttempt, resource::ResourceId};
+/// let attempt = CreateAttempt::for_test(ResourceId::with_provider_identity("p", "t", "n", None));
 /// ```
 #[derive(Debug)]
 pub struct CreateAttempt {
@@ -4343,13 +4438,6 @@ impl CreateAttempt {
             },
             CreateCallCancellationReceiver { receiver },
         )
-    }
-
-    /// Construct an initial-create witness in cross-crate tests.
-    #[cfg(feature = "test-utils")]
-    #[doc(hidden)]
-    pub fn for_test(id: ResourceId) -> Self {
-        Self::new(id).0
     }
 
     pub fn not_created(self, error: ProviderError) -> CreateFailure {
@@ -4564,6 +4652,65 @@ pub struct ResumeRoutingMismatch {
 pub struct ResumeCreateRequest {
     pending: InFlightCreate,
     request: CreateRequest,
+    authorization: ResumeAuthorization,
+}
+
+#[derive(Debug)]
+enum ResumeAuthorization {
+    Resend(crate::replacement::CreatePermit),
+    Poll(AppliedIdentifier),
+}
+
+/// Poll an already identified create. This request cannot produce an
+/// identifierless resume witness or send permission.
+///
+/// ```compile_fail,E0599
+/// use carina_core::provider::PollCreateRequest;
+/// fn resend(request: PollCreateRequest) {
+///     let (poll, _) = request.into_parts();
+///     poll.resend();
+/// }
+/// ```
+#[derive(Debug)]
+pub struct PollCreateRequest {
+    resumed: ResumedCreate,
+    request: CreateRequest,
+}
+
+impl PollCreateRequest {
+    pub(crate) fn new(pending: InFlightCreate, request: CreateRequest) -> Result<Self, HostError> {
+        if pending.id() != &request.resource().id {
+            return Err(
+                HostError::internal("poll request belongs to another resource")
+                    .for_resource(pending.id().clone()),
+            );
+        }
+        let Some(identifier) = pending.identifier().cloned() else {
+            return Err(
+                HostError::internal("poll-only continuation has no provider identifier")
+                    .for_resource(pending.id().clone()),
+            );
+        };
+        Ok(Self {
+            resumed: ResumedCreate {
+                pending,
+                identifier,
+            },
+            request,
+        })
+    }
+
+    pub fn into_parts(self) -> (ResumedCreate, CreateRequest) {
+        (self.resumed, self.request)
+    }
+
+    pub(crate) fn into_resume_request(self) -> ResumeCreateRequest {
+        ResumeCreateRequest {
+            pending: self.resumed.pending,
+            request: self.request,
+            authorization: ResumeAuthorization::Poll(self.resumed.identifier),
+        }
+    }
 }
 
 /// Resume typestate selected from the persisted continuation.
@@ -4627,6 +4774,7 @@ impl Resume {
 #[derive(Debug)]
 pub struct ResumeAttempt {
     pending: InFlightCreate,
+    permit: crate::replacement::CreatePermit,
 }
 
 impl ResumeAttempt {
@@ -4649,6 +4797,7 @@ impl ResumeAttempt {
     pub fn repend(self, token: PendingToken) -> Resume {
         Resume::Unissued(Self {
             pending: self.pending.repend_preserving_identifier(token),
+            permit: self.permit,
         })
     }
 
@@ -4667,6 +4816,7 @@ impl ResumeAttempt {
     pub fn resend(self) -> ResentCreateAttempt {
         ResentCreateAttempt {
             previous: self.pending,
+            _permit: self.permit,
         }
     }
 }
@@ -4812,10 +4962,23 @@ fn identified_from_resume<S: TextState>(
 }
 
 impl ResumeCreateRequest {
-    pub(crate) fn new(
+    /// A send-capable continuation needs the same admission permission as a
+    /// fresh create; a persisted token alone grants no resend authority.
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::provider::{CreateRequest, InFlightCreate, Resume, ResumeCreateRequest};
+    /// fn bypass(pending: InFlightCreate, request: CreateRequest) {
+    ///     let (resume, _) = ResumeCreateRequest::new(pending, request).unwrap().into_parts();
+    ///     if let Resume::Unissued(attempt) = resume {
+    ///         let _ = attempt.resend();
+    ///     }
+    /// }
+    /// ```
+    pub fn new(
         pending: InFlightCreate,
-        request: CreateRequest,
+        permit: crate::replacement::CreatePermit,
     ) -> Result<Self, ResumeRoutingMismatch> {
+        let request = permit.request().clone();
         let desired = request.resource().id.clone();
         if pending.id != desired {
             return Err(ResumeRoutingMismatch {
@@ -4823,7 +4986,11 @@ impl ResumeCreateRequest {
                 desired: Box::new(desired),
             });
         }
-        Ok(Self { pending, request })
+        Ok(Self {
+            pending,
+            request,
+            authorization: ResumeAuthorization::Resend(permit),
+        })
     }
 
     /// Construct a checked resume request in cross-crate tests.
@@ -4833,7 +5000,8 @@ impl ResumeCreateRequest {
         pending: InFlightCreate,
         request: CreateRequest,
     ) -> Result<Self, ResumeRoutingMismatch> {
-        Self::new(pending, request)
+        let permit = crate::replacement::create_permit_for_test(request);
+        Self::new(pending, permit)
     }
 
     pub fn id(&self) -> &ResourceId {
@@ -4849,14 +5017,21 @@ impl ResumeCreateRequest {
     }
 
     pub fn into_parts(self) -> (Resume, CreateRequest) {
-        let resume = match self.pending.identifier().cloned() {
-            Some(identifier) => Resume::Issued(ResumedCreate {
+        let resume = match self.authorization {
+            ResumeAuthorization::Poll(identifier) => Resume::Issued(ResumedCreate {
                 pending: self.pending,
                 identifier,
             }),
-            None => Resume::Unissued(ResumeAttempt {
-                pending: self.pending,
-            }),
+            ResumeAuthorization::Resend(permit) => match self.pending.identifier().cloned() {
+                Some(identifier) => Resume::Issued(ResumedCreate {
+                    pending: self.pending,
+                    identifier,
+                }),
+                None => Resume::Unissued(ResumeAttempt {
+                    pending: self.pending,
+                    permit,
+                }),
+            },
         };
         (resume, self.request)
     }
@@ -4870,6 +5045,7 @@ impl ResumeCreateRequest {
 #[derive(Debug)]
 pub struct ResentCreateAttempt {
     previous: InFlightCreate,
+    _permit: crate::replacement::CreatePermit,
 }
 
 impl ResentCreateAttempt {
@@ -5971,6 +6147,14 @@ pub trait Provider<S: TextState = Unbound>: Send + Sync {
     /// Create the resource described by `request.resource()` and return
     /// the resulting state (with `identifier` set to the cloud-side
     /// internal ID, e.g. `vpc-xxx`).
+    ///
+    /// ```compile_fail,E0061
+    /// use carina_core::provider::{Provider, CreateRequest};
+    /// use carina_core::resource::ResourceId;
+    /// fn bypass(provider: &dyn Provider, id: &ResourceId, request: CreateRequest) {
+    ///     let _ = provider.create(id, request);
+    /// }
+    /// ```
     fn create(
         &self,
         id: &ResourceId,
@@ -5999,24 +6183,52 @@ pub trait Provider<S: TextState = Unbound>: Send + Sync {
     /// used for read-modify-write paths or for resolving
     /// server-assigned identifiers; it MUST NOT be used to derive
     /// additional fields to write back.
+    ///
+    /// A raw request cannot be dispatched without the core-minted witness:
+    ///
+    /// ```compile_fail,E0061
+    /// use carina_core::provider::{AppliedIdentifier, Provider, UpdateRequest};
+    /// use carina_core::resource::ResourceId;
+    /// fn bypass(provider: &dyn Provider, id: &ResourceId,
+    ///           identifier: &AppliedIdentifier, request: UpdateRequest) {
+    ///     let _ = provider.update(id, identifier, request);
+    /// }
+    /// ```
     fn update(
         &self,
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        attempt: UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome<S>, S>>;
 
-    /// Delete an existing resource. `identifier` is the cloud-side
-    /// internal ID (e.g. `vpc-xxx`).
+    /// Delete the exact resource released by the scheduler. The attempt owns
+    /// its id, cloud-side identifier, and schema-resolved request directives.
     ///
-    /// `request.directives()` carries the resource's schema-resolved effective
-    /// directives (force-delete, create-before-destroy, prevent-destroy).
-    fn delete(
-        &self,
-        id: &ResourceId,
-        identifier: &AppliedIdentifier,
-        request: DeleteRequest,
-    ) -> BoxFuture<'_, ProviderResult<(), S>>;
+    /// Raw requests cannot authorize deletion, including the public chain
+    /// that previously bypassed scheduler readiness (carina#4306):
+    ///
+    /// ```compile_fail,E0061
+    /// use carina_core::provider::{AppliedIdentifier, DeleteRequest, Provider, ProviderDirectives};
+    /// use carina_core::resource::ResourceId;
+    /// async fn bypass(provider: &dyn Provider, id: ResourceId, resolved: ProviderDirectives)
+    ///     -> Result<(), Box<dyn std::error::Error>> {
+    ///     provider.delete(&id, &AppliedIdentifier::new("x")?, DeleteRequest::from_resolved(resolved)).await?;
+    ///     Ok(())
+    /// }
+    /// ```
+    ///
+    /// Resolving a request against a schema grants no delete authority either:
+    ///
+    /// ```compile_fail,E0061
+    /// use carina_core::provider::{AppliedIdentifier, DeleteRequest, Provider};
+    /// use carina_core::resource::{Directives, ProviderDirectiveSchema, ResourceId};
+    /// fn bypass(provider: &dyn Provider, id: &ResourceId, identifier: &AppliedIdentifier,
+    ///           directives: &Directives, schema: ProviderDirectiveSchema<'_>) {
+    ///     let _ = provider.delete(id, identifier, DeleteRequest::resolve(directives, schema));
+    /// }
+    /// ```
+    fn delete(&self, attempt: DeleteAttempt) -> BoxFuture<'_, ProviderResult<(), S>>;
 
     /// Permissions this provider needs to perform `op` on `id`.
     /// Empty vec means the provider declares no permissions for this resource/op pair.
@@ -7330,15 +7542,14 @@ impl Provider for ComparisonFixtureProvider {
         _id: &ResourceId,
         _identifier: &AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         Box::pin(async { panic!("comparison fixture must not dispatch update") })
     }
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: crate::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { panic!("comparison fixture must not dispatch delete") })
     }
@@ -7604,21 +7815,17 @@ impl Provider<Bound> for ProviderRouter {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        attempt: UpdateAttempt,
     ) -> BoxFuture<'_, HostResult<HostUpdateOutcome>> {
         match self.get_provider_or_error(id) {
-            Ok(provider) => provider.update(id, identifier, request),
+            Ok(provider) => provider.update(id, identifier, request, attempt),
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
 
-    fn delete(
-        &self,
-        id: &ResourceId,
-        identifier: &AppliedIdentifier,
-        request: DeleteRequest,
-    ) -> BoxFuture<'_, HostResult<()>> {
-        match self.get_provider_or_error(id) {
-            Ok(provider) => provider.delete(id, identifier, request),
+    fn delete(&self, attempt: crate::provider::DeleteAttempt) -> BoxFuture<'_, HostResult<()>> {
+        match self.get_provider_or_error(attempt.id()) {
+            Ok(provider) => provider.delete(attempt),
             Err(e) => Box::pin(async move { Err(e) }),
         }
     }
@@ -9374,17 +9581,13 @@ impl<P: Provider + ?Sized> Provider for Box<P> {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        attempt: UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
-        (**self).update(id, identifier, request)
+        (**self).update(id, identifier, request, attempt)
     }
 
-    fn delete(
-        &self,
-        id: &ResourceId,
-        identifier: &AppliedIdentifier,
-        request: DeleteRequest,
-    ) -> BoxFuture<'_, ProviderResult<()>> {
-        (**self).delete(id, identifier, request)
+    fn delete(&self, attempt: DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
+        (**self).delete(attempt)
     }
 
     fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
@@ -9454,17 +9657,13 @@ impl<P: Provider + ?Sized> Provider for Arc<P> {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        attempt: UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
-        (**self).update(id, identifier, request)
+        (**self).update(id, identifier, request, attempt)
     }
 
-    fn delete(
-        &self,
-        id: &ResourceId,
-        identifier: &AppliedIdentifier,
-        request: DeleteRequest,
-    ) -> BoxFuture<'_, ProviderResult<()>> {
-        (**self).delete(id, identifier, request)
+    fn delete(&self, attempt: DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
+        (**self).delete(attempt)
     }
 
     fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
@@ -9534,17 +9733,13 @@ impl<P: Provider + ?Sized> Provider for &P {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        attempt: UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
-        (**self).update(id, identifier, request)
+        (**self).update(id, identifier, request, attempt)
     }
 
-    fn delete(
-        &self,
-        id: &ResourceId,
-        identifier: &AppliedIdentifier,
-        request: DeleteRequest,
-    ) -> BoxFuture<'_, ProviderResult<()>> {
-        (**self).delete(id, identifier, request)
+    fn delete(&self, attempt: crate::provider::DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
+        (**self).delete(attempt)
     }
 
     fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
@@ -10027,10 +10222,6 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
 
     fn initialized(provider: impl Provider + 'static) -> InitializedProvider {
         InitializedProvider::for_test(Box::new(provider), ReferenceScope::Unavailable)
-    }
-
-    fn delete_request_without_schema() -> DeleteRequest {
-        DeleteRequest::resolve(&Directives::default(), ProviderDirectiveSchema::Unavailable)
     }
 
     #[test]
@@ -12263,6 +12454,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             id: &ResourceId,
             identifier: &AppliedIdentifier,
             request: UpdateRequest,
+            _attempt: crate::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             let id = id.clone();
             let identifier = identifier.clone();
@@ -12290,9 +12482,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: crate::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -12651,15 +12841,14 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             _id: &ResourceId,
             _identifier: &AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: crate::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not supported")) })
         }
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: crate::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -12763,13 +12952,12 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     async fn mock_provider_create_returns_existing() {
         let provider = MockProvider;
         let resource = Resource::new("test", "example");
-        let id = resource.id.clone();
         let provider_boundary = crate::provider::ProviderBoundary::fixture(&provider);
-        let (create, _cancellation) = crate::executor::dispatch_create(
-            &provider_boundary,
-            &id,
-            CreateRequest::checked(resolved_for_test(resource)),
-        );
+        let prepared = crate::replacement::create_permit_for_test(CreateRequest::checked(
+            resolved_for_test(resource),
+        ));
+        let (create, _cancellation) =
+            crate::executor::dispatch_create(&provider_boundary, prepared);
         let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
@@ -12836,12 +13024,10 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let resource = Resource::with_provider("mock", "test", "example", None);
-        let id = resource.id.clone();
-        let (create, _cancellation) = crate::executor::dispatch_create(
-            &router,
-            &id,
-            CreateRequest::checked(resolved_for_test(resource)),
-        );
+        let prepared = crate::replacement::create_permit_for_test(CreateRequest::checked(
+            resolved_for_test(resource),
+        ));
+        let (create, _cancellation) = crate::executor::dispatch_create(&router, prepared);
         let state = create.await.unwrap().into_state_for_writeback();
         assert!(state.exists);
         assert_eq!(state.identifier, Some("mock-id-123".to_string()));
@@ -14285,8 +14471,8 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             .expect("fixture has no ignored write-only paths");
         let identifier =
             AppliedIdentifier::new("mock-id-123").expect("fixture identifier is non-empty");
-        let state = router
-            .update(&id, &identifier, request)
+        let prepared = crate::replacement::update_permit_for_test(identifier.clone(), request);
+        let state = crate::executor::dispatch_update(&router, prepared)
             .await
             .unwrap()
             .into_state_for_writeback();
@@ -14299,10 +14485,18 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         router.add_provider("mock".to_string(), initialized(MockProvider));
 
         let id = ResourceId::with_provider_identity("mock", "test", "example", None);
-        let request = delete_request_without_schema();
         let identifier =
             AppliedIdentifier::new("mock-id-123").expect("fixture identifier is non-empty");
-        let result = router.delete(&id, &identifier, request).await;
+        let result = crate::executor::dispatch_delete(
+            &router,
+            crate::executor::delete_permit_for_test(
+                id.clone(),
+                identifier.clone(),
+                Default::default(),
+            ),
+            &crate::schema::SchemaRegistry::new(),
+        )
+        .await;
         assert!(result.is_ok());
     }
 
@@ -14368,14 +14562,13 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             _id: &ResourceId,
             _identifier: &AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: crate::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("not supported")) })
         }
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: crate::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -15022,6 +15215,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
                 id: &ResourceId,
                 identifier: &AppliedIdentifier,
                 _request: UpdateRequest,
+                _attempt: crate::provider::UpdateAttempt,
             ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
                 let id = id.clone();
                 let identifier = identifier.to_string();
@@ -15035,9 +15229,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
 
             fn delete(
                 &self,
-                _id: &ResourceId,
-                _identifier: &AppliedIdentifier,
-                _request: DeleteRequest,
+                _attempt: crate::provider::DeleteAttempt,
             ) -> BoxFuture<'_, ProviderResult<()>> {
                 Box::pin(async { Ok(()) })
             }

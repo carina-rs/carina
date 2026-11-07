@@ -14,6 +14,7 @@ use carina_core::effect::{
     PriorInstanceDestroyDependencies,
 };
 use carina_core::executor::{AcceptedRequest, Applied, ExecutionResult};
+use carina_core::parser::StateBlockAddress;
 use carina_core::plan::{Plan, ReplaceDisplayInfo, ReplacementPreviousAttributesForStateWriteback};
 #[cfg(test)]
 use carina_core::provider::SentRecord;
@@ -380,6 +381,8 @@ impl<S: Clone> ApplyStateSaveInputs<S> {
             self.planned_secret_hashes.as_ref(),
             &self.comparisons,
             self.references.as_ref(),
+            &result.permanent_name_overrides,
+            &result.replacement_writeback,
         )
     }
 }
@@ -926,8 +929,10 @@ struct PlannedRemoveDeposed {
 
 enum ReplacementOutcome {
     CurrentRowOnly,
+    CurrentRowRetireOldAddress(ResolvedResourceId),
     CreateAppliedDeposeOld(PlannedDepose),
     DeleteSucceededCreateAbsent(ResolvedResourceId),
+    DeposedDeleteSucceeded(PlannedRemoveDeposed),
     KeepOld,
 }
 
@@ -1051,6 +1056,7 @@ impl<'a, S> WritebackPlan<'a, S> {
     ) -> Result<(), WritebackConflict> {
         match outcome {
             ReplacementOutcome::CurrentRowOnly | ReplacementOutcome::KeepOld => Ok(()),
+            ReplacementOutcome::CurrentRowRetireOldAddress(id) => self.add_cleanup(id),
             ReplacementOutcome::CreateAppliedDeposeOld(depose) => {
                 self.deposes.push(depose);
                 Ok(())
@@ -1058,6 +1064,10 @@ impl<'a, S> WritebackPlan<'a, S> {
             ReplacementOutcome::DeleteSucceededCreateAbsent(id) => {
                 self.upserts.shift_remove(id.as_inner());
                 self.add_cleanup(id)
+            }
+            ReplacementOutcome::DeposedDeleteSucceeded(remove) => {
+                self.add_remove_deposed(remove.id, remove.key);
+                Ok(())
             }
         }
     }
@@ -1083,8 +1093,6 @@ struct ReplacementDeleteInput<'a> {
     prior_dependencies: carina_core::effect::PriorInstanceDestroyDependencies,
     previous_attributes: Option<ReplacementPreviousAttributesForStateWriteback<'a>>,
 }
-
-static CURRENT_GENERATION: EffectGeneration = EffectGeneration::Current;
 
 fn delete_succeeded(
     successfully_deleted: &HashSet<DeletedInstanceKey>,
@@ -1122,6 +1130,26 @@ fn classify_replacement_outcome<S>(
     successfully_deleted: &HashSet<DeletedInstanceKey>,
     schemas: &SchemaRegistry,
 ) -> Result<ReplacementOutcome, AppError> {
+    match delete.generation {
+        EffectGeneration::Current => {}
+        EffectGeneration::Deposed(key) => {
+            return Ok(
+                if delete_succeeded(
+                    successfully_deleted,
+                    delete.id,
+                    delete.generation,
+                    delete.identifier,
+                ) {
+                    ReplacementOutcome::DeposedDeleteSucceeded(PlannedRemoveDeposed {
+                        id: delete.id.clone(),
+                        key: key.clone(),
+                    })
+                } else {
+                    ReplacementOutcome::KeepOld
+                },
+            );
+        }
+    }
     let create_upsert = match create_result {
         ReplacementCreateResult::Upsert(upsert) => Some(upsert),
         ReplacementCreateResult::Ended => return Ok(ReplacementOutcome::CurrentRowOnly),
@@ -1129,7 +1157,7 @@ fn classify_replacement_outcome<S>(
     };
     let create_result = create_upsert.filter(|upsert| upsert.source.is_create_result());
     Ok(match create_result {
-        Some(_upsert)
+        Some(upsert)
             if delete_succeeded(
                 successfully_deleted,
                 delete.id,
@@ -1137,7 +1165,21 @@ fn classify_replacement_outcome<S>(
                 delete.identifier,
             ) =>
         {
-            ReplacementOutcome::CurrentRowOnly
+            // A runtime replacement can adopt a legacy address without a
+            // Move. Keep its new upsert and retire the distinct old row.
+            // Explicit moves transfer their source row during finalization.
+            let old_address = StateBlockAddress::new(
+                delete.id.provider.clone(),
+                delete.id.resource_type.clone(),
+                delete.id.identity().clone(),
+            );
+            if !old_address.matches_resource_id(&upsert.resource.id)
+                && !old_address.matches_resource_id(moved_origins.origin_for(&upsert.resource.id))
+            {
+                ReplacementOutcome::CurrentRowRetireOldAddress(delete.id.clone())
+            } else {
+                ReplacementOutcome::CurrentRowOnly
+            }
         }
         Some(upsert) => {
             let new_identifier = upsert.source.created_identifier();
@@ -1304,7 +1346,7 @@ fn delete_input_from_deferred(delete: &DeferredReplaceDelete) -> ReplacementDele
         id: &delete.id,
         identifier: delete.identifier.as_str(),
         provider_instance: delete.id.as_inner().provider_instance.clone(),
-        generation: &CURRENT_GENERATION,
+        generation: &delete.generation,
         previous_attributes: None,
         prior_dependencies: delete.prior_instance_destroy_dependencies(),
     }
@@ -1446,12 +1488,13 @@ struct DecomposeInput<'a, 's, S = ModuleSource> {
 #[cfg(test)]
 fn decompose<'a, S>(input: DecomposeInput<'a, '_, S>) -> Result<WritebackPlan<'a, S>, AppError> {
     let moved_origins = MovedOrigins::from_plan(input.plan);
-    decompose_with_moved_origins(input, &moved_origins)
+    decompose_with_moved_origins(input, &moved_origins, &[])
 }
 
 fn decompose_with_moved_origins<'a, S>(
     input: DecomposeInput<'a, '_, S>,
     moved_origins: &MovedOrigins,
+    runtime_replacements: &'a [carina_core::replacement::ReplacementWriteback],
 ) -> Result<WritebackPlan<'a, S>, AppError> {
     let state_file = input.state_file;
     let sorted_resources = input.sorted_resources;
@@ -1525,6 +1568,27 @@ fn decompose_with_moved_origins<'a, S>(
         }
     }
 
+    let runtime_by_delete: HashMap<_, _> = runtime_replacements
+        .iter()
+        .flat_map(|replacement| {
+            replacement
+                .old_instances()
+                .iter()
+                .enumerate()
+                .filter(|(_, old)| old.generation.is_current())
+                .map(move |(index, old)| {
+                    (
+                        old.instance_key(),
+                        (
+                            replacement.target(),
+                            old,
+                            replacement.previous_attributes_for_state_writeback(index),
+                        ),
+                    )
+                })
+        })
+        .collect();
+
     let replacement_by_delete_idx: HashMap<usize, ReplaceDisplayInfo<'_>> = plan
         .replace_display_info()
         .map(|replacement| (replacement.delete_idx, replacement))
@@ -1550,11 +1614,46 @@ fn decompose_with_moved_origins<'a, S>(
             continue;
         }
 
+        if let Effect::Delete {
+            id,
+            identifier,
+            generation,
+            ..
+        } = effect
+        {
+            let key = DeletedInstanceKey::new(
+                id.as_inner().clone(),
+                generation.clone(),
+                identifier.as_str().to_owned(),
+            );
+            if let Some((target, old, previous)) = runtime_by_delete.get(&key) {
+                let mut delete = delete_input_from_deferred(old);
+                delete.previous_attributes = Some(*previous);
+                let outcome = classify_replacement_outcome(
+                    delete,
+                    replacement_create_result(target.as_inner(), &wb.upserts, applied_states),
+                    state_file,
+                    managed_current,
+                    moved_origins,
+                    successfully_deleted,
+                    schemas,
+                )?;
+                wb.apply_replacement_outcome(outcome)?;
+                continue;
+            }
+        }
+
         if let Effect::DeferredReplace(payload) = effect {
             for delete in &payload.deletes {
-                let delete = delete_input_from_deferred(delete);
-                let create_result =
-                    replacement_create_result(delete.id.as_inner(), &wb.upserts, applied_states);
+                let key = delete.instance_key();
+                let mut delete = delete_input_from_deferred(delete);
+                let target = if let Some((target, _old, previous)) = runtime_by_delete.get(&key) {
+                    delete.previous_attributes = Some(*previous);
+                    target.as_inner()
+                } else {
+                    delete.id.as_inner()
+                };
+                let create_result = replacement_create_result(target, &wb.upserts, applied_states);
                 let outcome = classify_replacement_outcome(
                     delete,
                     create_result,
@@ -1641,6 +1740,8 @@ pub(crate) fn build_state_after_apply<S: Clone>(
         planned_secret_hashes,
         &comparisons,
         None,
+        &HashMap::new(),
+        &[],
     )
 }
 
@@ -1649,6 +1750,11 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
     planned_secret_hashes: Option<&HashMap<ResourceId, PersistedAttributes>>,
     comparisons: &ResolvedComparisonTable,
     references: Option<&carina_core::references::ResolvedReferences>,
+    runtime_name_overrides: &HashMap<
+        ResourceId,
+        HashMap<String, carina_core::name_override::NameOverride>,
+    >,
+    runtime_replacements: &[carina_core::replacement::ReplacementWriteback],
 ) -> Result<StateFile, AppError> {
     let ApplyStateSave {
         state_file,
@@ -1677,8 +1783,15 @@ fn build_state_after_apply_with_comparisons<S: Clone>(
             schemas,
         },
         &moved_origins,
+        runtime_replacements,
     )?;
-    let permanent_name_overrides = plan.permanent_name_overrides_for_state();
+    let mut permanent_name_overrides = plan.permanent_name_overrides_for_state();
+    for (id, overrides) in runtime_name_overrides {
+        permanent_name_overrides
+            .entry(id.clone())
+            .or_default()
+            .extend(overrides.clone());
+    }
     for (id, planned) in &writeback.upserts {
         let resource = planned.resource;
         let existing = moved_origins.find_persisted_row(&state, id);
@@ -2696,15 +2809,10 @@ mod apply_state_save_tests {
         let resource = Resource::with_provider("mock", "test.Resource", "unknown", None);
         let id = resource.id.clone();
         let resolved_resource = resolved(resource);
-        let failure = carina_core::provider::CreateAttempt::for_test(id.clone()).outcome_unknown(
-            carina_core::provider::EgressSent::for_test(),
+        let unknown = crate::fixture_unknown_create_outcome(
+            &id,
             carina_core::provider::ProviderError::api_error("guest trapped"),
         );
-        let carina_core::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } =
-            failure.into_kind()
-        else {
-            panic!("the witness-gated fixture must mint an unknown outcome")
-        };
 
         let state = build_state_after_apply(
             ApplyStateSave {
@@ -5347,6 +5455,8 @@ mod apply_state_save_tests {
 
     fn deferred_replace_delete(id: &ResourceId) -> DeferredReplaceDelete {
         DeferredReplaceDelete {
+            generation: carina_core::effect::EffectGeneration::Current,
+            previous_attributes: Default::default(),
             id: carina_core::resource::ResolvedResourceId::new(id.clone()),
             identifier: crate::fixture_applied_identifier("old-record-id"),
             directives: Directives::default(),
@@ -5910,8 +6020,11 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let snapshot_plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
-            .expect("replacement metadata should deserialize");
+        let snapshot_plan =
+            serde_json::from_value::<carina_core::plan::UnresolvedSavedPlan>(plan_json)
+                .expect("replacement metadata should deserialize")
+                .resolve_with_schemas(&SchemaRegistry::new())
+                .expect("replacement metadata should admit");
         let plan = carina_core::value::rehydrate_plan_desired_secrets(
             &snapshot_plan,
             &HashMap::new(),
@@ -6092,8 +6205,11 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let snapshot_plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
-            .expect("replacement metadata should deserialize");
+        let snapshot_plan =
+            serde_json::from_value::<carina_core::plan::UnresolvedSavedPlan>(plan_json)
+                .expect("replacement metadata should deserialize")
+                .resolve_with_schemas(&SchemaRegistry::new())
+                .expect("replacement metadata should admit");
         let plan = carina_core::value::rehydrate_plan_desired_secrets(
             &snapshot_plan,
             &HashMap::new(),
@@ -6223,8 +6339,11 @@ mod apply_state_save_tests {
                 "previous_attributes": previous_attributes,
             }
         ]);
-        let snapshot_plan = serde_json::from_value::<carina_core::plan::SavedPlan>(plan_json)
-            .expect("replacement metadata should deserialize");
+        let snapshot_plan =
+            serde_json::from_value::<carina_core::plan::UnresolvedSavedPlan>(plan_json)
+                .expect("replacement metadata should deserialize")
+                .resolve_with_schemas(&SchemaRegistry::new())
+                .expect("replacement metadata should admit");
         let plan = carina_core::value::rehydrate_plan_desired_secrets(
             &snapshot_plan,
             &HashMap::new(),
@@ -7398,6 +7517,91 @@ mod apply_state_save_tests {
     }
 
     #[test]
+    fn review10_4283_absorbed_deposed_delete_retires_only_its_generation() {
+        for current_deleted in [false, true] {
+            let id = ResourceId::with_provider_identity(
+                "aws",
+                "route53.Record",
+                "validation_records[0]",
+                None,
+            );
+            let retained_key = DeposedKey::new_unique();
+            let deleted_key = DeposedKey::new_unique();
+            let mut row = ResourceState::try_applied(
+                "route53.Record",
+                "validation_records[0]",
+                "aws",
+                "old-record-id",
+            )
+            .unwrap();
+            for (key, identifier) in [(&retained_key, "retained-id"), (&deleted_key, "deleted-id")]
+            {
+                row.deposed.push(DeposedInstance::from_persisted_json(
+                    key.clone(),
+                    identifier.into(),
+                    None,
+                    HashMap::new(),
+                    Default::default(),
+                ));
+            }
+            let mut initial = StateFile::new();
+            initial.upsert_resource(row).unwrap();
+            let Effect::DeferredReplace(payload) = deferred_replace_effect(&id) else {
+                unreachable!()
+            };
+            let current = payload.deletes[0].clone();
+            let mut deletes = vec![current.clone()];
+            for (key, identifier) in [(&retained_key, "retained-id"), (&deleted_key, "deleted-id")]
+            {
+                let mut old = current.clone();
+                old.generation = EffectGeneration::Deposed(key.clone());
+                old.identifier = crate::fixture_applied_identifier(identifier);
+                deletes.push(old);
+            }
+            let payload = Box::new(carina_core::effect::DeferredReplacePayload::new(
+                NonEmptyDeletes::try_new(deletes).unwrap(),
+                payload.template.clone(),
+                payload.dependency_template().clone(),
+            ));
+            let mut plan = Plan::new();
+            plan.add(Effect::DeferredReplace(payload));
+            let mut deleted = HashSet::from([DeletedInstanceKey::new(
+                id.clone(),
+                EffectGeneration::Deposed(deleted_key),
+                "deleted-id",
+            )]);
+            if current_deleted {
+                deleted.insert(DeletedInstanceKey::current(id.clone(), "old-record-id"));
+            }
+            let state = build_state_after_apply(
+                ApplyStateSave {
+                    state_file: initial,
+                    sorted_resources: &[],
+                    runtime_synthesized_resources: &[],
+                    managed_current: &HashMap::new(),
+                    applied_states: &HashMap::new(),
+                    plan: &plan,
+                    successfully_deleted: &deleted,
+                    failed_refreshes: &HashSet::new(),
+                    schemas: &SchemaRegistry::new(),
+                },
+                None,
+            )
+            .unwrap();
+            let saved = state
+                .find_resource("aws", "route53.Record", "validation_records[0]")
+                .expect("undeleted deposed generation must retain its row");
+            assert_eq!(
+                saved.identifier().map(|identifier| identifier.as_str()),
+                (!current_deleted).then_some("old-record-id")
+            );
+            assert_eq!(saved.deposed.len(), 1);
+            assert_eq!(saved.deposed[0].key, retained_key);
+            assert_eq!(saved.deposed[0].identifier, "retained-id");
+        }
+    }
+
+    #[test]
     fn plain_replacement_delete_success_create_failure_writes_cleanup() {
         let resource = Resource::new("ec2.Vpc", "main").with_attribute(
             "cidr_block",
@@ -7714,6 +7918,85 @@ mod apply_state_save_tests {
             message,
             WritebackConflict::UpsertCleanupOverlap { id }.to_string()
         );
+    }
+    #[test]
+    fn review_4283_runtime_name_override_survives_checkpoint_and_final_writeback() {
+        let resource = resolved(
+            Resource::with_provider("mock", "test.resource", "thing", None).with_attribute(
+                "name",
+                Value::Concrete(ConcreteValue::String("new-temp".into())),
+            ),
+        );
+        let id = resource.id.clone();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "mock",
+            PatternResourceSchema::new("test.resource")
+                .attribute(
+                    PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                        .create_only()
+                        .build(),
+                )
+                .with_unique_name_attribute("name")
+                .validate()
+                .unwrap(),
+        );
+        let inputs = ApplyStateSaveInputs::new_for_test(
+            vec![resolved(Resource::with_provider(
+                "mock",
+                "test.resource",
+                "template",
+                None,
+            ))],
+            Plan::new(),
+            schemas.clone(),
+            None,
+        );
+        let mut result = ExecutionResult::empty();
+        result.runtime_synthesized_resources.push(resource);
+        result.applied_states.insert(
+            id.clone(),
+            complete_create(applied_name_state(&id, "new-temp")),
+        );
+        result.permanent_name_overrides.insert(
+            id.clone(),
+            HashMap::from([(
+                "name".into(),
+                NameOverride {
+                    temp_value: "new-temp".into(),
+                    original_value: Some("dsl-name".into()),
+                },
+            )]),
+        );
+        let checkpoint = inputs.build_state(StateFile::new(), &result).unwrap();
+        let final_state = inputs.build_state(checkpoint.clone(), &result).unwrap();
+        for state in [&checkpoint, &final_state] {
+            let row = state.find_resource_for_id(&id).unwrap();
+            assert_eq!(
+                row.name_overrides.get("name"),
+                Some(&NameOverride {
+                    temp_value: "new-temp".into(),
+                    original_value: Some("dsl-name".into()),
+                }),
+                "runtime overrides must persist with the original DSL value"
+            );
+            let mut desired = vec![
+                Resource::with_provider("mock", "test.resource", "thing", None).with_attribute(
+                    "name",
+                    Value::Concrete(ConcreteValue::String("dsl-name".into())),
+                ),
+            ];
+            apply_name_overrides(&mut desired, &Some(state.clone()));
+            assert_eq!(
+                desired[0].get_attr("name"),
+                Some(&Value::Concrete(ConcreteValue::String("new-temp".into())))
+            );
+            let next_plan = plan_after_writeback(&desired[0], state, &schemas);
+            assert!(
+                !next_plan.has_mutations(),
+                "runtime naming must converge: {next_plan:?}"
+            );
+        }
     }
 }
 

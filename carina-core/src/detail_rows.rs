@@ -19,7 +19,7 @@ use crate::differ::{
 use crate::effect::{DeletedInstanceKey, Effect, EffectGeneration};
 use crate::explicit::{ExplicitProjection, ProjectedAuthoring};
 use crate::non_empty::NonEmptyVec;
-use crate::plan::{Plan, ReplaceDisplayInfo};
+use crate::plan::{AdmittedPlan, Plan, ReplaceDisplayInfo};
 use crate::provider::{ComparisonResolutionError, HostResult, ProviderRouter};
 use crate::provider::{NestedWriteOnlyRecord, PersistedAttributes};
 use crate::resource::{
@@ -412,6 +412,11 @@ fn combine_with_desired_secret_shape(
 /// Both CLI and TUI consume these to render effect details.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DetailRow {
+    /// Input eligibility cannot yet be decided for this exact desired write slot.
+    PendingInput {
+        path: crate::schema::InputPath,
+        codes: Vec<crate::schema::InputRuleCode>,
+    },
     /// A preformatted informational line.
     Text { text: String },
     /// A provider-retained keyed list entry released from authored state.
@@ -703,7 +708,7 @@ pub enum ListOfMapsDiffField {
 /// ```
 #[derive(Debug)]
 pub struct PreparedPlanDisplay {
-    plan: std::sync::Arc<Plan>,
+    plan: std::sync::Arc<crate::input_rules::InputCheckedPlan>,
     historical: HistoricalDisplayAttributes,
     detail: DetailLevel,
     rows: Vec<Vec<DetailRow>>,
@@ -712,7 +717,7 @@ pub struct PreparedPlanDisplay {
 impl PreparedPlanDisplay {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
-        plan: std::sync::Arc<Plan>,
+        plan: std::sync::Arc<crate::input_rules::InputCheckedPlan>,
         historical: HistoricalDisplayAttributes,
         detail: DetailLevel,
         registry: &SchemaRegistry,
@@ -729,7 +734,7 @@ impl PreparedPlanDisplay {
                 .iter()
                 .enumerate()
                 .map(|(index, effect)| {
-                    if let (Effect::Create(to), Some(replacement)) =
+                    let mut rows = if let (Effect::Create(to), Some(replacement)) =
                         (effect, replacements.get(&index))
                     {
                         build_replace_detail_rows_from_display(
@@ -753,7 +758,9 @@ impl PreparedPlanDisplay {
                             provider,
                             DetailComparisons::Planning(references),
                         )
-                    }
+                    }?;
+                    rows.extend(plan.pending_rows(index));
+                    Ok(rows)
                 })
                 .collect::<HostResult<Vec<_>>>()?
         };
@@ -765,7 +772,11 @@ impl PreparedPlanDisplay {
         })
     }
 
-    pub fn plan(&self) -> &Plan {
+    pub fn plan(&self) -> &AdmittedPlan {
+        &self.plan
+    }
+
+    pub fn checked_plan(&self) -> &crate::input_rules::InputCheckedPlan {
         &self.plan
     }
 
@@ -801,7 +812,7 @@ pub struct PlanDisplay<
     S = crate::resource::ModuleSource,
     V: crate::resource::PlanValueKind = crate::resource::NoPlaceholder,
 > {
-    plan: &'a Plan<S, V>,
+    plan: &'a AdmittedPlan<S, V>,
     historical: &'a HistoricalDisplayAttributes,
     rows: DisplayRows<'a>,
 }
@@ -818,7 +829,7 @@ impl<'a, S, V: crate::resource::PlanValueKind> PlanDisplay<'a, S, V> {
     /// A saved plan or a test comparison that builds its rows on demand.
     /// This constructor cannot accept prepared rows.
     pub fn unprepared(
-        plan: &'a Plan<S, V>,
+        plan: &'a AdmittedPlan<S, V>,
         historical: &'a HistoricalDisplayAttributes,
         comparisons: DetailComparisons<'a>,
     ) -> Self {
@@ -829,7 +840,7 @@ impl<'a, S, V: crate::resource::PlanValueKind> PlanDisplay<'a, S, V> {
         }
     }
 
-    pub fn plan(&self) -> &'a Plan<S, V> {
+    pub fn plan(&self) -> &'a AdmittedPlan<S, V> {
         self.plan
     }
 
@@ -4514,7 +4525,10 @@ mod tests {
         // default-tag provenance survives serialization without being copied
         // into ReplaceDisplayMetadata.
         let plan =
-            serde_json::from_str::<SavedPlan>(&serde_json::to_string(&plan).unwrap()).unwrap();
+            serde_json::from_str::<UnresolvedSavedPlan>(&serde_json::to_string(&plan).unwrap())
+                .unwrap()
+                .resolve_with_schemas(&SchemaRegistry::new())
+                .unwrap();
         let Effect::Create(saved_to) = &plan.effects()[0] else {
             panic!("replacement create effect must survive saved-plan round trip");
         };

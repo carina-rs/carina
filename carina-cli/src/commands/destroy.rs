@@ -1,8 +1,8 @@
 #[cfg(test)]
 use carina_core::config_loader::get_base_dir;
-use carina_core::effect::deps::KeptDestroyTargets;
-use carina_core::resource::{ResolvedDependencies, ResolvedResource};
-use carina_core::wait::ResolvedWaitBinding;
+use carina_core::planning_state::{StateRowKey, state_row_key_from_parts};
+#[cfg(test)]
+use carina_core::resource::ResolvedResource;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -19,16 +19,18 @@ use crate::output_style::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::load_configuration_with_config;
-use carina_core::effect::deps::{
-    DependencyAnalysis, DestroyWaitAlias, ScheduleInputs, build_effect_dependency_analysis,
-};
-use carina_core::effect::{Effect, EffectGeneration};
+use carina_core::effect::Effect;
+#[cfg(test)]
+use carina_core::effect::EffectGeneration;
 use carina_core::executor::{
-    EffectFailure, EffectFailureKind, ExecutionEvent, ExecutionObserver, FailureEventContext,
-    FailureReport, FailureSink, ProgressInfo, classify_stalled_effects as classify_destroy_stall,
+    DeleteRelease, DeleteScheduleError, DeleteScheduler, EffectFailure, EffectFailureKind,
+    ExecutionEvent, ExecutionObserver, FailureEventContext, FailureReport, FailureSink,
+    ProgressInfo, classify_stalled_effects as classify_destroy_stall,
 };
-use carina_core::plan::{Plan, PlanError};
-use carina_core::provider::{HostError, Provider};
+use carina_core::plan::Plan;
+#[cfg(test)]
+use carina_core::plan::PlanError;
+use carina_core::provider::HostError;
 #[cfg(test)]
 use carina_core::resource::State;
 use carina_core::resource::{
@@ -42,7 +44,9 @@ use carina_core::shutdown::{
 };
 #[cfg(test)]
 use carina_state::LockInfo;
-use carina_state::{StateBackend, StateFile};
+use carina_state::StateBackend;
+#[cfg(test)]
+use carina_state::StateFile;
 
 use carina_core::parser::ProviderContext;
 
@@ -59,7 +63,7 @@ use crate::commands::shared::incremental_state_saver::{FinalStateBase, Increment
 use crate::commands::shared::lock_heartbeat::{
     HeartbeatOutcome, StateLock, StateLockRef, with_lock_heartbeat,
 };
-use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
+use crate::commands::shared::plan_errors::render_plan_errors;
 use crate::commands::shared::progress::{
     FailedOutcome, NonFailureOutcome, ProgressBackend, ProgressGuard, ProgressSink, RefreshPhase,
     format_duration,
@@ -776,9 +780,10 @@ validated_config.provider_plan())
     };
     let (ctx, destroy_graph) = validated.config.context_and_resources();
     let parsed = destroy_graph.configuration();
-    let resolved_wait_bindings = destroy_graph.configuration().wait_bindings.iter()
-        .map(|wait| destroy_graph.resolve_wait_binding(wait))
-        .collect::<Result<Vec<_>, _>>()?;
+    // Preserve wait validation before any migrated-state writeback.
+    for wait in &parsed.wait_bindings {
+        destroy_graph.resolve_wait_binding(wait)?;
+    }
     if let Some(migrated) = validated.migrated_state {
         state_file = Some(migrated);
         if let Some(state) = state_file.as_ref() {
@@ -908,52 +913,31 @@ validated_config.provider_plan())
             .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
             .map(|id| state_row_key_from_id(&id)),
     );
-    let resolved_resources_to_destroy = resources_to_destroy
-        .iter()
-        .map(|resource| destroy_graph.resolve_resource((*resource).clone(), ctx.schemas()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let destroyed_ids: HashSet<_> = resolved_resources_to_destroy
-        .iter()
-        .map(ResolvedResource::resolved_id)
-        .collect();
-    let kept_targets: KeptDestroyTargets = parsed
-        .data_sources
-        .iter()
-        .filter_map(|data_source| ResolvedResourceId::try_new(data_source.id.clone()))
-        .chain(
-            all_resources
-                .iter()
-                .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone())),
-        )
-        .filter(|id| !destroyed_ids.contains(id))
-        .collect();
-    let (delete_effects, identifier_errors) = build_destroy_delete_effects(
-        &resolved_resources_to_destroy,
-        &managed_current,
-        state_file.as_ref(),
-        &protected_row_keys,
-    );
-    if !identifier_errors.is_empty() {
-        let mut error_plan = Plan::new();
-        for error in identifier_errors {
-            error_plan.add_error(error);
+    // A read keyed by the exact persisted row address may canonicalize its
+    // identifier. The planning copy preserves the persisted routing instance;
+    // observations under other keys cannot retarget the row.
+    let rows = state_file.as_ref().map(|state| state.planning_rows_after_refresh(&managed_current)).unwrap_or_default();
+    let execution_plan = match carina_core::planning_state::DestroyPlan::from_state(
+        &resources_to_destroy, &managed_current, &rows, destroy_graph,
+        &protected_row_keys, ctx.schemas(),
+    ) {
+        Ok(plan) => plan,
+        Err(carina_core::planning_state::DestroyPlanError::State(errors)) => {
+            return Err(render_plan_errors(color_mode, &errors, &base_dir.source_label()));
         }
-        render_plan_errors_and_abort(color_mode, &error_plan, &base_dir.source_label())?;
-    }
-
-    let wait_aliases = build_destroy_wait_aliases(&resolved_wait_bindings, &delete_effects);
-    let dependency_analysis = build_effect_dependency_analysis(
-        &delete_effects,
-        std::iter::empty(),
-        ScheduleInputs::Destroy {
-            aliases: &wait_aliases,
-            kept_targets: &kept_targets,
-        },
-    )
-    .map_err(DestroyDependencyAnalysisError::new)?;
+        Err(carina_core::planning_state::DestroyPlanError::Graph(error)) => return Err(error.into()),
+        Err(carina_core::planning_state::DestroyPlanError::Admission(error)) => return Err(error.into()),
+        Err(error @ carina_core::planning_state::DestroyPlanError::IdentifierMismatch { .. }) => return Err(error.into()),
+    };
+    let delete_effects = execution_plan.plan().effects();
+    let mut delete_scheduler = DeleteScheduler::for_destroy(&execution_plan)
+        .map_err(|error| match error {
+            DeleteScheduleError::Dependencies(error) => AppError::from(DestroyDependencyAnalysisError::new(error)),
+            error => AppError::from(error),
+        })?;
     let delete_count = delete_effects.len();
-    let deletion_deps = transitive_delete_deps(&dependency_analysis, delete_count);
-    let delete_depths = compute_delete_depths(delete_count, &deletion_deps);
+    let deletion_deps = delete_scheduler.dependencies();
+    let delete_depths = compute_delete_depths(delete_count, deletion_deps);
     let resource_names: Vec<String> = delete_effects
         .iter()
         .map(|effect| {
@@ -965,7 +949,7 @@ validated_config.provider_plan())
         .collect();
     let display_order = topological_delete_order(
         delete_count,
-        &deletion_deps,
+        deletion_deps,
         &delete_depths,
         &resource_names,
     )
@@ -988,7 +972,8 @@ validated_config.provider_plan())
     for idx in &display_order {
         destroy_plan.add(delete_effects[*idx].clone());
     }
-    destroy_plan.record_unresolved_delete_ordering_analysis(&dependency_analysis);
+    destroy_plan.record_unresolved_delete_ordering_analysis(delete_scheduler.analysis());
+    let destroy_plan = destroy_plan.admit(ctx.schemas())?;
     let historical_display =
         collect_historical_display_attributes(&destroy_plan, &managed_current, state_file.as_ref());
 
@@ -1154,7 +1139,6 @@ validated_config.provider_plan())
         },
     );
     let mut destroyed_instances = DestroyedInstances::new(saver.publisher());
-    let mut failed_indices: HashSet<usize> = HashSet::new();
     let mut cancelled = false;
 
     let destroy_total = delete_effects.len();
@@ -1182,7 +1166,11 @@ validated_config.provider_plan())
 
     // Retain the last provider cause as well as the failed-attempt count.
     let max_retries: usize = 3;
-    let mut retry_failures: HashMap<usize, DeleteRetryFailure> = HashMap::new();
+    // A pending retry owns both its provider cause and its completion receipt.
+    // After release, retain the prior cause until the next result is known,
+    // including cancellation between scheduler release and provider dispatch.
+    let mut pending_retries: HashMap<usize, (DeleteRetryFailure, carina_core::executor::DeleteCompletion)> = HashMap::new();
+    let mut active_retries = HashMap::new();
     // Indices waiting for at least one other effect to complete before retrying.
     // They are moved back to the ready pool when `in_flight.next()` returns.
     let mut retry_pending: HashSet<usize> = HashSet::new();
@@ -1212,22 +1200,28 @@ validated_config.provider_plan())
         }
 
         if !cancelled {
-            // Find newly ready resources: all deletion deps completed, not yet
-            // dispatched, and not waiting for a retry gate.
-            let mut newly_ready: Vec<usize> = Vec::new();
+            // Only the shared scheduler can release delete authority. The CLI
+            // retains display priority and its provider-retry gate.
+            let mut newly_ready = Vec::new();
+            let capacity = parallelism.get().saturating_sub(in_flight.len());
             for &idx in &all_indices {
+                if newly_ready.len() == capacity {
+                    break;
+                }
                 if dispatched.contains(&idx) || retry_pending.contains(&idx) {
                     continue;
                 }
-                let deps = &deletion_deps[&idx];
-                if deps.iter().all(|d| completed_indices.contains(d)) {
-                    newly_ready.push(idx);
+                if let Some((failure, completion)) = pending_retries.remove(&idx) {
+                    delete_scheduler.retry(completion)?;
+                    active_retries.insert(idx, failure);
+                }
+                if let Some(release) = delete_scheduler.release(idx)? {
+                    newly_ready.push((idx, release));
                 }
             }
-            newly_ready.truncate(parallelism.get().saturating_sub(in_flight.len()));
 
             // Process newly ready resources
-            for idx in newly_ready {
+            for (idx, release) in newly_ready {
                 match cancel.phase() {
                     ShutdownPhase::Running => {}
                     ShutdownPhase::Graceful | ShutdownPhase::CleanupPriority => {
@@ -1240,69 +1234,48 @@ validated_config.provider_plan())
 
                 let (_binding, effect) = &resource_info[idx];
 
-                // Check if any dependent has failed.
-                if let Some(failed_dep_idx) = delete_dependency_in_set(
-                    idx,
-                    &dependency_analysis,
-                    delete_count,
-                    &failed_indices,
-                ) {
-                    let failed_dep = &resource_info[failed_dep_idx].0;
-                    let outcome = NonFailureOutcome::skipped(format_destroy_outcome_summary(color_mode,
-                        &completed_counter,
-                        destroy_total,
-                        effect,
-                        format!("- skipped (dependent {failed_dep} failed)"),
-                    ));
-                    progress.outcome_line(outcome);
-                    skip_count += 1;
-                    failed_indices.insert(idx);
-                    completed_indices.insert(idx);
-                    continue;
-                }
+                let scheduled_delete = match release {
+                    DeleteRelease::Ready(delete) => delete,
+                    DeleteRelease::Blocked { dependency: failed_dep_idx } => {
+                        let failed_dep = &resource_info[failed_dep_idx].0;
+                        let outcome = NonFailureOutcome::skipped(format_destroy_outcome_summary(
+                            color_mode,
+                            &completed_counter,
+                            destroy_total,
+                            effect,
+                            format!("- skipped (dependent {failed_dep} failed)"),
+                        ));
+                        progress.outcome_line(outcome);
+                        skip_count += 1;
+                        completed_indices.insert(idx);
+                        continue;
+                    }
+                };
 
                 let active_progress = progress.start_indexed(idx, format_effect(effect));
 
                 // Spawn the deletion as a concurrent future
                 let Effect::Delete {
                     id,
-                    identifier,
                     generation,
-                    directives,
                     ..
                 } = effect
                 else {
                     unreachable!("destroy dispatch only contains delete effects");
                 };
                 let resource_id = id.clone();
-                let identifier = identifier.clone();
                 let generation = generation.clone();
-                let directives = directives.clone();
-                let resolved_directives = ctx
-                    .schemas()
-                    .resolve_directives(
-                        resource_id.as_inner(),
-                        SchemaKind::Resource,
-                        &directives,
-                    );
-                let delete_request = carina_core::provider::DeleteRequest::from_resolved(
-                    resolved_directives,
-                );
 
                 let provider_ref = &provider;
+                let schemas = ctx.schemas();
                 let result_runtime = &runtime;
                 let result_shutdown = &cancel;
                 let delete = async move {
                     let started = Instant::now();
-                    let delete_result = provider_ref
-                        .delete(
-                            resource_id.as_inner(),
-                            &identifier,
-                            delete_request,
-                        )
-                        .await;
+                    let (delete_result, completion) =
+                        scheduled_delete.dispatch(provider_ref, schemas).await;
                     observe_destroy_result_ready_for_tests(result_runtime, result_shutdown).await;
-                    (resource_id, generation, started, delete_result)
+                    (resource_id, generation, started, delete_result, completion)
                 };
                 in_flight.push(DestroyInFlight::new(idx, active_progress, delete));
             }
@@ -1328,7 +1301,8 @@ validated_config.provider_plan())
             // deletes instead of misdiagnosing attempted work as undispatched.
             let mut exhausted_retries = false;
             for &idx in &remaining {
-                if let Some(retry) = retry_failures.remove(&idx) {
+                if let Some((retry, completion)) = pending_retries.remove(&idx) {
+                    delete_scheduler.complete(completion)?;
                     let (_, effect) = &resource_info[idx];
                     record_destroy_failure(
                         &mut failures,
@@ -1344,7 +1318,6 @@ validated_config.provider_plan())
                             progress.failed_line(outcome);
                         },
                     );
-                    failed_indices.insert(idx);
                     dispatched.insert(idx);
                     completed_indices.insert(idx);
                     retry_pending.remove(&idx);
@@ -1357,7 +1330,7 @@ validated_config.provider_plan())
             // Non-retry cycle: retain one shared cycle and attribute every
             // remaining effect to it instead of silently counting failures.
             let effects = resource_info.iter().map(|(_, effect)| effect.clone()).collect::<Vec<_>>();
-            for (idx, kind) in classify_destroy_stall(&effects, &deletion_deps, &remaining.into_iter().collect(), &completed_indices) {
+            for (idx, kind) in classify_destroy_stall(&effects, delete_scheduler.dependencies(), &remaining.into_iter().collect(), &completed_indices) {
                 let (_, effect) = &resource_info[idx];
                 record_destroy_failure(&mut failures, effect, kind, |failure| {
                     let outcome = FailedOutcome::summary(format_destroy_outcome_summary(color_mode,
@@ -1396,7 +1369,7 @@ validated_config.provider_plan())
         let (
             finished_idx,
             active_progress,
-            (resource_id, generation, started, delete_result),
+            (resource_id, generation, started, delete_result, completion),
         ) = match next {
             CleanupInterrupted::Completed(Some(finished)) => finished,
             CleanupInterrupted::Completed(None) => break 'destroy,
@@ -1415,7 +1388,8 @@ validated_config.provider_plan())
 
         match delete_result {
             Ok(()) => {
-                retry_failures.remove(&finished_idx);
+                delete_scheduler.complete(completion)?;
+                active_retries.remove(&finished_idx);
                 let timing = format!("took {}", format_duration(started.elapsed())).dimmed(color_mode);
                 let outcome = NonFailureOutcome::success(format_destroy_outcome_summary(color_mode,
                     &completed_counter,
@@ -1433,7 +1407,7 @@ validated_config.provider_plan())
                 destroyed_instances.record(destroyed);
             }
             Err(e) => {
-                let retries = retry_failures.get(&finished_idx).map_or(0, |retry| retry.attempts);
+                let retries = active_retries.remove(&finished_idx).map_or(0, |retry| retry.attempts);
                 let retryable = is_retryable_delete_error(&e);
                 let has_pending_or_in_flight = !in_flight.is_empty()
                     || all_indices
@@ -1444,7 +1418,7 @@ validated_config.provider_plan())
                     && has_pending_or_in_flight
                 {
                     let retry_num = retries + 1;
-                    retry_failures.insert(finished_idx, DeleteRetryFailure { attempts: retry_num, last_error: e });
+                    pending_retries.insert(finished_idx, (DeleteRetryFailure { attempts: retry_num, last_error: e }, completion));
                     completed_indices.remove(&finished_idx);
                     dispatched.remove(&finished_idx);
                     retry_pending.insert(finished_idx);
@@ -1456,7 +1430,7 @@ validated_config.provider_plan())
                     ));
                     active_progress.finish(outcome);
                 } else {
-                    retry_failures.remove(&finished_idx);
+                    delete_scheduler.complete(completion)?;
                     let kind = if retries > 0 {
                         let reason = if !retryable {
                             DeleteRetryStop::NotRetryable
@@ -1487,7 +1461,6 @@ validated_config.provider_plan())
                             active_progress.finish_failed(outcome);
                         },
                     );
-                    failed_indices.insert(finished_idx);
                 }
             }
         }
@@ -1501,7 +1474,8 @@ validated_config.provider_plan())
             if dispatched.contains(&idx) || completed_indices.contains(&idx) {
                 continue;
             }
-            if let Some(retry) = retry_failures.remove(&idx) {
+            if let Some(retry) = pending_retries.remove(&idx).map(|(retry, _completion)| retry)
+                .or_else(|| active_retries.remove(&idx)) {
                 let effect = &resource_info[idx].1;
                 record_destroy_failure(
                     &mut failures,
@@ -1519,7 +1493,6 @@ validated_config.provider_plan())
                         ));
                     },
                 );
-                failed_indices.insert(idx);
                 dispatched.insert(idx);
                 completed_indices.insert(idx);
             }
@@ -1762,7 +1735,7 @@ async fn run_destroy_locked(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-async fn run_destroy_locked_with_ctx(
+pub(crate) async fn run_destroy_locked_with_ctx(
     validated_config: ValidatedConfig<carina_core::parser::ExpandedInferredFile>,
     auto_approve: bool,
     backend: Arc<dyn StateBackend>,
@@ -1920,148 +1893,44 @@ fn observe_destroy_success_for_tests(
 ) {
 }
 
-fn build_destroy_wait_aliases(
-    wait_bindings: &[ResolvedWaitBinding],
-    delete_effects: &[Effect],
-) -> Vec<DestroyWaitAlias> {
-    let delete_dependencies: Vec<(ResolvedResourceId, ResolvedDependencies)> = delete_effects
-        .iter()
-        .filter_map(|effect| match effect {
-            Effect::Delete {
-                id, dependencies, ..
-            } => Some((id.clone(), dependencies.to_resolved_dependencies())),
-            Effect::Read { .. }
-            | Effect::Create(_)
-            | Effect::ResumeCreate { .. }
-            | Effect::Update { .. }
-            | Effect::Import { .. }
-            | Effect::Remove { .. }
-            | Effect::Move { .. }
-            | Effect::ReleaseListKeys { .. }
-            | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
-            | Effect::DeferredReplace(_) => None,
-        })
-        .collect();
-    let destroy_targets: HashSet<&ResolvedResourceId> =
-        delete_dependencies.iter().map(|(id, _)| id).collect();
-    let referenced_bindings: HashSet<&ResolvedResourceId> = delete_dependencies
-        .iter()
-        .flat_map(|(_, dependencies)| dependencies.iter())
-        .collect();
-
-    wait_bindings
-        .iter()
-        .filter(|wait| referenced_bindings.contains(&wait.id))
-        .filter_map(|wait| {
-            if !destroy_targets.contains(wait.target_id.id()) {
-                return None;
-            }
-            let mut consumers = delete_dependencies
-                .iter()
-                .filter(|(_, dependencies)| dependencies.contains(&wait.id))
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            consumers.sort();
-            consumers.dedup();
-
-            DestroyWaitAlias::new(
-                wait.id.clone(),
-                wait.target_id.id().clone(),
-                wait.explicit_dependencies.clone(),
-                consumers,
-            )
-        })
-        .collect()
-}
-
+#[cfg(test)]
 fn build_destroy_delete_effects(
-    resources_to_destroy: &[ResolvedResource],
-    managed_current: &HashMap<ResourceId, Current>,
-    state_file: Option<&StateFile>,
-    protected_row_keys: &HashSet<StateRowKey>,
+    resources: &[ResolvedResource],
+    current: &HashMap<ResourceId, Current>,
+    state: Option<&StateFile>,
+    protected: &HashSet<StateRowKey>,
 ) -> (Vec<Effect>, Vec<PlanError>) {
-    let mut delete_effects = Vec::with_capacity(resources_to_destroy.len());
-    let mut errors = Vec::new();
-    for resource in resources_to_destroy {
-        let identifier = match managed_current.get(&resource.id) {
-            Some(Current::Present(present)) => present.identifier().clone(),
-            Some(Current::Absent(_state)) => {
-                errors.push(PlanError::new(
-                    resource.id.clone(),
-                    carina_core::plan::PlanErrorKind::MissingProviderIdentifier,
-                ));
-                continue;
-            }
-            Some(Current::MissingIdentifier(_state)) => {
-                errors.push(PlanError::new(
-                    resource.id.clone(),
-                    carina_core::plan::PlanErrorKind::MissingProviderIdentifier,
-                ));
-                continue;
-            }
-            Some(Current::CreateInFlight(_pending)) => {
-                errors.push(PlanError::new(
-                    resource.id.clone(),
-                    carina_core::plan::PlanErrorKind::DestroyCreateInFlight,
-                ));
-                continue;
-            }
-            Some(Current::CreateOutcomeUnknown(unknown)) => {
-                errors.push(PlanError::create_outcome_unknown(unknown.id().clone()));
-                continue;
-            }
-            None => {
-                errors.push(PlanError::new(
-                    resource.id.clone(),
-                    carina_core::plan::PlanErrorKind::MissingProviderIdentifier,
-                ));
-                continue;
-            }
-        };
-        let mut dependencies = resource.persisted_value_destroy_dependencies().clone();
-        dependencies.extend_projected(resource.persisted_explicit_destroy_dependencies());
-        let mut explicit_dependencies = resource.explicit_dependencies().clone();
-        if let Some(row) = state_file.and_then(|state| {
-            state.find_resource(
-                resource.id.provider.as_str(),
-                resource.id.resource_type.as_str(),
-                resource.identity_str(),
+    // Legacy unit fixtures supply current observations separately. Assemble
+    // their authoritative rows here, without exposing a production bypass.
+    let mut source = state.cloned().unwrap_or_default();
+    for resource in resources {
+        let stored = source.find_resource_for_id(&resource.id).cloned();
+        let mut row = match current.get(&resource.id) {
+            Some(Current::Present(present)) => carina_state::ResourceState::try_applied(
+                resource.id.resource_type.clone(),
+                resource.identity().clone(),
+                resource.id.provider.clone(),
+                present.identifier().as_str(),
             )
-        }) {
-            dependencies.extend_projected(&row.dependency_bindings);
-            dependencies.extend_projected(&row.directives.depends_on);
-            explicit_dependencies.extend(row.directives.depends_on.iter().cloned());
+            .unwrap(),
+            _ => carina_state::ResourceState::new(
+                resource.id.resource_type.clone(),
+                resource.identity().clone(),
+                resource.id.provider.clone(),
+            ),
+        };
+        if let Some(stored) = stored {
+            row.deposed = stored.deposed;
+            row.directives = stored.directives;
+            row.dependency_bindings = stored.dependency_bindings;
         }
-        delete_effects.push(Effect::Delete {
-            id: resource.resolved_id(),
-            identifier,
-            generation: EffectGeneration::Current,
-            directives: resource.directives.clone(),
-            binding: resource.binding.clone(),
-            dependencies,
-            explicit_dependencies,
-            blocked_by_updates: ResolvedDependencies::default(),
-        });
+        row.directives.provider_instance = resource.id.provider_instance.clone();
+        row.binding = resource.binding.clone();
+        source.upsert_resource(row).unwrap();
     }
-    if let Some(sf) = state_file {
-        for row in sf.resources() {
-            if protected_row_keys.contains(&state_row_key_from_parts(
-                &row.provider,
-                &row.resource_type,
-                row.identity.as_str(),
-            )) {
-                continue;
-            }
-            let (effects, row_errors) = crate::wiring::deposed_delete_effects_for_row(row, &[]);
-            delete_effects.extend(effects);
-            errors.extend(row_errors);
-        }
-    }
-    (delete_effects, errors)
+    let rows = source.planning_rows();
+    carina_core::planning_state::build_destroy_delete_effects(resources, current, &rows, protected)
 }
-
-type StateRowKey = (String, String, String);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DestroyPlanCounts {
@@ -2179,51 +2048,6 @@ fn finish_interrupted_destroy_outcomes(
 
 fn state_row_key_from_id(id: &ResolvedResourceId) -> StateRowKey {
     state_row_key_from_parts(&id.provider, &id.resource_type, id.identity_str())
-}
-
-fn state_row_key_from_parts(provider: &str, resource_type: &str, identity: &str) -> StateRowKey {
-    (
-        provider.to_string(),
-        resource_type.to_string(),
-        identity.to_string(),
-    )
-}
-
-fn transitive_delete_deps(
-    analysis: &DependencyAnalysis,
-    delete_count: usize,
-) -> HashMap<usize, HashSet<usize>> {
-    (0..delete_count)
-        .map(|idx| {
-            let mut deps = HashSet::new();
-            let mut seen = HashSet::new();
-            collect_delete_deps(idx, analysis, delete_count, &mut seen, &mut deps);
-            (idx, deps)
-        })
-        .collect()
-}
-
-fn collect_delete_deps(
-    idx: usize,
-    analysis: &DependencyAnalysis,
-    delete_count: usize,
-    seen: &mut HashSet<usize>,
-    deps: &mut HashSet<usize>,
-) {
-    let Some(children) = analysis.deps_of(idx) else {
-        return;
-    };
-
-    for &child in children {
-        if !seen.insert(child) {
-            continue;
-        }
-        if child < delete_count {
-            deps.insert(child);
-        } else {
-            collect_delete_deps(child, analysis, delete_count, seen, deps);
-        }
-    }
 }
 
 fn topological_delete_order(
@@ -2354,38 +2178,6 @@ fn cycle_path(
     "<unknown>".to_string()
 }
 
-fn delete_dependency_in_set(
-    idx: usize,
-    analysis: &DependencyAnalysis,
-    delete_count: usize,
-    candidates: &HashSet<usize>,
-) -> Option<usize> {
-    let mut sorted: Vec<_> = candidates.iter().copied().collect();
-    sorted.sort_unstable();
-    sorted.into_iter().find(|candidate| {
-        *candidate < delete_count && graph_reaches_delete_idx(*candidate, idx, analysis)
-    })
-}
-
-fn graph_reaches_delete_idx(start: usize, target: usize, analysis: &DependencyAnalysis) -> bool {
-    let mut stack = vec![start];
-    let mut seen = HashSet::new();
-
-    while let Some(idx) = stack.pop() {
-        if !seen.insert(idx) {
-            continue;
-        }
-        if idx == target {
-            return true;
-        }
-        if let Some(dependents) = analysis.dependents_of(idx) {
-            stack.extend(dependents.iter().copied());
-        }
-    }
-
-    false
-}
-
 pub(crate) struct FinalizeDestroyInput<'a> {
     pub backend: &'a dyn StateBackend,
     pub lock: StateLockRef<'a>,
@@ -2455,6 +2247,102 @@ mod tests {
     mod cancellation_fixture;
 
     use cancellation_fixture::DestroyCancellationFixture;
+
+    #[tokio::test]
+    async fn destroy_dispatches_only_scheduler_released_deletes() {
+        use carina_core::executor::{DeleteRelease, DeleteScheduler};
+        use carina_core::provider::AppliedIdentifier;
+        use carina_core::schema::SchemaRegistry;
+        use carina_provider_mock::{
+            ConfiguredBuiltinMock, MockBehavior, MockObservations, MockScope,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("deletes.log");
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                observations: MockObservations {
+                    delete_log: Some(log.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            MockScope::memory(),
+        )
+        .create_provider();
+        let parent = ResolvedResourceId::try_new(ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "parent",
+            None,
+        ))
+        .unwrap();
+        let child = ResolvedResourceId::try_new(ResourceId::with_provider_identity(
+            "mock",
+            "test.resource",
+            "child",
+            None,
+        ))
+        .unwrap();
+        let mut plan = Plan::new();
+        for (id, dependencies) in [
+            (parent.clone(), Default::default()),
+            (
+                child.clone(),
+                carina_core::resource::PersistedDestroyDependencies::from_test_dependencies(
+                    std::iter::once(parent),
+                ),
+            ),
+        ] {
+            plan.add(Effect::Delete {
+                identifier: AppliedIdentifier::new(id.identity_str()).unwrap(),
+                id,
+                generation: EffectGeneration::Current,
+                directives: Default::default(),
+                binding: None,
+                dependencies,
+                explicit_dependencies: Default::default(),
+                blocked_by_updates: Default::default(),
+            });
+        }
+        let schemas = SchemaRegistry::new();
+        let plan = plan.admit(&schemas).unwrap();
+        let mut scheduler = DeleteScheduler::for_test(&plan, &[], &Default::default()).unwrap();
+        assert!(
+            scheduler.release(0).unwrap().is_none(),
+            "parent must wait for child"
+        );
+        let Some(DeleteRelease::Ready(child_delete)) = scheduler.release(1).unwrap() else {
+            panic!("scheduler must release the leaf first");
+        };
+        assert!(
+            scheduler.release(1).unwrap().is_none(),
+            "one permit per attempt"
+        );
+        assert!(
+            scheduler.release(0).unwrap().is_none(),
+            "dispatch alone is not completion"
+        );
+        let provider = crate::provider_text_fixtures::boundary(Box::new(provider));
+        let (result, completion) = child_delete.dispatch(&provider, &schemas).await;
+        result.unwrap();
+        assert!(
+            scheduler.release(0).unwrap().is_none(),
+            "completion must be recorded"
+        );
+        scheduler.complete(completion).unwrap();
+        let Some(DeleteRelease::Ready(parent_delete)) = scheduler.release(0).unwrap() else {
+            panic!("completed leaf must release its parent");
+        };
+        let (result, completion) = parent_delete.dispatch(&provider, &schemas).await;
+        result.unwrap();
+        scheduler.complete(completion).unwrap();
+        assert!(scheduler.release(0).unwrap().is_none());
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "test.resource.child\ntest.resource.parent\n"
+        );
+    }
 
     #[test]
     fn destroy_stall_matches_apply_scc_and_no_progress_classification() {
@@ -3818,16 +3706,10 @@ mod tests {
             "unknown",
             None,
         ));
-        let failure = carina_core::provider::CreateAttempt::for_test(resource.id.clone())
-            .outcome_unknown(
-                carina_core::provider::EgressSent::for_test(),
-                carina_core::provider::ProviderError::api_error("guest trapped"),
-            );
-        let carina_core::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } =
-            failure.into_kind()
-        else {
-            panic!("the egress witness must mint an unknown outcome")
-        };
+        let unknown = crate::fixture_unknown_create_outcome(
+            &resource.id,
+            carina_core::provider::ProviderError::api_error("guest trapped"),
+        );
         let current_states = HashMap::from([(
             resource.id.clone(),
             Current::create_outcome_unknown(unknown),
@@ -3907,22 +3789,22 @@ mod tests {
             } if dependencies == &crate::test_support::persisted([network_id, parent_id.clone()]) && explicit_dependencies == &std::iter::once(parent_id).collect()
         ));
 
-        let analysis = build_effect_dependency_analysis(
-            &effects,
-            std::iter::empty(),
-            ScheduleInputs::Destroy {
-                aliases: &[],
-                kept_targets: &Default::default(),
-            },
-        )
-        .expect("destroy dependency analysis must resolve");
-        let deletion_deps = transitive_delete_deps(&analysis, effects.len());
-        let depths = compute_delete_depths(effects.len(), &deletion_deps);
+        let mut plan = Plan::new();
+        for effect in &effects {
+            plan.add(effect.clone());
+        }
+        let admitted = plan
+            .admit(&carina_core::schema::SchemaRegistry::new())
+            .unwrap();
+        let scheduler = DeleteScheduler::for_test(&admitted, &[], &Default::default())
+            .expect("destroy dependency analysis must resolve");
+        let deletion_deps = scheduler.dependencies();
+        let depths = compute_delete_depths(effects.len(), deletion_deps);
         let names = effects
             .iter()
             .map(|effect| effect.binding_address().unwrap().to_string())
             .collect::<Vec<_>>();
-        let order = topological_delete_order(effects.len(), &deletion_deps, &depths, &names)
+        let order = topological_delete_order(effects.len(), deletion_deps, &depths, &names)
             .expect("orphan dependency graph must be acyclic");
         assert_eq!(
             order

@@ -96,15 +96,11 @@ impl Provider for LateProvider {
         _: &carina_core::resource::ResourceId,
         _: &AppliedIdentifier,
         _: UpdateRequest,
+        _: UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         unreachable!()
     }
-    fn delete(
-        &self,
-        _: &carina_core::resource::ResourceId,
-        _: &AppliedIdentifier,
-        _: DeleteRequest,
-    ) -> BoxFuture<'_, ProviderResult<()>> {
+    fn delete(&self, _: DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
         unreachable!()
     }
 }
@@ -147,6 +143,8 @@ async fn guest_stderr_round5_deferred_ref_grows_during_and_after_create() {
         ),
     ));
     let schemas = carina_core::schema::SchemaRegistry::new();
+    let plan = carina_core::input_rules::finalize_plan_for_test(plan)
+        .check_inputs(&schemas, &Default::default()).unwrap();
     let input = LiveExecutionInput {
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,

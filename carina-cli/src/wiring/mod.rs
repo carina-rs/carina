@@ -72,7 +72,7 @@
 use carina_core::effect::{AddressedMoves, ResolvedExplicitMove, ResolvedMovePairs};
 use carina_core::paths::ResolvedPath;
 use carina_core::provider::{MetadataComparisonResolver, ResourceComparisonResolver};
-use carina_core::resource::{PersistedDirectives, ResolvedDependencies};
+use carina_core::resource::PersistedDirectives;
 use legacy_migration::DeferredForExpansionWitness;
 pub(crate) use legacy_migration::{
     MaterializedConfiguration, classify_legacy_state, replay_legacy_migration,
@@ -101,17 +101,13 @@ use carina_core::deps::{
     sort_resources_by_dependencies,
 };
 pub use carina_core::differ::DeferredForExpansionChoice;
-use carina_core::differ::{
-    CascadeDependents, DeferredCreateTargets, block_deletes_on_prior_consumer_updates,
-};
+use carina_core::differ::{CascadeDependents, DeferredCreateTargets};
 use carina_core::differ::{
     Orphan, Orphans, PlanPriorStates, into_all_prior_states, lift_prior_state_enum_leaves,
     provider_states_for, rekey_current_for_move, transform_prior_managed_provider_states,
     transform_prior_provider_states,
 };
-use carina_core::effect::{
-    Effect, EffectGeneration, MoveAuthority, OutcomeUnknownImportReplacement, ResolvedMove,
-};
+use carina_core::effect::{Effect, MoveAuthority, OutcomeUnknownImportReplacement, ResolvedMove};
 use carina_core::executor::normalized::{
     apply_host_desired_normalization_slice, is_value_fully_concrete_for_expansion,
     states_contain_unknown,
@@ -226,12 +222,18 @@ pub enum PlannedPlan {
         references: carina_core::references::ResolvedReferences,
     },
     Unrendered {
-        plan: Plan,
+        plan: Box<carina_core::input_rules::InputCheckedPlan>,
         references: carina_core::references::ResolvedReferences,
     },
 }
 
 impl PlannedPlan {
+    pub(crate) fn checked(&self) -> &carina_core::input_rules::InputCheckedPlan {
+        match self {
+            Self::Rendered { display, .. } => display.checked_plan(),
+            Self::Unrendered { plan, .. } => plan,
+        }
+    }
     pub(crate) fn references(&self) -> &carina_core::references::ResolvedReferences {
         match self {
             Self::Rendered { references, .. } | Self::Unrendered { references, .. } => references,
@@ -240,9 +242,9 @@ impl PlannedPlan {
 }
 
 impl std::ops::Deref for PlannedPlan {
-    type Target = Plan;
+    type Target = carina_core::plan::AdmittedPlan;
 
-    fn deref(&self) -> &Plan {
+    fn deref(&self) -> &carina_core::plan::AdmittedPlan {
         match self {
             Self::Rendered { display, .. } => display.plan(),
             Self::Unrendered { plan, .. } => plan,
@@ -285,19 +287,26 @@ impl std::ops::Deref for PlanOutcome {
 /// plans exit through a distinct type before a historical view is constructed.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn prepare_plan_outcome(
-    plan: Plan,
+    plan: carina_core::input_rules::FinalizedPlan,
     planning: carina_core::references::ResolvedReferences,
     preparation: &mut carina_core::references::ReferencePreparation,
     row_request: RowRequest,
     managed_current: &HashMap<ResourceId, Current>,
     state_file: Option<&StateFile>,
     schemas: &SchemaRegistry,
+    input_types: &carina_core::input_rules::InputTypeContext,
     explicit: &HashMap<ResourceId, carina_core::explicit::ExplicitFields>,
     provider: &ProviderRouter,
 ) -> Result<PlanOutcome, AppError> {
-    if let Ok(errors) = NonEmptyPlanErrors::try_from(plan.errors().to_vec()) {
-        return Ok(PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }));
-    }
+    let plan = match plan.check_inputs_with_types(schemas, managed_current, input_types) {
+        Ok(plan) => plan,
+        Err(plan) => {
+            let plan = plan.into_plan();
+            let errors = NonEmptyPlanErrors::try_from(plan.errors().to_vec())
+                .expect("input rejection contains diagnostics");
+            return Ok(PlanOutcome::Diagnostics(DiagnosticPlan { plan, errors }));
+        }
+    };
     let planned = match row_request {
         RowRequest::Render(detail) => {
             let historical = crate::commands::plan::collect_historical_display_attributes(
@@ -316,7 +325,7 @@ pub(crate) async fn prepare_plan_outcome(
             }
         }
         RowRequest::None => PlannedPlan::Unrendered {
-            plan,
+            plan: Box::new(plan),
             references: planning,
         },
     };
@@ -7102,9 +7111,9 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     )
                     .await?;
                 let mut state_block_result = Ok(());
-                let mut plan = prepared.value.finish(|plan| {
+                let plan = prepared.value.finish(resolved_desired_ids.ids.iter(), |plan| {
                     add_deposed_delete_effects(plan, state_file, &addressed.moved_pairs);
-                    block_deletes_on_prior_consumer_updates(plan, &directives_map);
+                    plan.block_deletes_on_prior_consumer_updates(&directives_map);
                     override_aware_resources.apply_plan_stability(
                         &plan_input_current,
                         plan,
@@ -7129,17 +7138,6 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                 });
                 state_block_result?;
 
-                let analysis = carina_core::effect::deps::build_effect_dependency_analysis(
-                    plan.effects(),
-                    resolved_desired_ids.ids.iter(),
-                    carina_core::effect::deps::ScheduleInputs::Apply,
-                );
-                let analysis = match analysis {
-                    Ok(analysis) => analysis,
-                    Err(failure) => failure.into_parts().0,
-                };
-                plan.record_unresolved_delete_ordering_analysis(&analysis);
-
                 let moved_origins = addressed
                     .moved_pairs
                     .iter()
@@ -7148,6 +7146,20 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                 let prev_explicit = addressed.prev_explicit;
                 let managed_current =
                     into_all_prior_states(addressed.orphans, addressed.managed_current);
+                let input_sources = paired_unresolved_resources
+                    .iter()
+                    .cloned()
+                    .map(UnresolvedResource::from_pre_resolve)
+                    .collect::<Vec<_>>();
+                let input_types = carina_core::input_rules::InputTypeContext::for_plan(
+                    &input_sources,
+                    &data_sources_for_plan,
+                    carina_core::input_rules::InputCompositions::Live(&compositions),
+                    &wait_aliases,
+                    provider_configs,
+                    context.schemas(),
+                    plan.effects().iter().map(|effect| effect.resource_id()),
+                )?;
                 let outcome = prepare_plan_outcome(
                     plan,
                     prepared.references,
@@ -7156,6 +7168,7 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                     &managed_current,
                     state_file.as_ref(),
                     context.schemas(),
+                    &input_types,
                     &prev_explicit,
                     provider,
                 )
@@ -9160,7 +9173,7 @@ pub struct StateBlockEvaluationContext<'a> {
 /// `removed` blocks, since those operations manage state without
 /// destroying infrastructure.
 pub fn add_state_block_effects<D>(
-    plan: &mut Plan,
+    plan: &mut impl carina_core::planning_state::StatePlanEdits,
     state_blocks: &[StateBlock],
     state_file: &Option<StateFile>,
     moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
@@ -9330,7 +9343,10 @@ pub fn add_state_block_effects<D>(
 
     // Add the new state block effects
     for effect in new_effects {
-        plan.add(effect);
+        plan.add_state_effect(
+            carina_core::planning_state::StateOnlyEffect::try_new(effect)
+                .expect("state blocks emit only import, remove and move operations"),
+        );
     }
     Ok(())
 }
@@ -9340,73 +9356,27 @@ pub fn add_state_block_effects<D>(
 /// Each entry uses its own provider-instance routing and dependency bindings,
 /// not the row's current-instance routing.
 pub fn add_deposed_delete_effects(
-    plan: &mut Plan,
+    plan: &mut impl carina_core::planning_state::StatePlanEdits,
     state_file: &Option<StateFile>,
     moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
 ) {
-    let Some(state_file) = state_file.as_ref() else {
-        return;
-    };
-
-    for row in state_file.resources() {
-        let (effects, errors) = deposed_delete_effects_for_row(row, moved_pairs);
-        for effect in effects {
-            plan.add(effect);
-        }
-        for error in errors {
-            plan.add_error(error);
-        }
+    if let Some(state) = state_file {
+        plan.add_deposed_rows(&state.planning_rows(), moved_pairs);
     }
 }
 
-/// Build top-level delete effects for every deposed generation on a state row.
-///
-/// Each deposed entry owns its provider-instance routing and dependency
-/// bindings; callers must not substitute the current row's routing here.
+#[cfg(test)]
 pub(crate) fn deposed_delete_effects_for_row(
     row: &carina_state::ResourceState,
     moved_pairs: &[(ResolvedResourceId, ResolvedResourceId)],
-) -> (Vec<Effect>, Vec<PlanError>) {
-    let mut effects = Vec::with_capacity(row.deposed.len());
-    let mut errors = Vec::new();
-    let row_id = resolved_state_row_id(row, row.directives.provider_instance.clone());
-    let blocked_by_current_resume = match row.current() {
-        carina_state::CurrentInstance::CreateInFlight { .. } => std::iter::once(
-            moved_pairs
-                .iter()
-                .find_map(|(from, to)| (from == &row_id).then(|| to.clone()))
-                .unwrap_or_else(|| row_id.clone()),
-        )
-        .collect(),
-        carina_state::CurrentInstance::None
-        | carina_state::CurrentInstance::Applied { .. }
-        | carina_state::CurrentInstance::CreateOutcomeUnknown { .. }
-        | carina_state::CurrentInstance::MissingIdentifier { .. } => {
-            ResolvedDependencies::default()
-        }
-    };
-    for deposed in &row.deposed {
-        let id = resolved_state_row_id(row, deposed.provider_instance.clone());
-        match PlanError::require_deposed_provider_identifier(
-            id.as_inner(),
-            &deposed.key,
-            deposed.identifier.as_str(),
-            row.identifier().map(AppliedIdentifier::as_str),
-        ) {
-            Ok(identifier) => effects.push(Effect::Delete {
-                id,
-                identifier,
-                generation: EffectGeneration::Deposed(deposed.key.clone()),
-                directives: Default::default(),
-                binding: row.binding.clone(),
-                dependencies: deposed.dependency_bindings.clone(),
-                explicit_dependencies: ResolvedDependencies::default(),
-                blocked_by_updates: blocked_by_current_resume.clone(),
-            }),
-            Err(error) => errors.push(*error),
-        }
-    }
-    (effects, errors)
+) -> (
+    Vec<carina_core::effect::DeferredReplaceDelete>,
+    Vec<PlanError>,
+) {
+    let mut state = StateFile::new();
+    state.upsert_resource(row.clone()).unwrap();
+    let rows = state.planning_rows();
+    carina_core::planning_state::deposed_delete_effects_for_row(&rows[0], moved_pairs)
 }
 
 /// Resolve an import block's `to` address to a matching resource in the plan or state.

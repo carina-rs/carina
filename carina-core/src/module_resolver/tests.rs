@@ -11390,12 +11390,9 @@ let reader = mock.test.Consumer { name = consumer.observed_name }
     plan.add(producer_effect.clone());
     plan.add(target_effect.clone());
     plan.add(wait_effect.clone());
-    let analysis = crate::effect::deps::build_effect_dependency_analysis(
-        plan.effects(),
-        std::iter::empty(),
-        crate::effect::deps::ScheduleInputs::Apply,
-    )
-    .expect("the complete P3 plan has a valid dependency graph");
+    let analysis = plan
+        .dependency_analysis(std::iter::empty())
+        .expect("the complete P3 plan has a valid dependency graph");
     assert!(
         analysis
             .deps_of(2)
@@ -11407,12 +11404,9 @@ let reader = mock.test.Consumer { name = consumer.observed_name }
     let mut incomplete = crate::plan::Plan::new();
     incomplete.add(target_effect);
     incomplete.add(wait_effect);
-    let failure = crate::effect::deps::build_effect_dependency_analysis(
-        incomplete.effects(),
-        std::iter::empty(),
-        crate::effect::deps::ScheduleInputs::Apply,
-    )
-    .expect_err("a missing producer effect must not silently drop the wait edge");
+    let failure = incomplete
+        .dependency_analysis(std::iter::empty())
+        .expect_err("a missing producer effect must not silently drop the wait edge");
     assert_eq!(failure.unresolved().len(), 1);
     assert_eq!(failure.unresolved()[0].id(), &expected);
 }

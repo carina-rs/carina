@@ -118,6 +118,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &crate::provider::AppliedIdentifier,
             _request: crate::provider::UpdateRequest,
+            _attempt: crate::provider::UpdateAttempt,
         ) -> crate::provider::BoxFuture<
             '_,
             crate::provider::ProviderResult<crate::provider::UpdateOutcome>,
@@ -127,9 +128,7 @@ mod tests {
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &crate::provider::AppliedIdentifier,
-            _request: crate::provider::DeleteRequest,
+            _attempt: crate::provider::DeleteAttempt,
         ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<()>> {
             Box::pin(async { panic!("unexpected delete") })
         }

@@ -1,0 +1,20 @@
+---
+source: carina-cli/src/plan_snapshot_tests.rs
+assertion_line: 58
+expression: output
+---
+Execution Plan:
+
+  + mock.test.resource suffix
+      name: 'suffix'
+      identifier: (known after apply)
+        │
+        └─ + mock.test.creation_constrained bucket
+              name: suffix.identifier
+              name [mock.name.not_ipv4]: input check pending until apply
+
+Exports:
+
+  + name = suffix.identifier
+
+Plan: 2 to add, 0 to change, 0 to destroy, 1 export change(s).

@@ -364,7 +364,7 @@ impl std::error::Error for WallBudgetExceeded {}
 /// An error captured by the metadata loaders before any configured input exists.
 /// Runtime callers cannot mint this display authority.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// use carina_plugin_host::wasm_factory::MetadataDiagnostic;
 /// let _ = MetadataDiagnostic::new(std::io::Error::other("guest private"));
 /// ```

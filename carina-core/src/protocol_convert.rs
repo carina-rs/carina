@@ -41,9 +41,11 @@ use crate::resource::{
 };
 use crate::schema::{
     AttributeSchema as DraftAttributeSchema, AttributeSchemaParts,
-    AttributeType as DraftAttributeType, CompiledAttributeSchema as AttributeSchema,
-    CompiledAttributeType as AttributeType, CompiledStructField as StructField,
-    ConfigSchemaValidationError, FieldGroup, FieldGroupKind, IdentityMode, InputMode, RawShape,
+    AttributeType as DraftAttributeType, CharSet, Compiled,
+    CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
+    CompiledStructField as StructField, ConfigSchemaValidationError, FieldGroup, FieldGroupKind,
+    IdentityMode, InputMode, InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleError,
+    InputRuleParts, InputRuleScope, InputRuleTarget, NonEmptyString, RawShape,
     ResourceSchema as DraftResourceSchema, ResourceSchemaParts, ResourceSchemaValidationError,
     ResourceValidation, SchemaKind, SchemaValidationIssueLocation, StructField as DraftStructField,
     StructFieldParts, TypeIdentity, UniqueNameSpec, ValidatedConfigSchema,
@@ -652,6 +654,163 @@ impl Error for SchemaDecodeError {
     }
 }
 
+fn input_charset_to_protocol(set: &CharSet) -> protocol::CharSet {
+    protocol::CharSet {
+        ranges: set
+            .ranges()
+            .iter()
+            .map(|(start, end)| protocol::CharRange {
+                start: u32::from(*start),
+                end: u32::from(*end),
+            })
+            .collect(),
+    }
+}
+
+fn input_rule_to_protocol(rule: &InputRule<Compiled>) -> protocol::InputRule {
+    let InputRuleParts {
+        scope,
+        target,
+        code,
+        predicate,
+    } = rule.parts();
+    let predicate = match predicate {
+        InputPredicate::Length { min, max } => protocol::InputPredicate::Length {
+            min: *min,
+            max: *max,
+        },
+        InputPredicate::AllowedChars(set) => {
+            protocol::InputPredicate::AllowedChars(input_charset_to_protocol(set))
+        }
+        InputPredicate::FirstChar(set) => {
+            protocol::InputPredicate::FirstChar(input_charset_to_protocol(set))
+        }
+        InputPredicate::LastChar(set) => {
+            protocol::InputPredicate::LastChar(input_charset_to_protocol(set))
+        }
+        InputPredicate::NoSubstring(token) => {
+            protocol::InputPredicate::NoSubstring(token.as_str().to_owned())
+        }
+        InputPredicate::NoPrefix(token) => {
+            protocol::InputPredicate::NoPrefix(token.as_str().to_owned())
+        }
+        InputPredicate::ForbiddenPrefix {
+            prefix,
+            ignore_ascii_case,
+        } => protocol::InputPredicate::ForbiddenPrefix {
+            prefix: prefix.as_str().to_owned(),
+            ignore_ascii_case: *ignore_ascii_case,
+        },
+        InputPredicate::NoSuffix(token) => {
+            protocol::InputPredicate::NoSuffix(token.as_str().to_owned())
+        }
+        InputPredicate::NoAdjacent { left, right } => protocol::InputPredicate::NoAdjacent {
+            left: input_charset_to_protocol(left),
+            right: input_charset_to_protocol(right),
+        },
+        InputPredicate::NotIpv4 => protocol::InputPredicate::NotIpv4,
+        InputPredicate::Matches(pattern) => {
+            protocol::InputPredicate::Matches(pattern.as_str().to_owned())
+        }
+        InputPredicate::NotMatches(pattern) => {
+            protocol::InputPredicate::NotMatches(pattern.as_str().to_owned())
+        }
+    };
+    protocol::InputRule {
+        scope: match scope {
+            InputRuleScope::CreateOnly => protocol::InputRuleScope::CreateOnly,
+            InputRuleScope::EveryWrite => protocol::InputRuleScope::EveryWrite,
+        },
+        target: match target {
+            InputRuleTarget::Value(path) => {
+                protocol::InputRuleTarget::Value(path.as_str().to_owned())
+            }
+            InputRuleTarget::MapKeys(path) => {
+                protocol::InputRuleTarget::MapKeys(path.as_str().to_owned())
+            }
+        },
+        code: code.as_str().to_owned(),
+        predicate,
+    }
+}
+
+fn protocol_to_input_charset(set: &protocol::CharSet) -> Result<CharSet, InputRuleError> {
+    let protocol::CharSet { ranges } = set;
+    let ranges = ranges
+        .iter()
+        .map(|range| {
+            let protocol::CharRange { start, end } = range;
+            let start = char::from_u32(*start).ok_or(InputRuleError::InvalidUnicodeScalar)?;
+            let end = char::from_u32(*end).ok_or(InputRuleError::InvalidUnicodeScalar)?;
+            Ok((start, end))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    CharSet::new(ranges)
+}
+
+fn protocol_to_input_rule(rule: &protocol::InputRule) -> Result<InputRule, InputRuleError> {
+    let protocol::InputRule {
+        scope,
+        target,
+        code,
+        predicate,
+    } = rule;
+    let scope = match scope {
+        protocol::InputRuleScope::CreateOnly => InputRuleScope::CreateOnly,
+        protocol::InputRuleScope::EveryWrite => InputRuleScope::EveryWrite,
+    };
+    let target = match target {
+        protocol::InputRuleTarget::Value(path) => {
+            InputRuleTarget::Value(InputPath::new(path.clone())?)
+        }
+        protocol::InputRuleTarget::MapKeys(path) => {
+            InputRuleTarget::MapKeys(InputPath::new(path.clone())?)
+        }
+    };
+    let code = InputRuleCode::new(code.clone())?;
+    let predicate = match predicate {
+        protocol::InputPredicate::Length { min, max } => InputPredicate::Length {
+            min: *min,
+            max: *max,
+        },
+        protocol::InputPredicate::AllowedChars(set) => {
+            InputPredicate::AllowedChars(protocol_to_input_charset(set)?)
+        }
+        protocol::InputPredicate::FirstChar(set) => {
+            InputPredicate::FirstChar(protocol_to_input_charset(set)?)
+        }
+        protocol::InputPredicate::LastChar(set) => {
+            InputPredicate::LastChar(protocol_to_input_charset(set)?)
+        }
+        protocol::InputPredicate::NoSubstring(token) => {
+            InputPredicate::NoSubstring(NonEmptyString::new(token.clone())?)
+        }
+        protocol::InputPredicate::NoPrefix(token) => {
+            InputPredicate::NoPrefix(NonEmptyString::new(token.clone())?)
+        }
+        protocol::InputPredicate::ForbiddenPrefix {
+            prefix,
+            ignore_ascii_case,
+        } => InputPredicate::ForbiddenPrefix {
+            prefix: NonEmptyString::new(prefix.clone())?,
+            ignore_ascii_case: *ignore_ascii_case,
+        },
+        protocol::InputPredicate::NoSuffix(token) => {
+            InputPredicate::NoSuffix(NonEmptyString::new(token.clone())?)
+        }
+        protocol::InputPredicate::NoAdjacent { left, right } => InputPredicate::NoAdjacent {
+            left: protocol_to_input_charset(left)?,
+            right: protocol_to_input_charset(right)?,
+        },
+        protocol::InputPredicate::NotIpv4 => InputPredicate::NotIpv4,
+        protocol::InputPredicate::Matches(pattern) => InputPredicate::Matches(pattern.clone()),
+        protocol::InputPredicate::NotMatches(pattern) => {
+            InputPredicate::NotMatches(pattern.clone())
+        }
+    };
+    Ok(InputRule::new(scope, target, code, predicate))
+}
+
 /// Convert a validated resource schema into its current protocol record.
 pub fn resource_schema_to_protocol(
     schema: &ValidatedResourceSchema,
@@ -661,6 +820,7 @@ pub fn resource_schema_to_protocol(
         attributes,
         description,
         validation,
+        input_rules,
         kind,
         unique_name,
         operation_config,
@@ -715,6 +875,7 @@ pub fn resource_schema_to_protocol(
         unique_name,
         operation_config: operation_config.cloned(),
         validators,
+        input_rules: input_rules.iter().map(input_rule_to_protocol).collect(),
         field_groups: field_groups.iter().map(field_group_to_protocol).collect(),
         default_prevent_destroy,
         defs,
@@ -802,7 +963,7 @@ fn protocol_to_assignability_edge(
     .map_err(SchemaDecodeError::InvalidProviderSchema)
 }
 
-/// Decode the version-22 provider-schema envelope and jointly admit resource,
+/// Decode the version-23 provider-schema envelope and jointly admit resource,
 /// config, reference-form, and assignability declarations.
 pub fn protocol_to_provider_schema_witness(
     envelope: &protocol::ProviderSchemaEnvelope,
@@ -1142,6 +1303,7 @@ pub fn protocol_to_resource_schema(
         operation_config,
         validators,
         field_groups,
+        input_rules,
         default_prevent_destroy,
         defs,
     } = schema;
@@ -1176,6 +1338,20 @@ pub fn protocol_to_resource_schema(
                 .prepend_attribute(&format!("field_groups[{index}]"))
                 .with_resource_type(resource_type)
         })?);
+    }
+
+    for (index, rule) in input_rules.iter().enumerate() {
+        let rule =
+            protocol_to_input_rule(rule).map_err(|error| SchemaDecodeError::InvalidSchema {
+                detail: "creation constraint is invalid".into(),
+                resource_type: Some(resource_type.as_str().into()),
+                attribute_path: Vec::new(),
+                schema_issue_location: Some(Box::new(SchemaValidationIssueLocation::InputRule(
+                    index,
+                ))),
+                source: Some(Box::new(error)),
+            })?;
+        core = core.input_rule(rule);
     }
 
     for (name, definition) in defs {
@@ -4723,6 +4899,7 @@ mod tests {
             operation_config: None,
             validators: Vec::new(),
             field_groups: Vec::new(),
+            input_rules: Vec::new(),
             default_prevent_destroy: false,
             defs: Default::default(),
         };

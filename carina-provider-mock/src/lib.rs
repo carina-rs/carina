@@ -9,8 +9,8 @@ use carina_core::effect::PlanOp;
 use carina_core::parser::ProviderConfig;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateAttempt, CreateFailure, CreateOutcome,
-    CreateRequest, DeleteRequest, Observation, PartialReadDiagnostic, PatchOp, PendingToken,
-    Provider, ProviderError, ProviderNormalizer, ProviderResult, ReadOutcome, ReadRequest,
+    CreateRequest, Observation, PartialReadDiagnostic, PatchOp, PendingToken, Provider,
+    ProviderError, ProviderNormalizer, ProviderResult, ReadOutcome, ReadRequest,
     Resume as CoreResume, ResumeCreateRequest, ResumeFailure, ResumeOutcome, SavedAttrs, Sent,
     StateTransformMap, UpdateOutcome, UpdateRequest,
 };
@@ -113,6 +113,10 @@ pub fn uses_builtin_provider<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a
 /// Schemas exposed by Carina's built-in `provider mock {}` implementation.
 pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
     let schemas = vec![
+        input_rule_schema(),
+        desired_input_rule_schema(),
+        estimated_input_rule_schema(),
+        input_rule_schema_for("test.creation_conflicting").with_conflicting_replacement(),
         ResourceSchema::new("test.resource")
             .attribute(
                 AttributeSchema::required("name", AttributeType::string())
@@ -405,6 +409,92 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
         })
         .chain(std::iter::once(references::resource_schema()))
         .collect()
+}
+
+/// Portable creation-declaration fixture shared by native and WASM schemas.
+pub fn input_rule_schema() -> ResourceSchema {
+    input_rule_schema_for("test.creation_constrained").with_coexisting_replacement()
+}
+
+/// Refined output declarations for static admission of unresolved templates.
+pub fn estimated_input_rule_schema() -> ResourceSchema {
+    ResourceSchema::new("test.estimated_input")
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("generation", AttributeType::int())
+                .create_only()
+                .build(),
+        )
+        .attribute(
+            AttributeSchema::provider_populated(
+                "short_part",
+                AttributeType::refined_string(
+                    None,
+                    Some("^[a-z]+$".into()),
+                    Some((Some(3), Some(5))),
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::provider_populated(
+                "long_part",
+                AttributeType::refined_string(
+                    None,
+                    Some("^[a-z]+$".into()),
+                    Some((Some(20), Some(30))),
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .input_rule(carina_core::schema::InputRule::value(
+            carina_core::schema::InputRuleScope::CreateOnly,
+            carina_core::schema::InputPath::new("name").unwrap(),
+            carina_core::schema::InputRuleCode::new("mock.name.length").unwrap(),
+            carina_core::schema::InputPredicate::Length {
+                min: Some(3),
+                max: Some(16),
+            },
+        ))
+}
+
+fn input_rule_schema_for(resource_type: &str) -> ResourceSchema {
+    ResourceSchema::new(resource_type)
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("generation", AttributeType::int())
+                .create_only()
+                .build(),
+        )
+        .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+        .input_rule(carina_core::schema::InputRule::value(
+            carina_core::schema::InputRuleScope::CreateOnly,
+            carina_core::schema::InputPath::new("name").unwrap(),
+            carina_core::schema::InputRuleCode::new("mock.name.not_ipv4").unwrap(),
+            carina_core::schema::InputPredicate::NotIpv4,
+        ))
+}
+
+/// Desired-only reserved tag-key fixture, shared by native and WASM paths.
+pub fn desired_input_rule_schema() -> ResourceSchema {
+    input_rule_schema_for("test.input_constrained")
+        .with_coexisting_replacement()
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        )
+        .input_rule(carina_core::schema::InputRule::new(
+            carina_core::schema::InputRuleScope::EveryWrite,
+            carina_core::schema::InputRuleTarget::MapKeys(
+                carina_core::schema::InputPath::new("tags").unwrap(),
+            ),
+            carina_core::schema::InputRuleCode::new("mock.tags.reserved_prefix").unwrap(),
+            carina_core::schema::InputPredicate::ForbiddenPrefix {
+                prefix: carina_core::schema::NonEmptyString::new("aws:").unwrap(),
+                ignore_ascii_case: true,
+            },
+        ))
 }
 
 /// Portable unique-list fixture shared by native diagnostics and the WASM mock.
@@ -1750,6 +1840,7 @@ impl Provider for MockProvider {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.as_str().to_string();
@@ -1869,13 +1960,12 @@ impl Provider for MockProvider {
 
     fn delete(
         &self,
-        id: &ResourceId,
-        identifier: &AppliedIdentifier,
-        _request: DeleteRequest,
+        attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        let id = id.clone();
-        let identifier = identifier.as_str().to_string();
+        let id = attempt.id().clone();
+        let identifier = attempt.identifier().as_str().to_string();
         Box::pin(async move {
+            let _attempt = attempt;
             let key = Self::resolved_resource_key(&id)?;
             if let Some(err) = self.delete_fail_error_for(&id, &identifier) {
                 return Err(err);
@@ -1931,13 +2021,6 @@ mod tests {
     use crate::provider_text_fixtures::*;
     use carina_core::resource::NoPlaceholder;
     use std::time::Duration;
-
-    fn delete_request_without_schema() -> DeleteRequest {
-        DeleteRequest::resolve(
-            &carina_core::resource::Directives::default(),
-            carina_core::provider::ProviderDirectiveSchema::Unavailable,
-        )
-    }
 
     #[test]
     fn builtin_schemas_are_all_valid() {
@@ -1998,15 +2081,35 @@ mod tests {
         Value::Concrete(ConcreteValue::String(value.clone().into()))
     }
 
+    fn fixture_schemas() -> carina_core::schema::SchemaRegistry {
+        let mut schemas = carina_core::schema::SchemaRegistry::new();
+        for schema in builtin_schemas() {
+            schemas.insert("", schema.clone());
+            schemas.insert("mock", schema);
+        }
+        schemas
+    }
+
+    fn mock_boundary(provider: &MockProvider) -> carina_core::provider::ProviderBoundary<'static> {
+        crate::provider_text_fixtures::boundary(Box::new(
+            ConfiguredBuiltinMock {
+                behavior: provider.behavior.clone(),
+                scope: provider.scope.clone(),
+                telemetry: provider.telemetry.clone(),
+            }
+            .create_provider(),
+        ))
+    }
+
     async fn dispatch_mock_create(
         provider: &MockProvider,
-        id: ResourceId,
         resource: Resource,
     ) -> Result<carina_core::provider::HostCreateOutcome, carina_core::provider::HostCreateFailure>
     {
+        let id = resource.id.clone();
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = carina_core::schema::SchemaRegistry::new();
+        let schemas = fixture_schemas();
         let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
             std::sync::Arc::new(Vec::new()),
             schemas.clone(),
@@ -2043,12 +2146,31 @@ mod tests {
                     carina_core::provider::ProviderBoundary::initialize(&factory, &session)
                         .await
                         .unwrap();
+                assert_eq!(request.resource().id, id);
+                let prepared = carina_core::replacement::create_permit_with_schemas_for_test(
+                    request, &schemas,
+                );
                 let (create, _cancellation) =
-                    carina_core::executor::dispatch_create(boundary.provider(), &id, request);
+                    carina_core::executor::dispatch_create(boundary.provider(), prepared);
                 create.await
             },
         )
         .await
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "fixture plan admission")]
+    async fn round3_mock_create_fixture_rejects_declared_input_rule_violation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior::default(),
+            MockScope::file(tmp.path().join("mock-state.json")).unwrap(),
+        )
+        .create_provider();
+        let resource =
+            Resource::with_provider("mock", "test.creation_constrained", "invalid", None)
+                .with_attribute("name", string_value("192.168.1.1"));
+        dispatch_mock_create(&provider, resource).await.unwrap();
     }
 
     fn persist_pending_for_resume(pending: &InFlightCreate) -> InFlightCreate {
@@ -2135,11 +2257,10 @@ mod tests {
                     .build()
                     .unwrap();
                 barrier.wait();
-                let id = ResourceId::with_provider_identity("mock", "test.resource", "same", None);
                 let resource = Resource::with_provider("mock", "test.resource", "same", None)
                     .with_attribute("name", string_value("same"));
                 runtime
-                    .block_on(dispatch_mock_create(&provider, id, resource))
+                    .block_on(dispatch_mock_create(&provider, resource))
                     .map(CreateOutcome::into_kind)
                     .map_err(|error| Box::new(CreateFailure::into_kind(error)))
             })
@@ -2201,17 +2322,11 @@ mod tests {
                             "worker-{worker}-{item}"
                         ))
                         .unwrap();
-                        let id = ResourceId::with_provider_identity(
-                            "mock",
-                            "test.resource",
-                            identity.clone(),
-                            None,
-                        );
                         let resource =
                             Resource::with_provider("mock", "test.resource", identity, None)
                                 .with_attribute("name", string_value("transaction"));
                         runtime
-                            .block_on(dispatch_mock_create(&provider, id, resource))
+                            .block_on(dispatch_mock_create(&provider, resource))
                             .unwrap();
                     }
                 });
@@ -2283,13 +2398,6 @@ mod tests {
             )
             .create_provider();
             let identity = format!("create-{mode}");
-            let id = ResourceId::with_provider_identity(
-                "mock",
-                "test.resource",
-                carina_core::resource::ResourceIdentity::try_from(identity.clone())
-                    .expect("fixture identity is non-empty"),
-                None,
-            );
             let resource = Resource::with_provider(
                 "mock",
                 "test.resource",
@@ -2299,7 +2407,7 @@ mod tests {
             )
             .with_attribute("name", string_value(mode));
             let result = runtime
-                .block_on(dispatch_mock_create(&provider, id, resource))
+                .block_on(dispatch_mock_create(&provider, resource))
                 .map(CreateOutcome::into_kind)
                 .map_err(CreateFailure::into_kind);
             match (expected, result) {
@@ -2358,11 +2466,7 @@ mod tests {
         let resource = Resource::with_provider("mock", "test.resource", "resume-modes", None)
             .with_attribute("name", string_value("resume-modes"));
         let pending = match runtime
-            .block_on(dispatch_mock_create(
-                &provider,
-                id.clone(),
-                resource.clone(),
-            ))
+            .block_on(dispatch_mock_create(&provider, resource.clone()))
             .map(CreateOutcome::into_kind)
             .map_err(CreateFailure::into_kind)
         {
@@ -2698,7 +2802,7 @@ mod tests {
             .unwrap();
 
         runtime
-            .block_on(dispatch_mock_create(&provider, id.clone(), resource))
+            .block_on(dispatch_mock_create(&provider, resource))
             .expect("create should save mock v2 state");
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
@@ -2743,7 +2847,7 @@ mod tests {
             .unwrap();
 
         runtime
-            .block_on(dispatch_mock_create(&provider, id.clone(), resource))
+            .block_on(dispatch_mock_create(&provider, resource))
             .expect("create should persist the write-only request value");
         let state = runtime
             .block_on(provider.read(
@@ -2830,7 +2934,7 @@ mod tests {
             .unwrap();
 
         runtime
-            .block_on(dispatch_mock_create(&provider, id.clone(), resource))
+            .block_on(dispatch_mock_create(&provider, resource))
             .expect("create should save versioned mock state");
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(&state_file).unwrap()).unwrap();
@@ -2888,7 +2992,7 @@ mod tests {
             .unwrap();
 
         let read = runtime.block_on(async {
-            dispatch_mock_create(&provider, id.clone(), resource)
+            dispatch_mock_create(&provider, resource)
                 .await
                 .expect("create succeeds");
             provider
@@ -2971,7 +3075,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            dispatch_mock_create(&provider, id.clone(), resource)
+            dispatch_mock_create(&provider, resource)
                 .await
                 .expect("create should succeed");
 
@@ -2984,13 +3088,7 @@ mod tests {
             let bindings = carina_core::binding_index::ResolvedBindings::default();
             let module_gate =
                 carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-            let mut schemas = carina_core::schema::SchemaRegistry::new();
-            schemas.insert(
-                "mock",
-                carina_core::schema::ResourceSchema::new("test.resource")
-                    .validate()
-                    .expect("test schema must be valid"),
-            );
+            let schemas = fixture_schemas();
             let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
                 std::sync::Arc::new(Vec::new()),
                 schemas.clone(),
@@ -3018,15 +3116,26 @@ mod tests {
                     let request = request.expect("update request should pass checked preparation");
                     let identifier = AppliedIdentifier::new("mock-id")
                         .expect("the mock identifier is non-empty");
-                    provider
-                        .update(&id, &identifier, request)
+                    let prepared = carina_core::replacement::update_permit_with_schemas_for_test(
+                        identifier.clone(),
+                        request,
+                        &schemas,
+                    );
+                    carina_core::executor::dispatch_update(&mock_boundary(&provider), prepared)
                         .await
                         .expect("update should succeed");
 
-                    provider
-                        .delete(&id, &identifier, delete_request_without_schema())
-                        .await
-                        .expect("delete should succeed");
+                    carina_core::executor::dispatch_delete(
+                        &mock_boundary(&provider),
+                        carina_core::executor::delete_permit_for_test(
+                            id.clone(),
+                            identifier.clone(),
+                            Default::default(),
+                        ),
+                        &carina_core::schema::SchemaRegistry::new(),
+                    )
+                    .await
+                    .expect("delete should succeed");
                 },
             )
             .await
@@ -3065,7 +3174,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            dispatch_mock_create(&provider, id.clone(), resource)
+            dispatch_mock_create(&provider, resource)
                 .await
                 .expect("create should succeed");
             fs::write(&log_path, "").expect("clear create log");
@@ -3135,7 +3244,6 @@ mod tests {
             MockScope::file(state_file).unwrap(),
         )
         .create_provider();
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "blocked", None);
         let resource = Resource::with_provider("mock", "test.resource", "blocked", None)
             .with_attribute("name", string_value("blocked"));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3144,7 +3252,7 @@ mod tests {
             .unwrap();
 
         let err = runtime
-            .block_on(dispatch_mock_create(&provider, id, resource))
+            .block_on(dispatch_mock_create(&provider, resource))
             .expect_err("create should fail when CARINA_MOCK_CREATE_FAIL_FOR matches");
         assert_eq!(err.to_string(), "create failed and left no resource");
         let message = std::error::Error::source(&err)
@@ -3185,7 +3293,6 @@ mod tests {
             MockScope::file(tmp.path().join("mock-state.json")).unwrap(),
         )
         .create_provider();
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
         let resource = Resource::with_provider("mock", "test.resource", "slow", None)
             .with_attribute("name", string_value("slow"));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3196,7 +3303,7 @@ mod tests {
 
         let (initially_pending, ready_seen, still_pending, released, outcome) =
             runtime.block_on(async {
-                let create = dispatch_mock_create(&provider, id, resource);
+                let create = dispatch_mock_create(&provider, resource);
                 tokio::pin!(create);
                 let mut context = std::task::Context::from_waker(std::task::Waker::noop());
                 let first = create.as_mut().poll(&mut context);
@@ -3245,7 +3352,6 @@ mod tests {
             MockScope::file(tmp.path().join("mock-state.json")).unwrap(),
         )
         .create_provider();
-        let id = ResourceId::with_provider_identity("mock", "test.resource", "slow", None);
         let resource = Resource::with_provider("mock", "test.resource", "slow", None)
             .with_attribute("name", string_value("slow"));
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3256,7 +3362,7 @@ mod tests {
 
         let (outcome, elapsed) = runtime.block_on(async {
             let started = tokio::time::Instant::now();
-            let outcome = dispatch_mock_create(&provider, id, resource).await;
+            let outcome = dispatch_mock_create(&provider, resource).await;
             (outcome, started.elapsed())
         });
 
@@ -3295,7 +3401,17 @@ mod tests {
 
         let (initially_pending, ready_seen, still_pending, released, outcome) =
             runtime.block_on(async {
-                let delete = provider.delete(&id, &identifier, delete_request_without_schema());
+                let schemas = carina_core::schema::SchemaRegistry::new();
+                let provider_boundary = mock_boundary(&provider);
+                let delete = carina_core::executor::dispatch_delete(
+                    &provider_boundary,
+                    carina_core::executor::delete_permit_for_test(
+                        id.clone(),
+                        identifier.clone(),
+                        Default::default(),
+                    ),
+                    &schemas,
+                );
                 tokio::pin!(delete);
                 let mut context = std::task::Context::from_waker(std::task::Waker::noop());
                 let first = delete.as_mut().poll(&mut context);
@@ -3356,9 +3472,16 @@ mod tests {
             AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
         let (outcome, elapsed) = runtime.block_on(async {
             let started = tokio::time::Instant::now();
-            let outcome = provider
-                .delete(&id, &identifier, delete_request_without_schema())
-                .await;
+            let outcome = carina_core::executor::dispatch_delete(
+                &mock_boundary(&provider),
+                carina_core::executor::delete_permit_for_test(
+                    id.clone(),
+                    identifier.clone(),
+                    Default::default(),
+                ),
+                &carina_core::schema::SchemaRegistry::new(),
+            )
+            .await;
             (outcome, tokio::time::Instant::now() - started)
         });
 

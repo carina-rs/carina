@@ -69,15 +69,11 @@ impl Provider for LateEcho {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
-        self.0.update(id, identifier, request)
+        self.0.update(id, identifier, request, attempt)
     }
-    fn delete(
-        &self,
-        _: &ResourceId,
-        _: &AppliedIdentifier,
-        _: DeleteRequest,
-    ) -> BoxFuture<'_, ProviderResult<()>> {
+    fn delete(&self, _: carina_core::provider::DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async {
             Err(ProviderError::api_error(format!(
                 "mock delete rejected password {SECRET}; public={PUBLIC}"

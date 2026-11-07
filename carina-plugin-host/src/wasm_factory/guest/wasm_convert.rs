@@ -2124,6 +2124,7 @@ fn upgrade_v12_schema_json_in_memory(value: &mut serde_json::Value) {
                     .get("attributes")
                     .is_some_and(serde_json::Value::is_object)
             {
+                object.insert("input_rules".to_string(), serde_json::json!([]));
                 let field_groups = object
                     .remove("exclusive_required")
                     .and_then(|value| value.as_array().cloned())
@@ -2207,6 +2208,7 @@ fn proto_attr_schema_to_core(
         operation_config: None,
         validators: Vec::new(),
         field_groups: Vec::new(),
+        input_rules: Vec::new(),
         default_prevent_destroy: false,
         defs: std::collections::BTreeMap::new(),
     };
@@ -2803,6 +2805,7 @@ mod tests {
             operation_config: None,
             validators: vec![],
             field_groups: vec![],
+            input_rules: Vec::new(),
             default_prevent_destroy: false,
             defs: Default::default(),
         }
@@ -5377,6 +5380,30 @@ mod tests {
     }
 
     #[test]
+    fn input_rules_reject_protocol_22() {
+        let error = check_protocol_version(
+            r#"{"name":"old","display_name":"Old","version":"1.0.0","protocol_version":22}"#,
+        )
+        .expect_err("creation declarations require protocol 23");
+        assert!(error.contains("requires at least version 23"));
+    }
+
+    #[test]
+    fn input_rules_are_supplied_only_by_v12_migration_upgrade() {
+        let json = include_str!("../../../tests/fixtures/protocol-v12/released-awscc-vpc.json");
+        let witness =
+            json_to_schema_only_provider_schema(json, CoreValidatedConfigSchema::default(), 12)
+                .unwrap();
+        for schema in witness.resources() {
+            let wire = carina_core::protocol_convert::resource_schema_to_protocol(schema).unwrap();
+            assert_eq!(
+                serde_json::to_value(wire).unwrap()["input_rules"],
+                serde_json::json!([])
+            );
+        }
+    }
+
+    #[test]
     fn test_check_protocol_version_accepts_host_version() {
         let json = format!(
             r#"{{"name":"aws","display_name":"AWS Provider","version":"1.0.0","protocol_version":{}}}"#,
@@ -5740,6 +5767,7 @@ mod tests {
                     }
                 },
                 "field_groups":[],
+                "input_rules":[],
                 "default_prevent_destroy":false
             }]"#,
         )
@@ -5835,6 +5863,7 @@ mod tests {
                     }
                 },
                 "field_groups":[],
+                "input_rules":[],
                 "default_prevent_destroy":false
             }]"#,
         )
@@ -5858,6 +5887,7 @@ mod tests {
                     }
                 },
                 "field_groups":[],
+                "input_rules":[],
                 "default_prevent_destroy":false
             }]"#,
         )
@@ -5875,6 +5905,7 @@ mod tests {
                 "resource_type":"s3.Bucket",
                 "attributes":{},
                 "field_groups":[],
+                "input_rules":[],
                 "default_prevent_destroy":false,
                 "unique_name_attribute":{"type":"attribute"}
             }]"#,
@@ -5900,6 +5931,7 @@ mod tests {
             "description": "EC2 Security Group",
             "unique_name_attribute": "group_name",
             "field_groups": [],
+            "input_rules":[],
             "default_prevent_destroy": false,
             "attributes": {
               "group_name": {
@@ -6011,6 +6043,7 @@ mod tests {
             attributes,
             description,
             validation,
+            input_rules,
             kind,
             unique_name,
             operation_config,
@@ -6020,6 +6053,7 @@ mod tests {
             default_wait_interval,
             defs,
         } = schema.parts();
+        assert!(input_rules.is_empty());
         assert_eq!(resource_type, "ec2.SecurityGroup");
         assert_eq!(description, Some("EC2 Security Group"));
         assert!(!matches!(kind, carina_core::schema::SchemaKind::DataSource));
@@ -6475,6 +6509,7 @@ mod tests {
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             field_groups: vec![],
+            input_rules: Vec::new(),
             default_prevent_destroy: false,
             defs: Default::default(),
         };
@@ -6497,6 +6532,7 @@ mod tests {
             operation_config: None,
             validators: vec![],
             field_groups: vec![],
+            input_rules: Vec::new(),
             default_prevent_destroy: false,
             defs: Default::default(),
         };
@@ -6532,6 +6568,7 @@ mod tests {
                 kind: proto::FieldGroupKind::ExactlyOne,
                 fields: vec!["cidr_block".to_string(), "ipv4_ipam_pool_id".to_string()],
             }],
+            input_rules: Vec::new(),
             default_prevent_destroy: false,
             defs: Default::default(),
         };
@@ -6583,6 +6620,7 @@ mod tests {
                 kind: proto::FieldGroupKind::AtLeastOne,
                 fields: vec!["a".to_string(), "b".to_string()],
             }],
+            input_rules: Vec::new(),
             default_prevent_destroy: false,
             defs: Default::default(),
         };
@@ -7144,6 +7182,7 @@ mod tests {
             {
                 "resource_type":"aws.ec2.VpcCidrBlockAssociation",
                 "field_groups":[],
+                "input_rules":[],
                 "default_prevent_destroy":false,
                 "attributes":{
                     "id":{
@@ -7344,6 +7383,7 @@ mod tests {
             operation_config: None,
             validators: vec![proto::ValidatorType::TagsKeyValueCheck],
             field_groups: vec![],
+            input_rules: Vec::new(),
             default_prevent_destroy: false,
             defs: Default::default(),
         };

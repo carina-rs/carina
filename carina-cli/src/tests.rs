@@ -94,8 +94,8 @@ fn absolute_binding(spelling: &str) -> carina_core::resource::AbsoluteBindingAdd
 }
 
 #[test]
-fn saved_plan_version_is_41_for_typed_secrets_and_pinned_source_identity() {
-    assert_eq!(PlanFile::CURRENT_VERSION, 41);
+fn saved_plan_version_is_42_for_replacement_admission_requests() {
+    assert_eq!(PlanFile::CURRENT_VERSION, 42);
 }
 
 #[test]
@@ -427,6 +427,7 @@ impl Provider for TestProvider {
         _id: &ResourceId,
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let state = self
             .update_result
@@ -437,9 +438,7 @@ impl Provider for TestProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: carina_core::provider::DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
     }
@@ -565,7 +564,7 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
             provider_context: carina_core::parser::ProviderContext::clone(
                 &carina_core::parser::LoadedProviderContext::empty_for_test(),
             ),
-            plan: &plan,
+            plan: &crate::test_support::creation_fixture::checked(plan.clone(), &schemas),
             provider_check_inputs: ProviderCheckInputs::Authored,
             compositions: &[],
             bindings: Default::default(),
@@ -602,7 +601,7 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),
             applied_states: &execution.applied_states,
-            plan: &plan,
+            plan: &crate::test_support::creation_fixture::checked(plan.clone(), &schemas),
             successfully_deleted: &HashSet::new(),
             failed_refreshes: &HashSet::new(),
             schemas: &schemas,
@@ -3582,7 +3581,10 @@ fn import_effect_preserves_resource_metadata_in_state() {
             runtime_synthesized_resources: &[],
             managed_current: &HashMap::new(),
             applied_states: &applied_states,
-            plan: &plan,
+            plan: &crate::test_support::creation_fixture::checked(
+                plan.clone(),
+                &SchemaRegistry::new(),
+            ),
             successfully_deleted: &HashSet::new(),
             failed_refreshes: &HashSet::new(),
             schemas: &SchemaRegistry::new(),
@@ -4212,6 +4214,8 @@ fn plan_file_with_bound_deferred_template() -> PlanFile {
 
 fn plan_file_with_bound_deferred_replace_template() -> PlanFile {
     let delete = DeferredReplaceDelete {
+        generation: carina_core::effect::EffectGeneration::Current,
+        previous_attributes: Default::default(),
         id: carina_core::resource::ResolvedResourceId::with_provider_identity(
             "mock",
             "test.resource",

@@ -811,8 +811,7 @@ mod tests {
     use aws_sdk_iam::error::ErrorMetadata;
     use carina_core::parser::{DeferredForExpression, ForBinding};
     use carina_core::provider::{
-        BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest,
-        UpdateRequest,
+        BoxFuture, CreateRequest, ProviderError, ProviderResult, ReadRequest, UpdateRequest,
     };
     use carina_core::resource::{
         ConcreteValue, DataSource, ResolvedDataSource, ResolvedResource, Resource, State, Value,
@@ -884,15 +883,14 @@ mod tests {
             _id: &ResourceId,
             _identifier: &carina_core::provider::AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: carina_core::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("unused")) })
         }
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &carina_core::provider::AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: carina_core::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("unused")) })
         }

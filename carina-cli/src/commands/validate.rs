@@ -354,6 +354,21 @@ pub fn run_validate(
         return Err(AppError::Validation(error_reports.join("\n")));
     }
 
+    // Only explicit authoring validation checks effect-independent rules here.
+    // Plan/apply use finalized write sites, so Import, adoption and other
+    // non-writing effects never inherit an early desired-input check.
+    let input_findings = carina_core::input_rules::check_authored_inputs(&parsed, schemas)
+        .map_err(AppError::Provider)?;
+    if !input_findings.is_empty() {
+        return Err(AppError::Validation(
+            input_findings
+                .into_iter()
+                .map(|finding| finding.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+
     // Check for unused let bindings (warnings, not errors)
     let unused_warnings = carina_core::validation::check_unused_bindings_with_identity_requirements(
         &loaded.authored_bindings,

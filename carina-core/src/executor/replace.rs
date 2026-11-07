@@ -10,6 +10,13 @@ use crate::binding_index::SecretPreservingAttributes;
 
 /// Result of executing a single effect.
 pub(super) enum SingleEffectResult<'a, S> {
+    Preparation {
+        write: usize,
+        outcome: Result<super::basic::PreparedBasicRequest, super::EffectFailureKind>,
+    },
+    Materialized {
+        outcome: Result<super::input_discharge::PreparedCohort<S>, super::EffectFailureKind>,
+    },
     /// Create/Update/Delete completed (wraps BasicEffectResult)
     Basic(Box<StartedBasicEffectResult<'a, S>>),
     ReadNoOp,

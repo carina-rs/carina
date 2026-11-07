@@ -668,7 +668,7 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
         &crate::references::prepare_empty_for_tests(),
     )
     .unwrap()
-    .finish(|_| {});
+    .finish(std::iter::empty(), |_| {});
 
     assert!(plan.effects().is_empty());
     assert_eq!(plan.errors().len(), 1);
@@ -1190,6 +1190,7 @@ impl crate::provider::Provider for HintProvider {
         _id: &ResourceId,
         _identifier: &crate::provider::AppliedIdentifier,
         _request: crate::provider::UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> crate::provider::BoxFuture<
         '_,
         crate::provider::ProviderResult<crate::provider::UpdateOutcome>,
@@ -1199,9 +1200,7 @@ impl crate::provider::Provider for HintProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &crate::provider::AppliedIdentifier,
-        _request: crate::provider::DeleteRequest,
+        _attempt: crate::provider::DeleteAttempt,
     ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<()>> {
         Box::pin(async { panic!("unexpected delete") })
     }
@@ -1735,7 +1734,29 @@ fn create_before_destroy_with_missing_schema_reports_schema_not_registered() {
     );
     let schemas = SchemaRegistry::new();
 
-    let err = plan::temporary_name_for_cbd(&resource, &(from).to_snapshot(), &schemas).unwrap_err();
+    let mut resource = resource;
+    resource.directives.create_before_destroy = true;
+    let old = crate::effect::DeferredReplaceDelete {
+        generation: crate::effect::EffectGeneration::Current,
+        id: ResolvedResourceId::new(from.id.clone()),
+        identifier: crate::effect::fixture_applied_identifier("old"),
+        directives: Default::default(),
+        binding: None,
+        dependencies: Default::default(),
+        explicit_dependencies: Default::default(),
+        blocked_by_updates: Default::default(),
+        previous_attributes: from.to_snapshot().attributes,
+    };
+    let err = crate::replacement::resolve_replacement(
+        crate::replacement::ReplacementRequest::new(
+            ResolvedResource::collect_resolved([resource])
+                .unwrap()
+                .remove(0),
+            crate::effect::NonEmptyDeletes::try_new(vec![old]).unwrap(),
+        ),
+        &schemas,
+    )
+    .unwrap_err();
 
     assert_eq!(
         PlanErrorKind::from(err),

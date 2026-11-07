@@ -560,6 +560,10 @@ impl ProviderReadyDataSource {
 /// Failure while preparing a provider-facing resource.
 #[derive(Debug, Error)]
 pub enum ProviderPreparationError {
+    #[error("input discharge failed")] // error-chain: caller-renders-sources
+    InputDischarge(#[source] super::EffectFailureKind),
+    #[error("bootstrap create is waiting for scheduler dependencies")]
+    InitialCreateNotReady,
     /// The complete provider input has no wire representation.
     #[error("{0}")]
     Wire(Box<ProviderWireError>),

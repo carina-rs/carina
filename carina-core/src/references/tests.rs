@@ -106,6 +106,7 @@ impl Provider for TableProvider {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let mut attributes = request.from().attributes.clone();
         for op in &request.patch().ops {
@@ -124,9 +125,7 @@ impl Provider for TableProvider {
     }
     fn delete(
         &self,
-        _: &ResourceId,
-        _: &AppliedIdentifier,
-        _: DeleteRequest,
+        _attempt: crate::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         unimplemented!()
     }
@@ -486,7 +485,11 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
         )
         .await
         .expect("cascade comparison must participate in reference recording");
-    let plan = prepared.value.finish(|_| {});
+    let plan = prepared
+        .value
+        .finish(std::iter::empty(), |_| {})
+        .check_inputs(&fixture.registry, &HashMap::new())
+        .unwrap();
     preparation
         .display(
             plan.clone(),
@@ -827,7 +830,9 @@ async fn round9_scalar_to_list_union_enumerates_planning_and_display_operands() 
     fixture.calls.lock().unwrap().clear();
     ReferencePreparation::default()
         .display(
-            plan.clone(),
+            crate::input_rules::FinalizedPlan::new(plan.clone())
+                .check_inputs(&fixture.registry, &HashMap::new())
+                .unwrap(),
             &prepare_empty_for_tests(),
             crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, &fixture.saved),
             crate::detail_rows::DetailLevel::Full,
@@ -2207,7 +2212,9 @@ async fn apply_concrete_plan_reference_reresolves_without_widening_equivalent_pa
                 provider_context: crate::parser::ProviderContext::clone(
                     &crate::parser::LoadedProviderContext::empty_for_test(),
                 ),
-                plan: &plan,
+                plan: &crate::input_rules::FinalizedPlan::new(plan.clone())
+                    .check_inputs(&SchemaRegistry::new(), &HashMap::new())
+                    .unwrap(),
                 provider_check_inputs: ProviderCheckInputs::PlanNormalized {
                     resource_origins: &origins,
                     data_source_origins: &[],

@@ -29,6 +29,32 @@ use crate::fixture_plan::{
 use crate::moved_hint::MovedBlockHint;
 use crate::plan_summary::PlanChangeSummary;
 
+#[test]
+fn snapshot_pending_inputs() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let fixture = build_plan_from_fixture_name(&runtime, "pending_inputs").unwrap();
+    assert_eq!(fixture.checked.as_ref().unwrap().pending_inputs().len(), 1);
+    let provider = provider_router_for_plan(&runtime, &fixture.plan).unwrap();
+    let display = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(fixture.prepare_display(carina_core::detail_rows::DetailLevel::Full, &provider))
+        .unwrap()
+        .unwrap();
+    let summary = build_fixture_plan_change_summary(&fixture);
+    let output = crate::display::format_prepared_plan(
+        runtime.color_mode(),
+        &display,
+        &summary,
+        Some(&fixture.schemas),
+        &fixture.moved_origins,
+        Some(&fixture.prev_explicit),
+        None,
+        &provider,
+    )
+    .unwrap();
+    insta::assert_snapshot!("pending_inputs", output);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
     color_mode: crate::output_style::ColorMode,
@@ -50,7 +76,7 @@ fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
         .expect("fixture mock inputs must be valid");
     format_plan_with_delete_instances(
         color_mode,
-        plan,
+        &crate::test_support::admit_fixture_plan(plan, schemas),
         &summary,
         detail,
         historical_display,
@@ -76,7 +102,7 @@ fn format_destroy_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
         .expect("fixture mock inputs must be valid");
     format_destroy_plan_with_delete_instances(
         color_mode,
-        plan,
+        &crate::test_support::admit_fixture_plan(plan, None),
         detail,
         historical_display,
         &provider,
@@ -723,7 +749,7 @@ fn snapshot_state_only_directive_change() {
     let output = strip_ansi(
         &format_plan_with_delete_instances(
             color_mode,
-            &fp.plan,
+            &crate::test_support::admit_fixture_plan(&fp.plan, Some(&fp.schemas)),
             &summary,
             DetailLevel::Full,
             &historical_display,
@@ -3178,6 +3204,15 @@ fn snapshot_deferred_for_with_dependent_wait() {
         };
         plan.add(effect);
     }
+    // The injected consumer requires create-first. This rendering-only fixture
+    // models a Coexisting child so its dependency tree passes admission.
+    fp.schemas.insert(
+        "aws",
+        carina_core::schema::PatternResourceSchema::new("route53.RecordSet")
+            .with_coexisting_replacement()
+            .validate()
+            .unwrap(),
+    );
     fp.plan = plan;
     let delete_attributes = crate::fixture_plan::delete_instance_attributes_from_plan(
         &fp.plan,
@@ -3630,7 +3665,7 @@ fn round2_saved_plan_matches_existing_nested_and_tags_snapshots() {
         let summary = PlanChangeSummary::new(&plan, &[], &fp.deferred_for_expressions, &[]);
         let output = format_plan_with_delete_instances(
             runtime.color_mode(),
-            &plan,
+            &crate::test_support::admit_fixture_plan(&plan, Some(&fp.schemas)),
             &summary,
             DetailLevel::Full,
             &carina_core::detail_rows::HistoricalDisplayAttributes::for_plan(&plan),

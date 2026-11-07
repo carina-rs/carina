@@ -17,14 +17,14 @@ pub struct SavedInputsResolved;
 /// A decoded saved document has no plan-minting authority until core resolves
 /// its complete desired configuration and rehydrates its secret placeholders.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::provider_text::SavedProviderConfiguration;
 /// let saved: SavedProviderConfiguration = serde_json::from_str(
 ///     r#"{"sorted_resources":[],"data_sources":[]}"#).unwrap();
 /// let _ = saved.provider_plan();
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::provider_text::SavedProviderConfiguration;
 /// let saved: SavedProviderConfiguration = serde_json::from_str(
 ///     r#"{"sorted_resources":[],"data_sources":[]}"#).unwrap();
@@ -42,6 +42,7 @@ impl<'de> Deserialize<'de> for SavedProviderConfiguration<SnapshotLeaf> {
         struct SavedDocument {
             sorted_resources:
                 Vec<Resource<SavedModuleSource, SnapshotLeaf, AbsoluteBindingAddress, ()>>,
+            #[serde(default)]
             data_sources:
                 Vec<DataSource<SavedModuleSource, SnapshotLeaf, AbsoluteBindingAddress, ()>>,
         }

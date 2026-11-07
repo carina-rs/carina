@@ -1,0 +1,1230 @@
+//! Scoped desired-input admission after effect finalization. Only this module
+//! classifies write sites and evaluates rules. Witnesses are never persisted.
+
+use std::{
+    borrow::Cow,
+    collections::{BTreeMap, HashMap},
+    ops::Deref,
+    sync::Arc,
+};
+
+use indexmap::IndexMap;
+use serde::{Deserialize, Serialize};
+
+mod estimator;
+mod type_context;
+use type_context::TypeFacts;
+pub use type_context::{InputCompositions, InputTypeContext};
+
+#[cfg(test)]
+mod estimator_tests;
+
+use crate::{
+    effect::{Effect, EffectGeneration, EffectInstanceKey},
+    plan::{Plan, PlanError, PlanErrorKind},
+    resource::{ConcreteValue, Current, DeferredValue, ModuleSource, ResourceId, Value, ValueKind},
+    schema::{
+        Compiled, InputMode, InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleScope,
+        InputRuleTarget, InputViolation, SchemaKind, SchemaRegistry, ValidatedResourceSchema,
+    },
+};
+
+/// The desired-write context selected by the sole site classifier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InputWriteContext {
+    Create,
+    Update,
+    AuthoredDesired,
+    Replacement { create_before_destroy: bool },
+    ResumeCreate,
+    DeferredCreate,
+    DeferredReplacement,
+}
+
+#[derive(Debug, Clone)]
+struct InputPlanIdentity(Arc<()>);
+
+impl PartialEq for InputPlanIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for InputPlanIdentity {}
+
+/// A slot in one immutable finalized plan. The index distinguishes effects
+/// even when several effects address the same resource/generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputEffectTarget {
+    plan: InputPlanIdentity,
+    effect_index: usize,
+}
+
+impl InputEffectTarget {
+    pub fn effect_index(&self) -> usize {
+        self.effect_index
+    }
+}
+
+/// A delete-first replacement's exact delete slot, including absorbed deletes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedInputDelete {
+    plan: InputPlanIdentity,
+    effect_index: usize,
+    absorbed_index: Option<usize>,
+    instance: EffectInstanceKey,
+}
+
+impl PairedInputDelete {
+    pub fn effect_index(&self) -> usize {
+        self.effect_index
+    }
+    pub fn absorbed_index(&self) -> Option<usize> {
+        self.absorbed_index
+    }
+    pub fn instance(&self) -> &EffectInstanceKey {
+        &self.instance
+    }
+}
+
+/// Only the write-site classifier can construct this view.
+/// Raw resources, raw effects and normalization inputs carry no such authority.
+///
+/// ```compile_fail,E0277
+/// use carina_core::{input_rules::WriteSite, resource::Resource};
+/// let view: WriteSite<'_> = Resource::new("test", "r").into();
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::{input_rules::WriteSite, effect::Effect};
+/// fn forge(effect: &Effect) -> WriteSite<'_> { effect.into() }
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::{input_rules::WriteSite, effect::Effect};
+/// fn forge(effect: Effect) -> WriteSite<'static> { effect.into() }
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::input_rules::WriteSite;
+/// let view: WriteSite<'_> = Default::default();
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::input_rules::WriteSite;
+/// let view: WriteSite<'_> = serde_json::from_str("{}").unwrap();
+/// ```
+/// ```compile_fail,E0616
+/// use carina_core::input_rules::WriteSite;
+/// fn mutate(view: &mut WriteSite<'_>) { view.attributes = None; }
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::{input_rules::WriteSite, resource::Current};
+/// fn forge(current: &Current) -> WriteSite<'_> { current.into() }
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::{input_rules::WriteSite, resource::State};
+/// fn forge(state: &State) -> WriteSite<'_> { state.into() }
+/// ```
+/// ```compile_fail,E0451
+/// use carina_core::{input_rules::{ApplicableInputRule, WriteSite}, schema::{Compiled, InputRule}};
+/// fn bypass<'a>(site: &WriteSite<'a>, rule: &'a InputRule<Compiled>) {
+///     let applicable = ApplicableInputRule { site, rule };
+///     let _ = applicable.evaluate();
+/// }
+/// ```
+/// The executor constructor requires discharge authority and is inaccessible
+/// outside core.
+///
+/// ```compile_fail,E0603
+/// use carina_core::input_rules::executor_write_site;
+/// use carina_core::executor::input_discharge::DischargeToken;
+/// ```
+pub struct WriteSite<'a> {
+    target: Option<InputEffectTarget>,
+    resource_id: &'a ResourceId,
+    attributes: Option<Cow<'a, IndexMap<String, Value>>>,
+    authored: Option<AuthoredAttributes<'a>>,
+    types: Option<&'a TypeFacts>,
+    context: InputWriteContext,
+    schema: &'a ValidatedResourceSchema,
+    rules: Vec<&'a InputRule<Compiled>>,
+    paired_deletes: Vec<PairedInputDelete>,
+}
+
+enum AuthoredAttributes<'a> {
+    Resource(&'a IndexMap<String, Value>),
+    Template(&'a IndexMap<String, Value<crate::resource::LoopSlot>>),
+}
+
+impl WriteSite<'_> {
+    pub fn target(&self) -> Option<&InputEffectTarget> {
+        self.target.as_ref()
+    }
+    pub fn applicable_rules(&self) -> impl Iterator<Item = ApplicableInputRule<'_, '_>> {
+        self.rules
+            .iter()
+            .filter(|rule| {
+                self.context != InputWriteContext::Update
+                    || self
+                        .attributes
+                        .as_deref()
+                        .is_some_and(|attributes| attributes.contains_key(rule.path().root()))
+            })
+            .map(|rule| ApplicableInputRule { site: self, rule })
+    }
+    pub fn resource_id(&self) -> &ResourceId {
+        self.resource_id
+    }
+    pub fn context(&self) -> InputWriteContext {
+        self.context
+    }
+}
+
+/// An applicable declaration bound to the desired projection selected by the
+/// classifier. Callers supply neither a rule nor a value when evaluating it.
+pub struct ApplicableInputRule<'s, 'a> {
+    site: &'s WriteSite<'a>,
+    rule: &'a InputRule<Compiled>,
+}
+
+impl ApplicableInputRule<'_, '_> {
+    pub(crate) fn path(&self) -> &InputPath {
+        self.rule.path()
+    }
+    pub(crate) fn code(&self) -> &InputRuleCode {
+        self.rule.code()
+    }
+    pub fn evaluate(&self) -> InputVerdict {
+        verdict(self.site, self.rule)
+    }
+}
+
+enum WriteSiteSource<'a, S> {
+    Finalized {
+        plan: &'a FinalizedPlan<S>,
+        index: usize,
+        current: &'a HashMap<ResourceId, Current>,
+        types: Option<&'a TypeFacts>,
+    },
+    Authored(&'a crate::resource::Resource),
+    Executor {
+        #[allow(dead_code)] // Type-level construction authority; no runtime data.
+        authority: &'a crate::executor::input_discharge::DischargeToken,
+        admission: &'a PendingInputObligation,
+        resource_id: &'a ResourceId,
+        attributes: &'a IndexMap<String, Value>,
+    },
+}
+
+/// The sole classifier and constructor of desired write sites. Current is
+/// consulted only for the issued/unissued continuation distinction; its values
+/// never become authored inputs. Updates select the patch's sent values,
+/// including any ignored readable leaves preserved by patch construction.
+fn classify_write_site<'a, S>(
+    source: WriteSiteSource<'a, S>,
+    schemas: &'a SchemaRegistry,
+) -> Result<Option<WriteSite<'a>>, crate::provider::UpdatePatchError> {
+    let (
+        target,
+        resource_id,
+        attributes,
+        context,
+        paired_deletes,
+        authored,
+        types,
+        schema,
+        declarations,
+    ) = match source {
+        WriteSiteSource::Executor {
+            authority: _,
+            admission,
+            resource_id,
+            attributes,
+        } => (
+            Some(admission.target.clone()),
+            resource_id,
+            Some(Cow::Borrowed(attributes)),
+            admission.context,
+            admission.paired_deletes.clone(),
+            None,
+            None,
+            admission.schema.as_ref(),
+            admission.rules.as_slice(),
+        ),
+        WriteSiteSource::Authored(resource) => {
+            let Some(schema) = schemas.get_for(resource) else {
+                return Ok(None);
+            };
+            let schema = schema.schema();
+            (
+                None,
+                &resource.id,
+                Some(Cow::Borrowed(&resource.attributes)),
+                InputWriteContext::AuthoredDesired,
+                Vec::new(),
+                Some(AuthoredAttributes::Resource(&resource.attributes)),
+                None,
+                schema,
+                schema.as_schema().input_rules(),
+            )
+        }
+        WriteSiteSource::Finalized {
+            plan,
+            index,
+            current,
+            types,
+        } => {
+            let effect = &plan.plan.effects()[index];
+            let Some(schema) = schemas.get(
+                &effect.resource_id().provider,
+                &effect.resource_id().resource_type,
+                SchemaKind::Resource,
+            ) else {
+                return Ok(None);
+            };
+            let schema = schema.schema();
+            let (resource_id, attributes, context, deletes) = match effect {
+                Effect::Create(resource) => {
+                    let replacement = plan.replacement_creates.get(&index);
+                    let deletes = replacement
+                        .into_iter()
+                        .flat_map(|info| &info.delete_indices)
+                        .map(|&delete_index| PairedInputDelete {
+                            plan: plan.identity.clone(),
+                            effect_index: delete_index,
+                            absorbed_index: None,
+                            instance: plan.plan.effects()[delete_index].instance_key(),
+                        })
+                        .collect();
+                    (
+                        &resource.id,
+                        Some(Cow::Borrowed(&resource.attributes)),
+                        replacement.map_or(InputWriteContext::Create, |info| {
+                            InputWriteContext::Replacement {
+                                create_before_destroy: info.create_before_destroy,
+                            }
+                        }),
+                        deletes,
+                    )
+                }
+                Effect::Update {
+                    from,
+                    identifier: _,
+                    to,
+                    changed_attributes,
+                } => (
+                    &to.id,
+                    Some(Cow::Owned(
+                        crate::provider::plan_update_patch(
+                            changed_attributes,
+                            to,
+                            from,
+                            schema.as_schema(),
+                        )?
+                        .sent_projection(),
+                    )),
+                    InputWriteContext::Update,
+                    Vec::new(),
+                ),
+                Effect::ResumeCreate {
+                    resource,
+                    started_at: _,
+                } => {
+                    if matches!(current.get(&resource.id), Some(Current::CreateInFlight(pending)) if pending.identifier().is_some())
+                    {
+                        return Ok(None);
+                    }
+                    (
+                        &resource.id,
+                        Some(Cow::Borrowed(&resource.attributes)),
+                        InputWriteContext::ResumeCreate,
+                        plan.replacement_creates
+                            .get(&index)
+                            .into_iter()
+                            .flat_map(|info| &info.delete_indices)
+                            .map(|&delete_index| PairedInputDelete {
+                                plan: plan.identity.clone(),
+                                effect_index: delete_index,
+                                absorbed_index: None,
+                                instance: plan.plan.effects()[delete_index].instance_key(),
+                            })
+                            .collect(),
+                    )
+                }
+                Effect::DeferredCreate(payload) => (
+                    payload.template.template_resource_id(),
+                    None,
+                    InputWriteContext::DeferredCreate,
+                    Vec::new(),
+                ),
+                Effect::DeferredReplace(payload) => (
+                    payload.template.template_resource_id(),
+                    None,
+                    InputWriteContext::DeferredReplacement,
+                    payload
+                        .deletes
+                        .iter()
+                        .enumerate()
+                        .map(|(absorbed, delete)| PairedInputDelete {
+                            plan: plan.identity.clone(),
+                            effect_index: index,
+                            absorbed_index: Some(absorbed),
+                            instance: EffectInstanceKey::new(
+                                delete.id.clone(),
+                                EffectGeneration::Current,
+                            ),
+                        })
+                        .collect(),
+                ),
+                Effect::Read { resource: _ }
+                | Effect::Delete {
+                    id: _,
+                    identifier: _,
+                    generation: _,
+                    directives: _,
+                    binding: _,
+                    dependencies: _,
+                    explicit_dependencies: _,
+                    blocked_by_updates: _,
+                }
+                | Effect::Import {
+                    id: _,
+                    identifier: _,
+                }
+                | Effect::Remove { id: _ }
+                | Effect::Move {
+                    from: _,
+                    to: _,
+                    origin: _,
+                }
+                | Effect::ReleaseListKeys {
+                    id: _,
+                    attribute: _,
+                    key_field: _,
+                    keys: _,
+                }
+                | Effect::Wait {
+                    id: _,
+                    target_id: _,
+                    until: _,
+                    until_surface: _,
+                    timeout: _,
+                    interval: _,
+                    explicit_dependencies: _,
+                } => return Ok(None),
+            };
+            let authored = match effect {
+                Effect::DeferredCreate(payload) => Some(AuthoredAttributes::Template(
+                    payload.template.template_resource().attributes(),
+                )),
+                Effect::DeferredReplace(payload) => Some(AuthoredAttributes::Template(
+                    payload.template.template_resource().attributes(),
+                )),
+                _ => types
+                    .and_then(|types| types.authored.get(resource_id))
+                    .map(AuthoredAttributes::Resource),
+            };
+            (
+                Some(InputEffectTarget {
+                    plan: plan.identity.clone(),
+                    effect_index: index,
+                }),
+                resource_id,
+                attributes,
+                context,
+                deletes,
+                authored,
+                types,
+                schema,
+                schema.as_schema().input_rules(),
+            )
+        }
+    };
+    // Discharge consumes the declarations admitted for this slot. Update
+    // applicability is decided from the same sent projection at both phases.
+    let mut rules = declarations
+        .iter()
+        .filter(|rule| match rule.scope() {
+            InputRuleScope::CreateOnly => match context {
+                InputWriteContext::Create
+                | InputWriteContext::Replacement {
+                    create_before_destroy: _,
+                }
+                | InputWriteContext::ResumeCreate
+                | InputWriteContext::DeferredCreate
+                | InputWriteContext::DeferredReplacement => true,
+                InputWriteContext::Update | InputWriteContext::AuthoredDesired => false,
+            },
+            InputRuleScope::EveryWrite => match context {
+                InputWriteContext::Create
+                | InputWriteContext::Replacement {
+                    create_before_destroy: _,
+                }
+                | InputWriteContext::ResumeCreate
+                | InputWriteContext::DeferredCreate
+                | InputWriteContext::DeferredReplacement
+                | InputWriteContext::Update
+                | InputWriteContext::AuthoredDesired => true,
+            },
+        })
+        .collect::<Vec<_>>();
+    rules.sort_by(|a, b| (a.target(), a.code()).cmp(&(b.target(), b.code())));
+    Ok(Some(WriteSite {
+        target,
+        resource_id,
+        attributes,
+        authored,
+        types,
+        context,
+        schema,
+        rules,
+        paired_deletes,
+    }))
+}
+
+/// An explicit remainder of admission; it cannot be deserialized or discharged
+/// by callers. Deferred slots bind to the template effect, never a name.
+///
+/// ```compile_fail,E0277
+/// use carina_core::input_rules::PendingInputObligation;
+/// let pending: PendingInputObligation = serde_json::from_str("{}").unwrap();
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::input_rules::PendingInputObligation;
+/// fn persist(pending: &PendingInputObligation) { let _ = serde_json::to_string(pending); }
+/// ```
+#[derive(Debug, Clone)]
+pub struct PendingInputObligation {
+    target: InputEffectTarget,
+    rules: Vec<InputRule<Compiled>>,
+    paired_deletes: Vec<PairedInputDelete>,
+    context: InputWriteContext,
+    schema: Arc<ValidatedResourceSchema>,
+}
+
+impl PendingInputObligation {
+    pub fn target(&self) -> &InputEffectTarget {
+        &self.target
+    }
+    pub fn paired_deletes(&self) -> &[PairedInputDelete] {
+        &self.paired_deletes
+    }
+}
+
+/// Finalization has completed all effect rewrites. There is no public raw-plan
+/// constructor or mutable access; input admission consumes this owner.
+///
+/// ```compile_fail,E0277
+/// use carina_core::{input_rules::FinalizedPlan, plan::Plan};
+/// let finalized: FinalizedPlan = Plan::new().into();
+/// ```
+/// ```compile_fail,E0599
+/// use carina_core::{plan::Plan, schema::SchemaRegistry};
+/// fn bypass(raw: Plan, schemas: &SchemaRegistry) {
+///     let _ = raw.check_inputs(schemas, &std::collections::HashMap::new());
+/// }
+/// ```
+#[derive(Debug)]
+pub struct FinalizedPlan<S = ModuleSource> {
+    plan: Plan<S>,
+    identity: InputPlanIdentity,
+    replacement_creates: HashMap<usize, ReplacementWrite>,
+}
+
+#[derive(Debug)]
+struct ReplacementWrite {
+    delete_indices: Vec<usize>,
+    create_before_destroy: bool,
+}
+
+/// Rejected admission retains the complete diagnostic plan, without creating
+/// display, persistence, or execution authority.
+pub struct InputAdmissionFailure<S = ModuleSource> {
+    plan: Box<Plan<S>>,
+}
+
+impl<S> std::fmt::Debug for InputAdmissionFailure<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InputAdmissionFailure")
+            .field("errors", &self.plan.errors())
+            .finish()
+    }
+}
+
+impl<S> Deref for InputAdmissionFailure<S> {
+    type Target = Plan<S>;
+    fn deref(&self) -> &Self::Target {
+        &self.plan
+    }
+}
+
+impl<S> InputAdmissionFailure<S> {
+    pub fn into_plan(self) -> Plan<S> {
+        *self.plan
+    }
+}
+
+impl<S> Deref for FinalizedPlan<S> {
+    type Target = Plan<S>;
+    fn deref(&self) -> &Self::Target {
+        &self.plan
+    }
+}
+
+/// Explicit fixture-only bridge from a hand-built plan into execution admission.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn finalize_plan_for_test<S>(plan: Plan<S>) -> FinalizedPlan<S> {
+    FinalizedPlan::new(plan)
+}
+
+impl FinalizedPlan<crate::resource::SavedModuleSource> {
+    /// Seal the saved effects after the caller has verified and rehydrated
+    /// them. This performs no diff or effect rewrite and grants no execution
+    /// authority until the ordinary input-admission transition succeeds.
+    pub(crate) fn from_saved_plan(plan: Plan<crate::resource::SavedModuleSource>) -> Self {
+        Self::new(plan)
+    }
+}
+
+impl<S> FinalizedPlan<S> {
+    pub(crate) fn new(plan: Plan<S>) -> Self {
+        let replacement_creates = plan
+            .replace_display_info()
+            .map(|info| {
+                (
+                    info.create_idx,
+                    ReplacementWrite {
+                        delete_indices: vec![info.delete_idx],
+                        create_before_destroy: info.create_before_destroy,
+                    },
+                )
+            })
+            .collect();
+        Self {
+            plan,
+            identity: InputPlanIdentity(Arc::new(())),
+            replacement_creates,
+        }
+    }
+
+    /// Borrow classified desired sites from this sealed plan. Rules can be
+    /// evaluated only against the projection retained by each returned site.
+    pub fn write_sites<'a>(
+        &'a self,
+        schemas: &'a SchemaRegistry,
+        current: &'a HashMap<ResourceId, Current>,
+    ) -> impl Iterator<Item = Result<WriteSite<'a>, crate::provider::UpdatePatchError>> {
+        (0..self.plan.effects().len()).filter_map(move |index| {
+            classify_write_site(
+                WriteSiteSource::Finalized {
+                    plan: self,
+                    index,
+                    current,
+                    types: None,
+                },
+                schemas,
+            )
+            .transpose()
+        })
+    }
+
+    /// Admit every final desired write and resend-capable continuation. Existing
+    /// diagnostics are retained; new diagnostics are sorted by routed address,
+    /// path and code independently of declaration order.
+    pub fn check_inputs(
+        self,
+        schemas: &SchemaRegistry,
+        current: &HashMap<ResourceId, Current>,
+    ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>>
+    where
+        S: Clone,
+    {
+        self.check_inputs_with_types(schemas, current, &InputTypeContext::empty())
+    }
+
+    /// Admit using the one immutable declaration context retained for this plan.
+    pub fn check_inputs_with_types(
+        mut self,
+        schemas: &SchemaRegistry,
+        current: &HashMap<ResourceId, Current>,
+        types: &InputTypeContext<S>,
+    ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>>
+    where
+        S: Clone,
+    {
+        // Replacement admission may install prepared temporary names. Classify
+        // the resulting exact effects, never the draft that preceded that seam.
+        let admitted = match self.plan.clone().admit(schemas) {
+            Ok(plan) => plan,
+            Err(error) => {
+                let error = error.into_plan_error();
+                if !self.plan.errors().contains(&error) {
+                    self.plan.add_error(error);
+                }
+                return Err(InputAdmissionFailure {
+                    plan: Box::new(self.plan),
+                });
+            }
+        };
+        self = Self::new(admitted.clone().into_unadmitted());
+        self.replacement_creates = admitted
+            .admitted_effects()
+            .input_replacement_sites()
+            .into_iter()
+            .map(|(index, delete_indices, create_before_destroy)| {
+                (
+                    index,
+                    ReplacementWrite {
+                        delete_indices,
+                        create_before_destroy,
+                    },
+                )
+            })
+            .collect();
+        let mut diagnostics = Vec::new();
+        let mut pending = Vec::new();
+        let mut write_checks = Vec::new();
+        for index in 0..self.plan.effects().len() {
+            let view = match classify_write_site(
+                WriteSiteSource::Finalized {
+                    plan: &self,
+                    index,
+                    current,
+                    types: Some(&types.facts),
+                },
+                schemas,
+            ) {
+                Ok(Some(view)) => view,
+                Ok(None) => continue,
+                Err(error) => {
+                    self.plan.add_error(PlanError::new(
+                        self.plan.effects()[index].resource_id().clone(),
+                        error.into(),
+                    ));
+                    continue;
+                }
+            };
+            if view.rules.is_empty() {
+                continue;
+            }
+            let resource_id = view.resource_id;
+            let context = view.context;
+            let mut undecided = Vec::new();
+            let schema = Arc::new(view.schema.clone());
+            // Normalization can change even statically proven values. Retain
+            // the classified authority for rechecking the exact wire request.
+            write_checks.push(PendingInputObligation {
+                target: view.target.clone().expect("finalized slot"),
+                rules: view.rules.iter().map(|rule| (*rule).clone()).collect(),
+                paired_deletes: view.paired_deletes.clone(),
+                context,
+                schema: Arc::clone(&schema),
+            });
+            for applicable in view.applicable_rules() {
+                let rule = applicable.rule;
+                match applicable.evaluate() {
+                    InputVerdict::Proven => {}
+                    InputVerdict::Violation(violation) => {
+                        diagnostics.push((resource_id.clone(), context, violation))
+                    }
+                    InputVerdict::Undecided => undecided.push(rule.clone()),
+                }
+            }
+            if !undecided.is_empty() {
+                pending.push(PendingInputObligation {
+                    target: view
+                        .target
+                        .expect("finalized sites carry an exact effect slot"),
+                    rules: undecided,
+                    paired_deletes: view.paired_deletes,
+                    context,
+                    schema: Arc::clone(&schema),
+                });
+            }
+        }
+        // Include provider-instance routing, which display spelling omits.
+        diagnostics.sort_by(|(a, _, av), (b, _, bv)| {
+            (
+                &a.provider,
+                &a.provider_instance,
+                &a.resource_type,
+                a.identity_str(),
+                av.path(),
+                av.code(),
+            )
+                .cmp(&(
+                    &b.provider,
+                    &b.provider_instance,
+                    &b.resource_type,
+                    b.identity_str(),
+                    bv.path(),
+                    bv.code(),
+                ))
+        });
+        for (resource_id, context, violation) in diagnostics {
+            self.plan.add_error(PlanError::new(
+                resource_id,
+                PlanErrorKind::InputRule {
+                    path: violation.path().as_str().into(),
+                    code: violation.code().as_str().into(),
+                    reason: violation.reason().to_string(),
+                    context,
+                },
+            ));
+        }
+        if self.plan.has_errors() {
+            Err(InputAdmissionFailure {
+                plan: Box::new(self.plan),
+            })
+        } else {
+            Ok(InputCheckedPlan {
+                plan: admitted,
+                obligations: Box::new(InputObligations {
+                    pending,
+                    write_checks,
+                }),
+            })
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputVerdict {
+    Proven,
+    Violation(InputViolation),
+    Undecided,
+}
+
+fn verdict(view: &WriteSite<'_>, rule: &InputRule<Compiled>) -> InputVerdict {
+    let path = rule.path().attribute_segments();
+    let mut verdict = projected_verdict(view, rule, &path);
+    if matches!(verdict, InputVerdict::Violation(_)) {
+        return verdict;
+    }
+    if matches!(rule.target(), InputRuleTarget::MapKeys(path) if path.as_str() == "tags")
+        && let Some(keys) = view
+            .types
+            .and_then(|types| types.default_keys.get(view.resource_id))
+    {
+        for (key, mandatory) in keys {
+            if let Err(violation) = evaluate_string(rule, key) {
+                if *mandatory {
+                    return InputVerdict::Violation(violation);
+                }
+                verdict = InputVerdict::Undecided;
+            }
+        }
+    }
+    verdict
+}
+
+fn projected_verdict(
+    view: &WriteSite<'_>,
+    rule: &InputRule<Compiled>,
+    path: &[String],
+) -> InputVerdict {
+    let Some(attributes) = view.attributes.as_deref() else {
+        return estimator::estimate(view, rule, path);
+    };
+    let mut fields = attributes;
+    for (index, segment) in path.iter().enumerate() {
+        let Some(value) = fields.get(segment) else {
+            return if estimator::omitted_optional(attributes, path, view.schema) {
+                InputVerdict::Proven
+            } else {
+                estimator::estimate(view, rule, path)
+            };
+        };
+        let value = peel_secret(value);
+        if index + 1 == path.len() {
+            return match rule.target() {
+                InputRuleTarget::Value(_) => match value {
+                    Value::Concrete(ConcreteValue::String(value)) => {
+                        evaluate_string(rule, value.expose_plaintext())
+                            .map_or_else(InputVerdict::Violation, |()| InputVerdict::Proven)
+                    }
+                    Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
+                        evaluate_string(rule, value.api_value())
+                            .map_or_else(InputVerdict::Violation, |()| InputVerdict::Proven)
+                    }
+                    Value::Concrete(ConcreteValue::EnumIdentifier(value)) => view
+                        .schema
+                        .effective_node_at_path(path)
+                        .and_then(|node| {
+                            let ty = node.value_type();
+                            crate::resource::EnumValueResolver::with_defs(ty.as_type(), ty.defs())
+                                .resolve_raw(value)
+                                .ok()
+                        })
+                        .map_or(InputVerdict::Undecided, |value| {
+                            evaluate_string(rule, value.api_value())
+                                .map_or_else(InputVerdict::Violation, |()| InputVerdict::Proven)
+                        }),
+                    _ => estimator::estimate(view, rule, path),
+                },
+                InputRuleTarget::MapKeys(_) => match value {
+                    Value::Concrete(ConcreteValue::Map(entries)) => {
+                        for key in entries.keys() {
+                            if let Err(violation) = evaluate_string(rule, key) {
+                                return InputVerdict::Violation(violation);
+                            }
+                        }
+                        InputVerdict::Proven
+                    }
+                    _ => estimator::estimate(view, rule, path),
+                },
+            };
+        }
+        fields = match value {
+            Value::Concrete(ConcreteValue::Map(fields)) => fields,
+            _ => return estimator::estimate(view, rule, path),
+        };
+    }
+    unreachable!("admitted input paths are nonempty")
+}
+
+fn peel_secret<P: ValueKind>(mut value: &Value<P>) -> &Value<P> {
+    while let Value::Deferred(DeferredValue::Secret(secret)) = value {
+        value = secret.expose_plaintext();
+    }
+    value
+}
+
+/// A value-free diagnostic on authored input, shared by validate and the LSP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthoredInputFinding {
+    pub resource_id: ResourceId,
+    pub violation: InputViolation,
+}
+
+impl std::fmt::Display for AuthoredInputFinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.resource_id, self.violation)
+    }
+}
+
+/// Check known EveryWrite inputs in a parser-owned configuration. Raw resource,
+/// state and attribute-map callers cannot manufacture this source authority.
+/// CreateOnly declarations are filtered by the same classifier used by plans.
+pub fn check_authored_inputs<E, P, T, D, B>(
+    parsed: &crate::parser::File<E, P, T, D, B>,
+    schemas: &SchemaRegistry,
+) -> crate::provider::HostResult<Vec<AuthoredInputFinding>>
+where
+    P: crate::resource::PlaceholderKind,
+    T: crate::resource::PlaceholderKind,
+    B: crate::resource::BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+{
+    use crate::parser::ResourceRef;
+    let mut resources = parsed
+        .iter_all_resources()
+        .filter_map(|source| {
+            // Only managed authored resources enter this projection. Read models
+            // and data sources have no path into a desired write site.
+            let (id, attributes) = match source {
+                ResourceRef::Resource(resource) => {
+                    (&resource.id, project_attributes(&resource.attributes))
+                }
+                ResourceRef::Deferred {
+                    resource,
+                    deferred: _,
+                } => (resource.id(), project_attributes(resource.attributes())),
+                ResourceRef::DataSource(_) | ResourceRef::LiveComposition(_) => return None,
+            };
+            let mut resource = crate::resource::Resource::with_provider(
+                &id.provider,
+                &id.resource_type,
+                "_input_projection",
+                id.provider_instance.clone(),
+            );
+            resource.id = id.clone();
+            resource.attributes = attributes;
+            Some(resource)
+        })
+        .collect::<Vec<_>>();
+    for config in &parsed.providers {
+        let crate::parser::ProviderConfig {
+            name,
+            attributes,
+            default_tags,
+            source,
+            version,
+            revision,
+            unresolved_attributes,
+            binding,
+        } = config;
+        let config = crate::parser::ProviderConfig {
+            name: name.clone(),
+            attributes: project_attributes(attributes),
+            default_tags: project_attributes(default_tags),
+            source: source.clone(),
+            version: version.clone(),
+            revision: revision.clone(),
+            unresolved_attributes: project_attributes(unresolved_attributes),
+            binding: binding.clone(),
+        };
+        // This is the existing host merge, also called by plan preprocessing
+        // and dispatch normalization before WireReady admission (#4279).
+        crate::provider::merge_default_tags(&config, &mut resources, schemas)?;
+    }
+    let mut findings = Vec::new();
+    for resource in &resources {
+        if let Some(site) =
+            classify_write_site::<ModuleSource>(WriteSiteSource::Authored(resource), schemas)
+                .map_err(|error| crate::provider::HostError::invalid_input(error.to_string()))?
+        {
+            for rule in site.applicable_rules() {
+                if let InputVerdict::Violation(violation) = rule.evaluate() {
+                    findings.push(AuthoredInputFinding {
+                        resource_id: resource.id.clone(),
+                        violation,
+                    });
+                }
+            }
+        }
+    }
+    Ok(findings)
+}
+
+fn project_attributes<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+    attributes: &IndexMap<String, Value<P, B>>,
+) -> IndexMap<String, Value> {
+    attributes
+        .iter()
+        .map(|(key, value)| (key.clone(), project_known_value(value)))
+        .collect()
+}
+
+/// Erase unresolved expressions conservatively, retaining known container keys
+/// and secret protection. No read-back value or state is consulted here.
+fn project_known_value<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+    value: &Value<P, B>,
+) -> Value {
+    match value {
+        Value::Concrete(ConcreteValue::String(value)) => {
+            Value::Concrete(ConcreteValue::String(value.clone()))
+        }
+        Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
+            Value::Concrete(ConcreteValue::CanonicalEnum(value.clone()))
+        }
+        Value::Concrete(ConcreteValue::EnumIdentifier(value)) => {
+            Value::Concrete(ConcreteValue::EnumIdentifier(value.clone()))
+        }
+        Value::Concrete(ConcreteValue::Int(value)) => Value::Concrete(ConcreteValue::Int(*value)),
+        Value::Concrete(ConcreteValue::Float(value)) => {
+            Value::Concrete(ConcreteValue::Float(*value))
+        }
+        Value::Concrete(ConcreteValue::Bool(value)) => Value::Concrete(ConcreteValue::Bool(*value)),
+        Value::Concrete(ConcreteValue::Duration(value)) => {
+            Value::Concrete(ConcreteValue::Duration(*value))
+        }
+        Value::Concrete(ConcreteValue::StringList(value)) => {
+            Value::Concrete(ConcreteValue::StringList(value.clone()))
+        }
+        Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
+            values.iter().map(project_known_value).collect(),
+        )),
+        Value::Concrete(ConcreteValue::Map(entries)) => {
+            Value::Concrete(ConcreteValue::Map(project_attributes(entries)))
+        }
+        Value::Deferred(DeferredValue::Secret(secret)) => {
+            project_known_value(secret.expose_plaintext()).into_secret()
+        }
+        Value::Deferred(_) => Value::Deferred(DeferredValue::Unknown(
+            crate::resource::ApplyTimeUnknown::PendingReRead(
+                crate::resource::PendingReRead::not_found(),
+            ),
+        )),
+    }
+}
+
+/// Every desired write slot either passed or retains an explicit obligation.
+/// Cloning this immutable owner preserves the same effects; mutable/raw plans
+/// cannot recover its execution authority.
+///
+/// ```compile_fail,E0277
+/// use carina_core::{input_rules::InputCheckedPlan, plan::Plan};
+/// let checked: InputCheckedPlan = Plan::new().into();
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::{input_rules::InputCheckedPlan, resource::Resource};
+/// let checked: InputCheckedPlan = Resource::new("test", "r").into();
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::{input_rules::InputCheckedPlan, effect::Effect};
+/// fn forge(effect: Effect) -> InputCheckedPlan { effect.into() }
+/// ```
+/// ```compile_fail,E0451
+/// use carina_core::{input_rules::InputCheckedPlan, plan::AdmittedPlan};
+/// fn forge(plan: AdmittedPlan) -> InputCheckedPlan {
+///     InputCheckedPlan { plan, obligations: todo!() }
+/// }
+/// ```
+/// ```compile_fail,E0277
+/// use carina_core::input_rules::InputCheckedPlan;
+/// let checked: InputCheckedPlan = serde_json::from_str("{}").unwrap();
+/// ```
+/// ```compile_fail,E0596
+/// use carina_core::{input_rules::InputCheckedPlan, effect::Effect};
+/// fn mutate(checked: &mut InputCheckedPlan, effect: Effect) { checked.add(effect); }
+/// ```
+/// ```compile_fail,E0599
+/// use carina_core::input_rules::InputCheckedPlan;
+/// let checked = InputCheckedPlan::default();
+/// ```
+#[derive(Debug, Clone)]
+pub struct InputCheckedPlan<S = ModuleSource> {
+    plan: crate::plan::AdmittedPlan<S>,
+    obligations: Box<InputObligations>,
+}
+
+#[derive(Debug, Clone)]
+struct InputObligations {
+    pending: Vec<PendingInputObligation>,
+    write_checks: Vec<PendingInputObligation>,
+}
+
+impl<S> Deref for InputCheckedPlan<S> {
+    type Target = crate::plan::AdmittedPlan<S>;
+    fn deref(&self) -> &Self::Target {
+        &self.plan
+    }
+}
+
+impl<S> InputCheckedPlan<S> {
+    pub(crate) fn execution_input_checks(&self) -> Vec<PendingInputObligation> {
+        self.obligations.write_checks.clone()
+    }
+    pub fn plan(&self) -> &crate::plan::AdmittedPlan<S> {
+        &self.plan
+    }
+    pub fn pending_inputs(&self) -> &[PendingInputObligation] {
+        &self.obligations.pending
+    }
+    pub(crate) fn pending_rows(&self, effect_index: usize) -> Vec<crate::detail_rows::DetailRow> {
+        let mut paths: BTreeMap<InputPath, Vec<InputRuleCode>> = BTreeMap::new();
+        for obligation in &self.obligations.pending {
+            if obligation.target.effect_index == effect_index {
+                for rule in &obligation.rules {
+                    paths
+                        .entry(rule.path().clone())
+                        .or_default()
+                        .push(rule.code().clone());
+                }
+            }
+        }
+        paths
+            .into_iter()
+            .map(|(path, mut codes)| {
+                codes.sort();
+                codes.dedup();
+                crate::detail_rows::DetailRow::PendingInput { path, codes }
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+impl<S: Clone> crate::plan::AdmittedPlan<S> {
+    /// Check the admitted, prepared effects and retain both witnesses for execution.
+    pub(crate) fn check_inputs(
+        self,
+        schemas: &SchemaRegistry,
+        current: &HashMap<ResourceId, Current>,
+    ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>> {
+        self.check_inputs_with_types(schemas, current, &InputTypeContext::empty())
+    }
+
+    /// Finalize the admitted effects and check them against retained declarations.
+    pub(crate) fn check_inputs_with_types(
+        self,
+        schemas: &SchemaRegistry,
+        current: &HashMap<ResourceId, Current>,
+        types: &InputTypeContext<S>,
+    ) -> Result<InputCheckedPlan<S>, InputAdmissionFailure<S>> {
+        FinalizedPlan::new(self.into_unadmitted()).check_inputs_with_types(schemas, current, types)
+    }
+}
+
+/// Only executor discharge can supply this unforgeable constructor token.
+///
+/// ```compile_fail,E0603
+/// use carina_core::input_rules::executor_write_site;
+/// ```
+pub(crate) fn executor_write_site<'a>(
+    authority: &'a crate::executor::input_discharge::DischargeToken,
+    admission: &'a PendingInputObligation,
+    resource_id: &'a ResourceId,
+    attributes: &'a IndexMap<String, Value>,
+    schemas: &'a SchemaRegistry,
+) -> Result<Option<WriteSite<'a>>, crate::provider::UpdatePatchError> {
+    classify_write_site::<ModuleSource>(
+        WriteSiteSource::Executor {
+            authority,
+            admission,
+            resource_id,
+            attributes,
+        },
+        schemas,
+    )
+}
+
+fn evaluate_string(rule: &InputRule<Compiled>, value: &str) -> Result<(), InputViolation> {
+    let accepted = match rule.predicate() {
+        InputPredicate::Length { min, max } => {
+            let count = u64::try_from(value.chars().count()).expect("string length fits u64");
+            min.is_none_or(|min| count >= min) && max.is_none_or(|max| count <= max)
+        }
+        InputPredicate::AllowedChars(set) => value.chars().all(|ch| set.contains(ch)),
+        InputPredicate::FirstChar(set) => value.chars().next().is_some_and(|ch| set.contains(ch)),
+        InputPredicate::LastChar(set) => {
+            value.chars().next_back().is_some_and(|ch| set.contains(ch))
+        }
+        InputPredicate::NoSubstring(token) => !value.contains(token.as_str()),
+        InputPredicate::NoPrefix(token) => !value.starts_with(token.as_str()),
+        InputPredicate::ForbiddenPrefix {
+            prefix,
+            ignore_ascii_case,
+        } => !value.get(..prefix.as_str().len()).is_some_and(|head| {
+            if *ignore_ascii_case {
+                head.eq_ignore_ascii_case(prefix.as_str())
+            } else {
+                head == prefix.as_str()
+            }
+        }),
+        InputPredicate::NoSuffix(token) => !value.ends_with(token.as_str()),
+        InputPredicate::NoAdjacent { left, right } => !value
+            .chars()
+            .zip(value.chars().skip(1))
+            .any(|(a, b)| left.contains(a) && right.contains(b)),
+        InputPredicate::NotIpv4 => !is_ipv4(value),
+        InputPredicate::Matches(pattern) => pattern.is_match(value),
+        InputPredicate::NotMatches(pattern) => !pattern.is_match(value),
+    };
+    if accepted {
+        Ok(())
+    } else {
+        Err(InputViolation {
+            path: rule.path().clone(),
+            code: rule.code().clone(),
+            reason: rule.predicate().violation_reason(),
+        })
+    }
+}
+/// Strict decimal dotted quad: exactly four ASCII octets in 0..=255, without
+/// signs, whitespace or leading zeroes on multi-digit octets.
+fn is_ipv4(value: &str) -> bool {
+    let mut octets = value.split('.');
+    for _ in 0..4 {
+        let Some(octet) = octets.next() else {
+            return false;
+        };
+        if octet.is_empty()
+            || octet.len() > 3
+            || (octet.len() > 1 && octet.starts_with('0'))
+            || !octet.bytes().all(|byte| byte.is_ascii_digit())
+            || octet.parse::<u8>().is_err()
+        {
+            return false;
+        }
+    }
+    octets.next().is_none()
+}

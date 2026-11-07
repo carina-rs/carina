@@ -74,8 +74,35 @@ pub enum ExpandedGraphResolutionError {
         evaluated: Box<ResourceId>,
         authored: Box<ResourceId>,
     },
+    #[error("bootstrap resource {id} is absent from the parsed configuration")]
+    MissingBootstrapResource { id: Box<ResourceId> },
+    #[error(transparent)]
+    BackendResource(BackendResourceError),
     #[error(transparent)]
     Resource(#[from] crate::resource::ResolvedResourceError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BackendResourceError {
+    #[error("Backend has no resolved bucket name")]
+    MissingBucket,
+    #[error("invalid backend bucket provider identifier")] // error-chain: caller-renders-sources
+    Identifier(#[source] crate::provider::EmptyAppliedIdentifier),
+    #[error("invalid backend bucket resource identity")] // error-chain: caller-renders-sources
+    Identity(#[source] crate::resource::ResourceIdentityError),
+    #[error(
+        "No managed resource schema registered for state bucket type '{provider}.{resource_type}'"
+    )]
+    MissingSchema {
+        provider: String,
+        resource_type: String,
+    },
+}
+
+impl From<BackendResourceError> for ExpandedGraphResolutionError {
+    fn from(error: BackendResourceError) -> Self {
+        Self::BackendResource(error)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -264,6 +291,146 @@ pub struct ExpandedBindingIndex {
     upstream_bindings: HashSet<AbsoluteBindingAddress>,
 }
 
+/// A bootstrap plan produced by resolving its create against its own graph.
+/// The graph remains private through input admission and scheduling.
+#[derive(Debug)]
+pub struct ResolvedInitialCreatePlan {
+    graph: ExpandedBindingIndex,
+    plan: crate::input_rules::FinalizedPlan,
+}
+
+/// Input-checked bootstrap intent retaining the graph that resolved its target.
+///
+/// The readiness graph cannot be replaced after admission:
+///
+/// ```compile_fail,E0616
+/// use carina_core::resolved_graph::{InputCheckedInitialCreatePlan, ExpandedBindingIndex};
+/// fn swap_graph(plan: &mut InputCheckedInitialCreatePlan, other: ExpandedBindingIndex) {
+///     plan.graph = other;
+/// }
+/// ```
+#[derive(Debug)]
+pub struct InputCheckedInitialCreatePlan {
+    pub(crate) graph: ExpandedBindingIndex,
+    pub(crate) checked: crate::input_rules::InputCheckedPlan,
+}
+
+/// One delete resolved against its own immutable graph before admission.
+#[derive(Debug)]
+pub struct ResolvedInitialDeletePlan {
+    graph: ExpandedBindingIndex,
+    plan: crate::plan::Plan,
+}
+
+/// Admitted delete intent retaining the exact graph used for resolution.
+///
+/// ```compile_fail,E0616
+/// use carina_core::resolved_graph::{AdmittedInitialDeletePlan, ExpandedBindingIndex};
+/// fn swap_graph(plan: &mut AdmittedInitialDeletePlan, other: ExpandedBindingIndex) {
+///     plan.graph = other;
+/// }
+/// ```
+#[derive(Debug)]
+pub struct AdmittedInitialDeletePlan {
+    pub(crate) graph: ExpandedBindingIndex,
+    pub(crate) admitted: crate::plan::AdmittedPlan,
+}
+
+impl ResolvedInitialDeletePlan {
+    /// Derive the implicit bucket's target and identifier from the backend configuration.
+    /// The CLI authenticates and validates this configuration value. Provider and
+    /// resource type select the backend implementation; the bucket field supplies
+    /// both the write target and its physical identifier.
+    pub fn from_backend_configuration(
+        configuration: &crate::parser::ExpandedInferredFile,
+        provider: &str,
+        resource_type: &str,
+        schemas: &SchemaRegistry,
+    ) -> Result<Self, ExpandedGraphResolutionError> {
+        let name = configuration
+            .backend
+            .as_ref()
+            .and_then(|backend| backend.attributes.get("bucket"))
+            .and_then(|value| match value {
+                Value::Concrete(ConcreteValue::String(name)) => Some(name.expose_plaintext()),
+                _ => None,
+            })
+            .ok_or(BackendResourceError::MissingBucket)?;
+        let identity =
+            ResourceIdentity::try_from(name.to_owned()).map_err(BackendResourceError::Identity)?;
+        let identifier = crate::provider::AppliedIdentifier::new(name)
+            .map_err(BackendResourceError::Identifier)?;
+        let resource = Resource::from_id(ResourceId::with_provider_identity(
+            provider,
+            resource_type,
+            identity,
+            None,
+        ));
+        if schemas
+            .get(provider, resource_type, crate::schema::SchemaKind::Resource)
+            .is_none()
+        {
+            return Err(BackendResourceError::MissingSchema {
+                provider: provider.to_owned(),
+                resource_type: resource_type.to_owned(),
+            }
+            .into());
+        }
+        let mut bucket_configuration = crate::parser::ExpandedInferredFile::default();
+        bucket_configuration.resources.push(resource.clone());
+        let graph = resolve_expanded_graph(bucket_configuration.into())?;
+        graph.initial_delete_plan(resource, identifier, schemas)
+    }
+
+    pub fn admit(
+        self,
+        schemas: &SchemaRegistry,
+    ) -> Result<AdmittedInitialDeletePlan, crate::replacement::ReplacementAdmissionError> {
+        Ok(AdmittedInitialDeletePlan {
+            graph: self.graph,
+            admitted: self.plan.admit(schemas)?,
+        })
+    }
+}
+
+impl ResolvedInitialCreatePlan {
+    /// Select the bootstrap target and ordering from the supplied configuration.
+    /// The CLI authenticates and validates the configuration; this constructor
+    /// retains its graph and does not accept a separate resource value.
+    pub fn from_configuration(
+        configuration: crate::parser::ExpandedInferredFile,
+        id: &ResourceId,
+        schemas: &SchemaRegistry,
+    ) -> Result<Self, ExpandedGraphResolutionError> {
+        let resource = configuration
+            .resources
+            .iter()
+            .find(|resource| &resource.id == id)
+            .cloned()
+            .ok_or_else(|| ExpandedGraphResolutionError::MissingBootstrapResource {
+                id: Box::new(id.clone()),
+            })?;
+        let graph = resolve_expanded_graph(configuration.into())?;
+        graph.initial_create_plan(resource, schemas)
+    }
+
+    /// Admit the resolved effects and retain their input obligations together
+    /// with the graph that will judge readiness at dispatch.
+    pub fn check_inputs_with_types(
+        self,
+        schemas: &SchemaRegistry,
+        types: &crate::input_rules::InputTypeContext,
+    ) -> Result<InputCheckedInitialCreatePlan, crate::input_rules::InputAdmissionFailure> {
+        let checked = self
+            .plan
+            .check_inputs_with_types(schemas, &HashMap::new(), types)?;
+        Ok(InputCheckedInitialCreatePlan {
+            graph: self.graph,
+            checked,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedHandleTarget {
     id: ResolvedResourceId,
@@ -431,6 +598,70 @@ fn rewrite_handle_output_refs<P: PlaceholderKind>(
 }
 
 impl ExpandedBindingIndex {
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn initial_create_plan_for_test(
+        &self,
+        resource: Resource,
+        schemas: &SchemaRegistry,
+    ) -> Result<ResolvedInitialCreatePlan, ExpandedGraphResolutionError> {
+        self.initial_create_plan(resource, schemas)
+    }
+
+    /// Resolve a standalone delete and retain this graph through dispatch.
+    pub(crate) fn initial_delete_plan(
+        &self,
+        resource: Resource,
+        identifier: crate::provider::AppliedIdentifier,
+        schemas: &SchemaRegistry,
+    ) -> Result<ResolvedInitialDeletePlan, ExpandedGraphResolutionError> {
+        let target = self.resolve_resource(resource, schemas)?;
+        let mut plan = crate::plan::Plan::new();
+        let mut dependencies = target.persisted_value_destroy_dependencies().clone();
+        dependencies.extend_projected(target.persisted_explicit_destroy_dependencies());
+        plan.add(crate::effect::Effect::Delete {
+            id: target.resolved_id(),
+            identifier,
+            generation: crate::effect::EffectGeneration::Current,
+            directives: target.directives.clone(),
+            binding: target.binding.clone(),
+            dependencies,
+            explicit_dependencies: target.explicit_dependencies().clone(),
+            blocked_by_updates: Default::default(),
+        });
+        Ok(ResolvedInitialDeletePlan {
+            graph: self.clone(),
+            plan,
+        })
+    }
+
+    /// Resolve and finalize one bootstrap create, retaining this exact graph
+    /// for the executor's dependency-ready release. No resolved plan can be
+    /// attached by the caller after this transition.
+    pub(crate) fn initial_create_plan(
+        &self,
+        resource: Resource,
+        schemas: &SchemaRegistry,
+    ) -> Result<ResolvedInitialCreatePlan, ExpandedGraphResolutionError> {
+        let target = self.resolve_resource(resource, schemas)?;
+        let mut plan = crate::plan::Plan::new();
+        plan.add(crate::effect::Effect::Create(target));
+        Ok(ResolvedInitialCreatePlan {
+            graph: self.clone(),
+            plan: crate::input_rules::FinalizedPlan::new(plan),
+        })
+    }
+
+    /// Declared inputs outside a subset plan remain known graph targets. This
+    /// catalog never removes edges to endpoints present in that plan.
+    pub(crate) fn scheduler_target_ids(&self) -> impl Iterator<Item = &ResolvedResourceId> {
+        self.targets
+            .bindings
+            .values()
+            .chain(self.targets.identities.values().flatten())
+            .map(ExpandedTarget::id)
+    }
+
     fn managed_target(
         &self,
         reference: &AbsoluteBindingAddress,
@@ -1645,6 +1876,37 @@ impl crate::resource::InsideSecret for ExpandedGraphResolutionError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backend_identity_error_retains_typed_source() {
+        use std::error::Error;
+        let configuration = crate::parser::ExpandedInferredFile {
+            backend: Some(crate::parser::BackendConfig {
+                backend_type: "s3".into(),
+                attributes: HashMap::from([(
+                    "bucket".into(),
+                    Value::Concrete(ConcreteValue::String("".into())),
+                )]),
+                attribute_spans: Default::default(),
+            }),
+            ..Default::default()
+        };
+        let error = ResolvedInitialDeletePlan::from_backend_configuration(
+            &configuration,
+            "mock",
+            "test.Bucket",
+            &SchemaRegistry::new(),
+        )
+        .unwrap_err();
+        let mut source = error.source();
+        while let Some(error) = source {
+            if error.is::<crate::resource::ResourceIdentityError>() {
+                return;
+            }
+            source = error.source();
+        }
+        panic!("the backend error chain must preserve ResourceIdentityError");
+    }
 
     #[test]
     fn review2_f8_dependency_resolution_inventory_protects_secret_binding_errors() {

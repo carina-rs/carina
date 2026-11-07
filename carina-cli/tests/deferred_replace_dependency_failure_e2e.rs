@@ -95,13 +95,33 @@ let rs = for _, t in (src.tags ?? {{ a = "x" }}) {{
     )
 }
 
+fn explicit_cbd_replacement_config(name: &str) -> String {
+    // This fixture tests admitted CBD. Distinct physical names exercise the
+    // Attribute class without needing a temporary name.
+    let child_prefix = if name == "yy" {
+        "off".to_string()
+    } else {
+        format!("off-{name}")
+    };
+    format!(
+        r#"let src = mock.test.resource {{ name = "{name}" }}
+let rs = for _, t in (src.tags ?? {{ a = "x" }}) {{
+  mock.test.resource {{
+    name = "{child_prefix}-${{t}}"
+    directives {{ create_before_destroy = true }}
+  }}
+}}
+"#,
+    )
+}
+
 const ABSENT_ITERABLE_CONFIG: &str = r#"let src = mock.test.resource { name = "source" }
 let rs = for _, t in src.tags {
   mock.test.resource { name = "off-${t}" }
 }
 "#;
 
-fn assert_replacement_converged(scenario: &Scenario, apply: &Output) {
+fn assert_replacement_converged(scenario: &Scenario, apply: &Output, create_first: bool) {
     assert_success("replacement apply", apply);
 
     let state = scenario.state();
@@ -117,11 +137,14 @@ fn assert_replacement_converged(scenario: &Scenario, apply: &Output) {
     assert_eq!(child_creates.len(), 2, "operations: {operations:?}");
     assert_eq!(child_deletes.len(), 1, "operations: {operations:?}");
     assert_eq!(src_deletes.len(), 1, "operations: {operations:?}");
+    let (first_child, last_child) = if create_first {
+        (child_creates[1], child_deletes[0])
+    } else {
+        (child_deletes[0], child_creates[1])
+    };
     assert!(
-        src_creates[1] < child_creates[1]
-            && child_creates[1] < child_deletes[0]
-            && child_deletes[0] < src_deletes[0],
-        "replacement must create src and the deferred child before deleting their old generations: {operations:?}",
+        src_creates[1] < first_child && first_child < last_child && last_child < src_deletes[0],
+        "replacement must respect the child's own order inside its parent's lifetime: {operations:?}",
     );
 }
 
@@ -285,7 +308,7 @@ fn deferred_replace_dependency_direct_apply_converges() {
     scenario.write_main(&replacement_config("yy"));
 
     let apply = scenario.apply_config();
-    assert_replacement_converged(&scenario, &apply);
+    assert_replacement_converged(&scenario, &apply, false);
 }
 
 #[test]
@@ -296,7 +319,28 @@ fn deferred_replace_dependency_saved_plan_apply_converges() {
     assert_success("carina plan --out", &scenario.save_plan());
 
     let apply = scenario.apply_saved_plan();
-    assert_replacement_converged(&scenario, &apply);
+    assert_replacement_converged(&scenario, &apply, false);
+}
+
+#[test]
+fn deferred_replace_dependency_explicit_cbd_direct_apply_converges() {
+    let scenario = Scenario::new(&explicit_cbd_replacement_config("zz"));
+    assert_success("initial apply", &scenario.apply_config());
+    scenario.write_main(&explicit_cbd_replacement_config("yy"));
+
+    let apply = scenario.apply_config();
+    assert_replacement_converged(&scenario, &apply, true);
+}
+
+#[test]
+fn deferred_replace_dependency_explicit_cbd_saved_plan_apply_converges() {
+    let scenario = Scenario::new(&explicit_cbd_replacement_config("zz"));
+    assert_success("initial apply", &scenario.apply_config());
+    scenario.write_main(&explicit_cbd_replacement_config("yy"));
+    assert_success("carina plan --out", &scenario.save_plan());
+
+    let apply = scenario.apply_saved_plan();
+    assert_replacement_converged(&scenario, &apply, true);
 }
 
 #[test]

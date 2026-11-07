@@ -12,7 +12,7 @@ use crate::resource::{ResourceId, State};
 ///
 /// Caller-built files cannot mint a whole-plan witness.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// use carina_core::parser::ExpandedFile;
 /// use carina_core::resource::Resource;
 /// let mut file = ExpandedFile::<()>::default();
@@ -302,12 +302,13 @@ impl Provider<super::Bound> for ProviderBoundary<'_> {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        attempt: UpdateAttempt,
     ) -> BoxFuture<'_, HostResult<HostUpdateOutcome>> {
         self.secrets
             .extend(&RedactionSet::collect(request.diagnostic_values()));
         let secrets = self.secrets.clone();
         let id = id.clone();
-        let call = self.provider.update(&id, identifier, request);
+        let call = self.provider.update(&id, identifier, request, attempt);
         Box::pin(async move {
             let outcome = call.await.map_err(|error| error.with_secrets(&secrets))?;
             if let Some(diagnostic) = outcome.diagnostic() {
@@ -319,14 +320,9 @@ impl Provider<super::Bound> for ProviderBoundary<'_> {
         })
     }
 
-    fn delete(
-        &self,
-        id: &ResourceId,
-        identifier: &AppliedIdentifier,
-        request: DeleteRequest,
-    ) -> BoxFuture<'_, HostResult<()>> {
+    fn delete(&self, attempt: DeleteAttempt) -> BoxFuture<'_, HostResult<()>> {
         let secrets = self.secrets.clone();
-        let call = self.provider.delete(id, identifier, request);
+        let call = self.provider.delete(attempt);
         Box::pin(async move { call.await.map_err(|error| error.with_secrets(&secrets)) })
     }
 

@@ -3564,6 +3564,7 @@ impl Provider for WasmProvider {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.as_str().to_string();
@@ -3580,14 +3581,14 @@ impl Provider for WasmProvider {
 
     fn delete(
         &self,
-        id: &ResourceId,
-        identifier: &AppliedIdentifier,
-        request: DeleteRequest,
+        attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        let id = id.clone();
-        let identifier = identifier.as_str().to_string();
+        let id = attempt.id().clone();
+        let identifier = attempt.identifier().as_str().to_string();
+        let request = attempt.request().clone();
         let budgets = self.operation_budgets(&id, carina_provider_protocol::OperationKind::Delete);
         Box::pin(async move {
+            let _attempt = attempt;
             let initial = self.call_delete(id.clone(), identifier, request);
             self.drive_operation("delete", id, budgets, initial, |pending, _finality| {
                 self.call_poll_delete(*pending)
@@ -4042,6 +4043,116 @@ pub(super) mod tests {
     #[cfg(test)]
     mod round6 {
         use super::*;
+        #[tokio::test]
+        async fn validation_failed_capacity_rebuild_does_not_retain_unsent_inputs() {
+            let mut factory = rebuildable_state_test_factory()
+                .await
+                .expect("mock WASM fixture is required");
+            let previous = (0..256)
+                .map(|index| format!("previousCapacity{index:04}"))
+                .collect::<Vec<_>>();
+            let previous_refs = previous.iter().map(String::as_str).collect::<Vec<_>>();
+            let input = crate::provider_text_fixtures::context(&previous_refs);
+            let attrs = vec![(
+                "probe".into(),
+                wit_types::Value::StrVal(previous[0].clone()),
+            )];
+            let context = factory.init_instance.validate_config_context(&attrs);
+            factory
+                .init_instance
+                .acquire_in_session(context, Some(input.session().guest_inputs()))
+                .await
+                .unwrap()
+                .call(async |bindings, store| bindings.call_validate_config(store, &attrs).await)
+                .await
+                .unwrap()
+                .unwrap();
+            factory.init_instance.rebuild.component =
+                Component::new(&factory.init_instance.rebuild.engine, "(component)").unwrap();
+            let empty = crate::provider_text_fixtures::context(&[]);
+            for index in 0..3 {
+                let secret = format!("neverSentCapacity{index:04}");
+                let incoming = crate::provider_text_fixtures::context(&[&secret]);
+                let attrs = [("probe".into(), wit_types::Value::StrVal(secret))];
+                let context = factory.init_instance.validate_config_context(&attrs);
+                let result = factory
+                    .init_instance
+                    .acquire_in_session(context, Some(incoming.session().guest_inputs()))
+                    .await;
+                assert!(
+                    result.is_err(),
+                    "the replacement component cannot instantiate"
+                );
+                drop(result);
+                let state = factory.init_instance.state.lock().await;
+                assert!(
+                    !state
+                        .inputs
+                        .would_exceed_secret_limit(&empty.session().guest_inputs(), 256),
+                    "a failed rebuild never hands current inputs to the old guest"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn validation_inventory_limit_rebuilds_once_and_forgets_prior_values() {
+            let factory = rebuildable_state_test_factory()
+                .await
+                .expect("mock WASM fixture is required");
+            let instance = &factory.init_instance;
+            // Raw alphanumeric values have one distinct spelling each.
+            for index in 0..256 {
+                let secret = format!("inventoryPrivate{index:04}");
+                let input = crate::provider_text_fixtures::context(&[&secret]);
+                let attrs = vec![("probe".into(), wit_types::Value::StrVal(secret))];
+                let context = instance.validate_config_context(&attrs);
+                instance
+                    .acquire_in_session(context, Some(input.session().guest_inputs()))
+                    .await
+                    .unwrap()
+                    .call(async |bindings, store| {
+                        bindings.call_validate_config(store, &attrs).await
+                    })
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            assert_eq!(
+                instance.additional_instantiations.load(Ordering::Relaxed),
+                0
+            );
+            let current = ["currentPrivateFirst", "currentPrivateSecond"];
+            let input = crate::provider_text_fixtures::context(&current);
+            let attrs = vec![("probe".into(), wit_types::Value::StrVal(current[0].into()))];
+            let context = instance.validate_config_context(&attrs);
+            instance
+                .acquire_in_session(context, Some(input.session().guest_inputs()))
+                .await
+                .unwrap()
+                .call(async |bindings, store| bindings.call_validate_config(store, &attrs).await)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                instance.additional_instantiations.load(Ordering::Relaxed),
+                1
+            );
+            let state = instance.state.lock().await;
+            let previous = (0..256)
+                .map(|index| format!("inventoryPrivate{index:04}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut output = Vec::new();
+            let mut writer = state.inputs.line_writer(&mut output);
+            writer
+                .push_str(&format!("{previous} {} {}\n", current[0], current[1]))
+                .unwrap();
+            writer.finish().unwrap();
+            drop(writer);
+            let output = String::from_utf8(output).unwrap();
+            assert_eq!(output, format!("{previous} (secret) (secret)\n"));
+        }
+
         #[tokio::test]
         async fn review_round6_failed_validation_rebuild_keeps_previous_inputs_redacted() {
             const SECRET: &str = "round6-previous-validation-rebuild-private";
@@ -5085,7 +5196,9 @@ pub(super) mod tests {
         }
     }
 
-    struct PendingFixtureProvider;
+    struct PendingFixtureProvider {
+        captured_attempt: Option<std::sync::Mutex<Option<CreateAttempt>>>,
+    }
 
     impl Provider for PendingFixtureProvider {
         fn name(&self) -> &str {
@@ -5118,6 +5231,10 @@ pub(super) mod tests {
             _request: CreateRequest,
             attempt: CreateAttempt,
         ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+            if let Some(captured) = &self.captured_attempt {
+                *captured.lock().unwrap() = Some(attempt);
+                return Box::pin(std::future::pending());
+            }
             Box::pin(async move {
                 let pending = attempt
                     .issued(
@@ -5147,6 +5264,7 @@ pub(super) mod tests {
             _id: &ResourceId,
             _identifier: &AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: carina_core::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async {
                 Err(ProviderError::internal(
@@ -5157,9 +5275,7 @@ pub(super) mod tests {
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: carina_core::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async {
                 Err(ProviderError::internal(
@@ -5175,6 +5291,67 @@ pub(super) mod tests {
         ) -> ProviderResult<Vec<String>> {
             Ok(Vec::new())
         }
+    }
+
+    fn create_attempt_for_test(id: ResourceId) -> CreateAttempt {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = carina_core::schema::SchemaRegistry::new();
+        let provider = std::sync::Arc::new(PendingFixtureProvider {
+            captured_attempt: Some(std::sync::Mutex::new(None)),
+        });
+        let mut resource = Resource::from_id(id);
+        resource.set_attr("name", test_string_value("example"));
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                let mut prepare = std::pin::pin!(carina_core::executor::prepare_create_request(
+                    resource,
+                    &preparation
+                ));
+                let Poll::Ready(request) = prepare
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                else {
+                    panic!("fixture preparation must complete synchronously");
+                };
+                let request = request.expect("fixture passes provider preparation");
+                // Pure dispatch fixture with no schema input rules.
+                let prepared = carina_core::replacement::create_permit_for_test(request);
+                let provider_boundary = crate::provider_text_fixtures::boundary(Box::new(
+                    std::sync::Arc::clone(&provider),
+                ));
+                let (create, _cancellation) =
+                    carina_core::executor::dispatch_create(&provider_boundary, prepared);
+                let mut create = std::pin::pin!(create);
+                assert!(
+                    create
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+            },
+        );
+        provider
+            .captured_attempt
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
     }
 
     async fn pending_create_with_issued_identifier() -> PendingCreate {
@@ -5205,9 +5382,12 @@ pub(super) mod tests {
                     carina_core::executor::prepare_create_request(resource, &preparation).await;
                 let request = request.expect("fixture resource passes provider preparation");
                 let provider_boundary =
-                    crate::provider_text_fixtures::boundary(Box::new(PendingFixtureProvider));
+                    crate::provider_text_fixtures::boundary(Box::new(PendingFixtureProvider {
+                        captured_attempt: None,
+                    }));
+                let prepared = carina_core::replacement::create_permit_for_test(request);
                 let (create, _cancellation) =
-                    carina_core::executor::dispatch_create(&provider_boundary, &id, request);
+                    carina_core::executor::dispatch_create(&provider_boundary, prepared);
                 let failure = create.await.expect_err("fixture create remains pending");
                 let pending = match failure.into_kind() {
                     CreateFailureKind::InFlight {
@@ -5245,7 +5425,7 @@ pub(super) mod tests {
 
     fn pending_create_without_identifier() -> PendingCreate {
         let (id, wit_id, wit_request) = boundary_resource();
-        let pending = CreateAttempt::for_test(id.clone()).pending(
+        let pending = create_attempt_for_test(id.clone()).pending(
             proto::PendingToken::new("original-token"),
             sent_name_only(),
             1,
@@ -5522,7 +5702,7 @@ pub(super) mod tests {
     #[test]
     fn initial_create_read_back_in_flight_keeps_the_continuation() {
         let (id, _wit_id, wit_request) = boundary_resource();
-        let attempt = CreateAttempt::for_test(id.clone());
+        let attempt = create_attempt_for_test(id.clone());
         let verdict: wasm_convert::DecodedCreateVerdict =
             proto::CreateVerdict::InFlight(proto::CreateInFlight {
                 pending: proto::PendingCreate {
@@ -5574,7 +5754,7 @@ pub(super) mod tests {
     fn poll_in_flight_phase_regression_is_protocol_violation_and_preserves_continuation() {
         let (id, wit_id, wit_request) = boundary_resource();
         let starting = PendingCreate {
-            pending: CreateAttempt::for_test(id.clone())
+            pending: create_attempt_for_test(id.clone())
                 .issued(
                     AppliedIdentifier::new("issued-id").unwrap(),
                     sent_name_only(),
@@ -5880,7 +6060,7 @@ pub(super) mod tests {
                 pending_id.clone(),
                 pending_wit_id,
                 pending_wit_request,
-                CreateAttempt::for_test(pending_id),
+                create_attempt_for_test(pending_id),
                 proto::CreateStep::Pending(pending_payload.clone()),
             ),
             "invalid-sent-token",
@@ -5893,7 +6073,7 @@ pub(super) mod tests {
             WasmProvider::initial_create_verdict(
                 verdict_id.clone(),
                 &verdict_wit_request,
-                CreateAttempt::for_test(verdict_id),
+                create_attempt_for_test(verdict_id),
                 proto::CreateVerdict::InFlight(proto::CreateInFlight {
                     pending: pending_payload,
                     error: ProviderError::timeout("provider error must not hide boundary error"),

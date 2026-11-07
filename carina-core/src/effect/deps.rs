@@ -4,7 +4,7 @@ use crate::effect::{Effect, EffectInstanceKey, ScheduleEdge};
 use crate::non_empty::NonEmptyVec;
 #[cfg(test)]
 use crate::resource::ResourceId;
-use crate::resource::{ResolvedDependencies, ResolvedResourceId, Resource};
+use crate::resource::{PlanValueKind, ResolvedDependencies, ResolvedResourceId, Resource};
 
 #[derive(Debug, Clone)]
 pub struct UnresolvedResource<S = crate::resource::ModuleSource>(
@@ -58,7 +58,7 @@ impl<S> UnresolvedResource<S> {
 /// graph nodes that intentionally have no destroy effect; distinguishing them
 /// from an absent address keeps missing targets fallible without inventing
 /// no-op effects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ScheduleInputs<'a> {
     Apply,
     Destroy {
@@ -132,7 +132,7 @@ pub(crate) struct WritesSet {
 }
 
 impl WritesSet {
-    pub(crate) fn from_update<S>(effect: &Effect<S>) -> Option<Self> {
+    pub(crate) fn from_update<S, P: PlanValueKind>(effect: &Effect<S, P>) -> Option<Self> {
         let Effect::Update {
             changed_attributes, ..
         } = effect
@@ -318,6 +318,9 @@ pub struct UnresolvedRequiredDependency {
 }
 
 impl UnresolvedRequiredDependency {
+    pub(crate) fn remap_effect_index(&mut self, index: usize) {
+        self.effect_index = index;
+    }
     pub fn effect_index(&self) -> usize {
         self.effect_index
     }
@@ -464,10 +467,10 @@ impl DependencyAnalyzer {
             .push(UnresolvedRequiredDependency { effect_index, id });
     }
 
-    fn record_unresolved_delete_ordering<S>(
+    fn record_unresolved_delete_ordering<S, P: PlanValueKind>(
         &self,
         analysis: &mut DependencyAnalysis,
-        effect: &Effect<S>,
+        effect: &Effect<S, P>,
         dependency: ResolvedResourceId,
     ) {
         let Effect::Delete { id, generation, .. } = effect else {
@@ -482,7 +485,7 @@ impl DependencyAnalyzer {
             });
     }
 
-    fn collect_from_schedule_edges<S, E: AsRef<Effect<S>>>(
+    fn collect_from_schedule_edges<S, P: PlanValueKind, E: AsRef<Effect<S, P>>>(
         &self,
         effects: &[E],
         edges: Vec<ScheduleEdge>,
@@ -592,9 +595,10 @@ impl DependencyAnalyzer {
 
 /// Build the scheduling dependency graph for a slice of effects.
 ///
-/// Single entry point shared by the parallel scheduler, the phased
-/// scheduler, and the destroy CLI driver. `inputs` chooses between the
-/// apply contract and the destroy contract (see [`ScheduleInputs`]); the
+/// Raw apply effects cannot schedule an unadmitted replacement pair. Obtain
+/// replacement graphs from
+/// [`crate::replacement::AdmittedReplacementEffects::dependency_analysis`].
+/// `inputs` chooses between apply and destroy rules (see [`ScheduleInputs`]); the
 /// resulting [`DependencyAnalysis`] is indexed by effect position, with
 /// any destroy `aliases` appearing at indices `effects.len()..` so callers
 /// can distinguish real effects from wait-binding bridges.
@@ -605,6 +609,46 @@ pub fn build_effect_dependency_analysis<'a, S, E>(
 ) -> Result<DependencyAnalysis, DependencyAnalysisFailure>
 where
     E: AsRef<Effect<S>>,
+{
+    build_effect_dependency_analysis_impl(
+        effects,
+        unresolved_resource_ids,
+        inputs,
+        HashMap::new(),
+        HashSet::new(),
+    )
+}
+
+pub(crate) fn build_effect_graph_dependency_analysis<'a, S: Clone, P: PlanValueKind>(
+    admitted: &crate::replacement::EffectGraph<'_, S, P>,
+    unresolved_resource_ids: impl IntoIterator<Item = &'a ResolvedResourceId>,
+) -> Result<DependencyAnalysis, DependencyAnalysisFailure> {
+    let mut edges = HashMap::new();
+    let pairs = admitted.order_edges(&mut edges);
+    let mut result = build_effect_dependency_analysis_impl(
+        admitted.effects(),
+        unresolved_resource_ids,
+        ScheduleInputs::Apply,
+        edges,
+        pairs,
+    );
+    let analysis = match &mut result {
+        Ok(analysis) => analysis,
+        Err(failure) => failure.0.as_mut(),
+    };
+    relax_update_update_edges(admitted.effects(), analysis);
+    result
+}
+
+fn build_effect_dependency_analysis_impl<'a, S, P: PlanValueKind, E>(
+    effects: &[E],
+    unresolved_resource_ids: impl IntoIterator<Item = &'a ResolvedResourceId>,
+    inputs: ScheduleInputs<'_>,
+    replacement_edges: HashMap<usize, HashSet<usize>>,
+    admitted_pairs: HashSet<(usize, usize)>,
+) -> Result<DependencyAnalysis, DependencyAnalysisFailure>
+where
+    E: AsRef<Effect<S, P>>,
 {
     let mut known_graph_ids = unresolved_resource_ids
         .into_iter()
@@ -674,18 +718,54 @@ where
 
     let analyzer = DependencyAnalyzer::new(instance_to_idx, delete_blockers_by_id, known_graph_ids);
     let mut analysis = DependencyAnalysis::new(effects.len() + aliases.len());
-    add_same_identity_replacement_order_edges(effects, &mut analysis);
+    if let ScheduleInputs::Apply = inputs {
+        for (dependent, dependencies) in replacement_edges {
+            for dependency in dependencies {
+                analysis.add_edge(dependent, dependency, ReadsSet::unknown());
+            }
+        }
+        for (create_idx, effect) in effects.iter().enumerate() {
+            let target = match effect.as_ref() {
+                Effect::Create(target)
+                | Effect::ResumeCreate {
+                    resource: target, ..
+                } => target,
+                _ => continue,
+            };
+            for (delete_idx, old) in effects.iter().enumerate() {
+                if matches!(old.as_ref(), Effect::Delete { id, .. } if target.id == **id)
+                    && !admitted_pairs.contains(&(create_idx, delete_idx))
+                {
+                    // An empty capability cannot admit raw replacement endpoints.
+                    analysis
+                        .unresolved_required
+                        .push(UnresolvedRequiredDependency {
+                            effect_index: create_idx,
+                            id: target.resolved_id(),
+                        });
+                    analysis
+                        .unresolved_required
+                        .push(UnresolvedRequiredDependency {
+                            effect_index: delete_idx,
+                            id: target.resolved_id(),
+                        });
+                }
+            }
+        }
+    }
 
     for (idx, effect) in effects.iter().enumerate() {
         let effect = effect.as_ref();
         match inputs {
             ScheduleInputs::Apply => {
-                analyzer.collect_from_schedule_edges(
-                    effects,
-                    effect.apply_edges(),
-                    &mut analysis,
-                    idx,
-                );
+                // A replacement's own cleanup barrier is selected by its
+                // admitted order, including the resend/poll distinction.
+                let edges = effect.apply_edges().into_iter().filter(|edge| {
+                    !matches!(edge, crate::effect::ScheduleEdge::RequiredDependsOn(target)
+                        if admitted_pairs.iter().any(|(create, delete)|
+                            *delete == idx && effects[*create].as_ref().resource_id() == target.as_inner()))
+                }).collect();
+                analyzer.collect_from_schedule_edges(effects, edges, &mut analysis, idx);
             }
             ScheduleInputs::Destroy { .. } => {
                 analyzer.collect_from_schedule_edges(
@@ -715,25 +795,7 @@ where
     }
 }
 
-fn add_same_identity_replacement_order_edges<S, E: AsRef<Effect<S>>>(
-    effects: &[E],
-    analysis: &mut DependencyAnalysis,
-) {
-    let mut previous_by_instance: HashMap<EffectInstanceKey, usize> = HashMap::new();
-    for (idx, effect) in effects.iter().enumerate() {
-        let effect = effect.as_ref();
-        if !matches!(effect, Effect::Create(_) | Effect::Delete { .. }) {
-            continue;
-        }
-
-        let instance = effect.instance_key();
-        if let Some(previous) = previous_by_instance.insert(instance, idx) {
-            analysis.add_edge(idx, previous, ReadsSet::unknown());
-        }
-    }
-}
-
-pub fn relax_update_update_edges<S, E: AsRef<Effect<S>>>(
+pub fn relax_update_update_edges<S, P: PlanValueKind, E: AsRef<Effect<S, P>>>(
     effects: &[E],
     analysis: &mut DependencyAnalysis,
 ) {
@@ -1389,7 +1451,7 @@ mod tests {
     }
 
     #[test]
-    fn deposed_delete_and_current_create_same_identity_have_no_replacement_edge() {
+    fn deposed_delete_and_current_create_require_replacement_admission() {
         let delete = Effect::Delete {
             id: ResolvedResourceId::new(ResourceId::with_identity("test", "thing")),
             identifier: crate::effect::fixture_applied_identifier("thing-old"),
@@ -1403,19 +1465,24 @@ mod tests {
             blocked_by_updates: Default::default(),
         };
         let create = create_effect("thing");
-
-        let deps = build_effect_dependency_analysis(
-            &[delete, create],
-            std::iter::empty(),
-            ScheduleInputs::Apply,
+        let effects = [delete, create];
+        // Recovery generations need the same admission as current instances.
+        let error =
+            build_effect_dependency_analysis(&effects, std::iter::empty(), ScheduleInputs::Apply)
+                .expect_err("raw replacement endpoints must not choose their own order");
+        assert_eq!(error.unresolved().len(), 2);
+        let admitted = crate::replacement::AdmittedReplacementEffects::resolve(
+            &effects,
+            &crate::schema::SchemaRegistry::new(),
+            |_| HashMap::new(),
         )
-        .expect("dependency analysis must resolve")
-        .into_deps_of();
-
-        assert!(
-            !deps[&1].contains(&0),
-            "current create must not be ordered after deposed delete as a replacement"
-        );
+        .unwrap();
+        let deps = admitted
+            .dependency_analysis(std::iter::empty())
+            .expect("admitted dependency analysis must resolve")
+            .into_deps_of();
+        assert!(deps[&1].contains(&0), "default replacement is delete-first");
+        assert!(!deps[&0].contains(&1));
     }
 
     #[test]

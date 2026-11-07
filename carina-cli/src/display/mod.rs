@@ -369,7 +369,7 @@ pub(crate) fn format_persisted_directive_changes(
 #[allow(clippy::too_many_arguments)]
 pub fn print_plan<S, D: HistoricalDisplaySource<S> + ?Sized>(
     color_mode: crate::output_style::ColorMode,
-    plan: &Plan<S>,
+    plan: &carina_core::plan::AdmittedPlan<S>,
     summary: &PlanChangeSummary,
     detail: DetailLevel,
     historical_display: &D,
@@ -507,7 +507,7 @@ pub fn format_prepared_plan(
 #[allow(clippy::too_many_arguments)]
 pub fn format_plan_with_delete_instances<S, D: HistoricalDisplaySource<S> + ?Sized>(
     color_mode: crate::output_style::ColorMode,
-    plan: &Plan<S>,
+    plan: &carina_core::plan::AdmittedPlan<S>,
     summary: &PlanChangeSummary,
     detail: DetailLevel,
     historical_display: &D,
@@ -750,7 +750,7 @@ fn format_deferred_for_expression(
 
 pub fn format_destroy_plan_with_delete_instances<D: HistoricalDisplaySource + ?Sized>(
     color_mode: crate::output_style::ColorMode,
-    plan: &Plan,
+    plan: &carina_core::plan::AdmittedPlan,
     detail: DetailLevel,
     historical_display: &D,
     provider: &ProviderRouter,
@@ -1890,6 +1890,20 @@ fn render_detail_row<S>(
     attr_prefix: &str,
 ) {
     match row {
+        DetailRow::PendingInput { path, codes } => {
+            writeln!(
+                out,
+                "{}{} [{}]: input check pending until apply",
+                attr_prefix,
+                path,
+                codes
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .unwrap();
+        }
         DetailRow::Text { text } => {
             writeln!(out, "{}{}", attr_prefix, text).unwrap();
         }

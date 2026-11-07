@@ -82,7 +82,7 @@ use guest_store::{EPOCH_TICK_INTERVAL, GuestStore, HostState, WallBudgetExceeded
 ///
 /// Credentials cannot be obtained as plain strings for guest input.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_plugin_host::AwsCredentials;
 /// fn plain(credentials: &AwsCredentials) {
 ///     let _: &str = credentials.secret_access_key();
@@ -3425,6 +3425,8 @@ fn rebuild_provider_error(
 /// error, and is retried by the next non-suspended validation call. A suspended
 /// input fails fast without inspecting or rebuilding the instance; other inputs
 /// continue to rebuild and use the shared instance normally.
+const VALIDATION_SECRET_VALUE_LIMIT: usize = 256;
+
 struct RebuildableInstance {
     state: Mutex<RebuildableState>,
     rebuild: RebuildContext,
@@ -3457,23 +3459,32 @@ impl RebuildableInstance {
         session: Option<carina_core::provider::ProviderValidationInputs>,
     ) -> ProviderResult<RebuildableLiveInstanceGuard<'_>> {
         let mut state = self.state.lock().await;
-        // Acquisition can fail while rendering a prior poison reason. Join
-        // the caller before rebuilding so those earlier inputs stay covered.
-        let _inputs = session.as_ref().map(|inputs| state.inputs.observe(inputs));
+        let reset_inventory = session.as_ref().is_some_and(|inputs| {
+            state
+                .inputs
+                .would_exceed_secret_limit(inputs, VALIDATION_SECRET_VALUE_LIMIT)
+        });
         if let Some(reason) = state.suspended_reason(&context) {
+            if let Some(inputs) = &session {
+                state.inputs.publish_to(inputs);
+            }
             return Err(suspended_validation_error(reason, &context));
         }
-        // One append-only inventory follows this validation instance. Inputs
-        // never trigger reinstantiation: a guest may remember earlier calls.
+        // Forget earlier inputs only after replacing the component that could
+        // remember them. Acquisition failures publish earlier coverage to the
+        // caller without retaining inputs that never entered this component.
         let previous_poison = match &state.instance {
             ValidationInstanceState::Live(_) => None,
             ValidationInstanceState::Poisoned { reason } => Some(reason.clone()),
         };
-        if previous_poison.is_some() {
+        if previous_poison.is_some() || reset_inventory {
             #[cfg(test)]
             self.additional_instantiations
                 .fetch_add(1, Ordering::Relaxed);
             let live = self.rebuild.create_instance().await.map_err(|failure| {
+                if let Some(inputs) = &session {
+                    state.inputs.publish_to(inputs);
+                }
                 let error = single_attempt_load_error(
                     &self.rebuild.engine,
                     &self.rebuild.component,
@@ -3488,6 +3499,9 @@ impl RebuildableInstance {
                     ),
                 }
             })?;
+            if reset_inventory && let Some(inputs) = &session {
+                state.inputs = inputs.guest_inventory();
+            }
             state.instance = ValidationInstanceState::Live(Box::new(live));
             if let Some(reason) = previous_poison {
                 log::warn!(
@@ -3496,6 +3510,7 @@ impl RebuildableInstance {
             }
         }
 
+        let _inputs = session.as_ref().map(|inputs| state.inputs.observe(inputs));
         let inventory = state.inputs.clone();
         if let ValidationInstanceState::Live(live) = &mut state.instance {
             live.store.set_input_inventory(inventory);

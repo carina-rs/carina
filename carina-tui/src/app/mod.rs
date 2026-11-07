@@ -108,7 +108,7 @@ impl App {
             plan.effects().iter().map(Effect::resource_id),
         );
         Self::new(
-            plan,
+            &plan.clone().admit(&schemas).unwrap(),
             &schemas,
             &historical_display,
             None,
@@ -121,7 +121,7 @@ impl App {
     }
 
     pub fn new(
-        plan: &Plan,
+        plan: &carina_core::plan::AdmittedPlan,
         schemas: &SchemaRegistry,
         historical_display: &HistoricalDisplayAttributes,
         prev_explicit: Option<&HashMap<ResourceId, ExplicitFields>>,
@@ -994,7 +994,8 @@ fn effect_to_node<S, V: carina_core::resource::PlanValueKind>(
             let template = &payload.template;
             let verb = deferred_for_verb(plan, template);
             let upstream_binding = template.binding_description();
-            let rows = deferred_for_detail_rows(template, &upstream_binding, verb);
+            let mut rows = deferred_for_detail_rows(template, &upstream_binding, verb);
+            rows.extend(detail_rows);
             TreeNode {
                 effect_label: format!(
                     "{} {}",
@@ -1014,7 +1015,8 @@ fn effect_to_node<S, V: carina_core::resource::PlanValueKind>(
         Effect::DeferredReplace(payload) => {
             let verb = deferred_for_verb(plan, &payload.template);
             let upstream_binding = payload.template.binding_description();
-            let rows = deferred_for_detail_rows(&payload.template, &upstream_binding, verb);
+            let mut rows = deferred_for_detail_rows(&payload.template, &upstream_binding, verb);
+            rows.extend(detail_rows);
             TreeNode {
                 effect_label: format!(
                     "{} {}",

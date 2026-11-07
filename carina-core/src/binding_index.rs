@@ -94,7 +94,7 @@ enum ReferenceTypeCheck {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InvalidAccessPolicy {
+pub(crate) enum InvalidAccessPolicy {
     Unchecked,
     Error,
 }
@@ -1564,13 +1564,13 @@ fn unknown_attribute<'a, B: BindingAddress>(
     }
 }
 
-fn narrow_type<'a>(
-    start: &'a AttributeType,
+pub(crate) fn narrow_type<'a, R: crate::schema::PatternForm>(
+    start: &'a crate::schema::PatternAttributeType<R>,
     segments: &[PathSegment],
-    defs: &'a BTreeMap<String, AttributeType>,
+    defs: &'a BTreeMap<String, crate::schema::PatternAttributeType<R>>,
     full_path: &str,
     invalid_access: InvalidAccessPolicy,
-) -> Result<Option<&'a AttributeType>, RefTypeError> {
+) -> Result<Option<&'a crate::schema::PatternAttributeType<R>>, RefTypeError> {
     let mut current = start;
     for segment in segments {
         current = match (segment, current.shape_with_defs(defs)) {

@@ -871,8 +871,7 @@ mod tests {
     use super::*;
     use crate::executor::{ExecutionEvent, ExecutionObserver};
     use crate::provider::{
-        AppliedState, BoxFuture, CreateRequest, DeleteRequest, ProviderResult, ReadRequest,
-        UpdateRequest,
+        AppliedState, BoxFuture, CreateRequest, ProviderResult, ReadRequest, UpdateRequest,
     };
     use crate::resource::{
         ApplyTimeUnknown, ConcreteValue, DeferredValue, ResolvedResource, Value,
@@ -1060,6 +1059,7 @@ mod tests {
             id: &ResourceId,
             identifier: &crate::provider::AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: crate::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<crate::provider::UpdateOutcome>> {
             let id = id.clone();
             let identifier = identifier.to_string();
@@ -1073,9 +1073,7 @@ mod tests {
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &crate::provider::AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: crate::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async move { Ok(()) })
         }

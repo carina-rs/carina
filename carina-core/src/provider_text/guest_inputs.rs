@@ -9,26 +9,29 @@ use crate::resource::{AbsoluteBindingAddress, DeferredValue, NoPlaceholder, Secr
 ///
 /// Inventories cannot be minted without core-owned inputs.
 ///
-/// ```compile_fail
-/// let _ = carina_core::provider_text::GuestInputInventory::new();
+/// ```compile_fail,E0624
+/// use carina_core::provider::{ProviderValidationInputs};
+/// fn forge(inputs: &ProviderValidationInputs) {
+///     let _ = carina_core::provider_text::GuestInputInventory::new(inputs);
+/// }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// let _: carina_core::provider_text::GuestInputInventory = Default::default();
 /// ```
 ///
 /// Plain strings cannot be handed to a guest as credentials.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::provider_text::GuestInputInventory;
 /// fn handoff(inputs: &GuestInputInventory) {
 ///     let _ = inputs.handoff(&String::from("unprotected credential"));
 /// }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::provider_text::GuestInputInventory;
 /// fn extract(inputs: &GuestInputInventory) { let _ = inputs.redaction_set().clone(); }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::provider_text::{GuestInputInventory, RedactionSet};
 /// fn observe(inputs: &GuestInputInventory, bare: &RedactionSet) { let _ = inputs.observe(bare); }
 /// ```
@@ -53,6 +56,23 @@ impl GuestInputInventory {
     }
     pub fn is_empty(&self) -> bool {
         self.secrets.snapshot().is_empty()
+    }
+
+    /// Decide whether another validation would exceed this instance's distinct
+    /// secret-value budget, without joining its inputs into the old inventory.
+    pub fn would_exceed_secret_limit(
+        &self,
+        inputs: &ProviderValidationInputs,
+        limit: usize,
+    ) -> bool {
+        self.secrets
+            .would_exceed_secret_limit(inputs.redaction_set(), limit)
+    }
+
+    /// Cover acquisition errors with earlier inputs without retaining a call
+    /// that never entered this guest instance.
+    pub fn publish_to(&self, inputs: &ProviderValidationInputs) {
+        inputs.redaction_set().extend(&self.secrets);
     }
 
     /// Collect the same opaque payload used by DSL secrets before projecting

@@ -27,12 +27,14 @@ pub mod diff_helpers;
 pub mod differ;
 pub mod effect;
 pub(crate) mod eval_value;
+pub mod execution_authority;
 pub mod executor;
 pub mod explicit;
 pub mod formatter;
 pub mod heredoc;
 pub mod hint;
 pub mod identifier;
+pub mod input_rules;
 pub mod integer_arithmetic;
 #[doc(hidden)]
 pub mod json_field_order;
@@ -47,17 +49,20 @@ pub mod parser;
 pub mod paths;
 pub mod plan;
 pub mod plan_tree;
+pub mod planning_state;
 pub mod protocol_convert;
 pub mod provider;
 pub mod provider_source;
 pub mod provider_text;
 pub mod provider_wire;
 pub mod references;
+pub use plan::replacement;
 pub mod resolved_graph;
 pub mod resolver;
 #[cfg(test)]
 mod resolver_split_tests;
 pub mod resource;
+pub mod saved_replay;
 pub mod schema;
 pub mod shutdown;
 pub mod static_type;
@@ -219,15 +224,40 @@ pub(crate) mod test_support {
             .resolve_graph(&index)
             .expect("fixture deferred targets resolve")
     }
+    pub fn checked_replacement(
+        create: crate::resource::ResolvedResource,
+        mut old: crate::effect::DeferredReplaceDelete,
+        create_first: bool,
+    ) -> crate::replacement::CheckedReplacement<crate::resource::ResolvedResource> {
+        let mut resource = create.as_resource().clone();
+        resource.directives.create_before_destroy = create_first;
+        old.directives.create_before_destroy = create_first;
+        let mut registry = crate::schema::SchemaRegistry::new();
+        registry.insert(
+            &resource.id.provider,
+            crate::schema::PatternResourceSchema::new(&resource.id.resource_type)
+                .with_coexisting_replacement()
+                .validate()
+                .unwrap(),
+        );
+        crate::replacement::resolve_replacement(
+            crate::replacement::ReplacementRequest::new(
+                create.replace_inner(resource),
+                crate::effect::NonEmptyDeletes::try_new(vec![old]).unwrap(),
+            ),
+            &registry,
+        )
+        .unwrap()
+    }
     pub fn compiled_replace(
         deletes: crate::effect::NonEmptyDeletes,
         template: Box<ExpandedDeferredForExpression>,
     ) -> crate::effect::DeferredReplacePayload {
         let payload = compiled_loop(template);
-        crate::effect::DeferredReplacePayload {
+        crate::effect::DeferredReplacePayload::new(
             deletes,
-            template: payload.template,
-            dependency_template: payload.dependency_template,
-        }
+            payload.template,
+            payload.dependency_template,
+        )
     }
 }

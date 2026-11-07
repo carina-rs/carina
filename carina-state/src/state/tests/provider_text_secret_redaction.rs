@@ -1,11 +1,9 @@
 //! carina#4305: assert against bytes written by the real local backend.
 
-use crate::provider_text_fixtures::*;
-
 use super::*;
 use crate::StateBackend;
 use crate::backends::LocalBackend;
-use carina_core::provider::{CreateAttempt, CreateFailureKind, Observation, ProviderError, Sent};
+use carina_core::provider::{CreateFailureKind, Observation, ProviderError, Sent};
 
 const SECRET: &str = "read-back-private-4305";
 const MASK: &str = "(secret)"; // carina-core's SECRET_VALUE_MASK is crate-private.
@@ -40,7 +38,7 @@ async fn persisted_read_back_failure(incomplete: bool) -> String {
     // and its finishing read-back fails. Keep the wire error round-trip.
     let detail = format!("mock read-back rejected password {SECRET}; public=read-context-4305");
     let error = ProviderError::from_wire(ProviderError::api_error(detail.clone()).to_wire());
-    let failed = CreateAttempt::for_test(desired.id.clone())
+    let failed = super::create_attempt_for_test(desired.id.clone())
         .issued(
             AppliedIdentifier::new("mock-id").unwrap(),
             Sent::AllRequestAttributes,

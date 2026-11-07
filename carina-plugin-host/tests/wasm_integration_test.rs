@@ -17,15 +17,15 @@ use carina_core::effect::PlanOp;
 use carina_core::executor::{AcceptedRequest, complete_create_for_writeback};
 use carina_core::provider::ProviderNormalizer;
 use carina_core::provider::{
-    AppliedIdentifier, BoxFuture, CreateRequest, DeleteRequest, HostCreateFailure as CreateFailure,
+    AppliedIdentifier, BoxFuture, CreateRequest, HostCreateFailure as CreateFailure,
     HostCreateFailureKind as CreateFailureKind, HostCreateObservation as CreateObservation,
     HostCreateOutcome as CreateOutcome, HostCreateOutcomeKind as CreateOutcomeKind,
-    HostError as ProviderError, HostResumeFailure as ResumeFailure,
+    HostError as ProviderError, HostProvider as Provider, HostResumeFailure as ResumeFailure,
     HostResumeFailureKind as ResumeFailureKind, HostResumeOutcome as ResumeOutcome,
     HostResumeOutcomeKind as ResumeOutcomeKind, HostUnobservedReason as UnobservedReason,
-    InFlightCreate, ProviderDirectiveSchema, ProviderErrorKind, ProviderFactory,
-    ProviderReadyConfig, RawSavedAttrs, ReadRequest, ResumeCreateRequest, SavedAttrs, Sent,
-    SentRecord, UpdateRequest, hydrate_host_provider_states as hydrate_provider_states,
+    InFlightCreate, ProviderErrorKind, ProviderFactory, ProviderReadyConfig, RawSavedAttrs,
+    ReadRequest, ResumeCreateRequest, SavedAttrs, Sent, SentRecord, UpdateRequest,
+    hydrate_host_provider_states as hydrate_provider_states,
     normalize_host_provider_states as normalize_provider_states,
 };
 use carina_core::resource::{
@@ -324,11 +324,21 @@ fn assert_minted_mock_identifier(identifier: &str) {
     );
 }
 
-fn delete_request_without_schema() -> DeleteRequest {
-    DeleteRequest::resolve(
-        &carina_core::resource::Directives::default(),
-        ProviderDirectiveSchema::Unavailable,
+async fn delete_without_schema(
+    provider: &dyn Provider,
+    id: &ResourceId,
+    identifier: &AppliedIdentifier,
+) -> carina_core::provider::HostResult<()> {
+    carina_core::executor::dispatch_delete(
+        provider,
+        carina_core::executor::delete_permit_for_test(
+            id.clone(),
+            identifier.clone(),
+            Default::default(),
+        ),
+        &carina_core::schema::SchemaRegistry::new(),
     )
+    .await
 }
 
 fn provider_resources(resources: Vec<Resource>) -> Vec<ProviderResource> {
@@ -398,10 +408,19 @@ fn redacted_secret_and_legacy_marker(plaintext: &str) -> (SnapshotValue, String)
     (SnapshotValue::redacted(hash), format!("_secret:{digest}"))
 }
 
+fn fixture_schemas() -> carina_core::schema::SchemaRegistry {
+    let mut schemas = carina_core::schema::SchemaRegistry::new();
+    for schema in carina_provider_mock::builtin_schemas() {
+        schemas.insert("", schema.clone());
+        schemas.insert("mock", schema);
+    }
+    schemas
+}
+
 async fn create_request_for_test(resource: Resource) -> CreateRequest {
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::schema::SchemaRegistry::new();
+    let schemas = fixture_schemas();
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
         schemas.clone(),
@@ -444,13 +463,38 @@ where
         id: &'a ResourceId,
         request: CreateRequest,
     ) -> BoxFuture<'a, Result<CreateOutcome, CreateFailure>> {
-        let (create, cancellation) = carina_core::executor::dispatch_create(self, id, request);
+        assert_eq!(&request.resource().id, id);
+        let prepared = carina_core::replacement::create_permit_with_schemas_for_test(
+            request,
+            &fixture_schemas(),
+        );
+        let (create, cancellation) = carina_core::executor::dispatch_create(self, prepared);
         Box::pin(async move {
             let _cancellation = cancellation;
             create.await
         })
     }
 }
+
+trait DispatchUpdateForTest: Provider {
+    fn update_for_test<'a>(
+        &'a self,
+        id: &ResourceId,
+        identifier: &'a carina_core::provider::AppliedIdentifier,
+        request: UpdateRequest,
+    ) -> BoxFuture<'a, carina_core::provider::HostResult<carina_core::provider::HostUpdateOutcome>>
+    {
+        assert_eq!(&request.from().id, id);
+        let prepared = carina_core::replacement::update_permit_with_schemas_for_test(
+            identifier.clone(),
+            request,
+            &fixture_schemas(),
+        );
+        Box::pin(carina_core::executor::dispatch_update(self, prepared))
+    }
+}
+
+impl<T: Provider + ?Sized> DispatchUpdateForTest for T {}
 
 async fn update_request_for_test<P: StateValueLeaf>(
     resource: Resource,
@@ -1341,6 +1385,91 @@ async fn test_wasm_mock_provider_factory() {
     assert_eq!(short_budget.create_timeout_secs, Some(2));
     assert_eq!(short_budget.update_timeout_secs, Some(2));
     assert_eq!(short_budget.delete_timeout_secs, Some(2));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_schema_preserves_input_rules() {
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let schemas = factory.schemas();
+    let constrained = schemas
+        .iter()
+        .find(|schema| schema.parts().resource_type == "test.creation_constrained")
+        .unwrap();
+    let rules = constrained.parts().input_rules;
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].path().as_str(), "name");
+    assert_eq!(rules[0].code().as_str(), "mock.name.not_ipv4");
+    // Evaluation now requires the real finalized-plan write-site boundary.
+    let admit = |name: &str| {
+        let mut registry = carina_core::schema::SchemaRegistry::new();
+        registry.insert("mock", constrained.clone());
+        let resource = carina_core::resource::Resource::with_provider(
+            "mock",
+            "test.creation_constrained",
+            "example",
+            None,
+        )
+        .with_attribute(
+            "name",
+            carina_core::resource::Value::Concrete(carina_core::resource::ConcreteValue::String(
+                name.into(),
+            )),
+        );
+        let mut plan = carina_core::plan::Plan::new();
+        plan.add(carina_core::effect::Effect::Create(
+            carina_core::resource::ResolvedResource::resolve_raw_fixture(resource, &registry)
+                .unwrap(),
+        ));
+        input_rule_fixture::finalize(plan).check_inputs(&registry, &HashMap::new())
+    };
+    assert!(admit("bucket").is_ok());
+    assert!(admit("192.168.0.1").is_err());
+    let empty = schemas
+        .iter()
+        .find(|schema| schema.parts().resource_type == "test.short_budget")
+        .unwrap();
+    assert!(empty.parts().input_rules.is_empty());
+}
+
+#[path = "../../carina-core/tests/support/creation.rs"]
+#[allow(dead_code)]
+mod input_rule_fixture;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_schema_preserves_every_write_map_key_rule_and_native_fingerprint() {
+    use carina_core::schema::{
+        InputPredicate, InputRuleScope, InputRuleTarget, SchemaKind, SchemaRegistry,
+    };
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    let mut guest = SchemaRegistry::new();
+    for schema in factory.schemas() {
+        guest.insert("mock", schema);
+    }
+    let mut native = SchemaRegistry::new();
+    native.insert(
+        "mock",
+        carina_provider_mock::desired_input_rule_schema()
+            .validate()
+            .unwrap(),
+    );
+    let guest = guest
+        .get("mock", "test.input_constrained", SchemaKind::Resource)
+        .unwrap();
+    let native = native
+        .get("mock", "test.input_constrained", SchemaKind::Resource)
+        .unwrap();
+    assert_eq!(guest.semantic_fingerprint(), native.semantic_fingerprint());
+    let rules = guest.parts().input_rules;
+    let tags = rules
+        .iter()
+        .find(|rule| rule.scope() == InputRuleScope::EveryWrite)
+        .unwrap();
+    assert!(matches!(tags.target(), InputRuleTarget::MapKeys(path) if path.as_str() == "tags"));
+    assert!(
+        matches!(tags.predicate(), InputPredicate::ForbiddenPrefix { prefix, ignore_ascii_case: true } if prefix.as_str() == "aws:")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2967,9 +3096,7 @@ async fn test_wasm_fresh_delete_recovers_pending_controls_from_identifier() {
     let config = ready_config(&factory, &indexmap::IndexMap::new());
     let fresh = factory.initialize_fixture(None, &config).await.unwrap();
     let identifier = AppliedIdentifier::new(created.identifier.unwrap()).unwrap();
-    let error = fresh
-        .provider()
-        .delete(&id, &identifier, delete_request_without_schema())
+    let error = delete_without_schema(fresh.provider(), &id, &identifier)
         .await
         .expect_err("a fresh instance must honor the pending delete and exhaust its budget");
     assert!(error.to_string().contains("budget"), "{error}");
@@ -3008,7 +3135,7 @@ async fn test_wasm_fresh_read_uses_updated_read_back_controls() {
     .await;
     let updated = updater
         .provider()
-        .update(&id, &identifier, request)
+        .update_for_test(&id, &identifier, request)
         .await
         .unwrap()
         .into_state_for_writeback();
@@ -3068,7 +3195,7 @@ async fn test_wasm_pending_update_polls_until_success() {
 
     let state = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update_for_test(&id, &created_identifier, request)
         .await
         .expect("pending update should settle")
         .into_state_for_writeback();
@@ -3120,7 +3247,7 @@ async fn test_wasm_update_read_back_completes_within_budget() {
 
     let state = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update_for_test(&id, &created_identifier, request)
         .await
         .expect("update read-back should settle within the default budget")
         .into_state_for_writeback();
@@ -3172,7 +3299,7 @@ async fn test_wasm_update_read_back_budget_returns_partial_then_refresh_complete
 
     let outcome = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update_for_test(&id, &created_identifier, request)
         .await
         .expect("the final update attempt should return a partial success");
     let diagnostic = outcome
@@ -3246,7 +3373,7 @@ async fn test_wasm_update_read_back_phase_regression_is_protocol_violation_and_r
 
     let error = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update_for_test(&id, &created_identifier, request)
         .await
         .expect_err("read-back must not regress to operation pending");
     assert!(error.to_string().contains("polling protocol"), "{error}");
@@ -3291,9 +3418,7 @@ async fn test_wasm_pending_delete_polls_until_success() {
         .expect("setup create should succeed");
     let identifier = created.identifier().clone();
 
-    provider
-        .provider()
-        .delete(&id, &identifier, delete_request_without_schema())
+    delete_without_schema(provider.provider(), &id, &identifier)
         .await
         .expect("pending delete should settle");
     {
@@ -5113,7 +5238,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
 
     let updated = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update_for_test(&id, &created_identifier, request)
         .await
         .expect("update should succeed")
         .into_state_for_writeback();
@@ -5172,9 +5297,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     );
 
     // Delete
-    provider
-        .provider()
-        .delete(&id, &updated_identifier, delete_request_without_schema())
+    delete_without_schema(provider.provider(), &id, &updated_identifier)
         .await
         .expect("delete should succeed");
 
@@ -5224,7 +5347,7 @@ async fn test_wasm_update_accepts_redacted_secret_in_current_state() {
 
     let updated = provider
         .provider()
-        .update(&id, &mock_identifier(), request)
+        .update_for_test(&id, &mock_identifier(), request)
         .await
         .expect("persisted current-state secrets must cross the update boundary")
         .into_state_for_writeback();
@@ -5269,7 +5392,7 @@ async fn test_wasm_update_carries_unchanged_redacted_secret_into_outcome() {
 
     let updated = provider
         .provider()
-        .update(&id, &mock_identifier(), request)
+        .update_for_test(&id, &mock_identifier(), request)
         .await
         .expect("unchanged persisted secrets must cross the update outcome boundary")
         .into_state_for_writeback();
@@ -5338,7 +5461,7 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
     let request = update_request_for_test(resource, from, &["color".to_string()]).await;
     let updated = provider
         .provider()
-        .update(&id, &created_identifier, request)
+        .update_for_test(&id, &created_identifier, request)
         .await
         .expect("update should preserve the unchanged persisted attribute")
         .into_state_for_writeback();

@@ -113,7 +113,7 @@ fn validated_export_decode_returns_evaluable_values() {
 #[test]
 fn snapshot_saved_plan_root_and_nested_hash_round_trip() {
     use carina_core::effect::Effect;
-    use carina_core::plan::{Plan, SavedPlan};
+    use carina_core::plan::{Plan, SavedPlan, UnresolvedSavedPlan};
     use carina_core::resource::{ResolvedResource, Resource, SavedModuleSource};
     let secret = Value::Deferred(DeferredValue::Secret(
         Box::new(Value::Concrete(ConcreteValue::String(
@@ -134,9 +134,17 @@ fn snapshot_saved_plan_root_and_nested_hash_round_trip() {
             .unwrap()
             .into();
         let bytes = serde_json::to_vec(&saved).unwrap();
-        let decoded: SavedPlan = serde_json::from_slice(&bytes).unwrap();
+        let decoded = serde_json::from_slice::<UnresolvedSavedPlan>(&bytes)
+            .unwrap()
+            .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
+            .unwrap();
         assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
-        assert!(serde_json::from_slice::<Plan<SavedModuleSource>>(&bytes).is_err());
+        assert!(
+            serde_json::from_value::<Effect<SavedModuleSource>>(
+                serde_json::to_value(&decoded.effects()[0]).unwrap()
+            )
+            .is_err()
+        );
     }
 }
 

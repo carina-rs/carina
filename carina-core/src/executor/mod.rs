@@ -13,6 +13,8 @@
 
 pub(crate) mod basic;
 mod deferred_dispatch;
+mod delete;
+pub(crate) mod input_discharge;
 pub mod normalized;
 #[cfg(test)]
 mod normalized_tests;
@@ -25,7 +27,16 @@ pub(super) mod scheduler;
 pub(crate) mod wait;
 
 pub use deferred_dispatch::{AnonymousIdentityCollisionSource, DeferredCreateFailure};
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub use delete::delete_permit_for_test;
+pub use delete::{
+    DeleteCompletion, DeleteRelease, DeleteScheduleError, DeleteScheduler, ScheduledDelete,
+    dispatch_delete, prepare_initial_delete,
+};
+pub use input_discharge::{DeletePermit, PreparedWrite};
 pub use parallel::classify_stalled_effects;
+pub use scheduler::prepare_initial_create;
 pub use wait::StartMarker;
 
 pub use crate::data_source_value::UnresolvedDataSourceInput;
@@ -62,24 +73,32 @@ pub struct PlanSchedulerEndpoint {
 /// endpoint phase preserves whether an edge touches an absorbed teardown.
 /// Dependency-analysis failures retain their partial edge graph, matching the
 /// scheduler's behavior for unaffected effects.
+///
+/// Continuations must be specialized before projecting a diagram:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::build_plan_scheduler_dependency_edges, plan::AdmittedPlan};
+/// fn unspecialized(plan: &AdmittedPlan) {
+///     build_plan_scheduler_dependency_edges(plan, &Default::default());
+/// }
+/// ```
+///
+/// An effects-only schedule has no admitted plan to project back to:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::build_plan_scheduler_dependency_edges, replacement::ScheduledEffects};
+/// fn unattached(scheduled: &ScheduledEffects) {
+///     build_plan_scheduler_dependency_edges(scheduled, &Default::default());
+/// }
+/// ```
 pub fn build_plan_scheduler_dependency_edges(
-    plan_effects: &[Effect],
+    scheduled: &crate::replacement::ScheduledPlan<'_>,
     unresolved_resources: &HashMap<ResolvedResourceId, &UnresolvedResource>,
 ) -> BTreeSet<(PlanSchedulerEndpoint, PlanSchedulerEndpoint)> {
-    let parallel::ExpandedEffects {
-        effects,
-        deferred_replace_delete_deps,
-        source_effect_indices,
-    } = parallel::expand_deferred_replace_effects(plan_effects);
-    let deferred_replace_teardowns: HashSet<_> = deferred_replace_delete_deps
-        .iter()
-        .map(|(_, delete_idx)| *delete_idx)
-        .collect();
-    let scheduler::SchedulerDeps { deps_of, .. } = scheduler::build_scheduler_deps_from_resources(
-        &effects,
-        unresolved_resources,
-        &deferred_replace_delete_deps,
-    );
+    let (admitted, deferred_replace_teardowns, source_effect_indices) =
+        scheduled.clone().expand_deferred_replacements();
+    let scheduler::SchedulerDeps { deps_of, .. } =
+        scheduler::build_scheduler_deps(&admitted, unresolved_resources.keys());
 
     deps_of
         .into_iter()
@@ -139,27 +158,106 @@ pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 /// core. The supervising caller must retain the receiver until the returned
 /// future settles. Executor-owned abandonment paths drain it before saving
 /// the cancellation classification.
+/// A caller cannot replace the admitted request, even at the same identity:
+///
+/// ```compile_fail,E0061
+/// use carina_core::{executor::dispatch_create, provider::{CreateRequest, HostProvider}, replacement::CreatePermit};
+/// fn create_dispatch_rejects_a_permit_for_another_target(provider: &dyn HostProvider, permit: CreatePermit, other: CreateRequest) {
+///     let _ = dispatch_create(provider, permit, other);
+/// }
+/// ```
+///
+/// Raw resource IDs cannot authorize a create, including a replacement:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::dispatch_create, provider::HostProvider, resource::ResourceId};
+/// fn bypass(provider: &dyn HostProvider, target: &ResourceId) {
+///     let _ = dispatch_create(provider, target);
+/// }
+/// ```
+/// The former raw dispatch shape cannot bypass either admission check:
+///
+/// ```compile_fail,E0061
+/// use carina_core::{executor::dispatch_create, provider::{CreateRequest, HostProvider}, resource::ResourceId};
+/// fn bypass(provider: &dyn HostProvider, id: &ResourceId, request: CreateRequest) {
+///     let _ = dispatch_create(provider, id, request);
+/// }
+/// ```
+///
+/// A discharged request alone cannot bypass scheduler readiness:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::{dispatch_create, PreparedWrite}, provider::{CreateRequest, HostProvider}};
+/// fn bypass(provider: &dyn HostProvider, discharged: PreparedWrite<CreateRequest>) {
+///     let _ = dispatch_create(provider, discharged);
+/// }
+/// ```
+///
+/// Preparing and checking a raw request cannot manufacture scheduler readiness:
+///
+/// ```compile_fail,E0277
+/// use carina_core::{
+///     executor::{prepare_create_request, ProviderPreparationContext},
+///     replacement::CreatePermit, resource::Resource,
+/// };
+/// async fn bypass(raw: Resource, context: &ProviderPreparationContext<'_>) -> CreatePermit {
+///     let request = prepare_create_request(raw, context).await.unwrap();
+///     request.into()
+/// }
+/// ```
 pub fn dispatch_create<'a, P: HostProvider + ?Sized>(
     provider: &'a P,
-    id: &'a ResourceId,
-    request: CreateRequest,
+    permit: crate::replacement::CreatePermit,
 ) -> (
     impl std::future::Future<Output = Result<HostCreateOutcome, HostCreateFailure>> + 'a,
     crate::provider::CreateCallCancellationReceiver,
 ) {
-    let (attempt, cancellation) = crate::provider::CreateAttempt::new(id.clone());
+    let (attempt, cancellation) = crate::provider::CreateAttempt::new(permit.target().clone());
     (
-        dispatch_create_with_attempt(provider, id, request, attempt),
+        dispatch_create_with_attempt(provider, permit, attempt),
         cancellation,
     )
 }
 
+/// Scheduled update dispatch also consumes the exact checked patch.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::dispatch_update, provider::{HostProvider, AppliedIdentifier, UpdateRequest}};
+/// fn bypass(provider: &dyn HostProvider, id: &AppliedIdentifier, raw: UpdateRequest) {
+///     let _ = dispatch_update(provider, raw);
+/// }
+/// ```
+///
+/// Even an input-discharged update cannot construct scheduler readiness:
+///
+/// ```compile_fail,E0451
+/// use carina_core::{
+///     executor::PreparedWrite,
+///     provider::{AppliedIdentifier, UpdateRequest},
+///     replacement::UpdatePermit,
+/// };
+/// fn bypass(identifier: AppliedIdentifier, write: PreparedWrite<UpdateRequest>) -> UpdatePermit {
+///     UpdatePermit { write, identifier }
+/// }
+/// ```
+pub async fn dispatch_update<P: HostProvider + ?Sized>(
+    provider: &P,
+    permit: crate::replacement::UpdatePermit,
+) -> crate::provider::HostResult<crate::provider::HostUpdateOutcome> {
+    let id = permit.write.resource_id().clone();
+    let request = permit.write.request().clone();
+    let identifier = permit.identifier.clone();
+    let attempt = crate::provider::UpdateAttempt::new(permit);
+    provider.update(&id, &identifier, request, attempt).await
+}
+
 async fn dispatch_create_with_attempt<P: HostProvider + ?Sized>(
     provider: &P,
-    id: &ResourceId,
-    request: CreateRequest,
+    permit: crate::replacement::CreatePermit,
     attempt: crate::provider::CreateAttempt,
 ) -> Result<HostCreateOutcome, HostCreateFailure> {
+    let request = permit.into_request();
+    let id = request.resource().id.clone();
     let request_attributes: BTreeSet<_> = request
         .resource()
         .as_resource()
@@ -167,7 +265,7 @@ async fn dispatch_create_with_attempt<P: HostProvider + ?Sized>(
         .keys()
         .cloned()
         .collect();
-    match provider.create(id, request, attempt).await {
+    match provider.create(&id, request, attempt).await {
         Ok(outcome) => Ok(outcome),
         Err(failure) => match failure.into_kind() {
             HostCreateFailureKind::OutcomeUnknown { unknown, error } => Err(
@@ -285,6 +383,15 @@ async fn dispatch_resume_create_raw<P: HostProvider + ?Sized>(
             }
         },
     }
+}
+
+/// Dispatch a continuation whose request can only yield an identified poll
+/// witness. This path cannot issue a new create or obtain a resend attempt.
+pub async fn dispatch_poll_create<P: HostProvider + ?Sized>(
+    provider: &P,
+    request: crate::provider::PollCreateRequest,
+) -> Result<HostResumeOutcome, HostResumeFailure> {
+    dispatch_resume_create(provider, request.into_resume_request()).await
 }
 
 /// The accepted provider request whose result produced a complete state.
@@ -456,8 +563,13 @@ pub enum Applied {
 }
 
 /// Input data required to execute a plan.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::LiveExecutionInput, plan::Plan};
+/// fn bypass<'a>(input: &mut LiveExecutionInput<'a>, raw: &'a Plan) { input.plan = raw; }
+/// ```
 pub struct LiveExecutionInput<'a> {
-    pub plan: &'a crate::plan::Plan,
+    pub plan: &'a crate::input_rules::InputCheckedPlan,
     /// Explicitly identifies whether provider-bound effects contain authored
     /// values or plan-normalized values paired with their authored origins.
     /// The executor never infers this from a missing map entry.
@@ -510,8 +622,15 @@ pub struct LiveExecutionInput<'a> {
 ///
 /// Keeping the composition slice in a distinct input type prevents a
 /// deserialized plan from entering the live validation/expansion lifecycle.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::SavedExecutionInput, plan::Plan, resource::SavedModuleSource};
+/// fn bypass<'a>(input: &mut SavedExecutionInput<'a>, raw: &'a Plan<SavedModuleSource>) {
+///     input.plan = raw;
+/// }
+/// ```
 pub struct SavedExecutionInput<'a> {
-    pub plan: &'a crate::plan::Plan<SavedModuleSource>,
+    pub plan: &'a crate::input_rules::InputCheckedPlan<SavedModuleSource>,
     pub provider_check_inputs: ProviderCheckInputs<'a, SavedModuleSource>,
     pub compositions: &'a [crate::resource::SavedComposition<crate::resource::NoPlaceholder>],
     pub bindings: ResolvedBindings,
@@ -545,20 +664,11 @@ impl RuntimeCompositions<'_> {
             }
         }
     }
-
-    fn scheduler_dependencies<S>(
-        self,
-        effects: &[Effect<S>],
-        unresolved_resources: &HashMap<ResolvedResourceId, UnresolvedResource<S>>,
-        deferred_replace_delete_deps: &[(usize, usize)],
-    ) -> scheduler::SchedulerDeps {
-        let _ = self;
-        scheduler::build_scheduler_deps(effects, unresolved_resources, deferred_replace_delete_deps)
-    }
 }
 
 pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
-    pub(super) plan: &'a crate::plan::Plan<S>,
+    input_checks: Vec<crate::input_rules::PendingInputObligation>,
+    pub(super) plan: &'a crate::plan::AdmittedPlan<S>,
     pub(super) provider_check_inputs: ProviderCheckInputs<'a, S>,
     pub(super) compositions: RuntimeCompositions<'a>,
     pub(super) bindings: ResolvedBindings,
@@ -602,6 +712,7 @@ impl<'a> LiveExecutionInput<'a> {
             checkpoint_sink,
         } = self;
         RuntimeExecutionInput {
+            input_checks: plan.execution_input_checks(),
             plan,
             provider_check_inputs,
             compositions: RuntimeCompositions::Live(compositions),
@@ -645,6 +756,7 @@ impl<'a> SavedExecutionInput<'a> {
             checkpoint_sink,
         } = self;
         RuntimeExecutionInput {
+            input_checks: plan.execution_input_checks(),
             plan,
             provider_check_inputs,
             compositions: RuntimeCompositions::Saved(compositions),
@@ -1148,6 +1260,13 @@ impl std::fmt::Display for UnsatisfiedDependency {
 /// Typed reason an effect did not complete successfully.
 #[derive(Debug, Clone)]
 pub enum EffectFailureKind {
+    InputRule {
+        violation: crate::schema::InputViolation,
+    },
+    UnresolvedInputRule {
+        path: crate::schema::InputPath,
+        code: crate::schema::InputRuleCode,
+    },
     Provider {
         error: ReportedError,
         note: Option<crate::provider_text::DiagnosticText>,
@@ -1179,6 +1298,8 @@ impl EffectFailureKind {
     /// Short final-summary label. The observer renders the full cause once.
     pub fn label(&self) -> &'static str {
         match self {
+            Self::InputRule { .. } => "input rule violation",
+            Self::UnresolvedInputRule { .. } => "input rule unresolved",
             Self::Provider { .. } => "provider error",
             Self::Execution { .. } => "execution error",
             Self::DeferredMaterialization { .. } => "deferred materialization failure",
@@ -1264,6 +1385,8 @@ impl EffectFailureKind {
             Self::Provider { error, .. } | Self::Execution { error } => Some(error.as_error()),
             Self::DeferredMaterialization { failure } => Some(failure.as_ref()),
             Self::MissingDependency { .. }
+            | Self::InputRule { .. }
+            | Self::UnresolvedInputRule { .. }
             | Self::DependencyCycle { .. }
             | Self::BlockedByDependencyCycle { .. }
             | Self::NoProgress { .. }
@@ -1275,6 +1398,11 @@ impl EffectFailureKind {
 impl std::fmt::Display for EffectFailureKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InputRule { violation } => violation.fmt(formatter),
+            Self::UnresolvedInputRule { path, code } => write!(
+                formatter,
+                "input rule {code} at {path} could not be discharged"
+            ),
             Self::Provider { error, note } => {
                 error.fmt(formatter)?;
                 if let Some(note) = note {
@@ -1315,6 +1443,12 @@ impl std::fmt::Display for EffectFailureKind {
             }
             Self::ModuleConstraint { failure } => failure.fmt(formatter),
         }
+    }
+}
+
+impl std::error::Error for EffectFailureKind {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.reported_error()
     }
 }
 
@@ -1412,6 +1546,7 @@ pub enum FailureReport<'a, S> {
         kind: EffectFailureKind,
         context: FailureEventContext<'a>,
     },
+    InputChecks(ReportedError),
     ModuleConstraint(Box<ModuleConstraintFailure>),
     ModuleConstraintResolution(crate::module_resolver::ModuleConstraintResolutionError),
 }
@@ -1428,6 +1563,13 @@ impl FailureSink {
                 kind,
                 context,
             } => (EffectFailure::new(effect, kind), Some((effect, context))),
+            FailureReport::InputChecks(error) => (
+                EffectFailure {
+                    endpoint: None,
+                    kind: EffectFailureKind::Execution { error },
+                },
+                None,
+            ),
             FailureReport::ModuleConstraint(failure) => {
                 (EffectFailure::module_constraint(failure), None)
             }
@@ -1470,8 +1612,10 @@ pub struct ExecutionResult<S = ModuleSource> {
     pub interrupted_count: usize,
     pub applied_states: std::collections::HashMap<ResourceId, Applied>,
     pub runtime_synthesized_resources: Vec<ResolvedResource<S>>,
+    pub replacement_writeback: Vec<crate::replacement::ReplacementWriteback>,
     pub successfully_deleted: HashSet<DeletedInstanceKey>,
-    pub permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
+    pub permanent_name_overrides:
+        HashMap<ResourceId, HashMap<String, crate::name_override::NameOverride>>,
     pub managed_current: HashMap<ResourceId, Current>,
     pub data_source_states: HashMap<ResourceId, State>,
     pub bindings: ResolvedBindings,
@@ -1489,6 +1633,7 @@ impl<S> ExecutionResult<S> {
             interrupted_count: 0,
             applied_states: HashMap::new(),
             runtime_synthesized_resources: Vec::new(),
+            replacement_writeback: Vec::new(),
             successfully_deleted: HashSet::new(),
             permanent_name_overrides: HashMap::new(),
             managed_current: HashMap::new(),
@@ -1525,8 +1670,10 @@ pub(super) struct ExecutionResultFields<S = ModuleSource> {
     pub(super) skip_count: usize,
     pub(super) interrupted_count: usize,
     pub(super) runtime_synthesized_resources: Vec<ResolvedResource<S>>,
+    pub(super) replacement_writeback: Vec<crate::replacement::ReplacementWriteback>,
     pub(super) successfully_deleted: HashSet<DeletedInstanceKey>,
-    pub(super) permanent_name_overrides: HashMap<ResourceId, HashMap<String, String>>,
+    pub(super) permanent_name_overrides:
+        HashMap<ResourceId, HashMap<String, crate::name_override::NameOverride>>,
     pub(super) managed_current: HashMap<ResourceId, Current>,
     pub(super) data_source_states: HashMap<ResourceId, State>,
     pub(super) bindings: ResolvedBindings,
@@ -1550,6 +1697,7 @@ impl<S> ExecutionResultFields<S> {
             skip_count,
             interrupted_count,
             runtime_synthesized_resources,
+            replacement_writeback,
             successfully_deleted,
             permanent_name_overrides,
             managed_current,
@@ -1566,6 +1714,7 @@ impl<S> ExecutionResultFields<S> {
             interrupted_count,
             applied_states,
             runtime_synthesized_resources,
+            replacement_writeback,
             successfully_deleted,
             permanent_name_overrides,
             managed_current,
@@ -1596,6 +1745,7 @@ impl<S: Clone> ExecutionAccumulator<S> {
             interrupted_count,
             applied_states,
             runtime_synthesized_resources,
+            replacement_writeback,
             successfully_deleted,
             permanent_name_overrides,
             managed_current,
@@ -1617,6 +1767,7 @@ impl<S: Clone> ExecutionAccumulator<S> {
                 skip_count,
                 interrupted_count,
                 runtime_synthesized_resources,
+                replacement_writeback,
                 successfully_deleted,
                 permanent_name_overrides,
                 managed_current,
@@ -1646,6 +1797,28 @@ impl<S: Clone> ExecutionAccumulator<S> {
     ) -> T {
         self.dirty = true;
         mutation(&mut self.fields)
+    }
+
+    pub(super) fn record_replacement_metadata(
+        &mut self,
+        admitted: &crate::replacement::AdmittedReplacementEffects<S>,
+    ) {
+        // Admission describes future work. Include its metadata in subsequent
+        // checkpoints without publishing a checkpoint before execution progresses.
+        self.fields.replacement_writeback = admitted.writeback().to_vec();
+        for (id, name) in admitted.temporary_names() {
+            self.fields
+                .permanent_name_overrides
+                .entry(id.clone())
+                .or_default()
+                .insert(
+                    name.attribute.clone(),
+                    crate::name_override::NameOverride {
+                        temp_value: name.temporary_value.clone(),
+                        original_value: Some(name.original_value.clone()),
+                    },
+                );
+        }
     }
 
     pub(super) fn insert_published(&mut self, id: ResourceId, applied: Applied, state: &State) {

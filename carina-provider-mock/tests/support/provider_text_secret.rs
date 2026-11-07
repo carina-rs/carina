@@ -11,8 +11,8 @@ use text_fixtures::NativeWireFixture;
 use carina_core::effect::PlanOp;
 use carina_core::provider::{
     AppliedIdentifier, BoxFuture, CanonicalProviderConfigAttributes, CreateAttempt, CreateFailure,
-    CreateOutcome, CreateRequest, DeleteRequest, InitializeOutcome, InitializeOutcomeMint,
-    Provider, ProviderError, ProviderFactory, ProviderInitialization, ProviderReadyDataSource,
+    CreateOutcome, CreateRequest, InitializeOutcome, InitializeOutcomeMint, Provider,
+    ProviderError, ProviderFactory, ProviderInitialization, ProviderReadyDataSource,
     ProviderResult, ReadOutcome, ReadRequest, ResumeCreateRequest, ResumeFailure, ResumeOutcome,
     UpdateOutcome, UpdateRequest, WireAttributes, WirePatchOp, WireValue,
 };
@@ -259,6 +259,7 @@ impl Provider for EchoMock {
         _: &ResourceId,
         _: &AppliedIdentifier,
         request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         assert!(matches!(
             self.failure,
@@ -287,12 +288,7 @@ impl Provider for EchoMock {
         Box::pin(async { Err(error) })
     }
 
-    fn delete(
-        &self,
-        _: &ResourceId,
-        _: &AppliedIdentifier,
-        _: DeleteRequest,
-    ) -> BoxFuture<'_, ProviderResult<()>> {
+    fn delete(&self, _: carina_core::provider::DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
         if self.failure == Failure::StateOnly {
             self.deletes
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);

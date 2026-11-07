@@ -1200,6 +1200,7 @@ dependencies = [
  "carina-core",
  "carina-plugin-host",
  "carina-plugin-sdk",
+ "carina-provider-mock",
  "carina-provider-protocol",
  "carina-provider-resolver",
  "carina-state",

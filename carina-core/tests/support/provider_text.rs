@@ -183,6 +183,7 @@ pub fn initialized_with_context(
 
 // Values enter through actual provider operations, using the immutable session.
 enum Payload {
+    CaptureAttempt(std::sync::Arc<Mutex<Option<CreateAttempt>>>),
     Error(ProviderError),
     Create(Result<CreateOutcome, CreateFailure>),
     Update(UpdateOutcome),
@@ -225,6 +226,10 @@ impl Provider for Fixture {
         attempt: CreateAttempt,
     ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
         let value = match self.0.lock().unwrap().take().unwrap() {
+            Payload::CaptureAttempt(capture) => {
+                *capture.lock().unwrap() = Some(attempt);
+                return Box::pin(std::future::pending());
+            }
             Payload::Create(value) => value,
             Payload::Partial(diagnostic) => Ok(attempt
                 .issued(
@@ -250,18 +255,14 @@ impl Provider for Fixture {
         _: &ResourceId,
         _: &AppliedIdentifier,
         _: UpdateRequest,
+        _: UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let Some(Payload::Update(value)) = self.0.lock().unwrap().take() else {
             panic!("update fixture")
         };
         Box::pin(async { Ok(value) })
     }
-    fn delete(
-        &self,
-        _: &ResourceId,
-        _: &AppliedIdentifier,
-        _: DeleteRequest,
-    ) -> BoxFuture<'_, ProviderResult<()>> {
+    fn delete(&self, _: DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
         unreachable!()
     }
 }
@@ -323,6 +324,9 @@ fn id() -> ResourceId {
     .id
 }
 fn create_request() -> CreateRequest {
+    create_request_for(id())
+}
+fn create_request_for(id: ResourceId) -> CreateRequest {
     block_on(
         carina_core::validation::deferred_types::with_session_for_test_async(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -340,7 +344,7 @@ fn create_request() -> CreateRequest {
                     checks,
                 );
                 carina_core::executor::provider_ready::prepare_create_request(
-                    Resource::with_provider("text-fixture", "resource", "fixture", None),
+                    Resource::from_id(id),
                     &context,
                 )
                 .await
@@ -351,11 +355,10 @@ fn create_request() -> CreateRequest {
 }
 fn create(payload: Payload, context: &Context) -> Result<HostCreateOutcome, HostCreateFailure> {
     let fixture = fixture(payload, context);
-    block_on(
-        fixture
-            .provider()
-            .create(&id(), create_request(), CreateAttempt::for_test(id())),
-    )
+    let permit = carina_core::replacement::create_permit_for_test(create_request());
+    let (create, _cancellation) =
+        carina_core::executor::dispatch_create(fixture.provider(), permit);
+    block_on(create)
 }
 pub trait BindProviderText: Sized {
     type Host;
@@ -435,7 +438,7 @@ impl BindProviderText for ResumeOutcome {
     }
 }
 fn resume(payload: Payload, context: &Context) -> Result<HostResumeOutcome, HostResumeFailure> {
-    let pending = CreateAttempt::for_test(id()).pending(
+    let pending = create_attempt_for_test(id()).pending(
         PendingToken::new("fixture"),
         Sent::AllRequestAttributes,
         0,
@@ -483,11 +486,16 @@ impl BindProviderText for UpdateOutcome {
                     )
                     .await
                     .unwrap();
-                    fixture(Payload::Update(self), context)
-                        .provider()
-                        .update(&id(), &AppliedIdentifier::new("fixture").unwrap(), request)
-                        .await
-                        .unwrap()
+                    let permit = carina_core::replacement::update_permit_for_test(
+                        AppliedIdentifier::new("fixture").unwrap(),
+                        request,
+                    );
+                    carina_core::executor::dispatch_update(
+                        fixture(Payload::Update(self), context).provider(),
+                        permit,
+                    )
+                    .await
+                    .unwrap()
                 },
             ),
         )
@@ -671,4 +679,23 @@ pub fn initialized_with_scope(
         name: "text-fixture".into(),
     };
     block_on(ProviderBoundary::initialize(&factory, context.session())).unwrap()
+}
+
+/// Capture a real scheduler-minted attempt through the host boundary.
+pub fn create_attempt_for_test(id: ResourceId) -> CreateAttempt {
+    use std::future::Future;
+    use std::task::{Context as TaskContext, Poll, Waker};
+    let capture = std::sync::Arc::new(Mutex::new(None));
+    let provider = fixture(Payload::CaptureAttempt(capture.clone()), &context(&[]));
+    let permit = carina_core::replacement::create_permit_for_test(create_request_for(id));
+    let (create, _cancellation) =
+        carina_core::executor::dispatch_create(provider.provider(), permit);
+    let mut create = std::pin::pin!(create);
+    assert!(matches!(
+        create
+            .as_mut()
+            .poll(&mut TaskContext::from_waker(Waker::noop())),
+        Poll::Pending
+    ));
+    capture.lock().unwrap().take().unwrap()
 }

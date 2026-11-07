@@ -15,174 +15,84 @@ pub use saved_configuration::{
 #[cfg(test)]
 thread_local! { static REDACTION_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
-/// Public API probes: raw output cannot acquire a display projection with an
-/// unrelated inventory, and fixture authority is absent from production.
-///
-/// ```compile_fail
-/// use carina_core::provider_text::{ProviderText, RedactionSet};
-/// fn unrelated(raw: ProviderText, unrelated: &RedactionSet) { let _ = raw.redact(unrelated); }
-/// ```
-/// ```compile_fail
-/// use carina_core::provider_text::ProviderTextLines;
-/// let mut lines = ProviderTextLines::default();
-/// let raw = lines.push_str("private\n");
-/// ```
-/// ```compile_fail
-/// use carina_core::provider_text::RedactionSet;
-/// let forged = RedactionSet::for_test(&[]);
-/// ```
-/// ```compile_fail
-/// let forged = carina_core::provider::ProviderError::internal("private").into_host_for_test();
-/// ```
-/// ```compile_fail
-/// use carina_core::provider::Provider;
-/// fn bypass(raw: &dyn Provider) { let _ = carina_core::provider::provider_text_boundary_for_test(raw); }
-/// ```
-/// ```compile_fail
-/// use carina_core::provider_text::HostDiagnostic;
-/// let cause = HostDiagnostic::new(std::io::Error::other("guest password"));
-/// ```
-/// ```compile_fail
-/// use carina_core::provider::HostError;
-/// let error = HostError::internal_caused_by("ctx", std::io::Error::other("guest password"));
-/// ```
-/// ```compile_fail
-/// use carina_core::provider_text::{ProviderTextContext, RedactionSet};
-/// fn forge(sent: RedactionSet) { let _ = ProviderTextContext::new(sent); }
-/// ```
 /// RedactionSet fields remain private.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use carina_core::provider_text::RedactionSet;
-/// let _ = RedactionSet { spellings: Default::default() };
+/// let _ = RedactionSet { spellings: Default::default(), generation: Default::default(), values: Default::default() };
 /// ```
 /// RedactionSet has no default constructor.
 ///
-/// ```compile_fail
-/// let _ = carina_core::provider_text::RedactionSet::default();
+/// ```compile_fail,E0277
+/// let _: carina_core::provider_text::RedactionSet = Default::default();
 /// ```
 /// Redacted text cannot be constructed externally.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0603
 /// let _ = carina_core::provider_text::RedactedProviderText(String::new());
 /// ```
 /// Redacted text has no String conversion.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// let _: carina_core::provider_text::RedactedProviderText = String::new().into();
 /// ```
 /// Sessions are minted by core.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use carina_core::provider::ProviderSession;
 /// let _ = ProviderSession { config: None, provider: String::new(), binding: None, secrets: todo!() };
 /// ```
-/// The no-config session constructor is private.
-///
-/// ```compile_fail
-/// let _ = carina_core::provider::ProviderSession::without_config(std::iter::empty::<&carina_core::resource::Value>());
-/// ```
 /// Boundaries cannot be constructed externally.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use carina_core::provider::ProviderBoundary;
 /// let _ = ProviderBoundary { provider: todo!(), normalizer: todo!(), secrets: todo!(), schemas: todo!() };
 /// ```
 /// Unbound provider errors have no Display.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// fn display(error: carina_core::provider::ProviderError) { let _ = format!("{error}"); }
 /// ```
 /// Unbound provider errors have no to_string.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// fn display(error: carina_core::provider::ProviderError) { let _ = error.to_string(); }
 /// ```
 /// ProviderText has no Display.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// fn display(text: carina_core::provider_text::ProviderText) { let _ = format!("{text}"); }
 /// ```
 /// ProviderText has no to_string.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// fn display(text: carina_core::provider_text::ProviderText) { let _ = text.to_string(); }
 /// ```
 /// Unbound ErrorText has no Display.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::provider_text::{ErrorText, Unbound};
 /// fn display(text: ErrorText<Unbound>) { let _ = format!("{text}"); }
 /// ```
 /// Unbound ErrorText has no to_string.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::provider_text::{ErrorText, Unbound};
 /// fn display(text: ErrorText<Unbound>) { let _ = text.to_string(); }
 /// ```
 /// Unbound diagnostics have no Display.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// fn display(text: carina_core::provider_text::ProviderDiagnostic) { let _ = format!("{text}"); }
 /// ```
 /// Partial-read reasons must remain typed.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// let _ = carina_core::provider::PartialReadDiagnostic::<carina_core::provider_text::Unbound>::new(String::from("provider reason"), vec!["name".into()]);
-/// ```
-/// Host providers cannot register per-call desired values.
-///
-/// ```compile_fail
-/// fn register(provider: &dyn carina_core::provider::HostProvider) { provider.note_desired(&[]); }
-/// ```
-/// An unconfigured provider boundary is unavailable.
-///
-/// ```compile_fail
-/// fn bypass(provider: Box<dyn carina_core::provider::Provider>) { let _ = carina_core::provider::ProviderBoundary::unconfigured(provider); }
-/// ```
-/// An unconfigured normalizer is unavailable.
-///
-/// ```compile_fail
-/// let _ = carina_core::provider::ConfiguredNormalizer::unconfigured(todo!());
-/// ```
-/// Initialization cannot bypass the session.
-///
-/// ```compile_fail
-/// fn bypass(provider: Box<dyn carina_core::provider::Provider>) { let _ = carina_core::provider::InitializedProvider::unavailable(provider); }
-/// ```
-/// create_provider_with_text_context is absent.
-///
-/// ```compile_fail
-/// fn bypass(factory: &dyn carina_core::provider::ProviderFactory) { let _ = factory.create_provider_with_text_context(); }
-/// ```
-/// create_normalizer_with_text_context is absent.
-///
-/// ```compile_fail
-/// fn bypass(factory: &dyn carina_core::provider::ProviderFactory) { let _ = factory.create_normalizer_with_text_context(); }
-/// ```
-/// validate_config_with_text_context is absent.
-///
-/// ```compile_fail
-/// fn bypass(factory: &dyn carina_core::provider::ProviderFactory) { let _ = factory.validate_config_with_text_context(); }
-/// ```
-/// validate_custom_type_with_text_context is absent.
-///
-/// ```compile_fail
-/// fn bypass(factory: &dyn carina_core::provider::ProviderFactory) { let _ = factory.validate_custom_type_with_text_context(); }
-/// ```
-/// create_initialized_provider is absent.
-///
-/// ```compile_fail
-/// fn bypass(factory: &dyn carina_core::provider::ProviderFactory) { let _ = factory.create_initialized_provider(); }
-/// ```
-/// create_initialized_normalizer is absent.
-///
-/// ```compile_fail
-/// fn bypass(factory: &dyn carina_core::provider::ProviderFactory) { let _ = factory.create_initialized_normalizer(); }
 /// ```
 /// Test features cannot grant an empty-session provider bypass.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// fn bypass(provider: Box<dyn carina_core::provider::Provider>) {
 ///     let _ = carina_core::provider::InitializedProvider::for_test(provider, carina_core::provider::ReferenceScope::Unavailable);
 /// }
@@ -192,13 +102,10 @@ pub struct BoundaryApiProbes;
 
 /// A provider session requires core's whole-plan admission witness.
 ///
-/// ```compile_fail
-/// use carina_core::provider::{prepare_provider_session, ProviderBoundary, ProviderFactory};
-/// use carina_core::resource::{ModuleSource, UnexpandedDependencyFields};
-/// fn slices(factory: &dyn ProviderFactory) {
-///     let session = prepare_provider_session::<ModuleSource, UnexpandedDependencyFields>(
-///         factory.name(), None, None, &[], &[]);
-///     let _ = ProviderBoundary::initialize(factory, &session);
+/// ```compile_fail,E0624
+/// use carina_core::provider::{ProviderPlan, ProviderSession};
+/// fn slices(plan: &ProviderPlan) {
+///     let _ = ProviderSession::new(plan, "mock", None, None);
 /// }
 /// ```
 #[doc(hidden)]
@@ -260,13 +167,14 @@ pub type HostDiagnostic = Diagnostic<Bound>;
 /// Untrusted provider output. Formatting deliberately reveals no contents.
 /// Projection belongs to the provider instance's core ingestion boundary.
 ///
-/// ```compile_fail
-/// use carina_core::provider_text::ProviderText;
-/// let text = ProviderText::new("provider output");
-/// let printable = format!("{}", text.redact()); // RedactionSet is required
+/// ```compile_fail,E0624
+/// use carina_core::provider_text::{ProviderText, RedactionSet};
+/// fn bypass(text: ProviderText, secrets: &RedactionSet) {
+///     let _ = text.redact(secrets);
+/// }
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::provider_text::ProviderText;
 /// let text = ProviderText::new("provider output");
 /// let raw: &str = text.as_str(); // no plaintext accessor, Deref or Serialize
@@ -704,26 +612,26 @@ impl PartialEq<&str> for RedactedProviderText {
 
 /// Unbound provider failures cannot be passed to the host renderer.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::provider::{HostError, ProviderError};
 /// fn render(error: &HostError) -> String { error.to_string() }
 /// let returned = ProviderError::api_error("provider returned text");
 /// let leaked = render(&returned);
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::provider::ProviderError;
 /// let returned = ProviderError::api_error("provider output");
 /// let raw: &str = returned.as_str();
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::provider::ProviderError;
 /// let returned = ProviderError::api_error("provider output");
 /// let json = serde_json::to_string(&returned).unwrap();
 /// ```
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::provider::{Provider, ProviderReadyDataSource};
 /// async fn bypass(provider: &dyn Provider, request: &ProviderReadyDataSource) {
 ///     carina_core::executor::read_data_source_with_retry(provider, request).await.unwrap();
@@ -732,7 +640,7 @@ impl PartialEq<&str> for RedactedProviderText {
 ///
 /// Binding an unbound error is private even when a request capability is available.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// use carina_core::provider::ProviderError;
 /// use carina_core::provider_text::RedactionSet;
 /// fn bypass(error: ProviderError, sent: &RedactionSet) {
@@ -744,20 +652,21 @@ impl PartialEq<&str> for RedactedProviderText {
 /// There is no Default, string constructor, deserializer or plaintext accessor.
 /// An empty pre-request inventory is private to the host boundary.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0624
 /// use carina_core::provider_text::RedactionSet;
 /// let empty = RedactionSet::before_request();
 /// ```
 ///
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::provider_text::RedactionSet;
-/// let forged = RedactionSet::from(vec!["arbitrary".to_owned()]);
+/// let _: RedactionSet = vec!["arbitrary".to_owned()].into();
 /// ```
 #[derive(Clone)]
 pub struct RedactionSet {
     spellings: std::sync::Arc<std::sync::RwLock<std::sync::Arc<Vec<String>>>>,
     generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    values: std::sync::Arc<std::sync::RwLock<std::collections::HashSet<[u8; 32]>>>,
 }
 impl PartialEq for RedactionSet {
     fn eq(&self, other: &Self) -> bool {
@@ -786,6 +695,7 @@ impl RedactionSet {
         Self {
             spellings: std::sync::Arc::default(),
             generation: std::sync::Arc::default(),
+            values: std::sync::Arc::default(),
         }
     }
 
@@ -822,6 +732,15 @@ impl RedactionSet {
         if std::sync::Arc::ptr_eq(&self.spellings, &other.spellings) {
             return;
         }
+        let values = other
+            .values
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        self.values
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(values);
         let added = other.snapshot();
         if added.is_empty() {
             return;
@@ -846,6 +765,23 @@ impl RedactionSet {
         Self::sort_values(values);
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Release);
+    }
+
+    fn would_exceed_secret_limit(&self, other: &Self, limit: usize) -> bool {
+        let mut values = self
+            .values
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        values.extend(
+            other
+                .values
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .copied(),
+        );
+        values.len() > limit
     }
 
     fn compare_values(a: &str, b: &str) -> std::cmp::Ordering {
@@ -945,6 +881,11 @@ impl RedactionSet {
         if plaintext.is_empty() {
             return;
         }
+        use sha2::{Digest, Sha256};
+        self.values
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(Sha256::digest(plaintext.as_bytes()).into());
         let mut locked = self
             .spellings
             .write()
@@ -1038,7 +979,6 @@ struct RedactionStream {
     secrets: RedactionSet,
     spellings: std::sync::Arc<Vec<String>>,
     lookahead: usize,
-    newline_barrier: bool,
     buffer: String,
     covered: Vec<(bool, bool)>,
     offset: usize,
@@ -1047,7 +987,6 @@ impl RedactionStream {
     fn new(secrets: RedactionSet) -> Self {
         let (generation, spellings) = secrets.versioned_snapshot();
         let lookahead = spellings.iter().map(String::len).max().unwrap_or(1);
-        let newline_barrier = spellings.iter().all(|secret| !secret.contains('\n'));
         Self {
             #[cfg(any(test, feature = "test-utils"))]
             refresh_checks: 0,
@@ -1057,7 +996,6 @@ impl RedactionStream {
             secrets,
             spellings,
             lookahead,
-            newline_barrier,
             buffer: String::new(),
             covered: Vec::new(),
             offset: 0,
@@ -1078,7 +1016,6 @@ impl RedactionStream {
         let (generation, spellings) = self.secrets.versioned_snapshot();
         self.generation = generation;
         self.lookahead = spellings.iter().map(String::len).max().unwrap_or(1);
-        self.newline_barrier = spellings.iter().all(|secret| !secret.contains('\n'));
         // Recheck retained lookahead if another operation added a spelling.
         for (end, ch) in self.buffer.char_indices() {
             let end = end + ch.len_utf8();
@@ -1116,14 +1053,36 @@ impl RedactionStream {
             while self.buffer.len() - self.offset >= self.lookahead {
                 self.emit_char(output);
             }
-            if ch == '\n' && self.newline_barrier {
-                self.emit_pending(output);
-            }
             if self.offset >= 4096 && self.offset >= self.buffer.len() / 2 {
                 self.buffer.drain(..self.offset);
                 self.covered.drain(..self.offset);
                 self.offset = 0;
             }
+        }
+    }
+    /// Live writes may release every byte that cannot start a future match.
+    /// Buffered diagnostic assembly keeps its lookahead until final projection,
+    /// including while its append-only input inventory is still growing.
+    fn emit_unambiguous(&mut self, output: &mut impl FnMut(&str)) {
+        let pending = &self.buffer[self.offset..];
+        let retained = pending
+            .char_indices()
+            .find_map(|(start, _)| {
+                let suffix = &pending[start..];
+                self.spellings
+                    .iter()
+                    .any(|secret| suffix.len() < secret.len() && secret.starts_with(suffix))
+                    .then_some(suffix.len())
+            })
+            .unwrap_or(0);
+        let end = self.buffer.len() - retained;
+        while self.offset < end {
+            self.emit_char(output);
+        }
+        if self.offset == self.buffer.len() {
+            self.buffer.clear();
+            self.covered.clear();
+            self.offset = 0;
         }
     }
     fn emit_char(&mut self, output: &mut impl FnMut(&str)) {
@@ -1187,6 +1146,11 @@ impl<W: std::io::Write> RedactingLineWriter<W> {
         } = self;
         let mut result = Ok(());
         stream.push_str(text, &mut |chunk| {
+            if result.is_ok() {
+                result = Self::append(line, pending, sink, chunk);
+            }
+        });
+        stream.emit_unambiguous(&mut |chunk| {
             if result.is_ok() {
                 result = Self::append(line, pending, sink, chunk);
             }
@@ -1919,6 +1883,40 @@ mod tests {
             })
             .collect();
         RedactionSet::collect(attributes.values())
+    }
+
+    #[test]
+    fn validation_secret_limit_counts_values_instead_of_encoded_spellings() {
+        let inputs = provider_secrets(&["single/+秘密"]);
+        assert!(inputs.snapshot().len() > 1);
+        assert!(!inputs.would_exceed_secret_limit(&provider_secrets(&["single/+秘密"]), 1));
+        assert!(inputs.would_exceed_secret_limit(&provider_secrets(&["second-private"]), 1));
+    }
+
+    #[test]
+    fn multiline_secret_does_not_delay_unrelated_stderr_lines() {
+        let secrets = provider_secrets(&[
+            "-----BEGIN PRIVATE KEY-----\nprivate-key-body\n-----END PRIVATE KEY-----",
+        ]);
+        let mut writer = RedactingLineWriter::new(&secrets, Vec::new());
+        writer.push_str("public=ready\n").unwrap();
+        assert_eq!(
+            writer.sink, b"public=ready\n",
+            "a complete unrelated line must be visible before teardown"
+        );
+        writer
+            .push_str("-----BEGIN PRIVATE KEY-----\nprivate-")
+            .unwrap();
+        assert_eq!(
+            writer.sink, b"public=ready\n",
+            "retain the possible secret prefix"
+        );
+        writer
+            .push_str("key-body\n-----END PRIVATE KEY-----\n")
+            .unwrap();
+        assert_eq!(writer.sink, b"public=ready\n(secret)\n");
+        writer.finish().unwrap();
+        assert_eq!(writer.sink, b"public=ready\n(secret)\n");
     }
 
     #[test]

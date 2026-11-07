@@ -116,8 +116,11 @@ async fn execute(
     current: HashMap<ResourceId, Current>,
 ) -> ExecutionResult {
     let schemas = fixture::schemas();
+    let checked = carina_core::input_rules::finalize_plan_for_test(plan.clone())
+        .check_inputs(&schemas, &Default::default())
+        .unwrap();
     let input = LiveExecutionInput {
-        plan,
+        plan: &checked,
         provider_check_inputs: ProviderCheckInputs::Authored,
         compositions: &[],
         bindings: ResolvedBindings::default(),
