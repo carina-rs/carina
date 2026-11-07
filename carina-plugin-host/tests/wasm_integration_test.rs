@@ -6184,6 +6184,47 @@ async fn test_wasm_create_normalizer_propagates_instance_initialization_failure(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sdk_configuration_failures_preserve_typed_causes_with_redaction() {
+    const SECRET: &str = "sdk-config-cause-4314";
+    let path = skip_if_no_wasm!();
+    let (factory, _cache) = load_factory(&path).await;
+    for (attribute, context) in [
+        (
+            "__mock_validate_config_cause__",
+            "configuration containing a secret failed validation",
+        ),
+        (
+            "__mock_initialize_cause__",
+            "mock initialization request failed",
+        ),
+    ] {
+        let attributes = indexmap::IndexMap::from([(
+            attribute.to_owned(),
+            Value::Deferred(carina_core::resource::DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(SECRET.into()))).into(),
+            )),
+        )]);
+        let config = resolved_provider_config(factory.name(), attributes);
+        let prepared = carina_core::executor::prepare_provider_ready_config(&factory, &config);
+        let error = if attribute == "__mock_validate_config_cause__" {
+            prepared.unwrap_err().provider_error().unwrap().clone()
+        } else {
+            match factory.initialize_fixture(None, &prepared.unwrap()).await {
+                Err(error) => error,
+                Ok(_) => panic!("the SDK initialization cause must propagate"),
+            }
+        };
+        assert_eq!(error.kind(), ProviderErrorKind::ApiError);
+        assert!(error.detail().cause().is_some());
+        assert_eq!(error.to_wire().status, Some(403));
+        let rendered = error.to_string();
+        assert!(rendered.contains(context), "{rendered}");
+        assert!(rendered.contains("(secret)"), "{rendered}");
+        assert!(!rendered.contains(SECRET), "{rendered}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;

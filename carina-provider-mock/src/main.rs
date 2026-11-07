@@ -205,6 +205,20 @@ impl MockProcessProvider {
         }
     }
 
+    fn configuration_error(message: impl Into<String>) -> ProviderError {
+        ProviderError {
+            kind: ProviderErrorKind::InvalidInput,
+            message: message.into(),
+            resource_id: None,
+            cause: None,
+            provider_name: None,
+            operation: None,
+            status: None,
+            code: None,
+            request_id: None,
+        }
+    }
+
     fn pending_polls(attributes: &BTreeMap<String, Value>, operation_key: &str) -> u32 {
         attributes
             .get(operation_key)
@@ -895,7 +909,14 @@ impl CarinaProvider for MockProcessProvider {
         .expect("mock provider config schema must be valid")
     }
 
-    fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), String> {
+    fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), ProviderError> {
+        if let Some(Value::String(cause)) = attrs.get("__mock_validate_config_cause__") {
+            let mut error = Self::configuration_error("mock configuration request failed");
+            error.kind = ProviderErrorKind::ApiError;
+            error.cause = Some(cause.clone());
+            error.status = Some(403);
+            return Err(error);
+        }
         if attrs.contains_key("__mock_validate_config_trap__") {
             panic!("intentional mock validate_config trap");
         }
@@ -907,18 +928,30 @@ impl CarinaProvider for MockProcessProvider {
         Ok(())
     }
 
-    fn initialize(&mut self, attrs: &BTreeMap<String, Value>) -> Result<ReferenceScope, String> {
+    fn initialize(
+        &mut self,
+        attrs: &BTreeMap<String, Value>,
+    ) -> Result<ReferenceScope, ProviderError> {
+        if let Some(Value::String(cause)) = attrs.get("__mock_initialize_cause__") {
+            let mut error = Self::configuration_error("mock initialization request failed");
+            error.kind = ProviderErrorKind::ApiError;
+            error.cause = Some(cause.clone());
+            error.status = Some(403);
+            return Err(error);
+        }
         if let Some(Value::String(table)) = attrs.get("reference_table") {
-            self.reference_table =
-                serde_json::from_str(table).map_err(|error| error.to_string())?;
+            self.reference_table = serde_json::from_str(table)
+                .map_err(|error| Self::configuration_error(error.to_string()))?;
         }
         if attrs.contains_key("__mock_initialize_error__") {
-            return Err("intentional mock initialization failure".to_string());
+            return Err(Self::configuration_error(
+                "intentional mock initialization failure",
+            ));
         }
         match attrs.get("__mock_reference_scope_region__") {
             Some(Value::String(region)) => {
                 ReferenceScope::available("mock", region.clone(), "test-account")
-                    .map_err(|error| error.to_string())
+                    .map_err(|error| Self::configuration_error(error.to_string()))
             }
             Some(_) | None => Ok(ReferenceScope::Unavailable),
         }

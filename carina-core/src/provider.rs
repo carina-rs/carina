@@ -5288,10 +5288,10 @@ impl<S: TextState> CreateOutcome<S> {
     #[cfg(test)]
     pub(crate) fn partial_success(
         state: AppliedState,
-        reason: String,
+        reason: S::PartialReadReason,
         missing_attributes: Vec<String>,
     ) -> Self {
-        match PartialReadDiagnostic::from_reason(ErrorText::new(reason), missing_attributes) {
+        match PartialReadDiagnostic::new(reason, missing_attributes) {
             Some(diagnostic) => {
                 Self::provider_reported(CreateOutcomeKind::PartialSuccess { state, diagnostic })
             }
@@ -5357,12 +5357,24 @@ impl<S: TextState> UpdateOutcome<S> {
         Self::provider_reported(UpdateOutcomeKind::Success { state })
     }
 
+    /// Report an incomplete update read-back without stringifying its cause.
+    /// Provider reasons must remain opaque until they cross the boundary.
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::provider::{AppliedState, UpdateOutcome};
+    /// use carina_core::provider_text::Unbound;
+    /// fn raw_reason(state: AppliedState) {
+    ///     let _ = UpdateOutcome::<Unbound>::partial_success(
+    ///         state, String::from("provider reason"), vec!["name".into()],
+    ///     );
+    /// }
+    /// ```
     pub fn partial_success(
         state: AppliedState,
-        reason: String,
+        reason: S::PartialReadReason,
         missing_attributes: Vec<String>,
     ) -> Self {
-        match PartialReadDiagnostic::from_reason(ErrorText::new(reason), missing_attributes) {
+        match PartialReadDiagnostic::new(reason, missing_attributes) {
             Some(diagnostic) => {
                 Self::provider_reported(UpdateOutcomeKind::PartialSuccess { state, diagnostic })
             }
@@ -12608,7 +12620,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
 
         let created = CreateOutcome::partial_success(
             applied(),
-            "provider returned a partial read".to_string(),
+            "provider returned a partial read".into(),
             vec!["computed".to_string()],
         )
         .with_secrets(&RedactionSet::for_test(&[]));
@@ -12616,7 +12628,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
 
         let updated = UpdateOutcome::partial_success(
             applied(),
-            "provider returned a partial read".to_string(),
+            "provider returned a partial read".into(),
             vec!["computed".to_string()],
         )
         .with_secrets(&RedactionSet::for_test(&[]));

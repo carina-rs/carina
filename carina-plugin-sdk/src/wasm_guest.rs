@@ -2106,7 +2106,7 @@ macro_rules! export_provider {
                     })?;
                     let provider = get_provider().lock().unwrap();
                     $crate::CarinaProvider::validate_config(&*provider, &map)
-                        .map_err(validate_string_to_provider_error)
+                        .map_err(proto_to_wit_provider_error)
                 }
 
                 fn initialize(
@@ -2120,7 +2120,7 @@ macro_rules! export_provider {
                         .map(|reference_scope| wit_types::InitializeResult {
                             reference_scope: proto_to_wit_reference_scope(reference_scope),
                         })
-                        .map_err(validate_string_to_provider_error)
+                        .map_err(proto_to_wit_provider_error)
                 }
 
                 fn read(
