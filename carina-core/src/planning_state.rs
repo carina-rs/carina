@@ -62,6 +62,18 @@ impl FromIterator<PlanningStateRow> for PlanningStateRows {
     }
 }
 
+impl PlanningStateRows {
+    /// Join refresh observations by exact persisted address, including instance.
+    /// The matching observation supplies the current identifier; an unmatched row
+    /// retains its persisted identifier. Observations never replace row addresses.
+    pub fn with_current_observations(self, current: &HashMap<ResourceId, Current>) -> Self {
+        self.0
+            .into_iter()
+            .map(|row| row.with_current_observation(current))
+            .collect()
+    }
+}
+
 impl PlanningStateRow {
     /// Project typed persisted fields. Source authenticity is the state owner's responsibility.
     pub fn from_persisted(
@@ -85,15 +97,12 @@ impl PlanningStateRow {
         }
     }
 
-    /// Include an authenticated read observation in the source row before planning.
-    /// The state owner supplies its routing and identifier; the persisted identifier
-    /// remains available for historical-generation diagnostics.
-    pub fn with_current_observation(
-        mut self,
-        id: ResolvedResourceId,
-        identifier: Option<AppliedIdentifier>,
-    ) -> Self {
-        self.id = id;
+    fn with_current_observation(mut self, current: &HashMap<ResourceId, Current>) -> Self {
+        let identifier = match current.get(self.id.as_inner()) {
+            Some(Current::Present(present)) => Some(present.identifier().clone()),
+            Some(Current::Absent(_)) => None,
+            _ => return self,
+        };
         self.current_kind = if identifier.is_some() {
             PlanningCurrentKind::Applied
         } else {
@@ -159,6 +168,9 @@ impl DestroyPlan {
     /// Select state-row addresses for deletion. Resource fields other than the
     /// address are ignored: targets come from rows and ordering from rows and
     /// the retained configuration graph. The CLI authenticates these sources.
+    /// Refreshed identifiers win only after an exact state-row observation join.
+    /// A requested address whose refreshed identifier differs from the joined row
+    /// is rejected as an identifier mismatch, including observations from another instance.
     pub fn from_state<E, D>(
         resources: &[&Resource],
         current: &HashMap<ResourceId, Current>,

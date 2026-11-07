@@ -58,7 +58,7 @@ impl InputCompositions<'_> {
 ///
 /// This context does not provide an arbitrary-value estimator:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::{input_rules::InputTypeContext, resource::Value, schema::AttributeType};
 /// let types = InputTypeContext::<carina_core::resource::ModuleSource>::empty();
 /// let _ = types.estimate(Value::Concrete(carina_core::resource::ConcreteValue::String("x".into())), AttributeType::string());

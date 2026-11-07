@@ -5,7 +5,7 @@
 //!
 //! A hand-built delete, including a deposed generation, cannot enter destroy:
 //!
-//! ```compile_fail
+//! ```compile_fail,E0308
 //! use carina_core::{effect::{Effect, EffectGeneration}, executor::{DeleteScheduler, DeleteRelease},
 //!     plan::Plan, provider::{AppliedIdentifier, Provider},
 //!     resource::{ResourceId, ResolvedResourceId, DeposedKey}, schema::SchemaRegistry};
@@ -19,8 +19,8 @@
 //!         explicit_dependencies: Default::default(), blocked_by_updates: Default::default(),
 //!     });
 //!     let plan = plan.admit(schemas).unwrap();
-//!     let mut scheduler = DeleteScheduler::for_destroy(&plan, &[], &Default::default()).unwrap();
-//!     if let Some(DeleteRelease::Ready(delete)) = scheduler.release(0) {
+//!     let mut scheduler = DeleteScheduler::for_destroy(&plan).unwrap();
+//!     if let Some(DeleteRelease::Ready(delete)) = scheduler.release(0).unwrap() {
 //!         delete.dispatch(provider, schemas).await;
 //!     }
 //! }
@@ -30,7 +30,7 @@
 //! This pins the absence of a public constructor taking an independent resource;
 //! it does not establish the authenticity of the configuration value:
 //!
-//! ```compile_fail
+//! ```compile_fail,E0624
 //! use carina_core::{effect::Effect, executor::{prepare_initial_create, ProviderPreparationContext},
 //!     plan::Plan, parser::ExpandedInferredFile, resource::Resource,
 //!     resolved_graph::resolve_expanded_graph, input_rules::InputTypeContext, schema::SchemaRegistry};
@@ -49,7 +49,7 @@
 //! The public backend constructor derives its target from the supplied configuration.
 //! These doctests pin private raw-resource entry points, not source authenticity:
 //!
-//! ```compile_fail
+//! ```compile_fail,E0624
 //! use carina_core::{executor::{prepare_initial_delete, dispatch_delete}, parser::ExpandedInferredFile,
 //!     provider::{AppliedIdentifier, Provider}, resource::Resource,
 //!     resolved_graph::resolve_expanded_graph, schema::SchemaRegistry};
@@ -65,7 +65,7 @@
 //!
 //! Ordinary replacement admission cannot authorize an executor run:
 //!
-//! ```compile_fail
+//! ```compile_fail,E0599
 //! use carina_core::{plan::Plan, schema::SchemaRegistry};
 //! let schemas = SchemaRegistry::new();
 //! let checked = Plan::new().admit(&schemas).unwrap()
@@ -74,7 +74,7 @@
 //!
 //! Saved execution cannot be minted by relabeling a raw plan:
 //!
-//! ```compile_fail
+//! ```compile_fail,E0624
 //! use carina_core::{plan::Plan, input_rules::FinalizedPlan, resource::SavedModuleSource};
 //! let plan: Plan<SavedModuleSource> = Plan::new().into();
 //! let finalized = FinalizedPlan::from_saved_plan(plan);
@@ -82,18 +82,11 @@
 //!
 //! Ancillary finalization cannot replace the differ's plan with arbitrary writes:
 //!
-//! ```compile_fail
+//! ```compile_fail,E0308
 //! use carina_core::{differ::PendingCascadePlan, plan::Plan};
 //! fn replace(builder: PendingCascadePlan, forged: Plan) {
 //!     let _ = builder.finish(std::iter::empty(), |plan| *plan = forged);
 //! }
-//! ```
-//!
-//! The current scheduler signature also rejects ordinary replacement admission:
-//!
-//! ```compile_fail,E0308
-//! use carina_core::{executor::DeleteScheduler, plan::AdmittedPlan};
-//! fn forged(plan: &AdmittedPlan) { let _ = DeleteScheduler::for_destroy(plan); }
 //! ```
 //!
 //! Finalization cannot append a caller's effect through mutable plan access:

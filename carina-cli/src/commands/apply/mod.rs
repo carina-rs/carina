@@ -65,7 +65,6 @@ use crate::commands::shared::lock_heartbeat::{
     HeartbeatOutcome, LockingDisabled, StateLock, StateLockRef, with_lock_heartbeat,
 };
 use crate::commands::shared::observer::{CliObserver, partial_read_detail_lines};
-use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
 use crate::commands::shared::progress::{
     ProgressBackend, ProgressSink, RefreshPhase, emit_newline_on_interrupt, format_duration,
 };
@@ -260,14 +259,11 @@ async fn prepare_bootstrap_creation(
     let checked = match bootstrap_plan.check_inputs_with_types(context.schemas, &input_types) {
         Ok(checked) => checked,
         Err(plan) => {
-            return Err(
-                crate::commands::shared::plan_errors::render_plan_errors_and_abort(
-                    color_mode,
-                    &plan,
-                    Path::new("."),
-                )
-                .expect_err("bootstrap input rejection has diagnostics"),
-            );
+            return Err(crate::commands::shared::plan_errors::render_plan_errors(
+                color_mode,
+                plan.errors(),
+                Path::new("."),
+            ));
         }
     };
     let bindings = bootstrap_resolved_bindings(context.parsed);
@@ -4163,8 +4159,9 @@ async fn run_apply_from_plan_locked_owned(
             let checked_plan_file = rehydrated_plan_file
                 .check_inputs(wiring.schemas(), &managed_current, &input_types)
                 .map_err(|failure| {
-                    render_plan_errors_and_abort(color_mode, &failure, project_dir)
-                        .expect_err("input rejection contains diagnostics")
+                    crate::commands::shared::plan_errors::render_plan_errors(
+                        color_mode, failure.errors(), project_dir,
+                    )
                 })?;
             let plan = checked_plan_file.plan();
 

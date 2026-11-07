@@ -110,6 +110,49 @@ fn destroy_refresh_projection_uses_the_stored_route_observation() {
 }
 
 #[test]
+fn destroy_refresh_projection_rejects_an_observation_from_another_instance() {
+    use carina_core::planning_state::{DestroyPlan, DestroyPlanError};
+
+    let mut row =
+        ResourceState::try_applied("test.Bucket", "stored", "mock", "persisted-east").unwrap();
+    row.directives.provider_instance = Some("east".into());
+    let mut state = StateFile::new();
+    state.upsert_resource(row).unwrap();
+    let before = serde_json::to_value(&state).unwrap();
+    let current = HashMap::from(["west", "north"].map(|instance| {
+        let id = ResourceId::with_provider_identity(
+            "mock",
+            "test.Bucket",
+            "stored",
+            Some(instance.into()),
+        );
+        let observation = SnapshotState::existing(id.clone(), HashMap::new())
+            .with_identifier(format!("canonical-{instance}"));
+        (id, Current::from_snapshot(observation))
+    }));
+    // The old fallback always selects this entry, whatever the map's iteration order.
+    let resource = Resource::from_id(current.keys().next().unwrap().clone());
+    let mut configuration = carina_core::parser::ExpandedInferredFile::default();
+    configuration.resources.push(resource.clone());
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
+    let rows = state.planning_rows_after_refresh(&current);
+    let result = DestroyPlan::from_state(
+        &[&resource],
+        &current,
+        &rows,
+        &graph,
+        &HashSet::new(),
+        &SchemaRegistry::new(),
+    );
+    assert!(
+        matches!(result, Err(DestroyPlanError::IdentifierMismatch { id })
+        if id.provider_instance.as_deref() == Some("east")),
+        "another instance's observation must not replace the persisted target"
+    );
+    assert_eq!(serde_json::to_value(&state).unwrap(), before);
+}
+
+#[test]
 fn destroy_refresh_projection_preserves_persisted_deposed_error_context() {
     let mut row =
         ResourceState::try_applied("test.Bucket", "stored", "mock", "persisted-id").unwrap();

@@ -175,7 +175,7 @@ impl ReadyDelete {
 
 /// Dependency-ready authority to send one exact, input-discharged update.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{replacement::UpdatePermit, provider::UpdateRequest};
 /// fn bypass(request: UpdateRequest) -> UpdatePermit { request.into() }
 /// ```
@@ -454,7 +454,7 @@ pub(super) fn release_ready_effect_mapped<S: Clone>(
 /// an endpoint with pending prerequisites yields no permission.
 /// A schedule without input admission cannot authorize bootstrap dispatch:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::{
 ///     executor::{prepare_initial_create, ProviderPreparationContext},
 ///     replacement::ScheduledPlan,
@@ -469,7 +469,7 @@ pub(super) fn release_ready_effect_mapped<S: Clone>(
 ///
 /// Input admission cannot be paired with a caller-chosen readiness graph:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0061
 /// use carina_core::{
 ///     executor::{prepare_initial_create, ProviderPreparationContext},
 ///     replacement::InputCheckedScheduledPlan, resolved_graph::ExpandedBindingIndex,

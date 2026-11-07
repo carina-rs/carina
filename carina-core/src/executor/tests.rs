@@ -617,28 +617,28 @@ async fn scheduler_delete_retry_keeps_ancestors_blocked() {
         provider.push_delete(Ok(()));
     }
 
-    let Some(DeleteRelease::Ready(delete)) = scheduler.release(0) else {
+    let Some(DeleteRelease::Ready(delete)) = scheduler.release(0).unwrap() else {
         panic!("leaf ready")
     };
     let (result, completion) = delete.dispatch(&provider, &schemas).await;
     assert!(result.is_err());
-    assert!(scheduler.release(1).is_none());
+    assert!(scheduler.release(1).unwrap().is_none());
     assert!(
-        scheduler.release(0).is_none(),
+        scheduler.release(0).unwrap().is_none(),
         "failed attempt awaits retry decision"
     );
-    scheduler.retry(completion);
+    scheduler.retry(completion).unwrap();
     assert!(
-        scheduler.release(1).is_none(),
+        scheduler.release(1).unwrap().is_none(),
         "retry does not complete the leaf"
     );
     for index in 0..3 {
-        let Some(DeleteRelease::Ready(delete)) = scheduler.release(index) else {
+        let Some(DeleteRelease::Ready(delete)) = scheduler.release(index).unwrap() else {
             panic!("next delete ready")
         };
         let (result, completion) = delete.dispatch(&provider, &schemas).await;
         result.unwrap();
-        scheduler.complete(completion);
+        scheduler.complete(completion).unwrap();
     }
     assert_eq!(
         provider.calls(),
@@ -654,21 +654,21 @@ async fn scheduler_delete_failure_skips_ancestors_without_dispatch() {
     let mut scheduler = DeleteScheduler::for_test(&plan, &[], &Default::default()).unwrap();
     let provider = MockProvider::new();
     provider.push_delete(Err(ProviderError::api_error("delete failed")));
-    let Some(DeleteRelease::Ready(delete)) = scheduler.release(0) else {
+    let Some(DeleteRelease::Ready(delete)) = scheduler.release(0).unwrap() else {
         panic!("leaf ready")
     };
     let (result, completion) = delete.dispatch(&provider, &schemas).await;
     assert!(result.is_err());
-    scheduler.complete(completion);
+    scheduler.complete(completion).unwrap();
     for index in 1..3 {
         assert!(
             matches!(
-                scheduler.release(index),
+                scheduler.release(index).unwrap(),
                 Some(DeleteRelease::Blocked { dependency: 0 })
             ),
             "retain the original failed descendant in skip diagnostics"
         );
-        assert!(scheduler.release(index).is_none());
+        assert!(scheduler.release(index).unwrap().is_none());
     }
     assert_eq!(
         provider.calls(),
@@ -695,6 +695,57 @@ fn delete_attempt_retains_exact_target_identifier_and_directives() {
     assert_eq!(attempt.id(), &id);
     assert_eq!(attempt.identifier(), &identifier);
     assert!(attempt.request().directives().force_delete());
+}
+
+#[tokio::test]
+async fn scheduler_delete_rejects_foreign_completion_without_changing_readiness() {
+    let schemas = crate::schema::SchemaRegistry::new();
+    let plan = delete_schedule_chain();
+    let mut first = DeleteScheduler::for_test(&plan, &[], &Default::default()).unwrap();
+    let mut second = DeleteScheduler::for_test(&plan, &[], &Default::default()).unwrap();
+    let provider = MockProvider::new();
+    provider.push_delete(Err(ProviderError::api_error("first delete failed")));
+    provider.push_delete(Ok(()));
+    let Some(DeleteRelease::Ready(first_delete)) = first.release(0).unwrap() else {
+        panic!("first leaf ready");
+    };
+    let Some(DeleteRelease::Ready(second_delete)) = second.release(0).unwrap() else {
+        panic!("second leaf ready");
+    };
+    let (_, foreign) = first_delete.dispatch(&provider, &schemas).await;
+    let (result, own) = second_delete.dispatch(&provider, &schemas).await;
+    result.unwrap();
+    assert!(matches!(
+        second.complete(foreign),
+        Err(DeleteScheduleError::ForeignCompletion)
+    ));
+    assert!(second.release(0).unwrap().is_none());
+    assert!(second.release(1).unwrap().is_none());
+    second.complete(own).unwrap();
+    assert!(matches!(
+        second.release(1).unwrap(),
+        Some(DeleteRelease::Ready(_))
+    ));
+}
+
+#[tokio::test]
+async fn scheduler_delete_rejects_retry_of_successful_attempt() {
+    let schemas = crate::schema::SchemaRegistry::new();
+    let plan = delete_schedule_chain();
+    let mut scheduler = DeleteScheduler::for_test(&plan, &[], &Default::default()).unwrap();
+    let provider = MockProvider::new();
+    provider.push_delete(Ok(()));
+    let Some(DeleteRelease::Ready(delete)) = scheduler.release(0).unwrap() else {
+        panic!("leaf ready");
+    };
+    let (result, completion) = delete.dispatch(&provider, &schemas).await;
+    result.unwrap();
+    assert!(matches!(
+        scheduler.retry(completion),
+        Err(DeleteScheduleError::RetrySucceeded { index: 0 })
+    ));
+    assert!(scheduler.release(0).unwrap().is_none());
+    assert!(scheduler.release(1).unwrap().is_none());
 }
 
 #[test]

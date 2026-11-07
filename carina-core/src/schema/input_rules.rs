@@ -269,13 +269,13 @@ impl InputRuleTarget {
 /// Schema declarations cannot evaluate arbitrary desired or observed strings.
 /// Evaluation requires an applicable rule obtained from a classified write site.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::schema::{Compiled, InputRule};
 /// fn bypass(rule: &InputRule<Compiled>, observed: &str) {
 ///     let _ = rule.evaluate(observed);
 /// }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0004
 /// use carina_core::schema::InputRuleScope;
 /// fn ignores_scope(scope: InputRuleScope) -> bool {
 ///     match scope { InputRuleScope::CreateOnly => true }

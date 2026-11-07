@@ -195,16 +195,14 @@ pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 ///
 /// Preparing and checking a raw request cannot manufacture scheduler readiness:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{
 ///     executor::{prepare_create_request, ProviderPreparationContext},
-///     replacement::CreatePermit, resource::Resource, schema::SchemaRegistry,
+///     replacement::CreatePermit, resource::Resource,
 /// };
 /// async fn bypass(raw: Resource, context: &ProviderPreparationContext<'_>) -> CreatePermit {
 ///     let request = prepare_create_request(raw, context).await.unwrap();
-///     carina_core::differ::finalize_bootstrap_create(request)
-///         .check_inputs(&SchemaRegistry::new(), &std::collections::HashMap::new())
-///         .unwrap()
+///     request.into()
 /// }
 /// ```
 pub fn dispatch_create<'a, P: Provider + ?Sized>(
@@ -230,17 +228,16 @@ pub fn dispatch_create<'a, P: Provider + ?Sized>(
 /// }
 /// ```
 ///
-/// A raw update request cannot obtain a permit by checking a synthetic plan:
+/// Even an input-discharged update cannot construct scheduler readiness:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use carina_core::{
+///     executor::PreparedWrite,
 ///     provider::{AppliedIdentifier, UpdateRequest},
-///     replacement::UpdatePermit, schema::SchemaRegistry,
+///     replacement::UpdatePermit,
 /// };
-/// fn bypass(identifier: AppliedIdentifier, raw: UpdateRequest) -> UpdatePermit {
-///     carina_core::differ::finalize_update_request(identifier, raw)
-///         .check_inputs(&SchemaRegistry::new(), &std::collections::HashMap::new())
-///         .unwrap()
+/// fn bypass(identifier: AppliedIdentifier, write: PreparedWrite<UpdateRequest>) -> UpdatePermit {
+///     UpdatePermit { write, identifier }
 /// }
 /// ```
 pub async fn dispatch_update<P: Provider + ?Sized>(
@@ -560,7 +557,7 @@ pub enum Applied {
 
 /// Input data required to execute a plan.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::{executor::LiveExecutionInput, plan::Plan};
 /// fn bypass<'a>(input: &mut LiveExecutionInput<'a>, raw: &'a Plan) { input.plan = raw; }
 /// ```
@@ -619,7 +616,7 @@ pub struct LiveExecutionInput<'a> {
 /// Keeping the composition slice in a distinct input type prevents a
 /// deserialized plan from entering the live validation/expansion lifecycle.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::{executor::SavedExecutionInput, plan::Plan, resource::SavedModuleSource};
 /// fn bypass<'a>(input: &mut SavedExecutionInput<'a>, raw: &'a Plan<SavedModuleSource>) {
 ///     input.plan = raw;

@@ -1253,30 +1253,13 @@ impl StateFile {
     /// Copy typed stored rows into core's immutable planning source.
     /// All fields have already crossed state decoding; projection is infallible.
     pub fn planning_rows(&self) -> carina_core::planning_state::PlanningStateRows {
-        self.project_planning_rows(None)
-    }
-
-    /// Project authenticated provider observations without changing stored rows or serial.
-    /// Main permits reads to canonicalize identifiers; historical diagnostics still
-    /// describe the persisted row. The CLI authenticates these observations.
-    pub fn planning_rows_after_refresh(
-        &self,
-        current: &HashMap<ResourceId, Current>,
-    ) -> carina_core::planning_state::PlanningStateRows {
-        self.project_planning_rows(Some(current))
-    }
-
-    fn project_planning_rows(
-        &self,
-        current: Option<&HashMap<ResourceId, Current>>,
-    ) -> carina_core::planning_state::PlanningStateRows {
         use carina_core::planning_state::{
             PlanningCurrentKind, PlanningDeposedRow, PlanningStateRow,
         };
         self.resources
             .iter()
             .map(|row| {
-                let projection = PlanningStateRow::from_persisted(
+                PlanningStateRow::from_persisted(
                     ResolvedResourceId::with_provider_identity(
                         row.provider.clone(),
                         row.resource_type.clone(),
@@ -1312,45 +1295,21 @@ impl StateFile {
                             )
                         })
                         .collect(),
-                );
-                let observed = current.and_then(|current| {
-                    let stored_id = ResourceId::with_provider_identity(
-                        row.provider.clone(),
-                        row.resource_type.clone(),
-                        row.identity.clone(),
-                        row.directives.provider_instance.clone(),
-                    );
-                    current.get_key_value(&stored_id).or_else(|| {
-                        current.iter().find(|(id, _)| {
-                            id.provider == row.provider
-                                && id.resource_type == row.resource_type
-                                && id.identity_str() == Some(row.identity.as_str())
-                        })
-                    })
-                });
-                match observed {
-                    Some((id, Current::Present(present))) => projection.with_current_observation(
-                        ResolvedResourceId::with_provider_identity(
-                            row.provider.clone(),
-                            row.resource_type.clone(),
-                            row.identity.clone(),
-                            id.provider_instance.clone(),
-                        ),
-                        Some(present.identifier().clone()),
-                    ),
-                    Some((id, Current::Absent(_))) => projection.with_current_observation(
-                        ResolvedResourceId::with_provider_identity(
-                            row.provider.clone(),
-                            row.resource_type.clone(),
-                            row.identity.clone(),
-                            id.provider_instance.clone(),
-                        ),
-                        None,
-                    ),
-                    _ => projection,
-                }
+                )
             })
             .collect()
+    }
+
+    /// Project authenticated observations without changing stored rows or serial.
+    /// An exact row-key match, including provider instance, supplies the refreshed
+    /// identifier. Otherwise the persisted identifier and instance remain in force.
+    /// Historical-generation diagnostics always use the persisted identifier.
+    /// The CLI authenticates the observation map.
+    pub fn planning_rows_after_refresh(
+        &self,
+        current: &HashMap<ResourceId, Current>,
+    ) -> carina_core::planning_state::PlanningStateRows {
+        self.planning_rows().with_current_observations(current)
     }
 
     /// Borrow all managed resource rows.

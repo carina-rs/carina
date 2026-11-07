@@ -1065,6 +1065,9 @@ pub enum AppError {
     #[error(transparent)]
     DestroyPlan(#[from] carina_core::planning_state::DestroyPlanError),
 
+    #[error(transparent)]
+    DeleteSchedule(#[from] carina_core::executor::DeleteScheduleError),
+
     /// A post-expansion handle or dependency operand could not be mapped to
     /// one complete scheduler address.
     #[error(transparent)]

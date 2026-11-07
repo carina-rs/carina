@@ -63,7 +63,7 @@ use crate::commands::shared::incremental_state_saver::{FinalStateBase, Increment
 use crate::commands::shared::lock_heartbeat::{
     HeartbeatOutcome, StateLock, StateLockRef, with_lock_heartbeat,
 };
-use crate::commands::shared::plan_errors::render_plan_errors_and_abort;
+use crate::commands::shared::plan_errors::render_plan_errors;
 use crate::commands::shared::progress::{
     FailedOutcome, NonFailureOutcome, ProgressBackend, ProgressGuard, ProgressSink, RefreshPhase,
     format_duration,
@@ -876,9 +876,9 @@ async fn run_destroy_locked_owned(
             .filter_map(|resource| ResolvedResourceId::try_new(resource.id.clone()))
             .map(|id| state_row_key_from_id(&id)),
     );
-    // Main permits a provider read to canonicalize an identifier. Record those
-    // authenticated observations in a planning copy, leaving persisted state
-    // and its checkpoint/recovery behavior unchanged.
+    // A read keyed by the exact persisted row address may canonicalize its
+    // identifier. The planning copy preserves the persisted routing instance;
+    // observations under other keys cannot retarget the row.
     let rows = state_file.as_ref().map(|state| state.planning_rows_after_refresh(&managed_current)).unwrap_or_default();
     let execution_plan = match carina_core::planning_state::DestroyPlan::from_state(
         &resources_to_destroy, &managed_current, &rows, destroy_graph,
@@ -886,10 +886,7 @@ async fn run_destroy_locked_owned(
     ) {
         Ok(plan) => plan,
         Err(carina_core::planning_state::DestroyPlanError::State(errors)) => {
-            let mut error_plan = Plan::new();
-            for error in errors { error_plan.add_error(error); }
-            render_plan_errors_and_abort(color_mode, &error_plan, &base_dir.source_label())?;
-            unreachable!("invalid destroy state has diagnostics")
+            return Err(render_plan_errors(color_mode, &errors, &base_dir.source_label()));
         }
         Err(carina_core::planning_state::DestroyPlanError::Graph(error)) => return Err(error.into()),
         Err(carina_core::planning_state::DestroyPlanError::Admission(error)) => return Err(error.into()),
@@ -899,7 +896,7 @@ async fn run_destroy_locked_owned(
     let mut delete_scheduler = DeleteScheduler::for_destroy(&execution_plan)
         .map_err(|error| match error {
             DeleteScheduleError::Dependencies(error) => AppError::from(DestroyDependencyAnalysisError::new(error)),
-            error => AppError::Config(error.to_string()),
+            error => AppError::from(error),
         })?;
     let delete_count = delete_effects.len();
     let deletion_deps = delete_scheduler.dependencies();
@@ -1132,8 +1129,11 @@ async fn run_destroy_locked_owned(
 
     // Retain the last provider cause as well as the failed-attempt count.
     let max_retries: usize = 3;
-    let mut retry_failures: HashMap<usize, DeleteRetryFailure> = HashMap::new();
-    let mut retry_completions = HashMap::new();
+    // A pending retry owns both its provider cause and its completion receipt.
+    // After release, retain the prior cause until the next result is known,
+    // including cancellation between scheduler release and provider dispatch.
+    let mut pending_retries: HashMap<usize, (DeleteRetryFailure, carina_core::executor::DeleteCompletion)> = HashMap::new();
+    let mut active_retries = HashMap::new();
     // Indices waiting for at least one other effect to complete before retrying.
     // They are moved back to the ready pool when `in_flight.next()` returns.
     let mut retry_pending: HashSet<usize> = HashSet::new();
@@ -1174,10 +1174,11 @@ async fn run_destroy_locked_owned(
                 if dispatched.contains(&idx) || retry_pending.contains(&idx) {
                     continue;
                 }
-                if let Some(completion) = retry_completions.remove(&idx) {
-                    delete_scheduler.retry(completion);
+                if let Some((failure, completion)) = pending_retries.remove(&idx) {
+                    delete_scheduler.retry(completion)?;
+                    active_retries.insert(idx, failure);
                 }
-                if let Some(release) = delete_scheduler.release(idx) {
+                if let Some(release) = delete_scheduler.release(idx)? {
                     newly_ready.push((idx, release));
                 }
             }
@@ -1263,10 +1264,8 @@ async fn run_destroy_locked_owned(
             // deletes instead of misdiagnosing attempted work as undispatched.
             let mut exhausted_retries = false;
             for &idx in &remaining {
-                if let Some(retry) = retry_failures.remove(&idx) {
-                    delete_scheduler.complete(
-                        retry_completions.remove(&idx).expect("failed retry completion"),
-                    );
+                if let Some((retry, completion)) = pending_retries.remove(&idx) {
+                    delete_scheduler.complete(completion)?;
                     let (_, effect) = &resource_info[idx];
                     record_destroy_failure(
                         &mut failures,
@@ -1352,8 +1351,8 @@ async fn run_destroy_locked_owned(
 
         match delete_result {
             Ok(()) => {
-                delete_scheduler.complete(completion);
-                retry_failures.remove(&finished_idx);
+                delete_scheduler.complete(completion)?;
+                active_retries.remove(&finished_idx);
                 let timing = format!("took {}", format_duration(started.elapsed())).dimmed(color_mode);
                 let outcome = NonFailureOutcome::success(format_destroy_outcome_summary(color_mode,
                     &completed_counter,
@@ -1371,7 +1370,7 @@ async fn run_destroy_locked_owned(
                 destroyed_instances.record(destroyed);
             }
             Err(e) => {
-                let retries = retry_failures.get(&finished_idx).map_or(0, |retry| retry.attempts);
+                let retries = active_retries.remove(&finished_idx).map_or(0, |retry| retry.attempts);
                 let retryable = is_retryable_delete_error(&e);
                 let has_pending_or_in_flight = !in_flight.is_empty()
                     || all_indices
@@ -1382,8 +1381,7 @@ async fn run_destroy_locked_owned(
                     && has_pending_or_in_flight
                 {
                     let retry_num = retries + 1;
-                    retry_failures.insert(finished_idx, DeleteRetryFailure { attempts: retry_num, last_error: e });
-                    retry_completions.insert(finished_idx, completion);
+                    pending_retries.insert(finished_idx, (DeleteRetryFailure { attempts: retry_num, last_error: e }, completion));
                     completed_indices.remove(&finished_idx);
                     dispatched.remove(&finished_idx);
                     retry_pending.insert(finished_idx);
@@ -1395,8 +1393,7 @@ async fn run_destroy_locked_owned(
                     ));
                     active_progress.finish(outcome);
                 } else {
-                    delete_scheduler.complete(completion);
-                    retry_failures.remove(&finished_idx);
+                    delete_scheduler.complete(completion)?;
                     let kind = if retries > 0 {
                         let reason = if !retryable {
                             DeleteRetryStop::NotRetryable
@@ -1440,7 +1437,8 @@ async fn run_destroy_locked_owned(
             if dispatched.contains(&idx) || completed_indices.contains(&idx) {
                 continue;
             }
-            if let Some(retry) = retry_failures.remove(&idx) {
+            if let Some(retry) = pending_retries.remove(&idx).map(|(retry, _completion)| retry)
+                .or_else(|| active_retries.remove(&idx)) {
                 let effect = &resource_info[idx].1;
                 record_destroy_failure(
                     &mut failures,
@@ -2271,29 +2269,35 @@ mod tests {
         let schemas = SchemaRegistry::new();
         let plan = plan.admit(&schemas).unwrap();
         let mut scheduler = DeleteScheduler::for_test(&plan, &[], &Default::default()).unwrap();
-        assert!(scheduler.release(0).is_none(), "parent must wait for child");
-        let Some(DeleteRelease::Ready(child_delete)) = scheduler.release(1) else {
+        assert!(
+            scheduler.release(0).unwrap().is_none(),
+            "parent must wait for child"
+        );
+        let Some(DeleteRelease::Ready(child_delete)) = scheduler.release(1).unwrap() else {
             panic!("scheduler must release the leaf first");
         };
-        assert!(scheduler.release(1).is_none(), "one permit per attempt");
         assert!(
-            scheduler.release(0).is_none(),
+            scheduler.release(1).unwrap().is_none(),
+            "one permit per attempt"
+        );
+        assert!(
+            scheduler.release(0).unwrap().is_none(),
             "dispatch alone is not completion"
         );
         let (result, completion) = child_delete.dispatch(&provider, &schemas).await;
         result.unwrap();
         assert!(
-            scheduler.release(0).is_none(),
+            scheduler.release(0).unwrap().is_none(),
             "completion must be recorded"
         );
-        scheduler.complete(completion);
-        let Some(DeleteRelease::Ready(parent_delete)) = scheduler.release(0) else {
+        scheduler.complete(completion).unwrap();
+        let Some(DeleteRelease::Ready(parent_delete)) = scheduler.release(0).unwrap() else {
             panic!("completed leaf must release its parent");
         };
         let (result, completion) = parent_delete.dispatch(&provider, &schemas).await;
         result.unwrap();
-        scheduler.complete(completion);
-        assert!(scheduler.release(0).is_none());
+        scheduler.complete(completion).unwrap();
+        assert!(scheduler.release(0).unwrap().is_none());
         assert_eq!(
             std::fs::read_to_string(log).unwrap(),
             "test.resource.child\ntest.resource.parent\n"

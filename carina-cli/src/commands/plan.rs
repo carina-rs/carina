@@ -701,7 +701,7 @@ mod provider_scope_evidence_tests {
 ///
 /// Raw contents cannot record a production plan without input admission.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_cli::commands::plan::PlanFileContents;
 /// fn record_raw(contents: PlanFileContents) { let _ = contents.record(); }
 /// ```

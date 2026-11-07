@@ -89,49 +89,49 @@ impl PairedInputDelete {
 /// Only the write-site classifier can construct this view.
 /// Raw resources, raw effects and normalization inputs carry no such authority.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{input_rules::WriteSite, resource::Resource};
 /// let view: WriteSite<'_> = Resource::new("test", "r").into();
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{input_rules::WriteSite, effect::Effect};
 /// fn forge(effect: &Effect) -> WriteSite<'_> { effect.into() }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{input_rules::WriteSite, effect::Effect};
 /// fn forge(effect: Effect) -> WriteSite<'static> { effect.into() }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::input_rules::WriteSite;
 /// let view: WriteSite<'_> = Default::default();
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::input_rules::WriteSite;
 /// let view: WriteSite<'_> = serde_json::from_str("{}").unwrap();
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0616
 /// use carina_core::input_rules::WriteSite;
 /// fn mutate(view: &mut WriteSite<'_>) { view.attributes = None; }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{input_rules::WriteSite, resource::Current};
 /// fn forge(current: &Current) -> WriteSite<'_> { current.into() }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{input_rules::WriteSite, resource::State};
 /// fn forge(state: &State) -> WriteSite<'_> { state.into() }
 /// ```
-/// ```compile_fail
-/// use carina_core::{input_rules::ApplicableInputRule, schema::{Compiled, InputRule}};
-/// fn bypass(rule: &InputRule<Compiled>) {
-///     let applicable = ApplicableInputRule { rule };
+/// ```compile_fail,E0451
+/// use carina_core::{input_rules::{ApplicableInputRule, WriteSite}, schema::{Compiled, InputRule}};
+/// fn bypass<'a>(site: &WriteSite<'a>, rule: &'a InputRule<Compiled>) {
+///     let applicable = ApplicableInputRule { site, rule };
 ///     let _ = applicable.evaluate();
 /// }
 /// ```
 /// The executor constructor requires discharge authority and is inaccessible
 /// outside core.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0603
 /// use carina_core::input_rules::executor_write_site;
 /// use carina_core::executor::input_discharge::DischargeToken;
 /// ```
@@ -481,11 +481,11 @@ fn classify_write_site<'a, S>(
 /// An explicit remainder of admission; it cannot be deserialized or discharged
 /// by callers. Deferred slots bind to the template effect, never a name.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::input_rules::PendingInputObligation;
 /// let pending: PendingInputObligation = serde_json::from_str("{}").unwrap();
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::input_rules::PendingInputObligation;
 /// fn persist(pending: &PendingInputObligation) { let _ = serde_json::to_string(pending); }
 /// ```
@@ -510,11 +510,11 @@ impl PendingInputObligation {
 /// Finalization has completed all effect rewrites. There is no public raw-plan
 /// constructor or mutable access; input admission consumes this owner.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{input_rules::FinalizedPlan, plan::Plan};
 /// let finalized: FinalizedPlan = Plan::new().into();
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::{plan::Plan, schema::SchemaRegistry};
 /// fn bypass(raw: Plan, schemas: &SchemaRegistry) {
 ///     let _ = raw.check_inputs(schemas, &std::collections::HashMap::new());
@@ -1040,31 +1040,33 @@ fn project_known_value<P: crate::resource::ValueKind, B: crate::resource::Bindin
 /// Cloning this immutable owner preserves the same effects; mutable/raw plans
 /// cannot recover its execution authority.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{input_rules::InputCheckedPlan, plan::Plan};
 /// let checked: InputCheckedPlan = Plan::new().into();
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{input_rules::InputCheckedPlan, resource::Resource};
 /// let checked: InputCheckedPlan = Resource::new("test", "r").into();
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{input_rules::InputCheckedPlan, effect::Effect};
 /// fn forge(effect: Effect) -> InputCheckedPlan { effect.into() }
 /// ```
-/// ```compile_fail
-/// use carina_core::{input_rules::InputCheckedPlan, plan::Plan};
-/// let checked = InputCheckedPlan { plan: Plan::new(), pending: Vec::new() };
+/// ```compile_fail,E0451
+/// use carina_core::{input_rules::InputCheckedPlan, plan::AdmittedPlan};
+/// fn forge(plan: AdmittedPlan) -> InputCheckedPlan {
+///     InputCheckedPlan { plan, obligations: todo!() }
+/// }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::input_rules::InputCheckedPlan;
 /// let checked: InputCheckedPlan = serde_json::from_str("{}").unwrap();
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0596
 /// use carina_core::{input_rules::InputCheckedPlan, effect::Effect};
 /// fn mutate(checked: &mut InputCheckedPlan, effect: Effect) { checked.add(effect); }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::input_rules::InputCheckedPlan;
 /// let checked = InputCheckedPlan::default();
 /// ```
@@ -1144,7 +1146,7 @@ impl<S: Clone> crate::plan::AdmittedPlan<S> {
 
 /// Only executor discharge can supply this unforgeable constructor token.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0603
 /// use carina_core::input_rules::executor_write_site;
 /// ```
 pub(crate) fn executor_write_site<'a>(

@@ -40,6 +40,16 @@ pub enum DeleteScheduleError {
     NonDelete { index: usize },
     #[error(transparent)]
     Dependencies(#[from] DependencyAnalysisFailure),
+    #[error("delete slot {index} was blocked without a failed dependency")]
+    MissingFailedDependency { index: usize },
+    #[error(transparent)]
+    Authorization(#[from] super::EffectFailureKind),
+    #[error("delete completion belongs to another execution")]
+    ForeignCompletion,
+    #[error("delete completion for slot {index} is not awaiting completion")]
+    CompletionNotReleased { index: usize },
+    #[error("successful delete slot {index} cannot be retried")]
+    RetrySucceeded { index: usize },
 }
 
 /// Stateful readiness for a core-built destroy plan. Completion and retry
@@ -136,9 +146,7 @@ impl<'plan, S: Clone> DeleteScheduler<'plan, S> {
         // Wait aliases are graph-only nodes. Project their paths onto the
         // delete slots once; this exact map controls display and release.
         let dependencies = delete_dependencies(&analysis, scheduled.effects().len());
-        let sources = (0..scheduled.effects().len()).collect::<Vec<_>>();
-        let checks = ExecutionInputChecks::new(Vec::new(), scheduled.effects(), &sources)
-            .expect("delete-only schedule has no write input obligations");
+        let checks = ExecutionInputChecks::without_write_checks(scheduled.effects());
         Ok(Self {
             scheduled,
             analysis,
@@ -159,17 +167,19 @@ impl<'plan, S: Clone> DeleteScheduler<'plan, S> {
         &self.dependencies
     }
 
-    pub fn release(&mut self, index: usize) -> Option<DeleteRelease> {
+    pub fn release(&mut self, index: usize) -> Result<Option<DeleteRelease>, DeleteScheduleError> {
         if self.completed.contains(&index) || self.released.contains(&index) {
-            return None;
+            return Ok(None);
         }
-        let ready = release_ready_effect(
+        let Some(ready) = release_ready_effect(
             &self.scheduled,
             index,
             &self.dependencies,
             &self.completed,
             &self.failed,
-        )?;
+        ) else {
+            return Ok(None);
+        };
         let ready = match ready {
             Ok(ready) => ready,
             Err(_) => {
@@ -179,7 +189,7 @@ impl<'plan, S: Clone> DeleteScheduler<'plan, S> {
                 let mut ancestors = HashSet::new();
                 let mut pending = vec![index];
                 while let Some(node) = pending.pop() {
-                    for &dependency in &self.dependencies[&node] {
+                    for &dependency in self.dependencies.get(&node).into_iter().flatten() {
                         if ancestors.insert(dependency) {
                             pending.push(dependency);
                         }
@@ -188,57 +198,75 @@ impl<'plan, S: Clone> DeleteScheduler<'plan, S> {
                 let dependency = *ancestors
                     .intersection(&self.failed)
                     .min()
-                    .expect("failed delete dependency");
+                    .ok_or(DeleteScheduleError::MissingFailedDependency { index })?;
                 self.completed.insert(index);
                 self.failed.insert(index);
-                return Some(DeleteRelease::Blocked { dependency });
+                return Ok(Some(DeleteRelease::Blocked { dependency }));
             }
         };
         let Some(ScheduledBasicEffect::Delete { permit: ready, .. }) = ready.into_basic() else {
-            unreachable!("delete-only schedule");
+            return Err(DeleteScheduleError::NonDelete { index });
         };
-        let permit = self
-            .checks
-            .authorize_delete(index, &ready)
-            .expect("ready delete-only slot has no paired writes");
+        let permit = self.checks.authorize_delete(index, &ready)?;
         self.released.insert(index);
-        Some(DeleteRelease::Ready(ScheduledDelete {
+        Ok(Some(DeleteRelease::Ready(ScheduledDelete {
             permit,
             completion: DeleteCompletion {
                 run: self.run.clone(),
                 index,
                 failed: false,
             },
-        }))
+        })))
     }
 
-    pub fn complete(&mut self, completion: DeleteCompletion) {
-        self.consume_completion(&completion);
+    pub fn complete(&mut self, completion: DeleteCompletion) -> Result<(), DeleteScheduleError> {
+        self.consume_completion(&completion)?;
         self.completed.insert(completion.index);
         if completion.failed {
             self.failed.insert(completion.index);
         }
+        Ok(())
     }
 
     /// Retry only an actual failed provider attempt, retaining its exact slot.
-    pub fn retry(&mut self, completion: DeleteCompletion) {
-        assert!(completion.failed, "only failed deletes can be retried");
-        self.consume_completion(&completion);
-        self.checks.retry_delete(
-            completion.index,
-            &self.scheduled.effects()[completion.index],
-        );
+    pub fn retry(&mut self, completion: DeleteCompletion) -> Result<(), DeleteScheduleError> {
+        self.validate_completion(&completion)?;
+        if !completion.failed {
+            return Err(DeleteScheduleError::RetrySucceeded {
+                index: completion.index,
+            });
+        }
+        let effect = self.scheduled.effects().get(completion.index).ok_or(
+            DeleteScheduleError::CompletionNotReleased {
+                index: completion.index,
+            },
+        )?;
+        self.checks.retry_delete(completion.index, effect)?;
+        self.consume_completion(&completion)
     }
 
-    fn consume_completion(&mut self, completion: &DeleteCompletion) {
-        assert!(
-            Arc::ptr_eq(&self.run, &completion.run),
-            "delete completion belongs to another execution"
-        );
-        assert!(
-            self.released.remove(&completion.index),
-            "delete completion already consumed"
-        );
+    fn validate_completion(
+        &self,
+        completion: &DeleteCompletion,
+    ) -> Result<(), DeleteScheduleError> {
+        if !Arc::ptr_eq(&self.run, &completion.run) {
+            return Err(DeleteScheduleError::ForeignCompletion);
+        }
+        if !self.released.contains(&completion.index) {
+            return Err(DeleteScheduleError::CompletionNotReleased {
+                index: completion.index,
+            });
+        }
+        Ok(())
+    }
+
+    fn consume_completion(
+        &mut self,
+        completion: &DeleteCompletion,
+    ) -> Result<(), DeleteScheduleError> {
+        self.validate_completion(completion)?;
+        self.released.remove(&completion.index);
+        Ok(())
     }
 }
 
@@ -329,7 +357,7 @@ pub fn delete_permit_for_test(
         .expect("fixture delete admission");
     let mut scheduler = DeleteScheduler::from_admitted(&plan, &[], &Default::default())
         .expect("fixture delete schedule");
-    let Some(DeleteRelease::Ready(delete)) = scheduler.release(0) else {
+    let Some(DeleteRelease::Ready(delete)) = scheduler.release(0).expect("fixture release") else {
         unreachable!("fixture ready delete")
     };
     delete.permit

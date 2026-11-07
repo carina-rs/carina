@@ -39,19 +39,19 @@ impl Eq for EffectSlot {}
 /// An immutable, nonserializable provider request. Only discharge constructs it.
 /// The request and secret-preserving writeback travel together until dispatch.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{executor::PreparedWrite, provider::CreateRequest};
 /// fn forge(request: CreateRequest) -> PreparedWrite<CreateRequest> { request.into() }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::{executor::PreparedWrite, provider::CreateRequest};
 /// let forged: PreparedWrite<CreateRequest> = serde_json::from_str("{}").unwrap();
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0616
 /// use carina_core::{executor::PreparedWrite, provider::CreateRequest};
 /// fn mutate(write: &mut PreparedWrite<CreateRequest>, request: CreateRequest) { write.request = request; }
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use carina_core::{executor::PreparedWrite, provider::CreateRequest};
 /// fn forge(request: CreateRequest) -> PreparedWrite<CreateRequest> {
 ///     PreparedWrite { request: std::sync::Arc::new(request), resource_id: todo!(), writeback: todo!(), receipt: todo!() }
@@ -60,7 +60,7 @@ impl Eq for EffectSlot {}
 /// Scheduled dispatch is private to the executor and requires a prepared
 /// request, even if a caller already possesses provider-readiness authority.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0603
 /// use carina_core::{executor::basic::execute_basic_effect, provider::ProviderReadyResource};
 /// fn bypass(request: ProviderReadyResource) { execute_basic_effect(request); }
 /// ```
@@ -86,17 +86,17 @@ struct PreparationReceipt {
 /// Release authority for one exact delete slot in one execution. The scheduler
 /// and input discharge jointly mint this owner of the immutable delete target.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0599
 /// use carina_core::executor::DeletePermit;
 /// let permit = DeletePermit::default();
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0277
 /// use carina_core::executor::DeletePermit;
 /// let permit: DeletePermit = serde_json::from_str("{}").unwrap();
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0451
 /// use carina_core::executor::DeletePermit;
-/// let permit = DeletePermit { delete: todo!(), prepared: todo!() };
+/// let permit = DeletePermit { _receipts: Vec::new(), target: todo!() };
 /// ```
 pub struct DeletePermit {
     _receipts: Vec<DeleteDischargeReceipt>,
@@ -440,32 +440,28 @@ pub(super) struct ExecutionInputChecks {
 impl ExecutionInputChecks {
     /// A delete-only scheduler may retry an actual completed attempt. Apply's
     /// paired delete slots never use this path or lose their discharge receipts.
-    pub(super) fn retry_delete<S>(&mut self, index: usize, effect: &Effect<S>) {
-        assert!(!self.required_deletes.contains_key(&index));
-        assert!(
-            self.delete_targets
-                .insert(
-                    index,
-                    DeleteTarget::from_effect(effect).expect("delete-only scheduler slot"),
-                )
-                .is_none()
-        );
+    pub(super) fn retry_delete<S>(
+        &mut self,
+        index: usize,
+        effect: &Effect<S>,
+    ) -> Result<(), EffectFailureKind> {
+        if self.required_deletes.contains_key(&index) || self.delete_targets.contains_key(&index) {
+            return Err(EffectFailureKind::message(
+                "delete retry slot is paired or already available",
+            ));
+        }
+        let target = DeleteTarget::from_effect(effect)
+            .ok_or_else(|| EffectFailureKind::message("delete retry slot is not a delete"))?;
+        self.delete_targets.insert(index, target);
+        Ok(())
     }
     pub(super) fn has_rules(&self, index: usize) -> bool {
         self.checks.contains_key(&index)
     }
-    pub(super) fn new<S>(
-        checks: Vec<PendingInputObligation>,
-        effects: &[Effect<S>],
-        sources: &[usize],
-    ) -> Result<Self, InputCheckConstructionError> {
-        if sources.len() != effects.len() {
-            return Err(InputCheckConstructionError::SourceCount {
-                sources: sources.len(),
-                effects: effects.len(),
-            });
-        }
-        let mut result = Self {
+
+    /// Deletes with no paired writes need no obligation-to-slot mapping.
+    pub(super) fn without_write_checks<S>(effects: &[Effect<S>]) -> Self {
+        Self {
             run: Arc::new(()),
             checks: HashMap::new(),
             paired: HashMap::new(),
@@ -480,7 +476,21 @@ impl ExecutionInputChecks {
                     DeleteTarget::from_effect(effect).map(|target| (index, target))
                 })
                 .collect(),
-        };
+        }
+    }
+
+    pub(super) fn new<S>(
+        checks: Vec<PendingInputObligation>,
+        effects: &[Effect<S>],
+        sources: &[usize],
+    ) -> Result<Self, InputCheckConstructionError> {
+        if sources.len() != effects.len() {
+            return Err(InputCheckConstructionError::SourceCount {
+                sources: sources.len(),
+                effects: effects.len(),
+            });
+        }
+        let mut result = Self::without_write_checks(effects);
         for check in checks {
             let source = check.target().effect_index();
             let mut writes =

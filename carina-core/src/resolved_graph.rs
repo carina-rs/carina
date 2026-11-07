@@ -356,10 +356,10 @@ impl ResolvedInitialDeletePlan {
                 _ => None,
             })
             .ok_or(BackendResourceError::MissingBucket)?;
-        let identifier = crate::provider::AppliedIdentifier::new(name)
-            .map_err(BackendResourceError::Identifier)?;
         let identity =
             ResourceIdentity::try_from(name.to_owned()).map_err(BackendResourceError::Identity)?;
+        let identifier = crate::provider::AppliedIdentifier::new(name)
+            .map_err(BackendResourceError::Identifier)?;
         let resource = Resource::from_id(ResourceId::with_provider_identity(
             provider,
             resource_type,
@@ -1878,7 +1878,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backend_identifier_error_retains_typed_source() {
+    fn backend_identity_error_retains_typed_source() {
         use std::error::Error;
         let configuration = crate::parser::ExpandedInferredFile {
             backend: Some(crate::parser::BackendConfig {
@@ -1900,12 +1900,12 @@ mod tests {
         .unwrap_err();
         let mut source = error.source();
         while let Some(error) = source {
-            if error.is::<crate::provider::EmptyAppliedIdentifier>() {
+            if error.is::<crate::resource::ResourceIdentityError>() {
                 return;
             }
             source = error.source();
         }
-        panic!("the backend error chain must preserve EmptyAppliedIdentifier");
+        panic!("the backend error chain must preserve ResourceIdentityError");
     }
 
     #[test]

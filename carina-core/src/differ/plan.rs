@@ -189,7 +189,7 @@ impl<'a> CascadeDependents<'a> {
 /// ```compile_fail,E0061
 /// use carina_core::differ::PendingCascadePlan;
 /// fn omit_desired_ids(builder: PendingCascadePlan) {
-///     let _ = builder.finish(|_| {});
+///     let _ = builder.finish();
 /// }
 /// ```
 ///

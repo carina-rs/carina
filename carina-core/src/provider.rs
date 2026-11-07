@@ -4130,8 +4130,8 @@ impl ResumeFailure {
 /// exact request that passed input discharge. It cannot be copied or forged.
 ///
 /// ```compile_fail,E0624
-/// use carina_core::provider::UpdateAttempt;
-/// let attempt = UpdateAttempt::new();
+/// use carina_core::{provider::UpdateAttempt, replacement::UpdatePermit};
+/// fn forge(permit: UpdatePermit) { let _ = UpdateAttempt::new(permit); }
 /// ```
 /// ```compile_fail,E0423
 /// use carina_core::provider::UpdateAttempt;
@@ -4158,8 +4158,10 @@ impl UpdateAttempt {
 /// Deletes have no desired values and therefore no input rules of their own.
 ///
 /// ```compile_fail,E0624
-/// use carina_core::provider::DeleteAttempt;
-/// let attempt = DeleteAttempt::new();
+/// use carina_core::{provider::DeleteAttempt, executor::DeletePermit, schema::SchemaRegistry};
+/// fn forge(permit: DeletePermit, schemas: &SchemaRegistry) {
+///     let _ = DeleteAttempt::new(permit, schemas);
+/// }
 /// ```
 /// ```compile_fail,E0451
 /// use carina_core::provider::DeleteAttempt;
