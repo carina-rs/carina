@@ -1265,11 +1265,31 @@ pub trait CarinaProvider {
     /// Validate provider-specific configuration semantics not expressible
     /// in the attribute type schema. Host-side type validation has
     /// already run by the time this is called.
-    fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), String>;
+    /// Failures carry the same structured protocol error as CRUD operations.
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_plugin_sdk::{CarinaProvider, types::Value};
+    /// use std::collections::BTreeMap;
+    /// fn stringify(provider: &impl CarinaProvider, attrs: &BTreeMap<String, Value>) {
+    ///     let _: Result<(), String> = provider.validate_config(attrs);
+    /// }
+    /// ```
+    fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), ProviderError>;
 
     /// Initialize the provider with configuration.
     /// Called once before any CRUD operations.
-    fn initialize(&mut self, attrs: &BTreeMap<String, Value>) -> Result<ReferenceScope, String>;
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_plugin_sdk::{CarinaProvider, types::{ReferenceScope, Value}};
+    /// use std::collections::BTreeMap;
+    /// fn stringify(provider: &mut impl CarinaProvider, attrs: &BTreeMap<String, Value>) {
+    ///     let _: Result<ReferenceScope, String> = provider.initialize(attrs);
+    /// }
+    /// ```
+    fn initialize(
+        &mut self,
+        attrs: &BTreeMap<String, Value>,
+    ) -> Result<ReferenceScope, ProviderError>;
 
     /// Read current state of a resource.
     ///
@@ -1632,6 +1652,37 @@ mod tests {
     use std::cell::Cell;
 
     #[test]
+    fn configuration_entry_points_accept_typed_provider_failures() {
+        let mut provider = TestProvider::default();
+        let validation: Result<(), ProviderError> = provider.validate_config(&BTreeMap::new());
+        let initialization: Result<ReferenceScope, ProviderError> =
+            provider.initialize(&BTreeMap::new());
+        assert!(validation.is_ok());
+        assert!(initialization.is_ok());
+        let error = ProviderError {
+            kind: types::ProviderErrorKind::ApiError,
+            message: "configuration request failed".into(),
+            cause: Some("provider cause".into()),
+            operation: Some("initialize".into()),
+            status: Some(403),
+            code: Some("AccessDenied".into()),
+            request_id: Some("request-id".into()),
+            provider_name: Some("test".into()),
+            resource_id: None,
+        };
+        provider.config_failure = Some(error.clone());
+        let expected = serde_json::to_value(error).unwrap();
+        assert_eq!(
+            serde_json::to_value(provider.validate_config(&BTreeMap::new()).unwrap_err()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            serde_json::to_value(provider.initialize(&BTreeMap::new()).unwrap_err()).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
     fn default_reference_resolver_rejects_every_unsupported_identity() {
         let provider = TestProvider {
             resources: Vec::new(),
@@ -1666,6 +1717,7 @@ mod tests {
         reference_form_calls: Cell<usize>,
         edges: Vec<carina_core::schema::AssignabilityEdge>,
         assignability_edge_calls: Cell<usize>,
+        config_failure: Option<ProviderError>,
     }
 
     impl CarinaProvider for TestProvider {
@@ -1702,15 +1754,17 @@ mod tests {
             self.edges.clone()
         }
 
-        fn validate_config(&self, _attrs: &BTreeMap<String, Value>) -> Result<(), String> {
-            Ok(())
+        fn validate_config(&self, _attrs: &BTreeMap<String, Value>) -> Result<(), ProviderError> {
+            self.config_failure.clone().map_or(Ok(()), Err)
         }
 
         fn initialize(
             &mut self,
             _attrs: &BTreeMap<String, Value>,
-        ) -> Result<ReferenceScope, String> {
-            Ok(ReferenceScope::Unavailable)
+        ) -> Result<ReferenceScope, ProviderError> {
+            self.config_failure
+                .clone()
+                .map_or(Ok(ReferenceScope::Unavailable), Err)
         }
 
         fn read(

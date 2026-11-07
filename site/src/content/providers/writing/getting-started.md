@@ -149,14 +149,14 @@ impl CarinaProvider for HelloProvider {
         ValidatedConfigSchema::default()
     }
 
-    fn validate_config(&self, _attrs: &BTreeMap<String, Value>) -> Result<(), String> {
+    fn validate_config(&self, _attrs: &BTreeMap<String, Value>) -> Result<(), ProviderError> {
         Ok(())
     }
 
     fn initialize(
         &mut self,
         _attrs: &BTreeMap<String, Value>,
-    ) -> Result<ReferenceScope, String> {
+    ) -> Result<ReferenceScope, ProviderError> {
         Ok(ReferenceScope::Unavailable)
     }
 
