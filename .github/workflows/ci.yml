@@ -248,6 +248,7 @@ jobs:
           --target wasm32-wasip2
       - run: cargo nextest run --workspace --all-features
       - run: scripts/test-in-process-isolation.sh
+      - run: bash scripts/check-provider-cause-test-api.sh
       # nextest does not run doctests; cover them with cargo test --doc.
       - run: cargo test --workspace --doc --all-features
 
