@@ -7,6 +7,9 @@ pub use carina_provider_protocol as protocol;
 pub use carina_provider_protocol::types;
 pub use carina_provider_protocol::{FiniteF64, NonFiniteFloatError};
 
+#[cfg(test)]
+use carina_core::test_utils::provider_text as provider_text_fixtures;
+
 pub mod aws_credentials;
 
 mod desired;
@@ -2784,7 +2787,3 @@ mod explicit_pattern_mode_tests {
         }
     }
 }
-
-#[cfg(test)]
-#[path = "../../carina-core/tests/support/provider_text.rs"]
-mod provider_text_fixtures;

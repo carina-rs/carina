@@ -11,6 +11,30 @@ The [`widget` provider](/providers/writing/implementing-operations/) takes its A
 
 There is one wrinkle. A `CreateAttempt` can only be created by the SDK, so a test cannot call `create` directly. Call `carina_plugin_sdk::dispatch_create` instead: it is the entry point the component's generated code uses, so it mints the attempt and returns the outcome in the wire form the host receives. `dispatch_poll_create` and `dispatch_resume_create` do the same for the other create calls. `update`, `delete` and `read` take no typestate, so tests call them directly.
 
+For native assertions on provider errors, enable `carina-core`'s `test-utils` feature in your dev-dependency. `NativeWireFixture` encodes an error through the real `ProviderBoundary`; `BindProviderText` binds it through that boundary so tests can inspect host diagnostics. Use `context` to register secrets when checking redaction. These helpers are available only in test builds or with `test-utils` enabled.
+
+```rust
+use carina_core::provider::ProviderError;
+use carina_core::test_utils::provider_text::{
+    BindProviderText, NativeWireFixture, context,
+};
+
+let error = ProviderError::api_error_caused_by(
+    "read error",
+    std::io::Error::other("ResourceNotFoundException"),
+);
+let wire = error.to_wire();
+assert_eq!(wire.cause.as_deref(), Some("ResourceNotFoundException"));
+
+let error = error.into_host_for_test();
+assert!(error.to_string().contains("ResourceNotFoundException"));
+assert_eq!(error.detail().context(), "read error");
+
+let error = ProviderError::api_error("password rejected")
+    .with_secrets_for_test(&context(&["password"]));
+assert_eq!(error.to_string(), "(secret) rejected");
+```
+
 ```rust
 #[cfg(test)]
 mod tests {
