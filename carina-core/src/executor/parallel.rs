@@ -1,6 +1,8 @@
 //! Dependency computation and parallel effect execution.
 
 #[cfg(test)]
+use crate::provider::Provider;
+#[cfg(test)]
 use crate::resource::ResolvedResourceId;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,7 +11,7 @@ use std::time::Instant;
 use crate::effect::Effect;
 #[cfg(test)]
 use crate::effect::deps::UnresolvedResource;
-use crate::provider::{AppliedIdentifier, CancelledCreateReport, Provider, ProviderRouter};
+use crate::provider::{AppliedIdentifier, CancelledCreateReport, HostProvider, ProviderRouter};
 use crate::resource::{ResourceId, ResourceIdentity};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
@@ -344,7 +346,7 @@ pub fn classify_stalled_effects<S>(
 pub(super) async fn execute_effects_sequential<
     S: Clone + crate::resource::AnonymousIdentityModuleSource,
 >(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     comparison_provider: &ProviderRouter,
     input: &mut RuntimeExecutionInput<'_, S>,
     observer: &dyn ExecutionObserver<S>,
@@ -894,18 +896,26 @@ pub(super) async fn execute_effects_sequential<
                     completed: completed_ref,
                     total,
                 };
-                let prepare = async {
+                // Preparation and dispatch each retain a large provider state
+                // machine. Store them separately on the heap so their frames
+                // do not accumulate inside the scheduled operation.
+                let prepare = Box::pin(async {
                     match prepared_request {
                         Some(prepared) => Ok(prepared),
                         None => match (authorized_delete, check) {
                             (Ok(delete), Ok(check)) => {
-                                prepare_basic_request(&effect_for_future, &context, check, delete)
-                                    .await
+                                Box::pin(prepare_basic_request(
+                                    &effect_for_future,
+                                    &context,
+                                    check,
+                                    delete,
+                                ))
+                                .await
                             }
                             (Err(failure), _) | (_, Err(failure)) => Err(failure),
                         },
                     }
-                };
+                });
                 if let Some(write) = preparation_write {
                     return (
                         idx,
@@ -917,13 +927,13 @@ pub(super) async fn execute_effects_sequential<
                 }
                 let result = match basic {
                     Some(basic) => SingleEffectResult::Basic(Box::new(
-                        execute_basic_effect(
+                        Box::pin(execute_basic_effect(
                             basic,
                             prepare.await,
                             &context,
                             in_flight_start,
                             observer,
-                        )
+                        ))
                         .await,
                     )),
                     None => match &effect_for_future {
@@ -1955,7 +1965,7 @@ mod tests {
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(1),
                     execute_effects_sequential(
-                        &provider,
+                        &crate::provider::ProviderBoundary::fixture(&provider),
                         &comparison_provider,
                         &mut input,
                         &observer,
@@ -2122,7 +2132,7 @@ mod tests {
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     execute_effects_sequential(
-                        &provider,
+                        &crate::provider::ProviderBoundary::fixture(&provider),
                         &comparison_provider,
                         &mut input,
                         &observer,

@@ -9462,6 +9462,7 @@ impl crate::provider::ProviderFactory for RecordingFactory {
     fn validate_config(
         &self,
         attributes: &crate::provider::CanonicalProviderConfigAttributes,
+        _session: &crate::provider::ProviderValidationInputs,
     ) -> crate::provider::ProviderResult<()> {
         self.seen
             .lock()
@@ -9472,8 +9473,7 @@ impl crate::provider::ProviderFactory for RecordingFactory {
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &crate::provider::ProviderReadyConfig,
+        _config: &crate::provider::ProviderSession,
         _initialize_outcome: crate::provider::InitializeOutcomeMint,
     ) -> futures::future::BoxFuture<
         '_,
@@ -9596,6 +9596,7 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
         fn validate_config(
             &self,
             attributes: &crate::provider::CanonicalProviderConfigAttributes,
+            _session: &crate::provider::ProviderValidationInputs,
         ) -> crate::provider::ProviderResult<()> {
             self.seen
                 .lock()
@@ -9606,8 +9607,7 @@ fn validate_provider_config_canonicalizes_enum_before_plugin_call() {
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &crate::provider::ProviderReadyConfig,
+            _config: &crate::provider::ProviderSession,
             _initialize_outcome: crate::provider::InitializeOutcomeMint,
         ) -> futures::future::BoxFuture<
             '_,

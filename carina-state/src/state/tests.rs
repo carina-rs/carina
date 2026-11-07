@@ -1,4 +1,6 @@
 use super::*;
+use crate::provider_text_fixtures::*;
+mod provider_text_secret_redaction;
 use carina_core::resource::Directives;
 use carina_core::resource::{
     DeferredValue, PendingReRead, ReReadReason, ResolvedDependencies, SavedModuleSource,
@@ -260,7 +262,7 @@ fn create_attempt_for_test(id: ResourceId) -> carina_core::provider::CreateAttem
         }
     }
 
-    let provider = CaptureAttempt(std::sync::Mutex::new(None));
+    let provider = std::sync::Arc::new(CaptureAttempt(std::sync::Mutex::new(None)));
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
     let schemas = carina_core::schema::SchemaRegistry::new();
@@ -283,8 +285,10 @@ fn create_attempt_for_test(id: ResourceId) -> carina_core::provider::CreateAttem
             .expect("fixture passes provider preparation");
             // This fixture only captures dispatch provenance; its schema has no input rules.
             let prepared = carina_core::replacement::create_permit_for_test(request);
+            let boundary =
+                crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
             let (create, _cancellation) =
-                carina_core::executor::dispatch_create(&provider, prepared);
+                carina_core::executor::dispatch_create(&boundary, prepared);
             let mut create = std::pin::pin!(create);
             assert!(
                 create
@@ -294,7 +298,7 @@ fn create_attempt_for_test(id: ResourceId) -> carina_core::provider::CreateAttem
             );
         },
     );
-    provider.0.into_inner().unwrap().unwrap()
+    provider.0.lock().unwrap().take().unwrap()
 }
 
 fn published_exports_from_state(state: &StateFile) -> PublishedExports {
@@ -449,7 +453,7 @@ fn resource_state_from_provider_state_for_resource_and_schema_for_test<
 
 fn resource_state_from_observation_for_test<S: Clone>(
     resource: &carina_core::resource::ResolvedResource<S>,
-    identified: &IdentifiedCreate,
+    identified: &carina_core::provider::HostIdentifiedCreate,
     existing: Option<&ResourceState>,
     schema: Option<&carina_core::schema::CompiledResourceSchema>,
     preferred_hashes: Option<&PersistedAttributes>,
@@ -8120,8 +8124,8 @@ fn nested_write_only_record_hashes_leaf_under_secret_wrapped_struct() {
 #[test]
 fn resumed_persisted_create_records_nested_write_only_sent_values() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateObservation, IdentifiedCreate, PendingToken,
-        PersistedAttributes, Sent,
+        AppliedIdentifier, AppliedState, HostCreateObservation as CreateObservation,
+        HostIdentifiedCreate as IdentifiedCreate, PendingToken, PersistedAttributes, Sent,
     };
 
     let (resource, schema) = nested_write_only_state_fixture("resumed-secret");
@@ -8188,8 +8192,10 @@ fn resumed_persisted_create_records_nested_write_only_sent_values() {
 #[test]
 fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateObservation, IdentifiedCreate,
-        PartialReadDiagnostic, PendingToken, PersistedAttributes, Sent,
+        AppliedIdentifier, AppliedState, HostCreateObservation as CreateObservation,
+        HostIdentifiedCreate as IdentifiedCreate,
+        HostPartialReadDiagnostic as PartialReadDiagnostic, PendingToken, PersistedAttributes,
+        Sent,
     };
 
     for key in ["computed\x1b[2J".to_string(), "x".repeat(9000)] {
@@ -8243,8 +8249,10 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
 #[test]
 fn resumed_partial_create_records_exact_missing_attributes() {
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateObservation, IdentifiedCreate,
-        PartialReadDiagnostic, PendingToken, PersistedAttributes, Sent, SentRecord,
+        AppliedIdentifier, AppliedState, HostCreateObservation as CreateObservation,
+        HostIdentifiedCreate as IdentifiedCreate,
+        HostPartialReadDiagnostic as PartialReadDiagnostic, PendingToken, PersistedAttributes,
+        Sent, SentRecord,
     };
 
     let resource = Resource::with_provider("mock", "test.Widget", "example", None).with_attribute(
@@ -8315,8 +8323,9 @@ fn resumed_partial_create_records_exact_missing_attributes() {
 #[test]
 fn unobserved_not_found_create_records_identifier_and_partial_read() {
     use carina_core::provider::{
-        AppliedIdentifier, CreateFailureKind, CreateObservation, Observation, ProviderError,
-        ReadOutcome, Sent, UnobservedReason,
+        AppliedIdentifier, HostCreateFailureKind as CreateFailureKind,
+        HostCreateObservation as CreateObservation, HostUnobservedReason as UnobservedReason,
+        Observation, ProviderError, ReadOutcome, Sent,
     };
 
     let resource = Resource::with_provider("awscc", "logs.LogGroup", "logs", None).with_attribute(
@@ -8330,7 +8339,7 @@ fn unobserved_not_found_create_records_identifier_and_partial_read() {
             Observation::Read(ReadOutcome::not_found(resource.id.clone())),
             ProviderError::api_error("create access denied"),
         );
-    let identified = match failure.into_kind() {
+    let identified = match failure.into_host_for_test().into_kind() {
         CreateFailureKind::IdentifierReported {
             identified,
             error: _,
@@ -8385,7 +8394,8 @@ fn unobserved_not_found_create_records_identifier_and_partial_read() {
 #[test]
 fn unobserved_read_failed_observation_records_identifier_and_provider_error_detail() {
     use carina_core::provider::{
-        AppliedIdentifier, CreateFailureKind, Observation, ProviderError, Sent,
+        AppliedIdentifier, HostCreateFailureKind as CreateFailureKind, Observation, ProviderError,
+        Sent,
     };
 
     let resource = Resource::with_provider("awscc", "logs.LogGroup", "logs", None).with_attribute(
@@ -8394,14 +8404,14 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
     );
     let identifier = AppliedIdentifier::new("application-logs").unwrap();
     let read_error = ProviderError::api_error("read-back access denied");
-    let read_error_display = read_error.to_string();
+    let read_error_display = read_error.clone().into_host_for_test().to_string();
     let failure = create_attempt_for_test(resource.id.clone())
         .issued(identifier, Sent::only(Vec::<String>::new()))
         .identifier_reported(
             Observation::ReadFailed(read_error),
             ProviderError::api_error("create finishing failed"),
         );
-    let identified = match failure.into_kind() {
+    let identified = match failure.into_host_for_test().into_kind() {
         CreateFailureKind::IdentifierReported {
             identified,
             error: _,
@@ -8443,7 +8453,8 @@ fn unobserved_read_failed_observation_records_identifier_and_provider_error_deta
 fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrappers() {
     use carina_core::differ::Diff;
     use carina_core::provider::{
-        AppliedIdentifier, AppliedState, CreateFailureKind, CreateObservation, IdentifiedCreate,
+        AppliedIdentifier, AppliedState, HostCreateFailureKind as CreateFailureKind,
+        HostCreateObservation as CreateObservation, HostIdentifiedCreate as IdentifiedCreate,
         Observation, PendingToken, PersistedAttributes, ProviderError, ReadOutcome, Sent,
     };
     use carina_core::resource::{ConcreteValue, DeferredValue, Resource, State, Value};
@@ -8567,7 +8578,7 @@ fn identified_create_records_nested_leaf_from_desired_under_ancestor_secret_wrap
                     Observation::Read(ReadOutcome::found(observed_state())),
                     ProviderError::internal("synthetic post-create finishing failure"),
                 );
-            match failed.into_kind() {
+            match failed.into_host_for_test().into_kind() {
                 CreateFailureKind::IdentifierReported {
                     identified,
                     error: _error,

@@ -584,6 +584,7 @@ fn string_list_or_list(values: Vec<Value>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_text::OpaqueFixtureDisplay as _;
     use crate::resource::{ConcreteValue, DeferredValue};
     use carina_provider_protocol::normalization::{NormalizationErrorKind, NormalizationValue};
 
@@ -1073,7 +1074,6 @@ mod tests {
     #[test]
     fn native_question_mark_conversion_keeps_the_typed_cause_and_resource_id() {
         use crate::provider::ProviderResult;
-        use std::error::Error;
         fn normalize(resource: &Resource) -> ProviderResult<()> {
             let batch = NormalizationBatch::new(std::slice::from_ref(resource))?;
             batch.finish(Vec::new())?;
@@ -1089,11 +1089,12 @@ mod tests {
                 }),
             );
             let error = normalize(&resource).unwrap_err();
-            let source = error
+            let bound = error.clone().into_host_for_test();
+            let source = bound
                 .detail()
                 .cause()
                 .unwrap()
-                .downcast_ref::<NormalizationError>()
+                .normalization()
                 .expect("cause must retain the normalization error type");
             assert!(error.source().is_none(), "provider errors remain terminal");
             assert_eq!(
@@ -1138,7 +1139,9 @@ mod tests {
                 .err()
                 .unwrap()
         };
-        let rendered = crate::provider::ProviderError::from(error()).to_string();
+        let rendered = crate::provider::ProviderError::from(error())
+            .into_host_for_test()
+            .to_string();
         let cause_message = ProtocolConvertError::DurationOutOfRange.to_string();
         assert_eq!(rendered.matches(&cause_message).count(), 1, "{rendered}");
         let wire: carina_provider_protocol::types::ProviderError = error().into();

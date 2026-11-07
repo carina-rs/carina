@@ -1,12 +1,15 @@
 //! Conversions between carina-core types and Wasmtime-generated WIT types.
 
-use std::collections::{BTreeMap, HashMap};
-use std::fmt;
+#[cfg(test)]
+use carina_core::schema::ValidatedResourceSchema as CoreValidatedResourceSchema;
 
+use std::collections::{BTreeMap, HashMap};
+
+use super::super::MetadataDiagnostic;
 use carina_core::effect::PlanOp as CorePlanOp;
 use carina_core::provider::{
     AppliedIdentifier as CoreAppliedIdentifier, AppliedState as CoreAppliedState,
-    CreateRequest as CoreCreateRequest, DeleteRequest as CoreDeleteRequest, EmptyAppliedIdentifier,
+    CreateRequest as CoreCreateRequest, DeleteRequest as CoreDeleteRequest,
     PartialReadDiagnostic as CorePartialReadDiagnostic, PendingCreate as CorePendingCreate,
     ProviderDirectives as CoreProviderDirectives, ProviderError as CoreProviderError,
     ReadOutcome as CoreReadOutcome, ReadRequest as CoreReadRequest, SavedAttrs as CoreSavedAttrs,
@@ -15,7 +18,7 @@ use carina_core::provider::{
 };
 #[cfg(test)]
 use carina_core::provider::{PatchOp as CorePatchOp, ProviderDirectiveSchema};
-use carina_core::provider_text::{ProviderDiagnostic, ProviderString, ProviderText};
+use carina_core::provider_text::{DiagnosticText, ProviderKey};
 use carina_core::resource::{
     ConcreteValue, DeferredValue, RedactedSecretHash, ResourceId as CoreResourceId,
     ResourceIdentityState, SnapshotLeaf, SnapshotState as CoreSnapshotState,
@@ -36,7 +39,6 @@ use carina_core::schema::{
 use carina_core::schema::{
     ValidatedConfigSchema as CoreValidatedConfigSchema,
     ValidatedProviderSchemaWitness as CoreValidatedProviderSchemaWitness,
-    ValidatedResourceSchema as CoreValidatedResourceSchema,
 };
 use carina_core::value::{PERSISTED_SECRET_KEY, SerializationContext, SerializationError};
 use carina_core::wait::BindingPattern as CoreBindingPattern;
@@ -44,254 +46,14 @@ use carina_core::wait::predicate::{AttrPath as CoreAttrPath, AttrPathError};
 
 use carina_provider_protocol::types as proto;
 
-use crate::wasm_factory::version_checked_bindings::{WitPlanOp, wit_types as wit};
+use super::version_checked_bindings::{WitPlanOp, wit_types as wit};
 
-/// Error raised when provider-emitted schema wire data cannot be decoded.
-///
-/// External provider metadata is version-gated but still untrusted at this
-/// boundary; carina#3459 makes unsupported wire shapes explicit errors instead
-/// of panics so callers can attach provider context.
-#[derive(Debug)]
-pub enum SchemaDecodeError {
-    JsonParse(ProviderDiagnostic),
-    Protocol(carina_core::protocol_convert::SchemaDecodeError),
-}
-
-impl SchemaDecodeError {
-    fn schema_json_parse(err: serde_json::Error) -> Self {
-        Self::JsonParse(ProviderDiagnostic::new(err))
-    }
-
-    fn protocol_conversion(err: carina_core::protocol_convert::SchemaDecodeError) -> Self {
-        Self::Protocol(err)
-    }
-}
-
-impl fmt::Display for SchemaDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::JsonParse(_) => f.write_str("schema JSON parse error"),
-            Self::Protocol(_) => f.write_str("schema protocol conversion failed"),
-        }
-    }
-}
-
-impl std::error::Error for SchemaDecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::JsonParse(source) => Some(source),
-            Self::Protocol(source) => Some(source),
-        }
-    }
-}
-
-/// Failure to decode a raw scalar or JSON-backed recursive value at the WIT boundary.
-///
-/// The payload itself is deliberately not retained: `secret-val` may contain
-/// plaintext credentials. JSON syntax failures retain the structured serde
-/// error as typed data and render its diagnostic once without exposing the
-/// input.
-#[derive(Debug)]
-pub struct WasmValueDecodeError {
-    wit_variant: WitValueVariant,
-    attribute_path: Vec<ProviderText>,
-    kind: WasmValueDecodeErrorKind,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum WitValueVariant {
-    Float,
-    StringList,
-    List,
-    Map,
-    Secret,
-    RedactedSecret,
-}
-
-impl fmt::Display for WitValueVariant {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Float => "float-val",
-            Self::StringList => "string-list-val",
-            Self::List => "list-val",
-            Self::Map => "map-val",
-            Self::Secret => "secret-val",
-            Self::RedactedSecret => "redacted-secret-val",
-        })
-    }
-}
-
-#[derive(Debug)]
-enum WasmValueDecodeErrorKind {
-    InvalidFloat(carina_provider_protocol::NonFiniteFloatError),
-    InvalidJson(serde_json::Error),
-    ExpectedArray,
-    ExpectedObject,
-    ExpectedString { index: usize },
-    Null,
-    UnsupportedNumber,
-    MalformedPersistedSecret,
-    ReservedPersistedKey,
-    InvalidRedactedSecretDigest,
-}
-
-impl WasmValueDecodeError {
-    fn new(wit_variant: WitValueVariant, kind: WasmValueDecodeErrorKind) -> Self {
-        Self {
-            wit_variant,
-            attribute_path: Vec::new(),
-            kind,
-        }
-    }
-
-    fn prepend_attribute(mut self, name: &str) -> Self {
-        self.attribute_path.insert(0, name.into());
-        self
-    }
-}
-
-impl fmt::Display for WasmValueDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "failed to decode WIT {}", self.wit_variant)?;
-        if !self.attribute_path.is_empty() {
-            write!(
-                f,
-                " attribute '{}'",
-                ProviderText::new(self.attribute_path.join("."))
-            )?;
-        }
-        match &self.kind {
-            WasmValueDecodeErrorKind::InvalidFloat(_) => Ok(()),
-            WasmValueDecodeErrorKind::InvalidJson(error) => {
-                write!(f, ": invalid JSON: {error}")
-            }
-            WasmValueDecodeErrorKind::ExpectedArray => f.write_str(": expected a JSON array"),
-            WasmValueDecodeErrorKind::ExpectedObject => f.write_str(": expected a JSON object"),
-            WasmValueDecodeErrorKind::ExpectedString { index } => {
-                write!(f, ": expected a JSON string at array index {index}")
-            }
-            WasmValueDecodeErrorKind::Null => {
-                f.write_str(": JSON null is not supported by the value protocol")
-            }
-            WasmValueDecodeErrorKind::UnsupportedNumber => {
-                f.write_str(": JSON number cannot be represented by the value protocol")
-            }
-            WasmValueDecodeErrorKind::MalformedPersistedSecret => {
-                f.write_str(": malformed persisted redacted-secret tag")
-            }
-            WasmValueDecodeErrorKind::ReservedPersistedKey => {
-                f.write_str(": unescaped reserved persisted-state object key")
-            }
-            WasmValueDecodeErrorKind::InvalidRedactedSecretDigest => {
-                f.write_str(": invalid redacted-secret digest")
-            }
-        }
-    }
-}
-
-impl std::error::Error for WasmValueDecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.kind {
-            WasmValueDecodeErrorKind::InvalidFloat(source) => Some(source),
-            WasmValueDecodeErrorKind::InvalidJson(_source) => None,
-            WasmValueDecodeErrorKind::ExpectedArray
-            | WasmValueDecodeErrorKind::ExpectedObject
-            | WasmValueDecodeErrorKind::ExpectedString { index: _ }
-            | WasmValueDecodeErrorKind::Null
-            | WasmValueDecodeErrorKind::UnsupportedNumber
-            | WasmValueDecodeErrorKind::MalformedPersistedSecret
-            | WasmValueDecodeErrorKind::ReservedPersistedKey
-            | WasmValueDecodeErrorKind::InvalidRedactedSecretDigest => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AppliedStateOperation {
-    Read,
-    Create,
-    Update,
-}
-
-impl fmt::Display for AppliedStateOperation {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Read => "read",
-            Self::Create => "create",
-            Self::Update => "update",
-        })
-    }
-}
-
-#[derive(Debug)]
-enum WasmAppliedStateDecodeErrorKind {
-    Attributes(Box<WasmValueDecodeError>),
-    Identifier(EmptyAppliedIdentifier),
-}
-
-/// Failure to decode an existing-resource observation returned across the WIT
-/// boundary.
-///
-/// The operation and request resource ID are host-owned context. Causes are
-/// retained through the typed source chain.
-#[derive(Debug)]
-pub(crate) struct WasmAppliedStateDecodeError {
-    operation: AppliedStateOperation,
-    resource_id: Box<CoreResourceId>,
-    kind: WasmAppliedStateDecodeErrorKind,
-}
-
-impl WasmAppliedStateDecodeError {
-    fn attributes(
-        operation: AppliedStateOperation,
-        resource_id: &CoreResourceId,
-        source: WasmValueDecodeError,
-    ) -> Self {
-        Self {
-            operation,
-            resource_id: Box::new(resource_id.clone()),
-            kind: WasmAppliedStateDecodeErrorKind::Attributes(Box::new(source)),
-        }
-    }
-
-    fn identifier(
-        operation: AppliedStateOperation,
-        resource_id: &CoreResourceId,
-        source: EmptyAppliedIdentifier,
-    ) -> Self {
-        Self {
-            operation,
-            resource_id: Box::new(resource_id.clone()),
-            kind: WasmAppliedStateDecodeErrorKind::Identifier(source),
-        }
-    }
-}
-
-impl fmt::Display for WasmAppliedStateDecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.kind {
-            WasmAppliedStateDecodeErrorKind::Attributes(_) => write!(
-                f,
-                "failed to decode WIT {} outcome applied state attributes for resource '{}'",
-                self.operation, self.resource_id
-            ),
-            WasmAppliedStateDecodeErrorKind::Identifier(error) => write!(
-                f,
-                "failed to decode WIT {} outcome applied state identifier for resource '{}': {error}",
-                self.operation, self.resource_id
-            ),
-        }
-    }
-}
-
-impl std::error::Error for WasmAppliedStateDecodeError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match &self.kind {
-            WasmAppliedStateDecodeErrorKind::Attributes(source) => Some(source.as_ref()),
-            WasmAppliedStateDecodeErrorKind::Identifier(_source) => None,
-        }
-    }
-}
+pub use super::super::diagnostics::SchemaDecodeError;
+pub(super) use super::super::diagnostics::WasmAppliedStateDecodeError;
+use super::super::diagnostics::{
+    AppliedStateOperation, PendingToken, WasmValueDecodeError, WasmValueDecodeErrorKind,
+    WitValueVariant,
+};
 
 fn decode_float(value: f64) -> Result<carina_provider_protocol::FiniteF64, WasmValueDecodeError> {
     carina_provider_protocol::FiniteF64::new(value).map_err(|source| {
@@ -448,7 +210,7 @@ pub(crate) fn core_to_wit_value(v: &CoreValue) -> Result<wit::Value, Serializati
 
 fn persisted_json_key(key: &str) -> String {
     if key.starts_with('$') {
-        format!("${key}")
+        ["$", key].concat()
     } else {
         key.to_string()
     }
@@ -994,6 +756,7 @@ where
 /// views returned by state rows and then passed through
 /// `RawSavedAttrs::from_persisted(...).lift(...)`; desired attribute maps have
 /// no conversion into that provenance type.
+// confinement-allow-return: Outbound structured saved attributes; strings are wire keys, never diagnostic text.
 pub(crate) fn core_saved_attrs_to_wit(
     saved_attrs: &CoreSavedAttrs,
     id: &CoreResourceId,
@@ -1003,6 +766,8 @@ pub(crate) fn core_saved_attrs_to_wit(
         .map(core_to_wit_persisted_value_map)
         .transpose()
 }
+
+// confinement-allow-return: Decoded structured attribute map; keys remain schema-addressed data inside confinement.
 
 pub(crate) fn wit_to_core_value_map(
     entries: &[(String, wit::Value)],
@@ -1021,6 +786,7 @@ pub(crate) fn wit_to_core_value_map(
 /// or `update` using the structural persisted-state wire policy. Ordinary
 /// provider `create`, `read`, and data-source responses use
 /// [`wit_to_core_value_map`].
+// confinement-allow-return: Decoded structured persisted attributes; keys remain data inside confinement.
 pub(crate) fn wit_to_core_persisted_value_map(
     entries: &[(String, wit::PersistedValue)],
 ) -> Result<HashMap<String, CoreSnapshotValue>, WasmValueDecodeError> {
@@ -1041,18 +807,24 @@ pub(crate) fn wit_to_core_persisted_value_map(
 /// This intentionally does not use `Display`: pending IDs must retain the
 /// exact pre-pending-token wire spelling even though their diagnostic display
 /// now includes `<pending>`.
+// confinement-allow-return: Outbound host resource address used solely as a guest wire map key.
 pub(crate) fn resource_id_wire_key(id: &CoreResourceId) -> String {
     match (id.provider.is_empty(), id.identity_state()) {
         (true, ResourceIdentityState::Pending(_)) => id.resource_type.clone(),
         (true, ResourceIdentityState::Resolved(identity)) => {
-            format!("{}.{}", id.resource_type, identity.as_str())
+            [id.resource_type.as_str(), ".", identity.as_str()].concat()
         }
         (false, ResourceIdentityState::Pending(_)) => {
-            format!("{}.{}", id.provider, id.resource_type)
+            [id.provider.as_str(), ".", id.resource_type.as_str()].concat()
         }
-        (false, ResourceIdentityState::Resolved(identity)) => {
-            format!("{}.{}.{}", id.provider, id.resource_type, identity.as_str())
-        }
+        (false, ResourceIdentityState::Resolved(identity)) => [
+            id.provider.as_str(),
+            ".",
+            id.resource_type.as_str(),
+            ".",
+            identity.as_str(),
+        ]
+        .concat(),
     }
 }
 
@@ -1144,15 +916,6 @@ pub(crate) fn wit_to_core_read_outcome(
         wit::ReadOutcome::Found(state) => Ok(CoreReadOutcome::found(
             wit_to_core_applied_state_for_operation(state, id, AppliedStateOperation::Read)?,
         )),
-    }
-}
-
-#[derive(Clone)]
-struct PendingToken(String);
-
-impl fmt::Debug for PendingToken {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("<redacted pending token>")
     }
 }
 
@@ -1547,7 +1310,7 @@ pub(crate) fn wit_to_core_create_step(
             decode_created_attributes(state, id, Some(proto::Sent::AllRequestAttributes), None).map(
                 |decoded| {
                     decoded.map(|(identifier, attributes)| {
-                        match CorePartialReadDiagnostic::new(reason, missing_attributes) {
+                        match CorePartialReadDiagnostic::new(reason.into(), missing_attributes) {
                             Some(diagnostic) => proto::CreateStep::PartialSuccess {
                                 identifier,
                                 attributes,
@@ -1682,7 +1445,7 @@ pub(crate) fn wit_to_core_resume_step(
             } = diagnostic;
             decode_created_attributes(state, id, None, None).map(|decoded| {
                 decoded.map(|(identifier, attributes)| {
-                    match CorePartialReadDiagnostic::new(reason, missing_attributes) {
+                    match CorePartialReadDiagnostic::new(reason.into(), missing_attributes) {
                         Some(diagnostic) => proto::ResumeStep::PartialSuccess {
                             identifier,
                             attributes,
@@ -1822,6 +1585,7 @@ pub(crate) fn core_data_source_to_wit_resource(
 }
 
 /// Adapt already checked protocol values; this layer has no rejection policy.
+// confinement-allow-return: Outbound checked attributes; strings are wire keys, never diagnostic text.
 pub(crate) fn checked_attributes_to_wit(attributes: &WireAttributes) -> Vec<(String, wit::Value)> {
     attributes
         .iter()
@@ -1970,6 +1734,7 @@ pub(crate) fn decode_reference_results(
 #[cfg(test)]
 mod reference_tests {
     use super::*;
+    use crate::provider_text_fixtures::*;
     use carina_core::references::{ReferenceError, ReferenceOutcome};
 
     #[test]
@@ -1993,6 +1758,24 @@ mod reference_tests {
             Err(wit::ReferenceError::InvalidReference(guest_error())),
         ]);
         for result in results {
+            let result = result
+                .map(|outcome| match outcome {
+                    ReferenceOutcome::Resolved(value) => ReferenceOutcome::Resolved(value),
+                    ReferenceOutcome::NotFound(error) => {
+                        ReferenceOutcome::NotFound(error.into_host_for_test())
+                    }
+                })
+                .map_err(|error| match error {
+                    ReferenceError::AccessDenied(error) => ReferenceError::AccessDenied(
+                        std::sync::Arc::new(error.as_ref().clone().into_host_for_test()),
+                    ),
+                    ReferenceError::Transient(error) => ReferenceError::Transient(
+                        std::sync::Arc::new(error.as_ref().clone().into_host_for_test()),
+                    ),
+                    ReferenceError::InvalidReference(error) => ReferenceError::InvalidReference(
+                        std::sync::Arc::new(error.as_ref().clone().into_host_for_test()),
+                    ),
+                });
             let rendered = match result {
                 Ok(ReferenceOutcome::NotFound(error)) => error.to_string(),
                 Err(error) => std::error::Error::source(&error).unwrap().to_string(),
@@ -2138,16 +1921,19 @@ pub(crate) fn core_type_identity_to_wit(
 }
 
 /// Deserialize JSON to (name, display_name, version) tuple from ProviderInfo.
+// confinement-allow-return: Structured provider name from pre-input metadata; display name and version use protected text.
 pub fn json_to_provider_info(
     json: &str,
-) -> Result<(String, ProviderText, ProviderString), ProviderDiagnostic> {
-    let proto::ProviderInfo {
-        name,
-        display_name,
-        capabilities: _capabilities,
-        version,
-    } = serde_json::from_str(json).map_err(ProviderDiagnostic::new)?;
-    Ok((name, display_name.into(), version.into()))
+) -> Result<(String, DiagnosticText, ProviderKey), MetadataDiagnostic> {
+    (|| {
+        let proto::ProviderInfo {
+            name,
+            display_name,
+            capabilities: _capabilities,
+            version,
+        } = serde_json::from_str(json).map_err(MetadataDiagnostic::new)?;
+        Ok((name, display_name.into(), version.into()))
+    })()
 }
 
 /// Reject a provider whose protocol is outside this host's supported range.
@@ -2156,24 +1942,42 @@ pub fn json_to_provider_info(
 /// the author sets. A provider predating the envelope omits the field ->
 /// deserializes to 0 -> below any host minimum (the carina#3364 class).
 /// carina#3365.
-pub fn check_protocol_version(info_json: &str) -> Result<(), ProviderText> {
-    let envelope: proto::ProviderInfoEnvelope = serde_json::from_str(info_json)
-        .map_err(|e| ProviderText::new(format!("invalid provider info: {e}")))?;
+pub fn check_protocol_version(info_json: &str) -> Result<(), DiagnosticText> {
+    let envelope: proto::ProviderInfoEnvelope = serde_json::from_str(info_json).map_err(|e| {
+        DiagnosticText::new(
+            [
+                "invalid provider info: ",
+                &MetadataDiagnostic::new(e).to_string(),
+            ]
+            .concat(),
+        )
+    })?;
     let host = carina_provider_protocol::PROTOCOL_VERSION;
     let min = carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION;
     if envelope.protocol_version < min {
-        return Err(format!(
-            "provider '{}' was built against protocol version {} but this host \
-             requires at least version {}; rebuild the provider against the current carina protocol",
-            envelope.info.name, envelope.protocol_version, min
-        ).into());
+        return Err([
+            "provider '",
+            envelope.info.name.as_str(),
+            "' was built against protocol version ",
+            &envelope.protocol_version.to_string(),
+            " but this host requires at least version ",
+            &min.to_string(),
+            "; rebuild the provider against the current carina protocol",
+        ]
+        .concat()
+        .into());
     }
     if envelope.protocol_version > host {
-        return Err(format!(
-            "provider '{}' was built against protocol version {} but this host \
-             supports up to version {}; upgrade carina to load this provider",
-            envelope.info.name, envelope.protocol_version, host
-        )
+        return Err([
+            "provider '",
+            envelope.info.name.as_str(),
+            "' was built against protocol version ",
+            &envelope.protocol_version.to_string(),
+            " but this host supports up to version ",
+            &host.to_string(),
+            "; upgrade carina to load this provider",
+        ]
+        .concat()
         .into());
     }
     Ok(())
@@ -2189,7 +1993,7 @@ pub fn check_protocol_version(info_json: &str) -> Result<(), ProviderText> {
 /// dynamic component API; it never constructs runtime bindings or calls
 /// `initialize`. Keep this compatibility window explicit rather than
 /// weakening the ordinary provider runtime gate above.
-pub fn check_schema_only_protocol_version(info_json: &str) -> Result<(), ProviderText> {
+pub fn check_schema_only_protocol_version(info_json: &str) -> Result<(), DiagnosticText> {
     const LEGACY_SCHEMA_PROTOCOL_VERSION: u32 = 12;
 
     if schema_only_protocol_version(info_json)? == LEGACY_SCHEMA_PROTOCOL_VERSION {
@@ -2199,18 +2003,28 @@ pub fn check_schema_only_protocol_version(info_json: &str) -> Result<(), Provide
 }
 
 /// Read the protocol stamp after the schema-only compatibility gate admits it.
-pub(crate) fn schema_only_protocol_version(info_json: &str) -> Result<u32, ProviderText> {
-    let envelope: proto::ProviderInfoEnvelope = serde_json::from_str(info_json)
-        .map_err(|e| ProviderText::new(format!("invalid provider info: {e}")))?;
+pub(crate) fn schema_only_protocol_version(info_json: &str) -> Result<u32, DiagnosticText> {
+    let envelope: proto::ProviderInfoEnvelope = serde_json::from_str(info_json).map_err(|e| {
+        DiagnosticText::new(
+            [
+                "invalid provider info: ",
+                &MetadataDiagnostic::new(e).to_string(),
+            ]
+            .concat(),
+        )
+    })?;
     Ok(envelope.protocol_version)
 }
 
 /// Deserialize JSON to validated core resource schemas.
+#[cfg(test)]
 pub fn json_to_schemas(json: &str) -> Result<Vec<CoreValidatedResourceSchema>, SchemaDecodeError> {
-    let proto_schemas: Vec<proto::ResourceSchema> =
-        serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
-    carina_core::protocol_convert::protocol_to_resource_schemas(&proto_schemas)
-        .map_err(SchemaDecodeError::protocol_conversion)
+    (|| {
+        let proto_schemas: Vec<proto::ResourceSchema> =
+            serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
+        carina_core::protocol_convert::protocol_to_resource_schemas(&proto_schemas)
+            .map_err(SchemaDecodeError::protocol_conversion)
+    })()
 }
 
 /// Deserialize the provider schema envelope and admit it together with the
@@ -2219,19 +2033,23 @@ pub fn json_to_provider_schema(
     json: &str,
     config: CoreValidatedConfigSchema,
 ) -> Result<CoreValidatedProviderSchemaWitness, SchemaDecodeError> {
-    let envelope: proto::ProviderSchemaEnvelope =
-        serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
-    carina_core::protocol_convert::protocol_to_provider_schema_witness(&envelope, config)
-        .map_err(SchemaDecodeError::protocol_conversion)
+    (|| {
+        let envelope: proto::ProviderSchemaEnvelope =
+            serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
+        carina_core::protocol_convert::protocol_to_provider_schema_witness(&envelope, config)
+            .map_err(SchemaDecodeError::protocol_conversion)
+    })()
 }
 
 /// Deserialize a JSON-encoded `BTreeMap<String, AttributeType>` from a WASM
 /// guest and convert it to core `AttributeType` values.
 pub fn json_to_attribute_types(json: &str) -> Result<CoreValidatedConfigSchema, SchemaDecodeError> {
-    let proto_types: BTreeMap<String, proto::AttributeType> =
-        serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
-    carina_core::protocol_convert::protocol_to_config_schema(proto_types)
-        .map_err(SchemaDecodeError::protocol_conversion)
+    (|| {
+        let proto_types: BTreeMap<String, proto::AttributeType> =
+            serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
+        carina_core::protocol_convert::protocol_to_config_schema(proto_types)
+            .map_err(SchemaDecodeError::protocol_conversion)
+    })()
 }
 
 /// Decode the schema metadata surface admitted for a migration-only provider.
@@ -2245,18 +2063,20 @@ pub(crate) fn json_to_schema_only_attribute_types(
     json: &str,
     protocol_version: u32,
 ) -> Result<CoreValidatedConfigSchema, SchemaDecodeError> {
-    if protocol_version != 12 {
-        return json_to_attribute_types(json);
-    }
+    (|| {
+        if protocol_version != 12 {
+            return json_to_attribute_types(json);
+        }
 
-    let mut value: serde_json::Value =
-        serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
-    upgrade_v12_schema_json_in_memory(&mut value);
-    let value = serde_json::to_string(&value).map_err(SchemaDecodeError::schema_json_parse)?;
-    let proto_types: BTreeMap<String, proto::AttributeType> =
-        serde_json::from_str(&value).map_err(SchemaDecodeError::schema_json_parse)?;
-    carina_core::protocol_convert::protocol_to_config_schema(proto_types)
-        .map_err(SchemaDecodeError::protocol_conversion)
+        let mut value: serde_json::Value =
+            serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
+        upgrade_v12_schema_json_in_memory(&mut value);
+        let value = serde_json::to_string(&value).map_err(SchemaDecodeError::schema_json_parse)?;
+        let proto_types: BTreeMap<String, proto::AttributeType> =
+            serde_json::from_str(&value).map_err(SchemaDecodeError::schema_json_parse)?;
+        carina_core::protocol_convert::protocol_to_config_schema(proto_types)
+            .map_err(SchemaDecodeError::protocol_conversion)
+    })()
 }
 
 /// Decode v12 resource-schema JSON into the current aggregate witness used only
@@ -2267,24 +2087,26 @@ pub(crate) fn json_to_schema_only_provider_schema(
     config: CoreValidatedConfigSchema,
     protocol_version: u32,
 ) -> Result<CoreValidatedProviderSchemaWitness, SchemaDecodeError> {
-    if protocol_version != 12 {
-        return json_to_provider_schema(json, config);
-    }
+    (|| {
+        if protocol_version != 12 {
+            return json_to_provider_schema(json, config);
+        }
 
-    let mut resources: serde_json::Value =
-        serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
-    upgrade_v12_schema_json_in_memory(&mut resources);
-    let envelope = serde_json::json!({
-        "resources": resources,
-        "reference_forms": [],
-        "assignability_edges": [],
-    });
-    let envelope =
-        serde_json::to_string(&envelope).map_err(SchemaDecodeError::schema_json_parse)?;
-    let envelope: proto::ProviderSchemaEnvelope =
-        serde_json::from_str(&envelope).map_err(SchemaDecodeError::schema_json_parse)?;
-    carina_core::protocol_convert::protocol_to_provider_schema_witness(&envelope, config)
-        .map_err(SchemaDecodeError::protocol_conversion)
+        let mut resources: serde_json::Value =
+            serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
+        upgrade_v12_schema_json_in_memory(&mut resources);
+        let envelope = serde_json::json!({
+            "resources": resources,
+            "reference_forms": [],
+            "assignability_edges": [],
+        });
+        let envelope =
+            serde_json::to_string(&envelope).map_err(SchemaDecodeError::schema_json_parse)?;
+        let envelope: proto::ProviderSchemaEnvelope =
+            serde_json::from_str(&envelope).map_err(SchemaDecodeError::schema_json_parse)?;
+        carina_core::protocol_convert::protocol_to_provider_schema_witness(&envelope, config)
+            .map_err(SchemaDecodeError::protocol_conversion)
+    })()
 }
 
 fn upgrade_v12_schema_json_in_memory(value: &mut serde_json::Value) {
@@ -2422,6 +2244,10 @@ fn proto_struct_field_to_core(
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::diagnostics::WasmAppliedStateDecodeErrorKind;
+    use super::MetadataDiagnostic as ProviderDiagnostic;
+    use crate::provider_text_fixtures::*;
+    use carina_core::provider::EmptyAppliedIdentifier;
     mod assignability_edges_stage_a {
         use super::*;
 
@@ -2440,7 +2266,7 @@ mod tests {
         #[test]
         fn v12_migration_adapter_supplies_empty_assignability_edges() {
             let witness = json_to_schema_only_provider_schema(
-                include_str!("../tests/fixtures/protocol-v12/released-awscc-vpc.json"),
+                include_str!("../../../tests/fixtures/protocol-v12/released-awscc-vpc.json"),
                 CoreValidatedConfigSchema::default(),
                 12,
             )
@@ -2609,16 +2435,17 @@ mod tests {
         let create = match create {
             proto::CreateVerdict::InFlight(in_flight) => in_flight,
             proto::CreateVerdict::NotCreated(error) => {
-                panic!("in-flight create became not_created: {error}")
+                panic!("in-flight create became not_created: {error:?}")
             }
             proto::CreateVerdict::IdentifierReported(identified) => {
                 panic!("in-flight create became identifier-reported: {identified:?}")
             }
             proto::CreateVerdict::NoResource(error) => {
-                panic!("in-flight create became no_resource: {error}")
+                panic!("in-flight create became no_resource: {error:?}")
             }
         };
         let proto::CreateInFlight { pending, error } = create;
+        let error = error.into_host_for_test();
         assert_eq!(pending.token.expose_for_provider_call(), "create-token");
         assert_eq!(
             pending.identifier().map(proto::AppliedIdentifier::as_str),
@@ -2646,19 +2473,20 @@ mod tests {
         let poll = match poll {
             proto::PollVerdict::InFlight(in_flight) => in_flight,
             proto::PollVerdict::NotCreated(error) => {
-                panic!("in-flight poll became not_created: {error}")
+                panic!("in-flight poll became not_created: {error:?}")
             }
             proto::PollVerdict::IdentifierReported(identified) => {
                 panic!("in-flight poll became identifier-reported: {identified:?}")
             }
             proto::PollVerdict::NoResource(error) => {
-                panic!("in-flight poll became no_resource: {error}")
+                panic!("in-flight poll became no_resource: {error:?}")
             }
             proto::PollVerdict::Unchanged(error) => {
-                panic!("in-flight poll became unchanged: {error}")
+                panic!("in-flight poll became unchanged: {error:?}")
             }
         };
         let proto::CreateInFlight { pending, error } = poll;
+        let error = error.into_host_for_test();
         assert_eq!(pending.token.expose_for_provider_call(), "poll-token");
         assert!(error.to_string().contains("poll interrupted"));
 
@@ -2685,22 +2513,23 @@ mod tests {
         let resume = match resume {
             proto::ResumeVerdict::InFlight(in_flight) => in_flight,
             proto::ResumeVerdict::NotCreated(error) => {
-                panic!("in-flight resume became not_created: {error}")
+                panic!("in-flight resume became not_created: {error:?}")
             }
             proto::ResumeVerdict::IdentifierReported(identified) => {
                 panic!("in-flight resume became identifier-reported: {identified:?}")
             }
             proto::ResumeVerdict::NoResource(error) => {
-                panic!("in-flight resume became no_resource: {error}")
+                panic!("in-flight resume became no_resource: {error:?}")
             }
             proto::ResumeVerdict::Unchanged(error) => {
-                panic!("in-flight resume became unchanged: {error}")
+                panic!("in-flight resume became unchanged: {error:?}")
             }
             proto::ResumeVerdict::Resent(verdict) => {
                 panic!("in-flight resume became resent: {verdict:?}")
             }
         };
         let proto::ResumeInFlight { pending, error } = resume;
+        let error = error.into_host_for_test();
         assert_eq!(pending.token.expose_for_provider_call(), "resume-token");
         assert_eq!(
             pending.identifier().map(proto::AppliedIdentifier::as_str),
@@ -5052,7 +4881,7 @@ mod tests {
             code: Some(attack.into()),
             request_id: Some(attack.into()),
         });
-        let decoded = wit_to_core_provider_error(error);
+        let decoded = wit_to_core_provider_error(error).into_host_for_test();
         let rendered = decoded.to_string();
         assert!(!rendered.contains(['\x1b', '\x07', '\r', '\u{9b}']));
         assert!(rendered.contains("\\u{1b}]52;c;ZXZpbA==\\u{7}"));
@@ -5117,6 +4946,7 @@ mod tests {
 
     #[test]
     fn test_provider_error_variant_round_trip_through_wit() {
+        use carina_core::provider::HostError as CoreProviderError;
         // Build host-side core errors of every variant, convert them
         // to the WIT shape, then back. The variant tag must be
         // preserved exactly so host code matching on the variant
@@ -5142,7 +4972,7 @@ mod tests {
 
         for (err, is_variant) in cases {
             let wit_err = wire_to_wit_provider_error(err.to_wire());
-            let back = wit_to_core_provider_error(wit_err);
+            let back = wit_to_core_provider_error(wit_err).into_host_for_test();
             assert!(is_variant(&back), "variant lost for {}", err.variant_name());
             assert_eq!(
                 back.detail().context(),
@@ -5154,6 +4984,7 @@ mod tests {
 
     #[test]
     fn test_provider_error_terminal_cause_and_detail_fields_round_trip() {
+        use carina_core::provider::HostError as CoreProviderError;
         // Resource id, complete terminal cause, provider name, and structured
         // fields must survive core -> wire -> WIT -> wire -> core. The
         // operation wrapper renders its actionable typed detail itself.
@@ -5162,13 +4993,15 @@ mod tests {
             source: std::io::Error::other("inner io error"),
         };
         let id = CoreResourceId::with_provider_identity("aws", "s3.Bucket", "my-bucket", None);
-        let err = CoreProviderError::api_error_caused_by("Failed to read", cause)
-            .for_resource(id.clone())
-            .for_provider("aws")
-            .with_operation("s3.HeadBucket")
-            .with_status(503)
-            .with_code("ServiceUnavailable")
-            .with_request_id("request-123");
+        let err =
+            carina_core::provider::ProviderError::api_error_caused_by("Failed to read", cause)
+                .into_host_for_test()
+                .for_resource(id.clone())
+                .for_provider("aws")
+                .with_operation("s3.HeadBucket")
+                .with_status(503)
+                .with_code("ServiceUnavailable")
+                .with_request_id("request-123");
 
         let wire: proto::ProviderError = err.to_wire();
         assert_eq!(
@@ -5176,7 +5009,7 @@ mod tests {
             Some("in operation read: inner io error")
         );
         let wit_err = wire_to_wit_provider_error(wire);
-        let back = wit_to_core_provider_error(wit_err);
+        let back = wit_to_core_provider_error(wit_err).into_host_for_test();
         assert!(matches!(back, CoreProviderError::ApiError(_)));
         let detail = back.detail();
         assert_eq!(detail.context(), "Failed to read");
@@ -5221,7 +5054,7 @@ mod tests {
             .with_request_id("997aa923-2aa4-4d2b-8d16-44fd21c81368");
 
         let wit_err = wire_to_wit_provider_error(err.to_wire());
-        let back = wit_to_core_provider_error(wit_err);
+        let back = wit_to_core_provider_error(wit_err).into_host_for_test();
         let detail = back.detail();
         assert_eq!(detail.operation.as_deref(), Some("iam.ListRoles"));
         assert_eq!(detail.status, Some(403));
@@ -5351,11 +5184,12 @@ mod tests {
                 .validate()
                 .unwrap(),
         );
+        let normalizer_boundary = crate::provider_text_fixtures::normalizer("", Box::new(LateSecrets));
         let context = carina_core::executor::ProviderPreparationContext::new(
             &bindings,
             &gate,
             &[],
-            &LateSecrets,
+            &normalizer_boundary,
             &[],
             &schemas,
  type_checks,
@@ -5556,7 +5390,7 @@ mod tests {
 
     #[test]
     fn input_rules_are_supplied_only_by_v12_migration_upgrade() {
-        let json = include_str!("../tests/fixtures/protocol-v12/released-awscc-vpc.json");
+        let json = include_str!("../../../tests/fixtures/protocol-v12/released-awscc-vpc.json");
         let witness =
             json_to_schema_only_provider_schema(json, CoreValidatedConfigSchema::default(), 12)
                 .unwrap();
@@ -5665,18 +5499,18 @@ mod tests {
             (
                 "acm.Certificate",
                 include_str!(
-                    "../tests/fixtures/protocol-v12/aws-acm-domain-validation-options.json"
+                    "../../../tests/fixtures/protocol-v12/aws-acm-domain-validation-options.json"
                 ),
             ),
             (
                 "ec2.EgressOnlyInternetGateway",
                 include_str!(
-                    "../tests/fixtures/protocol-v12/released-aws-egress-only-internet-gateway.json"
+                    "../../../tests/fixtures/protocol-v12/released-aws-egress-only-internet-gateway.json"
                 ),
             ),
             (
                 "ec2.Vpc",
-                include_str!("../tests/fixtures/protocol-v12/released-awscc-vpc.json"),
+                include_str!("../../../tests/fixtures/protocol-v12/released-awscc-vpc.json"),
             ),
         ];
 
@@ -6371,18 +6205,18 @@ mod tests {
             (
                 "acm.Certificate",
                 include_str!(
-                    "../tests/fixtures/protocol-v12/aws-acm-domain-validation-options.json"
+                    "../../../tests/fixtures/protocol-v12/aws-acm-domain-validation-options.json"
                 ),
             ),
             (
                 "ec2.EgressOnlyInternetGateway",
                 include_str!(
-                    "../tests/fixtures/protocol-v12/released-aws-egress-only-internet-gateway.json"
+                    "../../../tests/fixtures/protocol-v12/released-aws-egress-only-internet-gateway.json"
                 ),
             ),
             (
                 "ec2.Vpc",
-                include_str!("../tests/fixtures/protocol-v12/released-awscc-vpc.json"),
+                include_str!("../../../tests/fixtures/protocol-v12/released-awscc-vpc.json"),
             ),
         ] {
             let witness =
@@ -7663,7 +7497,9 @@ mod tests {
                 CoreResourceId::with_provider_identity("mock", "test.resource", "example", None);
             let error =
                 WasmAppliedStateDecodeError::attributes(AppliedStateOperation::Read, &id, error);
-            let diagnostic = ProviderDiagnostic::new(error).to_string();
+            let diagnostic = carina_core::provider_text::ProviderDiagnostic::new(error)
+                .into_host_for_test()
+                .to_string();
             assert_eq!(
                 diagnostic.matches("float-val attribute 'ratio'").count(),
                 1,

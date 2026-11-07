@@ -55,17 +55,17 @@ impl<R> StaticType<R, ConsumerResolvedType> {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum StaticTypeResolutionError {
-    #[error("unknown custom type '{name}'", name = crate::provider_text::ProviderText::new(name))]
+    #[error("unknown custom type '{name}'", name = crate::provider_text::DiagnosticText::new(name))]
     UnknownCustomType { name: String },
-    #[error("unknown custom type '{name}'; suggestion: use '{suggestion}'", name = crate::provider_text::ProviderText::new(name), suggestion = crate::provider_text::ProviderText::new(suggestion))]
+    #[error("unknown custom type '{name}'; suggestion: use '{suggestion}'", name = crate::provider_text::DiagnosticText::new(name), suggestion = crate::provider_text::DiagnosticText::new(suggestion))]
     UnknownCustomTypeWithSuggestion { name: String, suggestion: String },
-    #[error("custom type '{name}' has conflicting scalar kinds: {first_kind} and {second_kind}", name = crate::provider_text::ProviderText::new(name))]
+    #[error("custom type '{name}' has conflicting scalar kinds: {first_kind} and {second_kind}", name = crate::provider_text::DiagnosticText::new(name))]
     ConflictingScalarKinds {
         name: String,
         first_kind: crate::schema::RefinedScalarKind,
         second_kind: crate::schema::RefinedScalarKind,
     },
-    #[error("cannot resolve declaration of custom type '{name}': {reason}", name = crate::provider_text::ProviderText::new(name), reason = crate::provider_text::ProviderText::new(reason))]
+    #[error("cannot resolve declaration of custom type '{name}': {reason}", name = crate::provider_text::DiagnosticText::new(name), reason = crate::provider_text::DiagnosticText::new(reason))]
     MissingDeclaration { name: String, reason: String },
 }
 
@@ -123,20 +123,20 @@ pub fn consumer_static_type_label(static_type: &ConsumerStaticType) -> &TypeExpr
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum NotInferableReason {
     /// A valid expression whose type requires its resolved value.
-    #[error("{reason}", reason = crate::provider_text::ProviderText::new(reason))]
+    #[error("{reason}", reason = crate::provider_text::DiagnosticText::new(reason))]
     ValueDependent { reason: String },
     #[error("missing value")]
     MissingValue,
-    #[error("binding `{binding}` is not inferable in this context", binding = crate::provider_text::ProviderText::new(binding))]
+    #[error("binding `{binding}` is not inferable in this context", binding = crate::provider_text::DiagnosticText::new(binding))]
     NonInferableBinding { binding: String },
-    #[error("schema is unavailable for binding `{binding}`", binding = crate::provider_text::ProviderText::new(binding))]
+    #[error("schema is unavailable for binding `{binding}`", binding = crate::provider_text::DiagnosticText::new(binding))]
     SchemaUnavailable { binding: String },
     /// The parser slot has not yet been substituted and no declaration in the
     /// current inference scope establishes its type. This is unavailable
     /// authority, not evidence of an invalid type or invalid postfix access.
-    #[error("type authority is unavailable for parser placeholder `{placeholder}`", placeholder = crate::provider_text::ProviderText::new(placeholder))]
+    #[error("type authority is unavailable for parser placeholder `{placeholder}`", placeholder = crate::provider_text::DiagnosticText::new(placeholder))]
     PlaceholderTypeUnavailable { placeholder: String },
-    #[error("provider schema is unavailable for type `{identity}`", identity = crate::provider_text::ProviderText::new(identity.to_string()))]
+    #[error("provider schema is unavailable for type `{identity}`", identity = crate::provider_text::DiagnosticText::new(identity.to_string()))]
     CustomTypeSchemaUnavailable {
         identity: crate::schema::TypeIdentity,
     },
@@ -152,33 +152,33 @@ pub enum InferenceError {
     },
     #[error(transparent)]
     MissingEvidence(#[from] crate::parser::retained::MissingEvidence),
-    #[error("{reason}", reason = crate::provider_text::ProviderText::new(reason))]
+    #[error("{reason}", reason = crate::provider_text::DiagnosticText::new(reason))]
     UnknownType { reason: String },
-    #[error("collection element types disagree: `{}` vs `{}`", crate::provider_text::ProviderText::new(types.expected()), crate::provider_text::ProviderText::new(types.actual()))]
+    #[error("collection element types disagree: `{}` vs `{}`", crate::provider_text::DiagnosticText::new(types.expected()), crate::provider_text::DiagnosticText::new(types.actual()))]
     HeterogeneousCollection {
         types: crate::schema::MismatchTypeNames,
     },
-    #[error("coalesce default type `{}` does not match left type `{}`", crate::provider_text::ProviderText::new(types.actual()), crate::provider_text::ProviderText::new(types.expected()))]
+    #[error("coalesce default type `{}` does not match left type `{}`", crate::provider_text::DiagnosticText::new(types.actual()), crate::provider_text::DiagnosticText::new(types.expected()))]
     IncompatibleCoalesceTypes {
         types: crate::schema::MismatchTypeNames,
     },
-    #[error("operator '{op}': {side} operand must be Int, got {actual}", actual = crate::provider_text::ProviderText::new(actual))]
+    #[error("operator '{op}': {side} operand must be Int, got {actual}", actual = crate::provider_text::DiagnosticText::new(actual))]
     InvalidIntegerArithmeticOperand {
         op: crate::integer_arithmetic::IntegerOp,
         side: crate::integer_arithmetic::IntegerOperandSide,
         actual: String,
         operator_span: crate::integer_arithmetic::IntegerOperatorSpan,
     },
-    #[error("unknown binding `{binding}`", binding = crate::provider_text::ProviderText::new(binding))]
+    #[error("unknown binding `{binding}`", binding = crate::provider_text::DiagnosticText::new(binding))]
     UnknownBinding { binding: String },
-    #[error("unknown attribute `{attribute}` on `{binding}`", binding = crate::provider_text::ProviderText::new(binding), attribute = crate::provider_text::ProviderText::new(attribute))]
+    #[error("unknown attribute `{attribute}` on `{binding}`", binding = crate::provider_text::DiagnosticText::new(binding), attribute = crate::provider_text::DiagnosticText::new(attribute))]
     UnknownAttribute { binding: String, attribute: String },
-    #[error("cannot apply access {step} to {base_type}", base_type = crate::provider_text::ProviderText::new(base_type), step = crate::provider_text::ProviderText::new(step.to_string()))]
+    #[error("cannot apply access {step} to {base_type}", base_type = crate::provider_text::DiagnosticText::new(base_type), step = crate::provider_text::DiagnosticText::new(step.to_string()))]
     InvalidAccess {
         base_type: String,
         step: PathSegment,
     },
-    #[error("cyclic composition binding chain: {}", crate::provider_text::ProviderText::new(cycle.join(" -> ")))]
+    #[error("cyclic composition binding chain: {}", crate::provider_text::DiagnosticText::new(cycle.join(" -> ")))]
     CyclicVirtualBinding { cycle: Vec<String> },
 }
 

@@ -6,7 +6,10 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use carina_core::provider_text::{MAX_PROVIDER_TEXT_BYTES, ProviderTextBuilder};
+use carina_core::provider::ProviderValidationInputs;
+use carina_core::provider_text::GuestInputInventory;
+use carina_core::provider_text::RedactionSet;
+use carina_core::provider_text::{MAX_PROVIDER_TEXT_BYTES, RedactingLineWriter};
 use hyper::body::Bytes;
 use tokio::io::AsyncWrite;
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
@@ -14,29 +17,83 @@ use wasmtime_wasi::p2::{OutputStream, Pollable, StreamError, StreamResult};
 
 /// All handles for one guest stderr share a buffer and a host-owned sink.
 #[derive(Clone)]
-pub(super) struct GuestStderr {
+pub(in crate::wasm_factory) struct GuestStderr {
     state: Arc<Mutex<LineBuffer>>,
 }
 
 struct LineBuffer {
-    text: ProviderTextBuilder,
+    writer: Option<RedactingLineWriter<SharedSink>>,
+    session: Option<RedactionSet>,
     utf8_tail: Vec<u8>,
-    has_pending: bool,
-    sink: Box<dyn Write + Send>,
+    sink: SharedSink,
     failed: bool,
 }
-
+#[derive(Clone)]
+struct SharedSink(Arc<Mutex<Box<dyn Write + Send>>>);
+impl Write for SharedSink {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flush()
+    }
+}
 impl GuestStderr {
-    pub(super) fn new(sink: impl Write + Send + 'static) -> Self {
+    pub(in crate::wasm_factory) fn new(sink: impl Write + Send + 'static) -> Self {
+        let sink = SharedSink(Arc::new(Mutex::new(Box::new(sink))));
         Self {
             state: Arc::new(Mutex::new(LineBuffer {
-                text: ProviderTextBuilder::default(),
+                writer: Some(RedactingLineWriter::for_metadata(sink.clone())),
+                session: None,
                 utf8_tail: Vec::with_capacity(char::MAX.len_utf8()),
-                has_pending: false,
-                sink: Box::new(sink),
+                sink,
                 failed: false,
             })),
         }
+    }
+    #[cfg(test)]
+    pub(in crate::wasm_factory) fn begin_call(
+        &self,
+        session: &ProviderValidationInputs,
+    ) -> GuestStderrCall {
+        self.begin_inventory_call(session, &session.guest_inventory())
+    }
+    pub(in crate::wasm_factory) fn begin_inventory_call(
+        &self,
+        session: &ProviderValidationInputs,
+        inputs: &GuestInputInventory,
+    ) -> GuestStderrCall {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = state.flush_pending();
+        state.session = Some(session.redaction_set().clone());
+        state.writer = Some(inputs.line_writer(state.sink.clone()));
+        GuestStderrCall(self.clone())
+    }
+    pub(in crate::wasm_factory) fn known_secrets(&self) -> Option<RedactionSet> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .session
+            .clone()
+    }
+
+    pub(in crate::wasm_factory) fn write_line(&self, text: &str) -> io::Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.write_bytes(text.as_bytes())?;
+        state.write_bytes(b"\n")?;
+        state.flush_pending()
     }
 
     fn write_bytes(&self, bytes: &[u8]) -> io::Result<()> {
@@ -61,16 +118,29 @@ impl GuestStderr {
     }
 }
 
+pub(in crate::wasm_factory) struct GuestStderrCall(GuestStderr);
+impl Drop for GuestStderrCall {
+    fn drop(&mut self) {
+        let _ = self.0.flush_pending();
+    }
+}
 impl Drop for LineBuffer {
     fn drop(&mut self) {
-        // Rust's WASI stdio repeatedly opens, flushes, and drops handles for
-        // pieces of a single line. Only the final shared owner ends a partial
-        // line, after both the context and its handles have been dropped.
         let _ = self.flush_pending();
     }
 }
-
 impl LineBuffer {
+    fn push_str(&mut self, text: &str) -> io::Result<()> {
+        let result = self
+            .writer
+            .as_mut()
+            .expect("stderr writer installed")
+            .push_str(text);
+        if result.is_err() {
+            self.failed = true;
+        }
+        result
+    }
     fn ensure_open(&self) -> io::Result<()> {
         if self.failed {
             Err(io::Error::new(
@@ -84,67 +154,58 @@ impl LineBuffer {
 
     fn write_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
         self.ensure_open()?;
-        for &byte in bytes {
-            if byte == b'\n' {
-                self.emit_line()?;
-            } else {
-                self.has_pending = true;
-                self.utf8_tail.push(byte);
-                self.decode_utf8_tail();
-            }
+        if self.utf8_tail.is_empty() {
+            self.decode_utf8_chunk(bytes)
+        } else {
+            let mut pending = std::mem::take(&mut self.utf8_tail);
+            pending.extend_from_slice(bytes);
+            self.decode_utf8_chunk(&pending)
         }
-        Ok(())
     }
 
-    fn decode_utf8_tail(&mut self) {
+    fn decode_utf8_chunk(&mut self, mut bytes: &[u8]) -> io::Result<()> {
         loop {
-            match std::str::from_utf8(&self.utf8_tail) {
+            match std::str::from_utf8(bytes) {
                 Ok(text) => {
-                    self.text.push_str(text);
-                    self.utf8_tail.clear();
-                    return;
+                    if !text.is_empty() {
+                        self.push_str(text)?;
+                    }
+                    return Ok(());
                 }
                 Err(error) => {
-                    let valid = std::str::from_utf8(&self.utf8_tail[..error.valid_up_to()])
+                    let valid = std::str::from_utf8(&bytes[..error.valid_up_to()])
                         .expect("UTF-8 error identifies a valid prefix");
-                    self.text.push_str(valid);
-                    self.utf8_tail.drain(..error.valid_up_to());
+                    if !valid.is_empty() {
+                        self.push_str(valid)?;
+                    }
+                    bytes = &bytes[error.valid_up_to()..];
                     match error.error_len() {
                         Some(length) => {
-                            self.text.push_str("\u{fffd}");
-                            self.utf8_tail.drain(..length);
+                            self.push_str("\u{fffd}")?;
+                            bytes = &bytes[length..];
                         }
                         // At most three bytes can await a scalar's completion.
-                        None => return,
+                        None => {
+                            self.utf8_tail.extend_from_slice(bytes);
+                            return Ok(());
+                        }
                     }
                 }
             }
         }
     }
 
-    fn emit_line(&mut self) -> io::Result<()> {
-        if !self.utf8_tail.is_empty() {
-            self.text.push_str("\u{fffd}");
-            self.utf8_tail.clear();
-        }
-        let text = std::mem::take(&mut self.text).finish();
-        self.has_pending = false;
-        // The newline is host framing; line content, including the marker for
-        // the entire omitted tail, is capped by the shared sanitizer.
-        let result = writeln!(self.sink, "{text}").and_then(|()| self.sink.flush());
-        if result.is_err() {
-            self.failed = true;
-        }
-        result
-    }
-
     fn flush_pending(&mut self) -> io::Result<()> {
         self.ensure_open()?;
-        if !self.has_pending {
-            self.flush_sink()
-        } else {
-            self.emit_line()
+        if !self.utf8_tail.is_empty() {
+            self.push_str("\u{fffd}")?;
+            self.utf8_tail.clear();
         }
+        self.writer
+            .as_mut()
+            .expect("stderr writer installed")
+            .finish()?;
+        self.flush_sink()
     }
 
     fn flush_sink(&mut self) -> io::Result<()> {
@@ -224,8 +285,55 @@ impl AsyncWrite for GuestStderr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use carina_core::provider_text::ProviderText;
+    use crate::provider_text_fixtures::*;
     use tokio::io::AsyncWriteExt;
+
+    mod round5 {
+        include!("guest_stderr/tests/round5.rs");
+    }
+
+    struct StderrConfigFactory;
+    impl carina_core::provider::ProviderFactory for StderrConfigFactory {
+        fn name(&self) -> &str {
+            "stderr-test"
+        }
+        fn display_name(&self) -> &str {
+            "stderr test"
+        }
+        fn validate_config(
+            &self,
+            _: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
+        ) -> carina_core::provider::ProviderResult<()> {
+            Ok(())
+        }
+        fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
+            carina_core::schema::ValidatedConfigSchema::validate(std::collections::BTreeMap::new())
+                .unwrap()
+        }
+        fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
+            Vec::new()
+        }
+        fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
+            carina_core::schema::ValidatedProviderSchemaWitness::new(
+                Vec::new(),
+                self.provider_config_attribute_types(),
+                Default::default(),
+                Vec::new(),
+            )
+            .unwrap()
+        }
+        fn create_provider(
+            &self,
+            _: &carina_core::provider::ProviderSession,
+            _: carina_core::provider::InitializeOutcomeMint,
+        ) -> carina_core::provider::BoxFuture<
+            '_,
+            carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
+        > {
+            unreachable!("stderr test only prepares config")
+        }
+    }
 
     #[derive(Clone, Default)]
     struct Capture(Arc<Mutex<Vec<u8>>>);
@@ -258,8 +366,264 @@ mod tests {
         }
     }
 
+    fn call_secrets(plaintext: &str) -> ProviderValidationInputs {
+        crate::provider_text_fixtures::context(&[plaintext])
+            .session()
+            .guest_inputs()
+    }
+
+    #[test]
+    fn review_round7_guest_stderr_large_chunks_avoid_per_byte_refresh_and_locks() {
+        const CHUNK: usize = 4093;
+        const SPLIT: &str = "split-private-4305";
+        let capture = Capture::default();
+        let stderr = GuestStderr::new(capture.clone());
+        let context = crate::provider_text_fixtures::context(&[
+            "volume-private-4305",
+            "unicode-秘密-4305",
+            SPLIT,
+        ]);
+        let call = stderr.begin_call(&context.session().guest_inputs());
+        let line = "2026-11-07T12:34:56Z DEBUG provider::request public-context token=volume-private-4305 unicode-秘密-4305\n";
+        let mut volume = line.repeat((1024usize * 1024).div_ceil(line.len()));
+        volume.push_str(&"p".repeat((CHUNK - volume.len() % CHUNK + CHUNK - 8) % CHUNK));
+        volume.push_str(SPLIT);
+        volume.push_str(" public-tail\n");
+        let writes = volume.as_bytes().chunks(CHUNK).count();
+        for chunk in volume.as_bytes().chunks(CHUNK) {
+            stderr.write_bytes(chunk).unwrap();
+        }
+        drop(call);
+        let output = capture.text();
+        for secret in ["volume-private-4305", "unicode-秘密-4305", SPLIT] {
+            assert!(!output.contains(secret), "large stderr leaked {secret}");
+        }
+        assert!(output.contains("public-context"));
+        assert!(output.contains("(secret) public-tail"));
+        let (refresh_checks, snapshot_locks) = stderr
+            .state
+            .lock()
+            .unwrap()
+            .writer
+            .as_ref()
+            .unwrap()
+            .redaction_stats_for_test();
+        eprintln!(
+            "stderr redaction counters: {writes} writes, {refresh_checks} refresh checks, {snapshot_locks} snapshot locks"
+        );
+        assert!(
+            refresh_checks <= writes + 2,
+            "{refresh_checks} refresh checks for {writes} decoded writes"
+        );
+        assert!(
+            snapshot_locks <= 2,
+            "unchanged inventory acquired {snapshot_locks} snapshot locks"
+        );
+    }
+
+    #[test]
+    fn guest_stderr_uses_current_call_then_instance_union_without_a_call() {
+        let capture = Capture::default();
+        let stderr = GuestStderr::new(capture.clone());
+        let mut stream = stderr.p2_stream();
+        {
+            let _call = stderr.begin_call(
+                &crate::provider_text_fixtures::context(&["first-private", "second-private"])
+                    .session()
+                    .guest_inputs(),
+            );
+            write_all(stream.as_mut(), b"first-private\n");
+        }
+        {
+            let _call = stderr.begin_call(
+                &crate::provider_text_fixtures::context(&["first-private", "second-private"])
+                    .session()
+                    .guest_inputs(),
+            );
+            write_all(stream.as_mut(), b"first-private second-private\n");
+        }
+        write_all(stream.as_mut(), b"first-private second-private\n");
+        assert_eq!(
+            capture.text(),
+            "(secret)\n(secret) (secret)\n(secret) (secret)\n"
+        );
+        let independent = Capture::default();
+        let other = GuestStderr::new(independent.clone());
+        write_all(other.p2_stream().as_mut(), b"first-private\n");
+        assert_eq!(independent.text(), "first-private\n");
+    }
+
+    #[test]
+    fn review_a1_poison_relay_does_not_rescan_inserted_masks() {
+        let context = call_secrets("secret");
+        let stderr = GuestStderr::new(Capture::default());
+        drop(stderr.begin_call(&context));
+        let reason = super::super::PoisonReason::from_trap(
+            "create",
+            &wasmtime::Error::msg("secret"),
+            stderr.known_secrets().as_ref(),
+        );
+        let error = reason
+            .fail_fast_error("delete")
+            .with_secrets_for_test(&crate::provider_text_fixtures::context(&["secret"]));
+        assert_eq!(
+            error.to_string(),
+            "WASM provider instance unusable after trap in create: (secret) (operation 'delete'); re-run the command"
+        );
+    }
+
+    #[test]
+    fn review_a2_metadata_relay_retains_prior_call_context() {
+        let context =
+            crate::provider_text_fixtures::context(&["prior-private", "different-private"]);
+        let cause =
+            crate::wasm_factory::MetadataDiagnostic::new(std::io::Error::other("prior-private"));
+        let relayed =
+            carina_core::provider::ProviderError::internal_caused_by("public context", cause);
+        let received = relayed.with_secrets_for_test(&context);
+        assert_eq!(received.to_string(), "public context: (secret)");
+    }
+
+    #[test]
+    fn review_a4_guest_stderr_in_flight_retains_previous_resource_secrets() {
+        let capture = Capture::default();
+        let stderr = GuestStderr::new(capture.clone());
+        let mut stream = stderr.p2_stream();
+        drop(
+            stderr.begin_call(
+                &crate::provider_text_fixtures::context(&[
+                    "resource-a-password",
+                    "resource-b-password",
+                ])
+                .session()
+                .guest_inputs(),
+            ),
+        );
+        let call = stderr.begin_call(
+            &crate::provider_text_fixtures::context(&[
+                "resource-a-password",
+                "resource-b-password",
+            ])
+            .session()
+            .guest_inputs(),
+        );
+        write_all(
+            stream.as_mut(),
+            b"resource-a-password resource-b-password\n",
+        );
+        drop(call);
+        assert_eq!(capture.text(), "(secret) (secret)\n");
+    }
+
+    #[test]
+    fn guest_stderr_known_secrets_protect_poisoned_instance_diagnostics() {
+        let stderr = GuestStderr::new(Capture::default());
+        let call = stderr.begin_call(&call_secrets("previous-call-private"));
+        drop(call);
+        let reason = super::super::PoisonReason::from_trap(
+            "create",
+            &wasmtime::Error::msg("previous-call-private"),
+            stderr.known_secrets().as_ref(),
+        );
+        assert!(!format!("{reason:?}").contains("previous-call-private"));
+        let error = reason.fail_fast_error("delete").with_secrets_for_test(
+            &crate::provider_text_fixtures::context(&["previous-call-private"]),
+        );
+        assert!(error.to_string().contains("(secret)"));
+        assert!(!error.to_string().contains("previous-call-private"));
+    }
+
+    #[test]
+    fn guest_stderr_masks_multiline_secrets_before_line_framing() {
+        let capture = Capture::default();
+        let stderr = GuestStderr::new(capture.clone());
+        let mut stream = stderr.p2_stream();
+        let call = stderr.begin_call(&call_secrets("private\nmultiline"));
+        write_all(stream.as_mut(), b"public private\n");
+        assert!(!capture.text().contains("private"));
+        write_all(stream.as_mut(), b"multiline context\n");
+        drop(call);
+        assert_eq!(capture.text(), "public (secret) context\n");
+        write_all(stream.as_mut(), b"teardown private\nmultiline\n");
+        drop(stream);
+        drop(stderr);
+        assert_eq!(
+            capture.text(),
+            "public (secret) context\nteardown (secret)\n"
+        );
+    }
+
+    #[test]
+    fn guest_stderr_call_drop_flushes_partial_secret_and_protects_teardown() {
+        let capture = Capture::default();
+        let stderr = GuestStderr::new(capture.clone());
+        let mut stream = stderr.p2_stream();
+        let call = stderr.begin_call(&call_secrets("private-tail"));
+        write_all(stream.as_mut(), b"private-");
+        write_all(stream.as_mut(), b"tail");
+        assert!(capture.text().is_empty());
+        drop(call);
+        assert_eq!(capture.text(), "(secret)\n");
+        write_all(stream.as_mut(), b"teardown private-tail");
+        drop(stream);
+        drop(stderr);
+        assert_eq!(capture.text(), "(secret)\nteardown (secret)\n");
+    }
+
+    /// Unit-level coverage of the actual forwarding sink, without a compiled
+    /// WASM fixture. Split writes also exercise shared line buffering.
+    #[test]
+    fn guest_stderr_secret_plaintext_is_redacted_before_forwarding() {
+        const SECRET: &str = "guest-stderr-private-4305";
+        const MASK: &str = "(secret)";
+        let capture = Capture::default();
+        let stderr = GuestStderr::new(capture.clone());
+        let values = indexmap::IndexMap::from([(
+            "password".to_owned(),
+            carina_core::resource::Value::Deferred(carina_core::resource::DeferredValue::Secret(
+                Box::new(carina_core::resource::Value::Concrete(
+                    carina_core::resource::ConcreteValue::String(SECRET.into()),
+                ))
+                .into(),
+            )),
+        )]);
+        let factory = StderrConfigFactory;
+        let _config =
+            carina_core::executor::provider_ready::validate_and_canonicalize_provider_config(
+                &factory,
+                "mock",
+                &values,
+                &carina_core::provider::ProviderFactory::provider_config_attribute_types(&factory),
+            )
+            .unwrap();
+        let call = stderr.begin_call(&call_secrets(SECRET));
+        let mut stream = stderr.p2_stream();
+        write_all(
+            stream.as_mut(),
+            b"provider: public-context-4305 password=guest-stderr-",
+        );
+        write_all(stream.as_mut(), b"private-4305\n");
+        drop(stream);
+        drop(call);
+        drop(stderr);
+        let text = capture.text();
+        assert!(
+            text.contains("public-context-4305"),
+            "non-secret stderr context was lost: {text}"
+        );
+        assert!(
+            !text.contains(SECRET),
+            "provider secret plaintext leaked through guest stderr forwarding: {text}"
+        );
+        assert!(
+            text.contains(MASK),
+            "missing {MASK} in forwarded guest stderr: {text}"
+        );
+    }
+
     #[test]
     fn guest_stderr_omits_the_entire_oversized_tail_until_newline_or_final_drop() {
+        use carina_core::provider_text::DiagnosticText as ProviderText;
         for terminate_with_newline in [false, true] {
             let capture = Capture::default();
             let stderr = GuestStderr::new(capture.clone());
@@ -289,6 +653,7 @@ mod tests {
 
     #[test]
     fn guest_stderr_streaming_lossy_utf8_matches_whole_line_decoding() {
+        use carina_core::provider_text::DiagnosticText as ProviderText;
         for oversized in [false, true] {
             let capture = Capture::default();
             let stderr = GuestStderr::new(capture.clone());
@@ -452,6 +817,7 @@ mod tests {
 
     #[test]
     fn guest_stderr_keeps_utf8_at_truncation_boundaries_and_bounds_invalid_input() {
+        use carina_core::provider_text::DiagnosticText as ProviderText;
         for suffix in ["あ".as_bytes(), "🦀".as_bytes()] {
             let capture = Capture::default();
             let stderr = GuestStderr::new(capture.clone());

@@ -108,13 +108,13 @@ impl ProviderFactory for RuntimeEdgeFactory {
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> ProviderResult<()> {
         Ok(())
     }
     fn create_provider(
         &self,
-        _: Option<&str>,
-        _: &carina_core::provider::ProviderReadyConfig,
+        _: &carina_core::provider::ProviderSession,
         _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
@@ -283,13 +283,13 @@ impl ProviderFactory for ForwardFactory {
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> ProviderResult<()> {
         Ok(())
     }
     fn create_provider(
         &self,
-        _: Option<&str>,
-        _: &carina_core::provider::ProviderReadyConfig,
+        _: &carina_core::provider::ProviderSession,
         _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async { unreachable!("validation only") })
@@ -538,6 +538,7 @@ fn identity_edges_apply_checks_unknown_value_before_consumer_create() {
         output: Value::Concrete(ConcreteValue::String("bad-value".into())),
         creates: Mutex::new(Vec::new()),
     };
+    let provider = std::sync::Arc::new(provider);
     let input = LiveExecutionInput {
         plan: &creation_fixture::checked(fixture.plan.clone(), &fixture.schemas),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
@@ -562,7 +563,7 @@ fn identity_edges_apply_checks_unknown_value_before_consumer_create() {
     let outcome = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(execute_live_plan_for_test(
-            &provider,
+            &carina_cli::test_support::boundary(Box::new(std::sync::Arc::clone(&provider))),
             input,
             &Observer,
             carina_core::shutdown::ShutdownToken::running(),

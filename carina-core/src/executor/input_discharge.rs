@@ -13,7 +13,7 @@ use crate::{
     binding_index::SecretPreservingAttributes,
     effect::{DeletedInstanceKey, Effect, EffectGeneration},
     input_rules::{InputVerdict, PendingInputObligation, executor_write_site},
-    provider::{AppliedIdentifier, CreateRequest, Provider, UpdateRequest},
+    provider::{AppliedIdentifier, CreateRequest, HostProvider, UpdateRequest},
     resource::{Directives, ResourceId, Value},
     schema::SchemaRegistry,
 };
@@ -158,7 +158,7 @@ impl DeletePermit {
 
     pub(super) async fn dispatch(
         self,
-        provider: &dyn Provider,
+        provider: &dyn HostProvider,
         schemas: &SchemaRegistry,
     ) -> super::basic::BasicEffectResult {
         let target = self.target.clone();

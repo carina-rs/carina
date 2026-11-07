@@ -3,7 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::provider::{LiftedSavedAttrs, ProviderError, ProviderInstanceKey, ProviderRouter};
+use crate::provider::{
+    HostError, LiftedSavedAttrs, ProviderError, ProviderFailure, ProviderInstanceKey,
+    ProviderRouter,
+};
+use crate::provider_text::{Bound, TextState, Unbound};
 use crate::resource::{
     CanonicalComparisonAttributes, ConcreteValue, Current, PlanInputCurrent, ResolvedIgnoreChanges,
     ResolvedResource, ResourceId, Value, ValueString,
@@ -22,19 +26,23 @@ pub struct ReferenceRequest {
 pub struct CanonicalReference(String);
 
 #[derive(Debug)]
-pub enum ReferenceOutcome {
+pub enum ReferenceOutcome<S: TextState = Unbound> {
     Resolved(CanonicalReference),
-    NotFound(ProviderError),
+    NotFound(ProviderFailure<S>),
 }
 
+/// Complete result of one provider reference-resolution batch.
+pub type ReferenceResults<S = Unbound> =
+    crate::provider::ProviderResult<Vec<Result<ReferenceOutcome<S>, ReferenceError<S>>>, S>;
+
 #[derive(Debug, Clone, thiserror::Error)]
-pub enum ReferenceError {
+pub enum ReferenceError<S: TextState = Unbound> {
     #[error("reference access denied")] // error-chain: caller-renders-sources
-    AccessDenied(#[source] Arc<ProviderError>),
+    AccessDenied(#[source] Arc<ProviderFailure<S>>),
     #[error("reference resolution temporarily failed")] // error-chain: caller-renders-sources
-    Transient(#[source] Arc<ProviderError>),
+    Transient(#[source] Arc<ProviderFailure<S>>),
     #[error("invalid reference")] // error-chain: caller-renders-sources
-    InvalidReference(#[source] Arc<ProviderError>),
+    InvalidReference(#[source] Arc<ProviderFailure<S>>),
 }
 
 impl ReferenceOutcome {
@@ -58,11 +66,11 @@ impl ReferenceOutcome {
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ReferenceFailure {
     #[error("desired reference does not resolve")] // error-chain: caller-renders-sources
-    DesiredNotFound(#[source] Arc<ProviderError>),
+    DesiredNotFound(#[source] Arc<HostError>),
     #[error(transparent)]
-    Resolution(#[from] ReferenceError),
+    Resolution(#[from] ReferenceError<Bound>),
     #[error("provider reference resolution call failed")] // error-chain: caller-renders-sources
-    Call(#[source] Arc<ProviderError>),
+    Call(#[source] Arc<HostError>),
     #[error("reference comparison was not prepared")]
     MissingWitness,
     #[error("internal error: reference comparison was not prepared after the single replay")]
@@ -70,7 +78,7 @@ pub enum ReferenceFailure {
 }
 
 #[derive(Debug, thiserror::Error)]
-#[error("{}", crate::provider_text::ProviderText::new(format!("provider instance {instance:?}, resource {resource}, attribute {path}, reference {raw:?}")))] // error-chain: caller-renders-sources
+#[error("{}", crate::provider_text::DiagnosticText::new(format!("provider instance {instance:?}, resource {resource}, attribute {path}, reference {raw:?}")))] // error-chain: caller-renders-sources
 pub struct ReferencePlanError {
     pub instance: ProviderInstanceKey,
     pub resource: ResourceId,
@@ -82,15 +90,15 @@ pub struct ReferencePlanError {
 
 impl crate::resource::InsideSecret for ReferencePlanError {
     fn inside_secret(self) -> Self {
-        fn redact(error: Arc<ProviderError>) -> Arc<ProviderError> {
+        fn redact(error: Arc<HostError>) -> Arc<HostError> {
             use crate::provider::ProviderErrorKind;
             let message = crate::resource::INSIDE_SECRET_MESSAGE;
             Arc::new(match error.kind() {
-                ProviderErrorKind::InvalidInput => ProviderError::invalid_input(message),
-                ProviderErrorKind::ApiError => ProviderError::api_error(message),
-                ProviderErrorKind::NotFound => ProviderError::not_found(message),
-                ProviderErrorKind::Timeout => ProviderError::timeout(message),
-                ProviderErrorKind::Internal => ProviderError::internal(message),
+                ProviderErrorKind::InvalidInput => HostError::invalid_input(message),
+                ProviderErrorKind::ApiError => HostError::api_error(message),
+                ProviderErrorKind::NotFound => HostError::not_found(message),
+                ProviderErrorKind::Timeout => HostError::timeout(message),
+                ProviderErrorKind::Internal => HostError::internal(message),
             })
         }
         let source = match self.source {
@@ -116,9 +124,13 @@ impl crate::resource::InsideSecret for ReferencePlanError {
     }
 }
 
-impl From<Box<ReferencePlanError>> for ProviderError {
+impl From<Box<ReferencePlanError>> for HostError {
     fn from(error: Box<ReferencePlanError>) -> Self {
-        ProviderError::invalid_input_caused_by("Failed to prepare reference comparison", error)
+        HostError::from_diagnostic(
+            crate::provider::ProviderErrorKind::InvalidInput,
+            "Failed to prepare reference comparison",
+            crate::provider_text::HostDiagnostic::capture_host_or_provider(error),
+        )
     }
 }
 
@@ -282,7 +294,7 @@ impl ResolvedReferences {
                     path: operand.path.clone(),
                     raw: raw.clone(),
                     source: ReferenceError::InvalidReference(
-                        ProviderError::invalid_input("secret values cannot be used as references")
+                        HostError::invalid_input("secret values cannot be used as references")
                             .into(),
                     )
                     .into(),
@@ -389,7 +401,7 @@ pub struct ReferencePreparation {
 #[derive(Debug, Clone)]
 enum CachedOutcome {
     Resolved(CanonicalReference),
-    NotFound(Arc<ProviderError>),
+    NotFound(Arc<HostError>),
     Failed(ReferenceFailure),
 }
 
@@ -468,7 +480,7 @@ impl ReferencePreparation {
                     ],
                     Ok(outcomes) if outcomes.len() != requests.len() => {
                         let error = ReferenceError::InvalidReference(
-                            ProviderError::invalid_input(format!(
+                            HostError::invalid_input(format!(
                                 "reference result length mismatch: expected {}, got {}",
                                 requests.len(),
                                 outcomes.len(),
@@ -638,7 +650,7 @@ impl ReferencePreparation {
         registry: &SchemaRegistry,
         explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
         provider: &ProviderRouter,
-    ) -> crate::provider::ProviderResult<PreparedComparison<crate::detail_rows::PreparedPlanDisplay>>
+    ) -> crate::provider::HostResult<PreparedComparison<crate::detail_rows::PreparedPlanDisplay>>
     {
         let plan = Arc::new(plan);
         self.run(
@@ -839,9 +851,10 @@ impl ReferencePreparation {
                     path: "<planning>".into(),
                     raw: "<planning>".into(),
                     source: ReferenceFailure::Call(
-                        ProviderError::invalid_input_caused_by(
+                        HostError::from_diagnostic(
+                            crate::provider::ProviderErrorKind::InvalidInput,
                             "Failed to verify secret comparison",
-                            error,
+                            crate::provider_text::HostDiagnostic::capture_host_or_provider(error),
                         )
                         .into(),
                     ),
@@ -854,9 +867,10 @@ impl ReferencePreparation {
                     path: "<planning>".into(),
                     raw: "<planning>".into(),
                     source: ReferenceFailure::Call(
-                        ProviderError::invalid_input_caused_by(
+                        HostError::from_diagnostic(
+                            crate::provider::ProviderErrorKind::InvalidInput,
                             "Failed to resolve comparison resource",
-                            error,
+                            crate::provider_text::HostDiagnostic::capture_host_or_provider(error),
                         )
                         .into(),
                     ),
@@ -914,7 +928,7 @@ impl<'run> RecordingSession<'run> {
         provider: &ProviderRouter,
     ) -> ProvisionalComparison<
         'run,
-        crate::provider::ProviderResult<crate::detail_rows::PreparedPlanDisplay>,
+        crate::provider::HostResult<crate::detail_rows::PreparedPlanDisplay>,
     > {
         self.references
             .recording
@@ -1328,7 +1342,7 @@ impl ReferenceValidation<'_> {
                     resource: self.resource.clone(),
                     path: path.into(),
                     raw: ValueString::diagnostic_sensitive("<redacted>"),
-                    source: ReferenceError::InvalidReference(ProviderError::invalid_input(
+                    source: ReferenceError::InvalidReference(HostError::invalid_input(
                         "secret values cannot be used as references",
                     ).into()).into(),
                 }));
@@ -1359,7 +1373,7 @@ impl ReferenceValidation<'_> {
                 path: path.into(),
                 raw: ValueString::diagnostic_sensitive("<depth limit>"),
                 source: ReferenceError::InvalidReference(
-                    ProviderError::invalid_input(format!(
+                    HostError::invalid_input(format!(
                         "reference traversal depth limit (64) exceeded at {path}"
                     ))
                     .into(),

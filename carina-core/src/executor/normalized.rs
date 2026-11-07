@@ -62,7 +62,11 @@
 use std::collections::HashMap;
 
 use crate::parser::ProviderConfig;
-use crate::provider::{ProviderNormalizer, ProviderResult, merge_default_tags};
+use crate::provider::{
+    HostNormalizer, HostResult, ProviderFailure, ProviderNormalizer, ProviderResult,
+    merge_default_tags,
+};
+use crate::provider_text::{TextState, Unbound};
 use crate::resource::{
     ConcreteValue, DeferredValue, ModuleSource, Resource, ResourceId, State,
     UnexpandedDependencyFields, Value, value_contains_unknown,
@@ -100,6 +104,28 @@ impl<S, D> NormalizedResource<S, D> {
 
 /// Normalize one desired resource and return the typestate proof consumed by
 /// executor patch builders.
+async fn apply_desired_normalization_inner<S: Clone, D: Clone + Default, T: TextState>(
+    resource: Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    provider_configs: &[ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
+    normalizer: &dyn ProviderNormalizer<T>,
+    schemas: &SchemaRegistry,
+) -> ProviderResult<NormalizedResource<S, D>, T> {
+    let mut one = [resource];
+    apply_desired_normalization_slice_generic(&mut one, provider_configs, normalizer, schemas)
+        .await?;
+    let [resource] = one;
+    Ok(NormalizedResource(resource))
+}
+
+/// Provider-owned normalization through the shared desired pipeline.
 pub async fn apply_desired_normalization<S: Clone, D: Clone + Default>(
     resource: Resource<
         S,
@@ -111,13 +137,66 @@ pub async fn apply_desired_normalization<S: Clone, D: Clone + Default>(
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
     >],
-    normalizer: &dyn ProviderNormalizer,
+    normalizer: &dyn ProviderNormalizer<Unbound>,
     schemas: &SchemaRegistry,
 ) -> ProviderResult<NormalizedResource<S, D>> {
-    let mut one = [resource];
-    apply_desired_normalization_slice(&mut one, provider_configs, normalizer, schemas).await?;
-    let [resource] = one;
-    Ok(NormalizedResource(resource))
+    apply_desired_normalization_inner(resource, provider_configs, normalizer, schemas).await
+}
+
+/// Host ingestion through the shared desired pipeline.
+pub async fn apply_host_desired_normalization<S: Clone, D: Clone + Default>(
+    resource: Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >,
+    provider_configs: &[ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
+    normalizer: &dyn HostNormalizer,
+    schemas: &SchemaRegistry,
+) -> HostResult<NormalizedResource<S, D>> {
+    apply_desired_normalization_inner(resource, provider_configs, normalizer, schemas).await
+}
+
+/// Provider-owned normalization through the shared desired pipeline.
+pub async fn apply_desired_normalization_slice<S: Clone, D: Clone + Default>(
+    resources: &mut [Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >],
+    provider_configs: &[ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
+    normalizer: &dyn ProviderNormalizer<Unbound>,
+    schemas: &SchemaRegistry,
+) -> ProviderResult<()> {
+    apply_desired_normalization_slice_generic(resources, provider_configs, normalizer, schemas)
+        .await
+}
+
+/// Host ingestion through the shared desired pipeline.
+pub async fn apply_host_desired_normalization_slice<S: Clone, D: Clone + Default>(
+    resources: &mut [Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >],
+    provider_configs: &[ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
+    normalizer: &dyn HostNormalizer,
+    schemas: &SchemaRegistry,
+) -> HostResult<()> {
+    apply_desired_normalization_slice_generic(resources, provider_configs, normalizer, schemas)
+        .await
 }
 
 /// Dispatch gives normalizers main's plaintext input shape, then restores only
@@ -134,9 +213,9 @@ pub(super) async fn apply_dispatch_desired_normalization<S: Clone, D: Clone + De
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
     >],
-    normalizer: &dyn ProviderNormalizer,
+    normalizer: &dyn HostNormalizer,
     schemas: &SchemaRegistry,
-) -> ProviderResult<(NormalizedResource<S, D>, RestoredSecrets)> {
+) -> HostResult<(NormalizedResource<S, D>, RestoredSecrets)> {
     let mut resources = [resource];
     let mut restored = [RestoredSecrets::default()];
     apply_desired_normalization_slice_inner(
@@ -242,6 +321,14 @@ impl RestoredSecrets {
     }
 }
 
+pub(crate) fn unwrap_dispatch_desired(resources: &mut [crate::resource::ProviderResource]) {
+    for resource in resources {
+        for value in resource.attributes.values_mut() {
+            *value = unwrap_secret(value.clone());
+        }
+    }
+}
+
 /// Main's dispatch projection, applied only after protected host checks.
 pub(super) fn unwrap_secret(value: Value) -> Value {
     match value {
@@ -286,7 +373,7 @@ pub(super) fn unwrap_secret(value: Value) -> Value {
 /// 5. Run [`merge_default_tags`] for each provider instance.
 ///
 /// An error stops the pipeline before later stages run.
-pub async fn apply_desired_normalization_slice<S: Clone, D: Clone + Default>(
+async fn apply_desired_normalization_slice_generic<S: Clone, D: Clone + Default, T: TextState>(
     resources: &mut [Resource<
         S,
         crate::resource::NoPlaceholder,
@@ -297,14 +384,14 @@ pub async fn apply_desired_normalization_slice<S: Clone, D: Clone + Default>(
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
     >],
-    normalizer: &dyn ProviderNormalizer,
+    normalizer: &dyn ProviderNormalizer<T>,
     schemas: &SchemaRegistry,
-) -> ProviderResult<()> {
+) -> ProviderResult<(), T> {
     apply_desired_normalization_slice_inner(resources, provider_configs, normalizer, schemas, None)
         .await
 }
 
-async fn apply_desired_normalization_slice_inner<S: Clone, D: Clone + Default>(
+async fn apply_desired_normalization_slice_inner<S: Clone, D: Clone + Default, T: TextState>(
     resources: &mut [Resource<
         S,
         crate::resource::NoPlaceholder,
@@ -315,10 +402,39 @@ async fn apply_desired_normalization_slice_inner<S: Clone, D: Clone + Default>(
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
     >],
-    normalizer: &dyn ProviderNormalizer,
+    normalizer: &dyn ProviderNormalizer<T>,
+    schemas: &SchemaRegistry,
+    restored: Option<&mut [RestoredSecrets]>,
+) -> ProviderResult<(), T> {
+    apply_desired_normalization_slice_unprojected(
+        resources,
+        provider_configs,
+        normalizer,
+        schemas,
+        restored,
+    )
+    .await
+}
+
+async fn apply_desired_normalization_slice_unprojected<
+    S: Clone,
+    D: Clone + Default,
+    T: TextState,
+>(
+    resources: &mut [Resource<
+        S,
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+        D,
+    >],
+    provider_configs: &[ProviderConfig<
+        crate::resource::NoPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >],
+    normalizer: &dyn ProviderNormalizer<T>,
     schemas: &SchemaRegistry,
     mut restored: Option<&mut [RestoredSecrets]>,
-) -> ProviderResult<()> {
+) -> ProviderResult<(), T> {
     crate::value::canonicalize_resources_with_schemas(resources, schemas)?;
     let mut provider_resources = resources
         .iter()
@@ -327,19 +443,21 @@ async fn apply_desired_normalization_slice_inner<S: Clone, D: Clone + Default>(
         .collect::<Vec<_>>();
     let protected_inputs = restored.as_ref().map(|_| {
         provider_resources
-            .iter_mut()
-            .map(|resource| {
-                let protected = resource.attributes.clone();
-                for value in resource.attributes.values_mut() {
-                    *value = unwrap_secret(value.clone());
-                }
-                protected
-            })
+            .iter()
+            .map(|resource| resource.attributes.clone())
             .collect::<Vec<_>>()
     });
-    normalizer
-        .normalize_desired(&mut provider_resources)
-        .await?;
+    if restored.is_some() {
+        // The sealed host boundary must see annotations before the raw
+        // normalizer receives dispatch's usual plaintext input shape.
+        normalizer
+            .normalize_dispatch_desired(&mut provider_resources)
+            .await?;
+    } else {
+        normalizer
+            .normalize_desired(&mut provider_resources)
+            .await?;
+    }
     if let (Some(restored), Some(inputs)) = (restored.as_deref_mut(), protected_inputs) {
         for ((resource, input), restored) in provider_resources.iter_mut().zip(inputs).zip(restored)
         {
@@ -352,14 +470,15 @@ async fn apply_desired_normalization_slice_inner<S: Clone, D: Clone + Default>(
     }
     for (resource, provider_resource) in resources.iter_mut().zip(provider_resources) {
         if resource.id != provider_resource.id {
-            return Err(crate::provider::ProviderError::invalid_input(format!(
+            return Err(ProviderFailure::<T>::invalid_input(format!(
                 "provider normalizer changed resource identity from `{}` to `{}`",
                 resource.id, provider_resource.id
             )));
         }
         resource.apply_provider_resource(provider_resource);
     }
-    reject_provider_boundary_block_aliases(resources, schemas)?;
+    reject_provider_boundary_block_aliases(resources, schemas)
+        .map_err(crate::provider::HostError::host_for_state)?;
     crate::value::canonicalize_normalized_resources_with_schemas(resources, schemas)?;
     // Default-tag merging only inspects map shape and diagnoses config values.
     // Give it main's shape, then restore the diagnostic annotations for the
@@ -370,7 +489,8 @@ async fn apply_desired_normalization_slice_inner<S: Clone, D: Clone + Default>(
         }
     }
     for config in provider_configs {
-        merge_default_tags(config, resources, schemas)?;
+        merge_default_tags(config, resources, schemas)
+            .map_err(crate::provider::HostError::host_for_state)?;
     }
     if let Some(restored) = restored.as_deref() {
         for (resource, restored) in resources.iter_mut().zip(restored) {
@@ -388,14 +508,14 @@ fn reject_provider_boundary_block_aliases<S, D>(
         D,
     >],
     schemas: &SchemaRegistry,
-) -> ProviderResult<()> {
+) -> HostResult<()> {
     for resource in resources {
         let Some(schema) = schemas.get_for(resource) else {
             continue;
         };
         let schema = schema.as_schema();
         if let Some(alias) = find_resource_block_name_alias(resource, schema) {
-            return Err(crate::provider::ProviderError::invalid_input(format!(
+            return Err(crate::provider::HostError::invalid_input(format!(
                 "{}: block-name alias `{}` reached the provider boundary at `{}`; expected canonical attribute `{}`",
                 alias.resource_id(),
                 alias.alias(),

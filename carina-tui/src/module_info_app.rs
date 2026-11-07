@@ -46,7 +46,7 @@ pub struct ModuleInfoApp {
 
 impl ModuleInfoApp {
     fn type_label(static_type: &ConsumerStaticType) -> String {
-        carina_core::provider_text::ProviderText::new(
+        carina_core::provider_text::DiagnosticText::new(
             consumer_static_type_label(static_type).to_string(),
         )
         .to_string()

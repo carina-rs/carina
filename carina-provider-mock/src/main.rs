@@ -752,6 +752,13 @@ impl CarinaProvider for MockProcessProvider {
                 .expect("mock read-back schema must be valid"),
             CoreResourceSchema::new("test.short_budget")
                 .attribute(Self::optional_string_attribute("create_mode"))
+                .attribute(
+                    CoreAttributeSchema::provider_populated(
+                        "computed",
+                        CoreAttributeType::string(),
+                    )
+                    .build(),
+                )
                 .with_description("Mock resource with short operation budgets")
                 .with_operation_config(OperationConfig {
                     create_timeout_secs: Some(2),

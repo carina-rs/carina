@@ -2,7 +2,7 @@
 
 use std::{fmt, ops::Deref};
 
-use crate::provider_text::{ProviderString, ProviderText};
+use crate::provider_text::{DiagnosticText, ProviderKey};
 use regex_syntax::ast::{self, Ast};
 
 mod sealed {
@@ -69,7 +69,7 @@ impl CompiledPattern {
                 regex,
             })
             .map_err(|error| PatternCompileError {
-                diagnostic: ProviderText::new(format!(
+                diagnostic: DiagnosticText::new(format!(
                     "invalid string pattern {source:?}: {error}"
                 )),
                 pattern: source.into(),
@@ -150,10 +150,10 @@ impl Deref for CompiledPattern {
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("{diagnostic}")]
 pub struct PatternCompileError {
-    pub pattern: ProviderString,
+    pub pattern: ProviderKey,
     /// Typed parser, dialect or regex compiler diagnostic rendered by this error.
     pub reason: PatternCompileErrorSource,
-    diagnostic: ProviderText,
+    diagnostic: DiagnosticText,
 }
 
 impl Eq for PatternCompileError {}

@@ -435,9 +435,7 @@ mod recorded_provider_artifact_tests {
 #[cfg(test)]
 mod provider_scope_evidence_tests {
     use super::*;
-    use carina_core::provider::{
-        InitializedProvider, ProviderInstanceKey, ProviderRouter, ReferenceScope,
-    };
+    use carina_core::provider::{ProviderInstanceKey, ProviderRouter, ReferenceScope};
     use indexmap::IndexMap;
 
     fn provider_config(binding: &str) -> carina_core::parser::ExpandedProviderConfig {
@@ -462,7 +460,7 @@ mod provider_scope_evidence_tests {
         for (binding, scope) in scopes {
             router.add_provider_instance(
                 ProviderInstanceKey::new("test", Some(binding.to_string())),
-                InitializedProvider::for_test(
+                crate::provider_text_fixtures::initialized_with_scope(
                     Box::new(
                         carina_provider_mock::ConfiguredBuiltinMock::new(
                             carina_provider_mock::MockBehavior::default(),
@@ -544,7 +542,7 @@ mod provider_scope_evidence_tests {
         ]);
         provider.add_provider_instance(
             ProviderInstanceKey::new("test", None),
-            InitializedProvider::for_test(
+            crate::provider_text_fixtures::initialized_with_scope(
                 Box::new(
                     carina_provider_mock::ConfiguredBuiltinMock::new(
                         carina_provider_mock::MockBehavior::default(),
@@ -1093,12 +1091,46 @@ struct ProviderEvidence {
 /// format 32. Format 29 persists anonymous-loop provenance, typed deferred-loop
 /// targets, and Move origins. Provider evidence is validated both when
 /// recording and when decoding a saved plan.
+///
+/// A recorded plan cannot reload state under the apply lock. Compile the
+/// probe in the library's module context so crate visibility cannot mask the
+/// distinction between recorded and decoded plans.
+///
+/// ```compile_fail,E0599
+/// # include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+/// # fn main() {}
+/// fn recorded_cannot_reload(plan: commands::plan::PlanFile) {
+///     let _ = plan.reload_in_flight_from_locked_state(None);
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct PlanFile {
     contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
     persisted_directive_changes: Vec<PersistedDirectiveChange>,
     wire_order: Option<carina_core::json_field_order::JsonFieldOrder>,
+}
+
+/// A saved document whose complete provider configuration decoded before the
+/// apply lock was acquired. Recording alone cannot construct this type.
+#[derive(Debug, Clone)]
+pub(crate) struct DecodedPlanFile {
+    plan_file: PlanFile,
+    provider_configuration: carina_core::provider_text::SavedProviderConfiguration,
+}
+
+impl Deref for DecodedPlanFile {
+    type Target = PlanFile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.plan_file
+    }
+}
+
+impl Serialize for DecodedPlanFile {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.plan_file.serialize(serializer)
+    }
 }
 
 impl Serialize for PlanFile {
@@ -1113,11 +1145,10 @@ impl Serialize for PlanFile {
 
 impl<'de> Deserialize<'de> for PlanFile {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let mut order = carina_core::json_field_order::JsonFieldOrder::default();
-        let wire: PlanFileWire = order.deserialize(deserializer)?;
-        let mut plan = Self::try_from(wire).map_err(serde::de::Error::custom)?;
-        plan.wire_order = Some(order);
-        Ok(plan)
+        let document = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        Self::decode_json(document.get().as_bytes())
+            .map(|decoded| decoded.plan_file)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -1132,18 +1163,24 @@ pub(crate) enum PlanFileDecodeError {
 impl PlanFile {
     /// Finish structural decoding, including the end of input, before checking
     /// semantic evidence. Keep semantic failures out of the serde error channel.
-    pub(crate) fn decode_json(bytes: &[u8]) -> Result<Self, PlanFileDecodeError> {
+    pub(crate) fn decode_json(bytes: &[u8]) -> Result<DecodedPlanFile, PlanFileDecodeError> {
         let mut deserializer = serde_json::Deserializer::from_slice(bytes);
         let wire: PlanFileWire = serde_path_to_error::deserialize(&mut deserializer)
             .map_err(PlanFileJsonError::from_path_error)?;
         deserializer.end().map_err(PlanFileJsonError::at_root)?;
+        let mut inputs = serde_json::Deserializer::from_slice(bytes);
+        let provider_configuration = serde_path_to_error::deserialize(&mut inputs)
+            .map_err(PlanFileJsonError::from_path_error)?;
         let mut plan = Self::try_from(wire)
             .map_err(|error| PlanFileDecodeError::ProviderEvidence(Box::new(error)))?;
         plan.wire_order = Some(
             carina_core::json_field_order::JsonFieldOrder::from_json_slice(bytes)
                 .map_err(PlanFileJsonError::at_root)?,
         );
-        Ok(plan)
+        Ok(DecodedPlanFile {
+            plan_file: plan,
+            provider_configuration,
+        })
     }
 }
 
@@ -1931,13 +1968,16 @@ fn test_provider_router(instances: &BTreeSet<ProviderInstanceKey>) -> ProviderRo
     for instance in instances {
         provider.add_provider_instance(
             instance.clone(),
-            carina_core::provider::InitializedProvider::unavailable(Box::new(
-                carina_provider_mock::ConfiguredBuiltinMock::new(
-                    carina_provider_mock::MockBehavior::default(),
-                    carina_provider_mock::MockScope::memory(),
-                )
-                .create_provider(),
-            )),
+            crate::provider_text_fixtures::initialized_with_scope(
+                Box::new(
+                    carina_provider_mock::ConfiguredBuiltinMock::new(
+                        carina_provider_mock::MockBehavior::default(),
+                        carina_provider_mock::MockScope::memory(),
+                    )
+                    .create_provider(),
+                ),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ),
         );
     }
     provider
@@ -2107,6 +2147,12 @@ impl PlanFile {
     pub const CURRENT_VERSION: u32 = 42;
 
     #[cfg(test)]
+    pub(crate) fn decode_for_test(self) -> DecodedPlanFile {
+        Self::decode_json(&serde_json::to_vec(&self).expect("serialize saved plan fixture"))
+            .expect("decode saved plan fixture before locked reload")
+    }
+
+    #[cfg(test)]
     pub(crate) fn into_contents(self) -> UnresolvedPlanFileContents {
         self.contents
     }
@@ -2122,7 +2168,9 @@ impl PlanFile {
     pub fn provider_scopes(&self) -> &PlanProviderScopes {
         &self.evidence.provider_scopes.0
     }
+}
 
+impl DecodedPlanFile {
     /// Reload state-owned create continuations after the saved-plan apply has
     /// acquired its state lock. The plan contains only an address and marker;
     /// any status change in either direction invalidates it unless the row is
@@ -2131,11 +2179,15 @@ impl PlanFile {
         self,
         state_file: Option<&StateFile>,
     ) -> Result<UnresolvedReloadedPlanFile, LockedStateReloadError> {
-        let PlanFile {
-            mut contents,
-            evidence,
-            persisted_directive_changes,
-            wire_order: _,
+        let DecodedPlanFile {
+            provider_configuration,
+            plan_file:
+                PlanFile {
+                    mut contents,
+                    evidence,
+                    persisted_directive_changes,
+                    wire_order: _,
+                },
         } = self;
         let moved_origins = MovedOrigins::from_unresolved_plan(&contents.plan);
         let planned_removals: HashSet<_> = contents
@@ -2287,13 +2339,16 @@ impl PlanFile {
             }
         }
         Ok(UnresolvedReloadedPlanFile {
+            provider_configuration,
             contents,
             evidence,
             current_states,
             persisted_directive_changes,
         })
     }
+}
 
+impl PlanFile {
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
     pub(crate) fn contains_redacted_secret_placeholders(&self) -> bool {
@@ -3362,7 +3417,6 @@ mod historical_display_tests {
 
     impl HistoricalOperandFixture {
         fn new() -> Self {
-            use carina_core::provider::InitializedProvider;
             let string = |raw: &str| Value::Concrete(ConcreteValue::String(raw.into()));
             let mut schemas = SchemaRegistry::new();
             schemas.insert(
@@ -3403,10 +3457,13 @@ mod historical_display_tests {
             let mut provider = ProviderRouter::new();
             provider.add_provider(
                 "mock".into(),
-                InitializedProvider::unavailable(Box::new(CountingReferences {
-                    calls: calls.clone(),
-                    inner: runtime.builtin_mock().unwrap().create_provider(),
-                })),
+                crate::provider_text_fixtures::initialized_with_scope(
+                    Box::new(CountingReferences {
+                        calls: calls.clone(),
+                        inner: runtime.builtin_mock().unwrap().create_provider(),
+                    }),
+                    carina_core::provider::ReferenceScope::Unavailable,
+                ),
             );
             let target = Resource::with_provider("mock", "test.reference", "example", None)
                 .with_attribute("name", string("new"))
@@ -3565,7 +3622,7 @@ mod historical_display_tests {
 
     #[tokio::test]
     async fn moved_replacement_renders_the_persisted_display_view_instead_of_planning_history() {
-        use carina_core::provider::{InitializedProvider, RawSavedAttrs};
+        use carina_core::provider::RawSavedAttrs;
         use carina_core::references::ReferencePreparation;
         use carina_core::resource::{ResolvedResourceId, into_plan_input_current_map};
 
@@ -3603,9 +3660,10 @@ mod historical_display_tests {
         let mut provider = ProviderRouter::new();
         provider.add_provider(
             "mock".into(),
-            InitializedProvider::unavailable(Box::new(
-                runtime.builtin_mock().unwrap().create_provider(),
-            )),
+            crate::provider_text_fixtures::initialized_with_scope(
+                Box::new(runtime.builtin_mock().unwrap().create_provider()),
+                carina_core::provider::ReferenceScope::Unavailable,
+            ),
         );
         let target = Resource::with_provider("mock", "test.reference", "new", None)
             .with_attribute("key", string("alias/new"));
@@ -3860,6 +3918,7 @@ impl ReloadedCurrentStateEntry {
 /// inconsistent with its evidence.
 #[derive(Debug)]
 pub(crate) struct UnresolvedReloadedPlanFile {
+    provider_configuration: carina_core::provider_text::SavedProviderConfiguration,
     contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
     current_states: Vec<ReloadedCurrentStateEntry>,
@@ -3871,6 +3930,10 @@ pub(crate) struct ReloadedPlanFile<
     V: PlanValueKind = NoPlaceholder,
     P = carina_core::saved_replay::SavedPlanReplay<V>,
 > {
+    provider_configuration: carina_core::provider_text::SavedProviderConfiguration<
+        V,
+        carina_core::provider_text::SavedInputsResolved,
+    >,
     refresh_rows: carina_state::RefreshRows,
     data_source_refresh_rows: carina_state::RefreshRows,
     contents: PlanFileContents<SavedModuleSource, P, V>,
@@ -3910,11 +3973,13 @@ impl UnresolvedReloadedPlanFile {
         schemas: &carina_core::schema::SchemaRegistry,
     ) -> Result<ReloadedPlanFile<SnapshotLeaf>, carina_core::resource::ResolvedResourceError> {
         let Self {
+            provider_configuration,
             contents,
             evidence,
             current_states,
             persisted_directive_changes,
         } = self;
+        let provider_configuration = provider_configuration.resolve_with_schemas(schemas)?;
         let PlanFileContents {
             version,
             carina_version,
@@ -4004,6 +4069,7 @@ impl UnresolvedReloadedPlanFile {
         )
         .refreshable;
         Ok(ReloadedPlanFile {
+            provider_configuration,
             refresh_rows,
             data_source_refresh_rows,
             contents,
@@ -4014,12 +4080,34 @@ impl UnresolvedReloadedPlanFile {
     }
 }
 
+impl<P> ReloadedPlanFile<NoPlaceholder, P> {
+    pub(crate) fn provider_plan(&self) -> carina_core::provider::ProviderPlan {
+        self.provider_configuration.provider_plan()
+    }
+}
+impl<P> ReloadedPlanFile<SnapshotLeaf, P> {
+    pub(crate) fn rehydrate_provider_configuration(
+        &self,
+        resources: &HashMap<ResourceId, Resource>,
+        data_sources: &HashMap<ResourceId, carina_core::resource::DataSource>,
+    ) -> Result<
+        carina_core::provider_text::SavedProviderConfiguration<
+            NoPlaceholder,
+            carina_core::provider_text::SavedInputsResolved,
+        >,
+        carina_core::value::SecretRehydrationSiteError,
+    > {
+        self.provider_configuration
+            .rehydrate(resources, data_sources)
+    }
+}
 impl<V: PlanValueKind, P> ReloadedPlanFile<V, P> {
     pub(crate) fn try_map_plan<Q, E>(
         self,
         transform: impl FnOnce(P) -> Result<Q, E>,
     ) -> Result<ReloadedPlanFile<V, Q>, E> {
         let Self {
+            provider_configuration,
             refresh_rows,
             data_source_refresh_rows,
             contents,
@@ -4053,6 +4141,7 @@ impl<V: PlanValueKind, P> ReloadedPlanFile<V, P> {
             wait_bindings,
         } = contents;
         Ok(ReloadedPlanFile {
+            provider_configuration,
             refresh_rows,
             data_source_refresh_rows,
             evidence,
@@ -4182,11 +4271,13 @@ impl<V: PlanValueKind, P> ReloadedPlanFile<V, P> {
 }
 
 pub(crate) struct LivePlanFileValues {
+    pub(crate) provider_configuration: carina_core::provider_text::SavedProviderConfiguration<
+        NoPlaceholder,
+        carina_core::provider_text::SavedInputsResolved,
+    >,
     pub(crate) plan: carina_core::saved_replay::SavedPlanReplay,
-    pub(crate) sorted_resources: Vec<SavedPlanResource>,
     pub(crate) unresolved_resources: Vec<SavedResource>,
     pub(crate) compositions: Vec<SavedComposition<NoPlaceholder>>,
-    pub(crate) data_sources: Vec<SavedDataSource>,
     pub(crate) data_source_origins: Vec<SavedDataSource>,
     pub(crate) provider_configs: SavedProviderConfigs<NoPlaceholder>,
     pub(crate) upstream_snapshot: HashMap<String, HashMap<String, Value>>,
@@ -4197,6 +4288,7 @@ impl ReloadedPlanFile<SnapshotLeaf> {
         // Desired values are live, but historical names may still be redacted.
         // Final admission after historical verification prepares replacements.
         let Self {
+            provider_configuration: _,
             refresh_rows,
             data_source_refresh_rows,
             contents,
@@ -4230,6 +4322,7 @@ impl ReloadedPlanFile<SnapshotLeaf> {
             upstream_snapshot: _,
         } = contents;
         ReloadedPlanFile {
+            provider_configuration: values.provider_configuration.clone(),
             refresh_rows,
             data_source_refresh_rows,
             evidence,
@@ -4252,10 +4345,10 @@ impl ReloadedPlanFile<SnapshotLeaf> {
                 upstream_sources,
                 wait_bindings,
                 plan: values.plan,
-                sorted_resources: values.sorted_resources,
+                sorted_resources: values.provider_configuration.resources().to_vec(),
                 unresolved_resources: values.unresolved_resources,
                 compositions: values.compositions,
-                data_sources: values.data_sources,
+                data_sources: values.provider_configuration.data_sources().to_vec(),
                 data_source_origins: values.data_source_origins,
                 provider_configs: values.provider_configs,
                 upstream_snapshot: values.upstream_snapshot,
@@ -4267,18 +4360,17 @@ impl ReloadedPlanFile<SnapshotLeaf> {
         self,
     ) -> Result<ReloadedPlanFile, carina_core::value::SecretRehydrationSiteError> {
         let parsed = carina_core::parser::ExpandedInferredFile::default();
+        let provider_configuration = self
+            .provider_configuration
+            .rehydrate(&HashMap::new(), &HashMap::new())?;
         let values = LivePlanFileValues {
+            provider_configuration,
             plan: self.plan().rehydrate_desired(
                 &HashMap::new(),
                 &HashMap::new(),
                 &HashMap::new(),
                 parsed.deferred_for_expressions(),
             )?,
-            sorted_resources: self
-                .sorted_resources()
-                .iter()
-                .map(Resource::to_value_resource)
-                .collect::<Result<_, _>>()?,
             unresolved_resources: self
                 .unresolved_resources()
                 .iter()
@@ -4290,11 +4382,6 @@ impl ReloadedPlanFile<SnapshotLeaf> {
                 .map(|saved| {
                     carina_core::value::rehydrate_saved_composition_with_candidate(saved, None)
                 })
-                .collect::<Result<_, _>>()?,
-            data_sources: self
-                .data_sources()
-                .iter()
-                .map(carina_core::resource::DataSource::to_value_data_source)
                 .collect::<Result<_, _>>()?,
             data_source_origins: self
                 .data_source_origins()
@@ -4657,6 +4744,7 @@ mod managed_current_serde_tests {
             id.clone(),
             SavedManagedCurrent::from_current(Current::create_outcome_unknown(unknown.clone())),
         )
+        .decode_for_test()
         .reload_in_flight_from_locked_state(Some(&locked))
         .expect("an unchanged outcome-unknown marker must reload under the lock");
         let ReloadedCurrentStateEntry::Managed {
@@ -4676,6 +4764,7 @@ mod managed_current_serde_tests {
             id.clone(),
             SavedManagedCurrent::from_current(Current::absent(id.clone())),
         )
+        .decode_for_test()
         .reload_in_flight_from_locked_state(Some(&locked))
         .expect_err("an unknown row appearing after planning must invalidate the plan");
         let appeared = reload_error_text(&appeared, std::path::Path::new("infra/production"));
@@ -4688,6 +4777,7 @@ mod managed_current_serde_tests {
             id,
             SavedManagedCurrent::from_current(Current::create_outcome_unknown(unknown)),
         )
+        .decode_for_test()
         .reload_in_flight_from_locked_state(None)
         .expect_err("an unknown row disappearing after planning must invalidate the plan");
         assert!(
@@ -4787,6 +4877,7 @@ mod managed_current_serde_tests {
             SavedManagedCurrent::from_current(Current::absent(id.clone())),
         );
         let became_in_flight = planned_absent
+            .decode_for_test()
             .reload_in_flight_from_locked_state(Some(&locked_in_flight))
             .expect_err("absent to in-flight must invalidate the saved plan");
         let became_in_flight = reload_error_text(&became_in_flight, std::path::Path::new("."));
@@ -4798,6 +4889,7 @@ mod managed_current_serde_tests {
         let planned_in_flight =
             plan_file_with_current(id, SavedManagedCurrent::create_in_flight_marker());
         let ended = planned_in_flight
+            .decode_for_test()
             .reload_in_flight_from_locked_state(None)
             .expect_err("in-flight to absent must invalidate the saved plan");
         let ended = reload_error_text(&ended, std::path::Path::new("."));
@@ -4840,6 +4932,7 @@ mod managed_current_serde_tests {
         );
 
         let error = plan
+            .decode_for_test()
             .reload_in_flight_from_locked_state(Some(&locked))
             .expect_err("a new in-flight address must invalidate the saved plan");
         let error = reload_error_text(&error, std::path::Path::new("."));
@@ -4897,6 +4990,7 @@ mod managed_current_serde_tests {
             .expect("test plan provider evidence must be valid");
 
         let plan = plan
+            .decode_for_test()
             .reload_in_flight_from_locked_state(Some(&locked))
             .expect("a moved continuation must reload from its source row");
         let ReloadedCurrentStateEntry::Managed { id, current } = plan
@@ -4960,6 +5054,7 @@ mod managed_current_serde_tests {
             .expect("test plan provider evidence must be valid");
 
         let reloaded = plan
+            .decode_for_test()
             .reload_in_flight_from_locked_state(Some(&locked))
             .expect("a moved outcome-unknown marker must reload from its source row");
         let ReloadedCurrentStateEntry::Managed { id, current } = reloaded

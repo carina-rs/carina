@@ -147,7 +147,7 @@ fn convert_markdown_links_to_plain_text(text: &str) -> String {
 
 fn format_hover_display(mut hover: Hover) -> Hover {
     fn text(value: &mut String) {
-        *value = carina_core::provider_text::ProviderText::new(std::mem::take(value)).to_string();
+        *value = carina_core::provider_text::DiagnosticText::new(std::mem::take(value)).to_string();
     }
     fn marked(value: &mut tower_lsp::lsp_types::MarkedString) {
         match value {

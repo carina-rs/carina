@@ -4037,14 +4037,14 @@ impl ProviderFactory for TestProviderFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<
         '_,
@@ -4058,8 +4058,7 @@ impl ProviderFactory for TestProviderFactory {
 
     fn create_normalizer(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -6093,6 +6092,7 @@ impl ProviderFactory for WasmStyleProviderFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
@@ -6100,6 +6100,7 @@ impl ProviderFactory for WasmStyleProviderFactory {
         &self,
         identity: &carina_core::schema::TypeIdentity,
         value: &carina_core::provider::CanonicalCustomTypeValue,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         // Mirror awscc's `prefixed` validator family: VpcId must start
         // with "vpc-".
@@ -6129,8 +6130,7 @@ impl ProviderFactory for WasmStyleProviderFactory {
     }
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<
         '_,
@@ -6143,8 +6143,7 @@ impl ProviderFactory for WasmStyleProviderFactory {
     }
     fn create_normalizer(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -7058,6 +7057,7 @@ impl ProviderFactory for Round1ConfigFactory {
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> ProviderResult<()> {
         Ok(())
     }
@@ -7065,6 +7065,7 @@ impl ProviderFactory for Round1ConfigFactory {
         &self,
         _: &carina_core::schema::TypeIdentity,
         _: &carina_core::provider::CanonicalCustomTypeValue,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> ProviderResult<()> {
         Err(carina_core::provider::ProviderError::invalid_input(
             "provider rejected sibling",
@@ -7072,8 +7073,7 @@ impl ProviderFactory for Round1ConfigFactory {
     }
     fn create_provider(
         &self,
-        _: Option<&str>,
-        _: &carina_core::provider::ProviderReadyConfig,
+        _: &carina_core::provider::ProviderSession,
         _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         unreachable!("validation does not create providers")

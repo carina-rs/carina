@@ -1,4 +1,6 @@
 use super::*;
+use crate::provider_text_fixtures::*;
+use carina_core::provider::{Provider, ProviderError, ProviderNormalizer};
 use carina_core::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
@@ -60,7 +62,7 @@ fn throttling_error_uses_wire_message_before_display_truncation() {
     for marker in ["ThrottlingException", "Rate exceeded"] {
         let mut wire = ProviderError::api_error("request failed").to_wire();
         wire.message = format!("{} {marker}", "x".repeat(9 * 1024));
-        let error = ProviderError::from_wire(wire);
+        let error = ProviderError::from_wire(wire).into_host_for_test();
 
         assert!(!error.to_string().contains(marker));
         assert!(is_throttling_error(&error), "missing raw marker {marker}");
@@ -453,7 +455,9 @@ fn detect_anonymous_to_named_moves_to_fixed_point(
 #[test]
 fn saved_plan_validation_ready_constructor_is_unit_typed() {
     let ready: ValidationReady<()> = ValidationReady::from_saved_plan_artifact();
-    let ValidationReady { inner: (), origin } = ready;
+    let ValidationReady {
+        inner: (), origin, ..
+    } = ready;
 
     assert!(matches!(origin, ValidationReadyOrigin::SavedPlanArtifact));
 }
@@ -609,14 +613,14 @@ impl ProviderFactory for RawEnumStateFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
@@ -627,8 +631,7 @@ impl ProviderFactory for RawEnumStateFactory {
 
     fn create_normalizer(
         &self,
-        _binding: Option<&str>,
-        _config: &ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async {
             Ok(Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>)
@@ -2658,14 +2661,14 @@ async fn plan_desired_pipeline_rejects_unresolved_enums_at_every_schema_position
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             unreachable!("plan canonicalization test does not create providers")
@@ -3121,7 +3124,7 @@ where
 fn create_plan(
     managed: &[Resource],
     data_sources: &[carina_core::resource::DataSource],
-    provider: &dyn Provider,
+    provider: &dyn carina_core::provider::HostProvider,
     current_states: &HashMap<ResourceId, carina_core::resource::PlanInputCurrent>,
     directives_map: &HashMap<ResourceId, carina_core::resource::PersistedDirectives>,
     registry: &SchemaRegistry,
@@ -3222,6 +3225,7 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
     let normalizer = FailingNormalizer {
         state_called: Arc::clone(&state_called),
     };
+    let normalizer = std::sync::Arc::new(normalizer);
     let ctx = WiringContext::new_for_test(
         &crate::test_support::TestCommandRuntime::new(),
         Vec::new(),
@@ -3245,20 +3249,26 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
     let mut data_source_values = DataSourceValues::empty();
     let mut orphans = Orphans::new();
 
-    let error = PlanPreprocessor::new(&normalizer, &ctx)
-        .prepare(
-            &mut resources,
-            &[],
-            &module_gate,
-            &mut current_states,
-            &mut data_source_values,
-            &mut orphans,
-            &[],
-            &mut [],
-            &[],
-        )
-        .await
-        .expect_err("normalizer failure must abort plan preprocessing");
+    let error = PlanPreprocessor::new(
+        &crate::provider_text_fixtures::normalizer(
+            "mock",
+            Box::new(std::sync::Arc::clone(&normalizer)),
+        ),
+        &ctx,
+    )
+    .prepare(
+        &mut resources,
+        &[],
+        &module_gate,
+        &mut current_states,
+        &mut data_source_values,
+        &mut orphans,
+        &[],
+        &mut [],
+        &[],
+    )
+    .await
+    .expect_err("normalizer failure must abort plan preprocessing");
 
     match error {
         PlanPreparationError::Provider(error) => {
@@ -3277,10 +3287,13 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
 
 #[test]
 fn provider_plan_preparation_error_chain_renders_leaf_once() {
-    let error = PlanPreparationError::Provider(ProviderError::api_error_caused_by(
-        "x",
-        std::io::Error::other("provider leaf reason"),
-    ));
+    let error = PlanPreparationError::Provider(
+        carina_core::provider::ProviderError::api_error_caused_by(
+            "x",
+            std::io::Error::other("provider leaf reason"),
+        )
+        .into_host_for_test(),
+    );
 
     let rendered = error.to_string();
 
@@ -3397,6 +3410,7 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         carina_core::resource::PersistedDirectives::default(),
     )]);
     let normalizer = TransformingNormalizer;
+    let normalizer = std::sync::Arc::new(normalizer);
     let saved_attrs = crate::empty_lifted_saved_attrs();
     let data_source_id = ResourceId::with_provider_identity("mock", "test.lookup", "source", None);
     let data_source_states = HashMap::from([(
@@ -3418,14 +3432,20 @@ async fn post_reconcile_managed_set_promotes_transformed_orphan_for_bindings_and
         &mut current_states,
         &mut data_source_values,
         &mut orphans,
-        &normalizer,
+        &crate::provider_text_fixtures::normalizer(
+            "mock",
+            Box::new(std::sync::Arc::clone(&normalizer)),
+        ),
         &saved_attrs,
         &projected_state,
     )
     .await
     .unwrap();
     PlanPreprocessor::new(
-        &normalizer,
+        &crate::provider_text_fixtures::normalizer(
+            "mock",
+            Box::new(std::sync::Arc::clone(&normalizer)),
+        ),
         &WiringContext::new_for_test(
             &crate::test_support::TestCommandRuntime::new(),
             Vec::new(),
@@ -3587,7 +3607,7 @@ async fn combined_hydration_keeps_managed_state_out_of_same_id_data_source() {
         &mut current_states,
         &mut data_source_values,
         &mut orphans,
-        &SavedAttrsHydratingNormalizer,
+        &crate::provider_text_fixtures::normalizer("mock", Box::new(SavedAttrsHydratingNormalizer)),
         &saved_attrs,
         &projected_state,
     )
@@ -3641,14 +3661,14 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
@@ -3668,8 +3688,7 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
 
         fn create_normalizer(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
             Box::pin(async { Err(ProviderError::internal("normalizer initialization failed")) })
         }
@@ -3715,10 +3734,16 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
     let configs = validated_provider_configs(vec![config]);
     let config = configs.iter().next().unwrap();
     let mut router = ProviderRouter::new();
-    let error =
-        instantiate_provider_into_router(&ctx, &mut router, config, None, ProgressSink::Human)
-            .await
-            .expect_err("normalizer creation failure must abort provider router setup");
+    let error = instantiate_provider_into_router(
+        &ctx,
+        &mut router,
+        config,
+        None,
+        ProgressSink::Human,
+        &provider_mod::ProviderPlan::state_only(),
+    )
+    .await
+    .expect_err("normalizer creation failure must abort provider router setup");
 
     let AppError::Provider(error) = error else {
         panic!("expected provider error, got {error}");
@@ -3771,14 +3796,14 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async move {
@@ -3841,6 +3866,7 @@ async fn provider_progress_is_emitted_after_provider_initialization() {
         configs.iter().next().unwrap(),
         None,
         ProgressSink::Recorded(lines),
+        &provider_mod::ProviderPlan::state_only(),
     )
     .await
     .expect("provider initialization must precede its progress line");
@@ -3886,6 +3912,7 @@ async fn provider_progress_uses_schema_region() {
             config,
             None,
             ProgressSink::Recorded(lines),
+            &provider_mod::ProviderPlan::state_only(),
         )
         .await
         .expect("provider initialization must succeed");
@@ -3922,14 +3949,14 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
@@ -3986,6 +4013,7 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
         configs.iter().next().unwrap(),
         None,
         ProgressSink::Human,
+        &provider_mod::ProviderPlan::state_only(),
     )
     .await
     .expect_err("provider initialization must fail");
@@ -4026,14 +4054,14 @@ impl ProviderFactory for ProviderConfigConstraintFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         self.creates.fetch_add(1, Ordering::SeqCst);
@@ -4100,9 +4128,13 @@ async fn sourced_default_provider_executes_the_factory_retained_by_wiring_contex
 
     std::fs::write(&source_path, b"artifact swapped after context construction").unwrap();
 
-    let router = create_providers_from_configs_with_ctx(&ctx, &configs)
-        .await
-        .expect("router construction must use the already-loaded context factory");
+    let router = create_providers_from_configs_with_ctx(
+        &ctx,
+        &configs,
+        &carina_core::provider::ProviderPlan::state_only(),
+    )
+    .await
+    .expect("router construction must use the already-loaded context factory");
 
     assert_eq!(creates.load(Ordering::SeqCst), 1);
     assert!(!router.is_empty());
@@ -4182,7 +4214,14 @@ async fn apply_provider_construction_revalidates_resolved_upstream_config() {
         })],
         provider_configs.as_provider_configs(),
     );
-    let error = match get_provider_with_ctx(&ctx, &provider_configs, ProgressSink::Human).await {
+    let error = match get_provider_with_ctx(
+        &ctx,
+        &provider_configs,
+        ProgressSink::Human,
+        &carina_core::provider::ProviderPlan::state_only(),
+    )
+    .await
+    {
         Ok(_) => panic!("resolved provider config must be rejected before apply construction"),
         Err(error) => error,
     };
@@ -4209,14 +4248,14 @@ impl ProviderFactory for CascadeAwsccFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
@@ -4566,14 +4605,14 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
@@ -4584,8 +4623,7 @@ impl ProviderFactory for ManagedAndDataSourceFactory {
 
     fn create_normalizer(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async {
             Ok(Box::new(SavedAttrsHydratingNormalizer) as Box<dyn ProviderNormalizer>)
@@ -4734,11 +4772,12 @@ let shared = read test.shared.Type {}
 #[tokio::test]
 async fn read_with_retry_translates_not_found_to_state_not_found() {
     let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
+    let provider = std::sync::Arc::new(provider);
     let id = ResourceId::with_identity("test.Resource", "gone");
 
     let identifier = crate::fixture_applied_identifier("some-identifier");
     let state = read_with_retry(
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         &crate::test_support::refresh_target(&id, &identifier),
     )
     .await
@@ -4752,26 +4791,31 @@ async fn read_with_retry_translates_not_found_to_state_not_found() {
 #[tokio::test]
 async fn read_with_retry_propagates_other_errors() {
     let provider = ReadWithRetryProvider::new(ReadBehavior::ApiError);
+    let provider = std::sync::Arc::new(provider);
     let id = ResourceId::with_identity("test.Resource", "broken");
 
     let identifier = crate::fixture_applied_identifier("some-identifier");
     let result = read_with_retry(
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         &crate::test_support::refresh_target(&id, &identifier),
     )
     .await;
 
-    assert!(matches!(result, Err(ProviderError::ApiError(_))));
+    {
+        use carina_core::provider::HostError as ProviderError;
+        assert!(matches!(result, Err(ProviderError::ApiError(_))));
+    }
 }
 
 #[tokio::test]
 async fn read_with_retry_does_not_retry_not_found() {
     let provider = ReadWithRetryProvider::new(ReadBehavior::NotFoundThenSuccess);
+    let provider = std::sync::Arc::new(provider);
     let id = ResourceId::with_identity("test.Resource", "gone");
 
     let identifier = crate::fixture_applied_identifier("some-identifier");
     let state = read_with_retry(
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         &crate::test_support::refresh_target(&id, &identifier),
     )
     .await
@@ -4786,12 +4830,13 @@ async fn read_with_retry_does_not_retry_not_found() {
 #[tokio::test]
 async fn outcome_unknown_refresh_preserves_managed_and_orphan_rows_without_provider_read() {
     let provider = ReadWithRetryProvider::new(ReadBehavior::Success);
+    let provider = std::sync::Arc::new(provider);
     let id = ResourceId::with_provider_identity("test", "test.Resource", "unknown", None);
     let unknown =
         crate::fixture_unknown_create_outcome(&id, ProviderError::api_error("guest trapped"));
 
     let refreshed = refresh_loaded_resource_with_retry(
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         crate::test_support::refresh_current(Current::create_outcome_unknown(unknown.clone())),
         None,
         &SchemaRegistry::new(),
@@ -4818,10 +4863,14 @@ async fn outcome_unknown_refresh_preserves_managed_and_orphan_rows_without_provi
     .next()
     .unwrap()
     .1;
-    let refreshed_orphan =
-        refresh_loaded_orphan_with_retry(&provider, orphan, None, &SchemaRegistry::new())
-            .await
-            .expect("an outcome-unknown orphan must be carried without a read");
+    let refreshed_orphan = refresh_loaded_orphan_with_retry(
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
+        orphan,
+        None,
+        &SchemaRegistry::new(),
+    )
+    .await
+    .expect("an outcome-unknown orphan must be carried without a read");
     assert!(matches!(
         refreshed_orphan.current(),
         Current::CreateOutcomeUnknown(refreshed_unknown) if refreshed_unknown == &unknown
@@ -4904,7 +4953,13 @@ fn test_normalize_state_prevents_false_enum_diff() {
 
     // After normalize_state, state values match desired values → no diff
     let provider_configs = validated_provider_configs(Vec::new());
-    normalize_state_with_ctx(&ctx, &provider_configs, &mut current_states).unwrap();
+    normalize_state_with_ctx(
+        &ctx,
+        &provider_configs,
+        &mut current_states,
+        &carina_core::provider::ProviderPlan::state_only(),
+    )
+    .unwrap();
     let resources_with = vec![resource];
     let plan_with = create_plan(
         &resources_with,
@@ -4954,6 +5009,7 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
         fn validate_config(
             &self,
             attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> carina_core::provider::ProviderResult<()> {
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current()
@@ -4966,8 +5022,7 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async { unreachable!("state normalization does not create providers") })
@@ -5021,8 +5076,13 @@ fn normalize_state_with_ctx_prepares_config_inside_time_enabled_multithread_runt
         provider_configs.as_provider_configs(),
     );
 
-    normalize_state_with_ctx(&ctx, &provider_configs, &mut HashMap::new())
-        .expect("provider validation should run inside a time-enabled compatible runtime");
+    normalize_state_with_ctx(
+        &ctx,
+        &provider_configs,
+        &mut HashMap::new(),
+        &carina_core::provider::ProviderPlan::state_only(),
+    )
+    .expect("provider validation should run inside a time-enabled compatible runtime");
 
     assert!(validated.load(Ordering::SeqCst));
     assert_eq!(
@@ -5045,8 +5105,13 @@ fn normalize_state_with_ctx_renders_provider_config_error_once() {
         provider_configs.as_provider_configs(),
     );
 
-    let error = normalize_state_with_ctx(&ctx, &provider_configs, &mut HashMap::new())
-        .expect_err("invalid provider configuration must fail state normalization setup");
+    let error = normalize_state_with_ctx(
+        &ctx,
+        &provider_configs,
+        &mut HashMap::new(),
+        &carina_core::provider::ProviderPlan::state_only(),
+    )
+    .expect_err("invalid provider configuration must fail state normalization setup");
     let preparation_error = error
         .detail()
         .cause()
@@ -5081,14 +5146,14 @@ fn state_bucket_config_prefers_default_then_first_named_then_implicit_empty() {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             unreachable!("config selection test does not construct a provider")
@@ -7283,14 +7348,14 @@ impl ProviderFactory for DeferredForCollisionFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
@@ -7311,8 +7376,7 @@ impl ProviderFactory for DeferredForCollisionFactory {
 
     fn create_normalizer(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
@@ -7420,14 +7484,14 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
@@ -7448,8 +7512,7 @@ impl ProviderFactory for AssociationCreateOnlyFactory {
 
     fn create_normalizer(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
@@ -9406,6 +9469,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         .into_executable()
         .expect("fixture plan must not contain blocked data sources");
     let provider = CascadeCreateProvider::default();
+    let provider = std::sync::Arc::new(provider);
     let data_source_origins = plan_ctx
         .data_sources
         .iter()
@@ -9437,7 +9501,7 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         checkpoint_sink: carina_core::executor::ExecutionCheckpointSink::noop(),
     };
     let outcome = carina_core::executor::execute_live_plan_for_test(
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         input,
         &NoopExecutionObserver,
         carina_core::shutdown::ShutdownToken::running(),
@@ -10196,6 +10260,8 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
             .expect("literal inputs should be refreshable");
 
             let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
+
+            let provider = std::sync::Arc::new(provider);
             let bindings = ResolvedBindings::default();
             let module_gate =
                 carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
@@ -10203,7 +10269,9 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
                 match resolution {
                     DataSourceRefreshResolution::Resolved(resource) => {
                         read_data_source_with_retry(
-                            &provider,
+                            &crate::provider_text_fixtures::boundary(Box::new(
+                                std::sync::Arc::clone(&provider),
+                            )),
                             &resource,
                             &bindings,
                             &module_gate,
@@ -10260,10 +10328,11 @@ async fn invalid_data_source_preparation_keeps_complete_typed_diagnostic() {
         .expect("schema fixture must be valid"),
     );
     let provider = ReadWithRetryProvider::new(ReadBehavior::NotFound);
+    let provider = std::sync::Arc::new(provider);
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
 
     let error = read_data_source_with_retry(
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         &lookup,
         &ResolvedBindings::default(),
         &module_gate,
@@ -10796,14 +10865,14 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
@@ -10824,8 +10893,7 @@ impl carina_core::provider::ProviderFactory for RegionIdentityFactory {
 
     fn create_normalizer(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<Box<dyn carina_core::provider::ProviderNormalizer>>,
@@ -11773,11 +11841,12 @@ mod read_with_retry_identifier_tests {
     #[tokio::test]
     async fn read_with_retry_forwards_validated_identifier() {
         let provider = RecordingProvider::new();
+        let provider = std::sync::Arc::new(provider);
         let id = ResourceId::with_provider_identity("awscc", "iam.Role", "existing", None);
         let identifier = crate::fixture_applied_identifier("AROABC123");
 
         let _state = read_with_retry(
-            &provider,
+            &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
             &crate::test_support::refresh_target(&id, &identifier),
         )
         .await
@@ -13783,9 +13852,14 @@ async fn registry_source_reaches_plan_apply_provider_loader() {
 
     let configs = validated_provider_configs(vec![config]);
     let ctx = WiringContext::new(&user_dirs, factories, configs.as_provider_configs()).unwrap();
-    let router = get_provider_with_ctx(&ctx, &configs, ProgressSink::Human)
-        .await
-        .expect("the router must not retry a factory load that already failed");
+    let router = get_provider_with_ctx(
+        &ctx,
+        &configs,
+        ProgressSink::Human,
+        &carina_core::provider::ProviderPlan::state_only(),
+    )
+    .await
+    .expect("the router must not retry a factory load that already failed");
     assert!(router.is_empty());
 }
 
@@ -13813,7 +13887,8 @@ fn runtime_instantiation_error_retains_installed_artifact_provenance() {
     let error = runtime_instantiation_error_with_provenance(
         &installed,
         std::io::Error::other("runtime instantiation failed"),
-    );
+    )
+    .into_host_for_test();
     let cause = error
         .detail()
         .cause()
@@ -14037,6 +14112,7 @@ fn runtime_factory_loader_returns_lock_constraint_error_instead_of_exiting() {
 }
 
 mod resolved_value_constraint_gate {
+    use carina_core::provider::{Provider, ProviderError};
     use carina_core::schema::{
         PatternAttributeSchema, PatternAttributeType, PatternResourceSchema,
     };
@@ -14085,6 +14161,7 @@ mod resolved_value_constraint_gate {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
@@ -14093,6 +14170,7 @@ mod resolved_value_constraint_gate {
             &self,
             identity: &TypeIdentity,
             value: &carina_core::provider::CanonicalCustomTypeValue,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> carina_core::provider::ProviderResult<()> {
             if identity.kind == "ExternalId" && value.as_str() == "bad" {
                 Err(carina_core::provider::ProviderError::invalid_input(
@@ -14105,8 +14183,7 @@ mod resolved_value_constraint_gate {
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
@@ -14126,8 +14203,7 @@ mod resolved_value_constraint_gate {
 
         fn create_normalizer(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
         ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
             Box::pin(async {
                 Ok(Box::new(carina_core::provider::NoopNormalizer) as Box<dyn ProviderNormalizer>)
@@ -14223,14 +14299,14 @@ mod resolved_value_constraint_gate {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             let reads = self.reads.clone();
@@ -14331,9 +14407,9 @@ mod resolved_value_constraint_gate {
         }
     }
 
-    #[derive(Default)]
+    #[derive(Default, Clone)]
     struct RewritingNormalizer {
-        desired_calls: AtomicUsize,
+        desired_calls: Arc<AtomicUsize>,
     }
 
     impl ProviderNormalizer for RewritingNormalizer {
@@ -14450,20 +14526,23 @@ mod resolved_value_constraint_gate {
         let mut orphans = Orphans::new();
         let mut data_sources = Vec::new();
         let data_source_origins = Vec::new();
-        PlanPreprocessor::new(normalizer, ctx)
-            .prepare(
-                &mut resources,
-                &origins,
-                &module_gate,
-                &mut current_states,
-                &mut data_source_values,
-                &mut orphans,
-                &[],
-                &mut data_sources,
-                &data_source_origins,
-            )
-            .await
-            .map_err(into_plan_errors)
+        PlanPreprocessor::new(
+            &crate::provider_text_fixtures::normalizer("test", Box::new(normalizer.clone())),
+            ctx,
+        )
+        .prepare(
+            &mut resources,
+            &origins,
+            &module_gate,
+            &mut current_states,
+            &mut data_source_values,
+            &mut orphans,
+            &[],
+            &mut data_sources,
+            &data_source_origins,
+        )
+        .await
+        .map_err(into_plan_errors)
     }
 
     fn pending_composition(
@@ -14704,6 +14783,7 @@ mod resolved_value_constraint_gate {
             &[],
         );
         let normalizer = RewritingNormalizer::default();
+        let normalizer = std::sync::Arc::new(normalizer);
         let (mut resources, _) = build_override_aware_pair_for_test(
             canonical_unresolved(Vec::new(), ctx.schemas()),
             None::<&carina_state::StateFile>,
@@ -14730,20 +14810,26 @@ mod resolved_value_constraint_gate {
         let mut data_source_values = super::test_data_source_values(&data_sources, &HashMap::new());
         let mut orphans = Orphans::new();
 
-        let errors = PlanPreprocessor::new(&normalizer, &ctx)
-            .prepare(
-                &mut resources,
-                &[],
-                &module_gate,
-                &mut states,
-                &mut data_source_values,
-                &mut orphans,
-                &[],
-                &mut data_sources,
-                &data_source_origins,
-            )
-            .await
-            .expect_err("invalid resolved data-source input must fail planning");
+        let errors = PlanPreprocessor::new(
+            &crate::provider_text_fixtures::normalizer(
+                "test",
+                Box::new(std::sync::Arc::clone(&normalizer)),
+            ),
+            &ctx,
+        )
+        .prepare(
+            &mut resources,
+            &[],
+            &module_gate,
+            &mut states,
+            &mut data_source_values,
+            &mut orphans,
+            &[],
+            &mut data_sources,
+            &data_source_origins,
+        )
+        .await
+        .expect_err("invalid resolved data-source input must fail planning");
         let errors = into_plan_errors(errors);
 
         assert_resolved_error(&errors, "lookup.Pattern", "target", "required pattern");
@@ -15324,9 +15410,13 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                 .unwrap();
                 let ctx = &loaded.context;
                 std::fs::write(&maximum, "existing observation").unwrap();
-                let _normalizers = create_normalizers_from_configs_with_ctx(ctx, &resolved)
-                    .await
-                    .unwrap();
+                let _normalizers = create_normalizers_from_configs_with_ctx(
+                    ctx,
+                    &resolved,
+                    &carina_core::provider::ProviderPlan::state_only(),
+                )
+                .await
+                .unwrap();
                 assert!(!state_path.exists());
                 assert_eq!(
                     std::fs::read_to_string(&maximum).unwrap(),
@@ -15336,9 +15426,14 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                     ctx.provider_artifacts.get("mock"),
                     Some(LoadedProviderArtifact::BuiltIn)
                 ));
-                let provider = get_provider_with_ctx(ctx, &resolved, ProgressSink::Human)
-                    .await
-                    .unwrap();
+                let provider = get_provider_with_ctx(
+                    ctx,
+                    &resolved,
+                    ProgressSink::Human,
+                    &carina_core::provider::ProviderPlan::state_only(),
+                )
+                .await
+                .unwrap();
                 let resource = Resource::with_provider("mock", "test.resource", "same", None)
                     .with_attribute(
                         "name",
@@ -15483,7 +15578,10 @@ async fn round2_binding_stability_reuses_normalized_inputs() {
             let current = HashMap::from([(resource.id.clone(), Current::from_state(state))]);
             let mut provider =
                 comparison_provider_for_resources(&schemas, std::slice::from_ref(&resource));
-            provider.add_normalizer("test", Box::new(AlreadyNormalized));
+            provider.add_initialized_normalizer(crate::provider_text_fixtures::normalizer(
+                "test",
+                Box::new(AlreadyNormalized),
+            ));
             let saved = carina_core::provider::RawSavedAttrs::default().lift(&schemas);
             let stability = derive_managed_binding_stability(
                 &parsed,

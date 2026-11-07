@@ -16,8 +16,8 @@ use carina_core::provider::{
 };
 #[cfg(test)]
 use carina_core::provider::{
-    CreateFailureKind, CreateOutcomeKind, InFlightCreate, InFlightPersistence, ResumeFailureKind,
-    ResumeOutcomeKind,
+    HostCreateFailureKind as CreateFailureKind, HostCreateOutcomeKind as CreateOutcomeKind,
+    InFlightCreate, InFlightPersistence, ResumeFailureKind, ResumeOutcomeKind,
 };
 use carina_core::resource::{
     BindingAddress, ConcreteValue, PlaceholderKind, Resource, ResourceId, SnapshotValue, State,
@@ -691,9 +691,91 @@ impl ConfiguredBuiltinMock {
     }
 }
 
+impl carina_core::provider::ProviderFactory for ConfiguredBuiltinMock {
+    fn name(&self) -> &str {
+        BUILTIN_PROVIDER_NAME
+    }
+    fn display_name(&self) -> &str {
+        "Mock provider"
+    }
+    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+        ValidatedConfigSchema::default()
+    }
+    fn validate_config(
+        &self,
+        _: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        builtin_schemas()
+    }
+    fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+        builtin_schema_witness()
+    }
+    fn create_provider(
+        &self,
+        _: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+        let provider = self.create_provider();
+        Box::pin(async move {
+            Ok(carina_core::provider::InitializeOutcome::unavailable()
+                .with_provider(Box::new(provider)))
+        })
+    }
+}
+
 /// Normalization has no store and cannot initialize provider telemetry or CRUD.
+#[derive(Clone)]
 pub struct MockNormalizer {
     observations: MockObservations,
+}
+
+// The explicit normalizer-only pipeline retains its observation hooks. Ordinary
+// built-in provider routing has always used the default no-op normalizer.
+impl carina_core::provider::ProviderFactory for MockNormalizer {
+    fn name(&self) -> &str {
+        BUILTIN_PROVIDER_NAME
+    }
+    fn display_name(&self) -> &str {
+        "Mock normalizer"
+    }
+    fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+        ValidatedConfigSchema::default()
+    }
+    fn validate_config(
+        &self,
+        _: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _: &carina_core::provider::ProviderValidationInputs,
+    ) -> ProviderResult<()> {
+        Ok(())
+    }
+    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+        builtin_schemas()
+    }
+    fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+        builtin_schema_witness()
+    }
+    fn create_provider(
+        &self,
+        _: &carina_core::provider::ProviderSession,
+        _: carina_core::provider::InitializeOutcomeMint,
+    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
+        Box::pin(async {
+            Err(ProviderError::internal(
+                "normalizer-only factory cannot create providers",
+            ))
+        })
+    }
+    fn create_normalizer(
+        &self,
+        _: &carina_core::provider::ProviderSession,
+    ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
+        let normalizer = self.clone();
+        Box::pin(async move { Ok(Box::new(normalizer) as Box<dyn ProviderNormalizer>) })
+    }
 }
 
 struct ReadOutcomeGuard {
@@ -1333,7 +1415,7 @@ impl MockProvider {
         }
         if let Some(config) = partial_create {
             let outcome = match PartialReadDiagnostic::new(
-                "mock partial create".to_string(),
+                "mock partial create".into(),
                 config.missing_attributes.clone(),
             ) {
                 Some(diagnostic) => issued.partial(state_attrs, diagnostic),
@@ -1936,6 +2018,7 @@ impl Provider for MockProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_text_fixtures::*;
     use carina_core::resource::NoPlaceholder;
     use std::time::Duration;
 
@@ -2007,10 +2090,22 @@ mod tests {
         schemas
     }
 
+    fn mock_boundary(provider: &MockProvider) -> carina_core::provider::ProviderBoundary<'static> {
+        crate::provider_text_fixtures::boundary(Box::new(
+            ConfiguredBuiltinMock {
+                behavior: provider.behavior.clone(),
+                scope: provider.scope.clone(),
+                telemetry: provider.telemetry.clone(),
+            }
+            .create_provider(),
+        ))
+    }
+
     async fn dispatch_mock_create(
         provider: &MockProvider,
         resource: Resource,
-    ) -> Result<CreateOutcome, CreateFailure> {
+    ) -> Result<carina_core::provider::HostCreateOutcome, carina_core::provider::HostCreateFailure>
+    {
         let id = resource.id.clone();
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
@@ -2035,12 +2130,28 @@ mod tests {
                 let request =
                     carina_core::executor::prepare_create_request(resource, &preparation).await;
                 let request = request.expect("mock test resource should pass create preparation");
+                let factory = ConfiguredBuiltinMock {
+                    behavior: provider.behavior.clone(),
+                    scope: provider.scope.clone(),
+                    telemetry: provider.telemetry.clone(),
+                };
+                let mut file = carina_core::parser::ExpandedFile::<()>::default();
+                let mut desired = Resource::from_id(id.clone());
+                desired.attributes = request.resource().as_resource().attributes.clone();
+                file.resources.push(desired);
+                let session = carina_core::validation::ResolvedFile::for_test(file)
+                    .provider_plan()
+                    .session(&id.provider, id.provider_instance.as_deref(), None);
+                let boundary =
+                    carina_core::provider::ProviderBoundary::initialize(&factory, &session)
+                        .await
+                        .unwrap();
                 assert_eq!(request.resource().id, id);
                 let prepared = carina_core::replacement::create_permit_with_schemas_for_test(
                     request, &schemas,
                 );
                 let (create, _cancellation) =
-                    carina_core::executor::dispatch_create(provider, prepared);
+                    carina_core::executor::dispatch_create(boundary.provider(), prepared);
                 create.await
             },
         )
@@ -2326,17 +2437,17 @@ mod tests {
                     panic!("expected {expected}, got partial {state:?}: {diagnostic:?}")
                 }
                 (expected, Err(CreateFailureKind::NoResource(error))) => {
-                    panic!("expected {expected}, got not_created {error}")
+                    panic!("expected {expected}, got not_created {error:?}")
                 }
                 (expected, Err(CreateFailureKind::IdentifierReported { identified, error })) => {
-                    panic!("expected {expected}, got identifier-reported {identified:?}: {error}")
+                    panic!("expected {expected}, got identifier-reported {identified:?}: {error:?}")
                 }
                 (expected, Err(CreateFailureKind::InFlight { pending, error })) => {
-                    panic!("expected {expected}, got in flight {pending:?}: {error}")
+                    panic!("expected {expected}, got in flight {pending:?}: {error:?}")
                 }
                 (expected, Err(CreateFailureKind::OutcomeUnknown { unknown, error })) => {
                     panic!(
-                        "expected {expected}, got outcome unknown for {}: {error}",
+                        "expected {expected}, got outcome unknown for {}: {error:?}",
                         unknown.id()
                     )
                 }
@@ -2367,13 +2478,13 @@ mod tests {
             Ok(CreateOutcomeKind::PartialSuccess { state, diagnostic }) => {
                 panic!("expected pending, got {state:?}: {diagnostic:?}")
             }
-            Err(CreateFailureKind::NoResource(error)) => panic!("expected pending, got {error}"),
+            Err(CreateFailureKind::NoResource(error)) => panic!("expected pending, got {error:?}"),
             Err(CreateFailureKind::IdentifierReported { identified, error }) => {
-                panic!("expected pending, got {identified:?}: {error}")
+                panic!("expected pending, got {identified:?}: {error:?}")
             }
             Err(CreateFailureKind::OutcomeUnknown { unknown, error }) => {
                 panic!(
-                    "expected pending, got outcome unknown for {}: {error}",
+                    "expected pending, got outcome unknown for {}: {error:?}",
                     unknown.id()
                 )
             }
@@ -2439,14 +2550,16 @@ mod tests {
                 ("resumed", Ok(ResumeOutcomeKind::Resumed(created))) => {
                     assert_eq!(created.identifier().as_str(), "mock-id");
                 }
-                ("resent", Ok(ResumeOutcomeKind::Resent(outcome))) => match outcome.into_kind() {
-                    CreateOutcomeKind::Success { state } => {
-                        assert_eq!(state.identifier().as_str(), "mock-id");
+                ("resent", Ok(ResumeOutcomeKind::Resent(outcome))) => {
+                    match outcome.into_host_for_test().into_kind() {
+                        CreateOutcomeKind::Success { state } => {
+                            assert_eq!(state.identifier().as_str(), "mock-id");
+                        }
+                        CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
+                            panic!("unexpected partial resend {state:?}: {diagnostic:?}")
+                        }
                     }
-                    CreateOutcomeKind::PartialSuccess { state, diagnostic } => {
-                        panic!("unexpected partial resend {state:?}: {diagnostic:?}")
-                    }
-                },
+                }
                 ("no_resource", Err(ResumeFailureKind::NoResource(error))) => drop(error),
                 ("in_flight", Err(ResumeFailureKind::InFlight { pending, error })) => {
                     assert_eq!(pending.id(), &id);
@@ -2462,13 +2575,13 @@ mod tests {
                     panic!("expected {expected}, got resent {outcome:?}")
                 }
                 (expected, Err(ResumeFailureKind::NoResource(error))) => {
-                    panic!("expected {expected}, got no-resource {error}")
+                    panic!("expected {expected}, got no-resource {error:?}")
                 }
                 (expected, Err(ResumeFailureKind::IdentifierReported { identified, error })) => {
-                    panic!("expected {expected}, got identifier-reported {identified:?}: {error}")
+                    panic!("expected {expected}, got identifier-reported {identified:?}: {error:?}")
                 }
                 (expected, Err(ResumeFailureKind::InFlight { pending, error })) => {
-                    panic!("expected {expected}, got in flight {pending:?}: {error}")
+                    panic!("expected {expected}, got in flight {pending:?}: {error:?}")
                 }
             }
         }
@@ -2787,7 +2900,8 @@ mod tests {
                     &AppliedIdentifier::new("mock-id").unwrap(),
                     ReadRequest,
                 ))
-                .expect_err("corrupt mock state must not look like an empty store");
+                .expect_err("corrupt mock state must not look like an empty store")
+                .into_host_for_test();
             let rendered = error.to_string();
             assert!(
                 rendered.contains("Failed to load mock state")
@@ -3007,12 +3121,12 @@ mod tests {
                         request,
                         &schemas,
                     );
-                    carina_core::executor::dispatch_update(&provider, prepared)
+                    carina_core::executor::dispatch_update(&mock_boundary(&provider), prepared)
                         .await
                         .expect("update should succeed");
 
                     carina_core::executor::dispatch_delete(
-                        &provider,
+                        &mock_boundary(&provider),
                         carina_core::executor::delete_permit_for_test(
                             id.clone(),
                             identifier.clone(),
@@ -3288,8 +3402,9 @@ mod tests {
         let (initially_pending, ready_seen, still_pending, released, outcome) =
             runtime.block_on(async {
                 let schemas = carina_core::schema::SchemaRegistry::new();
+                let provider_boundary = mock_boundary(&provider);
                 let delete = carina_core::executor::dispatch_delete(
-                    &provider,
+                    &provider_boundary,
                     carina_core::executor::delete_permit_for_test(
                         id.clone(),
                         identifier.clone(),
@@ -3358,7 +3473,7 @@ mod tests {
         let (outcome, elapsed) = runtime.block_on(async {
             let started = tokio::time::Instant::now();
             let outcome = carina_core::executor::dispatch_delete(
-                &provider,
+                &mock_boundary(&provider),
                 carina_core::executor::delete_permit_for_test(
                     id.clone(),
                     identifier.clone(),
@@ -3374,3 +3489,7 @@ mod tests {
         assert_eq!(elapsed, Duration::from_millis(25));
     }
 }
+
+#[cfg(test)]
+#[path = "../../carina-core/tests/support/provider_text.rs"]
+mod provider_text_fixtures;

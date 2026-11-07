@@ -433,7 +433,7 @@ fn block_on_ready<F: std::future::Future>(future: F) -> F::Output {
 fn dispatch_fixture_create(
     id: &carina_core::resource::ResourceId,
     result: FixtureCreateResult,
-) -> carina_core::provider::CreateFailure {
+) -> carina_core::provider::HostCreateFailure {
     let mut resource = carina_core::resource::Resource::from_id(id.clone());
     let sent = match &result {
         FixtureCreateResult::NotCreated { .. } | FixtureCreateResult::Unknown { .. } => {
@@ -476,9 +476,12 @@ fn dispatch_fixture_create(
             let provider = FixtureCreateProvider {
                 result: std::sync::Mutex::new(Some(result)),
             };
+            let provider = std::sync::Arc::new(provider);
+            let provider_boundary =
+                crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
             let prepared = carina_core::replacement::create_permit_for_test(request);
             let (create, _cancellation) =
-                carina_core::executor::dispatch_create(&provider, prepared);
+                carina_core::executor::dispatch_create(&provider_boundary, prepared);
             block_on_ready(create).expect_err("fixture create returns a classified failure")
         },
     )
@@ -521,7 +524,7 @@ pub(crate) fn fixture_in_flight_create(
         carina_core::provider::CreateFailureKind::IdentifierReported {
             identified: _identified,
             error,
-        } => panic!("pending fixture was classified identifier-reported: {error}"),
+        } => panic!("pending fixture was classified identifier-reported: {error:?}"),
         carina_core::provider::CreateFailureKind::NoResource(error) => {
             panic!("pending fixture was classified not_created: {error}")
         }
@@ -576,9 +579,9 @@ pub(crate) fn fixture_repend_in_flight_create(
                 carina_core::provider::ResumeFailureKind::IdentifierReported {
                     identified: _identified,
                     error,
-                } => panic!("re-pend fixture was classified identifier-reported: {error}"),
+                } => panic!("re-pend fixture was classified identifier-reported: {error:?}"),
                 carina_core::provider::ResumeFailureKind::NoResource(error) => {
-                    panic!("re-pend fixture was classified no-resource: {error}")
+                    panic!("re-pend fixture was classified no-resource: {error:?}")
                 }
             }
         },
@@ -590,7 +593,7 @@ pub(crate) fn fixture_identified_create(
     id: &carina_core::resource::ResourceId,
     attributes: std::collections::HashMap<String, carina_core::resource::Value>,
     sent: carina_core::provider::Sent,
-) -> carina_core::provider::IdentifiedCreate {
+) -> carina_core::provider::HostIdentifiedCreate {
     let failure = dispatch_fixture_create(
         id,
         FixtureCreateResult::Observed {
@@ -643,3 +646,7 @@ impl DetailLevel {
 pub(crate) fn finite(value: f64) -> carina_core::FiniteF64 {
     carina_core::FiniteF64::new(value).unwrap()
 }
+
+#[cfg(any(test, feature = "test-utils"))]
+#[path = "../../carina-core/tests/support/provider_text.rs"]
+mod provider_text_fixtures;

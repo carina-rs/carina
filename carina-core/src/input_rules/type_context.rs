@@ -79,7 +79,7 @@ impl<S> InputTypeContext<S> {
         configs: &[crate::parser::ExpandedProviderConfig],
         schemas: &SchemaRegistry,
         write_ids: impl IntoIterator<Item = &'a ResourceId>,
-    ) -> crate::provider::ProviderResult<Self> {
+    ) -> crate::provider::HostResult<Self> {
         Self::from_compositions(resources, &[], compositions, wait_aliases, schemas)
             .with_data_sources(data_sources, schemas)
             .with_default_tags(configs, schemas, write_ids)
@@ -179,7 +179,7 @@ impl<S> InputTypeContext<S> {
         configs: &[crate::parser::ExpandedProviderConfig],
         schemas: &SchemaRegistry,
         write_ids: impl IntoIterator<Item = &'a ResourceId>,
-    ) -> crate::provider::ProviderResult<Self> {
+    ) -> crate::provider::HostResult<Self> {
         let mut mandatory = write_ids
             .into_iter()
             .map(|id| {
