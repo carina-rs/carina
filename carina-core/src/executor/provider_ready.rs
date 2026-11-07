@@ -2184,7 +2184,10 @@ mod provider_config_tests {
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
         let declaration = PatternAttributeType::refined_string(
             Some(identity.clone()),
-            Some("^accepted$".to_string()),
+            Some(crate::schema::PatternSpec::new(
+                "^accepted$".to_string(),
+                crate::schema::PatternMatch::Full,
+            )),
             None,
             None,
         );
@@ -2228,13 +2231,19 @@ mod provider_config_tests {
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
         let own_declaration = PatternAttributeType::refined_string(
             Some(identity.clone()),
-            Some("^own$".to_string()),
+            Some(crate::schema::PatternSpec::new(
+                "^own$".to_string(),
+                crate::schema::PatternMatch::Full,
+            )),
             None,
             None,
         );
         let sibling_declaration = PatternAttributeType::refined_string(
             Some(identity),
-            Some("^sibling$".to_string()),
+            Some(crate::schema::PatternSpec::new(
+                "^sibling$".to_string(),
+                crate::schema::PatternMatch::Full,
+            )),
             None,
             None,
         );
@@ -2732,7 +2741,10 @@ mod provider_config_tests {
                 "region".to_string(),
                 PatternAttributeType::refined_string(
                     None,
-                    Some(r"^good-[a-z]+$".to_string()),
+                    Some(crate::schema::PatternSpec::new(
+                        r"^good-[a-z]+$".to_string(),
+                        crate::schema::PatternMatch::Full,
+                    )),
                     None,
                     None,
                 ),

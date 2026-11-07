@@ -48,9 +48,13 @@ plan/apply without credentials, provider initialization, CRUD or data-source
 calls, upstream-state reads, backend access, locks, network access, cache
 writes, or state writes. It loads schema metadata only from exact installed
 provider artifacts. Repeat `--provider-schema KIND=/absolute/provider.wasm`
-to select explicit artifacts; this metadata-only path also understands
-released protocol-v12 schema signatures. A successful run reports configured
-rows plus orphan/deposed warnings and confirms that no state was written.
+to select explicit artifacts. The check requires providers built for the
+current protocol (24), including on this metadata-only path. Older artifacts,
+including released protocol-v12 providers, are rejected with a protocol-version
+error because their schemas do not declare pattern match modes. Rebuild them
+against the current SDK before checking the migration. A successful run reports
+configured rows plus orphan/deposed warnings and confirms that no state was
+written.
 
 State format v17 adds a top-level `exports_version` that versions the exports
 encoding separately from the rest of the state file. Readers that only need

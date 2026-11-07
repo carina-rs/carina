@@ -363,7 +363,7 @@ fn save_pending_input_plan(fixture: &Fixture, producer_name: &str, replacement: 
     );
     let saved = fs::read_to_string(fixture.0.path().join("plan.json")).unwrap();
     let json: serde_json::Value = serde_json::from_str(&saved).unwrap();
-    assert_eq!(json["version"], 42);
+    assert_eq!(json["version"], 43);
     for field in [
         "pending_inputs",
         "PendingInputObligation",

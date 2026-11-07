@@ -7367,3 +7367,59 @@ async fn raw_create_float_decode_failure_preserves_the_reported_identifier() {
     assert_eq!(identified.identifier().as_str(), "raw-created");
     assert_raw_float_cause(&error, carina_core::NonFiniteFloatError::NaN, "create");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn wasm_pattern_modes_preserve_matching_and_reason() {
+    use carina_core::schema::{PatternMatch, RawShape};
+    for http in [false, true] {
+        let (factory, _cache) = if http {
+            load_http_factory(
+                &http_wasm_path().expect("pattern modes require rebuilt HTTP mock WASM"),
+            )
+            .await
+        } else {
+            load_factory(&wasm_path().expect("pattern modes require rebuilt mock WASM")).await
+        };
+        let schemas = factory.schemas();
+        let schema = schemas
+            .iter()
+            .find(|schema| schema.parts().resource_type == "test.pattern_modes")
+            .expect("mock exports pattern fixture");
+        for (name, accepts_containing) in [("full", false), ("substring", true)] {
+            let ty = schema.parts().attributes[name].attr_type();
+            let RawShape::String {
+                identity: _identity,
+                pattern: Some(spec),
+                length: _length,
+                validate: _validate,
+                to_dsl: _to_dsl,
+            } = ty.raw_shape()
+            else {
+                panic!("pattern fixture string");
+            };
+            assert_eq!(spec.as_str(), "abc");
+            match spec.mode() {
+                PatternMatch::Full => assert!(!accepts_containing),
+                PatternMatch::Substring { reason } => {
+                    assert!(accepts_containing);
+                    assert_eq!(
+                        reason.as_str(),
+                        "Fixture exercises deliberate substring validation"
+                    );
+                }
+            }
+            for (value, accepted) in [("abc", true), ("xabcx", accepts_containing)] {
+                let value: Value = Value::Concrete(ConcreteValue::String(value.into()));
+                assert_eq!(
+                    schema
+                        .effective_attribute(name)
+                        .unwrap()
+                        .validate(&value)
+                        .is_ok(),
+                    accepted,
+                    "{name}={value:?}"
+                );
+            }
+        }
+    }
+}

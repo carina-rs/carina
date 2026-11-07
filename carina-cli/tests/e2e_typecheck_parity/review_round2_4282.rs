@@ -21,7 +21,10 @@ fn review_schemas() -> SchemaRegistry {
                             "test.Resource",
                             "Name",
                         )),
-                        Some("^[a-z]+$".into()),
+                        Some(carina_core::schema::PatternSpec::new(
+                            "^[a-z]+$",
+                            carina_core::schema::PatternMatch::Full,
+                        )),
                         None,
                         None,
                     )),
@@ -31,7 +34,15 @@ fn review_schemas() -> SchemaRegistry {
             .attribute(
                 AttributeSchema::optional(
                     "digit",
-                    AttributeType::refined_string(None, Some("^[0-9]$".into()), None, None),
+                    AttributeType::refined_string(
+                        None,
+                        Some(carina_core::schema::PatternSpec::new(
+                            "^[0-9]$",
+                            carina_core::schema::PatternMatch::Full,
+                        )),
+                        None,
+                        None,
+                    ),
                 )
                 .build(),
             )
@@ -87,7 +98,7 @@ fn expected_findings(
     }
     let index = usize::from(partial);
     let value = if partial { "B" } else { "A" };
-    let rule = "does not match required pattern /^[a-z]+$/";
+    let rule = "does not match required pattern /^[a-z]+$/ (Full)";
     let (cli, lsp) = if sink == "resource" {
         if bound {
             let message =

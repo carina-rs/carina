@@ -162,6 +162,7 @@ Provider-populated attributes can still be marked `deferred_populate` when the A
 `AttributeType` has a constructor for each shape:
 
 - Scalars: `string()`, `int()`, `float()`, `bool()`, `duration()`.
+- Patterns use `PatternSpec::new(regex, PatternMatch::Full)`. A deliberate substring exception requires `PatternMatch::Substring { reason: PatternReason::new(reason)? }` with a reason containing visible text. The mode determines matching; the source regex is preserved.
 - Refined scalars carry extra rules: `refined_string(identity, pattern, length, to_dsl)`, `refined_int(identity, range)` and `refined_float(identity, range)`, plus the `_with_validator` forms described in [Validators and type identities](#validators-and-type-identities).
 - Collections: `list(inner)`, `unordered_list(inner)` for lists whose order the API does not keep, `map(value)` and `map_with_key(key, value)`.
 - Refined lists: `refined_list(element_type, ordered, length, elements)`, with an explicit `ListElements::AllowDuplicates` or `ListElements::Unique` policy.
@@ -392,13 +393,13 @@ A refined type can carry a validator: a function the host runs on each value bef
 ```rust
 use carina_plugin_sdk::core::resource::{ConcreteValue, Value};
 use carina_plugin_sdk::core::schema::{
-    AttributeSchema, AttributeType, ResourceSchema, TypeError, TypeIdentity, validator,
+    AttributeSchema, AttributeType, ResourceSchema, TypeError, TypeIdentity, PatternSpec, PatternMatch, validator,
 };
 
 fn color() -> AttributeType {
     AttributeType::refined_string_with_validator(
         TypeIdentity::new(Some("widget"), ["widget"], "Color"),
-        Some("^#[0-9a-f]{6}$".to_string()),
+        Some(PatternSpec::new("#[0-9a-f]{6}", PatternMatch::Full)),
         None,
         validator(|value| match value {
             Value::Concrete(ConcreteValue::String(color))

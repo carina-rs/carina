@@ -49,7 +49,10 @@ impl ProviderFactory for RefinedValueFactory {
     fn schemas(&self) -> Vec<ValidatedResourceSchema> {
         let original = AttributeType::refined_string(
             None,
-            Some("^[a-z]+$".into()),
+            Some(carina_core::schema::PatternSpec::new(
+                "^[a-z]+$",
+                carina_core::schema::PatternMatch::Full,
+            )),
             Some((Some(1), Some(100))),
             None,
         );

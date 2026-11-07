@@ -526,7 +526,15 @@ fn directory_nested_union_keeps_the_inner_provider_rejection() {
 fn directory_union_tie_reports_the_provider_rejection_once() {
     let engine = engine(AttributeType::union(vec![
         remote("VpcId"),
-        AttributeType::refined_string(None, Some("^x".into()), None, None),
+        AttributeType::refined_string(
+            None,
+            Some(carina_core::schema::PatternSpec::new(
+                "^x",
+                carina_core::schema::PatternMatch::Full,
+            )),
+            None,
+            None,
+        ),
     ]));
     let source = "test.test.Widget {\n  value = \"bad\"\n}\n";
 

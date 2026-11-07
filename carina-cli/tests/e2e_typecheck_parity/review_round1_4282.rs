@@ -21,7 +21,10 @@ fn review_schemas() -> SchemaRegistry {
                             "test.Resource",
                             "Name",
                         )),
-                        Some("^[a-z]+$".into()),
+                        Some(carina_core::schema::PatternSpec::new(
+                            "^[a-z]+$",
+                            carina_core::schema::PatternMatch::Full,
+                        )),
                         None,
                         None,
                     )),
@@ -31,7 +34,15 @@ fn review_schemas() -> SchemaRegistry {
             .attribute(
                 AttributeSchema::optional(
                     "digit",
-                    AttributeType::refined_string(None, Some("^[0-9]$".into()), None, None),
+                    AttributeType::refined_string(
+                        None,
+                        Some(carina_core::schema::PatternSpec::new(
+                            "^[0-9]$",
+                            carina_core::schema::PatternMatch::Full,
+                        )),
+                        None,
+                        None,
+                    ),
                 )
                 .build(),
             )
@@ -269,7 +280,8 @@ fn issue_4282_round1_integer_interpolation_checks_refinement_once() {
         let (cli, lsp) = if number == 5 {
             (vec![], vec![])
         } else {
-            let error = "Invalid value '55' for 'digit': does not match required pattern /^[0-9]$/";
+            let error =
+                "Invalid value '55' for 'digit': does not match required pattern /^[0-9]$/ (Full)";
             (
                 vec![format!("mock.test.Resource.<pending>: {error}")],
                 vec![error.into()],
@@ -284,7 +296,7 @@ fn issue_4282_round1_mixed_list_keeps_main_messages_and_counts() {
     for (expression, invalid) in [(r#"["${''}a", 'b']"#, false), (r#"["${''}A", 'b']"#, true)] {
         let source = format!("let r = {expression}\nmock.test.Resource {{ names = r }}\n");
         let messages = if invalid {
-            vec!["List item at index 0: Invalid Name value 'A': does not match required pattern /^[a-z]+$/".into()]
+            vec!["List item at index 0: Invalid Name value 'A': does not match required pattern /^[a-z]+$/ (Full)".into()]
         } else {
             vec![]
         };
@@ -312,12 +324,12 @@ fn issue_4282_round1_mixed_builtin_list_uses_main_interpolation_messages_and_cou
             let mut cli = vec![];
             let mut lsp = vec![pipe_hint("join")];
             if bound && invalid {
-                let error = "List item at index 0: Invalid Name value 'A': does not match required pattern /^[a-z]+$/";
+                let error = "List item at index 0: Invalid Name value 'A': does not match required pattern /^[a-z]+$/ (Full)";
                 cli.push(error.into());
                 lsp.push(error.into());
             } else if invalid {
-                cli.push("mock.test.Resource.<pending>: List item at index 0: Invalid value 'A' for 'names' (Name): does not match required pattern /^[a-z]+$/".into());
-                lsp.push("Invalid value 'A' for 'names[0]' (Name): does not match required pattern /^[a-z]+$/".into());
+                cli.push("mock.test.Resource.<pending>: List item at index 0: Invalid value 'A' for 'names' (Name): does not match required pattern /^[a-z]+$/ (Full)".into());
+                lsp.push("Invalid value 'A' for 'names[0]' (Name): does not match required pattern /^[a-z]+$/ (Full)".into());
             }
             assert_findings(&source, None, cli, lsp);
         }

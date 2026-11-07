@@ -113,6 +113,7 @@ pub fn uses_builtin_provider<'a, P: PlaceholderKind + 'a, B: BindingAddress + 'a
 /// Schemas exposed by Carina's built-in `provider mock {}` implementation.
 pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
     let schemas = vec![
+        pattern_mode_schema(),
         input_rule_schema(),
         desired_input_rule_schema(),
         estimated_input_rule_schema(),
@@ -411,6 +412,44 @@ pub fn builtin_schemas() -> Vec<ValidatedResourceSchema> {
         .collect()
 }
 
+/// Both modes deliberately share the same unanchored source for transport/e2e tests.
+pub fn pattern_mode_schema() -> ResourceSchema {
+    use carina_core::schema::{PatternMatch, PatternReason, PatternSpec};
+    ResourceSchema::new("test.pattern_modes")
+        .attribute(
+            AttributeSchema::optional(
+                "full",
+                AttributeType::refined_string(
+                    None,
+                    Some(PatternSpec::new("abc", PatternMatch::Full)),
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+        .attribute(
+            AttributeSchema::optional(
+                "substring",
+                AttributeType::refined_string(
+                    None,
+                    Some(PatternSpec::new(
+                        "abc",
+                        PatternMatch::Substring {
+                            reason: PatternReason::new(
+                                "Fixture exercises deliberate substring validation",
+                            )
+                            .unwrap(),
+                        },
+                    )),
+                    None,
+                    None,
+                ),
+            )
+            .build(),
+        )
+}
+
 /// Portable creation-declaration fixture shared by native and WASM schemas.
 pub fn input_rule_schema() -> ResourceSchema {
     input_rule_schema_for("test.creation_constrained").with_coexisting_replacement()
@@ -430,7 +469,10 @@ pub fn estimated_input_rule_schema() -> ResourceSchema {
                 "short_part",
                 AttributeType::refined_string(
                     None,
-                    Some("^[a-z]+$".into()),
+                    Some(carina_core::schema::PatternSpec::new(
+                        "^[a-z]+$",
+                        carina_core::schema::PatternMatch::Full,
+                    )),
                     Some((Some(3), Some(5))),
                     None,
                 ),
@@ -442,7 +484,10 @@ pub fn estimated_input_rule_schema() -> ResourceSchema {
                 "long_part",
                 AttributeType::refined_string(
                     None,
-                    Some("^[a-z]+$".into()),
+                    Some(carina_core::schema::PatternSpec::new(
+                        "^[a-z]+$",
+                        carina_core::schema::PatternMatch::Full,
+                    )),
                     Some((Some(20), Some(30))),
                     None,
                 ),

@@ -194,6 +194,11 @@
 
 mod compile_schema;
 mod compiled_pattern;
+mod pattern_display;
+pub use carina_provider_protocol::types::{
+    EmptyPatternReason, PatternMatch, PatternReason, PatternSpec, PatternSpecParts,
+};
+pub use pattern_display::{DiagnosticPatternSpec, PatternSpecDisplay};
 pub(crate) mod length_interval;
 use length_interval::length_contains;
 mod input_rules;
@@ -205,7 +210,7 @@ pub use input_rules::{
     InputRuleScope, InputRuleTarget, InputViolation, InputViolationReason, NonEmptyString,
 };
 
-use crate::provider_text::{DiagnosticText, ProviderKey};
+use crate::provider_text::{DiagnosticText, DiagnosticTextBuilder, ProviderKey};
 use crate::resource::InsideSecret;
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -1377,13 +1382,13 @@ pub enum Shape<'a, R: PatternForm = Draft> {
     /// String-valued reference with mandatory resolver identity.
     Reference {
         identity: &'a TypeIdentity,
-        pattern: Option<&'a str>,
+        pattern: Option<&'a PatternSpec>,
         length: Option<(Option<u64>, Option<u64>)>,
     },
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
         identity: Option<&'a TypeIdentity>,
-        pattern: Option<&'a str>,
+        pattern: Option<&'a PatternSpec>,
         length: Option<(Option<u64>, Option<u64>)>,
         validate: Option<&'a CustomValidator>,
         to_dsl: Option<&'a DslTransform>,
@@ -1577,13 +1582,13 @@ pub enum RawShape<'a, R: PatternForm = Draft> {
     /// String-valued reference with mandatory resolver identity.
     Reference {
         identity: &'a TypeIdentity,
-        pattern: Option<&'a str>,
+        pattern: Option<&'a PatternSpec>,
         length: Option<(Option<u64>, Option<u64>)>,
     },
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
         identity: Option<&'a TypeIdentity>,
-        pattern: Option<&'a str>,
+        pattern: Option<&'a PatternSpec>,
         length: Option<(Option<u64>, Option<u64>)>,
         validate: Option<&'a CustomValidator>,
         to_dsl: Option<&'a DslTransform>,
@@ -2523,7 +2528,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 length,
             } => Shape::Reference {
                 identity,
-                pattern: pattern.as_deref(),
+                pattern: pattern.as_ref().map(AsRef::as_ref),
                 length: *length,
             },
             AttrTypeKind::String {
@@ -2533,7 +2538,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 to_dsl,
             } => Shape::String {
                 identity: binding.identity(),
-                pattern: pattern.as_deref(),
+                pattern: pattern.as_ref().map(AsRef::as_ref),
                 length: *length,
                 validate: binding.callback(),
                 to_dsl: to_dsl.as_ref(),
@@ -2629,7 +2634,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 length,
             } => RawShape::Reference {
                 identity,
-                pattern: pattern.as_deref(),
+                pattern: pattern.as_ref().map(AsRef::as_ref),
                 length: *length,
             },
             AttrTypeKind::String {
@@ -2639,7 +2644,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 to_dsl,
             } => RawShape::String {
                 identity: binding.identity(),
-                pattern: pattern.as_deref(),
+                pattern: pattern.as_ref().map(AsRef::as_ref),
                 length: *length,
                 validate: binding.callback(),
                 to_dsl: to_dsl.as_ref(),
@@ -3141,7 +3146,11 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 pattern,
                 length,
                 ..
-            } => custom_display_name(binding.identity(), pattern.as_deref(), length.as_ref()),
+            } => custom_display_name(
+                binding.identity(),
+                pattern.as_ref().map(AsRef::as_ref),
+                length.as_ref(),
+            ),
             AttrTypeKind::ResourceHandle {
                 provider,
                 resource_type,
@@ -4051,7 +4060,10 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     to_dsl: _,
                 },
             ) => {
-                if !pattern_compatible(s_pat.as_deref(), k_pat.as_deref()) {
+                if !pattern_compatible(
+                    s_pat.as_ref().map(AsRef::as_ref),
+                    k_pat.as_ref().map(AsRef::as_ref),
+                ) {
                     return false;
                 }
                 if !length_contains(s_len.as_ref(), k_len.as_ref()) {
@@ -4507,7 +4519,7 @@ fn validate_string_refinement(
     {
         return Err(TypeError::PatternMismatch {
             value: s.into(),
-            pattern: pattern.to_string().into(),
+            pattern: pattern.as_ref().clone().into(),
             attribute: None,
             type_name,
         });
@@ -5778,7 +5790,7 @@ fn validate_struct_field_assignment(
         })
 }
 
-fn pattern_compatible(source: Option<&str>, sink: Option<&str>) -> bool {
+fn pattern_compatible(source: Option<&PatternSpec>, sink: Option<&PatternSpec>) -> bool {
     match (source, sink) {
         (_, None) => true,
         (Some(source), Some(sink)) => source == sink,
@@ -5853,7 +5865,7 @@ impl<R: PatternForm> fmt::Display for PatternAttributeType<R> {
 
 fn custom_display_name(
     identity: Option<&TypeIdentity>,
-    pattern: Option<&str>,
+    pattern: Option<&PatternSpec>,
     length: Option<&(Option<u64>, Option<u64>)>,
 ) -> String {
     if let Some(id) = identity {
@@ -6025,15 +6037,15 @@ fn format_invalid_value_intro(
 
 fn format_pattern_mismatch(
     value: &DiagnosticValue,
-    pattern: &str,
+    pattern: &PatternSpec,
     attribute: Option<&str>,
     type_name: Option<&str>,
-) -> String {
-    format!(
-        "{}: does not match required pattern /{}/",
-        format_invalid_value_intro(value, attribute, type_name),
-        pattern
-    )
+) -> DiagnosticText {
+    let mut text = DiagnosticTextBuilder::default();
+    text.push_str(&format_invalid_value_intro(value, attribute, type_name));
+    text.push_str(": does not match required pattern ");
+    PatternSpecDisplay::new(pattern).push_to(&mut text);
+    text.finish()
 }
 
 fn format_length_out_of_range(
@@ -6755,11 +6767,11 @@ pub enum TypeError {
 
     #[error(
         "{}",
-        DiagnosticText::new(format_pattern_mismatch(value, pattern.as_str(), attribute.as_deref(), type_name.as_deref()))
+        format_pattern_mismatch(value, pattern.as_ref(), attribute.as_deref(), type_name.as_deref())
     )]
     PatternMismatch {
         value: DiagnosticValue,
-        pattern: ProviderKey,
+        pattern: DiagnosticPatternSpec,
         attribute: Option<String>,
         type_name: Option<String>,
     },
@@ -12796,13 +12808,17 @@ impl<R: PatternForm> PatternAttributeType<R> {
             } => {
                 constraints.push(format!("length {}", bounds(*length)));
                 if let Some(owned) = binding.annotation() {
-                    constraints.extend(
-                        owned
-                            .patterns()
-                            .map(|pattern| format!("pattern {:?}", pattern.as_str())),
-                    );
+                    constraints.extend(owned.patterns().map(|pattern| {
+                        format!(
+                            "pattern {}",
+                            PatternSpecDisplay::new(pattern.as_ref()).quoted()
+                        )
+                    }));
                 } else if let Some(pattern) = pattern {
-                    constraints.push(format!("pattern {:?}", &**pattern));
+                    constraints.push(format!(
+                        "pattern {}",
+                        PatternSpecDisplay::new(pattern.as_ref()).quoted()
+                    ));
                 }
             }
             AttrTypeKind::Reference {
@@ -12810,7 +12826,10 @@ impl<R: PatternForm> PatternAttributeType<R> {
             } => {
                 constraints.push(format!("length {}", bounds(*length)));
                 if let Some(pattern) = pattern {
-                    constraints.push(format!("pattern {:?}", &**pattern));
+                    constraints.push(format!(
+                        "pattern {}",
+                        PatternSpecDisplay::new(pattern.as_ref()).quoted()
+                    ));
                 }
             }
             AttrTypeKind::Int { range, .. } => {

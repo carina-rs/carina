@@ -538,6 +538,14 @@ A struct type represents a nested object with typed fields.
   that may accept a block alias uses the explicitly named
   `effective_attribute_by_authored_name` /
   `effective_node_at_authored_path` traversal.
+- **Patterns require explicit semantics.** Build a `PatternSpec::new(regex,
+  PatternMatch::Full)` for whole-value constraints. Use
+  `PatternMatch::Substring { reason: PatternReason::new(reason)? }` only for a
+  documented exception; reasons must contain visible text. Pass the
+  typed spec to refined-string/reference constructors and Matches/NotMatches
+  input predicates. No string-only constructor, conversion, or default mode is
+  permitted. Preserve authored regex text; `CompiledPattern::try_new(&spec)`
+  compiles absolute Full boundaries internally once at schema admission.
 - **Schema types are builder-only.** `StructField`, `AttributeSchema`, and
   `ResourceSchema` keep their fields `pub(crate)` (carina#3984 / PR #3999).
   Code outside `carina-core` builds them only through the builders
@@ -665,7 +673,11 @@ A struct type represents a nested object with typed fields.
   `write_only` flag is required in schema JSON (no `#[serde(default)]`), and the
   protocol minimum (`MIN_SUPPORTED_PROTOCOL_VERSION`) requires it, so a host
   and provider that disagree about it
-  fail at load instead of silently dropping nested write-only members. Adding
+  fail at load instead of silently dropping nested write-only members. Protocol
+  24 also requires a typed pattern spec (regex plus explicit mode, and a reason
+  containing visible text for Substring); convert the complete spec
+  exhaustively, including its reason. Never supply a default mode or admit a bare
+  string, including on the schema-only migration path. Adding
   a protocol field must break compilation until it is consciously carried
   across or explicitly bound and documented as unavailable on the destination
   side. Never use a catch-all `_` or `..` at this seam; a silently dropped field

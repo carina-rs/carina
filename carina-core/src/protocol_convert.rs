@@ -710,10 +710,10 @@ fn input_rule_to_protocol(rule: &InputRule<Compiled>) -> protocol::InputRule {
         },
         InputPredicate::NotIpv4 => protocol::InputPredicate::NotIpv4,
         InputPredicate::Matches(pattern) => {
-            protocol::InputPredicate::Matches(pattern.as_str().to_owned())
+            protocol::InputPredicate::Matches(pattern.as_ref().clone())
         }
         InputPredicate::NotMatches(pattern) => {
-            protocol::InputPredicate::NotMatches(pattern.as_str().to_owned())
+            protocol::InputPredicate::NotMatches(pattern.as_ref().clone())
         }
     };
     protocol::InputRule {
@@ -1075,7 +1075,7 @@ pub fn attribute_type_to_protocol(
                 segments: identity.segments.clone(),
                 kind: identity.kind.clone(),
             },
-            pattern: pattern.map(str::to_owned),
+            pattern: pattern.cloned(),
             length,
         }),
         RawShape::String {
@@ -1088,7 +1088,7 @@ pub fn attribute_type_to_protocol(
             ensure_validator_identity("String", identity, validate)?;
             let _validate_via_identity = validate;
             Ok(protocol::AttributeType::String {
-                pattern: pattern.map(str::to_owned),
+                pattern: pattern.cloned(),
                 length,
                 validate: None,
                 to_dsl: to_dsl.cloned(),
@@ -1749,7 +1749,7 @@ fn reject_opaque_validator(
 
 fn decoded_refined_string(
     identity: Option<TypeIdentity>,
-    pattern: Option<String>,
+    pattern: Option<crate::schema::PatternSpec>,
     length: Option<(Option<u64>, Option<u64>)>,
     to_dsl: Option<protocol::DslTransform>,
 ) -> DraftAttributeType {
@@ -1806,7 +1806,7 @@ fn decoded_refined_float(
 fn protocol_legacy_custom_to_core(
     enclosing_name: &str,
     base: &protocol::AttributeType,
-    pattern: Option<String>,
+    pattern: Option<crate::schema::PatternSpec>,
     length: Option<(Option<u64>, Option<u64>)>,
     to_dsl: Option<protocol::DslTransform>,
 ) -> Result<DraftAttributeType, SchemaDecodeError> {
@@ -3067,7 +3067,10 @@ mod tests {
         use carina_provider_protocol::types as protocol;
         let string = protocol::AttributeType::String {
             identity: None,
-            pattern: Some("(?=x)".to_string()),
+            pattern: Some(protocol::PatternSpec::new(
+                "(?=x)".to_string(),
+                protocol::PatternMatch::Full,
+            )),
             length: None,
             validate: None,
             to_dsl: None,
@@ -3081,7 +3084,10 @@ mod tests {
                 validate: None,
                 to_dsl: None,
             }),
-            pattern: Some("(?=x)".to_string()),
+            pattern: Some(protocol::PatternSpec::new(
+                "(?=x)".to_string(),
+                protocol::PatternMatch::Full,
+            )),
             length: None,
             validate: None,
             to_dsl: None,
@@ -3098,14 +3104,17 @@ mod tests {
                 location,
                 &SchemaValidationIssueLocation::Attribute("value".into())
             );
-            assert_eq!(source.pattern, "(?=x)");
+            assert_eq!(source.as_ref().as_str(), "(?=x)");
         }
     }
 
     fn bad_pattern(pattern: &str) -> protocol::AttributeType {
         protocol::AttributeType::String {
             identity: None,
-            pattern: Some(pattern.into()),
+            pattern: Some(protocol::PatternSpec::new(
+                pattern,
+                protocol::PatternMatch::Full,
+            )),
             length: None,
             validate: None,
             to_dsl: None,
@@ -3155,7 +3164,7 @@ mod tests {
         assert_eq!(
             source
                 .pattern_errors()
-                .map(|(location, error)| (location.clone(), error.pattern.as_str()))
+                .map(|(location, error)| (location.clone(), error.as_ref().as_str()))
                 .collect::<Vec<_>>(),
             vec![
                 (SchemaValidationIssueLocation::Definition("Bad".into()), "["),
@@ -3241,7 +3250,10 @@ mod tests {
     fn legacy_custom_compiles_only_the_surviving_pattern() {
         let invalid_string = protocol::AttributeType::String {
             identity: None,
-            pattern: Some("(?=x)".into()),
+            pattern: Some(protocol::PatternSpec::new(
+                "(?=x)",
+                protocol::PatternMatch::Full,
+            )),
             length: None,
             validate: None,
             to_dsl: None,
@@ -3249,7 +3261,10 @@ mod tests {
         let invalid_custom = protocol::AttributeType::Custom {
             name: "Inner".into(),
             base: Box::new(invalid_string.clone()),
-            pattern: Some("(?=y)".into()),
+            pattern: Some(protocol::PatternSpec::new(
+                "(?=y)",
+                protocol::PatternMatch::Full,
+            )),
             length: None,
             validate: None,
             to_dsl: None,
@@ -3258,7 +3273,10 @@ mod tests {
             let wire = protocol::AttributeType::Custom {
                 name: "Outer".into(),
                 base: Box::new(base),
-                pattern: Some("^valid$".into()),
+                pattern: Some(protocol::PatternSpec::new(
+                    "^valid$",
+                    protocol::PatternMatch::Full,
+                )),
                 length: None,
                 validate: None,
                 to_dsl: None,
@@ -3268,9 +3286,9 @@ mod tests {
             assert!(matches!(
                 decoded.raw_shape(),
                 RawShape::String {
-                    pattern: Some("^valid$"),
+                    pattern: Some(pattern),
                     ..
-                }
+                } if pattern == &crate::schema::PatternSpec::new("^valid$", crate::schema::PatternMatch::Full)
             ));
             ValidatedConfigSchema::validate(BTreeMap::from([("value".to_string(), decoded)]))
                 .expect("only the surviving pattern may reach admission");
@@ -3308,7 +3326,10 @@ mod tests {
             let wire = protocol::AttributeType::Custom {
                 name: String::new(),
                 base: Box::new(base),
-                pattern: Some("(?=x)".into()),
+                pattern: Some(protocol::PatternSpec::new(
+                    "(?=x)",
+                    protocol::PatternMatch::Full,
+                )),
                 length: None,
                 validate: None,
                 to_dsl: None,
@@ -3455,7 +3476,10 @@ mod tests {
         let identity = TypeIdentity::new(Some("test"), ["keys", "Key"], "Reference");
         let ty = DraftAttributeType::reference(
             identity.clone(),
-            Some("^alias/[a-z]+$".into()),
+            Some(crate::schema::PatternSpec::new(
+                "^alias/[a-z]+$",
+                crate::schema::PatternMatch::Full,
+            )),
             Some((Some(8), Some(12))),
         );
         let owner = PatternResourceSchema::new("keys.Resource")
@@ -3465,7 +3489,7 @@ mod tests {
         let wire = attribute_type_to_protocol(&owner.parts().attributes["key"].attr_type).unwrap();
         let decoded = protocol_to_attribute_type(&wire).unwrap();
         assert!(
-            matches!(decoded.raw_shape(), RawShape::Reference { identity: actual, pattern: Some("^alias/[a-z]+$"), length: Some((Some(8), Some(12))) } if actual == &identity)
+            matches!(decoded.raw_shape(), RawShape::Reference { identity: actual, pattern: Some(pattern), length: Some((Some(8), Some(12))) } if actual == &identity && pattern == &crate::schema::PatternSpec::new("^alias/[a-z]+$", crate::schema::PatternMatch::Full))
         );
         let schema = PatternResourceSchema::new("keys.Resource")
             .attribute(crate::schema::AttributeSchema::optional("key", decoded).build())
@@ -4949,7 +4973,10 @@ mod tests {
         let wire = protocol::AttributeType::Custom {
             name: "test.StringId".to_string(),
             base: Box::new(protocol::AttributeType::String {
-                pattern: Some("^base-[a-z]+$".to_string()),
+                pattern: Some(protocol::PatternSpec::new(
+                    "^base-[a-z]+$".to_string(),
+                    protocol::PatternMatch::Full,
+                )),
                 length: Some((Some(5), Some(32))),
                 validate: None,
                 to_dsl: Some(protocol::DslTransform::HyphenToUnderscore),
@@ -4971,7 +4998,7 @@ mod tests {
                 validate: None,
                 to_dsl: Some(protocol::DslTransform::HyphenToUnderscore),
             } if identity == &TypeIdentity::from_dotted("test.StringId")
-                && pattern == "^base-[a-z]+$"
+                && pattern == &crate::schema::PatternSpec::new("^base-[a-z]+$", crate::schema::PatternMatch::Full)
         ));
     }
 
@@ -5137,13 +5164,19 @@ mod tests {
         let duplicate_wire = protocol::AttributeType::Custom {
             name: "test.ConflictingString".to_string(),
             base: Box::new(protocol::AttributeType::String {
-                pattern: Some("^base$".to_string()),
+                pattern: Some(protocol::PatternSpec::new(
+                    "^base$".to_string(),
+                    protocol::PatternMatch::Full,
+                )),
                 length: None,
                 validate: None,
                 to_dsl: None,
                 identity: None,
             }),
-            pattern: Some("^outer$".to_string()),
+            pattern: Some(protocol::PatternSpec::new(
+                "^outer$".to_string(),
+                protocol::PatternMatch::Full,
+            )),
             length: None,
             validate: None,
             to_dsl: None,
@@ -5164,9 +5197,9 @@ mod tests {
         assert!(matches!(
             decoded.raw_shape(),
             RawShape::String {
-                pattern: Some("^outer$"),
+                pattern: Some(pattern),
                 ..
-            }
+            } if pattern == &crate::schema::PatternSpec::new("^outer$", crate::schema::PatternMatch::Full)
         ));
     }
 
@@ -5191,5 +5224,62 @@ mod tests {
         let wire = try_update_patch_to_protocol(&patch).expect("patch must encode");
         let decoded = protocol_update_patch_to_core(&wire).expect("patch must decode");
         assert_eq!(decoded.ops, patch.ops);
+    }
+}
+
+#[cfg(test)]
+mod explicit_pattern_mode_tests {
+    use super::*;
+    use crate::schema::{PatternMatch, PatternReason, PatternSpec};
+
+    #[test]
+    fn legacy_custom_precedence_selects_the_entire_pattern_spec() {
+        let inner = protocol::PatternSpec::new(
+            "abc",
+            protocol::PatternMatch::Substring {
+                reason: protocol::PatternReason::new("Inner contract permits a substring").unwrap(),
+            },
+        );
+        let outer = protocol::PatternSpec::new("abc", protocol::PatternMatch::Full);
+        let base = protocol::AttributeType::String {
+            pattern: Some(inner.clone()),
+            length: None,
+            validate: None,
+            to_dsl: None,
+            identity: None,
+        };
+        for (outer_pattern, expected) in [
+            (Some(outer), PatternSpec::new("abc", PatternMatch::Full)),
+            (
+                None,
+                PatternSpec::new(
+                    "abc",
+                    PatternMatch::Substring {
+                        reason: PatternReason::new("Inner contract permits a substring").unwrap(),
+                    },
+                ),
+            ),
+        ] {
+            let wire = protocol::AttributeType::Custom {
+                name: "test.Pattern".into(),
+                base: Box::new(base.clone()),
+                pattern: outer_pattern,
+                length: None,
+                validate: None,
+                to_dsl: None,
+            };
+            let decoded = protocol_to_attribute_type(&wire).unwrap();
+            let RawShape::String {
+                identity: _identity,
+                pattern,
+                length: _length,
+                validate: _validate,
+                to_dsl: _to_dsl,
+            } = decoded.raw_shape()
+            else {
+                panic!("String refinement");
+            };
+            assert_eq!(pattern, Some(&expected));
+        }
     }
 }

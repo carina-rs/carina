@@ -7,7 +7,15 @@ use carina_core::schema::{AttributeType, RawShape, Shape, ValidatedConfigSchema}
 fn map_length_builder_preserves_bounds_and_typed_keys_through_protocol() {
     let length = Some((Some(0), Some(10)));
     let map = AttributeType::refined_map(
-        AttributeType::refined_string(None, Some("^key_[0-9]+$".into()), None, None),
+        AttributeType::refined_string(
+            None,
+            Some(carina_core::schema::PatternSpec::new(
+                "^key_[0-9]+$",
+                carina_core::schema::PatternMatch::Full,
+            )),
+            None,
+            None,
+        ),
         AttributeType::string(),
         length,
     );
@@ -30,7 +38,10 @@ fn map_length_builder_preserves_bounds_and_typed_keys_through_protocol() {
     let wire = attribute_type_to_protocol(original).unwrap();
     let json = serde_json::to_value(&wire).unwrap();
     assert_eq!(json["length"], serde_json::json!([0, 10]));
-    assert_eq!(json["key"]["pattern"], "^key_[0-9]+$");
+    assert_eq!(
+        json["key"]["pattern"],
+        serde_json::json!({"regex":"^key_[0-9]+$", "mode":{"kind":"full"}})
+    );
     let decoded_wire = serde_json::from_value(json).unwrap();
     let decoded =
         protocol_to_config_schema(BTreeMap::from([("params".into(), decoded_wire)])).unwrap();

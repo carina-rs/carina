@@ -1136,8 +1136,20 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
 
     fn schemas(&self) -> Vec<carina_core::schema::ValidatedResourceSchema> {
         let schema_drafts: Vec<carina_core::schema::ResourceSchema> = {
-            let constrained =
-                AttributeType::refined_string(None, Some("^good-".to_string()), None, None);
+            let constrained = AttributeType::refined_string(
+                None,
+                Some(carina_core::schema::PatternSpec::new(
+                    "^good-",
+                    carina_core::schema::PatternMatch::Substring {
+                        reason: carina_core::schema::PatternReason::new(
+                            "Plan fixture deliberately validates only the prefix",
+                        )
+                        .unwrap(),
+                    },
+                )),
+                None,
+                None,
+            );
             vec![
                 ResourceSchema::new("test.Source")
                     .attribute(AttributeSchema::required("value", AttributeType::string()).build()),

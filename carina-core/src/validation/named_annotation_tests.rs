@@ -81,10 +81,10 @@ fn identity() -> TypeIdentity {
     TypeIdentity::from_schema_type("aws", "iam.Role", "Name")
 }
 
-fn string(min: u64, max: u64, pattern: Option<&str>) -> DraftType {
+fn string(min: u64, max: u64, pattern: Option<crate::schema::PatternSpec>) -> DraftType {
     DraftType::refined_string(
         Some(identity()),
-        pattern.map(str::to_string),
+        pattern,
         Some((Some(min), Some(max))),
         None,
     )
@@ -159,7 +159,17 @@ fn assign(
 
 #[test]
 fn lifting_preserves_all_string_obligations_in_nested_annotations() {
-    let snapshot = snapshot(vec![("awscc", vec![string(1, 64, Some("^[A-Z]+$"))])]);
+    let snapshot = snapshot(vec![(
+        "awscc",
+        vec![string(
+            1,
+            64,
+            Some(crate::schema::PatternSpec::new(
+                "^[A-Z]+$",
+                crate::schema::PatternMatch::Full,
+            )),
+        )],
+    )]);
     let ty = annotation(&snapshot);
     let lifted = lift_type_expr(&ty).unwrap();
     assert!(matches!(
@@ -185,8 +195,42 @@ fn lifting_preserves_all_string_obligations_in_nested_annotations() {
 
 #[test]
 fn every_owner_and_every_declaration_contribute_order_independently() {
-    let first = vec![string(1, 64, Some("^A")), string(8, 128, Some("Z$"))];
-    let second = vec![string(4, 80, Some("^[A-Z]+$"))];
+    let first = vec![
+        string(
+            1,
+            64,
+            Some(crate::schema::PatternSpec::new(
+                "^A",
+                crate::schema::PatternMatch::Substring {
+                    reason: crate::schema::PatternReason::new(
+                        "Owner contributes a prefix or suffix constraint to the conjunction",
+                    )
+                    .unwrap(),
+                },
+            )),
+        ),
+        string(
+            8,
+            128,
+            Some(crate::schema::PatternSpec::new(
+                "Z$",
+                crate::schema::PatternMatch::Substring {
+                    reason: crate::schema::PatternReason::new(
+                        "Owner contributes a prefix or suffix constraint to the conjunction",
+                    )
+                    .unwrap(),
+                },
+            )),
+        ),
+    ];
+    let second = vec![string(
+        4,
+        80,
+        Some(crate::schema::PatternSpec::new(
+            "^[A-Z]+$",
+            crate::schema::PatternMatch::Full,
+        )),
+    )];
     let a = snapshot(vec![("p", first.clone()), ("q", second.clone())]);
     let b = snapshot(vec![
         ("q", second),
@@ -272,8 +316,38 @@ fn numeric_annotation_intersections_preserve_effective_ranges() {
 
 #[test]
 fn nominal_pattern_policy_is_preserved_and_diagnostics_show_each_pattern() {
-    let a = snapshot(vec![("p", vec![string(1, 64, Some("^A"))])]);
-    let b = snapshot(vec![("p", vec![string(1, 64, Some("Z$"))])]);
+    let a = snapshot(vec![(
+        "p",
+        vec![string(
+            1,
+            64,
+            Some(crate::schema::PatternSpec::new(
+                "^A",
+                crate::schema::PatternMatch::Substring {
+                    reason: crate::schema::PatternReason::new(
+                        "Owner contributes a prefix or suffix constraint to the conjunction",
+                    )
+                    .unwrap(),
+                },
+            )),
+        )],
+    )]);
+    let b = snapshot(vec![(
+        "p",
+        vec![string(
+            1,
+            64,
+            Some(crate::schema::PatternSpec::new(
+                "Z$",
+                crate::schema::PatternMatch::Substring {
+                    reason: crate::schema::PatternReason::new(
+                        "Owner contributes a prefix or suffix constraint to the conjunction",
+                    )
+                    .unwrap(),
+                },
+            )),
+        )],
+    )]);
     let source = lift_type_expr(&annotation(&a)).unwrap();
     let sink = declaration(&b, "p", 0);
     assert!(
@@ -286,13 +360,35 @@ fn nominal_pattern_policy_is_preserved_and_diagnostics_show_each_pattern() {
     assert!(actual.contains("pattern \"^A\""), "{actual}");
     let source = AttributeType::refined_string(
         None,
-        Some(crate::schema::CompiledPattern::try_new("^A").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^A",
+                crate::schema::PatternMatch::Substring {
+                    reason: crate::schema::PatternReason::new(
+                        "Owner contributes a prefix constraint to the conjunction",
+                    )
+                    .unwrap(),
+                },
+            ))
+            .unwrap(),
+        ),
         None,
         None,
     );
     let sink = AttributeType::refined_string(
         None,
-        Some(crate::schema::CompiledPattern::try_new("Z$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "Z$",
+                crate::schema::PatternMatch::Substring {
+                    reason: crate::schema::PatternReason::new(
+                        "Owner contributes a suffix constraint to the conjunction",
+                    )
+                    .unwrap(),
+                },
+            ))
+            .unwrap(),
+        ),
         None,
         None,
     );
@@ -580,8 +676,14 @@ fn review_projection_serde_rebinds_exact_callbacks_and_enum_semantics() {
 
 #[test]
 fn review_projection_serde_keeps_reference_semantics_and_rejects_ambiguous_callbacks() {
-    let reference =
-        DraftType::reference(identity(), Some("^ref-".into()), Some((Some(1), Some(64))));
+    let reference = DraftType::reference(
+        identity(),
+        Some(crate::schema::PatternSpec::new(
+            "^ref-",
+            crate::schema::PatternMatch::Full,
+        )),
+        Some((Some(1), Some(64))),
+    );
     let references = snapshot(vec![("p", vec![reference])]);
     let exact = inference::attribute_type_to_type_expr(declaration(&references, "p", 0), "p");
     let wire = serde_json::to_value(&exact).unwrap();
@@ -644,7 +746,17 @@ fn review_projection_serde_keeps_reference_semantics_and_rejects_ambiguous_callb
 #[test]
 fn review_enum_witness_constraints_apply_to_canonical_api_spelling() {
     use crate::resource::{CanonicalEnumValue, ConcreteValue, RawEnumIdentifier};
-    let strict = snapshot(vec![("p", vec![string(4, 4, Some("^[A-Z]+$"))])]);
+    let strict = snapshot(vec![(
+        "p",
+        vec![string(
+            4,
+            4,
+            Some(crate::schema::PatternSpec::new(
+                "^[A-Z]+$",
+                crate::schema::PatternMatch::Full,
+            )),
+        )],
+    )]);
     let enumeration = DraftType::enum_(
         identity(),
         Some(vec!["GOOD".into()]),
@@ -677,7 +789,17 @@ fn review_enum_witness_constraints_apply_to_canonical_api_spelling() {
 fn review_enum_values_validate_canonical_scalar_against_retained_witness() {
     use crate::resource::{CanonicalEnumValue, ConcreteValue, RawEnumIdentifier};
     let open_enum = |base| DraftType::enum_with_base(identity(), base, None, vec![], None, None);
-    for base in [string(2, 4, None), string(1, 32, Some("^[A-Z]+$"))] {
+    for base in [
+        string(2, 4, None),
+        string(
+            1,
+            32,
+            Some(crate::schema::PatternSpec::new(
+                "^[A-Z]+$",
+                crate::schema::PatternMatch::Full,
+            )),
+        ),
+    ] {
         let strict = snapshot(vec![("p", vec![open_enum(base)])]);
         let lax = snapshot(vec![("p", vec![open_enum(DraftType::string())])]);
         let ty = annotation(&strict);
@@ -754,7 +876,17 @@ fn review_enum_witness_length_error_masks_env_value() {
 
 #[test]
 fn review_enum_witness_pattern_error_masks_env_value() {
-    assert_enum_witness_masks_env_value(string(1, 32, Some("^[A-Z]+$")), "required pattern");
+    assert_enum_witness_masks_env_value(
+        string(
+            1,
+            32,
+            Some(crate::schema::PatternSpec::new(
+                "^[A-Z]+$",
+                crate::schema::PatternMatch::Full,
+            )),
+        ),
+        "required pattern",
+    );
 }
 
 #[test]
@@ -969,7 +1101,17 @@ fn review_bare_enum_module_argument_checks_retained_canonical_constraints() {
             None,
         )],
     )]);
-    for base in [string(4, 4, None), string(1, 32, Some("^[A-Z]+$"))] {
+    for base in [
+        string(4, 4, None),
+        string(
+            1,
+            32,
+            Some(crate::schema::PatternSpec::new(
+                "^[A-Z]+$",
+                crate::schema::PatternMatch::Full,
+            )),
+        ),
+    ] {
         let callee = snapshot(vec![(
             "p",
             vec![DraftType::enum_with_base(
@@ -1746,7 +1888,14 @@ fn assert_constructed_builtin_at_named_field(expression: &str, value: &str) {
     let interpolation = format!(r#""${{''}}{value}""#);
     for declaration in [
         string(1, 32, None),
-        string(1, 32, Some("^never$")),
+        string(
+            1,
+            32,
+            Some(crate::schema::PatternSpec::new(
+                "^never$",
+                crate::schema::PatternMatch::Full,
+            )),
+        ),
         string(1, 1, None),
     ] {
         let expected = constructed_builtin_at_named_field(&interpolation, declaration.clone());
@@ -1788,7 +1937,14 @@ fn issue_4282_split_checks_each_named_string_element() {
         ("abc,TOOLONG", false),
         ("abc,123", false),
     ] {
-        let declaration = DraftType::list(string(1, 3, Some("^[a-z]+$")));
+        let declaration = DraftType::list(string(
+            1,
+            3,
+            Some(crate::schema::PatternSpec::new(
+                "^[a-z]+$",
+                crate::schema::PatternMatch::Full,
+            )),
+        ));
         let actual = constructed_builtin_at_named_field(
             &format!("split(',', '{input}')"),
             declaration.clone(),
@@ -1870,7 +2026,14 @@ fn issue_4282_review_split_coalesce_checks_literal_alternative() {
         "p",
         vec![
             DraftType::string(),
-            DraftType::list(string(1, 32, Some("^[a-z]+$"))),
+            DraftType::list(string(
+                1,
+                32,
+                Some(crate::schema::PatternSpec::new(
+                    "^[a-z]+$",
+                    crate::schema::PatternMatch::Full,
+                )),
+            )),
         ],
     )]);
     let context = loaded.provider_context();
@@ -1899,6 +2062,6 @@ fn issue_4282_review_split_coalesce_checks_literal_alternative() {
     let error = checked.expect_err("the literal alternative must retain its value check");
     assert_eq!(
         error.to_string(),
-        "at list element 0: expected aws.iam.Role.Name, got string 'UPPER': p rejected `aws.iam.Role.Name`: Invalid Name value 'UPPER': does not match required pattern /^[a-z]+$/"
+        "at list element 0: expected aws.iam.Role.Name, got string 'UPPER': p rejected `aws.iam.Role.Name`: Invalid Name value 'UPPER': does not match required pattern /^[a-z]+$/ (Full)"
     );
 }
