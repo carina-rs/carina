@@ -13,6 +13,7 @@ workspace = true
 
 [features]
 async-io = ["tokio/fs", "tokio/rt"]
+guest-runtime = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http"]
 test-shutdown = []
 test-utils = ["dep:tempfile"]
 
@@ -41,6 +42,9 @@ tracing = "0.1"
 chrono = "0.4"
 dirs = "6"
 tempfile = { version = "3", optional = true }
+wasmtime = { version = "43", optional = true }
+wasmtime-wasi = { version = "43", optional = true }
+wasmtime-wasi-http = { version = "43", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

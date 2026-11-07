@@ -35,6 +35,17 @@ use crate::resource::{AbsoluteBindingAddress, DeferredValue, NoPlaceholder, Secr
 /// use carina_core::provider_text::{GuestInputInventory, RedactionSet};
 /// fn observe(inputs: &GuestInputInventory, bare: &RedactionSet) { let _ = inputs.observe(bare); }
 /// ```
+///
+/// An inventory alone cannot extract the plaintext of an opaque secret.
+///
+/// ```compile_fail,E0308
+/// use carina_core::provider::ProviderPlan;
+/// use carina_core::resource::{AbsoluteBindingAddress, NoPlaceholder, SecretPayload};
+/// fn extract(payload: &SecretPayload<NoPlaceholder, AbsoluteBindingAddress>) {
+///     let inputs = ProviderPlan::state_only().session("", None, None).guest_inventory();
+///     let _: Result<carina_provider_protocol::types::Value, _> = inputs.handoff(payload);
+/// }
+/// ```
 #[derive(Clone, Debug)]
 pub struct GuestInputInventory {
     secrets: RedactionSet,
@@ -75,9 +86,21 @@ impl GuestInputInventory {
         inputs.redaction_set().extend(&self.secrets);
     }
 
-    /// Collect the same opaque payload used by DSL secrets before projecting
-    /// its wire value. This is the single plaintext credential handoff.
+    /// Project a credential only with the capability borrowed from its live
+    /// guest store. Registration always reaches that store's input inventory,
+    /// even if the receiver is a separate inventory.
     pub fn handoff(
+        &self,
+        handoff: GuestCredentialHandoff<'_>,
+    ) -> Result<carina_provider_protocol::types::Value, crate::protocol_convert::ProtocolConvertError>
+    {
+        self.join(handoff.inputs);
+        let value = handoff.inputs.project_credential(handoff.secret);
+        self.join(handoff.inputs);
+        value
+    }
+
+    fn project_credential(
         &self,
         secret: &SecretPayload<NoPlaceholder, AbsoluteBindingAddress>,
     ) -> Result<carina_provider_protocol::types::Value, crate::protocol_convert::ProtocolConvertError>
@@ -85,6 +108,16 @@ impl GuestInputInventory {
         let value = Value::Deferred(DeferredValue::Secret(secret.clone()));
         self.secrets.extend(&RedactionSet::collect([&value]));
         crate::provider_wire::project_plaintext(&value)
+    }
+
+    /// Inspect a credential in test fixtures without minting a live guest store.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn handoff_for_test(
+        &self,
+        secret: &SecretPayload<NoPlaceholder, AbsoluteBindingAddress>,
+    ) -> Result<carina_provider_protocol::types::Value, crate::protocol_convert::ProtocolConvertError>
+    {
+        self.project_credential(secret)
     }
 
     /// Join only core-collected inputs. Previous calls remain covered even if
@@ -100,6 +133,22 @@ impl GuestInputInventory {
         }
     }
 }
+
+/// A credential handoff borrowed from data installed in a live guest store.
+/// Its fields and constructor are private; a session's inventory cannot mint it.
+///
+/// ```compile_fail,E0451
+/// use carina_core::provider_text::{GuestCredentialHandoff, GuestInputInventory};
+/// use carina_core::resource::{AbsoluteBindingAddress, NoPlaceholder, SecretPayload};
+/// fn forge(inputs: &GuestInputInventory, secret: &SecretPayload<NoPlaceholder, AbsoluteBindingAddress>) {
+///     let _ = GuestCredentialHandoff { inputs, secret };
+/// }
+/// ```
+pub struct GuestCredentialHandoff<'a> {
+    pub(super) inputs: &'a GuestInputInventory,
+    pub(super) secret: &'a SecretPayload<NoPlaceholder, AbsoluteBindingAddress>,
+}
+
 #[must_use]
 pub struct GuestInputCall {
     inventory: GuestInputInventory,

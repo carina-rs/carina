@@ -624,6 +624,13 @@ impl<S: TextState> ProviderFailure<S> {
     }
 
     /// A provider-internal operation failed because of a typed source error.
+    ///
+    /// An arbitrary error cannot become bound host text through this context.
+    ///
+    /// ```compile_fail,E0277
+    /// use carina_core::provider::HostError;
+    /// let error = HostError::internal_caused_by("ctx", std::io::Error::other("guest password"));
+    /// ```
     pub fn internal_caused_by(context: &'static str, cause: impl DiagnosticSource<S>) -> Self {
         ProviderFailure::Internal(Box::new(OperationErrorDetail::caused_by(context, cause)))
     }

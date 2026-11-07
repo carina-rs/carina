@@ -279,7 +279,7 @@ mod tests {
             let inputs = carina_core::provider::ProviderPlan::state_only()
                 .session("", None, None)
                 .guest_inventory();
-            let project = |value| match inputs.handoff(value).unwrap() {
+            let project = |value| match inputs.handoff_for_test(value).unwrap() {
                 carina_provider_protocol::types::Value::String(value) => value,
                 _ => unreachable!(),
             };

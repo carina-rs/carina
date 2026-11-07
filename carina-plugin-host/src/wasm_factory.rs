@@ -2350,10 +2350,13 @@ fn build_sandboxed_wasi_ctx_with(
     capabilities: Option<&RuntimeCapabilities>,
     env_value: impl FnMut(&str) -> Option<String>,
 ) -> WasiCtx {
+    let engine = Engine::default();
+    let inputs = carina_core::provider::ProviderPlan::state_only()
+        .session("", None, None)
+        .guest_inventory();
+    let store = carina_core::provider_text::GuestStoreData::new_store(&engine, (), inputs);
     build_sandboxed_wasi_ctx_with_stderr(
-        &carina_core::provider::ProviderPlan::state_only()
-            .session("", None, None)
-            .guest_inventory(),
+        store.data(),
         capabilities,
         env_value,
         guest_stderr::GuestStderr::new(std::io::stderr()),
@@ -2368,20 +2371,21 @@ enum GuestEnvironmentValue {
     Public(String),
     Secret(GuestCredential),
 }
-fn handoff_credential(
-    inputs: &carina_core::provider_text::GuestInputInventory,
+fn handoff_credential<T>(
+    store: &carina_core::provider_text::GuestStoreData<T>,
     value: &GuestCredential,
 ) -> String {
-    match inputs
-        .handoff(value)
+    match store
+        .input_inventory()
+        .handoff(store.credential_handoff(value))
         .expect("host credentials are concrete strings")
     {
         carina_provider_protocol::types::Value::String(value) => value,
         _ => unreachable!("host credentials are constructed as strings"),
     }
 }
-fn build_sandboxed_wasi_ctx_with_stderr(
-    inputs: &carina_core::provider_text::GuestInputInventory,
+fn build_sandboxed_wasi_ctx_with_stderr<T>(
+    store: &carina_core::provider_text::GuestStoreData<T>,
     capabilities: Option<&RuntimeCapabilities>,
     mut env_value: impl FnMut(&str) -> Option<String>,
     stderr: guest_stderr::GuestStderr,
@@ -2411,7 +2415,7 @@ fn build_sandboxed_wasi_ctx_with_stderr(
                     builder.env(key, &value);
                 }
                 GuestEnvironmentValue::Secret(value) => {
-                    builder.env(key, handoff_credential(inputs, &value));
+                    builder.env(key, handoff_credential(store, &value));
                 }
             }
         }

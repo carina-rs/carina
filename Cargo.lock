@@ -1120,6 +1120,9 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "wasmtime",
+ "wasmtime-wasi",
+ "wasmtime-wasi-http",
 ]
 
 [[package]]

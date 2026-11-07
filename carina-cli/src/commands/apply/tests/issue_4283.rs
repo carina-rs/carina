@@ -665,6 +665,7 @@ pub(in crate::commands::apply) async fn saved_plan_conversion_fixture(
     .unwrap();
     let decoded: PlanFile = serde_json::from_str(&serde_json::to_string(&saved).unwrap()).unwrap();
     let resolved = decoded
+        .decode_for_test()
         .reload_in_flight_from_locked_state(state.as_ref())
         .unwrap()
         .resolve_with_schemas(loaded.context().schemas())

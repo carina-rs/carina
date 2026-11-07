@@ -2,12 +2,16 @@
 
 pub mod boundary;
 mod guest_inputs;
+#[cfg(feature = "guest-runtime")]
+mod guest_store;
 mod permissions;
 #[cfg(test)]
 mod round7_tests;
 pub use permissions::{InvalidRequiredPermission, RequiredPermission};
 mod saved_configuration;
-pub use guest_inputs::{GuestInputCall, GuestInputInventory};
+pub use guest_inputs::{GuestCredentialHandoff, GuestInputCall, GuestInputInventory};
+#[cfg(feature = "guest-runtime")]
+pub use guest_store::{GuestInputStore, GuestStoreData};
 pub use saved_configuration::{
     SavedInputsPending, SavedInputsResolved, SavedProviderConfiguration,
 };
@@ -162,6 +166,12 @@ impl TextState for Bound {
 pub type ProviderErrorText = ErrorText<Unbound>;
 pub type HostErrorText = ErrorText<Bound>;
 pub type ProviderDiagnostic = Diagnostic<Unbound>;
+/// Arbitrary errors cannot be promoted to bound host diagnostics.
+///
+/// ```compile_fail,E0277
+/// use carina_core::provider_text::HostDiagnostic;
+/// let cause = HostDiagnostic::new(std::io::Error::other("guest password"));
+/// ```
 pub type HostDiagnostic = Diagnostic<Bound>;
 
 /// Untrusted provider output. Formatting deliberately reveals no contents.

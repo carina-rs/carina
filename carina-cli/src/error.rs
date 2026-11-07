@@ -166,7 +166,6 @@ impl std::error::Error for ProjectBackendError {}
 /// can contain a project-scoped recovery command.
 #[derive(Debug)]
 pub(crate) enum LockedStateReloadError {
-    SavedConfigurationNotDecoded,
     Config(String),
     Plan(Box<PlanError>),
 }
@@ -203,9 +202,6 @@ struct LockedStateReloadErrorDisplay<'a> {
 impl std::fmt::Display for LockedStateReloadErrorDisplay<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.error {
-            LockedStateReloadError::SavedConfigurationNotDecoded => formatter.write_str(
-                "saved provider configuration must be decoded before acquiring the apply lock",
-            ),
             LockedStateReloadError::Config(message) => formatter.write_str(message),
             LockedStateReloadError::Plan(error) => {
                 std::fmt::Display::fmt(&error.display_with_project_dir(self.project_dir), formatter)

@@ -1000,7 +1000,7 @@ fn expanded_provider_configs(
 }
 
 fn inspected_saved_plan(plan_file: PlanFile) -> InspectedPlanFile {
-    InspectedPlanFile::inspect(plan_file)
+    InspectedPlanFile::inspect(plan_file.decode_for_test())
 }
 
 trait IntoValidatedTestSchema {
@@ -1919,6 +1919,7 @@ async fn saved_plan_does_not_match_anonymous_compositions_by_missing_binding() {
     .expect("test plan provider evidence must be valid");
 
     let plan_file = plan_file
+        .decode_for_test()
         .reload_in_flight_from_locked_state(None)
         .expect("test plan should cross the locked-state reload boundary")
         .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())

@@ -1,5 +1,7 @@
 use carina_core::provider::{ProviderPlan, ProviderValidationInputs};
-use carina_core::provider_text::{GuestInputInventory, RedactionSet};
+use carina_core::provider_text::{
+    GuestInputInventory, GuestInputStore, GuestStoreData, RedactionSet,
+};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -106,7 +108,9 @@ impl GuestStoreState {
     }
 }
 
-pub(in crate::wasm_factory) struct HostState {
+pub(in crate::wasm_factory) type HostState = GuestStoreData<HostRuntimeState>;
+
+pub(in crate::wasm_factory) struct HostRuntimeState {
     wasi_ctx: WasiCtx,
     http_ctx: Option<WasiHttpCtx>,
     table: ResourceTable,
@@ -114,10 +118,9 @@ pub(in crate::wasm_factory) struct HostState {
     limits: StoreLimits,
     guest: GuestStoreState,
     stderr: super::guest_stderr::GuestStderr,
-    inputs: GuestInputInventory,
 }
 
-impl WasiView for HostState {
+impl WasiView for HostRuntimeState {
     fn ctx(&mut self) -> WasiCtxView<'_> {
         WasiCtxView {
             ctx: &mut self.wasi_ctx,
@@ -126,7 +129,7 @@ impl WasiView for HostState {
     }
 }
 
-impl WasiHttpView for HostState {
+impl WasiHttpView for HostRuntimeState {
     fn http(&mut self) -> WasiHttpCtxView<'_> {
         WasiHttpCtxView {
             ctx: self
@@ -151,7 +154,7 @@ impl WasiHttpView for HostState {
 pub(in crate::wasm_factory) struct GuestStore {
     #[cfg(any(test, feature = "test-utils"))]
     deadline_observer: Option<super::PollObserverForTest>,
-    store: Store<HostState>,
+    store: GuestInputStore<HostRuntimeState>,
     next_secrets: Option<ProviderValidationInputs>,
     config_secrets: Option<ProviderValidationInputs>,
 }
@@ -190,25 +193,26 @@ impl GuestStore {
         let inputs = ProviderPlan::state_only()
             .session("", None, None)
             .guest_inventory();
-        let wasi_ctx = super::build_sandboxed_wasi_ctx_with_stderr(
-            &inputs,
-            network.runtime_capabilities(),
-            |key| std::env::var(key).ok(),
-            stderr.clone(),
-        );
+        let capabilities = network.runtime_capabilities().cloned();
         let mut http_hooks = AllowListHttpHooks::with_test_route(label, network, http_test_route);
         http_hooks.stderr = stderr.clone();
-        let host_state = HostState {
-            wasi_ctx,
+        let host_state = HostRuntimeState {
+            wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
             http_ctx,
             table: ResourceTable::new(),
             http_hooks,
             limits,
             guest: GuestStoreState::new(budget),
-            stderr,
-            inputs,
+            stderr: stderr.clone(),
         };
-        let mut store = Store::new(engine, host_state);
+        let mut store = GuestStoreData::new_store(engine, host_state, inputs);
+        let wasi_ctx = super::build_sandboxed_wasi_ctx_with_stderr(
+            store.data(),
+            capabilities.as_ref(),
+            |key| std::env::var(key).ok(),
+            stderr,
+        );
+        store.data_mut().wasi_ctx = wasi_ctx;
         store.limiter(|state| &mut state.limits);
         store.call_hook(|mut store, transition| {
             let now = Instant::now();
@@ -259,8 +263,7 @@ impl GuestStore {
     }
 
     pub(in crate::wasm_factory) fn set_input_inventory(&mut self, inputs: GuestInputInventory) {
-        inputs.join(&self.store.data().inputs);
-        self.store.data_mut().inputs = inputs;
+        self.store.data_mut().set_input_inventory(inputs);
     }
 
     pub(in crate::wasm_factory) fn set_configuration_secrets(
@@ -305,7 +308,7 @@ impl GuestStore {
             .next_secrets
             .take()
             .or_else(|| self.config_secrets.clone());
-        let inputs = &self.store.data().inputs;
+        let inputs = self.store.data().input_inventory();
         let source = secrets.clone().unwrap_or_else(|| {
             ProviderPlan::state_only()
                 .session("", None, None)
@@ -394,15 +397,15 @@ impl GuestStore {
     }
 }
 
-impl HostState {
-    // confinement-allow-return: Outbound credential wire handoff; only opaque SecretPayload inputs reach this adapter.
-    pub(in crate::wasm_factory) fn handoff_credential(
-        &self,
-        value: &super::super::GuestCredential,
-    ) -> String {
-        super::super::handoff_credential(&self.inputs, value)
-    }
+// confinement-allow-return: Outbound credential wire handoff; only opaque SecretPayload inputs reach this adapter.
+pub(in crate::wasm_factory) fn handoff_credential(
+    store: &HostState,
+    value: &super::super::GuestCredential,
+) -> String {
+    super::super::handoff_credential(store, value)
+}
 
+impl HostRuntimeState {
     pub(in crate::wasm_factory) fn network(&self) -> &GuestNetwork {
         &self.http_hooks.network
     }

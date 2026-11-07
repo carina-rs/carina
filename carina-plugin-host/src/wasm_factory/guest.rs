@@ -851,11 +851,17 @@ impl version_checked_bindings::aws_credentials::Host for HostState {
                     })
                     .transpose()?;
                 Ok(WitCredentials {
-                    access_key_id: self.handoff_credential(credentials.access_key_id()),
-                    secret_access_key: self.handoff_credential(credentials.secret_access_key()),
+                    access_key_id: guest_store::handoff_credential(
+                        self,
+                        credentials.access_key_id(),
+                    ),
+                    secret_access_key: guest_store::handoff_credential(
+                        self,
+                        credentials.secret_access_key(),
+                    ),
                     session_token: credentials
                         .session_token()
-                        .map(|value| self.handoff_credential(value)),
+                        .map(|value| guest_store::handoff_credential(self, value)),
                     expires_at,
                 })
             })

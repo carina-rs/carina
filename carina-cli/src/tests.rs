@@ -1129,6 +1129,7 @@ fn plan_file_serde_round_trip() {
         saved_module_source
     );
     let reloaded = deserialized
+        .decode_for_test()
         .reload_in_flight_from_locked_state(None)
         .expect("a plan without in-flight markers reloads");
     match reloaded.current_states() {

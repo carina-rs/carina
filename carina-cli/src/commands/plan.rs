@@ -1091,15 +1091,46 @@ struct ProviderEvidence {
 /// format 32. Format 29 persists anonymous-loop provenance, typed deferred-loop
 /// targets, and Move origins. Provider evidence is validated both when
 /// recording and when decoding a saved plan.
+///
+/// A recorded plan cannot reload state under the apply lock. Compile the
+/// probe in the library's module context so crate visibility cannot mask the
+/// distinction between recorded and decoded plans.
+///
+/// ```compile_fail,E0599
+/// # include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/lib.rs"));
+/// # fn main() {}
+/// fn recorded_cannot_reload(plan: commands::plan::PlanFile) {
+///     let _ = plan.reload_in_flight_from_locked_state(None);
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub struct PlanFile {
-    // Present only after the complete saved document has decoded successfully.
-    // Recording a plan grants no authority to reload it under the apply lock.
-    provider_configuration: Option<carina_core::provider_text::SavedProviderConfiguration>,
     contents: UnresolvedPlanFileContents,
     evidence: ProviderEvidence,
     persisted_directive_changes: Vec<PersistedDirectiveChange>,
     wire_order: Option<carina_core::json_field_order::JsonFieldOrder>,
+}
+
+/// A saved document whose complete provider configuration decoded before the
+/// apply lock was acquired. Recording alone cannot construct this type.
+#[derive(Debug, Clone)]
+pub(crate) struct DecodedPlanFile {
+    plan_file: PlanFile,
+    provider_configuration: carina_core::provider_text::SavedProviderConfiguration,
+}
+
+impl Deref for DecodedPlanFile {
+    type Target = PlanFile;
+
+    fn deref(&self) -> &Self::Target {
+        &self.plan_file
+    }
+}
+
+impl Serialize for DecodedPlanFile {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.plan_file.serialize(serializer)
+    }
 }
 
 impl Serialize for PlanFile {
@@ -1115,7 +1146,9 @@ impl Serialize for PlanFile {
 impl<'de> Deserialize<'de> for PlanFile {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let document = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
-        Self::decode_json(document.get().as_bytes()).map_err(serde::de::Error::custom)
+        Self::decode_json(document.get().as_bytes())
+            .map(|decoded| decoded.plan_file)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -1130,7 +1163,7 @@ pub(crate) enum PlanFileDecodeError {
 impl PlanFile {
     /// Finish structural decoding, including the end of input, before checking
     /// semantic evidence. Keep semantic failures out of the serde error channel.
-    pub(crate) fn decode_json(bytes: &[u8]) -> Result<Self, PlanFileDecodeError> {
+    pub(crate) fn decode_json(bytes: &[u8]) -> Result<DecodedPlanFile, PlanFileDecodeError> {
         let mut deserializer = serde_json::Deserializer::from_slice(bytes);
         let wire: PlanFileWire = serde_path_to_error::deserialize(&mut deserializer)
             .map_err(PlanFileJsonError::from_path_error)?;
@@ -1140,12 +1173,14 @@ impl PlanFile {
             .map_err(PlanFileJsonError::from_path_error)?;
         let mut plan = Self::try_from(wire)
             .map_err(|error| PlanFileDecodeError::ProviderEvidence(Box::new(error)))?;
-        plan.provider_configuration = Some(provider_configuration);
         plan.wire_order = Some(
             carina_core::json_field_order::JsonFieldOrder::from_json_slice(bytes)
                 .map_err(PlanFileJsonError::at_root)?,
         );
-        Ok(plan)
+        Ok(DecodedPlanFile {
+            plan_file: plan,
+            provider_configuration,
+        })
     }
 }
 
@@ -1573,7 +1608,6 @@ impl From<PlanFile> for PlanFileWire {
             evidence,
             persisted_directive_changes,
             wire_order: _,
-            provider_configuration: _,
         } = plan_file;
         let PlanFileContents {
             version,
@@ -1711,7 +1745,6 @@ impl TryFrom<PlanFileWire> for PlanFile {
             evidence,
             persisted_directive_changes,
             wire_order: None,
-            provider_configuration: None,
         })
     }
 }
@@ -1807,16 +1840,12 @@ impl UnresolvedPlanFileContents {
             provider,
             &expected_instances,
         )?;
-        let recorded = PlanFile {
+        Ok(PlanFile {
             contents: self,
             evidence,
             persisted_directive_changes,
             wire_order: None,
-            provider_configuration: None,
-        };
-        #[cfg(any(test, feature = "test-utils"))]
-        let recorded = recorded.decode_recorded_fixture();
-        Ok(recorded)
+        })
     }
 }
 
@@ -1843,16 +1872,12 @@ impl UnresolvedPlanFileContents {
             &provider,
             &expected_instances,
         )?;
-        let recorded = PlanFile {
+        Ok(PlanFile {
             contents: self,
             evidence,
             persisted_directive_changes,
             wire_order: None,
-            provider_configuration: None,
-        };
-        #[cfg(any(test, feature = "test-utils"))]
-        let recorded = recorded.decode_recorded_fixture();
-        Ok(recorded)
+        })
     }
 }
 
@@ -2121,14 +2146,10 @@ impl UnresolvedPlanFileContents {
 impl PlanFile {
     pub const CURRENT_VERSION: u32 = 42;
 
-    #[cfg(any(test, feature = "test-utils"))]
-    fn decode_recorded_fixture(self) -> Self {
-        // Invalid fixtures must reach the serialization/validation boundary
-        // their tests exercise. They never gain locked-reload authority.
-        let Ok(bytes) = serde_json::to_vec(&self) else {
-            return self;
-        };
-        Self::decode_json(&bytes).unwrap_or(self)
+    #[cfg(test)]
+    pub(crate) fn decode_for_test(self) -> DecodedPlanFile {
+        Self::decode_json(&serde_json::to_vec(&self).expect("serialize saved plan fixture"))
+            .expect("decode saved plan fixture before locked reload")
     }
 
     #[cfg(test)]
@@ -2147,7 +2168,9 @@ impl PlanFile {
     pub fn provider_scopes(&self) -> &PlanProviderScopes {
         &self.evidence.provider_scopes.0
     }
+}
 
+impl DecodedPlanFile {
     /// Reload state-owned create continuations after the saved-plan apply has
     /// acquired its state lock. The plan contains only an address and marker;
     /// any status change in either direction invalidates it unless the row is
@@ -2156,15 +2179,16 @@ impl PlanFile {
         self,
         state_file: Option<&StateFile>,
     ) -> Result<UnresolvedReloadedPlanFile, LockedStateReloadError> {
-        let PlanFile {
+        let DecodedPlanFile {
             provider_configuration,
-            mut contents,
-            evidence,
-            persisted_directive_changes,
-            wire_order: _,
+            plan_file:
+                PlanFile {
+                    mut contents,
+                    evidence,
+                    persisted_directive_changes,
+                    wire_order: _,
+                },
         } = self;
-        let provider_configuration =
-            provider_configuration.ok_or(LockedStateReloadError::SavedConfigurationNotDecoded)?;
         let moved_origins = MovedOrigins::from_unresolved_plan(&contents.plan);
         let planned_removals: HashSet<_> = contents
             .plan
@@ -2322,7 +2346,9 @@ impl PlanFile {
             persisted_directive_changes,
         })
     }
+}
 
+impl PlanFile {
     /// Whether any typed, value-bearing plan field still contains a secret
     /// placeholder.
     pub(crate) fn contains_redacted_secret_placeholders(&self) -> bool {
@@ -4678,32 +4704,6 @@ mod managed_current_serde_tests {
     }
 
     #[test]
-    fn locked_reload_requires_predecoded_saved_configuration() {
-        let id = ResourceId::with_provider_identity("mock", "test.Resource", "probe", None);
-        let recorded = plan_file_with_current(
-            id.clone(),
-            SavedManagedCurrent::from_current(Current::absent(id)),
-        );
-        // Bypass the document loader while retaining valid provider evidence.
-        let undecoded = PlanFile::try_from(super::PlanFileWire::from(recorded)).unwrap();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            undecoded.reload_in_flight_from_locked_state(None)
-        }));
-        assert!(
-            result.is_ok(),
-            "locked reload must return a typed error, never panic"
-        );
-        let result = result.unwrap();
-        assert!(
-            result.is_err(),
-            "locked reload requires the saved configuration decoded at load time"
-        );
-        assert!(
-            reload_error_text(&result.unwrap_err(), std::path::Path::new(".")).contains("decoded")
-        );
-    }
-
-    #[test]
     fn saved_plan_unknown_marker_round_trips_and_rejects_status_changes() {
         let resource = resolved(Resource::with_provider(
             "mock",
@@ -4744,6 +4744,7 @@ mod managed_current_serde_tests {
             id.clone(),
             SavedManagedCurrent::from_current(Current::create_outcome_unknown(unknown.clone())),
         )
+        .decode_for_test()
         .reload_in_flight_from_locked_state(Some(&locked))
         .expect("an unchanged outcome-unknown marker must reload under the lock");
         let ReloadedCurrentStateEntry::Managed {
@@ -4763,6 +4764,7 @@ mod managed_current_serde_tests {
             id.clone(),
             SavedManagedCurrent::from_current(Current::absent(id.clone())),
         )
+        .decode_for_test()
         .reload_in_flight_from_locked_state(Some(&locked))
         .expect_err("an unknown row appearing after planning must invalidate the plan");
         let appeared = reload_error_text(&appeared, std::path::Path::new("infra/production"));
@@ -4775,6 +4777,7 @@ mod managed_current_serde_tests {
             id,
             SavedManagedCurrent::from_current(Current::create_outcome_unknown(unknown)),
         )
+        .decode_for_test()
         .reload_in_flight_from_locked_state(None)
         .expect_err("an unknown row disappearing after planning must invalidate the plan");
         assert!(
@@ -4874,6 +4877,7 @@ mod managed_current_serde_tests {
             SavedManagedCurrent::from_current(Current::absent(id.clone())),
         );
         let became_in_flight = planned_absent
+            .decode_for_test()
             .reload_in_flight_from_locked_state(Some(&locked_in_flight))
             .expect_err("absent to in-flight must invalidate the saved plan");
         let became_in_flight = reload_error_text(&became_in_flight, std::path::Path::new("."));
@@ -4885,6 +4889,7 @@ mod managed_current_serde_tests {
         let planned_in_flight =
             plan_file_with_current(id, SavedManagedCurrent::create_in_flight_marker());
         let ended = planned_in_flight
+            .decode_for_test()
             .reload_in_flight_from_locked_state(None)
             .expect_err("in-flight to absent must invalidate the saved plan");
         let ended = reload_error_text(&ended, std::path::Path::new("."));
@@ -4927,6 +4932,7 @@ mod managed_current_serde_tests {
         );
 
         let error = plan
+            .decode_for_test()
             .reload_in_flight_from_locked_state(Some(&locked))
             .expect_err("a new in-flight address must invalidate the saved plan");
         let error = reload_error_text(&error, std::path::Path::new("."));
@@ -4984,6 +4990,7 @@ mod managed_current_serde_tests {
             .expect("test plan provider evidence must be valid");
 
         let plan = plan
+            .decode_for_test()
             .reload_in_flight_from_locked_state(Some(&locked))
             .expect("a moved continuation must reload from its source row");
         let ReloadedCurrentStateEntry::Managed { id, current } = plan
@@ -5047,6 +5054,7 @@ mod managed_current_serde_tests {
             .expect("test plan provider evidence must be valid");
 
         let reloaded = plan
+            .decode_for_test()
             .reload_in_flight_from_locked_state(Some(&locked))
             .expect("a moved outcome-unknown marker must reload from its source row");
         let ReloadedCurrentStateEntry::Managed { id, current } = reloaded

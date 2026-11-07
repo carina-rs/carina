@@ -18,7 +18,7 @@ use carina_state::{RefreshRows, RefreshableCurrent, ResourceState, StateFile};
 
 use super::{ApplyTarget, saved_plan_secret_rehydration_error};
 use crate::commands::plan::{
-    MovedOrigins, PlanFile, PlanSchemaReferences, PlanWaitBinding, RecordedProviderArtifact,
+    DecodedPlanFile, MovedOrigins, PlanSchemaReferences, PlanWaitBinding, RecordedProviderArtifact,
     RecordedProviderScopes, ReloadedCurrentStateEntry, ReloadedPlanFile, ResolvedProviderInputs,
     SavedPlanResource, UnresolvedReloadedPlanFile, UpstreamSource, recorded_provider_artifacts,
 };
@@ -149,12 +149,12 @@ pub(super) enum InspectedPlanFile {
 /// Decoded placeholder-free plan. It still cannot expose managed current
 /// state until its in-flight markers are reconciled under the state lock.
 pub(super) struct VerifiedPlanFile {
-    plan_file: PlanFile,
+    plan_file: DecodedPlanFile,
     schema_references: PlanSchemaReferences,
 }
 
 impl InspectedPlanFile {
-    pub(super) fn inspect(plan_file: PlanFile) -> Self {
+    pub(super) fn inspect(plan_file: DecodedPlanFile) -> Self {
         let schema_references = plan_file.referenced_schema_types();
         if plan_file.contains_redacted_secret_placeholders() {
             Self::NeedsSecretVerification(PendingPlanFile {
@@ -478,7 +478,7 @@ fn check_loaded_providers(
 /// Deserialized saved plan whose typed placeholders still need fresh desired
 /// values. There is intentionally no accessor for the inner plan.
 pub(super) struct PendingPlanFile {
-    plan_file: PlanFile,
+    plan_file: DecodedPlanFile,
     schema_references: PlanSchemaReferences,
 }
 
@@ -1528,7 +1528,7 @@ mod tests {
         let InspectedPlanFile::Verified(VerifiedPlanFile {
             plan_file,
             schema_references,
-        }) = InspectedPlanFile::inspect(plan)
+        }) = InspectedPlanFile::inspect(plan.decode_for_test())
         else {
             panic!("artifact fixture unexpectedly contains secret placeholders")
         };
@@ -1570,6 +1570,7 @@ mod tests {
         let plan_file = contents
             .record_for_test(&builtin_context(), Vec::new())
             .expect("test plan provider evidence must be valid")
+            .decode_for_test()
             .reload_in_flight_from_locked_state(Some(&locked_state))
             .expect("reload saved move plan")
             .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
@@ -1641,6 +1642,7 @@ mod tests {
         let plan_file = contents
             .record_for_test(&builtin_context(), Vec::new())
             .expect("test plan provider evidence must be valid")
+            .decode_for_test()
             .reload_in_flight_from_locked_state(Some(&locked_state))
             .expect("reload saved move plan")
             .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
@@ -2092,6 +2094,7 @@ mod tests {
         }
         .record_for_test(&builtin_context(), Vec::new())
         .expect("test plan provider evidence must be valid")
+        .decode_for_test()
         .reload_in_flight_from_locked_state(None)
         .expect("reload saved plan")
         .resolve_with_schemas(&carina_core::schema::SchemaRegistry::new())
