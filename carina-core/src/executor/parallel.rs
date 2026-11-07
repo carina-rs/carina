@@ -896,18 +896,26 @@ pub(super) async fn execute_effects_sequential<
                     completed: completed_ref,
                     total,
                 };
-                let prepare = async {
+                // Preparation and dispatch each retain a large provider state
+                // machine. Store them separately on the heap so their frames
+                // do not accumulate inside the scheduled operation.
+                let prepare = Box::pin(async {
                     match prepared_request {
                         Some(prepared) => Ok(prepared),
                         None => match (authorized_delete, check) {
                             (Ok(delete), Ok(check)) => {
-                                prepare_basic_request(&effect_for_future, &context, check, delete)
-                                    .await
+                                Box::pin(prepare_basic_request(
+                                    &effect_for_future,
+                                    &context,
+                                    check,
+                                    delete,
+                                ))
+                                .await
                             }
                             (Err(failure), _) | (_, Err(failure)) => Err(failure),
                         },
                     }
-                };
+                });
                 if let Some(write) = preparation_write {
                     return (
                         idx,
@@ -919,13 +927,13 @@ pub(super) async fn execute_effects_sequential<
                 }
                 let result = match basic {
                     Some(basic) => SingleEffectResult::Basic(Box::new(
-                        execute_basic_effect(
+                        Box::pin(execute_basic_effect(
                             basic,
                             prepare.await,
                             &context,
                             in_flight_start,
                             observer,
-                        )
+                        ))
                         .await,
                     )),
                     None => match &effect_for_future {

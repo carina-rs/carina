@@ -232,7 +232,7 @@ pub async fn run_destroy_with_factories_for_test(
         &loaded.duplicate_declarations,
     )?;
     let backend: Arc<dyn StateBackend> =
-        carina_state::backends::local_backend_for_test(path.join("carina.state.json")).into();
+        crate::commands::local_backend_for_test(path.join("carina.state.json")).into();
     let cancel = ShutdownToken::running();
     let outcome = run_destroy_locked_owned(
         validated,

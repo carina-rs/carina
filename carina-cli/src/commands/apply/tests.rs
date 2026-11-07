@@ -7178,19 +7178,16 @@ async fn failed_update_nested_struct_pending_removal_is_replanned() {
 
 #[tokio::test]
 async fn failed_update_list_element_nested_pending_removal_is_replanned() {
-    Box::pin(assert_failed_nested_pending_removal_is_replanned(
-        NestedPendingRemovalCase::ListElement,
-        false,
-    ))
-    .await;
+    assert_failed_nested_pending_removal_is_replanned(NestedPendingRemovalCase::ListElement, false)
+        .await;
 }
 
 #[tokio::test]
 async fn ambiguous_list_pending_removal_retries_whole_value_and_converges() {
-    Box::pin(assert_failed_nested_pending_removal_is_replanned(
+    assert_failed_nested_pending_removal_is_replanned(
         NestedPendingRemovalCase::DuplicateListElement,
         true,
-    ))
+    )
     .await;
 }
 

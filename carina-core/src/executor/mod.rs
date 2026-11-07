@@ -310,7 +310,9 @@ pub async fn dispatch_resume_create<P: HostProvider + ?Sized>(
     provider: &P,
     request: ResumeCreateRequest,
 ) -> Result<HostResumeOutcome, HostResumeFailure> {
-    dispatch_resume_create_raw(provider, request).await
+    // Resume validation retains both the starting witness and the provider result.
+    // Bound that frame before embedding it in every scheduled basic operation.
+    Box::pin(dispatch_resume_create_raw(provider, request)).await
 }
 
 async fn dispatch_resume_create_raw<P: HostProvider + ?Sized>(

@@ -685,7 +685,9 @@ impl<R> ValidationReady<R> {
             origin,
             provider_plan,
         } = self;
-        let (inner, output) = transform(inner).await?;
+        // Configuration transitions retain large provider preparation futures.
+        // Keep the inner phase off callers' stacks as transitions are composed.
+        let (inner, output) = Box::pin(transform(inner)).await?;
         Ok((
             ValidationReady {
                 inner,
@@ -704,7 +706,7 @@ impl<R> ValidationReady<R> {
         F: FnOnce(R) -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        let inner = transform(self.inner).await?;
+        let inner = Box::pin(transform(self.inner)).await?;
         Ok(ValidationReady {
             inner,
             origin: self.origin,

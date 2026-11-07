@@ -931,7 +931,7 @@ pub(super) async fn prepare_basic_request<S: Clone>(
             let input = ctx
                 .provider_check_inputs
                 .resource_input(resource.as_inner(), ctx.runtime_authored);
-            let (ready, writeback) = resolve_resource(input, ctx.preparation).await?;
+            let (ready, writeback) = Box::pin(resolve_resource(input, ctx.preparation)).await?;
             let write = check.prepare_create(
                 CreateRequest::checked(ready),
                 writeback,
@@ -948,9 +948,15 @@ pub(super) async fn prepare_basic_request<S: Clone>(
             to,
             changed_attributes,
             ..
-        } => prepare_update_request_for_dispatch(from, to, changed_attributes, ctx, check)
-            .await
-            .map(PreparedBasicRequest::Update),
+        } => Box::pin(prepare_update_request_for_dispatch(
+            from,
+            to,
+            changed_attributes,
+            ctx,
+            check,
+        ))
+        .await
+        .map(PreparedBasicRequest::Update),
         Effect::Delete { .. } => delete
             .map(PreparedBasicRequest::Delete)
             .ok_or_else(|| EffectFailureKind::message("delete dispatch authorization missing")),
@@ -978,7 +984,7 @@ async fn prepare_update_request_for_dispatch<S: Clone>(
         })
         .unwrap_or_else(|| to.attributes.clone());
     let (resolved_to, resolved_desired_attributes) =
-        resolve_resource(check_input, preparation).await?;
+        Box::pin(resolve_resource(check_input, preparation)).await?;
     // Augment plan-time `changed_attributes` with any
     // ResourceRef-derived attributes whose resolved value at
     // apply time differs from `from`. This catches the case

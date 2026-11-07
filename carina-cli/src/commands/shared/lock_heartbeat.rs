@@ -86,7 +86,9 @@ pub(crate) async fn with_lock_heartbeat<T>(
                 trigger.request_graceful_shutdown();
             });
             let writer = MidRunStateWriter::locked(heartbeat.writer());
-            let result = operation(run_shutdown, writer).await;
+            // Command phases retain large provider preparation/execution futures.
+            // Heap-pin the phase before embedding it in the heartbeat state machine.
+            let result = Box::pin(operation(run_shutdown, writer)).await;
             let stopped = match shutdown.phase() {
                 ShutdownPhase::CleanupPriority => heartbeat.stop_for_cleanup().await,
                 ShutdownPhase::Running | ShutdownPhase::Graceful => heartbeat.stop().await,
@@ -101,7 +103,7 @@ pub(crate) async fn with_lock_heartbeat<T>(
         }
         StateLock::Disabled(disabled) => {
             let writer = MidRunStateWriter::unlocked(Arc::clone(&backend), disabled.clone());
-            let result = operation(shutdown, writer).await;
+            let result = Box::pin(operation(shutdown, writer)).await;
             HeartbeatOutcome::Kept {
                 result,
                 lock: StateLock::Disabled(disabled),

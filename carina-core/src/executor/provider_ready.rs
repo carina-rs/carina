@@ -934,10 +934,10 @@ pub async fn prepare_provider_ready_resource<S: Clone, D: Clone + Default>(
     >,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
-    prepare_provider_ready_resource_with_value_check(
+    Box::pin(prepare_provider_ready_resource_with_value_check(
         ResolvedCheckInput::authored(resource),
         context,
-    )
+    ))
     .await
 }
 
@@ -958,7 +958,12 @@ pub(super) async fn prepare_provider_ready_resource_after_resolution<
     >,
     context: &ProviderPreparationContext<'_>,
 ) -> Result<ProviderReadyResource, ProviderPreparationError> {
-    prepare_provider_ready_resource_with_value_check(input, context).await
+    // Retain authored values and normalization state in the preparation frame,
+    // rather than embedding it in every dispatch caller.
+    Box::pin(prepare_provider_ready_resource_with_value_check(
+        input, context,
+    ))
+    .await
 }
 
 enum ResourceValueCheck {
