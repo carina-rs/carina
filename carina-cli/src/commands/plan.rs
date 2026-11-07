@@ -3428,9 +3428,7 @@ mod historical_display_tests {
         }
         fn delete(
             &self,
-            _: &ResourceId,
-            _: &carina_core::provider::AppliedIdentifier,
-            _: carina_core::provider::DeleteRequest,
+            _attempt: carina_core::provider::DeleteAttempt,
         ) -> carina_core::provider::BoxFuture<'_, carina_core::provider::ProviderResult<()>>
         {
             unreachable!()

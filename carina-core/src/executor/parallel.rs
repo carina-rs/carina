@@ -1453,8 +1453,8 @@ mod tests {
     };
     use crate::plan::Plan;
     use crate::provider::{
-        AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer, ProviderError,
-        ProviderResult, ReadRequest, UpdateRequest,
+        AppliedState, BoxFuture, CreateRequest, NoopNormalizer, ProviderError, ProviderResult,
+        ReadRequest, UpdateRequest,
     };
     use crate::resource::{
         AbsoluteBindingAddress, ConcreteValue, Directives, ExpandedResource as Resource,
@@ -1779,9 +1779,7 @@ mod tests {
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &crate::provider::AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: crate::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("delete not used")) })
         }

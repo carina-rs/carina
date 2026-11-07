@@ -39,9 +39,9 @@ use carina_core::executor::{
 use carina_core::module_resolver::resolve_modules_providerless as resolve_modules;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
-    AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
-    InitializedProvider, NoopNormalizer, Provider, ProviderInstanceKey, ProviderResult,
-    ProviderRouter, ReadOutcome, ReadRequest, UpdateOutcome, UpdateRequest,
+    AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, InitializedProvider,
+    NoopNormalizer, Provider, ProviderInstanceKey, ProviderResult, ProviderRouter, ReadOutcome,
+    ReadRequest, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{
@@ -296,9 +296,7 @@ impl Provider for MockProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async move { Ok(()) })
     }

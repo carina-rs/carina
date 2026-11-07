@@ -7484,14 +7484,14 @@ impl Provider for WasmProvider {
 
     fn delete(
         &self,
-        id: &ResourceId,
-        identifier: &AppliedIdentifier,
-        request: DeleteRequest,
+        attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        let id = id.clone();
-        let identifier = identifier.as_str().to_string();
+        let id = attempt.id().clone();
+        let identifier = attempt.identifier().as_str().to_string();
+        let request = attempt.request().clone();
         let budgets = self.operation_budgets(&id, carina_provider_protocol::OperationKind::Delete);
         Box::pin(async move {
+            let _attempt = attempt;
             let initial = self.call_delete(id.clone(), identifier, request);
             self.drive_operation("delete", id, budgets, initial, |pending, _finality| {
                 self.call_poll_delete(*pending)
@@ -8808,9 +8808,7 @@ mod tests {
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: carina_core::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async {
                 Err(ProviderError::internal(

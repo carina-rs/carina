@@ -438,9 +438,7 @@ impl Provider for TestProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: carina_core::provider::DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
     }

@@ -1597,12 +1597,9 @@ async fn run_state_bucket_delete(
     })?;
     let bucket_id =
         ResourceId::with_provider_identity(provider_name, resource_type, bucket_identity, None);
-    let delete_request =
-        state_bucket_delete_request(validated_config.context().schemas(), &bucket_id)?;
-    match bucket_provider
-        .provider()
-        .delete(&bucket_id, &bucket_identifier, delete_request)
-        .await
+    let schemas = validated_config.context().schemas();
+    let permit = state_bucket_delete_permit(schemas, &bucket_id, bucket_identifier)?;
+    match carina_core::executor::dispatch_delete(bucket_provider.provider(), permit, schemas).await
     {
         Ok(()) => {
             println!(
@@ -1615,6 +1612,26 @@ async fn run_state_bucket_delete(
         }
         Err(e) => Err(AppError::Provider(e)),
     }
+}
+
+fn state_bucket_delete_permit(
+    schemas: &carina_core::schema::SchemaRegistry,
+    resource_id: &ResourceId,
+    identifier: AppliedIdentifier,
+) -> Result<carina_core::executor::DeletePermit, AppError> {
+    // Require the managed bucket schema, preserving the request's directive
+    // resolution and the existing missing-schema diagnostic.
+    state_bucket_delete_request(schemas, resource_id)?;
+    let resource = carina_core::resource::Resource::from_id(resource_id.clone());
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+    parsed.resources.push(resource.clone()); // allow: direct — topology (dependency sort), implicit bucket's own graph
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(parsed.into())?;
+    let admitted = graph
+        .initial_delete_plan(resource, identifier, schemas)?
+        .admit(schemas)?;
+    carina_core::executor::prepare_initial_delete(&admitted).ok_or_else(|| {
+        AppError::Config("State bucket delete is not ready for scheduler dispatch".to_owned())
+    })
 }
 
 fn state_bucket_delete_request(
@@ -3063,8 +3080,7 @@ mod tests {
     use carina_core::parser::parse_file;
     use carina_core::parser::{CompareOp, ValidateExpr};
     use carina_core::provider::{
-        BoxFuture, CreateRequest, DeleteRequest, ProviderError, ProviderResult, ReadRequest, Sent,
-        UpdateRequest,
+        BoxFuture, CreateRequest, ProviderError, ProviderResult, ReadRequest, Sent, UpdateRequest,
     };
     use carina_core::resource::{
         ConcreteValue, DeferredValue, LiveComposition, LiveCompositionArgument,
@@ -3645,6 +3661,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_bucket_delete_dispatches_with_scheduler_permit() {
+        use carina_provider_mock::{
+            ConfiguredBuiltinMock, MockBehavior, MockObservations, MockScope,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("deletes.log");
+        let provider = ConfiguredBuiltinMock::new(
+            MockBehavior {
+                observations: MockObservations {
+                    delete_log: Some(log.clone()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            MockScope::memory(),
+        )
+        .create_provider();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("mock", ResourceSchema::new("s3.Bucket").validate().unwrap());
+        let id = ResourceId::with_provider_identity("mock", "s3.Bucket", "state", None);
+        let identifier = AppliedIdentifier::new("bucket-provider-id").unwrap();
+        let permit = state_bucket_delete_permit(&schemas, &id, identifier).unwrap();
+        carina_core::executor::dispatch_delete(&provider, permit, &schemas)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(log).unwrap(), "s3.Bucket.state\n");
+    }
+
+    #[tokio::test]
     async fn state_bucket_delete_reports_provider_attribute_for_missing_upstream_state() {
         let (_temp, downstream, parsed) = provider_upstream_fixture();
         std::fs::remove_file(
@@ -3918,9 +3964,7 @@ mod tests {
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &carina_core::provider::AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: carina_core::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
         }
@@ -4065,9 +4109,7 @@ mod tests {
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &carina_core::provider::AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: carina_core::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
         }
@@ -4718,9 +4760,7 @@ mod tests {
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &carina_core::provider::AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: carina_core::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
         }

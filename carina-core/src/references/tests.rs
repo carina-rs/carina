@@ -125,9 +125,7 @@ impl Provider for TableProvider {
     }
     fn delete(
         &self,
-        _: &ResourceId,
-        _: &AppliedIdentifier,
-        _: DeleteRequest,
+        _attempt: crate::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         unimplemented!()
     }

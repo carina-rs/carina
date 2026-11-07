@@ -29,9 +29,9 @@ pub(super) fn checked_fixture_plan(plan: &Plan) -> crate::input_rules::InputChec
 }
 
 use crate::provider::{
-    AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
-    ProviderError, ProviderReadyDataSource, ProviderResult, ReadOutcome, ReadRequest,
-    UpdateRequest, fixture_read_outcome, fixture_read_outcome_for_identifier,
+    AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, NoopNormalizer, ProviderError,
+    ProviderReadyDataSource, ProviderResult, ReadOutcome, ReadRequest, UpdateRequest,
+    fixture_applied_identifier, fixture_read_outcome, fixture_read_outcome_for_identifier,
 };
 use crate::resource::ResolvedResourceId;
 use crate::resource::{
@@ -583,6 +583,133 @@ struct MockProvider {
     data_source_reads: Arc<Mutex<Vec<crate::resource::ProviderDataSource>>>,
 }
 
+fn delete_schedule_chain() -> crate::plan::AdmittedPlan {
+    let mut plan = Plan::new();
+    for (name, dependency) in [
+        ("leaf", Some("middle")),
+        ("middle", Some("root")),
+        ("root", None),
+    ] {
+        plan.add(Effect::Delete {
+            id: ResolvedResourceId::with_identity("test.resource", name),
+            identifier: fixture_applied_identifier(format!("{name}-provider-id")),
+            generation: EffectGeneration::Current,
+            directives: Default::default(),
+            binding: Some(absolute_binding(name)),
+            dependencies: crate::resource::PersistedDestroyDependencies::from_test_dependencies(
+                dependency.map(|name| ResolvedResourceId::with_identity("test.resource", name)),
+            ),
+            explicit_dependencies: Default::default(),
+            blocked_by_updates: Default::default(),
+        });
+    }
+    plan.admit(&crate::schema::SchemaRegistry::new()).unwrap()
+}
+
+#[tokio::test]
+async fn scheduler_delete_retry_keeps_ancestors_blocked() {
+    let schemas = crate::schema::SchemaRegistry::new();
+    let plan = delete_schedule_chain();
+    let mut scheduler = DeleteScheduler::for_destroy(&plan, &[], &Default::default()).unwrap();
+    let provider = MockProvider::new();
+    provider.push_delete(Err(ProviderError::api_error("DependencyViolation")));
+    for _ in 0..3 {
+        provider.push_delete(Ok(()));
+    }
+
+    let Some(DeleteRelease::Ready(delete)) = scheduler.release(0) else {
+        panic!("leaf ready")
+    };
+    let (result, completion) = delete.dispatch(&provider, &schemas).await;
+    assert!(result.is_err());
+    assert!(scheduler.release(1).is_none());
+    assert!(
+        scheduler.release(0).is_none(),
+        "failed attempt awaits retry decision"
+    );
+    scheduler.retry(completion);
+    assert!(
+        scheduler.release(1).is_none(),
+        "retry does not complete the leaf"
+    );
+    for index in 0..3 {
+        let Some(DeleteRelease::Ready(delete)) = scheduler.release(index) else {
+            panic!("next delete ready")
+        };
+        let (result, completion) = delete.dispatch(&provider, &schemas).await;
+        result.unwrap();
+        scheduler.complete(completion);
+    }
+    assert_eq!(
+        provider.calls(),
+        ["leaf", "leaf", "middle", "root"]
+            .map(|name| ("delete".to_owned(), format!("test.resource.{name}")))
+    );
+}
+
+#[tokio::test]
+async fn scheduler_delete_failure_skips_ancestors_without_dispatch() {
+    let schemas = crate::schema::SchemaRegistry::new();
+    let plan = delete_schedule_chain();
+    let mut scheduler = DeleteScheduler::for_destroy(&plan, &[], &Default::default()).unwrap();
+    let provider = MockProvider::new();
+    provider.push_delete(Err(ProviderError::api_error("delete failed")));
+    let Some(DeleteRelease::Ready(delete)) = scheduler.release(0) else {
+        panic!("leaf ready")
+    };
+    let (result, completion) = delete.dispatch(&provider, &schemas).await;
+    assert!(result.is_err());
+    scheduler.complete(completion);
+    for index in 1..3 {
+        assert!(
+            matches!(
+                scheduler.release(index),
+                Some(DeleteRelease::Blocked { dependency: 0 })
+            ),
+            "retain the original failed descendant in skip diagnostics"
+        );
+        assert!(scheduler.release(index).is_none());
+    }
+    assert_eq!(
+        provider.calls(),
+        vec![("delete".to_owned(), "test.resource.leaf".to_owned())]
+    );
+}
+
+#[test]
+fn delete_attempt_retains_exact_target_identifier_and_directives() {
+    let id = ResourceId::with_provider_identity(
+        "test",
+        "resource",
+        "logical-name",
+        Some("alias".into()),
+    );
+    let identifier = fixture_applied_identifier("physical-id");
+    let permit = delete_permit_for_test(
+        id.clone(),
+        identifier.clone(),
+        Directives::default().with_force_delete(true),
+    );
+    let attempt =
+        crate::provider::DeleteAttempt::new(permit, &crate::schema::SchemaRegistry::new());
+    assert_eq!(attempt.id(), &id);
+    assert_eq!(attempt.identifier(), &identifier);
+    assert!(attempt.request().directives().force_delete());
+}
+
+#[test]
+fn delete_scheduler_rejects_non_delete_effects() {
+    let mut plan = Plan::new();
+    plan.add(Effect::Remove {
+        id: ResolvedResourceId::with_identity("test.resource", "removed"),
+    });
+    let plan = plan.admit(&crate::schema::SchemaRegistry::new()).unwrap();
+    assert!(matches!(
+        DeleteScheduler::for_destroy(&plan, &[], &Default::default()),
+        Err(DeleteScheduleError::NonDelete { index: 0 })
+    ));
+}
+
 enum ClassifiedCreateFixture {
     OutcomeUnknown,
     IdentifierReported,
@@ -998,12 +1125,8 @@ impl Provider for MockProvider {
         Box::pin(async move { result })
     }
 
-    fn delete(
-        &self,
-        id: &ResourceId,
-        _identifier: &crate::provider::AppliedIdentifier,
-        _request: DeleteRequest,
-    ) -> BoxFuture<'_, ProviderResult<()>> {
+    fn delete(&self, attempt: crate::provider::DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = attempt.id();
         let id_str = id.to_string();
         self.call_log
             .lock()
@@ -1752,12 +1875,8 @@ impl Provider for DelayedCountingProvider {
         })
     }
 
-    fn delete(
-        &self,
-        id: &ResourceId,
-        _identifier: &crate::provider::AppliedIdentifier,
-        _request: DeleteRequest,
-    ) -> BoxFuture<'_, ProviderResult<()>> {
+    fn delete(&self, attempt: crate::provider::DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = attempt.id();
         let id = id.clone();
         let started = self.started.clone();
         Box::pin(async move {
@@ -1855,9 +1974,7 @@ impl Provider for PendingWaitProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &crate::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: crate::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("delete not used")) })
     }
@@ -2093,9 +2210,7 @@ impl Provider for PendingRefreshProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &crate::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: crate::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("delete not used")) })
     }
@@ -2186,9 +2301,7 @@ impl Provider for CheckpointBlockingProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: crate::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("delete not used")) })
     }
@@ -2277,9 +2390,7 @@ impl Provider for ControlledReadyCreateProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &crate::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: crate::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("delete not used")) })
     }
@@ -8852,9 +8963,7 @@ async fn test_fine_grained_scheduling_starts_dependent_before_slow_peer_complete
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &crate::provider::AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: crate::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("not implemented")) })
         }
@@ -9021,9 +9130,7 @@ impl Provider for YieldingUpdateProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &crate::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: crate::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
@@ -9899,9 +10006,7 @@ impl Provider for RecordingMockProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &crate::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: crate::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("not implemented")) })
     }
@@ -10021,12 +10126,8 @@ impl Provider for CascadeReplaceProvider {
         Box::pin(async { Err(ProviderError::internal("update not used")) })
     }
 
-    fn delete(
-        &self,
-        id: &ResourceId,
-        _identifier: &crate::provider::AppliedIdentifier,
-        _request: DeleteRequest,
-    ) -> BoxFuture<'_, ProviderResult<()>> {
+    fn delete(&self, attempt: crate::provider::DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = attempt.id();
         let id = id.clone();
         self.call_log
             .lock()
@@ -11220,9 +11321,7 @@ impl Provider for IdentifierAwareProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &crate::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: crate::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async move { Ok(()) })
     }
@@ -12167,10 +12266,9 @@ async fn deferred_replace_delete_runs_in_flight_after_completed_sibling_wakes_no
 
         fn delete(
             &self,
-            id: &ResourceId,
-            _identifier: &crate::provider::AppliedIdentifier,
-            _request: DeleteRequest,
+            attempt: crate::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
+            let id = attempt.id();
             let id = id.clone();
             Box::pin(async move { self.delete_id(&id).await })
         }

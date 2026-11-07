@@ -4,9 +4,9 @@ use carina_core::config_loader::get_base_dir;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::effect::{Effect, ResolvedMovePairs, UnresolvedSavedEffect};
 use carina_core::provider::{
-    AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
-    PatchOp, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
-    ReadOutcome, ReadRequest, UpdateRequest,
+    AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, NoopNormalizer, PatchOp, Provider,
+    ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult, ReadOutcome, ReadRequest,
+    UpdateRequest,
 };
 use carina_core::resource::{
     DataSource, DeferredValue, LiveComposition, LiveCompositionArgument, LiveCompositionSignature,
@@ -3181,10 +3181,9 @@ impl Provider for FailBCreateProvider {
 
     fn delete(
         &self,
-        id: &ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = attempt.id();
         let id = id.clone();
         Box::pin(async move { Err(ProviderError::internal("unexpected delete").for_resource(id)) })
     }
@@ -3659,10 +3658,10 @@ impl Provider for ApplyCascadeProvider {
 
     fn delete(
         &self,
-        id: &ResourceId,
-        identifier: &carina_core::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = attempt.id();
+        let identifier = attempt.identifier();
         let id = id.clone();
         let identifier = identifier.to_string();
         let shared = self.shared.clone();
@@ -4099,10 +4098,9 @@ impl Provider for ApplyTimeReadProvider {
 
     fn delete(
         &self,
-        id: &ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = attempt.id();
         let id = id.clone();
         Box::pin(async move { Err(ProviderError::internal("unexpected delete").for_resource(id)) })
     }
@@ -7428,9 +7426,7 @@ impl Provider for BootstrapRecordingProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
     }

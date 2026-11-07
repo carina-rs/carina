@@ -9,8 +9,8 @@ use carina_core::effect::PlanOp;
 use carina_core::parser::ProviderConfig;
 use carina_core::provider::{
     AppliedIdentifier, AppliedState, BoxFuture, CreateAttempt, CreateFailure, CreateOutcome,
-    CreateRequest, DeleteRequest, Observation, PartialReadDiagnostic, PatchOp, PendingToken,
-    Provider, ProviderError, ProviderNormalizer, ProviderResult, ReadOutcome, ReadRequest,
+    CreateRequest, Observation, PartialReadDiagnostic, PatchOp, PendingToken, Provider,
+    ProviderError, ProviderNormalizer, ProviderResult, ReadOutcome, ReadRequest,
     Resume as CoreResume, ResumeCreateRequest, ResumeFailure, ResumeOutcome, SavedAttrs, Sent,
     StateTransformMap, UpdateOutcome, UpdateRequest,
 };
@@ -1878,13 +1878,12 @@ impl Provider for MockProvider {
 
     fn delete(
         &self,
-        id: &ResourceId,
-        identifier: &AppliedIdentifier,
-        _request: DeleteRequest,
+        attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        let id = id.clone();
-        let identifier = identifier.as_str().to_string();
+        let id = attempt.id().clone();
+        let identifier = attempt.identifier().as_str().to_string();
         Box::pin(async move {
+            let _attempt = attempt;
             let key = Self::resolved_resource_key(&id)?;
             if let Some(err) = self.delete_fail_error_for(&id, &identifier) {
                 return Err(err);
@@ -1939,13 +1938,6 @@ mod tests {
     use super::*;
     use carina_core::resource::NoPlaceholder;
     use std::time::Duration;
-
-    fn delete_request_without_schema() -> DeleteRequest {
-        DeleteRequest::resolve(
-            &carina_core::resource::Directives::default(),
-            carina_core::provider::ProviderDirectiveSchema::Unavailable,
-        )
-    }
 
     #[test]
     fn builtin_schemas_are_all_valid() {
@@ -3019,10 +3011,17 @@ mod tests {
                         .await
                         .expect("update should succeed");
 
-                    provider
-                        .delete(&id, &identifier, delete_request_without_schema())
-                        .await
-                        .expect("delete should succeed");
+                    carina_core::executor::dispatch_delete(
+                        &provider,
+                        carina_core::executor::delete_permit_for_test(
+                            id.clone(),
+                            identifier.clone(),
+                            Default::default(),
+                        ),
+                        &carina_core::schema::SchemaRegistry::new(),
+                    )
+                    .await
+                    .expect("delete should succeed");
                 },
             )
             .await
@@ -3288,7 +3287,16 @@ mod tests {
 
         let (initially_pending, ready_seen, still_pending, released, outcome) =
             runtime.block_on(async {
-                let delete = provider.delete(&id, &identifier, delete_request_without_schema());
+                let schemas = carina_core::schema::SchemaRegistry::new();
+                let delete = carina_core::executor::dispatch_delete(
+                    &provider,
+                    carina_core::executor::delete_permit_for_test(
+                        id.clone(),
+                        identifier.clone(),
+                        Default::default(),
+                    ),
+                    &schemas,
+                );
                 tokio::pin!(delete);
                 let mut context = std::task::Context::from_waker(std::task::Waker::noop());
                 let first = delete.as_mut().poll(&mut context);
@@ -3349,9 +3357,16 @@ mod tests {
             AppliedIdentifier::new("mock-id").expect("the mock identifier is non-empty");
         let (outcome, elapsed) = runtime.block_on(async {
             let started = tokio::time::Instant::now();
-            let outcome = provider
-                .delete(&id, &identifier, delete_request_without_schema())
-                .await;
+            let outcome = carina_core::executor::dispatch_delete(
+                &provider,
+                carina_core::executor::delete_permit_for_test(
+                    id.clone(),
+                    identifier.clone(),
+                    Default::default(),
+                ),
+                &carina_core::schema::SchemaRegistry::new(),
+            )
+            .await;
             (outcome, tokio::time::Instant::now() - started)
         });
 

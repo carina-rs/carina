@@ -13,9 +13,9 @@ use crate::{
     binding_index::SecretPreservingAttributes,
     effect::{DeletedInstanceKey, Effect, EffectGeneration},
     input_rules::{InputVerdict, PendingInputObligation, executor_write_site},
-    provider::{AppliedIdentifier, CreateRequest, DeleteRequest, Provider, UpdateRequest},
+    provider::{AppliedIdentifier, CreateRequest, Provider, UpdateRequest},
     resource::{Directives, ResourceId, Value},
-    schema::{SchemaKind, SchemaRegistry},
+    schema::SchemaRegistry,
 };
 
 // Its constructor is private to discharge. Even other core modules cannot
@@ -144,19 +144,25 @@ impl DeleteTarget {
 }
 
 impl DeletePermit {
+    pub(crate) fn id(&self) -> &ResourceId {
+        &self.target.id
+    }
+
+    pub(crate) fn identifier(&self) -> &AppliedIdentifier {
+        &self.target.identifier
+    }
+
+    pub(crate) fn directives(&self) -> &Directives {
+        &self.target.directives
+    }
+
     pub(super) async fn dispatch(
         self,
         provider: &dyn Provider,
         schemas: &SchemaRegistry,
     ) -> super::basic::BasicEffectResult {
-        let target = &self.target;
-        let directives =
-            schemas.resolve_directives(&target.id, SchemaKind::Resource, &target.directives);
-        let request = DeleteRequest::from_resolved(directives);
-        match provider
-            .delete(&target.id, &target.identifier, request)
-            .await
-        {
+        let target = self.target.clone();
+        match super::dispatch_delete(provider, self, schemas).await {
             Ok(()) => super::basic::BasicEffectResult::Deleted {
                 instance_key: DeletedInstanceKey::new(
                     target.id.clone(),
@@ -432,6 +438,19 @@ pub(super) struct ExecutionInputChecks {
 }
 
 impl ExecutionInputChecks {
+    /// A delete-only scheduler may retry an actual completed attempt. Apply's
+    /// paired delete slots never use this path or lose their discharge receipts.
+    pub(super) fn retry_delete<S>(&mut self, index: usize, effect: &Effect<S>) {
+        assert!(!self.required_deletes.contains_key(&index));
+        assert!(
+            self.delete_targets
+                .insert(
+                    index,
+                    DeleteTarget::from_effect(effect).expect("delete-only scheduler slot"),
+                )
+                .is_none()
+        );
+    }
     pub(super) fn has_rules(&self, index: usize) -> bool {
         self.checks.contains_key(&index)
     }

@@ -16,9 +16,9 @@ use carina_core::executor::{
 use carina_core::plan::PlanErrorKind;
 use carina_core::provider::{
     AppliedIdentifier, BoxFuture, CreateAttempt, CreateFailure, CreateOutcome, CreateRequest,
-    DeleteRequest, NoopNormalizer, Provider, ProviderFactory, ProviderReadyDataSource,
-    ProviderResult, ReadOutcome, ReadRequest, ResumeCreateRequest, ResumeFailure, ResumeOutcome,
-    Sent, UpdateOutcome, UpdateRequest,
+    NoopNormalizer, Provider, ProviderFactory, ProviderReadyDataSource, ProviderResult,
+    ReadOutcome, ReadRequest, ResumeCreateRequest, ResumeFailure, ResumeOutcome, Sent,
+    UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{ConcreteValue, Current, ResourceId, State, Value};
 use carina_core::schema::{
@@ -485,9 +485,7 @@ impl Provider for OutputMock {
 
     fn delete(
         &self,
-        _: &ResourceId,
-        _: &AppliedIdentifier,
-        _: DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { unreachable!("this fixture never deletes") })
     }

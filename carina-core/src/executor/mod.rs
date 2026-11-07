@@ -13,6 +13,7 @@
 
 pub(crate) mod basic;
 mod deferred_dispatch;
+mod delete;
 pub(crate) mod input_discharge;
 pub mod normalized;
 #[cfg(test)]
@@ -26,6 +27,13 @@ pub(super) mod scheduler;
 pub(crate) mod wait;
 
 pub use deferred_dispatch::{AnonymousIdentityCollisionSource, DeferredCreateFailure};
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub use delete::delete_permit_for_test;
+pub use delete::{
+    DeleteCompletion, DeleteRelease, DeleteScheduleError, DeleteScheduler, ScheduledDelete,
+    dispatch_delete, prepare_initial_delete,
+};
 pub use input_discharge::{DeletePermit, PreparedWrite};
 pub use parallel::classify_stalled_effects;
 pub use scheduler::prepare_initial_create;

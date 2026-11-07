@@ -398,9 +398,7 @@ impl carina_core::provider::Provider for FixtureCreateProvider {
 
     fn delete(
         &self,
-        _id: &carina_core::resource::ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: carina_core::provider::DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> carina_core::provider::BoxFuture<'_, carina_core::provider::ProviderResult<()>> {
         Box::pin(async {
             Err(carina_core::provider::ProviderError::internal(

@@ -14,11 +14,11 @@ use carina_core::effect::PlanOp;
 use carina_core::executor::{AcceptedRequest, complete_create_for_writeback};
 use carina_core::provider::{
     AppliedIdentifier, BoxFuture, CreateFailure, CreateFailureKind, CreateObservation,
-    CreateOutcome, CreateOutcomeKind, CreateRequest, DeleteRequest, InFlightCreate, Provider,
-    ProviderDirectiveSchema, ProviderError, ProviderErrorKind, ProviderFactory,
-    ProviderReadyConfig, RawSavedAttrs, ReadRequest, ResumeCreateRequest, ResumeFailure,
-    ResumeFailureKind, ResumeOutcome, ResumeOutcomeKind, SavedAttrs, Sent, SentRecord,
-    UnobservedReason, UpdateRequest, hydrate_provider_states, normalize_provider_states,
+    CreateOutcome, CreateOutcomeKind, CreateRequest, InFlightCreate, Provider, ProviderError,
+    ProviderErrorKind, ProviderFactory, ProviderReadyConfig, RawSavedAttrs, ReadRequest,
+    ResumeCreateRequest, ResumeFailure, ResumeFailureKind, ResumeOutcome, ResumeOutcomeKind,
+    SavedAttrs, Sent, SentRecord, UnobservedReason, UpdateRequest, hydrate_provider_states,
+    normalize_provider_states,
 };
 use carina_core::resource::{
     ApplyTimeUnknown, ConcreteValue, DataSource, DeferredValue, EnumValueResolver,
@@ -316,11 +316,21 @@ fn assert_minted_mock_identifier(identifier: &str) {
     );
 }
 
-fn delete_request_without_schema() -> DeleteRequest {
-    DeleteRequest::resolve(
-        &carina_core::resource::Directives::default(),
-        ProviderDirectiveSchema::Unavailable,
+async fn delete_without_schema(
+    provider: &dyn Provider,
+    id: &ResourceId,
+    identifier: &AppliedIdentifier,
+) -> carina_core::provider::ProviderResult<()> {
+    carina_core::executor::dispatch_delete(
+        provider,
+        carina_core::executor::delete_permit_for_test(
+            id.clone(),
+            identifier.clone(),
+            Default::default(),
+        ),
+        &carina_core::schema::SchemaRegistry::new(),
     )
+    .await
 }
 
 fn provider_resources(resources: Vec<Resource>) -> Vec<ProviderResource> {
@@ -3084,9 +3094,7 @@ async fn test_wasm_fresh_delete_recovers_pending_controls_from_identifier() {
         .await
         .unwrap();
     let identifier = AppliedIdentifier::new(created.identifier.unwrap()).unwrap();
-    let error = fresh
-        .provider()
-        .delete(&id, &identifier, delete_request_without_schema())
+    let error = delete_without_schema(fresh.provider(), &id, &identifier)
         .await
         .expect_err("a fresh instance must honor the pending delete and exhaust its budget");
     assert!(error.to_string().contains("budget"), "{error}");
@@ -3417,9 +3425,7 @@ async fn test_wasm_pending_delete_polls_until_success() {
         .expect("setup create should succeed");
     let identifier = created.identifier().clone();
 
-    provider
-        .provider()
-        .delete(&id, &identifier, delete_request_without_schema())
+    delete_without_schema(provider.provider(), &id, &identifier)
         .await
         .expect("pending delete should settle");
     {
@@ -5287,9 +5293,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     );
 
     // Delete
-    provider
-        .provider()
-        .delete(&id, &updated_identifier, delete_request_without_schema())
+    delete_without_schema(provider.provider(), &id, &updated_identifier)
         .await
         .expect("delete should succeed");
 

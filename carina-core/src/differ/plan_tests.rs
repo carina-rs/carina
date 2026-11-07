@@ -1200,9 +1200,7 @@ impl crate::provider::Provider for HintProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &crate::provider::AppliedIdentifier,
-        _request: crate::provider::DeleteRequest,
+        _attempt: crate::provider::DeleteAttempt,
     ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<()>> {
         Box::pin(async { panic!("unexpected delete") })
     }

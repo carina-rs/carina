@@ -288,6 +288,39 @@ pub struct InputCheckedInitialCreatePlan {
     pub(crate) checked: crate::input_rules::InputCheckedPlan,
 }
 
+/// One delete resolved against its own immutable graph before admission.
+#[derive(Debug)]
+pub struct ResolvedInitialDeletePlan {
+    graph: ExpandedBindingIndex,
+    plan: crate::plan::Plan,
+}
+
+/// Admitted delete intent retaining the exact graph used for resolution.
+///
+/// ```compile_fail,E0616
+/// use carina_core::resolved_graph::{AdmittedInitialDeletePlan, ExpandedBindingIndex};
+/// fn swap_graph(plan: &mut AdmittedInitialDeletePlan, other: ExpandedBindingIndex) {
+///     plan.graph = other;
+/// }
+/// ```
+#[derive(Debug)]
+pub struct AdmittedInitialDeletePlan {
+    pub(crate) graph: ExpandedBindingIndex,
+    pub(crate) admitted: crate::plan::AdmittedPlan,
+}
+
+impl ResolvedInitialDeletePlan {
+    pub fn admit(
+        self,
+        schemas: &SchemaRegistry,
+    ) -> Result<AdmittedInitialDeletePlan, crate::replacement::ReplacementAdmissionError> {
+        Ok(AdmittedInitialDeletePlan {
+            graph: self.graph,
+            admitted: self.plan.admit(schemas)?,
+        })
+    }
+}
+
 impl ResolvedInitialCreatePlan {
     /// Admit the resolved effects and retain their input obligations together
     /// with the graph that will judge readiness at dispatch.
@@ -473,6 +506,33 @@ fn rewrite_handle_output_refs<P: PlaceholderKind>(
 }
 
 impl ExpandedBindingIndex {
+    /// Resolve a standalone delete and retain this graph through dispatch.
+    pub fn initial_delete_plan(
+        &self,
+        resource: Resource,
+        identifier: crate::provider::AppliedIdentifier,
+        schemas: &SchemaRegistry,
+    ) -> Result<ResolvedInitialDeletePlan, ExpandedGraphResolutionError> {
+        let target = self.resolve_resource(resource, schemas)?;
+        let mut plan = crate::plan::Plan::new();
+        let mut dependencies = target.persisted_value_destroy_dependencies().clone();
+        dependencies.extend_projected(target.persisted_explicit_destroy_dependencies());
+        plan.add(crate::effect::Effect::Delete {
+            id: target.resolved_id(),
+            identifier,
+            generation: crate::effect::EffectGeneration::Current,
+            directives: target.directives.clone(),
+            binding: target.binding.clone(),
+            dependencies,
+            explicit_dependencies: target.explicit_dependencies().clone(),
+            blocked_by_updates: Default::default(),
+        });
+        Ok(ResolvedInitialDeletePlan {
+            graph: self.clone(),
+            plan,
+        })
+    }
+
     /// Resolve and finalize one bootstrap create, retaining this exact graph
     /// for the executor's dependency-ready release. No resolved plan can be
     /// attached by the caller after this transition.

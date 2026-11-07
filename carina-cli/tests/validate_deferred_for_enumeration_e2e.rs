@@ -210,9 +210,7 @@ impl Provider for NoopProvider {
     }
     fn delete(
         &self,
-        _id: &carina_core::resource::ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: carina_core::provider::DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async move { Ok(()) })
     }

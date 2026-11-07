@@ -63,9 +63,7 @@ fn create_attempt_for_test(id: ResourceId) -> carina_core::provider::CreateAttem
         }
         fn delete(
             &self,
-            _: &ResourceId,
-            _: &AppliedIdentifier,
-            _: DeleteRequest,
+            _attempt: carina_core::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             panic!("unexpected fixture delete")
         }
