@@ -22,10 +22,12 @@
 //!    keeps `defs` empty by default — guards against accidentally
 //!    forcing every caller to populate the new field.
 
+#[path = "support/provider_text.rs"]
+mod text_fixtures;
 use std::collections::{BTreeMap, HashMap};
 
 use carina_core::differ::{Diff, diff_for_test as diff};
-use carina_core::provider::{InitializedProvider, ProviderRouter};
+use carina_core::provider::ProviderRouter;
 use carina_core::resource::{ConcreteValue, ResolvedResource, Resource, ResourceId, State, Value};
 use carina_core::schema::{
     CompiledAttributeSchema as AttributeSchema, CompiledAttributeType as AttributeType,
@@ -211,7 +213,7 @@ fn differ_treats_equal_cyclic_values_as_unchanged() {
     let mut providers = ProviderRouter::new();
     providers.add_provider(
         "test".into(),
-        InitializedProvider::unavailable(Box::new(ProviderRouter::new())),
+        text_fixtures::initialized(text_fixtures::idle_provider()),
     );
     let comparison = providers
         .comparison_context_for(
@@ -278,7 +280,7 @@ fn differ_surfaces_a_real_change_inside_a_cyclic_value() {
     let mut providers = ProviderRouter::new();
     providers.add_provider(
         "test".into(),
-        InitializedProvider::unavailable(Box::new(ProviderRouter::new())),
+        text_fixtures::initialized(text_fixtures::idle_provider()),
     );
     let comparison = providers
         .comparison_context_for(

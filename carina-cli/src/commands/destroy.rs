@@ -28,7 +28,7 @@ use carina_core::executor::{
     FailureReport, FailureSink, ProgressInfo, classify_stalled_effects as classify_destroy_stall,
 };
 use carina_core::plan::{Plan, PlanError};
-use carina_core::provider::{Provider, ProviderError};
+use carina_core::provider::{HostError, Provider};
 #[cfg(test)]
 use carina_core::resource::State;
 use carina_core::resource::{
@@ -209,6 +209,44 @@ pub async fn run_destroy(
     Ok(())
 }
 
+/// Exercise the production destroy refresh/execution path with native factories.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn run_destroy_with_factories_for_test(
+    runtime: &crate::runtime::CommandRuntime,
+    path: &Path,
+    factories: Vec<crate::wiring::LoadedProviderFactory>,
+) -> Result<(), AppError> {
+    let project = carina_core::paths::ResolvedPath::new(path).unwrap();
+    let context = ProviderContext::new(runtime.environment().clone());
+    let loaded = load_configuration_with_config(&project, &context, &Default::default())?;
+    let providers =
+        ProviderLoad::for_test_with_provider_phase(runtime, factories, &loaded.parsed.providers);
+    let validated = providers.validate_evaluated_config(
+        loaded.parsed,
+        &project,
+        true,
+        &loaded.duplicate_declarations,
+    )?;
+    let backend: Arc<dyn StateBackend> =
+        carina_state::backends::local_backend_for_test(path.join("carina.state.json")).into();
+    let cancel = ShutdownToken::running();
+    let outcome = run_destroy_locked_owned(
+        validated,
+        true,
+        Arc::clone(&backend),
+        None,
+        StateLock::disabled_by_cli_flag(),
+        true,
+        false,
+        &project,
+        &context,
+        crate::DEFAULT_PARALLELISM,
+        cancel.clone(),
+    )
+    .await;
+    finish_lock_command(runtime.color_mode(), backend.as_ref(), outcome, &cancel).await
+}
+
 enum DestroyAfterHeartbeat {
     Done,
     Executed(Box<DestroyExecuted>),
@@ -229,7 +267,7 @@ struct DestroyExecuted {
 /// The number of failed attempts cannot outlive its reportable cause.
 struct DeleteRetryFailure {
     attempts: usize,
-    last_error: ProviderError,
+    last_error: HostError,
 }
 
 enum DeleteRetryStop {
@@ -408,11 +446,10 @@ async fn run_destroy_locked_owned(
 
     // Select the initialized provider before address reconciliation so every
     // create-only comparison uses the owning instance's reference scope.
-    let provider = get_provider_with_ctx(
-        ctx,
-        provider_inputs.configs(),
-        ProgressSink::Human,
-    )
+    let provider = get_provider_with_ctx(ctx,
+provider_inputs.configs(),
+ProgressSink::Human,
+validated_config.provider_plan())
     .await?;
 
     // Collect all resources (managed + orphans) before sorting.
@@ -2399,6 +2436,8 @@ pub(crate) async fn finalize_destroy(
 
 #[cfg(test)]
 mod tests {
+    use crate::provider_text_fixtures::BindProviderText;
+    use carina_core::provider::HostError as ProviderError;
 
     use super::*;
     use crate::provider_upstream_test_support::{
@@ -2498,10 +2537,11 @@ mod tests {
         let mut streamed = String::new();
         let kind = DeleteRetryFailure {
             attempts: 2,
-            last_error: ProviderError::internal_caused_by(
+            last_error: carina_core::provider::ProviderError::internal_caused_by(
                 "DependencyViolation",
                 std::io::Error::other("blocking ENI eni-distinctive"),
-            ),
+            )
+            .into_host_for_test(),
         }
         .stopped(DeleteRetryStop::NoProgress);
         record_destroy_failure(&mut sink, &effect, kind, |failure| {

@@ -31,9 +31,13 @@ pub enum ComparisonError {
     Secret(#[from] SerializationError),
 }
 
-impl From<ComparisonError> for crate::provider::ProviderError {
+impl From<ComparisonError> for crate::provider::HostError {
     fn from(error: ComparisonError) -> Self {
-        Self::invalid_input_caused_by("Failed to compare resource attributes", error)
+        Self::from_diagnostic(
+            crate::provider::ProviderErrorKind::InvalidInput,
+            "Failed to compare resource attributes",
+            crate::provider_text::HostDiagnostic::capture_host_or_provider(error),
+        )
     }
 }
 

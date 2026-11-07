@@ -36,7 +36,7 @@ use carina_core::explicit::ExplicitFields;
 use carina_core::module::FileSignature;
 #[cfg(test)]
 use carina_core::plan::Plan;
-use carina_core::provider::{ProviderError, ProviderRouter};
+use carina_core::provider::{HostError, ProviderRouter};
 use carina_core::resource::ResourceId;
 use carina_core::schema::SchemaRegistry;
 
@@ -201,7 +201,7 @@ pub fn run_module_info(signature: &FileSignature) -> Result<(), TuiError> {
 /// command callers to add presentation without flattening it into a string.
 #[derive(Debug)]
 pub enum TuiError {
-    PlanDisplay(ProviderError),
+    PlanDisplay(HostError),
     Io(io::Error),
 }
 
@@ -445,8 +445,25 @@ mod tests {
         };
 
         let provider_error = std::error::Error::source(&error)
-            .and_then(|source| source.downcast_ref::<ProviderError>())
+            .and_then(|source| source.downcast_ref::<HostError>())
             .expect("TuiError must retain ProviderError as its source");
+        let cause = provider_error
+            .detail()
+            .cause()
+            .unwrap()
+            .comparison_resolution()
+            .unwrap();
+        // This fixture view lends only the cause inside the gated projection.
+        struct CauseFixture<'a>(&'a (dyn std::error::Error + 'static));
+        impl CauseFixture<'_> {
+            fn detail(&self) -> &Self {
+                self
+            }
+            fn cause(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(self.0)
+            }
+        }
+        let provider_error = CauseFixture(&cause);
         assert!(matches!(
             provider_error
                 .detail()
@@ -1084,3 +1101,7 @@ mod tests {
         assert_eq!(app.focused_panel, FocusedPanel::Tree);
     }
 }
+
+#[cfg(test)]
+#[path = "../../carina-core/tests/support/provider_text.rs"]
+mod provider_text_fixtures;

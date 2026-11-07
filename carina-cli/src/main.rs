@@ -825,6 +825,7 @@ mod cli_version_tests;
 #[cfg(test)]
 mod error_format_tests {
     use super::*;
+    use crate::provider_text_fixtures::*;
 
     #[cfg(unix)]
     #[test]
@@ -1064,7 +1065,7 @@ mod error_format_tests {
     fn provider_account_guard_renders_structured_block() {
         let color_mode = carina_cli::output_style::ColorMode::Plain;
 
-        let pe = carina_core::provider::ProviderError::invalid_input(
+        let pe = carina_core::provider::HostError::invalid_input(
             "AWS account ID '019115212452' \
              is not in the provider's allowed_account_ids [\"151116838382\"]. \
              Refusing to operate against this account. \
@@ -1125,6 +1126,7 @@ mod error_format_tests {
         for (provider_name, message) in [("aws", AWS_MESSAGE), ("awscc", AWSCC_MESSAGE)] {
             let pe =
                 carina_plugin_host::wasm_factory::decode_initialize_string_error_for_test(message)
+                    .into_host_for_test()
                     // This is the wiring boundary used by both ordinary and
                     // source-loaded provider construction.
                     .for_provider(provider_name);
@@ -1155,7 +1157,7 @@ mod error_format_tests {
         // credentials chain, etc.) must still be surfaced — just not
         // through the structured account-guard renderer.
 
-        let pe = carina_core::provider::ProviderError::invalid_input(
+        let pe = carina_core::provider::HostError::invalid_input(
             "failed to load AWS credentials from the environment",
         );
         let app_err: error::AppError = pe.into();
@@ -1190,6 +1192,7 @@ mod error_format_tests {
         let pe = carina_plugin_host::wasm_factory::decode_initialize_string_error_for_test(
             "failed to load AWS credentials from the environment",
         )
+        .into_host_for_test()
         .for_provider("awscc");
 
         let rendered = render_app_error(color_mode, &error::AppError::Provider(pe));
@@ -1206,7 +1209,7 @@ mod error_format_tests {
     fn non_initialization_provider_error_does_not_add_provider_header() {
         let color_mode = carina_cli::output_style::ColorMode::Plain;
 
-        let pe = carina_core::provider::ProviderError::invalid_input(
+        let pe = carina_core::provider::HostError::invalid_input(
             "failed to encode default tag for provider 'aws'",
         )
         .for_provider("aws");
@@ -1227,7 +1230,7 @@ mod error_format_tests {
         // it instead of the "aws" default. Catches awscc-vs-aws
         // mislabeling.
 
-        let pe = carina_core::provider::ProviderError::invalid_input(
+        let pe = carina_core::provider::HostError::invalid_input(
             "AWS account ID '019115212452' \
              is not in the provider's allowed_account_ids [\"151116838382\"]. \
              Refusing to operate against this account.",
@@ -1685,3 +1688,7 @@ mod cursor_abort_tests {
         assert!(output.find("\x1b[?25l") < output.find("\x1b[?25h"));
     }
 }
+
+#[cfg(test)]
+#[path = "../../carina-core/tests/support/provider_text.rs"]
+mod provider_text_fixtures;

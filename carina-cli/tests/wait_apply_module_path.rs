@@ -76,6 +76,7 @@ impl ProviderFactory for AwsStub {
     fn validate_config(
         &self,
         _a: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
@@ -83,13 +84,13 @@ impl ProviderFactory for AwsStub {
         &self,
         _t: &carina_core::schema::TypeIdentity,
         _v: &carina_core::provider::CanonicalCustomTypeValue,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
     fn create_provider(
         &self,
-        _b: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
@@ -104,8 +105,7 @@ impl ProviderFactory for AwsStub {
     }
     fn create_normalizer(
         &self,
-        _b: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
     ) -> BoxFuture<'_, ProviderResult<Box<dyn ProviderNormalizer>>> {
         Box::pin(async { Ok(Box::new(NoopNormalizer) as Box<dyn ProviderNormalizer>) })
     }
@@ -609,6 +609,8 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         .expect("override-aware resolve");
 
     let provider = NoopProvider { cert_publishes_arn };
+
+    let provider = std::sync::Arc::new(provider);
     let wait_bindings = parsed.wait_bindings.clone();
     let compositions = parsed.compositions.clone();
     let module_gate =
@@ -679,7 +681,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     let plan = carina_core::differ::create_plan_for_test(
         &resolved_resources_for_plan,
         &resolved_data_sources,
-        &provider,
+        &carina_cli::test_support::boundary(Box::new(std::sync::Arc::clone(&provider))),
         carina_core::differ::PlanPriorStates::new(
             &carina_core::resource::into_plan_input_current_map(
                 current_states.clone(),
@@ -750,7 +752,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
     };
     let result = completed_result(
         carina_core::executor::execute_live_plan_for_test(
-            &provider,
+            &carina_cli::test_support::boundary(Box::new(std::sync::Arc::clone(&provider))),
             input,
             &observer,
             carina_core::shutdown::ShutdownToken::running(),

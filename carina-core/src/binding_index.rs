@@ -1910,7 +1910,7 @@ impl AppliedOperation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PartialReadBack {
     operation: AppliedOperation,
-    reason: crate::provider_text::ProviderText,
+    reason: crate::provider_text::DiagnosticText,
     missing_attributes: HashSet<String>,
     end: crate::provider::ReadBackEnd,
 }
@@ -1918,7 +1918,7 @@ pub struct PartialReadBack {
 impl PartialReadBack {
     pub(crate) fn from_diagnostic(
         operation: AppliedOperation,
-        diagnostic: &crate::provider::PartialReadDiagnostic,
+        diagnostic: &crate::provider::HostPartialReadDiagnostic,
         end: crate::provider::ReadBackEnd,
     ) -> Self {
         Self {

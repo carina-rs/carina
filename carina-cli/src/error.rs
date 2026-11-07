@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use carina_core::hint::ProjectCommand;
 use carina_core::plan::PlanError;
-use carina_core::provider::{ProviderError, ProviderInstanceKey, ReferenceScope};
+use carina_core::provider::{HostError, ProviderInstanceKey, ReferenceScope};
 use carina_core::resource::{ResolvedResourceId, ResourceId};
 use carina_state::BackendError;
 
@@ -523,19 +523,19 @@ impl std::error::Error for StateBucketPreparationError {}
 /// available through [`StateBucketCreateError::create_failure`].
 #[derive(Debug)]
 pub struct StateBucketCreateError {
-    create: Box<carina_core::provider::CreateFailure>,
+    create: Box<carina_core::provider::HostCreateFailure>,
     seed: Option<Box<AppError>>,
 }
 
 impl StateBucketCreateError {
-    pub fn new(create: carina_core::provider::CreateFailure, seed: Option<AppError>) -> Self {
+    pub fn new(create: carina_core::provider::HostCreateFailure, seed: Option<AppError>) -> Self {
         Self {
             create: Box::new(create),
             seed: seed.map(Box::new),
         }
     }
 
-    pub fn create_failure(&self) -> &carina_core::provider::CreateFailure {
+    pub fn create_failure(&self) -> &carina_core::provider::HostCreateFailure {
         &self.create
     }
 
@@ -564,7 +564,7 @@ impl std::error::Error for StateBucketCreateError {
 #[derive(Debug)]
 pub struct StateBucketSeedError {
     identifier: String,
-    identifier_label: carina_core::provider_text::ProviderText,
+    identifier_label: carina_core::provider_text::DiagnosticText,
     resource_address: String,
     source: BackendError,
 }
@@ -572,7 +572,7 @@ pub struct StateBucketSeedError {
 impl StateBucketSeedError {
     pub fn new(identifier: String, resource_address: String, source: BackendError) -> Self {
         Self {
-            identifier_label: carina_core::provider_text::ProviderText::new(&identifier),
+            identifier_label: carina_core::provider_text::DiagnosticText::new(&identifier),
             identifier,
             resource_address,
             source,
@@ -865,7 +865,7 @@ fn parse_account_guard_clause(msg: &str, kind: &str) -> Option<AccountGuardClaus
 pub enum SavedPlanSecretVerificationError {
     #[error(
         "Saved-plan secret is unavailable at {location}: {error}; re-run `{replan}` after restoring its value.",
-        location = carina_core::provider_text::ProviderText::new(location)
+        location = carina_core::provider_text::DiagnosticText::new(location)
     )]
     UnavailableSecret {
         location: String,
@@ -875,13 +875,13 @@ pub enum SavedPlanSecretVerificationError {
 
     #[error(
         "Saved-plan secret verification failed at {location}: the secret changed since the plan was created; re-run `{replan}`.",
-        location = carina_core::provider_text::ProviderText::new(location)
+        location = carina_core::provider_text::DiagnosticText::new(location)
     )]
     HashMismatch { location: String, replan: String },
 
     #[error(
         "Saved-plan secret verification failed at {location}: the configuration changed and the recorded secret position no longer exists; re-run `{replan}`.",
-        location = carina_core::provider_text::ProviderText::new(location)
+        location = carina_core::provider_text::DiagnosticText::new(location)
     )]
     ConfigurationChanged { location: String, replan: String },
 
@@ -895,19 +895,19 @@ pub enum SavedPlanSecretVerificationError {
 
     #[error(
         "Saved-plan secret verification failed at {location}: the current secret could not be evaluated (for example, an environment variable or decryption key may be unavailable); re-run `{replan}` after restoring the required inputs.",
-        location = carina_core::provider_text::ProviderText::new(location)
+        location = carina_core::provider_text::DiagnosticText::new(location)
     )]
     SecretEvaluationUnavailable { location: String, replan: String },
 
     #[error(
         "Saved-plan secret verification failed because orphan resource {resource} no longer exists; re-run `{replan}`.",
-        resource = carina_core::provider_text::ProviderText::new(resource)
+        resource = carina_core::provider_text::DiagnosticText::new(resource)
     )]
     OrphanVanished { resource: String, replan: String },
 
     #[error(
         "Saved-plan secret verification failed at {location}: the current secret could not be encoded for verification: {error}; re-run `{replan}`.",
-        location = carina_core::provider_text::ProviderText::new(location)
+        location = carina_core::provider_text::DiagnosticText::new(location)
     )]
     Serialization {
         location: String,
@@ -1124,7 +1124,7 @@ pub enum AppError {
 
     /// Provider errors (AWS API failures, timeouts, etc.)
     #[error(transparent)]
-    Provider(#[from] ProviderError),
+    Provider(#[from] HostError),
 
     #[error(transparent)]
     ReferencePreparation(#[from] Box<carina_core::references::ReferencePlanError>),
@@ -1184,7 +1184,7 @@ pub enum AppError {
     )]
     SourceProviderKindMismatch {
         configured: String,
-        loaded: carina_core::provider_text::ProviderText,
+        loaded: carina_core::provider_text::DiagnosticText,
         provider_source: String,
     },
 
@@ -1617,6 +1617,8 @@ impl From<&str> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_text_fixtures::BindProviderText;
+    use carina_core::provider::HostError as ProviderError;
 
     #[test]
     fn app_errors_stay_within_clippy_large_error_threshold() {
@@ -2073,10 +2075,11 @@ mod tests {
     #[test]
     fn tui_error_keeps_the_typed_provider_failure_in_the_app_error_chain() {
         let app_error = AppError::from(carina_tui::TuiError::PlanDisplay(
-            ProviderError::internal_caused_by(
+            carina_core::provider::ProviderError::internal_caused_by(
                 "comparison resolution failed",
                 std::io::Error::other("typed leaf"),
-            ),
+            )
+            .into_host_for_test(),
         ));
 
         assert_eq!(app_error.to_string(), "Failed to prepare TUI plan details");
@@ -2133,7 +2136,7 @@ mod tests {
         let create = crate::dispatch_fixture_create(
             &id,
             crate::FixtureCreateResult::NotCreated {
-                error: ProviderError::api_error("create leaf"),
+                error: carina_core::provider::ProviderError::api_error("create leaf"),
             },
         );
         let error =

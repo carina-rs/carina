@@ -1,7 +1,7 @@
 use super::*;
 use carina_core::provider::{
     BoxFuture, CanonicalCustomTypeValue, CanonicalProviderConfigAttributes, InitializeOutcomeMint,
-    ProviderError, ProviderInitialization, ProviderReadyConfig, ProviderResult,
+    ProviderError, ProviderInitialization, ProviderResult,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, StructField, TypeIdentity,
@@ -33,13 +33,18 @@ impl ProviderFactory for WalkFactory {
         )
         .unwrap()
     }
-    fn validate_config(&self, _: &CanonicalProviderConfigAttributes) -> ProviderResult<()> {
+    fn validate_config(
+        &self,
+        _: &CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
+    ) -> ProviderResult<()> {
         Ok(())
     }
     fn validate_custom_type(
         &self,
         identity: &TypeIdentity,
         value: &CanonicalCustomTypeValue,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> ProviderResult<()> {
         if (identity.kind == "SubnetId" && value.as_str().starts_with("subnet-"))
             || (identity.kind == "VpcId" && value.as_str().starts_with("vpc-"))
@@ -54,8 +59,7 @@ impl ProviderFactory for WalkFactory {
     }
     fn create_provider(
         &self,
-        _: Option<&str>,
-        _: &ProviderReadyConfig,
+        _: &carina_core::provider::ProviderSession,
         _: InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { Err(ProviderError::internal("unused test factory")) })

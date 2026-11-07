@@ -5,6 +5,8 @@
 //! so normalization or identity resolution alone cannot cross the provider
 //! boundary without value-constraint validation.
 
+#[cfg(test)]
+use crate::provider::ProviderNormalizer;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Deref;
@@ -21,7 +23,7 @@ use crate::module_resolver::{
 };
 use crate::parser::{ProviderConfig, ResolvedProviderConfig};
 use crate::provider::{
-    CreateRequest, ProviderDirectives, ProviderFactory, ProviderNormalizer, ProviderWireError,
+    CreateRequest, HostNormalizer, ProviderDirectives, ProviderFactory, ProviderWireError,
     ProviderWireTarget, ResourceWirePayload, UpdateRequest, WireAttributes, WireReady,
 };
 use crate::resource::{
@@ -69,6 +71,9 @@ use crate::value::SerializationError;
 pub struct ProviderReady<T: ResourceWirePayload> {
     value: WireReady<T>,
     directives: ProviderDirectives,
+    // The same sent values before dispatch removes secret annotations. Keep
+    // scalar/container provenance available only to the ingestion boundary.
+    diagnostic_attributes: IndexMap<String, Value>,
 }
 
 impl<T: ResourceWirePayload> ProviderReady<T> {
@@ -77,6 +82,7 @@ impl<T: ResourceWirePayload> ProviderReady<T> {
             '_,
             (T, ProviderDirectives),
         >,
+        diagnostic_attributes: IndexMap<String, Value>,
     ) -> Result<Self, ProviderPreparationError> {
         let mut diagnostics = Vec::new();
         let (value, directives) = pending.publish(&mut diagnostics)?;
@@ -86,14 +92,62 @@ impl<T: ResourceWirePayload> ProviderReady<T> {
                 | crate::validation::deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(warning) => warning.into_warning().message,
             }).collect::<Vec<_>>();
             return Err(ProviderPreparationError::Provider(
-                crate::provider::ProviderError::invalid_input(messages.join("\n")),
+                crate::provider::HostError::invalid_input(messages.join("\n")),
             ));
         }
         let target = ProviderWireTarget::Resource(value.resource_id().clone());
         Ok(Self {
             value: WireReady::try_new(value, target)?,
             directives,
+            diagnostic_attributes,
         })
+    }
+
+    pub(crate) fn diagnostic_values(&self) -> impl Iterator<Item = &Value> {
+        self.diagnostic_attributes.values()
+    }
+    pub(crate) fn diagnostic_value(&self, key: &str, sent: &Value) -> Value {
+        fn annotate(sent: &Value, source: &Value) -> Value {
+            use crate::resource::{ConcreteValue, DeferredValue};
+            match (sent, source) {
+                (_, Value::Deferred(DeferredValue::Secret(_))) => sent.clone().into_secret(),
+                (
+                    Value::Concrete(ConcreteValue::Map(values)),
+                    Value::Concrete(ConcreteValue::Map(source)),
+                ) => Value::Concrete(ConcreteValue::Map(
+                    values
+                        .iter()
+                        .map(|(key, value)| {
+                            (
+                                key.clone(),
+                                source.get(key).map_or_else(
+                                    || value.clone(),
+                                    |source| annotate(value, source),
+                                ),
+                            )
+                        })
+                        .collect(),
+                )),
+                (
+                    Value::Concrete(ConcreteValue::List(values)),
+                    Value::Concrete(ConcreteValue::List(source)),
+                ) => Value::Concrete(ConcreteValue::List(
+                    values
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            source
+                                .get(index)
+                                .map_or_else(|| value.clone(), |source| annotate(value, source))
+                        })
+                        .collect(),
+                )),
+                _ => sent.clone(),
+            }
+        }
+        self.diagnostic_attributes
+            .get(key)
+            .map_or_else(|| sent.clone(), |source| annotate(sent, source))
     }
 
     /// Borrow the checked payload.
@@ -219,7 +273,7 @@ pub struct ProviderPreparationContext<'a> {
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
     >],
-    normalizer: &'a dyn ProviderNormalizer,
+    normalizer: &'a dyn HostNormalizer,
     custom_type_resolver:
         crate::provider::FactoryCustomTypeResolver<&'a [Box<dyn ProviderFactory>]>,
     type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
@@ -234,7 +288,7 @@ impl<'a> ProviderPreparationContext<'a> {
             crate::resource::NoPlaceholder,
             crate::resource::AbsoluteBindingAddress,
         >],
-        normalizer: &'a dyn ProviderNormalizer,
+        normalizer: &'a dyn HostNormalizer,
         factories: &'a [Box<dyn ProviderFactory>],
         schemas: &'a SchemaRegistry,
         type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
@@ -538,7 +592,7 @@ pub enum ProviderPreparationError {
     UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
     /// Provider-specific normalization failed before dispatch.
     #[error("{0}")]
-    Provider(crate::provider::ProviderError),
+    Provider(crate::provider::HostError),
 }
 
 impl From<crate::provider::UpdatePatchError> for ProviderPreparationError {
@@ -566,8 +620,8 @@ impl From<crate::resource::ResolvedResourceError> for ProviderPreparationError {
     }
 }
 
-impl From<crate::provider::ProviderError> for ProviderPreparationError {
-    fn from(error: crate::provider::ProviderError) -> Self {
+impl From<crate::provider::HostError> for ProviderPreparationError {
+    fn from(error: crate::provider::HostError) -> Self {
         Self::Provider(error)
     }
 }
@@ -585,11 +639,11 @@ impl From<crate::value::EnumCanonicalizationError> for ProviderPreparationError 
 #[derive(Debug, Error)]
 #[error("{error}")]
 pub struct ProviderConfigValidationError {
-    error: crate::provider::ProviderError,
+    error: crate::provider::HostError,
 }
 
 impl ProviderConfigValidationError {
-    pub fn provider_error(&self) -> &crate::provider::ProviderError {
+    pub fn provider_error(&self) -> &crate::provider::HostError {
         &self.error
     }
 }
@@ -621,6 +675,16 @@ impl From<ProviderWireError> for ProviderConfigPreparationError {
     }
 }
 
+impl From<ProviderConfigPreparationError> for crate::provider::HostError {
+    fn from(error: ProviderConfigPreparationError) -> Self {
+        Self::from_diagnostic(
+            crate::provider::ProviderErrorKind::Internal,
+            "Failed to prepare provider configuration",
+            crate::provider_text::HostDiagnostic::capture_host_or_provider(error),
+        )
+    }
+}
+
 impl ProviderConfigPreparationError {
     /// Attribute responsible for a host-side type/canonicalization failure.
     pub fn attribute(&self) -> Option<&str> {
@@ -632,7 +696,7 @@ impl ProviderConfigPreparationError {
     }
 
     /// Typed provider failure when provider-specific validation was reached.
-    pub fn provider_error(&self) -> Option<&crate::provider::ProviderError> {
+    pub fn provider_error(&self) -> Option<&crate::provider::HostError> {
         match self {
             Self::Wire(_) => None,
             Self::InvalidAttribute { .. } => None,
@@ -674,17 +738,22 @@ fn validate_canonical_provider_config(
         },
     )?;
     let canonical = CanonicalProviderConfigAttributes { attributes };
-    factory.validate_config(&canonical).map_err(|error| {
-        let error = if canonical.values().any(crate::value::contains_secret) {
-            error.with_redacted_message("configuration containing a secret failed validation")
-        } else {
-            error
-        };
-        ProviderConfigPreparationError::ProviderValidation {
-            provider: provider_name.to_string(),
-            error: ProviderConfigValidationError { error },
-        }
-    })?;
+    let session = crate::provider::ProviderValidationInputs::collect(canonical.values());
+    factory
+        .validate_config(&canonical, &session)
+        .map_err(|error| {
+            let error = if canonical.values().any(crate::value::contains_secret) {
+                error.with_redacted_message("configuration containing a secret failed validation")
+            } else {
+                error
+            };
+            ProviderConfigPreparationError::ProviderValidation {
+                provider: provider_name.to_string(),
+                error: ProviderConfigValidationError {
+                    error: error.with_secrets(session.redaction_set()),
+                },
+            }
+        })?;
     Ok(canonical)
 }
 
@@ -948,6 +1017,7 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
         resource.clone(),
         ProviderWireTarget::Resource(resource.id.clone()),
     )?;
+    let diagnostic_attributes = resource.as_resource().attributes.clone();
     let mut resource = resource.into_inner();
     restored.remove(&mut resource.attributes);
     let resource = ResolvedResource::resolve_with_schemas(resource, context.schemas)?;
@@ -956,7 +1026,10 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
         SchemaKind::Resource,
         &resource.as_resource().directives,
     );
-    ProviderReady::settled(context.type_checks.pending((resource, directives)))
+    ProviderReady::settled(
+        context.type_checks.pending((resource, directives)),
+        diagnostic_attributes,
+    )
 }
 
 /// Validate and prepare a data source for provider dispatch.
@@ -1024,6 +1097,7 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
         crate::resource::assert_value_fully_resolved(value)?;
     }
     let mut value = value.into_provider_data_source();
+    let diagnostic_attributes = value.attributes.clone();
     let protected = ResolvedDataSource::new(value.clone());
     WireReady::try_new(protected, ProviderWireTarget::Resource(value.id.clone()))?;
     for attribute in value.attributes.values_mut() {
@@ -1035,7 +1109,10 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
         SchemaKind::DataSource,
         &value.as_inner().directives,
     );
-    ProviderReady::settled(context.type_checks.pending((value, directives)))
+    ProviderReady::settled(
+        context.type_checks.pending((value, directives)),
+        diagnostic_attributes,
+    )
 }
 
 /// Prepare a checked create request through the provider-boundary gate.
@@ -1329,6 +1406,7 @@ mod provider_config_tests {
         fn validate_config(
             &self,
             attributes: &CanonicalProviderConfigAttributes,
+            _session: &crate::provider::ProviderValidationInputs,
         ) -> crate::provider::ProviderResult<()> {
             match attributes.get("region") {
                 Some(Value::Concrete(ConcreteValue::CanonicalEnum(value)))
@@ -1344,8 +1422,7 @@ mod provider_config_tests {
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &ProviderReadyConfig,
+            _config: &crate::provider::ProviderSession,
             _initialize_outcome: crate::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("config preparation tests do not create providers")
@@ -1612,11 +1689,13 @@ mod provider_config_tests {
         crate::validation::deferred_types::with_session_for_test_async(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             async |type_checks| {
+                let normalizer_boundary =
+                    crate::provider::ConfiguredNormalizer::fixture(&DefaultingNormalizer);
                 let context = ProviderPreparationContext::new(
                     &bindings,
                     &module_gate,
                     &[],
-                    &DefaultingNormalizer,
+                    &normalizer_boundary,
                     &factories,
                     &schemas,
                     type_checks,
@@ -1676,6 +1755,7 @@ mod provider_config_tests {
         fn validate_config(
             &self,
             _attributes: &CanonicalProviderConfigAttributes,
+            _session: &crate::provider::ProviderValidationInputs,
         ) -> ProviderResult<()> {
             Ok(())
         }
@@ -1684,6 +1764,7 @@ mod provider_config_tests {
             &self,
             _identity: &TypeIdentity,
             value: &crate::provider::CanonicalCustomTypeValue,
+            _session: &crate::provider::ProviderValidationInputs,
         ) -> ProviderResult<()> {
             self.validate_calls.fetch_add(1, Ordering::SeqCst);
             if let Some(seen_values) = &self.seen_values {
@@ -1703,8 +1784,7 @@ mod provider_config_tests {
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &ProviderReadyConfig,
+            _config: &crate::provider::ProviderSession,
             _initialize_outcome: crate::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("routing tests do not create providers")
@@ -2525,6 +2605,7 @@ mod provider_config_tests {
         fn validate_config(
             &self,
             _attributes: &CanonicalProviderConfigAttributes,
+            _session: &crate::provider::ProviderValidationInputs,
         ) -> ProviderResult<()> {
             Ok(())
         }
@@ -2533,6 +2614,7 @@ mod provider_config_tests {
             &self,
             _identity: &TypeIdentity,
             value: &crate::provider::CanonicalCustomTypeValue,
+            _session: &crate::provider::ProviderValidationInputs,
         ) -> ProviderResult<()> {
             self.validate_calls.fetch_add(1, Ordering::SeqCst);
             if value.as_str() == "valid" {
@@ -2544,8 +2626,7 @@ mod provider_config_tests {
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &ProviderReadyConfig,
+            _config: &crate::provider::ProviderSession,
             _initialize_outcome: crate::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("config preparation tests do not create providers")
@@ -2653,6 +2734,7 @@ mod provider_config_tests {
         fn validate_config(
             &self,
             _attributes: &CanonicalProviderConfigAttributes,
+            _session: &crate::provider::ProviderValidationInputs,
         ) -> crate::provider::ProviderResult<()> {
             self.validate_calls.fetch_add(1, Ordering::SeqCst);
             match self.plugin_error {
@@ -2667,8 +2749,7 @@ mod provider_config_tests {
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &ProviderReadyConfig,
+            _config: &crate::provider::ProviderSession,
             _initialize_outcome: crate::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>> {
             unreachable!("config preparation tests do not create providers")
@@ -2776,14 +2857,14 @@ mod provider_config_tests {
             fn validate_config(
                 &self,
                 _attributes: &CanonicalProviderConfigAttributes,
+                _session: &crate::provider::ProviderValidationInputs,
             ) -> ProviderResult<()> {
                 Ok(())
             }
 
             fn create_provider(
                 &self,
-                _binding: Option<&str>,
-                _config: &ProviderReadyConfig,
+                _config: &crate::provider::ProviderSession,
                 _initialize_outcome: crate::provider::InitializeOutcomeMint,
             ) -> BoxFuture<'_, ProviderResult<crate::provider::ProviderInitialization>>
             {

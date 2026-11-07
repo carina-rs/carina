@@ -1,7 +1,7 @@
 use super::*;
 use crate::provider::{
     BoxFuture, CanonicalProviderConfigAttributes, InitializeOutcomeMint, LoadedProviderSnapshot,
-    ProviderInitialization, ProviderReadyConfig, ProviderResult,
+    ProviderInitialization, ProviderResult,
 };
 use crate::schema::{
     AttributeSchema, AttributeType as DraftType, RawShape, ResourceSchema, SchemaKind,
@@ -28,13 +28,16 @@ impl ProviderFactory for Factory {
     fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
         ValidatedConfigSchema::validate(self.config.clone()).unwrap()
     }
-    fn validate_config(&self, _: &CanonicalProviderConfigAttributes) -> ProviderResult<()> {
+    fn validate_config(
+        &self,
+        _: &CanonicalProviderConfigAttributes,
+        _session: &crate::provider::ProviderValidationInputs,
+    ) -> ProviderResult<()> {
         Ok(())
     }
     fn create_provider(
         &self,
-        _: Option<&str>,
-        _: &ProviderReadyConfig,
+        _: &crate::provider::ProviderSession,
         _: InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { panic!("annotation fixtures only validate") })

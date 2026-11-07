@@ -210,7 +210,7 @@ pub fn detect_moved_block_hints<S>(
     prior: &HashMap<ResourceId, Current>,
     schemas: &SchemaRegistry,
     comparison_provider: &ProviderRouter,
-) -> carina_core::provider::ProviderResult<MovedBlockHints> {
+) -> carina_core::provider::HostResult<MovedBlockHints> {
     let mut replacement_creates = HashSet::new();
     let mut replacement_deletes = HashSet::new();
     for replacement in plan.replace_display_info() {

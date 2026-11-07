@@ -142,7 +142,7 @@ pub enum PlanErrorKind {
     },
     WaitPredicateInvalid {
         wait_binding: String,
-        reason: crate::provider_text::ProviderText,
+        reason: crate::provider_text::DiagnosticText,
     },
     /// A schema value constraint failed after one or more authored
     /// references became known.
@@ -152,7 +152,7 @@ pub enum PlanErrorKind {
         /// Authored reference paths that supplied the newly known values.
         origins: Vec<String>,
         /// Schema or provider-validator diagnostic.
-        message: crate::provider_text::ProviderText,
+        message: crate::provider_text::DiagnosticText,
     },
     /// An update would have to resend an ignored write-only value that the
     /// provider cannot return on read.
@@ -327,7 +327,7 @@ impl PlanErrorKind {
             }
         }
         std::fmt::Display::fmt(
-            &crate::provider_text::ProviderText::new(
+            &crate::provider_text::DiagnosticText::new(
                 Context {
                     kind: self,
                     project_dir,
@@ -394,7 +394,7 @@ impl PlanErrorKind {
                     write!(
                         f,
                         ", then add an `import` block with provider identifier `{}` to restore management of the healthy current instance",
-                        crate::provider_text::ProviderText::new(identifier.as_str())
+                        crate::provider_text::DiagnosticText::new(identifier.as_str())
                     )?;
                 }
                 Ok(())
@@ -1490,6 +1490,26 @@ impl PlanSummary {
 impl std::fmt::Display for PlanSummary {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.render_line())
+    }
+}
+
+#[cfg(test)]
+impl<S> Plan<S> {
+    /// Core executor fixtures retain their whole input plan here.
+    pub(crate) fn provider_plan(&self) -> crate::provider::ProviderPlan {
+        let mut plan = crate::provider::ProviderPlan::state_only();
+        for effect in self.effects() {
+            match effect.as_resource_ref() {
+                Some(crate::parser::ResourceRef::Resource(resource)) => {
+                    plan.include(&resource.id, resource.attributes.values())
+                }
+                Some(crate::parser::ResourceRef::DataSource(source)) => {
+                    plan.include(&source.id, source.attributes.values())
+                }
+                _ => {}
+            }
+        }
+        plan
     }
 }
 

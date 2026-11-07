@@ -183,14 +183,14 @@ impl ProviderFactory for EvidenceTestFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
@@ -558,8 +558,9 @@ async fn ignored_write_only_parent_is_not_in_sent_attributes_and_writeback_keeps
         )
         .expect("non-empty applied identifier"),
     );
+    let provider = std::sync::Arc::new(provider);
     let outcome = carina_core::executor::execute_live_plan_for_test(
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         LiveExecutionInput {
             provider_context: carina_core::parser::ProviderContext::clone(
                 &carina_core::parser::LoadedProviderContext::empty_for_test(),
@@ -652,6 +653,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
         )
         .with_identifier(identifier),
     );
+    let provider = std::sync::Arc::new(provider);
 
     let mut pending_refreshes = HashMap::new();
     let pending_identifier =
@@ -659,7 +661,7 @@ async fn refresh_pending_states_updates_saved_state_from_provider_read() {
     queue_state_refresh(&mut pending_refreshes, &id, &pending_identifier);
     let failed_refreshes = refresh_pending_states(
         color_mode,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         &mut current_states,
         &pending_refreshes,
     )
@@ -727,6 +729,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
         identifier,
         State::<carina_core::resource::NoPlaceholder>::not_found(id.clone()),
     );
+    let provider = std::sync::Arc::new(provider);
 
     let mut pending_refreshes = HashMap::new();
     let pending_identifier =
@@ -734,7 +737,7 @@ async fn refresh_pending_states_removes_not_found_resource_from_saved_state() {
     queue_state_refresh(&mut pending_refreshes, &id, &pending_identifier);
     let failed_refreshes = refresh_pending_states(
         color_mode,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         &mut current_states,
         &pending_refreshes,
     )
@@ -789,6 +792,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
         ),
     )]);
     let provider = TestProvider::with_read_error(&id, identifier, "read failed");
+    let provider = std::sync::Arc::new(provider);
 
     let mut pending_refreshes = HashMap::new();
     let pending_identifier =
@@ -796,7 +800,7 @@ async fn refresh_pending_states_does_not_overwrite_with_stale_snapshot_when_refr
     queue_state_refresh(&mut pending_refreshes, &id, &pending_identifier);
     let failed_refreshes = refresh_pending_states(
         color_mode,
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         &mut current_states,
         &pending_refreshes,
     )
@@ -1935,6 +1939,7 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
         "",
         State::<carina_core::resource::NoPlaceholder>::not_found(id.clone()),
     );
+    let provider = std::sync::Arc::new(provider);
 
     // planned_states is empty - resource is missing
     let planned_states = Vec::new();
@@ -1944,7 +1949,7 @@ async fn detect_drift_errors_when_resource_missing_from_planned_states() {
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         None,
         &carina_core::schema::SchemaRegistry::new(),
         ApplyTarget::Project(std::path::Path::new(".")),
@@ -1980,6 +1985,8 @@ async fn detect_drift_returns_none_when_no_drift() {
     .with_identifier(identifier);
 
     let provider = TestProvider::with_read_state(&id, identifier, state.clone());
+
+    let provider = std::sync::Arc::new(provider);
     let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), state)];
 
     let result = detect_drift_for_test(
@@ -1987,7 +1994,7 @@ async fn detect_drift_returns_none_when_no_drift() {
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         None,
         &carina_core::schema::SchemaRegistry::new(),
         ApplyTarget::Project(std::path::Path::new(".")),
@@ -2042,6 +2049,7 @@ async fn detect_drift_treats_empty_non_marker_struct_and_absent_as_equal() {
             State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), actual_attributes)
                 .with_identifier(identifier);
         let provider = TestProvider::with_read_state(&id, identifier, actual);
+        let provider = std::sync::Arc::new(provider);
         let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), planned)];
 
         let result = detect_drift_for_test(
@@ -2049,7 +2057,7 @@ async fn detect_drift_treats_empty_non_marker_struct_and_absent_as_equal() {
             std::slice::from_ref(&resource),
             &planned_states,
             &MovedOrigins::from_plan(&Plan::new()),
-            &provider,
+            &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
             None,
             &schemas,
             ApplyTarget::Project(std::path::Path::new(".")),
@@ -2098,13 +2106,14 @@ async fn detect_drift_ignores_top_level_attribute_added_after_plan() {
     )
     .with_identifier(identifier);
     let provider = TestProvider::with_read_state(&id, identifier, actual);
+    let provider = std::sync::Arc::new(provider);
 
     let result = detect_drift_for_test(
         color_mode,
         &[resource],
         &[ReloadedCurrentStateEntry::managed(id, planned)],
         &MovedOrigins::from_plan(&Plan::new()),
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         None,
         &schemas,
         ApplyTarget::Project(std::path::Path::new(".")),
@@ -2118,7 +2127,7 @@ async fn detect_drift_ignores_top_level_attribute_added_after_plan() {
 #[tokio::test]
 async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
     let color_mode = crate::output_style::ColorMode::Plain;
-    use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
+    use carina_core::provider::{ProviderRouter, ReferenceScope};
     use carina_core::schema::{
         ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
         ValidatedProviderSchemaWitness,
@@ -2177,7 +2186,7 @@ async fn detect_drift_accepts_reference_form_equivalent_name_and_local_arn() {
     let mut provider = ProviderRouter::new();
     provider.add_provider(
         "aws".to_string(),
-        InitializedProvider::for_test(
+        crate::provider_text_fixtures::initialized_with_scope(
             Box::new(TestProvider::with_read_state(&id, identifier, actual)),
             ReferenceScope::available("aws", "us-east-1", "123456789012")
                 .expect("fixture scope is valid"),
@@ -2255,6 +2264,7 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
         )
         .with_identifier(identifier),
     );
+    let provider = std::sync::Arc::new(provider);
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
@@ -2276,7 +2286,7 @@ async fn detect_drift_restores_legacy_unlisted_write_only_secret_from_state_file
         &[resource],
         &[ReloadedCurrentStateEntry::managed(id.clone(), planned)],
         &MovedOrigins::from_plan(&Plan::new()),
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         Some(&state_file),
         &schemas,
         ApplyTarget::Project(std::path::Path::new(".")),
@@ -2300,6 +2310,7 @@ async fn detect_drift_uses_identifier_carried_by_present_current() {
         State::<carina_core::resource::NoPlaceholder>::existing(id.clone(), HashMap::new())
             .with_identifier("typed-provider-id");
     let provider = TestProvider::with_read_state(&id, "typed-provider-id", actual);
+    let provider = std::sync::Arc::new(provider);
     let planned_states = vec![ReloadedCurrentStateEntry::managed_current(
         id.clone(),
         carina_core::resource::fixture_present_current(planned, identifier),
@@ -2310,7 +2321,7 @@ async fn detect_drift_uses_identifier_carried_by_present_current() {
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         None,
         &carina_core::schema::SchemaRegistry::new(),
         ApplyTarget::Project(std::path::Path::new(".")),
@@ -2348,6 +2359,8 @@ async fn detect_drift_returns_messages_when_drift_detected() {
     .with_identifier(identifier);
 
     let provider = TestProvider::with_read_state(&id, identifier, actual);
+
+    let provider = std::sync::Arc::new(provider);
     let planned_states = vec![ReloadedCurrentStateEntry::managed(id.clone(), planned)];
 
     let result = detect_drift_for_test(
@@ -2355,7 +2368,7 @@ async fn detect_drift_returns_messages_when_drift_detected() {
         &[resource],
         &planned_states,
         &MovedOrigins::from_plan(&Plan::new()),
-        &provider,
+        &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider))),
         None,
         &carina_core::schema::SchemaRegistry::new(),
         ApplyTarget::Project(std::path::Path::new(".")),

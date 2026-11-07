@@ -1,5 +1,8 @@
 //! Tests for WasmProviderFactory precompile cache functionality.
 
+#[path = "../../carina-core/tests/support/provider_text.rs"]
+mod provider_text_fixtures;
+use provider_text_fixtures::InitializeFixture;
 use std::path::{Path, PathBuf};
 
 use carina_core::UserDirs;
@@ -584,7 +587,7 @@ async fn precompiled_factory_is_schema_only() {
     let resolved = resolved.provider_or_implicit(factory.name());
     let config = carina_core::executor::prepare_provider_ready_config(&factory, resolved.as_ref())
         .expect("test provider config should pass preparation");
-    let error = match factory.create_initialized_provider(None, &config).await {
+    let error = match factory.initialize_fixture(None, &config).await {
         Ok(_) => panic!("a schema-only precompiled factory must reject runtime creation"),
         Err(error) => error,
     };

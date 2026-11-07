@@ -21,8 +21,8 @@ use carina_core::plan::{
     CreateOutcomeUnknownAbsentResolution, create_outcome_unknown_absent_resolution,
 };
 use carina_core::provider::{
-    self as provider_mod, AppliedIdentifier, InFlightCreate, PersistedAttributes, Provider,
-    ProviderError, ProviderNormalizer, ProviderRouter, RawSavedAttrs, UnknownCreateOutcome,
+    self as provider_mod, AppliedIdentifier, HostError, HostNormalizer, HostProvider,
+    InFlightCreate, PersistedAttributes, ProviderRouter, RawSavedAttrs, UnknownCreateOutcome,
 };
 use carina_core::resource::{
     AbsoluteBindingAddress, Current, DataSource, ResolvedDataSource, ResolvedResource,
@@ -552,7 +552,7 @@ fn format_state_forget_target(
         lines.extend(row.deposed.iter().map(|deposed| {
             format!(
                 "  - identifier `{}` (generation `{}`, provider instance `{}`)",
-                carina_core::provider_text::ProviderText::new(&deposed.identifier),
+                carina_core::provider_text::DiagnosticText::new(&deposed.identifier),
                 deposed.key,
                 deposed.provider_instance.as_deref().unwrap_or("default")
             )
@@ -1011,7 +1011,7 @@ fn format_state_list(state: &StateFile) -> Vec<String> {
 }
 
 fn deposed_state_marker(key: &DeposedKey, identifier: &str) -> String {
-    carina_core::provider_text::ProviderText::new(format!("(deposed {key} {identifier})"))
+    carina_core::provider_text::DiagnosticText::new(format!("(deposed {key} {identifier})"))
         .to_string()
 }
 
@@ -1572,6 +1572,7 @@ async fn run_state_bucket_delete(
         &validated_config,
         provider_inputs.configs(),
         provider_name,
+        validated_config.provider_plan(),
     )
     .await?;
 
@@ -1660,15 +1661,18 @@ async fn create_state_bucket_delete_provider<R>(
     validated_config: &ValidatedConfig<R>,
     provider_configs: &carina_core::parser::ResolvedProviderConfigs,
     provider_name: &str,
+    plan: &provider_mod::ProviderPlan,
 ) -> Result<carina_core::provider::InitializedProvider, AppError> {
     let ctx = validated_config.context();
     let factory = provider_mod::find_factory(ctx.factories(), provider_name)
         .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
     let config = prepare_default_provider_ready_config(factory, provider_name, provider_configs)?;
-    factory
-        .create_initialized_provider(None, &config)
-        .await
-        .map_err(AppError::Provider)
+    provider_mod::ProviderBoundary::initialize(
+        factory,
+        &plan.session(provider_name, None, Some(&config)),
+    )
+    .await
+    .map_err(AppError::Provider)
 }
 
 /// Run state refresh command
@@ -1808,8 +1812,13 @@ pub(crate) async fn run_state_refresh_locked(
     let sorted_resources = expansion_prelude.sorted_resources();
 
     // Select provider
-    let provider =
-        get_provider_with_ctx(ctx, provider_inputs.configs(), ProgressSink::Human).await?;
+    let provider = get_provider_with_ctx(
+        ctx,
+        provider_inputs.configs(),
+        ProgressSink::Human,
+        validated_config.provider_plan(),
+    )
+    .await?;
 
     println!();
     let progress = ProgressBackend::new(color_mode, ProgressSink::Human);
@@ -2318,7 +2327,7 @@ fn format_state_refresh_summary(
 
 async fn refresh_existing_resources_until_cancelled(
     #[cfg(test)] runtime: &crate::runtime::CommandRuntime,
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     reads: Vec<carina_state::RefreshTarget>,
     cancel: &ShutdownToken,
 ) -> Result<(HashMap<ResourceId, Current>, HashSet<ResourceId>), AppError> {
@@ -2424,7 +2433,7 @@ async fn refresh_existing_resources_until_cancelled(
 
 async fn refresh_orphans_until_cancelled(
     #[cfg(test)] runtime: &crate::runtime::CommandRuntime,
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     loaded: carina_state::RefreshableOrphans,
     state_file: Option<&StateFile>,
     schemas: &carina_core::schema::SchemaRegistry,
@@ -2558,7 +2567,7 @@ async fn refresh_deposed_generations_until_cancelled<P>(
     cancel: &ShutdownToken,
 ) -> Result<DeposedRefreshSummary, AppError>
 where
-    P: Provider + ProviderNormalizer + ?Sized,
+    P: HostProvider + HostNormalizer + ?Sized,
 {
     let targets: Vec<_> = refresh_rows.deposed_targets(state).collect();
     let mut summary = DeposedRefreshSummary {
@@ -2743,13 +2752,13 @@ async fn normalize_deposed_read_state<P>(
     resource: &ResolvedResource,
     fresh_state: &mut SnapshotState,
     schemas: &carina_core::schema::SchemaRegistry,
-) -> Result<(), ProviderError>
+) -> Result<(), HostError>
 where
-    P: ProviderNormalizer + ?Sized,
+    P: HostNormalizer + ?Sized,
 {
     let mut states = HashMap::from([(target.id().as_inner().clone(), fresh_state.clone())]);
     let saved_attrs = deposed_saved_attrs(target).lift(schemas);
-    carina_core::provider::hydrate_provider_states(
+    carina_core::provider::hydrate_host_provider_states(
         provider,
         &mut states,
         saved_attrs.as_provider_saved_attrs(),
@@ -3033,6 +3042,7 @@ fn diff_display_update_resource(
 
 #[cfg(test)]
 mod tests {
+    use carina_core::provider::{Provider, ProviderNormalizer};
     #[test]
     fn provider_text_state_attribute_display_sanitizes_keys_and_enum_values() {
         let raw = format!("\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
@@ -3165,7 +3175,7 @@ mod tests {
     #[test]
     fn state_refresh_counts_reference_form_equivalent_value_as_unchanged() {
         let color_mode = crate::output_style::ColorMode::Plain;
-        use carina_core::provider::{InitializedProvider, ProviderRouter, ReferenceScope};
+        use carina_core::provider::{ProviderRouter, ReferenceScope};
         use carina_core::schema::{
             ReferenceForm, ReferenceForms, ReferenceTemplate, TypeIdentity, ValidatedConfigSchema,
             ValidatedProviderSchemaWitness,
@@ -3230,7 +3240,7 @@ mod tests {
         let mut provider = ProviderRouter::new();
         provider.add_provider(
             "aws".to_string(),
-            InitializedProvider::for_test(
+            crate::provider_text_fixtures::initialized_with_scope(
                 Box::new(
                     carina_provider_mock::ConfiguredBuiltinMock::new(
                         carina_provider_mock::MockBehavior::default(),
@@ -3613,9 +3623,14 @@ mod tests {
             })],
             inputs.configs().as_provider_configs(),
         );
-        create_state_bucket_delete_provider(&ctx, inputs.configs(), "test")
-            .await
-            .expect("state bucket delete must create from the resolved value");
+        create_state_bucket_delete_provider(
+            &ctx,
+            inputs.configs(),
+            "test",
+            &provider_mod::ProviderPlan::state_only(),
+        )
+        .await
+        .expect("state bucket delete must create from the resolved value");
 
         assert_eq!(
             received_role_arn.lock().unwrap().as_ref(),
@@ -3707,9 +3722,14 @@ mod tests {
             inputs.configs().as_provider_configs(),
         );
 
-        create_state_bucket_delete_provider(&ctx, inputs.configs(), "test")
-            .await
-            .expect("bucket delete must construct without resolving default tags");
+        create_state_bucket_delete_provider(
+            &ctx,
+            inputs.configs(),
+            "test",
+            &provider_mod::ProviderPlan::state_only(),
+        )
+        .await
+        .expect("bucket delete must construct without resolving default tags");
         assert_eq!(*received_role_arn.lock().unwrap(), None);
     }
 
@@ -3768,9 +3788,14 @@ mod tests {
             inputs.configs().as_provider_configs(),
         );
 
-        create_state_bucket_delete_provider(&ctx, inputs.configs(), "test")
-            .await
-            .expect("bucket delete must use the real prepared-provider path");
+        create_state_bucket_delete_provider(
+            &ctx,
+            inputs.configs(),
+            "test",
+            &provider_mod::ProviderPlan::state_only(),
+        )
+        .await
+        .expect("bucket delete must use the real prepared-provider path");
         assert_eq!(*received_role_arn.lock().unwrap(), None);
     }
 
@@ -3808,14 +3833,14 @@ mod tests {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             let reads = self.reads.clone();
@@ -3948,14 +3973,14 @@ mod tests {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             let reads = self.reads.clone();
@@ -5093,9 +5118,15 @@ mod tests {
         let provider = DeposedRefreshTestProvider::default()
             .with_saved_attr_hydration()
             .with_read_state(&child.id, "widget-1", refreshed);
+        let provider = std::sync::Arc::new(provider);
+        let provider_boundary = crate::provider_text_fixtures::boundary_with_components(
+            Box::new(std::sync::Arc::clone(&provider)),
+            Box::new(std::sync::Arc::clone(&provider)),
+            &schemas,
+        );
         let (orphans, already_refreshed) = refresh_orphans_until_cancelled(
             &crate::test_support::TestCommandRuntime::new(),
-            &provider,
+            &provider_boundary,
             carina_state::PreparedRows::from_state(
                 Some(&state_file),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -5149,7 +5180,7 @@ mod tests {
             );
         validated_config
             .expand_refresh_and_lift_states(crate::wiring::ValidatedExpandRefreshAndLiftInputs {
-                provider: &provider,
+                provider: &provider_boundary,
                 comparison_provider: &comparison_provider,
                 expansion: &mut prepared_expansion,
                 warning_policy: crate::wiring::DeferredForWarningPolicy::Suppress,
@@ -5854,11 +5885,14 @@ mod tests {
                 )
                 .with_identifier("vpc-alive"),
             );
+        let provider = std::sync::Arc::new(provider);
+        let provider_boundary =
+            crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
         let desired = Resource::with_provider("awscc", "ec2.Vpc", "main", None);
 
         let summary = refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -5933,10 +5967,13 @@ mod tests {
             "vpc-gone",
             State::<carina_core::resource::NoPlaceholder>::not_found(id.clone()),
         );
+        let provider = std::sync::Arc::new(provider);
+        let provider_boundary =
+            crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
 
         let summary = refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -5990,6 +6027,9 @@ mod tests {
             )
             .with_identifier("db-old"),
         );
+        let provider = std::sync::Arc::new(provider);
+        let provider_boundary =
+            crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None)
             .with_attribute("password", string_value("new-desired-password"));
         let mut schemas = SchemaRegistry::new();
@@ -6008,7 +6048,7 @@ mod tests {
 
         refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -6069,6 +6109,9 @@ mod tests {
             )
             .with_identifier("db-old"),
         );
+        let provider = std::sync::Arc::new(provider);
+        let provider_boundary =
+            crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None)
             .with_attribute("password", string_value("new-desired-password"));
         let mut schemas = SchemaRegistry::new();
@@ -6085,7 +6128,7 @@ mod tests {
 
         refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -6137,6 +6180,9 @@ mod tests {
             )
             .with_identifier("db-old"),
         );
+        let provider = std::sync::Arc::new(provider);
+        let provider_boundary =
+            crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
         let desired = Resource::with_provider("awscc", "db.Instance", "main", None).with_attribute(
             "password",
             Value::Deferred(DeferredValue::Secret(
@@ -6146,7 +6192,7 @@ mod tests {
 
         refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -6202,6 +6248,9 @@ mod tests {
             )
             .with_identifier("db-old"),
         );
+        let provider = std::sync::Arc::new(provider);
+        let provider_boundary =
+            crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "awscc",
@@ -6218,7 +6267,7 @@ mod tests {
 
         refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -6282,9 +6331,13 @@ mod tests {
             .with_identifier("db-old"),
         );
 
+        let provider = std::sync::Arc::new(provider);
+        let provider_boundary =
+            crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
+
         let summary = refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -6358,10 +6411,13 @@ mod tests {
             )
             .with_identifier("vpc-old"),
         );
+        let provider = std::sync::Arc::new(provider);
+        let provider_boundary =
+            crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
 
         refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -6389,7 +6445,7 @@ mod tests {
 
         refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -7461,10 +7517,23 @@ mod tests {
                 )
                 .with_identifier("db-old"),
             );
+        let provider = std::sync::Arc::new(provider);
+        let mut boundary_schemas = SchemaRegistry::new();
+        boundary_schemas.insert(
+            "awscc",
+            carina_core::schema::ResourceSchema::new("db.Instance")
+                .validate()
+                .unwrap(),
+        );
+        let provider_boundary = crate::provider_text_fixtures::boundary_with_components(
+            Box::new(std::sync::Arc::clone(&provider)),
+            Box::new(std::sync::Arc::clone(&provider)),
+            &boundary_schemas,
+        );
 
         let summary = refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -7551,11 +7620,14 @@ mod tests {
             )
             .with_identifier("widget-old"),
         );
+        let provider = std::sync::Arc::new(provider);
+        let provider_boundary =
+            crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
         let desired = Resource::with_provider("awscc", "service.Widget", "main", None);
 
         let first = refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -7591,7 +7663,7 @@ mod tests {
 
         let second = refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -7653,6 +7725,9 @@ mod tests {
             )
             .with_identifier("db-old"),
         );
+        let provider = std::sync::Arc::new(provider);
+        let provider_boundary =
+            crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
         let wrong_instance =
             Resource::with_provider("awscc", "db.Instance", "main", Some("east".to_string()))
                 .with_attribute(
@@ -7666,7 +7741,7 @@ mod tests {
 
         refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),
@@ -7712,10 +7787,13 @@ mod tests {
         let id = ResourceId::with_provider_identity("awscc", "ec2.Vpc", "main", None);
         let provider =
             DeposedRefreshTestProvider::default().with_read_error(&id, "vpc-old", "read failed");
+        let provider = std::sync::Arc::new(provider);
+        let provider_boundary =
+            crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&provider)));
 
         let summary = refresh_deposed_generations_until_cancelled(
             color_mode,
-            &provider,
+            &provider_boundary,
             &carina_state::PreparedRows::from_state(
                 Some(&state),
                 &carina_state::ResolvedRemovedClaims::resolve(&[], None),

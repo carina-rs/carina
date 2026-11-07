@@ -97,6 +97,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: bash scripts/check-provider-boundaries.sh
+      - run: bash scripts/check-wit-guest-text-confinement.sh
 
   error-source-display:
     name: Error Source Display Check

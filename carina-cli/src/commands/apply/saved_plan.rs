@@ -9,7 +9,7 @@ use carina_core::parser::{
 };
 use carina_core::plan::Plan;
 type ExecutableSavedPlan = Plan<SavedModuleSource>;
-use carina_core::provider::{PersistedAttributes, Provider, ProviderRouter, ReadRequest};
+use carina_core::provider::{HostProvider, PersistedAttributes, ProviderRouter, ReadRequest};
 use carina_core::resource::{
     Current, DataSource, NoPlaceholder, ResolvedResourceId, Resource, ResourceId, SavedComposition,
     SavedDataSource, SavedModuleSource, SavedResource, SnapshotLeaf, SnapshotState as State, Value,
@@ -77,7 +77,7 @@ fn planned_secret_hashes<D>(
 pub(crate) type HistoricalResourceAddresses = MovedOrigins;
 
 struct HistoricalStateVerifier<'a> {
-    provider: &'a dyn Provider,
+    provider: &'a dyn HostProvider,
     actual_states: &'a mut HashMap<ResourceId, State>,
     verified_planned_states: &'a mut HashMap<ResourceId, State>,
     apply_target: ApplyTarget<'a>,
@@ -755,6 +755,13 @@ impl ValidatedDesiredPlan {
         self.plan.provider_configs()
     }
 
+    pub(super) fn provider_plan(&self) -> carina_core::provider::ProviderPlan {
+        match &self.plan {
+            DesiredPlanFile::Verified(plan) => plan.plan_file.provider_plan(),
+            DesiredPlanFile::NeedsHistoricalVerification(plan) => plan.plan_file.provider_plan(),
+        }
+    }
+
     pub(super) fn sorted_resources(&self) -> &[SavedPlanResource] {
         self.plan.sorted_resources()
     }
@@ -785,7 +792,7 @@ impl ValidatedDesiredPlan {
 
     async fn verify_historical(
         self,
-        provider: &dyn Provider,
+        provider: &dyn HostProvider,
         actual_states: &mut HashMap<ResourceId, State>,
         verified_planned_states: &mut HashMap<ResourceId, State>,
         historical_addresses: &HistoricalResourceAddresses,
@@ -934,7 +941,7 @@ impl DesiredPlanFile {
     /// saved-plan capability while retaining the schema-check proof.
     pub(super) async fn verify_historical(
         self,
-        provider: &dyn Provider,
+        provider: &dyn HostProvider,
         actual_states: &mut HashMap<ResourceId, State>,
         verified_planned_states: &mut HashMap<ResourceId, State>,
         historical_addresses: &HistoricalResourceAddresses,
@@ -985,7 +992,7 @@ impl DesiredVerifiedPlanFile {
     /// return the rehydrated payload to the outer executor-gate transition.
     async fn verify_historical(
         mut self,
-        provider: &dyn Provider,
+        provider: &dyn HostProvider,
         actual_states: &mut HashMap<ResourceId, State>,
         verified_planned_states: &mut HashMap<ResourceId, State>,
         historical_addresses: &HistoricalResourceAddresses,
@@ -1208,8 +1215,8 @@ mod tests {
     use carina_core::parser::{ExpandedProviderConfig, ProviderConfig};
     use carina_core::plan::Plan;
     use carina_core::provider::{
-        BoxFuture, InitializedProvider, ProviderFactory, ProviderInstanceKey, ProviderResult,
-        ProviderRouter, ReferenceScope,
+        BoxFuture, ProviderFactory, ProviderInstanceKey, ProviderResult, ProviderRouter,
+        ReferenceScope,
     };
     use carina_core::resource::{
         BindingAddress, ConcreteValue, Current, DataSource, DeferredValue, NoPlaceholder,
@@ -1252,14 +1259,14 @@ mod tests {
         fn validate_config(
             &self,
             _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _binding: Option<&str>,
-            _config: &carina_core::provider::ProviderReadyConfig,
+            _config: &carina_core::provider::ProviderSession,
             _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
             Box::pin(async {
@@ -1430,7 +1437,7 @@ mod tests {
         for (binding, scope) in scopes {
             provider.add_provider_instance(
                 ProviderInstanceKey::new("test", Some(binding.to_string())),
-                InitializedProvider::for_test(
+                crate::provider_text_fixtures::initialized_with_scope(
                     Box::new(
                         carina_provider_mock::ConfiguredBuiltinMock::new(
                             carina_provider_mock::MockBehavior::default(),
@@ -2009,11 +2016,13 @@ mod tests {
 
         let rehydrated = pending
             .verify_historical(
-                &carina_provider_mock::ConfiguredBuiltinMock::new(
-                    carina_provider_mock::MockBehavior::default(),
-                    carina_provider_mock::MockScope::memory(),
-                )
-                .create_provider(),
+                &crate::provider_text_fixtures::boundary(Box::new(
+                    carina_provider_mock::ConfiguredBuiltinMock::new(
+                        carina_provider_mock::MockBehavior::default(),
+                        carina_provider_mock::MockScope::memory(),
+                    )
+                    .create_provider(),
+                )),
                 &mut actual_states,
                 &mut verified_planned_states,
                 &HistoricalResourceAddresses::from_plan(&plan),

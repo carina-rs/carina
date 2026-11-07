@@ -11,10 +11,10 @@ use carina_core::parser::StateBlockAddress;
 use carina_core::plan::ReplacementPreviousAttributesForStateWriteback;
 pub use carina_core::provider::PreviousSecretHashAuthority;
 use carina_core::provider::{
-    AppliedIdentifier, CreateObservation, EmptyAppliedIdentifier, IdentifiedCreate, InFlightCreate,
-    InFlightPersistence, NestedWriteOnlyRecord, PersistedAttributes, PersistedAttributesError,
-    RawSavedAttrs, Sent, SentDesiredAttributes, SentRecord, StateRowInFlightCreate,
-    StateRowUnknownCreateOutcome, StateTransformMap, UnknownCreateOutcome,
+    AppliedIdentifier, EmptyAppliedIdentifier, HostCreateObservation, HostIdentifiedCreate,
+    InFlightCreate, InFlightPersistence, NestedWriteOnlyRecord, PersistedAttributes,
+    PersistedAttributesError, RawSavedAttrs, Sent, SentDesiredAttributes, SentRecord,
+    StateRowInFlightCreate, StateRowUnknownCreateOutcome, StateTransformMap, UnknownCreateOutcome,
     merge_previous_secret_hashes_into_provider_value, previous_hash,
 };
 use carina_core::resolved_graph::{
@@ -4440,7 +4440,7 @@ impl ResourceState {
     /// establishes the current desired resource as the authoring baseline.
     pub fn from_observation<S: Clone, R: ReferenceEquality>(
         resource: &ResolvedResource<S>,
-        identified: &IdentifiedCreate,
+        identified: &HostIdentifiedCreate,
         existing: Option<&ResourceState>,
         schema: Option<&ResourceSchema>,
         preferred_hashes: Option<&PersistedAttributes>,
@@ -4455,13 +4455,13 @@ impl ResourceState {
         let previous = existing.and_then(ResourceState::persisted_attributes);
         let no_observed_values = HashMap::new();
         let (observed_values, pending_reread) = match identified.observation() {
-            CreateObservation::Observed(state) => (state.attributes(), None),
-            CreateObservation::Unobserved(carina_core::provider::UnobservedReason::NotFound) => {
-                (&no_observed_values, Some(PendingReRead::not_found()))
-            }
-            CreateObservation::Unobserved(carina_core::provider::UnobservedReason::ReadFailed(
-                error,
-            )) => (
+            HostCreateObservation::Observed(state) => (state.attributes(), None),
+            HostCreateObservation::Unobserved(
+                carina_core::provider::HostUnobservedReason::NotFound,
+            ) => (&no_observed_values, Some(PendingReRead::not_found())),
+            HostCreateObservation::Unobserved(
+                carina_core::provider::HostUnobservedReason::ReadFailed(error),
+            ) => (
                 &no_observed_values,
                 Some(PendingReRead::read_failed(error.to_string())),
             ),
@@ -4507,7 +4507,7 @@ impl ResourceState {
             .partial_read_diagnostic()
             .and_then(|diagnostic| {
                 PartialReadMarker::new(
-                    PendingReRead::incomplete(diagnostic.raw_reason()),
+                    PendingReRead::incomplete(diagnostic.raw_reason().to_owned()),
                     diagnostic
                         .missing_attributes()
                         .iter()

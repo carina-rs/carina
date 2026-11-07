@@ -13,7 +13,7 @@ use std::ops::Index;
 use crate::binding_index::ManagedBindingStability;
 use crate::effect::{MoveAuthority, ReleasedListKey, ReleasedListKeys};
 use crate::provider::{
-    LiftedSavedAttrs, NestedWriteOnlyRecord, ProviderError, ProviderRouter, StateTransformMap,
+    HostError, LiftedSavedAttrs, NestedWriteOnlyRecord, ProviderRouter, StateTransformMap,
 };
 use crate::resource::{
     AbsoluteBindingAddress, CanonicalComparisonAttributes, Current, MaskedComparisonAttributes,
@@ -37,7 +37,7 @@ pub use plan::{
 #[derive(Debug, thiserror::Error)]
 pub enum PlanComparisonError {
     #[error(transparent)]
-    Provider(#[from] ProviderError),
+    Provider(#[from] HostError),
     #[error(transparent)]
     Reference(#[from] Box<crate::references::ReferencePlanError>),
     #[error(transparent)]
@@ -888,8 +888,8 @@ fn install_prior_managed_transform_states(
 pub async fn transform_prior_managed_provider_states(
     current_states: &mut HashMap<ResourceId, Current>,
     orphans: &mut Orphans,
-    transform: impl AsyncFnOnce(&mut StateTransformMap) -> Result<(), ProviderError>,
-) -> Result<(), ProviderError> {
+    transform: impl AsyncFnOnce(&mut StateTransformMap) -> Result<(), HostError>,
+) -> Result<(), HostError> {
     let mut transformed = prior_managed_transform_states(current_states, orphans);
     let expected_ids = transformed
         .iter()
@@ -905,7 +905,7 @@ fn validate_state_transform_routes(
     label: &str,
     expected: &HashSet<ResourceId>,
     transformed: &StateTransformMap,
-) -> Result<(), ProviderError> {
+) -> Result<(), HostError> {
     let actual = transformed
         .iter()
         .map(|(id, _)| id.clone())
@@ -923,7 +923,7 @@ fn validate_state_transform_routes(
         .collect::<Vec<_>>();
     missing.sort();
     unexpected.sort();
-    Err(ProviderError::internal(format!(
+    Err(HostError::internal(format!(
         "provider {label} state transform changed its address set (missing: [{}]; unexpected: [{}])",
         missing.join(", "),
         unexpected.join(", ")
@@ -943,9 +943,9 @@ pub async fn transform_prior_provider_states(
     current_states: &mut HashMap<ResourceId, Current>,
     data_source_states: &mut HashMap<ResourceId, State>,
     orphans: &mut Orphans,
-    mut transform_managed_orphans: impl AsyncFnMut(&mut StateTransformMap) -> Result<(), ProviderError>,
-    mut transform_data_sources: impl AsyncFnMut(&mut StateTransformMap) -> Result<(), ProviderError>,
-) -> Result<(), ProviderError> {
+    mut transform_managed_orphans: impl AsyncFnMut(&mut StateTransformMap) -> Result<(), HostError>,
+    mut transform_data_sources: impl AsyncFnMut(&mut StateTransformMap) -> Result<(), HostError>,
+) -> Result<(), HostError> {
     let mut managed_states = prior_managed_transform_states(current_states, orphans);
     let mut transformed_data_sources = StateTransformMap::from_states(data_source_states.clone());
     let expected_managed_ids = managed_states
@@ -1019,7 +1019,7 @@ pub fn into_all_prior_states(
 fn create_plan_for_tests(
     managed: &[Resource],
     data_sources: &[crate::resource::DataSource],
-    provider: &dyn crate::provider::Provider,
+    provider: &dyn crate::provider::HostProvider,
     current_states: &HashMap<ResourceId, crate::resource::PlanInputCurrent>,
     directives_map: &HashMap<ResourceId, crate::resource::PersistedDirectives>,
     registry: &crate::schema::SchemaRegistry,

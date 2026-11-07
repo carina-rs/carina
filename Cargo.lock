@@ -1128,7 +1128,9 @@ version = "0.11.0"
 dependencies = [
  "aws-config",
  "aws-credential-types",
+ "carina-core",
  "carina-plugin-host",
+ "carina-provider-protocol",
  "log",
  "rustls 0.23.36",
  "rustls-native-certs",

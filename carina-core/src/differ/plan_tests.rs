@@ -124,7 +124,7 @@ fn plan_with_historical_secret(desired_secret: &str) -> crate::plan::Plan {
     create_plan(
         &[desired],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &current,
         &HashMap::new(),
         &schemas,
@@ -219,7 +219,7 @@ fn plan_rejects_historical_hash_needed_by_ignored_readable_patch() {
     let plan = create_plan(
         &[desired],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &current,
         &HashMap::new(),
         &schemas,
@@ -265,7 +265,7 @@ fn plan_records_readable_ignored_drift_without_an_update() {
     let plan = create_plan(
         &[desired],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &current,
         &HashMap::new(),
         &schemas,
@@ -333,7 +333,7 @@ fn plan_reports_typed_error_when_changed_parent_contains_ignored_write_only_leaf
     let plan = create_plan(
         &[desired],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &current,
         &HashMap::new(),
         &schemas,
@@ -368,7 +368,7 @@ fn missing_identifier_current_produces_existing_plan_error() {
     let plan = create_plan(
         &[resource],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &plan_current,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -400,7 +400,7 @@ fn current_variant_determines_create_update_or_plan_error() {
         create_plan(
             std::slice::from_ref(&desired),
             &[],
-            &HintProvider { hints: Vec::new() },
+            &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
             &current,
             &HashMap::new(),
             &SchemaRegistry::new(),
@@ -462,7 +462,7 @@ fn desired_in_flight_plans_resume_never_create() {
     let plan = create_plan(
         &[desired],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &current,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -504,7 +504,7 @@ fn saved_resume_contains_no_token() {
     let plan = create_plan(
         &[desired],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &current,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -536,7 +536,7 @@ fn in_flight_orphan_is_create_in_flight_orphan_error() {
     let plan = create_plan(
         &[],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -567,7 +567,7 @@ fn outcome_unknown_blocks_both_desired_create_and_orphan_cleanup() {
     let desired_plan = create_plan(
         std::slice::from_ref(&desired),
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &current,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -593,7 +593,7 @@ fn outcome_unknown_blocks_both_desired_create_and_orphan_cleanup() {
     let orphan_plan = create_plan(
         &[],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -711,7 +711,7 @@ fn changed_provider_instance_rejects_resume() {
     let plan = create_plan(
         &[desired],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &current,
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -959,7 +959,7 @@ fn nested_create_only_plan(
     create_plan(
         &[desired],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &current,
         &HashMap::new(),
         &registry,
@@ -1016,7 +1016,7 @@ fn plan_nested_create_only_with_authoring(
     create_plan(
         &[desired],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &current,
         &HashMap::new(),
         &registry,
@@ -2785,7 +2785,7 @@ async fn prior_state_transform_keeps_managed_and_data_source_key_spaces_separate
                     (Value::Concrete(ConcreteValue::Bool(true))).to_snapshot(),
                 );
             }
-            Ok::<(), crate::provider::ProviderError>(())
+            Ok::<(), crate::provider::HostError>(())
         },
         async |states| {
             for state in states.values_mut() {
@@ -2794,7 +2794,7 @@ async fn prior_state_transform_keeps_managed_and_data_source_key_spaces_separate
                     (Value::Concrete(ConcreteValue::Bool(true))).to_snapshot(),
                 );
             }
-            Ok::<(), crate::provider::ProviderError>(())
+            Ok::<(), crate::provider::HostError>(())
         },
     )
     .await
@@ -2845,11 +2845,11 @@ async fn prior_state_transform_rebuilds_managed_current_after_provider_transform
                 "normalized".to_string(),
                 (Value::Concrete(ConcreteValue::Bool(true))).to_snapshot(),
             );
-            Ok::<(), crate::provider::ProviderError>(())
+            Ok::<(), crate::provider::HostError>(())
         },
         async |states| {
             assert!(states.is_empty());
-            Ok::<(), crate::provider::ProviderError>(())
+            Ok::<(), crate::provider::HostError>(())
         },
     )
     .await
@@ -2894,11 +2894,11 @@ async fn prior_state_transform_preserves_typed_managed_identifier() {
                 "normalized".to_string(),
                 (Value::Concrete(ConcreteValue::Bool(true))).to_snapshot(),
             );
-            Ok::<(), crate::provider::ProviderError>(())
+            Ok::<(), crate::provider::HostError>(())
         },
         async |states| {
             assert!(states.is_empty());
-            Ok::<(), crate::provider::ProviderError>(())
+            Ok::<(), crate::provider::HostError>(())
         },
     )
     .await
@@ -4956,7 +4956,7 @@ fn wait_binding_lowers_to_wait_effect() {
     let plan = create_plan(
         &resources,
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -5034,7 +5034,7 @@ fn unresolved_wait_enum_identifier_is_a_plan_error() {
     let plan = create_plan(
         &[job, consumer],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -5109,7 +5109,7 @@ fn nested_wait_enum_resolves_and_matches_provider_state() {
     let plan = create_plan(
         &[cert, consumer],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -5189,7 +5189,7 @@ fn quoted_wait_value_traverses_a_string_map_when_planning() {
     let plan = create_plan(
         &[job, consumer],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -5268,7 +5268,7 @@ fn typed_enum_wait_value_traverses_an_enum_map_when_planning() {
     let plan = create_plan(
         &[job, consumer],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -5377,7 +5377,7 @@ let renewed = wait cert {
     let plan = create_plan(
         &[cert, consumer],
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -5493,7 +5493,7 @@ fn create_plan_records_error_for_empty_predicate_attr_path() {
     let plan = create_plan(
         &resources,
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &HashMap::new(),
         &HashMap::new(),
         &SchemaRegistry::new(),
@@ -5572,7 +5572,7 @@ fn wait_provider_satisfier_hint_augments_explicit_dependencies() {
     let plan = create_plan(
         &parsed.resources,
         &parsed.data_sources,
-        &provider,
+        &crate::provider::ProviderBoundary::fixture(&provider),
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -5646,7 +5646,7 @@ fn wait_user_depends_on_conflict_with_provider_hint_deduplicates() {
     let plan = create_plan(
         &resources,
         &[],
-        &provider,
+        &crate::provider::ProviderBoundary::fixture(&provider),
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -5729,7 +5729,7 @@ fn wait_uses_schema_default_timeout_when_omitted() {
     let plan = create_plan(
         &resources,
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -5849,7 +5849,7 @@ fn wait_omitted_when_all_consumers_unchanged() {
     let plan = create_plan(
         &resources,
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &crate::schema::SchemaRegistry::new(),
@@ -5907,7 +5907,7 @@ fn wait_emitted_when_a_consumer_has_a_pending_change() {
     let plan = create_plan(
         &resources,
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -6008,7 +6008,7 @@ fn wait_omitted_when_already_satisfied_and_target_unchanged() {
     let plan = create_plan(
         &resources,
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &schemas,
@@ -6074,7 +6074,7 @@ fn wait_emitted_when_target_is_changing_even_if_cached_state_satisfies() {
     let plan = create_plan(
         &resources,
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &HashMap::new(),
         &HashMap::new(),
         &schemas,
@@ -6159,7 +6159,7 @@ fn wait_emitted_when_known_target_has_pending_update_even_if_cached_state_satisf
     let plan = create_plan(
         &resources,
         &[],
-        &HintProvider { hints: Vec::new() },
+        &crate::provider::ProviderBoundary::fixture(&HintProvider { hints: Vec::new() }),
         &crate::resource::into_plan_input_current_map_from_states(
             current_states.clone(),
             &schemas,

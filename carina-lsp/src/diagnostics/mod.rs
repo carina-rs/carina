@@ -19,7 +19,7 @@ use carina_core::parser::{
 };
 use carina_core::paths::PathIdentity;
 use carina_core::provider::{
-    HostErrorCause, LoadedProviderSnapshot, ProviderError, ProviderFactory, SuspendedValidationId,
+    HostErrorCause, LoadedProviderSnapshot, ProviderFactory, SuspendedValidationId,
 };
 use carina_core::resource::{
     AbsoluteBindingAddress, BindingAddress, ConcreteValue, DeferredValue, ParserPlaceholder,
@@ -265,7 +265,7 @@ pub(super) struct ProviderValidationDeduplicator {
 }
 
 impl ProviderValidationDeduplicator {
-    fn should_emit(&self, provider: &str, error: &ProviderError) -> bool {
+    fn should_emit(&self, provider: &str, error: &carina_core::provider::HostError) -> bool {
         let Some(HostErrorCause::ValidationSuspended(input_id)) = error.detail().host_cause()
         else {
             return true;

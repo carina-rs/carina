@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::output_style::Colorize;
 use carina_core::executor::{ExecutionEvent, ExecutionObserver};
 use carina_core::plan::Plan;
-use carina_core::provider::PartialReadDiagnostic;
+use carina_core::provider::HostPartialReadDiagnostic;
 use carina_core::resource::ModuleSource;
 use carina_core::value::format_attribute_user_facing;
 use carina_core::wait::WaitObservation;
@@ -19,7 +19,7 @@ use crate::display::format_effect;
 
 /// Render the shared diagnostic details for a mutation whose follow-up read
 /// only partially succeeded.
-pub(crate) fn partial_read_detail_lines(diagnostic: &PartialReadDiagnostic) -> [String; 3] {
+pub(crate) fn partial_read_detail_lines(diagnostic: &HostPartialReadDiagnostic) -> [String; 3] {
     let missing = if diagnostic.missing_attributes().is_empty() {
         "(none)".to_string()
     } else {
@@ -244,6 +244,8 @@ fn format_wait_observed_attr(observation: &WaitObservation) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::provider_text_fixtures::*;
+    use carina_core::provider::PartialReadDiagnostic;
     use std::collections::HashMap;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
@@ -742,9 +744,10 @@ mod tests {
             "demo",
         ));
         let diagnostic = carina_core::provider::PartialReadDiagnostic::new(
-            "provider read was incomplete".to_string(),
+            "provider read was incomplete".into(),
             vec!["arn".to_string(), "versioning".to_string()],
         )
+        .map(|diagnostic| diagnostic.into_host_for_test())
         .expect("fixture has missing attributes");
 
         let output = plain_output(
@@ -775,11 +778,13 @@ mod tests {
 
     #[test]
     fn partial_read_detail_lines_render_none_for_empty_missing_attributes() {
-        let diagnostic: PartialReadDiagnostic = serde_json::from_value(serde_json::json!({
-            "reason": "provider returned no attributes",
-            "missing_attributes": [],
-        }))
-        .expect("serialized diagnostic shape is valid");
+        let diagnostic: carina_core::provider::HostPartialReadDiagnostic =
+            serde_json::from_value::<PartialReadDiagnostic>(serde_json::json!({
+                "reason": "provider returned no attributes",
+                "missing_attributes": [],
+            }))
+            .expect("serialized diagnostic shape is valid")
+            .into_host_for_test();
 
         assert_eq!(
             partial_read_detail_lines(&diagnostic),

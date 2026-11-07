@@ -1,6 +1,8 @@
+#[cfg(test)]
+use crate::provider::Provider;
 use std::collections::HashMap;
 
-use crate::provider::{Provider, ProviderResult};
+use crate::provider::{HostProvider, HostResult};
 use crate::resource::ResourceId;
 use crate::resource::{ResolvedDependencies, ResolvedResourceId};
 use crate::wait::BindingPattern;
@@ -9,11 +11,11 @@ use crate::wait::predicate::AttrPath;
 /// Resolve satisfier hints from the provider against the plan's known bindings,
 /// and return additional explicit dependencies for a wait on `target_id.attr_path`.
 pub fn satisfier_augmentation(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     target_id: &ResourceId,
     attr_path: &AttrPath,
     known_bindings: &HashMap<crate::resource::AbsoluteBindingAddress, ResolvedResourceId>,
-) -> ProviderResult<ResolvedDependencies> {
+) -> HostResult<ResolvedDependencies> {
     let mut additional = ResolvedDependencies::default();
 
     for hint in provider.satisfier_hint(target_id, attr_path)? {
@@ -40,7 +42,7 @@ pub fn satisfier_augmentation(
                 attr,
                 from,
             } => {
-                let diagnostic = crate::provider_text::ProviderText::new(format!(
+                let diagnostic = crate::provider_text::DiagnosticText::new(format!(
                     "resource_type={resource_type} attr={attr:?} from={from:?}"
                 ));
                 tracing::debug!(
@@ -176,7 +178,7 @@ mod tests {
             })
             .collect();
         satisfier_augmentation(
-            &provider,
+            &crate::provider::ProviderBoundary::fixture(&provider),
             &ResourceId::with_identity("acm.Certificate", "cert"),
             &AttrPath::single("status"),
             &known_bindings,
@@ -242,7 +244,7 @@ mod tests {
         };
 
         let error = satisfier_augmentation(
-            &provider,
+            &crate::provider::ProviderBoundary::fixture(&provider),
             &ResourceId::with_identity("acm.Certificate", "cert"),
             &AttrPath::single("status"),
             &Default::default(),

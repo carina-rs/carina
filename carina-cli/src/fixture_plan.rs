@@ -14,8 +14,7 @@ use carina_core::differ::Orphans;
 use carina_core::executor::UnresolvedResource;
 use carina_core::plan::Plan;
 use carina_core::provider::{
-    BoxFuture, InitializedProvider, ProviderFactory, ProviderInitialization, ProviderInstanceKey,
-    ProviderResult, ProviderRouter,
+    BoxFuture, ProviderFactory, ProviderInitialization, ProviderInstanceKey, ProviderRouter,
 };
 use carina_core::resource::{Current, ResolvedResource, ResourceId, SnapshotState, State, Value};
 use carina_core::schema::{
@@ -284,6 +283,20 @@ pub fn provider_router_for_plan<S>(
     runtime: &crate::runtime::CommandRuntime,
     plan: &Plan<S>,
 ) -> Result<ProviderRouter, AppError> {
+    let mut file = carina_core::parser::ExpandedFile::<()>::default();
+    file.resources = plan
+        .effects()
+        .iter()
+        .filter_map(|effect| match effect.as_resource_ref() {
+            Some(carina_core::parser::ResourceRef::Resource(resource)) => {
+                let mut desired = carina_core::resource::Resource::from_id(resource.id.clone());
+                desired.attributes = resource.attributes.clone();
+                Some(desired)
+            }
+            _ => None,
+        })
+        .collect();
+    let admission = carina_core::validation::ResolvedFile::for_test(file).provider_plan();
     let instances = plan
         .effects()
         .iter()
@@ -291,10 +304,12 @@ pub fn provider_router_for_plan<S>(
         .collect::<std::collections::BTreeSet<_>>();
     let mut provider = ProviderRouter::new();
     for instance in instances {
-        provider.add_provider_instance(
-            instance,
-            InitializedProvider::unavailable(Box::new(runtime.builtin_mock()?.create_provider())),
-        );
+        let initialized =
+            futures::executor::block_on(carina_core::provider::ProviderBoundary::initialize(
+                runtime.builtin_mock()?,
+                &admission.session(instance.provider(), instance.provider_instance(), None),
+            ))?;
+        provider.add_provider_instance(instance, initialized);
     }
     Ok(provider)
 }
@@ -518,16 +533,26 @@ where
                 )
             })
             .expect("fixture provider config unexpectedly failed validation");
-        provider_router.add_normalizer(
-            factory.name(),
-            rt.block_on(factory.create_normalizer(None, &config))
-                .expect("fixture normalizer creation unexpectedly failed"),
+        provider_router.add_initialized_normalizer(
+            rt.block_on(
+                carina_core::provider::ProviderBoundary::initialize_normalizer(
+                    factory.as_ref(),
+                    &validated_config
+                        .provider_plan()
+                        .session(factory.name(), None, Some(&config)),
+                ),
+            )
+            .expect("fixture normalizer creation unexpectedly failed"),
         );
         provider_router.add_provider(
             factory.name().to_string(),
-            carina_core::provider::InitializedProvider::unavailable(Box::new(
-                builtin_mock.create_provider(),
-            )),
+            rt.block_on(carina_core::provider::ProviderBoundary::initialize(
+                builtin_mock,
+                &validated_config
+                    .provider_plan()
+                    .session(factory.name(), None, None),
+            ))
+            .expect("fixture provider initializes through its session"),
         );
     }
     // Built-in fixture providers (notably `mock`) do not have a loaded
@@ -551,10 +576,17 @@ where
         )
         .collect::<BTreeSet<_>>();
     for route in fixture_routes {
-        provider_router.add_provider_instance(
-            route,
-            InitializedProvider::unavailable(Box::new(builtin_mock.create_provider())),
-        );
+        let initialized = rt
+            .block_on(carina_core::provider::ProviderBoundary::initialize(
+                builtin_mock,
+                &validated_config.provider_plan().session(
+                    route.provider(),
+                    route.provider_instance(),
+                    None,
+                ),
+            ))
+            .expect("fixture route initializes through its session");
+        provider_router.add_provider_instance(route, initialized);
     }
     let expansion_prelude = expansion_prelude
         .detect_moves(
@@ -988,16 +1020,16 @@ impl ProviderFactory for FixtureProviderConfigFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
-    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1042,16 +1074,16 @@ impl ProviderFactory for ResolvedValueConstraintFixtureFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
-    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1105,16 +1137,16 @@ impl ProviderFactory for BestFirstPairingFixtureFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
-    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1185,16 +1217,16 @@ impl ProviderFactory for ReplaceCreateOnlyFixtureFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
-    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1258,16 +1290,16 @@ impl ProviderFactory for PlanImageFixtureFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
-    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1321,16 +1353,16 @@ impl ProviderFactory for MovedClaimsPrecedeHeuristicsFixtureFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
-    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1383,16 +1415,16 @@ impl ProviderFactory for EnumDisplayFixtureFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
-    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1453,16 +1485,16 @@ impl ProviderFactory for DynamicEnumFixtureFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
-    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 
@@ -1511,16 +1543,16 @@ impl ProviderFactory for Route53HostedZoneFixtureFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
-    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+    ) -> BoxFuture<'_, carina_core::provider::ProviderResult<ProviderInitialization>> {
         Box::pin(async { unreachable!("plan fixture does not instantiate providers") })
     }
 

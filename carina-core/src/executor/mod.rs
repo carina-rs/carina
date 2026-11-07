@@ -115,11 +115,11 @@ use crate::binding_index::{ResolvedBindings, SecretPreservingAttributes};
 use crate::effect::{DeletedInstanceKey, Effect};
 use crate::parser::ProviderConfig;
 use crate::provider::{
-    AppliedIdentifier, CreateFailure, CreateFailureKind, CreateOutcome, CreateRequest,
-    IdentifiedCreate, InFlightCreate, PartialReadDiagnostic, PatchOp, Provider, ProviderError,
-    ProviderNormalizer, ProviderReadyDataSource, ResumeCreateRequest, ResumeFailure,
-    ResumeFailureKind, ResumeOutcome, SentAttributes, SentDesiredAttributes, UnknownCreateOutcome,
-    UpdateRequest,
+    AppliedIdentifier, CreateRequest, HostCreateFailure, HostCreateFailureKind, HostCreateOutcome,
+    HostError, HostIdentifiedCreate, HostNormalizer, HostPartialReadDiagnostic, HostProvider,
+    HostResumeFailure, HostResumeFailureKind, HostResumeOutcome, InFlightCreate, PatchOp,
+    ProviderReadyDataSource, ResumeCreateRequest, SentAttributes, SentDesiredAttributes,
+    UnknownCreateOutcome, UpdateRequest,
 };
 #[cfg(test)]
 use crate::resource::ApplyTimeUnknown;
@@ -139,12 +139,12 @@ pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 /// core. The supervising caller must retain the receiver until the returned
 /// future settles. Executor-owned abandonment paths drain it before saving
 /// the cancellation classification.
-pub fn dispatch_create<'a, P: Provider + ?Sized>(
+pub fn dispatch_create<'a, P: HostProvider + ?Sized>(
     provider: &'a P,
     id: &'a ResourceId,
     request: CreateRequest,
 ) -> (
-    impl std::future::Future<Output = Result<CreateOutcome, CreateFailure>> + 'a,
+    impl std::future::Future<Output = Result<HostCreateOutcome, HostCreateFailure>> + 'a,
     crate::provider::CreateCallCancellationReceiver,
 ) {
     let (attempt, cancellation) = crate::provider::CreateAttempt::new(id.clone());
@@ -154,12 +154,12 @@ pub fn dispatch_create<'a, P: Provider + ?Sized>(
     )
 }
 
-async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
+async fn dispatch_create_with_attempt<P: HostProvider + ?Sized>(
     provider: &P,
     id: &ResourceId,
     request: CreateRequest,
     attempt: crate::provider::CreateAttempt,
-) -> Result<CreateOutcome, CreateFailure> {
+) -> Result<HostCreateOutcome, HostCreateFailure> {
     let request_attributes: BTreeSet<_> = request
         .resource()
         .as_resource()
@@ -170,37 +170,37 @@ async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
     match provider.create(id, request, attempt).await {
         Ok(outcome) => Ok(outcome),
         Err(failure) => match failure.into_kind() {
-            CreateFailureKind::OutcomeUnknown { unknown, error } => {
-                Err(CreateFailure::outcome_unknown_at_dispatch(unknown, error))
-            }
-            CreateFailureKind::IdentifierReported { identified, error } => {
+            HostCreateFailureKind::OutcomeUnknown { unknown, error } => Err(
+                HostCreateFailure::outcome_unknown_at_dispatch(unknown, error),
+            ),
+            HostCreateFailureKind::IdentifierReported { identified, error } => {
                 let (identified, valid) = identified.validate_request_sent(&request_attributes);
                 let error = if valid {
                     error
                 } else {
-                    ProviderError::internal_caused_by(
+                    HostError::internal_caused_by(
                         "provider returned sent attributes outside the checked create request",
                         error,
                     )
                     .for_resource(id.clone())
                 };
-                Err(CreateFailure::identifier_reported(identified, error))
+                Err(HostCreateFailure::identifier_reported(identified, error))
             }
-            CreateFailureKind::InFlight { pending, error } => {
+            HostCreateFailureKind::InFlight { pending, error } => {
                 let (pending, valid) = pending.validate_fresh_sent(&request_attributes);
                 let error = if valid {
                     error
                 } else {
-                    ProviderError::internal_caused_by(
+                    HostError::internal_caused_by(
                         "provider returned sent attributes outside the checked create request",
                         error,
                     )
                     .for_resource(id.clone())
                 };
-                Err(CreateFailure::in_flight(pending, error))
+                Err(HostCreateFailure::in_flight(pending, error))
             }
-            CreateFailureKind::NoResource(error) => {
-                Err(CreateFailure::not_created_at_dispatch(error))
+            HostCreateFailureKind::NoResource(error) => {
+                Err(HostCreateFailure::not_created_at_dispatch(error))
             }
         },
     }
@@ -208,10 +208,17 @@ async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
 
 /// Dispatch a checked resume request through the same sent-attribute
 /// validation seam as an initial create.
-pub async fn dispatch_resume_create<P: Provider + ?Sized>(
+pub async fn dispatch_resume_create<P: HostProvider + ?Sized>(
     provider: &P,
     request: ResumeCreateRequest,
-) -> Result<ResumeOutcome, ResumeFailure> {
+) -> Result<HostResumeOutcome, HostResumeFailure> {
+    dispatch_resume_create_raw(provider, request).await
+}
+
+async fn dispatch_resume_create_raw<P: HostProvider + ?Sized>(
+    provider: &P,
+    request: ResumeCreateRequest,
+) -> Result<HostResumeOutcome, HostResumeFailure> {
     let id = request.id().clone();
     let starting = request.pending_for_dispatch();
     let request_attributes: BTreeSet<_> = request
@@ -225,14 +232,14 @@ pub async fn dispatch_resume_create<P: Provider + ?Sized>(
     match provider.resume_create(request).await {
         Ok(outcome) if outcome.id() == &id => Ok(outcome),
         Ok(_outcome) => Err(starting.into_resume_failure(
-            ProviderError::internal("provider returned a resume outcome for another resource")
+            HostError::internal("provider returned a resume outcome for another resource")
                 .for_resource(id),
         )),
         Err(failure) => match failure.into_kind() {
-            ResumeFailureKind::IdentifierReported { identified, error } => {
+            HostResumeFailureKind::IdentifierReported { identified, error } => {
                 if identified.id() != &id {
                     return Err(starting.into_resume_failure(
-                        ProviderError::internal_caused_by(
+                        HostError::internal_caused_by(
                             "provider returned a resumed failure for another resource",
                             error,
                         )
@@ -243,18 +250,18 @@ pub async fn dispatch_resume_create<P: Provider + ?Sized>(
                 let error = if valid {
                     error
                 } else {
-                    ProviderError::internal_caused_by(
+                    HostError::internal_caused_by(
                         "provider returned sent attributes outside the checked create request",
                         error,
                     )
                     .for_resource(id)
                 };
-                Err(ResumeFailure::identifier_reported(identified, error))
+                Err(HostResumeFailure::identifier_reported(identified, error))
             }
-            ResumeFailureKind::InFlight { pending, error } => {
+            HostResumeFailureKind::InFlight { pending, error } => {
                 if pending.id() != &id {
                     return Err(starting.into_resume_failure(
-                        ProviderError::internal_caused_by(
+                        HostError::internal_caused_by(
                             "provider returned a resumed continuation for another resource",
                             error,
                         )
@@ -265,16 +272,16 @@ pub async fn dispatch_resume_create<P: Provider + ?Sized>(
                 let error = if valid {
                     error
                 } else {
-                    ProviderError::internal_caused_by(
+                    HostError::internal_caused_by(
                         "provider returned sent attributes outside the checked create request",
                         error,
                     )
                     .for_resource(id)
                 };
-                Err(ResumeFailure::in_flight(pending, error))
+                Err(HostResumeFailure::in_flight(pending, error))
             }
-            ResumeFailureKind::NoResource(error) => {
-                Err(ResumeFailure::no_resource_from_verdict(error))
+            HostResumeFailureKind::NoResource(error) => {
+                Err(HostResumeFailure::no_resource_from_verdict(error))
             }
         },
     }
@@ -417,12 +424,12 @@ impl AcceptedRequest {
 /// normal apply writeback. Partial-success diagnostics are folded into the
 /// state before it is persisted.
 pub fn complete_create_for_writeback(
-    outcome: CreateOutcome,
+    outcome: HostCreateOutcome,
     request: AcceptedRequest,
 ) -> (
     State,
     AcceptedRequest,
-    Option<PartialReadDiagnostic>,
+    Option<HostPartialReadDiagnostic>,
     crate::provider::ReadBackEnd,
 ) {
     let diagnostic = outcome.diagnostic().cloned();
@@ -439,7 +446,7 @@ pub enum Applied {
         state: State,
         request: AcceptedRequest,
     },
-    Observed(Arc<IdentifiedCreate>),
+    Observed(Arc<HostIdentifiedCreate>),
     CreateInFlight(InFlightCreate),
     CreateOutcomeUnknown(UnknownCreateOutcome),
     CreateEnded,
@@ -473,7 +480,7 @@ pub struct LiveExecutionInput<'a> {
     /// re-apply this after each resolution and before constructing the
     /// provider request — otherwise plan-time normalization is silently
     /// undone (carina#3060).
-    pub normalizer: &'a dyn ProviderNormalizer,
+    pub normalizer: &'a dyn HostNormalizer,
     /// Provider configs whose default_tags participate in desired-side
     /// normalization before provider patch construction.
     pub provider_configs: &'a [ProviderConfig<
@@ -510,7 +517,7 @@ pub struct SavedExecutionInput<'a> {
     pub bindings: ResolvedBindings,
     pub managed_current: HashMap<ResourceId, Current>,
     pub data_source_values: crate::data_source_value::ExecutableDataSourceValues<SavedModuleSource>,
-    pub normalizer: &'a dyn ProviderNormalizer,
+    pub normalizer: &'a dyn HostNormalizer,
     pub provider_configs: &'a [ProviderConfig<
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
@@ -557,7 +564,7 @@ pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
     pub(super) bindings: ResolvedBindings,
     pub(super) managed_current: HashMap<ResourceId, Current>,
     pub(super) data_source_values: crate::data_source_value::ExecutableDataSourceValues<S>,
-    pub(super) normalizer: &'a dyn ProviderNormalizer,
+    pub(super) normalizer: &'a dyn HostNormalizer,
     pub(super) provider_configs: &'a [ProviderConfig<
         crate::resource::NoPlaceholder,
         crate::resource::AbsoluteBindingAddress,
@@ -774,16 +781,16 @@ pub fn unresolved_data_source_inputs<S, D>(
         .collect()
 }
 
-fn is_throttling_error(err: &ProviderError) -> bool {
-    err.is_throttled()
+fn is_throttling_error(err: &HostError) -> bool {
+    err.is_throttled() || err.is_transient()
 }
 
 /// Read a data source through the provider with the same throttling retry
 /// policy the CLI refresh path uses.
 pub async fn read_data_source_with_retry(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     resource: &ProviderReadyDataSource,
-) -> Result<State, ProviderError> {
+) -> Result<State, HostError> {
     let max_retries = 3;
     for attempt in 0..=max_retries {
         match provider.read_data_source(resource).await {
@@ -860,7 +867,7 @@ impl std::fmt::Display for PublicReportContext {
                 crate::resource::INSIDE_SECRET_MESSAGE
             ),
         };
-        crate::provider_text::ProviderText::new(message).fmt(f)
+        crate::provider_text::DiagnosticText::new(message).fmt(f)
     }
 }
 
@@ -878,7 +885,7 @@ impl ReportedError {
     }
 
     pub fn message(message: impl Into<String>) -> Self {
-        Self::new(MessageError(crate::provider_text::ProviderText::new(
+        Self::new(MessageError(crate::provider_text::DiagnosticText::new(
             message,
         )))
     }
@@ -892,7 +899,7 @@ impl ReportedError {
 
     pub fn with_context(self, context: impl Into<String>) -> Self {
         Self::new(UntrustedContextError {
-            context: crate::provider_text::ProviderText::new(context),
+            context: crate::provider_text::DiagnosticText::new(context),
             source: self,
         })
     }
@@ -968,7 +975,7 @@ pub fn render_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
 }
 
 #[derive(Debug)]
-struct MessageError(crate::provider_text::ProviderText);
+struct MessageError(crate::provider_text::DiagnosticText);
 
 impl std::fmt::Display for MessageError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1000,7 +1007,7 @@ impl std::error::Error for ContextError {
 /// authority and is discarded when the cause crosses a secret boundary.
 #[derive(Debug)]
 struct UntrustedContextError {
-    context: crate::provider_text::ProviderText,
+    context: crate::provider_text::DiagnosticText,
     source: ReportedError,
 }
 impl std::fmt::Display for UntrustedContextError {
@@ -1143,7 +1150,7 @@ impl std::fmt::Display for UnsatisfiedDependency {
 pub enum EffectFailureKind {
     Provider {
         error: ReportedError,
-        note: Option<crate::provider_text::ProviderText>,
+        note: Option<crate::provider_text::DiagnosticText>,
     },
     Execution {
         error: ReportedError,
@@ -1202,7 +1209,7 @@ impl EffectFailureKind {
 
     pub fn provider_with_note(
         error: impl std::error::Error + Send + Sync + 'static,
-        note: impl Into<crate::provider_text::ProviderText>,
+        note: impl Into<crate::provider_text::DiagnosticText>,
     ) -> Self {
         Self::Provider {
             error: ReportedError::new(error),
@@ -1458,7 +1465,7 @@ pub struct ExecutionResult<S = ModuleSource> {
     pub success_count: usize,
     failures: FailureSink,
     pub partial_count: usize,
-    pub partial_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
+    pub partial_diagnostics: Vec<(ResourceId, HostPartialReadDiagnostic)>,
     pub skip_count: usize,
     pub interrupted_count: usize,
     pub applied_states: std::collections::HashMap<ResourceId, Applied>,
@@ -1514,7 +1521,7 @@ pub(super) struct ExecutionResultFields<S = ModuleSource> {
     pub(super) success_count: usize,
     failures: FailureSink,
     pub(super) partial_count: usize,
-    pub(super) partial_diagnostics: Vec<(ResourceId, PartialReadDiagnostic)>,
+    pub(super) partial_diagnostics: Vec<(ResourceId, HostPartialReadDiagnostic)>,
     pub(super) skip_count: usize,
     pub(super) interrupted_count: usize,
     pub(super) runtime_synthesized_resources: Vec<ResolvedResource<S>>,
@@ -1765,7 +1772,7 @@ pub enum ExecutionEvent<'a, S = ModuleSource> {
     EffectPartiallySucceeded {
         effect: &'a Effect<S>,
         state: &'a State,
-        diagnostic: &'a PartialReadDiagnostic,
+        diagnostic: &'a HostPartialReadDiagnostic,
         duration: Duration,
         progress: ProgressInfo,
     },
@@ -1812,7 +1819,7 @@ pub enum ExecutionEvent<'a, S = ModuleSource> {
     },
     RefreshFailed {
         id: &'a ResourceId,
-        error: &'a ProviderError,
+        error: &'a HostError,
     },
     /// A terminal module constraint failed without an owning provider effect.
     ModuleConstraintFailed {
@@ -1927,7 +1934,7 @@ pub async fn execute_live_plan(
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub async fn execute_live_plan_for_test(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     input: LiveExecutionInput<'_>,
     observer: &dyn ExecutionObserver,
     shutdown: ShutdownToken,
@@ -1940,12 +1947,18 @@ pub(crate) type ExecutionInput<'a> = LiveExecutionInput<'a>;
 
 #[cfg(test)]
 async fn execute_plan(
-    provider: &dyn Provider,
+    provider: &dyn crate::provider::Provider,
     input: LiveExecutionInput<'_>,
     observer: &dyn ExecutionObserver,
     shutdown: ShutdownToken,
 ) -> ExecutionOutcome {
-    execute_test_runtime_plan(provider, input, observer, shutdown).await
+    let mut boundary = crate::provider::ProviderBoundary::fixture(provider);
+    let session = input
+        .plan
+        .provider_plan()
+        .session(provider.name(), None, None);
+    boundary.set_fixture_session(session, input.schemas);
+    execute_test_runtime_plan(&boundary, input, observer, shutdown).await
 }
 
 pub async fn execute_saved_plan(
@@ -2013,7 +2026,7 @@ impl crate::validation::deferred_types::ProviderTypeCheckSink for ExecutionTypeC
 }
 
 async fn execute_runtime_plan<S: Clone + crate::resource::AnonymousIdentityModuleSource>(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     comparison_provider: &crate::provider::ProviderRouter,
     mut input: RuntimeExecutionInput<'_, S>,
     observer: &dyn ExecutionObserver<S>,
@@ -2036,7 +2049,7 @@ async fn execute_runtime_plan<S: Clone + crate::resource::AnonymousIdentityModul
 
 #[cfg(any(test, feature = "test-utils"))]
 async fn execute_test_runtime_plan(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     input: LiveExecutionInput<'_>,
     observer: &dyn ExecutionObserver,
     shutdown: ShutdownToken,

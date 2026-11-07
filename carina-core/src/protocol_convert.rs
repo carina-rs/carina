@@ -22,7 +22,7 @@
 //! let _ = config_schema_to_protocol(&draft);
 //! ```
 
-use crate::provider_text::{ProviderString, ProviderText};
+use crate::provider_text::{DiagnosticText, ProviderKey};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
@@ -91,7 +91,7 @@ pub enum WirePathSegment {
 #[derive(Clone, PartialEq, Eq)]
 pub struct WirePathKey {
     key: String,
-    diagnostic: ProviderText,
+    diagnostic: DiagnosticText,
 }
 
 impl fmt::Debug for WirePathKey {
@@ -113,7 +113,7 @@ impl WirePathKey {
 impl From<String> for WirePathKey {
     fn from(key: String) -> Self {
         Self {
-            diagnostic: ProviderText::new(&key),
+            diagnostic: DiagnosticText::new(&key),
             key,
         }
     }
@@ -172,7 +172,7 @@ pub enum ProtocolConvertError {
         base_kind: &'static str,
     },
     Context {
-        context: ProviderText,
+        context: DiagnosticText,
         source: Box<ProtocolConvertError>,
     },
     ValuePath {
@@ -205,22 +205,22 @@ impl fmt::Display for ProtocolConvertError {
             Self::OpenEnumWithoutNamespace { identity } => write!(
                 formatter,
                 "open enum `{identity}` has no namespace for the protocol CustomEnum record",
-                identity = ProviderText::new(identity.to_string())
+                identity = DiagnosticText::new(identity.to_string())
             ),
             Self::OpenEnumWithAliases { identity } => write!(
                 formatter,
                 "open enum `{identity}` carries DSL aliases that CustomEnum cannot represent",
-                identity = ProviderText::new(identity.to_string())
+                identity = DiagnosticText::new(identity.to_string())
             ),
             Self::EmptyCustomEnumNamespace { name } => write!(
                 formatter,
                 "protocol CustomEnum `{}` must have a non-empty namespace",
-                ProviderText::new(name)
+                DiagnosticText::new(name)
             ),
             Self::ClosedEnumWithTransform { identity } => write!(
                 formatter,
                 "closed enum `{identity}` carries a DSL transform that StringEnum cannot represent",
-                identity = ProviderText::new(identity.to_string())
+                identity = DiagnosticText::new(identity.to_string())
             ),
             Self::ClosedEnumUnsupportedBase {
                 identity,
@@ -228,8 +228,8 @@ impl fmt::Display for ProtocolConvertError {
             } => write!(
                 formatter,
                 "closed enum `{identity}` has {base_kind} base metadata that StringEnum cannot represent",
-                identity = ProviderText::new(identity.to_string()),
-                base_kind = ProviderText::new(base_kind)
+                identity = DiagnosticText::new(identity.to_string()),
+                base_kind = DiagnosticText::new(base_kind)
             ),
             Self::LegacyCustomUnsupportedBase {
                 identity,
@@ -237,7 +237,7 @@ impl fmt::Display for ProtocolConvertError {
             } => write!(
                 formatter,
                 "legacy Custom `{identity}` has {base_kind} base metadata that core cannot preserve with the enclosing identity",
-                identity = ProviderText::new(identity.to_string())
+                identity = DiagnosticText::new(identity.to_string())
             ),
             Self::LegacyCustomUnsupportedMetadata {
                 identity,
@@ -246,7 +246,7 @@ impl fmt::Display for ProtocolConvertError {
             } => write!(
                 formatter,
                 "legacy Custom `{identity}` carries `{field}` metadata that a {base_kind} base cannot represent",
-                identity = ProviderText::new(identity.to_string())
+                identity = DiagnosticText::new(identity.to_string())
             ),
             Self::Context {
                 context,
@@ -357,7 +357,7 @@ impl ProtocolConvertError {
 
     fn context(self, context: impl Into<String>) -> Self {
         Self::Context {
-            context: ProviderText::new(context),
+            context: DiagnosticText::new(context),
             source: Box::new(self),
         }
     }
@@ -367,9 +367,9 @@ impl ProtocolConvertError {
 #[derive(Debug)]
 pub enum SchemaDecodeError {
     InvalidSchema {
-        detail: ProviderText,
-        resource_type: Option<ProviderString>,
-        attribute_path: Vec<ProviderString>,
+        detail: DiagnosticText,
+        resource_type: Option<ProviderKey>,
+        attribute_path: Vec<ProviderKey>,
         schema_issue_location: Option<Box<SchemaValidationIssueLocation>>,
         source: Option<Box<dyn Error + Send + Sync>>,
     },
@@ -382,7 +382,7 @@ pub enum SchemaDecodeError {
 impl SchemaDecodeError {
     fn new(detail: impl Into<String>) -> Self {
         Self::InvalidSchema {
-            detail: ProviderText::new(detail),
+            detail: DiagnosticText::new(detail),
             resource_type: None,
             attribute_path: Vec::new(),
             schema_issue_location: None,
@@ -534,9 +534,9 @@ impl SchemaDecodeError {
                 schema_issue_location,
                 source: _source,
             } => {
-                let path = std::iter::once(ProviderString::from(name))
+                let path = std::iter::once(ProviderKey::from(name))
                     .chain(attribute_path.drain(..))
-                    .map(ProviderString::into_string)
+                    .map(ProviderKey::into_string)
                     .collect::<Vec<_>>()
                     .join(".");
                 *schema_issue_location = Some(Box::new(SchemaValidationIssueLocation::Definition(
@@ -579,10 +579,10 @@ impl fmt::Display for SchemaDecodeError {
                         write!(
                             formatter,
                             " attribute '{}'",
-                            ProviderText::new(
+                            DiagnosticText::new(
                                 attribute_path
                                     .iter()
-                                    .map(ProviderString::as_str)
+                                    .map(ProviderKey::as_str)
                                     .collect::<Vec<_>>()
                                     .join(".")
                             )
@@ -594,7 +594,7 @@ impl fmt::Display for SchemaDecodeError {
                         write!(
                             formatter,
                             " attribute '{}'",
-                            ProviderText::new(attribute_path)
+                            DiagnosticText::new(attribute_path)
                         )?;
                     }
                     formatter.write_str(": ")?;
@@ -610,10 +610,10 @@ impl fmt::Display for SchemaDecodeError {
                     write!(
                         formatter,
                         "attribute '{}': {}",
-                        ProviderText::new(
+                        DiagnosticText::new(
                             attribute_path
                                 .iter()
-                                .map(ProviderString::as_str)
+                                .map(ProviderKey::as_str)
                                 .collect::<Vec<_>>()
                                 .join(".")
                         ),
@@ -625,7 +625,7 @@ impl fmt::Display for SchemaDecodeError {
                 write!(
                     formatter,
                     "duplicate reference form identity `{}`",
-                    ProviderText::new(identity.to_string())
+                    DiagnosticText::new(identity.to_string())
                 )?;
             }
             Self::InvalidProviderSchema(error) => error.fmt(formatter)?,
@@ -2742,13 +2742,12 @@ pub fn try_update_outcome_to_protocol(
             } = diagnostic;
             Ok(protocol::UpdateOutcome::PartialSuccess {
                 state: try_applied_update_state_to_protocol(state, state_after_patch)?,
-                diagnostic: protocol::PartialReadDiagnostic {
-                    reason: reason.as_str().to_owned(),
-                    missing_attributes: missing_attributes
+                diagnostic: reason.partial_read_wire(
+                    missing_attributes
                         .iter()
                         .map(|name| name.as_str().to_owned())
                         .collect(),
-                },
+                ),
             })
         }
     }

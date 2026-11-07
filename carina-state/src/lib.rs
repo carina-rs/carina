@@ -108,3 +108,7 @@ pub use state::{
     ValidatedLegacyMigration, check_and_migrate, check_and_migrate_bytes, log_state_migration_once,
     should_apply_override,
 };
+
+#[cfg(any(test, feature = "test-utils"))]
+#[path = "../../carina-core/tests/support/provider_text.rs"]
+mod provider_text_fixtures;

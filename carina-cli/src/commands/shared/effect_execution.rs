@@ -7,7 +7,7 @@ use carina_core::executor::{
     FailureEventContext, FailureReport, ProgressInfo,
 };
 use carina_core::plan::Plan;
-use carina_core::provider::{AppliedIdentifier, Provider, ReadRequest};
+use carina_core::provider::{AppliedIdentifier, HostProvider, ReadRequest};
 use carina_core::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
 /// Owns all result mutation for one import iteration and publishes at most one
@@ -77,7 +77,7 @@ fn record_import_failure<S: Clone>(
 pub(crate) async fn execute_import_effects<S: Clone>(
     color_mode: crate::output_style::ColorMode,
     plan: &Plan<S>,
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     result: &mut ExecutionResult<S>,
     shutdown: &ShutdownToken,
     checkpoint_sink: &ExecutionCheckpointSink<S>,
@@ -467,11 +467,13 @@ mod tests {
         });
 
         let recorder = ReadRecorder::new();
+
+        let recorder = std::sync::Arc::new(recorder);
         let mut result = empty_result();
         execute_import_effects(
             color_mode,
             &plan,
-            &recorder,
+            &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&recorder))),
             &mut result,
             &ShutdownToken::running(),
             &ExecutionCheckpointSink::noop(),
@@ -533,7 +535,7 @@ mod tests {
         execute_import_effects(
             color_mode,
             &plan,
-            &ReadRecorder::new(),
+            &crate::provider_text_fixtures::boundary(Box::new(ReadRecorder::new())),
             &mut result,
             &ShutdownToken::running(),
             &ExecutionCheckpointSink::noop(),
@@ -556,11 +558,13 @@ mod tests {
         });
 
         let recorder = ReadRecorder::new();
+
+        let recorder = std::sync::Arc::new(recorder);
         let mut result = empty_result();
         execute_import_effects(
             color_mode,
             &plan,
-            &recorder,
+            &crate::provider_text_fixtures::boundary(Box::new(std::sync::Arc::clone(&recorder))),
             &mut result,
             &ShutdownToken::running(),
             &ExecutionCheckpointSink::noop(),

@@ -1,5 +1,7 @@
 //! carina#4305: assert against bytes written by the real local backend.
 
+use crate::provider_text_fixtures::*;
+
 use super::*;
 use crate::StateBackend;
 use crate::backends::LocalBackend;
@@ -36,13 +38,8 @@ async fn persisted_read_back_failure(incomplete: bool) -> String {
     );
     // This is the classified observation produced when create reports an ID
     // and its finishing read-back fails. Keep the wire error round-trip.
-    let error = ProviderError::from_wire(
-        ProviderError::api_error(format!(
-            "mock read-back rejected password {SECRET}; public=read-context-4305"
-        ))
-        .to_wire(),
-    );
-    let detail = error.to_string();
+    let detail = format!("mock read-back rejected password {SECRET}; public=read-context-4305");
+    let error = ProviderError::from_wire(ProviderError::api_error(detail.clone()).to_wire());
     let failed = CreateAttempt::for_test(desired.id.clone())
         .issued(
             AppliedIdentifier::new("mock-id").unwrap(),
@@ -57,12 +54,17 @@ async fn persisted_read_back_failure(incomplete: bool) -> String {
     };
     let identified = if incomplete {
         identified.with_partial_read_for_test(
-            carina_core::provider::PartialReadDiagnostic::new(detail, vec!["computed".into()])
-                .unwrap(),
+            carina_core::provider::PartialReadDiagnostic::new(
+                detail.into(),
+                vec!["computed".into()],
+            )
+            .unwrap(),
         )
     } else {
         identified
     };
+    let identified =
+        identified.with_secrets_for_test(&crate::provider_text_fixtures::context(&[SECRET]));
     let row = resource_state_from_observation_for_test(
         &desired,
         &identified,

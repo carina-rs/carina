@@ -19,13 +19,13 @@ impl ProviderFactory for NamedAnnotationCompletionFactory {
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
     fn create_provider(
         &self,
-        _: Option<&str>,
-        _: &carina_core::provider::ProviderReadyConfig,
+        _: &carina_core::provider::ProviderSession,
         _: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
@@ -3360,13 +3360,13 @@ for _, account_id in orgs.accounts {
         fn validate_config(
             &self,
             _: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
         fn create_provider(
             &self,
-            _: Option<&str>,
-            _: &carina_core::provider::ProviderReadyConfig,
+            _: &carina_core::provider::ProviderSession,
             _: carina_core::provider::InitializeOutcomeMint,
         ) -> carina_core::provider::BoxFuture<
             '_,
@@ -3845,14 +3845,14 @@ fn completion_uses_the_directory_partial_catalog_instead_of_the_document_catalog
         fn validate_config(
             &self,
             _: &carina_core::provider::CanonicalProviderConfigAttributes,
+            _session: &carina_core::provider::ProviderValidationInputs,
         ) -> carina_core::provider::ProviderResult<()> {
             Ok(())
         }
 
         fn create_provider(
             &self,
-            _: Option<&str>,
-            _: &carina_core::provider::ProviderReadyConfig,
+            _: &carina_core::provider::ProviderSession,
             _: carina_core::provider::InitializeOutcomeMint,
         ) -> carina_core::provider::BoxFuture<
             '_,

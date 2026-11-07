@@ -1,6 +1,9 @@
 //! Integration tests for the general mock and the isolated wasi:http probe guests.
 
+#[path = "../../carina-core/tests/support/provider_text.rs"]
+mod provider_text_fixtures;
 use carina_plugin_host::wasm_factory::PollEventForTest;
+use provider_text_fixtures::InitializeFixture;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::{Read, Write};
@@ -12,13 +15,18 @@ use std::time::{Duration, Instant};
 
 use carina_core::effect::PlanOp;
 use carina_core::executor::{AcceptedRequest, complete_create_for_writeback};
+use carina_core::provider::ProviderNormalizer;
 use carina_core::provider::{
-    AppliedIdentifier, BoxFuture, CreateFailure, CreateFailureKind, CreateObservation,
-    CreateOutcome, CreateOutcomeKind, CreateRequest, DeleteRequest, InFlightCreate, Provider,
-    ProviderDirectiveSchema, ProviderError, ProviderErrorKind, ProviderFactory,
-    ProviderReadyConfig, RawSavedAttrs, ReadRequest, ResumeCreateRequest, ResumeFailure,
-    ResumeFailureKind, ResumeOutcome, ResumeOutcomeKind, SavedAttrs, Sent, SentRecord,
-    UnobservedReason, UpdateRequest, hydrate_provider_states, normalize_provider_states,
+    AppliedIdentifier, BoxFuture, CreateRequest, DeleteRequest, HostCreateFailure as CreateFailure,
+    HostCreateFailureKind as CreateFailureKind, HostCreateObservation as CreateObservation,
+    HostCreateOutcome as CreateOutcome, HostCreateOutcomeKind as CreateOutcomeKind,
+    HostError as ProviderError, HostResumeFailure as ResumeFailure,
+    HostResumeFailureKind as ResumeFailureKind, HostResumeOutcome as ResumeOutcome,
+    HostResumeOutcomeKind as ResumeOutcomeKind, HostUnobservedReason as UnobservedReason,
+    InFlightCreate, ProviderDirectiveSchema, ProviderErrorKind, ProviderFactory,
+    ProviderReadyConfig, RawSavedAttrs, ReadRequest, ResumeCreateRequest, SavedAttrs, Sent,
+    SentRecord, UpdateRequest, hydrate_host_provider_states as hydrate_provider_states,
+    normalize_host_provider_states as normalize_provider_states,
 };
 use carina_core::resource::{
     ApplyTimeUnknown, ConcreteValue, DataSource, DeferredValue, EnumValueResolver,
@@ -76,13 +84,13 @@ impl ProviderFactory for WireConfigFactory {
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
     fn create_provider(
         &self,
-        _: Option<&str>,
-        _: &ProviderReadyConfig,
+        _: &carina_core::provider::ProviderSession,
         _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<
         '_,
@@ -169,11 +177,11 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
             );
             let (factory, _cache) = load_factory(&wasm).await;
             let ready = ready_config(&factory, &indexmap::IndexMap::new());
-            let provider = factory
-                .create_initialized_provider(None, &ready)
+            let provider = factory.initialize_fixture(None, &ready).await.unwrap();
+            let normalizer = factory
+                .initialize_normalizer_fixture(None, &ready)
                 .await
                 .unwrap();
-            let normalizer = factory.create_normalizer(None, &ready).await.unwrap();
             let mut schemas = SchemaRegistry::new();
             schemas.insert(
                 "mock",
@@ -209,7 +217,7 @@ async fn wire_boundary_default_tag_fails_before_native_and_guest_crud() {
             for normalizer in [
                 normalizer.as_ref(),
                 &carina_core::provider::NoopNormalizer
-                    as &dyn carina_core::provider::ProviderNormalizer,
+                    as &dyn carina_core::provider::HostNormalizer,
             ] {
                 let context = ProviderPreparationContext::new(
                     &bindings,
@@ -429,7 +437,7 @@ trait DispatchCreateForTest {
 
 impl<T> DispatchCreateForTest for T
 where
-    T: Provider + ?Sized,
+    T: carina_core::provider::HostProvider + ?Sized,
 {
     fn create_for_test<'a>(
         &'a self,
@@ -1071,7 +1079,7 @@ async fn initial_create_trap_after_dispatched_egress_is_outcome_unknown() {
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", server_address);
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let id = ResourceId::with_provider_identity(
@@ -1114,7 +1122,7 @@ async fn initial_create_unencodable_pending_token_after_egress_is_outcome_unknow
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", server_address);
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let id = ResourceId::with_provider_identity(
@@ -1154,7 +1162,7 @@ async fn initial_create_trap_without_egress_is_not_created() {
     let path = skip_if_no_http_wasm!();
     let (factory, _cache) = load_http_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let id = ResourceId::with_provider_identity(
@@ -1194,7 +1202,7 @@ async fn provider_declared_not_created_remains_not_created_after_egress() {
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", server_address);
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let id = ResourceId::with_provider_identity(
@@ -1548,7 +1556,7 @@ async fn aws_credential_import_returns_the_sources_credentials() {
     ))));
     let (factory, _cache) = load_aws_http_factory(&path, source).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("AWS credential probe should initialize");
 
@@ -1578,7 +1586,7 @@ async fn aws_credential_source_error_reaches_the_guest_as_a_wit_error() {
     ))));
     let (factory, _cache) = load_aws_http_factory(&path, source).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("AWS credential probe should initialize");
 
@@ -1611,7 +1619,7 @@ async fn each_guest_call_asks_the_host_source() {
     ]));
     let (factory, _cache) = load_aws_http_factory(&path, source).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("AWS credential probe should initialize");
 
@@ -1650,11 +1658,11 @@ async fn initialized_reference_scope_is_kept_per_provider_instance() {
     )]);
 
     let _tokyo = factory
-        .create_initialized_provider(None, &ready_config(&factory, &tokyo_attributes))
+        .initialize_fixture(None, &ready_config(&factory, &tokyo_attributes))
         .await
         .expect("default provider should initialize");
     let _virginia = factory
-        .create_initialized_provider(
+        .initialize_fixture(
             Some("virginia"),
             &ready_config(&factory, &virginia_attributes),
         )
@@ -1727,7 +1735,7 @@ async fn declared_host_is_allowed_before_the_test_route_replaces_resolution() {
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", server_address);
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let id = ResourceId::with_provider_identity(
@@ -1819,7 +1827,7 @@ async fn provider_kinds_do_not_inherit_amazonaws_egress() {
             load_http_factory_with_name_and_class(path, provider_name, class).await;
         let factory = factory.with_http_test_route("sts.amazonaws.com", address);
         let provider = factory
-            .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+            .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
             .await
             .expect("provider should initialize");
         let id = ResourceId::with_provider_identity(
@@ -1856,7 +1864,7 @@ async fn host_egress_denial_traps_instead_of_reaching_guest_send_phase_classific
     let path = skip_if_no_http_wasm!();
     let (factory, _cache) = load_http_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -1907,7 +1915,7 @@ async fn untrusted_metadata_denial_poisons_the_provider_instance() {
     let path = skip_if_no_http_wasm!();
     let (factory, _cache) = load_http_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -1977,7 +1985,7 @@ async fn post_resolution_metadata_denial_traps_and_poisons_the_provider_instance
     let metadata_address = SocketAddr::from((Ipv4Addr::new(169, 254, 169, 254), 80));
     let factory = factory.with_http_test_route("resolved-metadata.invalid", metadata_address);
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -2063,7 +2071,7 @@ async fn wasm_guest_classifies_post_body_closed_tcp_port_as_not_sent() {
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", closed_address);
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -2119,7 +2127,7 @@ async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", server_address);
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -2200,7 +2208,7 @@ async fn probe_early_http_response(response: &'static [u8], check_outcome: impl 
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", server_address);
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let id = ResourceId::with_provider_identity(
@@ -2334,7 +2342,7 @@ async fn wasm_guest_connection_reset_after_request_head_is_maybe_sent() {
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", server_address);
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let id = ResourceId::with_provider_identity(
@@ -2428,7 +2436,7 @@ async fn wasm_guest_classifies_post_body_first_byte_timeout_as_maybe_sent() {
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", server_address);
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -2504,7 +2512,7 @@ async fn test_wasm_pending_create_polls_until_success() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "pending-create", None);
@@ -2543,7 +2551,7 @@ async fn test_wasm_create_read_back_completes_within_budget() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "read-back-create", None);
@@ -2574,7 +2582,7 @@ async fn test_wasm_create_read_back_preserve_error_keeps_phase_and_identifier() 
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let identity = "__mock_read_back_preserve_error__";
@@ -2621,7 +2629,7 @@ async fn test_wasm_resumed_create_read_back_preserve_error_keeps_token_and_ident
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let identity = "__mock_read_back_preserve_error__";
@@ -2665,7 +2673,7 @@ async fn test_wasm_resumed_saved_read_back_from_fresh_instance_reads_by_identifi
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let identity = "resumed-saved-read-back";
@@ -2689,7 +2697,7 @@ async fn test_wasm_resumed_saved_read_back_from_fresh_instance_reads_by_identifi
     drop(provider);
     let (factory, _fresh_cache) = load_factory(&path).await;
     let fresh = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("fresh provider should init");
     let token = serde_json::json!({"phase": "read_back"}).to_string();
@@ -2726,7 +2734,7 @@ async fn test_wasm_identifierless_read_back_resume_ends_invalid_continuation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let identity = "invalid-resumed-read-back";
@@ -2757,7 +2765,7 @@ async fn test_wasm_create_read_back_budget_returns_partial_then_refresh_complete
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -2811,7 +2819,7 @@ async fn test_wasm_create_read_back_pending_after_final_preserves_identifier() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -2854,7 +2862,7 @@ async fn test_wasm_create_read_back_cannot_regress_to_operation_phase() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -2897,7 +2905,7 @@ async fn test_wasm_resumed_create_read_back_final_attempt_returns_partial_succes
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -2939,10 +2947,7 @@ async fn test_wasm_fresh_delete_recovers_pending_controls_from_identifier() {
     let path = wasm_path().expect("build the WASM mock before running this test");
     let (factory, _cache) = load_factory(&path).await;
     let config = ready_config(&factory, &indexmap::IndexMap::new());
-    let provider = factory
-        .create_initialized_provider(None, &config)
-        .await
-        .unwrap();
+    let provider = factory.initialize_fixture(None, &config).await.unwrap();
     let resource = resource_with_int_attribute(
         "test.short_budget",
         "fresh-delete",
@@ -2960,10 +2965,7 @@ async fn test_wasm_fresh_delete_recovers_pending_controls_from_identifier() {
     drop(provider);
     let (factory, _fresh_cache) = load_factory(&path).await;
     let config = ready_config(&factory, &indexmap::IndexMap::new());
-    let fresh = factory
-        .create_initialized_provider(None, &config)
-        .await
-        .unwrap();
+    let fresh = factory.initialize_fixture(None, &config).await.unwrap();
     let identifier = AppliedIdentifier::new(created.identifier.unwrap()).unwrap();
     let error = fresh
         .provider()
@@ -2978,10 +2980,7 @@ async fn test_wasm_fresh_read_uses_updated_read_back_controls() {
     let path = wasm_path().expect("build the WASM mock before running this test");
     let (factory, _cache) = load_factory(&path).await;
     let config = ready_config(&factory, &indexmap::IndexMap::new());
-    let provider = factory
-        .create_initialized_provider(None, &config)
-        .await
-        .unwrap();
+    let provider = factory.initialize_fixture(None, &config).await.unwrap();
     let mut resource = resource_with_int_attribute("test.resource", "fresh-update", "value", 1);
     let id = resource.id.clone();
     let created = create_state_for_writeback(
@@ -2994,10 +2993,7 @@ async fn test_wasm_fresh_read_uses_updated_read_back_controls() {
     drop(provider);
     let (factory, _update_cache) = load_factory(&path).await;
     let config = ready_config(&factory, &indexmap::IndexMap::new());
-    let updater = factory
-        .create_initialized_provider(None, &config)
-        .await
-        .unwrap();
+    let updater = factory.initialize_fixture(None, &config).await.unwrap();
     let identifier = AppliedIdentifier::new(created.identifier.clone().unwrap()).unwrap();
     resource.set_attr("value", Value::Concrete(ConcreteValue::Int(2)));
     resource.set_attr(
@@ -3019,10 +3015,7 @@ async fn test_wasm_fresh_read_uses_updated_read_back_controls() {
     drop(updater);
     let (factory, _read_cache) = load_factory(&path).await;
     let config = ready_config(&factory, &indexmap::IndexMap::new());
-    let reader = factory
-        .create_initialized_provider(None, &config)
-        .await
-        .unwrap();
+    let reader = factory.initialize_fixture(None, &config).await.unwrap();
     let identifier = AppliedIdentifier::new(updated.identifier.unwrap()).unwrap();
     let state = reader
         .provider()
@@ -3048,7 +3041,7 @@ async fn test_wasm_pending_update_polls_until_success() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "pending-update", None);
@@ -3097,7 +3090,7 @@ async fn test_wasm_update_read_back_completes_within_budget() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "read-back-update", None);
@@ -3143,7 +3136,7 @@ async fn test_wasm_update_read_back_budget_returns_partial_then_refresh_complete
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -3208,7 +3201,7 @@ async fn test_wasm_update_read_back_phase_regression_is_protocol_violation_and_r
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -3281,7 +3274,7 @@ async fn test_wasm_pending_delete_polls_until_success() {
     let factory =
         factory.with_poll_observer_for_test(move |event| recorded.lock().unwrap().push(event));
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "pending-delete", None);
@@ -3336,7 +3329,7 @@ async fn test_wasm_pending_create_can_settle_on_final_poll_at_deadline() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -3386,7 +3379,7 @@ async fn test_wasm_cancel_between_polls_does_not_poison_instance() {
         }
     });
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let pending_id =
@@ -3429,7 +3422,7 @@ async fn test_wasm_pending_over_budget_times_out_without_poisoning_instance() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.short_budget", "over-budget", None);
@@ -3479,7 +3472,7 @@ async fn wasm_mock_exercises_not_created_identifier_reported_and_malformed_pendi
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
 
@@ -3585,7 +3578,7 @@ async fn initial_token_encode_failure_with_create_done_identifier_is_identifier_
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -3630,7 +3623,7 @@ async fn initial_unissued_pending_token_encode_failure_without_egress_is_not_cre
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -3675,7 +3668,7 @@ async fn initial_issued_pending_token_encode_failure_is_identifier_reported() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -3736,7 +3729,7 @@ async fn unissued_poll_token_encode_failure_keeps_previous_continuation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id =
@@ -3781,7 +3774,7 @@ async fn issued_poll_token_encode_failure_keeps_previous_continuation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -3836,7 +3829,7 @@ async fn resume_pending_token_encode_failure_keeps_previous_continuation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -3905,7 +3898,7 @@ async fn wasm_mock_exercises_resumed_no_resource_unchanged_repending_and_resend(
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
 
@@ -4032,7 +4025,7 @@ async fn canonicalized_composite_identifiers_survive_finished_and_resumed_paths(
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let canonical = "part-a|part-b";
@@ -4111,7 +4104,7 @@ async fn test_wasm_operation_budget_includes_initial_guest_call() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id =
@@ -4140,10 +4133,13 @@ async fn test_wasm_operation_budget_includes_initial_guest_call() {
         CreateFailureKind::InFlight {
             pending: _pending,
             error,
-        } => assert!(matches!(
-            error,
-            carina_core::provider::ProviderError::Timeout(_timeout)
-        )),
+        } => {
+            let error: carina_core::provider::ProviderError = error.into();
+            assert!(matches!(
+                error,
+                carina_core::provider::ProviderError::Timeout(_timeout)
+            ));
+        }
         CreateFailureKind::NoResource(error) => {
             panic!("slow initial call was classified as not_created: {error}")
         }
@@ -4164,7 +4160,7 @@ async fn test_wasm_production_budget_allows_25s_host_wait() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "host-wait-25s", None);
@@ -4188,7 +4184,7 @@ async fn test_wasm_production_budget_allows_35s_host_wait() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "host-wait-35s", None);
@@ -4216,7 +4212,7 @@ async fn test_wasm_short_compute_budget_excludes_5s_host_wait() {
         Duration::from_secs(30),
     ));
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "host-wait-5s", None);
@@ -4240,7 +4236,7 @@ async fn test_wasm_short_compute_budget_interrupts_busy_loop() {
         Duration::from_secs(60),
     ));
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "spin-forever", None);
@@ -4276,7 +4272,7 @@ async fn test_wasm_short_compute_budget_interrupts_spin_with_host_calls() {
         Duration::from_secs(60),
     ));
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -4318,7 +4314,7 @@ async fn test_wasm_short_wall_budget_times_out_host_wait() {
         Duration::from_secs(2),
     ));
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "wall-timeout", None);
@@ -4368,7 +4364,7 @@ async fn test_wasm_queued_sibling_observes_poison_before_dead_store() {
         Duration::from_secs(1),
     ));
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let slow_id =
@@ -4439,7 +4435,7 @@ async fn test_wasm_cancelled_guest_call_drops_live_instance_before_followup() {
         Duration::from_secs(30),
     ));
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let slow_id =
@@ -4497,7 +4493,7 @@ async fn test_wasm_poll_sleep_does_not_block_sibling_operation() {
         }
     });
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let pending_id =
@@ -4606,6 +4602,14 @@ async fn test_wasm_repeated_validation_timeout_survives_interleaved_successes() 
             .expect_err("a repeatedly timed-out validation input must be suspended");
     let rendered = suspended.to_string();
 
+    // Retain the original raw-provider assertion using a host error relay.
+    struct ValidationFailure(carina_core::provider::ProviderError);
+    impl ValidationFailure {
+        fn provider_error(&self) -> Option<&carina_core::provider::ProviderError> {
+            Some(&self.0)
+        }
+    }
+    let suspended = ValidationFailure(suspended.provider_error().unwrap().clone().into());
     assert_eq!(
         suspended
             .provider_error()
@@ -4828,7 +4832,7 @@ async fn test_wasm_store_lock_wait_does_not_count_against_guest_call_timeout() {
             Duration::from_secs(1),
         ));
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let first_id = ResourceId::with_provider_identity("mock", "test.resource", "slow-one", None);
@@ -4927,7 +4931,7 @@ async fn test_wasm_mock_provider_create_and_read() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
 
@@ -5019,7 +5023,7 @@ async fn test_wasm_mock_provider_create_and_read() {
 async fn test_wasm_host_rejects_raw_non_finite_read_values_as_provider_errors() {
     let (factory, _cache) = load_factory(&raw_float_wasm_path()).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .unwrap();
     for (selector, category) in NON_FINITE_FLOAT_CASES {
@@ -5052,7 +5056,7 @@ async fn test_wasm_mock_provider_update_and_delete() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
 
@@ -5190,7 +5194,7 @@ async fn test_wasm_update_accepts_redacted_secret_in_current_state() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "secret-update", None);
@@ -5240,7 +5244,7 @@ async fn test_wasm_update_carries_unchanged_redacted_secret_into_outcome() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "secret-carry", None);
@@ -5286,7 +5290,7 @@ async fn test_wasm_update_preserves_cloud_attribute_with_nested_stored_secret_fo
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "nested-secret", None);
@@ -5361,7 +5365,7 @@ async fn test_wasm_mock_provider_normalizer() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -5459,7 +5463,7 @@ async fn wasm_normalize_desired_echo_preserves_nested_enum_typing() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
     let hosted_zone_type = AttributeType::enum_(
@@ -5516,7 +5520,7 @@ async fn test_wasm_normalize_desired_preserves_ref_and_unknown_bearing_attribute
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -5574,7 +5578,7 @@ async fn wasm_normalize_desired_edits_known_leaves_in_mixed_containers() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .unwrap();
     let string = |value: &str| Value::Concrete(ConcreteValue::String(value.to_string().into()));
@@ -5677,7 +5681,7 @@ async fn wasm_normalize_desired_rejects_absent_required_together_attribute() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
     let mut resource = Resource::with_provider(
@@ -5709,7 +5713,7 @@ async fn http_wasm_normalize_desired_preserves_leaf_handles() {
     let path = skip_if_no_http_wasm!();
     let (factory, _cache) = load_http_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .unwrap();
     let secret = Value::Deferred(DeferredValue::Secret(
@@ -5765,7 +5769,7 @@ async fn wasm_normalize_desired_accepts_and_restores_deferred_required_together_
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
     let mut resource = Resource::with_provider(
@@ -5795,7 +5799,7 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -5903,10 +5907,17 @@ async fn test_wasm_pending_state_accepts_one_rekeyed_result_and_rejects_zero_res
 async fn test_wasm_resolved_wire_key_collisions_are_normalized_one_at_a_time() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
-    let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
-        .await
-        .expect("normalizer should initialize");
+    let config = ready_config(&factory, &indexmap::IndexMap::new());
+    let mut routes = carina_core::provider::NormalizerRouter::new();
+    for binding in ["first", "second"] {
+        routes.add_initialized_normalizer(
+            factory
+                .initialize_normalizer_fixture(Some(binding), &config)
+                .await
+                .expect("normalizer should initialize"),
+        );
+    }
+    let normalizer: Box<dyn carina_core::provider::HostNormalizer> = Box::new(routes);
 
     let first_id = ResourceId::with_provider_identity(
         "mock",
@@ -6034,7 +6045,7 @@ async fn test_wasm_create_normalizer_propagates_instance_initialization_failure(
     let config = ready_config(&factory, &attributes);
 
     let result = factory
-        .create_normalizer(Some("bad-normalizer"), &config)
+        .initialize_normalizer_fixture(Some("bad-normalizer"), &config)
         .await;
 
     let error = match result {
@@ -6054,7 +6065,7 @@ async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() 
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -6143,7 +6154,7 @@ async fn test_wasm_hydrate_read_state_round_trips_structural_redacted_secret() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
     let secret: Value = Value::Deferred(DeferredValue::Secret(
@@ -6195,7 +6206,7 @@ async fn test_wasm_hydrate_keeps_marker_strings_plain_top_level_and_nested() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
     let (redacted, marker) = redacted_secret_and_legacy_marker("wasm-marker-collision");
@@ -6276,7 +6287,7 @@ async fn test_wasm_hydrate_read_state_write_only_legacy_secret_plans_no_change()
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "legacy-write-only", None);
@@ -6350,14 +6361,16 @@ async fn test_wasm_normalize_state_trap_is_an_error_and_does_not_mutate_state() 
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let attributes = indexmap::IndexMap::new();
-    let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &attributes))
+    let config = ready_config(&factory, &attributes);
+    let session =
+        carina_core::provider::ProviderPlan::state_only().session("mock", None, Some(&config));
+    let provider = carina_core::provider::ProviderBoundary::initialize(&factory, &session)
         .await
         .expect("provider should initialize");
-    let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &attributes))
-        .await
-        .expect("normalizer should initialize");
+    let normalizer =
+        carina_core::provider::ProviderBoundary::initialize_normalizer(&factory, &session)
+            .await
+            .expect("normalizer should initialize");
     let id = ResourceId::with_provider_identity(
         "mock",
         "test.resource",
@@ -6411,7 +6424,7 @@ async fn test_wasm_crud_trap_poisons_instance_with_original_operation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let trap_id =
@@ -6463,7 +6476,7 @@ async fn test_wasm_provider_returned_error_does_not_poison_instance() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let error_id =
@@ -6500,7 +6513,7 @@ async fn test_wasm_provider_returned_wit_error_does_not_poison_fail_fast_instanc
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should initialize");
     let error_id = ResourceId::with_provider_identity("mock", "test.resource", "read-error", None);
@@ -6531,14 +6544,16 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let attributes = indexmap::IndexMap::new();
-    let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &attributes))
+    let config = ready_config(&factory, &attributes);
+    let session =
+        carina_core::provider::ProviderPlan::state_only().session("mock", None, Some(&config));
+    let provider = carina_core::provider::ProviderBoundary::initialize(&factory, &session)
         .await
         .expect("provider should initialize");
-    let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &attributes))
-        .await
-        .expect("normalizer should initialize");
+    let normalizer =
+        carina_core::provider::ProviderBoundary::initialize_normalizer(&factory, &session)
+            .await
+            .expect("normalizer should initialize");
 
     let desired_id = ResourceId::with_provider_identity(
         "mock",
@@ -6695,7 +6710,7 @@ async fn test_wasm_normalizer_rejects_out_of_range_duration_without_mutating_res
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -6724,7 +6739,7 @@ async fn test_wasm_normalize_state_rejects_unresolved_enum_without_mutation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "bad-state", None);
@@ -6755,7 +6770,7 @@ async fn test_wasm_hydrate_rejects_unresolved_enum_without_mutation() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "bad-saved", None);
@@ -6790,7 +6805,7 @@ async fn test_wasm_normalize_desired_preserves_secret() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -6816,7 +6831,7 @@ async fn test_wasm_mock_provider_hydrate_read_state_preserves_host_ids() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("normalizer should initialize");
 
@@ -6876,7 +6891,7 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
 
@@ -6951,7 +6966,7 @@ async fn test_wasm_mock_provider_required_permissions_dispatches_through_wit() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity("mock", "test.resource", "example", None);
@@ -6970,7 +6985,7 @@ async fn test_wasm_required_permissions_trap_is_not_an_empty_permission_set() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -6996,7 +7011,7 @@ async fn test_wasm_invalid_satisfier_hint_is_not_silently_dropped() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .expect("provider should init");
     let id = ResourceId::with_provider_identity(
@@ -7039,7 +7054,7 @@ async fn wasm_reference_batches_preserve_order_and_all_typed_outcomes() {
         Value::Concrete(ConcreteValue::String(table.to_string().into())),
     )]);
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &attributes))
+        .initialize_fixture(None, &ready_config(&factory, &attributes))
         .await
         .unwrap();
     let requests = ["alias/live", "gone", "denied", "retry", "invalid", "empty"]
@@ -7086,7 +7101,7 @@ async fn wasm_reference_batches_preserve_order_and_all_typed_outcomes() {
 async fn raw_float_normalization_outputs_are_rejected_atomically() {
     let (factory, _cache) = load_factory(&raw_float_wasm_path()).await;
     let normalizer = factory
-        .create_normalizer(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_normalizer_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .unwrap();
     for (selector, category) in NON_FINITE_FLOAT_CASES {
@@ -7129,7 +7144,7 @@ async fn raw_float_normalization_outputs_are_rejected_atomically() {
 async fn raw_data_source_floats_retain_resource_operation_and_constructor_source() {
     let (factory, _cache) = load_factory(&raw_float_wasm_path()).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .unwrap();
     for (selector, category) in NON_FINITE_FLOAT_CASES {
@@ -7171,7 +7186,7 @@ async fn raw_data_source_floats_retain_resource_operation_and_constructor_source
 async fn raw_create_float_decode_failure_preserves_the_reported_identifier() {
     let (factory, _cache) = load_factory(&raw_float_wasm_path()).await;
     let provider = factory
-        .create_initialized_provider(None, &ready_config(&factory, &indexmap::IndexMap::new()))
+        .initialize_fixture(None, &ready_config(&factory, &indexmap::IndexMap::new()))
         .await
         .unwrap();
     let resource = Resource::with_provider("mock", "test.resource", "raw-create", None);

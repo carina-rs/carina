@@ -13,7 +13,7 @@ use crate::executor::{
 use crate::parser::{ExpandedProviderConfig, ResolvedProviderConfigs};
 use crate::provider::{
     BoxFuture, CanonicalProviderConfigAttributes, NoopNormalizer, ProviderFactory,
-    ProviderInitialization, ProviderReadyConfig, ProviderResult,
+    ProviderInitialization, ProviderResult,
 };
 use crate::resource::{
     ConcreteValue, DataSource, ParsedIgnorePath, ParsedIgnorePathSegment, Resource, State, Value,
@@ -403,14 +403,17 @@ impl ProviderFactory for ConfigFactory {
     fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
         ValidatedConfigSchema::validate(BTreeMap::new()).unwrap()
     }
-    fn validate_config(&self, _: &CanonicalProviderConfigAttributes) -> ProviderResult<()> {
+    fn validate_config(
+        &self,
+        _: &CanonicalProviderConfigAttributes,
+        _session: &crate::provider::ProviderValidationInputs,
+    ) -> ProviderResult<()> {
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
     fn create_provider(
         &self,
-        _: Option<&str>,
-        _: &ProviderReadyConfig,
+        _: &crate::provider::ProviderSession,
         _: crate::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         panic!("invalid configuration must not initialize a provider")
@@ -644,11 +647,12 @@ async fn review2_f4_dispatch_and_native_normalizer_receive_main_plaintext_shapes
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
             let schemas = SchemaRegistry::new();
+            let normalizer_boundary = crate::provider::ConfiguredNormalizer::fixture(&MainShapes);
             let context = ProviderPreparationContext::new(
                 &bindings,
                 &gate,
                 &[],
-                &MainShapes,
+                &normalizer_boundary,
                 &[],
                 &schemas,
                 type_checks,

@@ -139,12 +139,9 @@ impl AwsSdkCredentialSource {
             .credentials
             .as_ref()
             .expect("the test must populate the credential cache first");
-        let expired = AwsCredentials::new(
-            credentials.access_key_id(),
-            credentials.secret_access_key(),
-            credentials.session_token().map(str::to_string),
-            Some(SystemTime::now() - Duration::from_secs(1)),
-        );
+        let expired = credentials
+            .clone()
+            .with_expiry(Some(SystemTime::now() - Duration::from_secs(1)));
         cache.credentials = Some(expired);
     }
 }
@@ -271,6 +268,44 @@ mod tests {
         .find(|path| path.is_file())
     }
 
+    struct CredentialProbe {
+        protected: AwsCredentials,
+        access_key_id: String,
+        secret_access_key: String,
+        session_token: Option<String>,
+    }
+    impl CredentialProbe {
+        fn new(protected: AwsCredentials) -> Self {
+            let inputs = carina_core::provider::ProviderPlan::state_only()
+                .session("", None, None)
+                .guest_inventory();
+            let project = |value| match inputs.handoff(value).unwrap() {
+                carina_provider_protocol::types::Value::String(value) => value,
+                _ => unreachable!(),
+            };
+            Self {
+                access_key_id: project(protected.access_key_id()),
+                secret_access_key: project(protected.secret_access_key()),
+                session_token: protected.session_token().map(project),
+                protected,
+            }
+        }
+        fn access_key_id(&self) -> &str {
+            &self.access_key_id
+        }
+        fn secret_access_key(&self) -> &str {
+            &self.secret_access_key
+        }
+        fn session_token(&self) -> Option<&str> {
+            self.session_token.as_deref()
+        }
+    }
+    impl fmt::Debug for CredentialProbe {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            self.protected.fmt(f)
+        }
+    }
+
     #[tokio::test]
     async fn static_provider_returns_credentials_without_exposing_secrets() {
         let source = AwsSdkCredentialSource::from_static_for_test(
@@ -280,7 +315,7 @@ mod tests {
             None,
         );
 
-        let credentials = source.current_credentials().await.unwrap();
+        let credentials = CredentialProbe::new(source.current_credentials().await.unwrap());
         assert_eq!(credentials.access_key_id(), "AKIASTATIC");
         assert_eq!(credentials.secret_access_key(), "static-secret-sentinel");
         assert_eq!(credentials.session_token(), Some("static-session-sentinel"));
@@ -343,9 +378,9 @@ mod tests {
         };
         let source = AwsSdkCredentialSource::from_provider_for_test(provider);
 
-        let first = source.current_credentials().await.unwrap();
-        let second = source.current_credentials().await.unwrap();
-        let third = source.current_credentials().await.unwrap();
+        let first = CredentialProbe::new(source.current_credentials().await.unwrap());
+        let second = CredentialProbe::new(source.current_credentials().await.unwrap());
+        let third = CredentialProbe::new(source.current_credentials().await.unwrap());
 
         assert_eq!(first.access_key_id(), "AKIAEXPIRING");
         assert_eq!(second.access_key_id(), "AKIAFRESH");
@@ -378,9 +413,9 @@ mod tests {
         };
         let source = AwsSdkCredentialSource::from_provider_for_test(provider);
 
-        let first = source.current_credentials().await.unwrap();
-        let fallback = source.current_credentials().await.unwrap();
-        let backed_off = source.current_credentials().await.unwrap();
+        let first = CredentialProbe::new(source.current_credentials().await.unwrap());
+        let fallback = CredentialProbe::new(source.current_credentials().await.unwrap());
+        let backed_off = CredentialProbe::new(source.current_credentials().await.unwrap());
 
         assert_eq!(first.access_key_id(), "AKIACACHED");
         assert_eq!(fallback.access_key_id(), "AKIACACHED");
@@ -416,7 +451,7 @@ mod tests {
         source.current_credentials().await.unwrap();
         source.current_credentials().await.unwrap();
         tokio::time::advance(Duration::from_secs(30)).await;
-        let refreshed = source.current_credentials().await.unwrap();
+        let refreshed = CredentialProbe::new(source.current_credentials().await.unwrap());
 
         assert_eq!(refreshed.access_key_id(), "AKIAREFRESHED");
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -450,7 +485,7 @@ mod tests {
         source.current_credentials().await.unwrap();
         source.current_credentials().await.unwrap();
         source.expire_cached_credentials_for_test().await;
-        let refreshed = source.current_credentials().await.unwrap();
+        let refreshed = CredentialProbe::new(source.current_credentials().await.unwrap());
 
         assert_eq!(refreshed.access_key_id(), "AKIAREFRESHED");
         assert_eq!(calls.load(Ordering::SeqCst), 3);

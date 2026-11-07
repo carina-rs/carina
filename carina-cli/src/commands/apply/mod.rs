@@ -24,7 +24,7 @@ use carina_core::executor::{
 use carina_core::paths::ResolvedPath;
 use carina_core::plan::Plan;
 use carina_core::provider::AppliedIdentifier;
-use carina_core::provider::{self as provider_mod, Provider, ProviderNormalizer, ProviderRouter};
+use carina_core::provider::{self as provider_mod, HostNormalizer, HostProvider, ProviderRouter};
 use carina_core::resource::{
     CanonicalComparisonAttributes, CompositionSourceIdentityResolver, Current, DataSource,
     ModuleSource, NoPlaceholder, PlanValueKind, ResolvedResource, Resource, ResourceId,
@@ -216,14 +216,14 @@ struct BootstrapCreateContext<'a> {
     backend: &'a dyn StateBackend,
     parsed: &'a carina_core::parser::ExpandedInferredFile,
     provider_configs: &'a ResolvedProviderConfigs,
-    normalizer: &'a dyn ProviderNormalizer,
+    normalizer: &'a dyn HostNormalizer,
     factories: &'a [Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &'a carina_core::schema::SchemaRegistry,
 }
 
 async fn create_checked_bootstrap_resource(
     color_mode: crate::output_style::ColorMode,
-    operation_provider: &dyn Provider,
+    operation_provider: &dyn HostProvider,
     comparison_provider: &ProviderRouter,
     resource: Resource,
     context: BootstrapCreateContext<'_>,
@@ -314,7 +314,7 @@ carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                                 "{}",
                                 format_partial_state_bucket_create_warning(
                                     color_mode,
-                                    &carina_core::provider_text::ProviderText::new(&identifier),
+                                    &carina_core::provider_text::DiagnosticText::new(&identifier),
                                     &diagnostic
                                 )
                             );
@@ -325,10 +325,10 @@ carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                         let row = resolved_comparison
                             .context()
                             .with_observation(|comparison| match error.kind() {
-                                carina_core::provider::CreateFailureKind::NoResource(_error) => {
+                                carina_core::provider::HostCreateFailureKind::NoResource(_error) => {
                                     Ok(None)
                                 }
-                                carina_core::provider::CreateFailureKind::OutcomeUnknown {
+                                carina_core::provider::HostCreateFailureKind::OutcomeUnknown {
                                     unknown,
                                     error: _provider_error,
                                 } => Ok(Some(
@@ -336,7 +336,7 @@ carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                                         &resolved, unknown, None, schema, comparison,
                                     ),
                                 )),
-                                carina_core::provider::CreateFailureKind::IdentifierReported {
+                                carina_core::provider::HostCreateFailureKind::IdentifierReported {
                                     identified,
                                     error: _provider_error,
                                 } => carina_state::ResourceState::from_observation(
@@ -346,7 +346,7 @@ carina_state::ResourceState::from_provider_state_for_resource_and_schema(
                                 .map_err(|source| {
                                     AppError::from_resource_state_encoding(id.clone(), source)
                                 }),
-                                carina_core::provider::CreateFailureKind::InFlight {
+                                carina_core::provider::HostCreateFailureKind::InFlight {
                                     pending,
                                     error: _provider_error,
                                 } => carina_state::ResourceState::from_in_flight(
@@ -382,7 +382,7 @@ carina_state::ResourceState::from_provider_state_for_resource_and_schema(
 #[cfg(test)]
 async fn create_checked_bootstrap_resource_for_test(
     color_mode: crate::output_style::ColorMode,
-    operation_provider: &dyn Provider,
+    operation_provider: &dyn HostProvider,
     resource: Resource,
     context: BootstrapCreateContext<'_>,
 ) -> Result<(), AppError> {
@@ -429,8 +429,8 @@ async fn seed_protected_bootstrap_resource(
 
 fn format_partial_state_bucket_create_warning(
     color_mode: crate::output_style::ColorMode,
-    identifier: &carina_core::provider_text::ProviderText,
-    diagnostic: &carina_core::provider::PartialReadDiagnostic,
+    identifier: &carina_core::provider_text::DiagnosticText,
+    diagnostic: &carina_core::provider::HostPartialReadDiagnostic,
 ) -> String {
     let [reason, missing, state_recorded] = partial_read_detail_lines(diagnostic);
     format!(
@@ -711,7 +711,7 @@ fn saved_plan_replan_command(plan_path: &Path, source_path: &Path) -> String {
 
 struct ApplyExecutionContext<'a, S = ModuleSource> {
     provider: &'a ProviderRouter,
-    normalizer: &'a dyn ProviderNormalizer,
+    normalizer: &'a dyn HostNormalizer,
     provider_configs: &'a [ExpandedProviderConfig],
     factories: &'a [Box<dyn carina_core::provider::ProviderFactory>],
     schemas: &'a carina_core::schema::SchemaRegistry,
@@ -1033,7 +1033,7 @@ mod upstream_snapshot_tests {
 #[cfg(test)]
 pub async fn refresh_pending_states(
     color_mode: crate::output_style::ColorMode,
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     managed_current: &mut HashMap<ResourceId, Current>,
     pending_refreshes: &HashMap<ResourceId, AppliedIdentifier>,
 ) -> HashSet<ResourceId> {
@@ -1416,7 +1416,7 @@ pub(crate) async fn detect_drift<S: Clone>(
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     refresh_rows: &carina_state::RefreshRows,
     historical_addresses: &HistoricalResourceAddresses,
-    operation_provider: &dyn Provider,
+    operation_provider: &dyn HostProvider,
     comparison_provider: &ProviderRouter,
     state_file: Option<&StateFile>,
     schemas: &carina_core::schema::SchemaRegistry,
@@ -1641,7 +1641,7 @@ pub(crate) async fn detect_drift_for_test<S: Clone>(
     sorted_resources: &[carina_core::resource::Resource<S>],
     planned_state_entries: &[crate::commands::plan::ReloadedCurrentStateEntry],
     historical_addresses: &HistoricalResourceAddresses,
-    operation_provider: &dyn Provider,
+    operation_provider: &dyn HostProvider,
     state_file: Option<&StateFile>,
     schemas: &carina_core::schema::SchemaRegistry,
     apply_target: ApplyTarget<'_>,
@@ -1821,6 +1821,7 @@ async fn run_apply_with_observer_factory(
                     &validated_config,
                     bootstrap_provider_inputs.configs(),
                     backend_provider_name,
+                    validated_config.provider_plan(),
                 )
                 .await?;
                 // Module expansion can place a module-owned state-bucket
@@ -2061,10 +2062,11 @@ async fn create_state_bucket_bootstrap_provider<R>(
     validated_config: &ValidatedConfig<R>,
     provider_configs: &ResolvedProviderConfigs,
     provider_name: &str,
+    plan: &provider_mod::ProviderPlan,
 ) -> Result<
     (
         ProviderRouter,
-        Box<dyn carina_core::provider::ProviderNormalizer>,
+        Box<dyn carina_core::provider::HostNormalizer>,
     ),
     AppError,
 > {
@@ -2072,8 +2074,11 @@ async fn create_state_bucket_bootstrap_provider<R>(
     let factory = provider_mod::find_factory(ctx.factories(), provider_name)
         .ok_or_else(|| format!("No provider factory found for '{provider_name}'"))?;
     let config = prepare_default_provider_ready_config(factory, provider_name, provider_configs)?;
-    let provider = factory.create_initialized_provider(None, &config).await?;
-    let normalizer = factory.create_normalizer(None, &config).await?;
+    let session = plan.session(provider_name, None, Some(&config));
+    let provider = provider_mod::ProviderBoundary::initialize(factory, &session).await?;
+    let normalizer =
+        Box::new(provider_mod::ProviderBoundary::initialize_normalizer(factory, &session).await?)
+            as Box<dyn carina_core::provider::HostNormalizer>;
     let mut router = ProviderRouter::new();
     router.add_provider(provider_name.to_string(), provider);
     Ok((router, normalizer))
@@ -2217,8 +2222,13 @@ async fn run_apply_locked_owned(
             let raw_provider_configs = provider_configs.as_provider_configs();
             let remote_bindings = provider_inputs.remote_bindings();
             // Select appropriate Provider based on configuration
-            let provider =
-                get_provider_with_ctx(ctx, provider_configs, ProgressSink::Human).await?;
+            let provider = get_provider_with_ctx(
+                ctx,
+                provider_configs,
+                ProgressSink::Human,
+                validated_config.provider_plan(),
+            )
+            .await?;
 
             // carina#3132: `sorted_resources` is `mut` because deferred-for
             // expansion now runs post-refresh (after phase-2, below) via the
@@ -3169,8 +3179,12 @@ async fn prepare_saved_plan_secret_candidates(
     let wiring = validated_config.context();
     let canonical_resources = validated_config.resources();
     let parsed = canonical_resources.parsed();
-    let provider =
-        create_providers_from_configs_with_ctx(wiring, provider_inputs.configs()).await?;
+    let provider = create_providers_from_configs_with_ctx(
+        wiring,
+        provider_inputs.configs(),
+        validated_config.provider_plan(),
+    )
+    .await?;
     let expansion_prelude = crate::wiring::DeferredForExpansionPrelude::new(
         canonical_resources,
         &state_blocks.targets.removed_from,
@@ -3216,6 +3230,7 @@ async fn prepare_saved_plan_secret_candidates(
     let normalizers = create_normalizers_from_configs_with_ctx(
         validated_expansion.context(),
         provider_inputs.configs(),
+        validated_expansion.provider_plan(),
     )
     .await?;
     validated_expansion
@@ -3289,13 +3304,9 @@ fn rehydrate_desired_plan_file_from_parts(
                 )
                 .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
 
-                let sorted_resources = rehydrate_saved_resource_like(
-                    plan_file.sorted_resources(),
-                    &resource_candidates,
-                    apply_target,
-                    carina_core::value::rehydrate_resource_secrets,
-                    Resource::to_value_resource,
-                )?;
+                let provider_configuration = plan_file
+                    .rehydrate_provider_configuration(&resource_candidates, &data_source_candidates)
+                    .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
                 let unresolved_resources = rehydrate_saved_resource_like(
                     plan_file.unresolved_resources(),
                     &resource_candidates,
@@ -3337,13 +3348,6 @@ fn rehydrate_desired_plan_file_from_parts(
                         .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))
                 }).collect::<Result<_, _>>()?;
 
-                let data_sources = rehydrate_saved_resource_like(
-                    plan_file.data_sources(),
-                    &data_source_candidates,
-                    apply_target,
-                    carina_core::value::rehydrate_data_source_secrets,
-                    carina_core::resource::DataSource::to_value_data_source,
-                )?;
                 let data_source_origins = rehydrate_saved_resource_like(
                     plan_file.data_source_origins(),
                     &data_source_candidates,
@@ -3382,10 +3386,9 @@ fn rehydrate_desired_plan_file_from_parts(
 
                 Ok(plan_file.into_live(LivePlanFileValues {
                     plan: rehydrated_plan,
-                    sorted_resources,
+                    provider_configuration,
                     unresolved_resources,
                     compositions,
-                    data_sources,
                     data_source_origins,
                     provider_configs,
                     upstream_snapshot,
@@ -3950,7 +3953,9 @@ async fn run_apply_from_plan_locked_owned(
             let provider = match initialized_provider {
                 Some(provider) => provider,
                 None => {
-                    create_providers_from_configs_with_ctx(wiring, &resolved_provider_configs)
+                    create_providers_from_configs_with_ctx(wiring,
+&resolved_provider_configs,
+&validated_plan.provider_plan())
                         .await?
                 }
             };

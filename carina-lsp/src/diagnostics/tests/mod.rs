@@ -100,14 +100,14 @@ impl ProviderFactory for RegionConfigFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> std::pin::Pin<
         Box<
@@ -188,6 +188,7 @@ impl ProviderFactory for SuspendedValidationFactory {
     fn validate_config(
         &self,
         attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         if attributes.contains_key("region") {
             Err(
@@ -206,6 +207,7 @@ impl ProviderFactory for SuspendedValidationFactory {
         &self,
         _identity: &carina_core::schema::TypeIdentity,
         value: &carina_core::provider::CanonicalCustomTypeValue,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         if value.as_str() == "invalid-input" {
             return Err(carina_core::provider::ProviderError::invalid_input(
@@ -239,8 +241,7 @@ impl ProviderFactory for SuspendedValidationFactory {
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> std::pin::Pin<
         Box<
@@ -317,6 +318,7 @@ impl ProviderFactory for EnumDeclaredCustomTypeFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
@@ -325,6 +327,7 @@ impl ProviderFactory for EnumDeclaredCustomTypeFactory {
         &self,
         _identity: &carina_core::schema::TypeIdentity,
         value: &carina_core::provider::CanonicalCustomTypeValue,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         self.seen.lock().unwrap().push(value.to_string());
         if value.as_str() == "ENABLED" {
@@ -338,8 +341,7 @@ impl ProviderFactory for EnumDeclaredCustomTypeFactory {
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> std::pin::Pin<
         Box<
@@ -420,6 +422,7 @@ impl ProviderFactory for SharedRoleArnFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
@@ -428,6 +431,7 @@ impl ProviderFactory for SharedRoleArnFactory {
         &self,
         identity: &carina_core::schema::TypeIdentity,
         value: &carina_core::provider::CanonicalCustomTypeValue,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         assert_eq!(
             identity,
@@ -446,8 +450,7 @@ impl ProviderFactory for SharedRoleArnFactory {
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
@@ -524,6 +527,7 @@ impl ProviderFactory for BareTypeFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
@@ -532,6 +536,7 @@ impl ProviderFactory for BareTypeFactory {
         &self,
         identity: &carina_core::schema::TypeIdentity,
         _value: &carina_core::provider::CanonicalCustomTypeValue,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         assert_eq!(
             identity,
@@ -544,8 +549,7 @@ impl ProviderFactory for BareTypeFactory {
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,
@@ -884,14 +888,14 @@ impl ProviderFactory for SchemaFixtureFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        _config: &carina_core::provider::ProviderReadyConfig,
+        _config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
     ) -> carina_core::provider::BoxFuture<
         '_,

@@ -5,8 +5,7 @@ use std::sync::Arc;
 use carina_cli::wiring::LoadedProviderFactory;
 use carina_core::provider::{
     BoxFuture, CanonicalProviderConfigAttributes, InitializeOutcomeMint, ProviderFactory,
-    ProviderInitialization, ProviderReadyConfig, ProviderResult,
-    loaded_provider_snapshot_from_factories,
+    ProviderInitialization, ProviderResult, loaded_provider_snapshot_from_factories,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry, TypeIdentity,
@@ -30,14 +29,17 @@ impl ProviderFactory for CollectionFactory {
         Default::default()
     }
 
-    fn validate_config(&self, _: &CanonicalProviderConfigAttributes) -> ProviderResult<()> {
+    fn validate_config(
+        &self,
+        _: &CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
+    ) -> ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _: Option<&str>,
-        _: &ProviderReadyConfig,
+        _: &carina_core::provider::ProviderSession,
         _: InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { panic!("validation must not instantiate providers") })

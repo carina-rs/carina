@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use carina_core::config_loader::load_configuration_with_config;
 use carina_core::parser::{InferredFile, ProviderContext};
-use carina_core::provider::{BoxFuture, ProviderFactory, ProviderResult};
+use carina_core::provider::{BoxFuture, ProviderFactory};
 use carina_core::resource::Value;
 use carina_core::schema::SchemaRegistry;
 use carina_state::StateFile;
@@ -28,17 +28,23 @@ impl ProviderFactory for ProviderConfigCaptureFactory {
     fn validate_config(
         &self,
         _attributes: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> carina_core::provider::ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _binding: Option<&str>,
-        config: &carina_core::provider::ProviderReadyConfig,
+        config: &carina_core::provider::ProviderSession,
         _initialize_outcome: carina_core::provider::InitializeOutcomeMint,
-    ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
-        *self.received_role_arn.lock().unwrap() = config.attributes().get("role_arn").cloned();
+    ) -> BoxFuture<
+        '_,
+        carina_core::provider::ProviderResult<carina_core::provider::ProviderInitialization>,
+    > {
+        *self.received_role_arn.lock().unwrap() = config
+            .configuration()
+            .and_then(|config| config.attributes().get("role_arn"))
+            .cloned();
         Box::pin(async {
             Ok(
                 carina_core::provider::InitializeOutcome::unavailable().with_provider(Box::new(

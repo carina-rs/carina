@@ -20,7 +20,7 @@ use crate::effect::{DeletedInstanceKey, Effect, EffectGeneration};
 use crate::explicit::{ExplicitProjection, ProjectedAuthoring};
 use crate::non_empty::NonEmptyVec;
 use crate::plan::{Plan, ReplaceDisplayInfo};
-use crate::provider::{ComparisonResolutionError, ProviderResult, ProviderRouter};
+use crate::provider::{ComparisonResolutionError, HostResult, ProviderRouter};
 use crate::provider::{NestedWriteOnlyRecord, PersistedAttributes};
 use crate::resource::{
     CanonicalComparisonAttributes, ConcreteValue, DefaultTagKeys, DeferredValue, ResourceId,
@@ -719,7 +719,7 @@ impl PreparedPlanDisplay {
         explicit: &HashMap<ResourceId, crate::explicit::ExplicitFields>,
         provider: &ProviderRouter,
         references: &crate::references::ResolvedReferences,
-    ) -> ProviderResult<Self> {
+    ) -> HostResult<Self> {
         let replacements = plan
             .replace_display_info()
             .map(|info| (info.create_idx, info))
@@ -755,7 +755,7 @@ impl PreparedPlanDisplay {
                         )
                     }
                 })
-                .collect::<ProviderResult<Vec<_>>>()?
+                .collect::<HostResult<Vec<_>>>()?
         };
         Ok(Self {
             plan,
@@ -840,7 +840,7 @@ impl<'a, S, V: crate::resource::PlanValueKind> PlanDisplay<'a, S, V> {
         registry: Option<&SchemaRegistry>,
         explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
         provider: &ProviderRouter,
-    ) -> ProviderResult<std::borrow::Cow<'a, [DetailRow]>> {
+    ) -> HostResult<std::borrow::Cow<'a, [DetailRow]>> {
         if detail == DetailLevel::NamesOnly {
             return Ok(std::borrow::Cow::Borrowed(&[]));
         }
@@ -850,7 +850,7 @@ impl<'a, S, V: crate::resource::PlanValueKind> PlanDisplay<'a, S, V> {
                 rows,
             } => {
                 if detail != *prepared_detail {
-                    return Err(crate::provider::ProviderError::invalid_input(
+                    return Err(crate::provider::HostError::invalid_input(
                         "display detail differs from the prepared request",
                     ));
                 }
@@ -858,7 +858,7 @@ impl<'a, S, V: crate::resource::PlanValueKind> PlanDisplay<'a, S, V> {
                     .get(index)
                     .map(|rows| std::borrow::Cow::Borrowed(rows.as_slice()))
                     .ok_or_else(|| {
-                        crate::provider::ProviderError::invalid_input(
+                        crate::provider::HostError::invalid_input(
                             "prepared display has no rows for this effect index",
                         )
                     });
@@ -866,7 +866,7 @@ impl<'a, S, V: crate::resource::PlanValueKind> PlanDisplay<'a, S, V> {
             DisplayRows::Build(comparisons) => *comparisons,
         };
         let effect = self.plan.effects().get(index).ok_or_else(|| {
-            crate::provider::ProviderError::invalid_input("plan has no effect at this index")
+            crate::provider::HostError::invalid_input("plan has no effect at this index")
         })?;
         let replacement = self
             .plan
@@ -909,7 +909,7 @@ pub fn build_detail_rows_by_instance<S, V: crate::resource::PlanValueKind>(
     prev_explicit: Option<&HashMap<ResourceId, crate::explicit::ExplicitFields>>,
     provider: &ProviderRouter,
     comparisons: DetailComparisons<'_>,
-) -> ProviderResult<Vec<DetailRow>> {
+) -> HostResult<Vec<DetailRow>> {
     if detail == DetailLevel::NamesOnly {
         return Ok(Vec::new());
     }
@@ -1821,7 +1821,7 @@ pub fn build_replace_detail_rows_from_display<S, D, V: crate::resource::PlanValu
     explicit: Option<&crate::explicit::ExplicitFields>,
     provider: &ProviderRouter,
     comparisons: DetailComparisons<'_>,
-) -> ProviderResult<Vec<DetailRow>> {
+) -> HostResult<Vec<DetailRow>> {
     let Some(Effect::Delete {
         id,
         identifier,

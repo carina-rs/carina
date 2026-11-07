@@ -1,6 +1,8 @@
 //! Dependency computation and parallel effect execution.
 
 #[cfg(test)]
+use crate::provider::Provider;
+#[cfg(test)]
 use crate::resource::ResolvedResourceId;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -9,7 +11,7 @@ use std::time::Instant;
 use crate::effect::Effect;
 #[cfg(test)]
 use crate::effect::deps::UnresolvedResource;
-use crate::provider::{AppliedIdentifier, CancelledCreateReport, Provider, ProviderRouter};
+use crate::provider::{AppliedIdentifier, CancelledCreateReport, HostProvider, ProviderRouter};
 use crate::resource::{ResourceId, ResourceIdentity};
 use crate::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
@@ -474,7 +476,7 @@ pub fn classify_stalled_effects<S>(
 pub(super) async fn execute_effects_sequential<
     S: Clone + crate::resource::AnonymousIdentityModuleSource,
 >(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     comparison_provider: &ProviderRouter,
     input: &mut RuntimeExecutionInput<'_, S>,
     observer: &dyn ExecutionObserver<S>,
@@ -1834,7 +1836,7 @@ mod tests {
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(1),
                     execute_effects_sequential(
-                        &provider,
+                        &crate::provider::ProviderBoundary::fixture(&provider),
                         &comparison_provider,
                         &mut input,
                         &observer,
@@ -2000,7 +2002,7 @@ mod tests {
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(2),
                     execute_effects_sequential(
-                        &provider,
+                        &crate::provider::ProviderBoundary::fixture(&provider),
                         &comparison_provider,
                         &mut input,
                         &observer,

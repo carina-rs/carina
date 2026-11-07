@@ -76,7 +76,7 @@ pub enum SerializationError {
     /// must strip / resolve it before this point — see
     /// [`crate::resource::value_contains_unknown`] for recursive
     /// detection before crossing a serialization boundary.
-    #[error("cannot serialize at {context}: value is not yet known ({reason})", reason = crate::provider_text::ProviderText::new(reason.to_string()))]
+    #[error("cannot serialize at {context}: value is not yet known ({reason})", reason = crate::provider_text::DiagnosticText::new(reason.to_string()))]
     UnknownNotAllowed {
         reason: Box<ApplyTimeUnknown>,
         context: SerializationContext,
@@ -92,7 +92,7 @@ pub enum SerializationError {
     /// consumed only via `Display`; programmatic path inspection has
     /// no callers today. Lift to `AccessPath` if a future caller needs
     /// it.
-    #[error("cannot serialize at {context}: unresolved reference {path}", path = crate::provider_text::ProviderText::new(path))]
+    #[error("cannot serialize at {context}: unresolved reference {path}", path = crate::provider_text::DiagnosticText::new(path))]
     UnresolvedResourceRef {
         path: String,
         context: SerializationContext,
@@ -106,14 +106,14 @@ pub enum SerializationError {
     /// A `Value::Deferred(DeferredValue::FunctionCall)` reached a serialization boundary. The
     /// resolver should evaluate the function (built-in or user-defined)
     /// before this point; reaching this arm is a resolver bug.
-    #[error("cannot serialize at {context}: unresolved function call {name}(...)", name = crate::provider_text::ProviderText::new(name))]
+    #[error("cannot serialize at {context}: unresolved function call {name}(...)", name = crate::provider_text::DiagnosticText::new(name))]
     UnresolvedFunctionCall {
         name: String,
         context: SerializationContext,
     },
     /// A deferred postfix field/index access reached a concrete-only
     /// serialization boundary before its base resolved.
-    #[error("cannot serialize at {context}: unresolved access {expression}", expression = crate::provider_text::ProviderText::new(expression))]
+    #[error("cannot serialize at {context}: unresolved access {expression}", expression = crate::provider_text::DiagnosticText::new(expression))]
     UnresolvedAccess {
         expression: String,
         context: SerializationContext,
@@ -129,7 +129,7 @@ pub enum SerializationError {
     /// A parser-authored enum identifier reached a serialization boundary
     /// without schema resolution. Provider transports accept only
     /// [`CanonicalEnumValue`] API spellings; plain strings remain literals.
-    #[error("cannot serialize at {context}: unresolved enum identifier {value}", value = crate::provider_text::ProviderText::new(value))]
+    #[error("cannot serialize at {context}: unresolved enum identifier {value}", value = crate::provider_text::DiagnosticText::new(value))]
     UnresolvedEnumIdentifier {
         value: String,
         context: SerializationContext,
@@ -142,7 +142,7 @@ pub enum SerializationError {
     SecretNotAllowed { context: SerializationContext },
     /// A secret was found in a named saved-plan field that cannot safely
     /// persist plaintext or a placeholder.
-    #[error("cannot serialize saved-plan field {location}: secret values are not allowed", location = crate::provider_text::ProviderText::new(location))]
+    #[error("cannot serialize saved-plan field {location}: secret values are not allowed", location = crate::provider_text::DiagnosticText::new(location))]
     SavedPlanFieldSecretNotAllowed { location: String },
 }
 
@@ -267,7 +267,7 @@ impl std::fmt::Display for SecretRehydrationSiteError {
         write!(
             f,
             "{}: {}",
-            crate::provider_text::ProviderText::new(&self.location),
+            crate::provider_text::DiagnosticText::new(&self.location),
             self.source
         )
     }
@@ -414,7 +414,7 @@ impl DecodedNumber {
 pub enum PersistedValueDecodeError {
     #[error(transparent)]
     Number(#[from] JsonNumberDecodeError),
-    #[error("invalid host-reserved persisted JSON object with keys {}", crate::provider_text::ProviderText::new(format!("{keys:?}")))]
+    #[error("invalid host-reserved persisted JSON object with keys {}", crate::provider_text::DiagnosticText::new(format!("{keys:?}")))]
     InvalidHostObject { keys: Vec<String> },
     #[error("malformed {PERSISTED_ENUM_KEY} persisted enum payload")]
     MalformedEnum,
@@ -1379,7 +1379,7 @@ impl ValueSpan {
 /// structure for frontends to style it without re-parsing the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedValue {
-    plain: crate::provider_text::ProviderText,
+    plain: crate::provider_text::DiagnosticText,
     spans: Vec<ValueSpan>,
 }
 
@@ -1407,7 +1407,7 @@ impl std::fmt::Display for RenderedValue {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderedKey {
     raw: String,
-    text: crate::provider_text::ProviderText,
+    text: crate::provider_text::DiagnosticText,
 }
 
 impl RenderedKey {
@@ -1530,7 +1530,7 @@ pub fn format_value_user_facing<P: ValueKind, B: BindingAddress>(value: &Value<P
         Value::Concrete(ConcreteValue::String(value)) => value.expose_plaintext().to_string(),
         _ => format_value(value),
     };
-    crate::provider_text::ProviderText::new(rendered).to_string()
+    crate::provider_text::DiagnosticText::new(rendered).to_string()
 }
 
 /// Render an observed attribute after raw-key selection, sorting and lookup.
@@ -1540,7 +1540,7 @@ pub fn format_attribute_user_facing<P: ValueKind, B: BindingAddress>(
 ) -> String {
     format!(
         "{}={}",
-        crate::provider_text::ProviderText::new(key),
+        crate::provider_text::DiagnosticText::new(key),
         format_value_user_facing(value)
     )
 }
@@ -1596,7 +1596,7 @@ impl FormatSink for StringSink {
 
 #[derive(Default)]
 struct SpanSink {
-    sanitizer: crate::provider_text::ProviderTextBuilder,
+    sanitizer: crate::provider_text::DiagnosticTextBuilder,
     spans: Vec<(ValueSpanKind, std::ops::Range<usize>)>,
 }
 
@@ -6662,7 +6662,7 @@ impl<'a, S, H: PlaceholderKind, B: BindingAddress, D> CanonicalizedResources<'a,
 /// The structured [`crate::schema::TypeError`] is retained as typed data while
 /// this terminal diagnostic renders it exactly once.
 #[derive(Debug, Error)]
-#[error("{resource}: failed to canonicalize enum attribute `{attribute}`: {error}", resource = crate::provider_text::ProviderText::new(resource.to_string()), attribute = crate::provider_text::ProviderText::new(attribute))]
+#[error("{resource}: failed to canonicalize enum attribute `{attribute}`: {error}", resource = crate::provider_text::DiagnosticText::new(resource.to_string()), attribute = crate::provider_text::DiagnosticText::new(attribute))]
 pub struct EnumCanonicalizationError {
     resource: Box<crate::resource::ResourceId>,
     attribute: String,
@@ -6911,7 +6911,7 @@ pub(crate) fn canonicalize_provider_config_with_type_and_ancestry<
 /// A provider configuration value could not be resolved through the
 /// provider-declared attribute type.
 #[derive(Debug, Error)]
-#[error("provider {provider}: failed to canonicalize enum attribute `{attribute}`: {error}", provider = crate::provider_text::ProviderText::new(provider), attribute = crate::provider_text::ProviderText::new(attribute))]
+#[error("provider {provider}: failed to canonicalize enum attribute `{attribute}`: {error}", provider = crate::provider_text::DiagnosticText::new(provider), attribute = crate::provider_text::DiagnosticText::new(attribute))]
 pub struct ProviderConfigCanonicalizationError {
     provider: String,
     attribute: String,

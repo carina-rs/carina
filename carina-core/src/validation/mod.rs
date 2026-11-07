@@ -823,6 +823,17 @@ pub struct ResolvedFile<E> {
 }
 
 impl<E> ResolvedFile<E> {
+    /// Admit the complete file produced by binding resolution and expansion.
+    pub fn provider_plan(&self) -> crate::provider::ProviderPlan {
+        self.inner.provider_plan()
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn for_test(inner: crate::parser::ExpandedFile<E>) -> Self {
+        Self { inner }
+    }
+
     pub fn as_file(&self) -> &crate::parser::ExpandedFile<E> {
         &self.inner
     }

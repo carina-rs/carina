@@ -24,11 +24,11 @@ pub enum ProviderWireTarget {
 impl fmt::Display for ProviderWireTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Resource(id) => crate::provider_text::ProviderText::new(id.to_string()).fmt(f),
+            Self::Resource(id) => crate::provider_text::DiagnosticText::new(id.to_string()).fmt(f),
             Self::Configuration { provider } => write!(
                 f,
                 "provider {} configuration",
-                crate::provider_text::ProviderText::new(provider)
+                crate::provider_text::DiagnosticText::new(provider)
             ),
         }
     }
@@ -51,7 +51,7 @@ impl fmt::Debug for ProviderWireError {
             .field("attribute_path", &self.attribute_path())
             .field(
                 "error",
-                &crate::provider_text::ProviderText::new(self.error.to_string()),
+                &crate::provider_text::DiagnosticText::new(self.error.to_string()),
             )
             .finish()
     }
@@ -81,7 +81,7 @@ impl ProviderWireError {
         self.error.as_ref()
     }
 
-    pub fn attribute_path(&self) -> crate::provider_text::ProviderText {
+    pub fn attribute_path(&self) -> crate::provider_text::DiagnosticText {
         fn append_key(path: &mut String, key: &str) {
             let mut chars = key.chars();
             let identifier = chars
@@ -115,7 +115,7 @@ impl ProviderWireError {
                 WirePathSegment::Secret => path.push_str(crate::schema::SECRET_VALUE_MASK),
             }
         }
-        crate::provider_text::ProviderText::new(path)
+        crate::provider_text::DiagnosticText::new(path)
     }
 }
 
@@ -207,6 +207,7 @@ mod sealed {
 /// let _ = attributes.project(&target, token);
 /// ```
 pub trait ProviderWirePayload: sealed::Sealed {
+    #[doc(hidden)]
     type Projection: Clone;
     #[doc(hidden)]
     fn project(
@@ -278,7 +279,7 @@ impl<T: ProviderWirePayload> fmt::Debug for WireReady<T> {
 
 // Check the transport projection while retaining original annotations in core.
 // Every recursive secret conversion protects errors at its own payload boundary.
-fn project_plaintext(value: &Value) -> Result<protocol::Value, ProtocolConvertError> {
+pub(crate) fn project_plaintext(value: &Value) -> Result<protocol::Value, ProtocolConvertError> {
     match value {
         Value::Deferred(DeferredValue::Secret(payload)) => {
             payload.try_project_plaintext(project_plaintext)

@@ -7,6 +7,8 @@
 //!
 //! See `notes/specs/2026-05-09-wait-construct-design.md` §Executor logic.
 
+#[cfg(test)]
+use crate::provider::{Provider, ProviderError};
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -20,8 +22,8 @@ use crate::effect::Effect;
 use crate::executor::scheduler::FailureView;
 use crate::executor::{ExecutionEvent, ExecutionObserver, ProgressInfo};
 use crate::provider::{
-    AppliedIdentifier, CancelledCreateReport, CreateCallCancellationReceiver,
-    PartialReadDiagnostic, Provider, ProviderError, ReadRequest,
+    AppliedIdentifier, CancelledCreateReport, CreateCallCancellationReceiver, HostError,
+    HostPartialReadDiagnostic, HostProvider, ReadRequest,
 };
 #[cfg(test)]
 use crate::provider::{ReadOutcome, fixture_read_outcome_for_identifier};
@@ -152,8 +154,8 @@ pub enum WaitOutcome {
         last_attrs: HashMap<String, crate::resource::SnapshotValue>,
         elapsed: Duration,
     },
-    NotFound(ProviderError),
-    ReadFailed(ProviderError),
+    NotFound(HostError),
+    ReadFailed(HostError),
     UnavailableSecret(crate::resource::UnavailableSecretError),
 }
 
@@ -460,7 +462,7 @@ impl<S> StartedEffect<'_, S> {
     pub(super) fn partially_succeeded(
         mut self,
         state: &State,
-        diagnostic: &PartialReadDiagnostic,
+        diagnostic: &HostPartialReadDiagnostic,
         duration: Duration,
     ) {
         let progress = self.finish();
@@ -725,7 +727,7 @@ impl<'a, 'fut, R, S> NextReady<'a, 'fut, R, S> {
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_wait_effect<S>(
     cleanup_loop: &CleanupAwareLoop<'_>,
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     wait: WaitEffectRef<'_, S>,
     identifier_resolver: &WaitIdentifierResolver<'_>,
     cancel: tokio::sync::watch::Receiver<WaitSignal>,
@@ -747,7 +749,7 @@ pub(super) async fn execute_wait_effect<S>(
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_wait_effect_with_heartbeat_cadence<S>(
     cleanup_loop: &CleanupAwareLoop<'_>,
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     wait: WaitEffectRef<'_, S>,
     identifier_resolver: &WaitIdentifierResolver<'_>,
     mut cancel: tokio::sync::watch::Receiver<WaitSignal>,
@@ -774,7 +776,7 @@ pub(super) async fn execute_wait_effect_with_heartbeat_cadence<S>(
         let iteration = async {
             let Some(target_identifier) = identifier_resolver(target_id) else {
                 return Some(WaitOutcome::ReadFailed(
-                    ProviderError::internal(format!(
+                    HostError::internal(format!(
                         "wait target {} has no provider identifier",
                         target_id
                     ))
@@ -786,14 +788,14 @@ pub(super) async fn execute_wait_effect_with_heartbeat_cadence<S>(
                 .await
             {
                 Ok(outcome) => outcome.into_state(),
-                Err(err @ ProviderError::NotFound(_)) => {
+                Err(err @ HostError::NotFound(_)) => {
                     return Some(WaitOutcome::NotFound(err));
                 }
                 Err(err) => return Some(WaitOutcome::ReadFailed(err)),
             };
             if !state.exists {
                 return Some(WaitOutcome::NotFound(
-                    ProviderError::not_found(format!(
+                    HostError::not_found(format!(
                         "wait target {} not found (deleted out-of-band?)",
                         target_id
                     ))
@@ -1245,9 +1247,10 @@ mod tests {
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
             let cleanup_loop = shutdown.cleanup_aware_loop();
 
+            let provider_boundary = crate::provider::ProviderBoundary::fixture(&provider);
             let wait = execute_wait_effect(
                 &cleanup_loop,
-                &provider,
+                &provider_boundary,
                 WaitEffectRef::from_effect(&effect).unwrap(),
                 &provider_identifier,
                 cancel_rx,
@@ -1296,9 +1299,10 @@ mod tests {
             let (trigger, shutdown) = crate::shutdown::testing::shutdown_channel();
             let cleanup_loop = shutdown.cleanup_aware_loop();
 
+            let provider_boundary = crate::provider::ProviderBoundary::fixture(&provider);
             let wait = execute_wait_effect(
                 &cleanup_loop,
-                &provider,
+                &provider_boundary,
                 WaitEffectRef::from_effect(&effect).unwrap(),
                 &provider_identifier,
                 cancel_rx,
@@ -1356,7 +1360,7 @@ mod tests {
             CLEANUP_TEST_BOUND,
             execute_wait_effect(
                 &cleanup_loop,
-                provider.as_ref(),
+                &crate::provider::ProviderBoundary::fixture(provider.as_ref()),
                 WaitEffectRef::from_effect(&effect).unwrap(),
                 &provider_identifier,
                 cancel_rx,
@@ -1395,7 +1399,7 @@ mod tests {
 
             let result = execute_wait_effect(
                 &cleanup_loop,
-                &provider,
+                &crate::provider::ProviderBoundary::fixture(&provider),
                 WaitEffectRef::from_effect(&effect).unwrap(),
                 &provider_identifier,
                 cancel_rx,
@@ -1427,7 +1431,7 @@ mod tests {
         let cleanup_loop = shutdown.cleanup_aware_loop();
         let result = execute_wait_effect(
             &cleanup_loop,
-            &provider,
+            &crate::provider::ProviderBoundary::fixture(&provider),
             WaitEffectRef::from_effect(&effect).unwrap(),
             &provider_identifier,
             cancel_rx,
@@ -1458,7 +1462,7 @@ mod tests {
         let cleanup_loop = shutdown.cleanup_aware_loop();
         let result = execute_wait_effect(
             &cleanup_loop,
-            &provider,
+            &crate::provider::ProviderBoundary::fixture(&provider),
             WaitEffectRef::from_effect(&effect).unwrap(),
             &provider_identifier,
             cancel_rx,
@@ -1482,7 +1486,7 @@ mod tests {
         let cleanup_loop = shutdown.cleanup_aware_loop();
         let result = execute_wait_effect(
             &cleanup_loop,
-            &provider,
+            &crate::provider::ProviderBoundary::fixture(&provider),
             WaitEffectRef::from_effect(&effect).unwrap(),
             &provider_identifier,
             cancel_rx,
@@ -1595,7 +1599,7 @@ mod tests {
         let cleanup_loop = shutdown.cleanup_aware_loop();
         let result = execute_wait_effect(
             &cleanup_loop,
-            &provider,
+            &crate::provider::ProviderBoundary::fixture(&provider),
             WaitEffectRef::from_effect(&effect).unwrap(),
             &provider_identifier,
             cancel_rx,
@@ -1618,6 +1622,7 @@ mod tests {
         let shutdown = crate::shutdown::ShutdownToken::running();
         let cleanup_loop = shutdown.cleanup_aware_loop();
 
+        let provider_boundary = crate::provider::ProviderBoundary::fixture(&provider);
         let result = tokio::join!(
             async {
                 loop {
@@ -1631,7 +1636,7 @@ mod tests {
             },
             execute_wait_effect(
                 &cleanup_loop,
-                &provider,
+                &provider_boundary,
                 WaitEffectRef::from_effect(&effect).unwrap(),
                 &provider_identifier,
                 cancel_rx,
@@ -1672,7 +1677,7 @@ mod tests {
 
         let result = execute_wait_effect_with_heartbeat_cadence(
             &cleanup_loop,
-            &provider,
+            &crate::provider::ProviderBoundary::fixture(&provider),
             WaitEffectRef::from_effect(&effect).unwrap(),
             &provider_identifier,
             cancel_rx,

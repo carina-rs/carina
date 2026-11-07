@@ -632,7 +632,7 @@ pub fn validate_custom_type<P: PlaceholderKind, B: BindingAddress>(
     identity: &TypeIdentity,
     value: &GenericValue<P, B>,
     _config: &ProviderContext,
-) -> crate::provider::ProviderResult<()> {
+) -> crate::provider::HostResult<()> {
     match value {
         GenericValue::Deferred(DeferredValue::ResourceRef { .. }) => return Ok(()),
         GenericValue::Deferred(
@@ -648,7 +648,7 @@ pub fn validate_custom_type<P: PlaceholderKind, B: BindingAddress>(
     let declaration = crate::schema::builtin_type_registry()
         .get(identity)
         .ok_or_else(|| {
-            crate::provider::ProviderError::invalid_input(format!(
+            crate::provider::HostError::invalid_input(format!(
                 "unknown custom type `{identity}`; provider-owned annotations must resolve to an owner-qualified schema type"
             ))
         })?;
@@ -657,6 +657,7 @@ pub fn validate_custom_type<P: PlaceholderKind, B: BindingAddress>(
             "Custom type validation failed",
             error,
         )
+        .with_secrets(crate::provider::ProviderValidationInputs::collect([value]).redaction_set())
     })
 }
 

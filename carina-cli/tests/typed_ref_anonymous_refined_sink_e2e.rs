@@ -58,14 +58,14 @@ impl ProviderFactory for TypedRefMockFactory {
     fn validate_config(
         &self,
         _: &carina_core::provider::CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
     ) -> ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _: Option<&str>,
-        _: &carina_core::provider::ProviderReadyConfig,
+        _: &carina_core::provider::ProviderSession,
         _: carina_core::provider::InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ProviderInitialization>> {
         Box::pin(async {
@@ -597,6 +597,7 @@ fn apply_unknown_outputs(attributes: &str, output: Value, port: i64) -> Executio
         port,
         creates: Mutex::new(Vec::new()),
     };
+    let provider = std::sync::Arc::new(provider);
     let input = LiveExecutionInput {
         plan: &fixture.plan,
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
@@ -623,7 +624,7 @@ fn apply_unknown_outputs(attributes: &str, output: Value, port: i64) -> Executio
     let outcome = tokio::runtime::Runtime::new()
         .unwrap()
         .block_on(execute_live_plan_for_test(
-            &provider,
+            &carina_cli::test_support::boundary(Box::new(std::sync::Arc::clone(&provider))),
             input,
             &Observer,
             carina_core::shutdown::ShutdownToken::running(),

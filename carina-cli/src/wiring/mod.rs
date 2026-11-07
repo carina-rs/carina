@@ -113,7 +113,7 @@ use carina_core::effect::{
     Effect, EffectGeneration, MoveAuthority, OutcomeUnknownImportReplacement, ResolvedMove,
 };
 use carina_core::executor::normalized::{
-    apply_desired_normalization_slice, is_value_fully_concrete_for_expansion,
+    apply_host_desired_normalization_slice, is_value_fully_concrete_for_expansion,
     states_contain_unknown,
 };
 use carina_core::executor::{
@@ -135,9 +135,9 @@ use carina_core::parser::{
 use carina_core::parser::{MovedAddresses, ParseWarning};
 use carina_core::plan::{Plan, PlanError, PlanErrorKind};
 use carina_core::provider::{
-    self as provider_mod, AppliedIdentifier, BoxFuture, InitializedProvider, LiftedSavedAttrs,
-    LoadedProviderSnapshot, NormalizerRouter, Provider, ProviderError, ProviderFactory,
-    ProviderLoadedSchemaRegistry, ProviderNormalizer, ProviderRouter,
+    self as provider_mod, AppliedIdentifier, BoxFuture, HostError, HostNormalizer, HostProvider,
+    LiftedSavedAttrs, LoadedProviderSnapshot, NormalizerRouter, ProviderFactory,
+    ProviderLoadedSchemaRegistry, ProviderRouter,
 };
 use carina_core::provider_source::ProviderSource;
 #[cfg(test)]
@@ -619,6 +619,7 @@ enum ValidationReadyOrigin {
 pub struct ValidationReady<R> {
     inner: R,
     origin: ValidationReadyOrigin,
+    provider_plan: provider_mod::ProviderPlan,
 }
 
 impl ValidationReady<()> {
@@ -626,6 +627,7 @@ impl ValidationReady<()> {
         Self {
             inner: (),
             origin: ValidationReadyOrigin::SavedPlanArtifact,
+            provider_plan: provider_mod::ProviderPlan::state_only(),
         }
     }
 }
@@ -636,6 +638,7 @@ impl<R> ValidationReady<R> {
         Self {
             inner,
             origin: ValidationReadyOrigin::Fixture,
+            provider_plan: provider_mod::ProviderPlan::state_only(),
         }
     }
 
@@ -654,6 +657,7 @@ impl<R> ValidationReady<R> {
             ValidationReady {
                 inner,
                 origin: self.origin,
+                provider_plan: self.provider_plan,
             },
             output,
         ))
@@ -667,9 +671,20 @@ impl<R> ValidationReady<R> {
         F: FnOnce(R) -> Fut,
         Fut: std::future::Future<Output = Result<(T, O), E>>,
     {
-        let Self { inner, origin } = self;
+        let Self {
+            inner,
+            origin,
+            provider_plan,
+        } = self;
         let (inner, output) = transform(inner).await?;
-        Ok((ValidationReady { inner, origin }, output))
+        Ok((
+            ValidationReady {
+                inner,
+                origin,
+                provider_plan,
+            },
+            output,
+        ))
     }
 
     async fn try_map_async_preserving_binding_use_resolution<T, E, F, Fut>(
@@ -684,15 +699,18 @@ impl<R> ValidationReady<R> {
         Ok(ValidationReady {
             inner,
             origin: self.origin,
+            provider_plan: self.provider_plan,
         })
     }
 }
 
 impl<E> ValidationReady<ExpandedFile<E>> {
     fn from_resolved_file(file: carina_core::validation::ResolvedFile<E>) -> Self {
+        let provider_plan = file.provider_plan();
         Self {
             inner: file.into_file(),
             origin: ValidationReadyOrigin::Parsed,
+            provider_plan,
         }
     }
 }
@@ -702,9 +720,11 @@ impl<E> ValidationReady<CanonicalResourcePair<E>> {
         parsed: carina_core::validation::ResolvedFile<E>,
         unresolved: Vec<Resource>,
     ) -> Self {
+        let provider_plan = parsed.provider_plan();
         Self {
             inner: CanonicalResourcePair::from_resolved_file(parsed, unresolved),
             origin: ValidationReadyOrigin::Parsed,
+            provider_plan,
         }
     }
 }
@@ -799,6 +819,12 @@ pub struct ValidatedConfig<
     wiring: ValidatedWiring,
     resources: ValidationReady<R>,
     config_state: std::marker::PhantomData<C>,
+}
+
+impl<R, C> ValidatedConfig<R, C> {
+    pub fn provider_plan(&self) -> &provider_mod::ProviderPlan {
+        &self.resources.provider_plan
+    }
 }
 
 impl<R: fmt::Debug, C> fmt::Debug for ValidatedConfig<R, C> {
@@ -2191,7 +2217,7 @@ impl ValidatedConfig<ExpandedInferredFile> {
 impl<E: Clone> ValidatedConfig<ExpandedFile<E>> {
     /// Run the address-preserving state-refresh expansion through this owner,
     /// keeping the mutated file bound to its validating wiring.
-    pub(crate) async fn expand_refresh_and_lift_states<P: Provider + ProviderNormalizer>(
+    pub(crate) async fn expand_refresh_and_lift_states<P: HostProvider + HostNormalizer>(
         &mut self,
         inputs: ValidatedExpandRefreshAndLiftInputs<
             '_,
@@ -2272,8 +2298,8 @@ impl<E> ValidatedConfig<ExpandedCanonicalResources<E>> {
     pub(crate) async fn prepare_desired_side_for_plan(
         &mut self,
         provider_configs: &[ExpandedProviderConfig],
-        normalizer: &dyn ProviderNormalizer,
-    ) -> carina_core::provider::ProviderResult<()> {
+        normalizer: &dyn HostNormalizer,
+    ) -> carina_core::provider::HostResult<()> {
         let Self {
             wiring, resources, ..
         } = self;
@@ -2971,11 +2997,11 @@ where
 fn runtime_instantiation_error_with_provenance<E>(
     installed: &carina_provider_resolver::InstalledProvider,
     error: E,
-) -> ProviderError
+) -> carina_core::provider::ProviderError
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    ProviderError::internal_caused_by(
+    carina_core::provider::ProviderError::internal_caused_by(
         "Failed to instantiate WASM provider runtime instance",
         installed.with_load_error(error),
     )
@@ -3972,17 +3998,17 @@ pub(crate) fn compute_canonical_pair_anonymous_identifiers_with_policy_with_ctx<
 /// 4. `normalize_state` runs provider-specific state transforms; host schema
 ///    walks own all enum lifting used for comparison.
 pub struct PlanPreprocessor<'a> {
-    normalizer: &'a dyn ProviderNormalizer,
+    normalizer: &'a dyn HostNormalizer,
     ctx: &'a WiringContext,
 }
 
 pub(crate) async fn hydrate_prior_managed_states(
     managed_current: &mut HashMap<ResourceId, Current>,
     orphans: &mut Orphans,
-    normalizer: &dyn ProviderNormalizer,
+    normalizer: &dyn HostNormalizer,
     saved_attrs: &LiftedSavedAttrs,
     state_file: Option<&StateFile>,
-) -> Result<(), ProviderError> {
+) -> Result<(), HostError> {
     transform_prior_managed_provider_states(managed_current, orphans, async |states| {
         normalizer
             .hydrate_read_state(states, saved_attrs.as_provider_saved_attrs())
@@ -3999,10 +4025,10 @@ pub(crate) async fn hydrate_prior_data_source_values(
     managed_current: &mut HashMap<ResourceId, Current>,
     data_source_values: &mut DataSourceValues,
     orphans: &mut Orphans,
-    normalizer: &dyn ProviderNormalizer,
+    normalizer: &dyn HostNormalizer,
     saved_attrs: &LiftedSavedAttrs,
     state: &ProjectedStateRead<'_>,
-) -> Result<(), ProviderError> {
+) -> Result<(), HostError> {
     let mut read_states = data_source_values.read_states_map();
     transform_prior_provider_states(
         managed_current,
@@ -4025,7 +4051,7 @@ pub(crate) async fn hydrate_prior_data_source_values(
     .await?;
     data_source_values
         .merge_read_states(&read_states)
-        .map_err(|error| ProviderError::internal(error.to_string()))?;
+        .map_err(|error| HostError::internal(error.to_string()))?;
     Ok(())
 }
 
@@ -4053,8 +4079,8 @@ async fn normalize_prior_states(
     managed_current: &mut HashMap<ResourceId, Current>,
     data_source_states: &mut HashMap<ResourceId, State>,
     orphans: &mut Orphans,
-    normalizer: &dyn ProviderNormalizer,
-) -> Result<(), ProviderError> {
+    normalizer: &dyn HostNormalizer,
+) -> Result<(), HostError> {
     transform_prior_provider_states(
         managed_current,
         data_source_states,
@@ -4087,13 +4113,13 @@ async fn normalize_prior_data_source_values(
     managed_current: &mut HashMap<ResourceId, Current>,
     data_source_values: &mut DataSourceValues,
     orphans: &mut Orphans,
-    normalizer: &dyn ProviderNormalizer,
-) -> Result<(), ProviderError> {
+    normalizer: &dyn HostNormalizer,
+) -> Result<(), HostError> {
     let mut read_states = data_source_values.read_states_map();
     normalize_prior_states(managed_current, &mut read_states, orphans, normalizer).await?;
     data_source_values
         .merge_read_states(&read_states)
-        .map_err(|error| ProviderError::internal(error.to_string()))?;
+        .map_err(|error| HostError::internal(error.to_string()))?;
     Ok(())
 }
 
@@ -4138,7 +4164,7 @@ pub enum PlanPreparationError {
     #[error("plan validation failed")]
     Plan(NonEmptyPlanErrors),
     #[error(transparent)]
-    Provider(#[from] ProviderError),
+    Provider(#[from] HostError),
 }
 
 fn resolved_constraint_context(
@@ -4298,7 +4324,7 @@ pub(crate) fn module_constraint_plan_errors(
 }
 
 impl<'a> PlanPreprocessor<'a> {
-    pub fn new(normalizer: &'a dyn ProviderNormalizer, ctx: &'a WiringContext) -> Self {
+    pub fn new(normalizer: &'a dyn HostNormalizer, ctx: &'a WiringContext) -> Self {
         Self { normalizer, ctx }
     }
 
@@ -4363,7 +4389,7 @@ impl<'a> PlanPreprocessor<'a> {
                 },
             )
             .await,
-            |message| PlanPreparationError::Provider(ProviderError::internal(message)),
+            |message| PlanPreparationError::Provider(HostError::internal(message)),
         )
     }
 }
@@ -4375,12 +4401,13 @@ pub(crate) async fn prepare_desired_side_for_plan(
     resources: &mut [Resource],
     data_sources: &mut [DataSource],
     provider_configs: &[ExpandedProviderConfig],
-    normalizer: &dyn ProviderNormalizer,
+    normalizer: &dyn HostNormalizer,
     ctx: &WiringContext,
-) -> Result<(), ProviderError> {
+) -> Result<(), HostError> {
     carina_core::value::canonicalize_data_sources_with_schemas(data_sources, ctx.schemas())?;
 
-    apply_desired_normalization_slice(resources, provider_configs, normalizer, ctx.schemas()).await
+    apply_host_desired_normalization_slice(resources, provider_configs, normalizer, ctx.schemas())
+        .await
 }
 
 /// Apply provider-specific state normalization before host schema lifting.
@@ -4392,7 +4419,8 @@ pub fn normalize_state_with_ctx(
     ctx: &WiringContext,
     provider_configs: &ResolvedProviderConfigs,
     managed_current: &mut HashMap<ResourceId, Current>,
-) -> Result<(), ProviderError> {
+    plan: &provider_mod::ProviderPlan,
+) -> Result<(), HostError> {
     // WASM factories bridge their synchronous validation hook to async host
     // calls with `block_in_place` plus `Handle::current`. Preparation must
     // therefore be polled inside a multi-thread runtime, not merely happen
@@ -4404,18 +4432,25 @@ pub fn normalize_state_with_ctx(
         .expect("failed to build tokio runtime for normalize_state");
     let mut router = ProviderRouter::new();
     for factory in ctx.factories() {
-        let resolved_config = provider_configs.provider_or_implicit(factory.name());
-        let config = rt
-            .block_on(async {
-                prepare_provider_ready_config(factory.as_ref(), resolved_config.as_ref())
-            })
-            .map_err(|error| {
-                ProviderError::internal_caused_by("Failed to prepare provider configuration", error)
-            })?;
-        router.add_normalizer(
-            factory.name(),
-            rt.block_on(factory.create_normalizer(None, &config))?,
-        );
+        let implicit = provider_configs.provider_or_implicit(factory.name());
+        let mut configs = provider_configs
+            .iter()
+            .filter(|config| config.name() == factory.name())
+            .collect::<Vec<_>>();
+        if configs.is_empty() {
+            configs.push(implicit.as_ref());
+        }
+        for resolved_config in configs {
+            let config = rt
+                .block_on(async {
+                    prepare_provider_ready_config(factory.as_ref(), resolved_config)
+                })
+                .map_err(HostError::from)?;
+            let session = plan.session(factory.name(), resolved_config.binding(), Some(&config));
+            router.add_initialized_normalizer(rt.block_on(
+                provider_mod::ProviderBoundary::initialize_normalizer(factory.as_ref(), &session),
+            )?);
+        }
     }
     // Outermost runtime: not nested.
     let mut provider_states = managed_current
@@ -4431,7 +4466,7 @@ pub fn normalize_state_with_ctx(
             state.map(|state| (id.clone(), state.clone()))
         })
         .collect();
-    let result = rt.block_on(carina_core::provider::normalize_provider_states(
+    let result = rt.block_on(carina_core::provider::normalize_host_provider_states(
         &router,
         &mut provider_states,
     ));
@@ -4683,6 +4718,7 @@ pub(crate) async fn get_provider_with_ctx(
     ctx: &WiringContext,
     configs: &ResolvedProviderConfigs,
     progress_sink: ProgressSink,
+    plan: &provider_mod::ProviderPlan,
 ) -> Result<ProviderRouter, AppError> {
     let color_mode = ctx.runtime().color_mode();
     let mut router = ProviderRouter::new();
@@ -4692,8 +4728,15 @@ pub(crate) async fn get_provider_with_ctx(
     // blocks). Pass 2 handles each named instance (`let <name> = provider
     // <kind> { ... }`), reusing the same context factory.
     for provider_config in configs.iter().filter(|config| config.is_default()) {
-        instantiate_provider_into_router(ctx, &mut router, provider_config, None, progress_sink)
-            .await?;
+        instantiate_provider_into_router(
+            ctx,
+            &mut router,
+            provider_config,
+            None,
+            progress_sink,
+            plan,
+        )
+        .await?;
     }
 
     for provider_config in configs.iter().filter(|config| !config.is_default()) {
@@ -4704,6 +4747,7 @@ pub(crate) async fn get_provider_with_ctx(
             provider_config,
             inherited_source,
             progress_sink,
+            plan,
         )
         .await?;
     }
@@ -4717,11 +4761,16 @@ pub(crate) async fn get_provider_with_ctx(
         progress_sink.line("Using mock provider".cyan(color_mode));
         router.add_provider(
             BUILTIN_PROVIDER_NAME.to_string(),
-            InitializedProvider::unavailable(Box::new(builtin_mock.create_provider())),
+            provider_mod::ProviderBoundary::initialize(
+                builtin_mock,
+                &plan.session(BUILTIN_PROVIDER_NAME, None, None),
+            )
+            .await?,
         );
         router.add_provider(
             String::new(),
-            InitializedProvider::unavailable(Box::new(builtin_mock.create_provider())),
+            provider_mod::ProviderBoundary::initialize(builtin_mock, &plan.session("", None, None))
+                .await?,
         );
     }
 
@@ -4800,26 +4849,20 @@ async fn instantiate_provider_into_router(
     provider_config: &ResolvedProviderConfig,
     inherited_source: Option<&ProviderSource>,
     progress_sink: ProgressSink,
+    plan: &provider_mod::ProviderPlan,
 ) -> Result<(), AppError> {
     let color_mode = ctx.runtime().color_mode();
     let binding = provider_config.binding();
     if let Some(factory) = provider_mod::find_factory(ctx.factories(), provider_config.name()) {
         let config = prepare_provider_ready_config(factory, provider_config)?;
         let displayed_source = provider_config.source().or(inherited_source);
-        let provider = factory
-            .create_initialized_provider(binding, &config)
+        let session = plan.session(factory.name(), binding, Some(&config));
+        let provider = provider_mod::ProviderBoundary::initialize(factory, &session)
             .await
             .map_err(|e| e.for_provider(provider_config.name().to_string()))?;
         progress_sink.line(
             format_provider_using_line(factory.name(), config.region(), binding, displayed_source)
                 .cyan(color_mode),
-        );
-        router.add_normalizer(
-            provider_config.name().to_string(),
-            factory
-                .create_normalizer(binding, &config)
-                .await
-                .map_err(|e| e.for_provider(provider_config.name().to_string()))?,
         );
         router.add_provider_config(provider_config.as_provider_config(), provider);
     } else if let Some(builtin_mock) = ctx.builtin_mock()
@@ -4828,7 +4871,11 @@ async fn instantiate_provider_into_router(
         progress_sink.line("Using mock provider".cyan(color_mode));
         router.add_provider_config(
             provider_config.as_provider_config(),
-            InitializedProvider::unavailable(Box::new(builtin_mock.create_provider())),
+            provider_mod::ProviderBoundary::initialize(
+                builtin_mock,
+                &plan.session(provider_config.name(), binding, None),
+            )
+            .await?,
         );
     } else if let Some(message) = missing_provider_message(provider_config, inherited_source) {
         eprintln!("{}", message.red(color_mode));
@@ -4926,6 +4973,7 @@ fn take_unverified_official_load_error<E>(
 pub async fn create_providers_from_configs_with_ctx(
     ctx: &WiringContext,
     configs: &ResolvedProviderConfigs,
+    plan: &provider_mod::ProviderPlan,
 ) -> Result<ProviderRouter, AppError> {
     let color_mode = ctx.runtime().color_mode();
     let mut router = ProviderRouter::new();
@@ -4933,7 +4981,7 @@ pub async fn create_providers_from_configs_with_ctx(
     // Same two-pass shape as `get_provider_with_ctx`: default instances
     // first, then named instances reuse the same context factory.
     for config in configs.iter().filter(|config| config.is_default()) {
-        instantiate_provider_into_router(ctx, &mut router, config, None, ProgressSink::Human)
+        instantiate_provider_into_router(ctx, &mut router, config, None, ProgressSink::Human, plan)
             .await?;
     }
     for config in configs.iter().filter(|config| !config.is_default()) {
@@ -4944,27 +4992,27 @@ pub async fn create_providers_from_configs_with_ctx(
             config,
             inherited_source,
             ProgressSink::Human,
+            plan,
         )
         .await?;
     }
 
-    if let Some(builtin_mock) = ctx.builtin_mock() {
-        router.add_normalizer(
-            BUILTIN_PROVIDER_NAME,
-            Box::new(builtin_mock.create_normalizer()),
-        );
-    }
     if router.is_empty()
         && let Some(builtin_mock) = ctx.builtin_mock()
     {
         ProgressSink::Human.line("Using mock provider".cyan(color_mode));
         router.add_provider(
             BUILTIN_PROVIDER_NAME.to_string(),
-            InitializedProvider::unavailable(Box::new(builtin_mock.create_provider())),
+            provider_mod::ProviderBoundary::initialize(
+                builtin_mock,
+                &plan.session(BUILTIN_PROVIDER_NAME, None, None),
+            )
+            .await?,
         );
         router.add_provider(
             String::new(),
-            InitializedProvider::unavailable(Box::new(builtin_mock.create_provider())),
+            provider_mod::ProviderBoundary::initialize(builtin_mock, &plan.session("", None, None))
+                .await?,
         );
     }
 
@@ -4978,29 +5026,33 @@ pub async fn create_providers_from_configs_with_ctx(
 pub(crate) async fn create_normalizers_from_configs_with_ctx(
     ctx: &WiringContext,
     configs: &ResolvedProviderConfigs,
+    plan: &provider_mod::ProviderPlan,
 ) -> Result<NormalizerRouter, AppError> {
     let mut router = NormalizerRouter::new();
 
     for config in configs.iter() {
         if let Some(factory) = provider_mod::find_factory(ctx.factories(), config.name()) {
             let ready = prepare_provider_ready_config(factory, config)?;
-            router.add_normalizer(
-                config.name().to_string(),
-                factory
-                    .create_normalizer(config.binding(), &ready)
-                    .await
-                    .map_err(|error| AppError::Provider(error.for_provider(config.name())))?,
+            router.add_initialized_normalizer(
+                provider_mod::ProviderBoundary::initialize_normalizer(
+                    factory,
+                    &plan.session(factory.name(), config.binding(), Some(&ready)),
+                )
+                .await?,
             );
         }
     }
 
     if let Some(builtin_mock) = ctx.builtin_mock() {
-        router.add_normalizer(
-            BUILTIN_PROVIDER_NAME,
-            Box::new(builtin_mock.create_normalizer()),
+        let session = plan.session(BUILTIN_PROVIDER_NAME, None, None);
+        router.add_initialized_normalizer(
+            provider_mod::ProviderBoundary::initialize_normalizer(
+                &builtin_mock.create_normalizer(),
+                &session,
+            )
+            .await?,
         );
     }
-
     Ok(router)
 }
 
@@ -5666,7 +5718,7 @@ impl<'state> DeferredForExpansionPrelude<'state> {
 }
 
 pub(crate) struct ProjectedPhase1RefreshInputs<'a, 'backend> {
-    pub provider: &'a dyn Provider,
+    pub provider: &'a dyn HostProvider,
     pub refresh_phase: &'a RefreshPhase<'backend>,
     pub schemas: &'a SchemaRegistry,
 }
@@ -5881,7 +5933,7 @@ pub struct ReconciledDeferredForExpansion(
 /// completed its address transition and before deferred-`for` expansion.
 pub(crate) struct AddressedDataSourceReadInputs<'a, 'backend> {
     pub provider_context: &'a carina_core::parser::LoadedProviderContext,
-    pub provider: &'a dyn Provider,
+    pub provider: &'a dyn HostProvider,
     pub refresh_phase: Option<&'a RefreshPhase<'backend>>,
     pub compositions: &'a [LiveComposition],
     pub data_sources: &'a [DataSource],
@@ -6181,9 +6233,9 @@ impl<E> ExpandedCanonicalResources<E> {
     async fn prepare_desired_side_for_plan(
         &mut self,
         provider_configs: &[ExpandedProviderConfig],
-        normalizer: &dyn ProviderNormalizer,
+        normalizer: &dyn HostNormalizer,
         schemas: &SchemaRegistry,
-    ) -> carina_core::provider::ProviderResult<()> {
+    ) -> carina_core::provider::HostResult<()> {
         self.resources
             .prepare_desired_side_for_plan(provider_configs, normalizer, schemas)
             .await
@@ -6334,8 +6386,8 @@ impl<E, C> PostExpansionPlanView<E, C> {
 }
 
 struct LiveExpandedChildrenInputs<'a, 'backend> {
-    provider: &'a dyn Provider,
-    normalizer: &'a dyn ProviderNormalizer,
+    provider: &'a dyn HostProvider,
+    normalizer: &'a dyn HostNormalizer,
     state_file: &'a StateFile,
     saved_dep_bindings:
         &'a HashMap<ResourceId, carina_core::resource::PersistedDestroyDependencies>,
@@ -6344,7 +6396,7 @@ struct LiveExpandedChildrenInputs<'a, 'backend> {
 }
 
 struct CachedExpandedChildrenInputs<'a> {
-    normalizer: &'a dyn ProviderNormalizer,
+    normalizer: &'a dyn HostNormalizer,
     state_file: &'a StateFile,
     schemas: &'a SchemaRegistry,
 }
@@ -6499,7 +6551,7 @@ pub(crate) struct PostExpansionPlanInput<'a, E, S> {
 pub(crate) struct PostExpansionPlanEnvironment<'a> {
     pub data_sources: &'a [DataSource],
     pub provider: &'a ProviderRouter,
-    pub normalizer: &'a dyn ProviderNormalizer,
+    pub normalizer: &'a dyn HostNormalizer,
     pub provider_configs: &'a [ExpandedProviderConfig],
     pub remote_bindings: &'a HashMap<String, HashMap<String, Value>>,
     pub state_file: &'a Option<StateFile>,
@@ -7185,13 +7237,17 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) async fn settle_expanded_children_from_cache(
         self,
-        normalizer: &dyn ProviderNormalizer,
+        normalizer: &dyn HostNormalizer,
         state_file: &StateFile,
     ) -> Result<ValidatedConfig<PostExpansionPlanView<E, PlanChildrenSettled>>, AppError> {
         let Self {
             wiring, resources, ..
         } = self;
-        let ValidationReady { inner, origin } = resources;
+        let ValidationReady {
+            inner,
+            origin,
+            provider_plan,
+        } = resources;
         let settled = inner
             .settle_children_from_cache(CachedExpandedChildrenInputs {
                 normalizer,
@@ -7205,6 +7261,7 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
             resources: ValidationReady {
                 inner: settled,
                 origin,
+                provider_plan,
             },
             config_state: std::marker::PhantomData,
         })
@@ -7217,7 +7274,11 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
         let Self {
             wiring, resources, ..
         } = self;
-        let ValidationReady { inner, origin } = resources;
+        let ValidationReady {
+            inner,
+            origin,
+            provider_plan,
+        } = resources;
         let settled = inner
             .settle_children_absent(wiring.context().schemas(), None)
             .into_plan_settled();
@@ -7226,6 +7287,7 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
             resources: ValidationReady {
                 inner: settled,
                 origin,
+                provider_plan,
             },
             config_state: std::marker::PhantomData,
         }
@@ -7249,6 +7311,7 @@ impl<E, S> ValidatedConfig<PostExpansionPlanView<E, S>> {
         let ValidationReady {
             inner: expansion,
             origin,
+            provider_plan,
         } = resources;
         let context = wiring.context();
         let outcome = build_post_expansion_plan::<M, E>(
@@ -7266,6 +7329,7 @@ impl<E, S> ValidatedConfig<PostExpansionPlanView<E, S>> {
                 resources: ValidationReady {
                     inner: expanded_resources,
                     origin,
+                    provider_plan,
                 },
                 config_state: std::marker::PhantomData,
             }),
@@ -7858,7 +7922,7 @@ pub(crate) struct ExpandedRefreshState {
 /// Grouped into a struct because the underlying phases need many of
 /// the same inputs (provider, schemas, wait_aliases, …) and a flat
 /// arg list would already trip the 7-argument lint here.
-pub(crate) struct ExpandRefreshAndLiftInputs<'a, 'backend, P: Provider + ProviderNormalizer, E> {
+pub(crate) struct ExpandRefreshAndLiftInputs<'a, 'backend, P: HostProvider + HostNormalizer, E> {
     pub provider: &'a P,
     pub comparison_provider: &'a ProviderRouter,
     /// Address/metadata parity witness produced by the shared I/O-free
@@ -7880,7 +7944,7 @@ pub(crate) struct ExpandRefreshAndLiftInputs<'a, 'backend, P: Provider + Provide
 pub(crate) struct ValidatedExpandRefreshAndLiftInputs<
     'a,
     'backend,
-    P: Provider + ProviderNormalizer,
+    P: HostProvider + HostNormalizer,
     E,
 > {
     pub provider: &'a P,
@@ -7899,7 +7963,7 @@ pub(crate) struct ValidatedExpandRefreshAndLiftInputs<
 pub(crate) struct ValidatedCanonicalExpandRefreshAndLiftInputs<
     'a,
     'backend,
-    P: Provider + ProviderNormalizer,
+    P: HostProvider + HostNormalizer,
 > {
     pub provider: &'a P,
     pub comparison_provider: &'a ProviderRouter,
@@ -7917,7 +7981,7 @@ pub(crate) struct ValidatedCanonicalExpandRefreshAndLiftInputs<
 ///
 /// The unit resource witness makes the raw-file variant distinct from the
 /// canonical plan/apply result at the type level.
-async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormalizer>(
+async fn expand_refresh_and_lift_states<E: Clone, P: HostProvider + HostNormalizer>(
     parsed: &mut ExpandedFile<E>,
     inputs: ExpandRefreshAndLiftInputs<'_, '_, P, PreparedAddressPreservingDeferredForExpansion>,
 ) -> Result<ExpandedRefreshState, AppError> {
@@ -7943,7 +8007,7 @@ async fn expand_refresh_and_lift_states<E: Clone, P: Provider + ProviderNormaliz
 /// caller.
 pub(crate) async fn expand_validated_canonical_refresh_and_lift_states<
     E: Clone,
-    P: Provider + ProviderNormalizer,
+    P: HostProvider + HostNormalizer,
 >(
     validated: ValidatedConfig<CanonicalResourcePair<E>>,
     inputs: ValidatedCanonicalExpandRefreshAndLiftInputs<'_, '_, P>,
@@ -8169,7 +8233,7 @@ fn mark_expanded_children_absent(
 }
 
 async fn finish_expanded_refresh_state<
-    P: Provider + ProviderNormalizer,
+    P: HostProvider + HostNormalizer,
     E: PreparedExpansionInputs,
 >(
     expansion: DeferredForExpansion,
@@ -8249,6 +8313,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
         resources: canonical_resources,
         config_state: _,
     } = validated;
+    let provider_plan = canonical_resources.provider_plan.clone();
     let resources = {
         let context = wiring.context();
         canonical_resources
@@ -8257,6 +8322,7 @@ pub(crate) async fn create_plan_from_parsed_with_upstream_with_ctx<E: Clone>(
                     context,
                     canonical_resources,
                     provider_configs,
+                    &provider_plan,
                     state_file,
                     refresh,
                     progress_sink,
@@ -8281,6 +8347,7 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     ctx: &WiringContext,
     canonical_resources: CanonicalResourcePair<E>,
     provider_configs: &ResolvedProviderConfigs,
+    provider_plan: &provider_mod::ProviderPlan,
     state_file: &Option<StateFile>,
     refresh: bool,
     progress_sink: ProgressSink,
@@ -8305,7 +8372,8 @@ async fn create_plan_from_parsed_with_upstream_with_ctx_inner<E: Clone>(
     // `managed_current`.
     // Initialize the exact provider routes before automatic move detection;
     // create-only matching needs each owning instance's comparison scope.
-    let provider = get_provider_with_ctx(ctx, provider_configs, progress_sink).await?;
+    let provider =
+        get_provider_with_ctx(ctx, provider_configs, progress_sink, provider_plan).await?;
     let expansion_prelude = DeferredForExpansionPrelude::new(
         &canonical_resources,
         &resolved_state_block_targets.removed_from,
@@ -9381,8 +9449,8 @@ pub(crate) fn resolve_import_target<D>(
 }
 
 /// Check whether a `ProviderError` is an AWS throttling error that should be retried.
-fn is_throttling_error(err: &ProviderError) -> bool {
-    err.is_throttled()
+fn is_throttling_error(err: &HostError) -> bool {
+    err.is_throttled() || err.is_transient()
 }
 
 /// Read a resource via the provider with retry and exponential backoff for throttling errors.
@@ -9390,9 +9458,9 @@ fn is_throttling_error(err: &ProviderError) -> bool {
 /// Retries up to 3 times with delays of 1s, 2s, 4s when the error looks like an
 /// AWS throttling / rate-limit response.
 pub async fn read_with_retry(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     target: &RefreshTarget,
-) -> Result<State, ProviderError> {
+) -> Result<State, HostError> {
     let id = target.id();
     let identifier = target.identifier();
     let max_retries = 3;
@@ -9402,7 +9470,7 @@ pub async fn read_with_retry(
             .await
         {
             Ok(outcome) => return Ok(outcome.into_state()),
-            Err(ProviderError::NotFound(_)) => {
+            Err(HostError::NotFound(_)) => {
                 // carina-rs/carina-provider-aws#462: ProviderError::NotFound is
                 // the canonical drift signal — the resource is recorded in state
                 // but no longer exists in the cloud. Translate it into
@@ -9428,11 +9496,11 @@ pub async fn read_with_retry(
 /// Read one managed instance and restore host-owned write-only comparison
 /// values from the persisted row when the provider omits them.
 pub(crate) async fn read_managed_state_with_retry(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     target: &RefreshTarget,
     state_file: Option<&StateFile>,
     schemas: &SchemaRegistry,
-) -> Result<State, ProviderError> {
+) -> Result<State, HostError> {
     let mut state = read_with_retry(provider, target).await?;
     if let Some(state_file) = state_file {
         state_file.restore_recorded_write_only_attributes_in_state(&mut state, schemas);
@@ -9446,11 +9514,11 @@ pub(crate) async fn read_managed_state_with_retry(
 /// A missing-identifier row stays present in cached state so planning can emit
 /// its actionable error, while an absent address remains `not_found`.
 pub async fn refresh_loaded_resource_with_retry(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     loaded: RefreshableCurrent,
     state_file: Option<&StateFile>,
     schemas: &SchemaRegistry,
-) -> Result<Current, ProviderError> {
+) -> Result<Current, HostError> {
     match loaded.read_target() {
         Some(target) => read_managed_state_with_retry(provider, &target, state_file, schemas)
             .await
@@ -9462,11 +9530,11 @@ pub async fn refresh_loaded_resource_with_retry(
 /// Refresh an orphan minted from the refreshable partition.
 /// Missing identifiers remain typed planner errors without a provider read.
 pub async fn refresh_loaded_orphan_with_retry(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     loaded: RefreshableOrphan,
     state_file: Option<&StateFile>,
     schemas: &SchemaRegistry,
-) -> Result<Orphan, ProviderError> {
+) -> Result<Orphan, HostError> {
     match loaded.read_target() {
         Some(target) => {
             let fresh =
@@ -9478,7 +9546,7 @@ pub async fn refresh_loaded_orphan_with_retry(
 }
 
 async fn refresh_loaded_orphans(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     loaded: RefreshableOrphans,
     refresh_phase: &RefreshPhase<'_>,
     state_file: Option<&StateFile>,
@@ -9525,7 +9593,7 @@ async fn refresh_loaded_orphans(
 /// restore (the new loop children have no prior state-file dep
 /// bindings).
 pub(crate) struct RefreshResourceSetInputs<'a, 'backend> {
-    pub provider: &'a dyn Provider,
+    pub provider: &'a dyn HostProvider,
     pub refresh_phase: &'a RefreshPhase<'backend>,
     pub refresh_rows: &'a RefreshRows,
     pub state_file: Option<&'a StateFile>,
@@ -9590,7 +9658,7 @@ async fn refresh_resource_set_with_state_reads<'a>(
 /// so the provider receives the full [`DataSource`](carina_core::resource::DataSource)
 /// (including user-supplied input attributes) rather than just the identifier.
 pub async fn read_data_source_with_retry(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     resource: &carina_core::resource::DataSource,
     bindings: &ResolvedBindings,
     module_gate: &carina_core::executor::ModuleConstraintGate,
@@ -9628,7 +9696,7 @@ pub(crate) enum DataSourceRefreshResolution {
 /// and state refresh.
 pub(crate) struct ReadDataSourcesInputs<'a, 'backend> {
     pub provider_context: &'a carina_core::parser::LoadedProviderContext,
-    pub provider: &'a dyn Provider,
+    pub provider: &'a dyn HostProvider,
     pub refresh_phase: Option<&'a RefreshPhase<'backend>>,
     pub managed: &'a [&'a Resource],
     pub compositions: &'a [LiveComposition],
@@ -9715,7 +9783,7 @@ pub(crate) struct ReadDataSourcesPhase2 {
 /// `Read` outcomes are retained; only `DeferredToApply` outcomes are retried.
 pub(crate) struct ExpandedDataSourceReadInputs<'a, 'backend> {
     pub provider_context: &'a carina_core::parser::LoadedProviderContext,
-    pub provider: &'a dyn Provider,
+    pub provider: &'a dyn HostProvider,
     pub refresh_phase: Option<&'a RefreshPhase<'backend>>,
     pub managed: &'a [Resource],
     pub compositions: &'a [LiveComposition],
@@ -10914,6 +10982,7 @@ impl<E> ValidatedConfig<MaterializedConfiguration<E>> {
         let ValidationReady {
             inner: parsed,
             origin,
+            provider_plan,
         } = validated_resources;
         let classified = match classify_legacy_state(parsed, moves, state)? {
             LegacyClassificationOutcome::Classified(classified) => classified,
@@ -10929,6 +10998,7 @@ impl<E> ValidatedConfig<MaterializedConfiguration<E>> {
                     resources: ValidationReady {
                         inner: validated.graph,
                         origin,
+                        provider_plan,
                     },
                     config_state: std::marker::PhantomData,
                 },
@@ -10961,6 +11031,7 @@ impl<E> ValidatedConfig<ExpandedFile<E>> {
                         materialization,
                     ),
                     origin: resources.origin,
+                    provider_plan: resources.provider_plan,
                 },
                 config_state: std::marker::PhantomData,
             },
@@ -10983,6 +11054,7 @@ impl<E> ValidatedConfig<ExpandedFile<E>> {
             resources: ValidationReady {
                 inner: MaterializedConfiguration::offline(resources.inner),
                 origin: resources.origin,
+                provider_plan: resources.provider_plan,
             },
             config_state: std::marker::PhantomData,
         }
@@ -11119,6 +11191,7 @@ impl<E: Clone> ValidatedConfig<ExpandedFile<E>> {
             resources: ValidationReady {
                 inner: MaterializedConfiguration::after_expansion(resources.inner, materialization),
                 origin: resources.origin,
+                provider_plan: resources.provider_plan,
             },
             config_state: std::marker::PhantomData,
         };
@@ -11211,3 +11284,6 @@ pub(crate) fn classify_apply_time_resolved_data_source_read_inputs<S>(
     }
     deferred
 }
+
+#[cfg(test)]
+mod round6_tests;

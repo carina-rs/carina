@@ -1,6 +1,8 @@
 //! Single-effect execution: Create, Update, Delete dispatch, resource resolution,
 //! Secret unwrapping, and post-apply binding updates.
 
+#[cfg(test)]
+use crate::provider::HostPartialReadDiagnostic as PartialReadDiagnostic;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -16,10 +18,10 @@ use crate::executor::provider_ready::{
     ResourceCheckInput, managed_update_schema, prepare_provider_ready_resource_after_resolution,
 };
 use crate::provider::{
-    AppliedIdentifier, CompletedResume, CreateFailureKind, CreateRequest, DeleteRequest,
-    PartialReadDiagnostic, PartialResume, Provider, ProviderReadyResource, ProviderRouter,
-    ReadBackEnd, ReadRequest, ResumeCreateRequest, ResumeFailureKind, ResumeOutcomeKind,
-    UpdateRequest,
+    AppliedIdentifier, CreateRequest, DeleteRequest, HostCompletedResume, HostCreateFailureKind,
+    HostPartialReadDiagnostic, HostPartialResume, HostProvider, HostResumeFailureKind,
+    HostResumeOutcomeKind, ProviderReadyResource, ProviderRouter, ReadBackEnd, ReadRequest,
+    ResumeCreateRequest, UpdateRequest,
 };
 use crate::resolver::resolve_ref_value;
 #[cfg(test)]
@@ -56,7 +58,7 @@ pub(super) enum BasicEffectResult {
     PartialSuccess {
         completed: CompletedEffect,
         resource_id: ResourceId,
-        diagnostic: PartialReadDiagnostic,
+        diagnostic: HostPartialReadDiagnostic,
         read_back_end: ReadBackEnd,
         resolved_attrs: Option<SecretPreservingAttributes>,
         binding: Option<AbsoluteBindingAddress>,
@@ -66,13 +68,13 @@ pub(super) enum BasicEffectResult {
         refresh: Option<(ResourceId, AppliedIdentifier)>,
     },
     ResumeSuccess {
-        completed: CompletedResume,
+        completed: HostCompletedResume,
         resource_id: ResourceId,
         resolved_attrs: SecretPreservingAttributes,
         binding: Option<AbsoluteBindingAddress>,
     },
     ResumePartialSuccess {
-        partial: PartialResume,
+        partial: HostPartialResume,
         resource_id: ResourceId,
         resolved_attrs: SecretPreservingAttributes,
         binding: Option<AbsoluteBindingAddress>,
@@ -140,7 +142,7 @@ pub(super) fn queue_state_refresh(
 
 /// Refresh states for resources whose operations failed.
 pub(super) async fn refresh_pending_states<S: Clone>(
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     accumulator: &mut ExecutionAccumulator<S>,
     pending_refreshes: &HashMap<ResourceId, AppliedIdentifier>,
     observer: &dyn ExecutionObserver<S>,
@@ -889,7 +891,7 @@ pub(super) fn count_actionable_effects<S>(effects: &[Effect<S>]) -> usize {
 /// `execute_basic_effect`'s arity in check (clippy `too_many_arguments`)
 /// and keeping dispatch context fields grouped consistently.
 pub(super) struct BasicEffectCtx<'a, S> {
-    pub(super) provider: &'a dyn Provider,
+    pub(super) provider: &'a dyn HostProvider,
     pub(super) comparison_provider: &'a ProviderRouter,
     pub(super) provider_check_inputs: &'a super::ProviderCheckInputs<'a, S>,
     pub(super) runtime_authored: bool,
@@ -984,11 +986,11 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     }
                 }
                 Err(failure) => match failure.into_kind() {
-                    CreateFailureKind::NoResource(error) => BasicEffectResult::Failure {
+                    HostCreateFailureKind::NoResource(error) => BasicEffectResult::Failure {
                         failure: EffectFailureKind::provider(error),
                         refresh: None,
                     },
-                    CreateFailureKind::OutcomeUnknown { unknown, error } => {
+                    HostCreateFailureKind::OutcomeUnknown { unknown, error } => {
                         BasicEffectResult::ClassifiedFailure {
                             failure: EffectFailureKind::provider(error),
                             recovery: Some(Box::new(
@@ -998,7 +1000,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             applied: Applied::CreateOutcomeUnknown(unknown),
                         }
                     }
-                    CreateFailureKind::IdentifierReported { identified, error } => {
+                    HostCreateFailureKind::IdentifierReported { identified, error } => {
                         let identified =
                             identified.with_resolved_desired_attributes(resolved_attrs.clone());
                         let note = identified.post_error_note();
@@ -1009,7 +1011,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             applied: Applied::Observed(identified.into()),
                         }
                     }
-                    CreateFailureKind::InFlight { pending, error } => {
+                    HostCreateFailureKind::InFlight { pending, error } => {
                         BasicEffectResult::ClassifiedFailure {
                             failure: EffectFailureKind::provider_with_note(
                                 error,
@@ -1076,9 +1078,9 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
             };
             match super::dispatch_resume_create(provider, request)
                 .await
-                .map(crate::provider::ResumeOutcome::into_kind)
+                .map(crate::provider::HostResumeOutcome::into_kind)
             {
-                Ok(ResumeOutcomeKind::Resumed(completed)) => {
+                Ok(HostResumeOutcomeKind::Resumed(completed)) => {
                     let completed =
                         completed.with_resolved_desired_attributes(resolved_attrs.clone());
                     BasicEffectResult::ResumeSuccess {
@@ -1088,7 +1090,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         binding: resource.binding.clone(),
                     }
                 }
-                Ok(ResumeOutcomeKind::PartialSuccess(partial)) => {
+                Ok(HostResumeOutcomeKind::PartialSuccess(partial)) => {
                     let partial =
                         (*partial).with_resolved_desired_attributes(resolved_attrs.clone());
                     BasicEffectResult::ResumePartialSuccess {
@@ -1098,7 +1100,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                         binding: resource.binding.clone(),
                     }
                 }
-                Ok(ResumeOutcomeKind::Resent(outcome)) => {
+                Ok(HostResumeOutcomeKind::Resent(outcome)) => {
                     let (state, request, diagnostic, read_back_end) =
                         super::complete_create_for_writeback(*outcome, accepted_request);
                     if let Some(diagnostic) = diagnostic {
@@ -1126,13 +1128,15 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                     }
                 }
                 Err(failure) => match failure.into_kind() {
-                    ResumeFailureKind::NoResource(error) => BasicEffectResult::ClassifiedFailure {
-                        failure: EffectFailureKind::provider(error),
-                        recovery: None,
-                        resource_id: resource.id.clone(),
-                        applied: Applied::CreateEnded,
-                    },
-                    ResumeFailureKind::IdentifierReported { identified, error } => {
+                    HostResumeFailureKind::NoResource(error) => {
+                        BasicEffectResult::ClassifiedFailure {
+                            failure: EffectFailureKind::provider(error),
+                            recovery: None,
+                            resource_id: resource.id.clone(),
+                            applied: Applied::CreateEnded,
+                        }
+                    }
+                    HostResumeFailureKind::IdentifierReported { identified, error } => {
                         let identified =
                             identified.with_resolved_desired_attributes(resolved_attrs.clone());
                         let note = identified.post_error_note();
@@ -1143,7 +1147,7 @@ pub(super) async fn execute_basic_effect<'effect, 'observer, S: Clone>(
                             applied: Applied::Observed(identified.into()),
                         }
                     }
-                    ResumeFailureKind::InFlight { pending, error } => {
+                    HostResumeFailureKind::InFlight { pending, error } => {
                         BasicEffectResult::ClassifiedFailure {
                             failure: EffectFailureKind::provider_with_note(
                                 error,
@@ -1474,11 +1478,9 @@ mod process_basic_result_tests {
         let resource: Resource = Resource::with_provider("mock", "test.resource", "r1", None);
         let id = resource.id.clone();
         let state = State::existing(id.clone(), HashMap::new()).with_identifier("mock-id");
-        let diagnostic = PartialReadDiagnostic::new(
-            "mock partial create".to_string(),
-            vec!["computed".to_string()],
-        )
-        .expect("missing attributes are non-empty");
+        let diagnostic =
+            PartialReadDiagnostic::new("mock partial create".into(), vec!["computed".to_string()])
+                .expect("missing attributes are non-empty");
         let writeback_state = diagnostic.clone().into_state_for_writeback(state.clone());
         let (mut accumulator, _) = ExecutionAccumulator::new(empty_execution_result());
         let mut failed_indices = HashSet::new();

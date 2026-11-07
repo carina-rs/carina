@@ -7,7 +7,8 @@ use aws_sdk_iam::operation::simulate_principal_policy::SimulatePrincipalPolicyEr
 use aws_sdk_iam::types::PolicyEvaluationDecisionType;
 use carina_core::effect::{Effect, PlanOp};
 use carina_core::plan::Plan;
-use carina_core::provider::Provider;
+use carina_core::provider::HostProvider;
+use carina_core::provider_text::RequiredPermission;
 use carina_core::resource::ResourceId;
 use carina_core::schema::SchemaRegistry;
 use serde_json::Value as JsonValue;
@@ -20,7 +21,7 @@ pub(crate) enum IamPreflightResult {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct IamPreflightSkipped {
-    pub reason: carina_core::provider_text::ProviderText,
+    pub reason: carina_core::provider_text::DiagnosticText,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,7 +41,7 @@ pub(crate) enum IamCheckMethod {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MissingEffectActions {
     pub effect: EffectAddress,
-    pub missing_actions: Vec<carina_core::provider_text::ProviderText>,
+    pub missing_actions: Vec<carina_core::provider_text::DiagnosticText>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,19 +65,19 @@ impl Ord for EffectAddress {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RequiredAction {
+pub(crate) struct RequiredAction<A = RequiredPermission> {
     pub effect: EffectAddress,
-    pub action: String,
+    pub action: A,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SimulationResult {
-    denied_actions: BTreeSet<String>,
+    denied_actions: BTreeSet<RequiredPermission>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DocumentFallbackResult {
-    allowed_actions: BTreeSet<String>,
+    allowed_actions: BTreeSet<RequiredPermission>,
 }
 
 /// IAM principal ARN suitable for `iam:SimulatePrincipalPolicy`,
@@ -188,7 +189,7 @@ enum SimulateError {
 
 pub(crate) async fn run_iam_preflight(
     plan: &Plan,
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     schemas: &SchemaRegistry,
     strict: bool,
 ) -> Result<IamPreflightResult, crate::error::AppError> {
@@ -228,7 +229,7 @@ pub(crate) async fn run_iam_preflight(
                     let missing = action_set
                         .iter()
                         .filter(|action| {
-                            !action_allowed_by_documents(action, &fallback.allowed_actions)
+                            !action_allowed_by_documents(*action, &fallback.allowed_actions)
                         })
                         .cloned()
                         .collect();
@@ -272,7 +273,7 @@ pub(crate) async fn run_iam_preflight(
 
 pub(crate) fn collect_required_actions(
     plan: &Plan,
-    provider: &dyn Provider,
+    provider: &dyn HostProvider,
     schemas: &SchemaRegistry,
 ) -> Result<Vec<RequiredAction>, crate::error::AppError> {
     let mut required = Vec::new();
@@ -441,13 +442,13 @@ async fn resolve_actor_arn(sts_client: &aws_sdk_sts::Client) -> Result<PolicySou
     PolicySourceArn::from_caller_identity_arn(arn)
 }
 
-fn unique_actions(required: &[RequiredAction]) -> BTreeSet<String> {
+fn unique_actions(required: &[RequiredAction]) -> BTreeSet<RequiredPermission> {
     required.iter().map(|entry| entry.action.clone()).collect()
 }
 
 async fn simulate(
     actor_arn: &PolicySourceArn,
-    actions: &BTreeSet<String>,
+    actions: &BTreeSet<RequiredPermission>,
     iam_client: &aws_sdk_iam::Client,
 ) -> Result<SimulationResult, SimulateError> {
     let mut denied_actions = BTreeSet::new();
@@ -459,7 +460,7 @@ async fn simulate(
             .resource_arns("*")
             .set_marker(marker.clone());
         for action in actions {
-            request = request.action_names(action);
+            request = request.action_names(action.iam_action());
         }
 
         let output = request
@@ -467,13 +468,16 @@ async fn simulate(
             .await
             .map_err(|e| classify_simulate_error(e.into_service_error()))?;
 
-        denied_actions.extend(
-            output
-                .evaluation_results()
-                .iter()
-                .filter(|result| result.eval_decision() != &PolicyEvaluationDecisionType::Allowed)
-                .map(|result| result.eval_action_name().to_string()),
-        );
+        for result in output.evaluation_results() {
+            if result.eval_decision() != &PolicyEvaluationDecisionType::Allowed {
+                denied_actions.extend(
+                    actions
+                        .iter()
+                        .filter(|action| action.matches_iam_action(result.eval_action_name()))
+                        .cloned(),
+                );
+            }
+        }
 
         if !output.is_truncated() {
             break;
@@ -488,7 +492,7 @@ async fn simulate(
 
 async fn document_fallback(
     actor_arn: &PolicySourceArn,
-    actions: &BTreeSet<String>,
+    actions: &BTreeSet<RequiredPermission>,
     iam_client: &aws_sdk_iam::Client,
 ) -> Result<DocumentFallbackResult, String> {
     let role_name = actor_arn
@@ -562,10 +566,25 @@ async fn document_fallback(
     Ok(DocumentFallbackResult { allowed_actions })
 }
 
-fn collect_allowed_actions_from_policy(
+trait PolicyAction: Ord + Clone {
+    fn matches_policy_pattern(&self, pattern: &str) -> bool;
+}
+impl PolicyAction for RequiredPermission {
+    fn matches_policy_pattern(&self, pattern: &str) -> bool {
+        self.matches_policy_pattern(pattern)
+    }
+}
+#[cfg(test)]
+impl PolicyAction for String {
+    fn matches_policy_pattern(&self, pattern: &str) -> bool {
+        action_matches(pattern, self)
+    }
+}
+
+fn collect_allowed_actions_from_policy<A: PolicyAction>(
     policy_document: &str,
-    required_actions: &BTreeSet<String>,
-    allowed_actions: &mut BTreeSet<String>,
+    required_actions: &BTreeSet<A>,
+    allowed_actions: &mut BTreeSet<A>,
 ) {
     let document = serde_json::from_str::<JsonValue>(policy_document)
         .or_else(|_| {
@@ -596,7 +615,7 @@ fn collect_allowed_actions_from_policy(
         for required in required_actions {
             if patterns
                 .iter()
-                .any(|pattern| action_matches(pattern, required))
+                .any(|pattern| required.matches_policy_pattern(pattern))
             {
                 allowed_actions.insert(required.clone());
             }
@@ -618,6 +637,7 @@ fn action_patterns(value: Option<&JsonValue>) -> Vec<String> {
     Vec::new()
 }
 
+#[cfg(test)]
 fn action_matches(pattern: &str, action: &str) -> bool {
     let pattern = pattern.to_ascii_lowercase();
     let action = action.to_ascii_lowercase();
@@ -630,7 +650,7 @@ fn action_matches(pattern: &str, action: &str) -> bool {
     action.starts_with(prefix)
 }
 
-fn action_allowed_by_documents(action: &str, allowed_actions: &BTreeSet<String>) -> bool {
+fn action_allowed_by_documents<A: Ord>(action: &A, allowed_actions: &BTreeSet<A>) -> bool {
     allowed_actions.contains(action)
 }
 
@@ -664,11 +684,11 @@ fn percent_decode(input: &str) -> Result<String, serde_json::Error> {
     serde_json::from_str::<JsonValue>(&decoded).map(|_| decoded)
 }
 
-fn group_missing_by_effect(
-    required: &[RequiredAction],
-    missing_actions: &BTreeSet<String>,
+fn group_missing_by_effect<A: Ord + Clone + std::fmt::Display>(
+    required: &[RequiredAction<A>],
+    missing_actions: &BTreeSet<A>,
 ) -> Vec<MissingEffectActions> {
-    let mut grouped: BTreeMap<EffectAddress, BTreeSet<String>> = BTreeMap::new();
+    let mut grouped: BTreeMap<EffectAddress, BTreeSet<A>> = BTreeMap::new();
     for entry in required {
         if missing_actions.contains(&entry.action) {
             grouped
@@ -681,7 +701,10 @@ fn group_missing_by_effect(
         .into_iter()
         .map(|(effect, actions)| MissingEffectActions {
             effect,
-            missing_actions: actions.into_iter().map(Into::into).collect(),
+            missing_actions: actions
+                .into_iter()
+                .map(|action| action.to_string().into())
+                .collect(),
         })
         .collect()
 }
@@ -767,6 +790,7 @@ fn plan_op_rank(op: PlanOp) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::provider::Provider;
 
     #[test]
     fn provider_text_permission_report_keeps_action_data_and_sanitizes_display() {
@@ -874,17 +898,232 @@ mod tests {
         }
 
         fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
+            if id.resource_type == "SecretPermission" {
+                return Ok(vec!["iam:GetRole\npermission-private-4305".into()]);
+            }
+            if id.resource_type == "SecretValidPermission" {
+                return Ok(vec!["iam:PermissionPrivate4305".into()]);
+            }
+            if id.resource_type == "AwsccGeneratedPermissions" {
+                // Generated s3/bucket.rs:957 and logs/log_group.rs:144,170.
+                return Ok(vec![
+                    "S3:GetBucketWebsite".into(),
+                    "s3:REST.PUT.OBJECT".into(),
+                    "s3:REST.PUT.OBJECT".into(),
+                ]);
+            }
             if self.fail {
                 return Err(ProviderError::internal(
                     "intentional permission lookup failure",
                 ));
             }
             Ok(vec![format!(
-                "test:{}:{}",
+                "test:{}0{}",
                 plan_op_label(op),
-                id.resource_type
+                id.resource_type.replace('.', "Dot")
             )])
         }
+    }
+
+    #[test]
+    fn review_round7_invalid_permission_never_reaches_preflight_output() {
+        const CHILD: &str = "CARINA_4305_ROUND7_IAM_CHILD";
+        if std::env::var(CHILD).as_deref() != Ok("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "commands::iam_preflight::tests::review_round7_invalid_permission_never_reaches_preflight_output", "--nocapture"])
+                .env(CHILD, "1").output().unwrap();
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(output.status.success(), "preflight child failed: {text}");
+            assert!(
+                !text.contains("permission-private-4305"),
+                "preflight stdout/stderr leaked: {text}"
+            );
+            assert!(text.contains("index 0"));
+            return;
+        }
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(Resource::with_provider(
+            "awscc",
+            "SecretPermission",
+            "main",
+            None,
+        ))));
+        let result = collect_required_actions(
+            &plan,
+            &crate::provider_text_fixtures::boundary(Box::new(PermissionProvider { fail: false })),
+            &SchemaRegistry::new(),
+        );
+        let output = match result {
+            Err(error) => {
+                if let crate::error::AppError::Provider(host) = &error {
+                    assert!(
+                        host.detail()
+                            .cause()
+                            .unwrap()
+                            .is::<carina_core::provider_text::InvalidRequiredPermission>()
+                    );
+                } else {
+                    panic!("permission rejection lost its typed provider error");
+                }
+                error.to_string()
+            }
+            Ok(required) => format_warnings(&IamPreflightResult::Checked(IamPreflightReport {
+                actor_arn: "fixture actor".into(),
+                method: IamCheckMethod::SimulatePrincipalPolicy,
+                source_providers: vec!["awscc".into()],
+                missing_by_effect: group_missing_by_effect(&required, &unique_actions(&required)),
+            }))
+            .unwrap(),
+        };
+        assert!(
+            !output.contains("permission-private-4305"),
+            "guest permission leaked: {output}"
+        );
+        assert!(
+            output.contains("index 0"),
+            "missing typed rejection: {output}"
+        );
+        println!("{output}");
+    }
+
+    #[test]
+    fn review_round7_valid_permission_masks_display_and_keeps_iam_request_action() {
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(Resource::with_provider(
+            "awscc",
+            "SecretValidPermission",
+            "main",
+            None,
+        ))));
+        let provider = crate::provider_text_fixtures::initialized_with_context(
+            Box::new(PermissionProvider { fail: false }),
+            &crate::provider_text_fixtures::context(&["PermissionPrivate4305"]),
+        );
+        let required =
+            collect_required_actions(&plan, provider.provider(), &SchemaRegistry::new()).unwrap();
+        let output = format_warnings(&IamPreflightResult::Checked(IamPreflightReport {
+            actor_arn: "fixture actor".into(),
+            method: IamCheckMethod::SimulatePrincipalPolicy,
+            source_providers: vec!["awscc".into()],
+            missing_by_effect: group_missing_by_effect(&required, &unique_actions(&required)),
+        }))
+        .unwrap();
+        assert!(!output.contains("PermissionPrivate4305"));
+        assert!(output.contains("iam:(secret)"));
+        let actor =
+            PolicySourceArn::from_caller_identity_arn("arn:aws:iam::123456789012:role/deploy")
+                .unwrap();
+        let input = build_simulate_input_for_test(
+            &actor,
+            &BTreeSet::from([required[0].action.iam_action().to_owned()]),
+            None,
+        );
+        assert_eq!(input.action_names(), &["iam:PermissionPrivate4305"]);
+    }
+
+    #[tokio::test]
+    async fn review_round8_awscc_permissions_pass_boundary_and_keep_iam_simulate_action_names() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug)]
+        struct CaptureActions(Arc<Mutex<Vec<String>>>);
+        impl aws_sdk_iam::config::Intercept for CaptureActions {
+            fn name(&self) -> &'static str {
+                "CaptureActions"
+            }
+            fn read_before_execution(
+                &self,
+                context: &aws_sdk_iam::config::interceptors::BeforeSerializationInterceptorContextRef<
+                    '_,
+                >,
+                _cfg: &mut aws_sdk_iam::config::ConfigBag,
+            ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+                let input = context
+                    .input()
+                    .downcast_ref::<aws_sdk_iam::operation::simulate_principal_policy::SimulatePrincipalPolicyInput>()
+                    .expect("the production simulator must send a SimulatePrincipalPolicy input");
+                *self.0.lock().unwrap() = input.action_names().to_vec();
+                Err(std::io::Error::other("captured IAM simulate input").into())
+            }
+        }
+
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved(Resource::with_provider(
+            "awscc",
+            "AwsccGeneratedPermissions",
+            "main",
+            None,
+        ))));
+        let provider =
+            crate::provider_text_fixtures::boundary(Box::new(PermissionProvider { fail: false }));
+        let required = collect_required_actions(&plan, &provider, &SchemaRegistry::new())
+            .expect("all three generated AWSCC permissions must pass the real provider boundary");
+        assert_eq!(
+            required
+                .iter()
+                .map(|entry| entry.action.iam_action())
+                .collect::<Vec<_>>(),
+            [
+                "S3:GetBucketWebsite",
+                "s3:REST.PUT.OBJECT",
+                "s3:REST.PUT.OBJECT"
+            ]
+        );
+
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let client = aws_sdk_iam::Client::from_conf(
+            aws_sdk_iam::Config::builder()
+                .behavior_version_latest()
+                .region(aws_sdk_iam::config::Region::new("us-east-1"))
+                .http_client(winterbaume_core::MockAws::builder().build().http_client())
+                .interceptor(CaptureActions(Arc::clone(&captured)))
+                .build(),
+        );
+        let actor =
+            PolicySourceArn::from_caller_identity_arn("arn:aws:iam::123456789012:role/deploy")
+                .unwrap();
+        // Capture the production request before network I/O; de-duplication
+        // keeps the two distinct spellings from the three provider entries.
+        assert!(
+            simulate(&actor, &unique_actions(&required), &client)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            *captured.lock().unwrap(),
+            ["S3:GetBucketWebsite", "s3:REST.PUT.OBJECT"]
+        );
+    }
+
+    fn collect_fixture_required_actions(
+        plan: &Plan,
+        provider: &dyn HostProvider,
+        schemas: &SchemaRegistry,
+    ) -> Result<Vec<RequiredAction<String>>, crate::error::AppError> {
+        // Preserve the routing fixtures' historical labels after passing
+        // grammar-valid identifiers through the production boundary.
+        super::collect_required_actions(plan, provider, schemas).map(|actions| {
+            actions
+                .into_iter()
+                .map(|entry| {
+                    let (op, resource) = entry
+                        .action
+                        .iam_action()
+                        .strip_prefix("test:")
+                        .unwrap()
+                        .split_once('0')
+                        .unwrap();
+                    RequiredAction {
+                        effect: entry.effect,
+                        action: format!("test:{op}:{}", resource.replace("Dot", ".")),
+                    }
+                })
+                .collect()
+        })
     }
 
     #[test]
@@ -962,9 +1201,9 @@ mod tests {
             origin: None,
         });
 
-        let entries = collect_required_actions(
+        let entries = collect_fixture_required_actions(
             &plan,
-            &PermissionProvider { fail: false },
+            &crate::provider_text_fixtures::boundary(Box::new(PermissionProvider { fail: false })),
             &SchemaRegistry::new(),
         )
         .expect("permission lookup should succeed");
@@ -1006,9 +1245,9 @@ mod tests {
             Box::new(template),
         )));
 
-        let entries = collect_required_actions(
+        let entries = collect_fixture_required_actions(
             &plan,
-            &PermissionProvider { fail: false },
+            &crate::provider_text_fixtures::boundary(Box::new(PermissionProvider { fail: false })),
             &SchemaRegistry::new(),
         )
         .expect("permission lookup should succeed");
@@ -1057,9 +1296,12 @@ mod tests {
                 .validate()
                 .expect("valid IAM preflight schema"),
         );
-        let entries =
-            collect_required_actions(&plan, &PermissionProvider { fail: false }, &schemas)
-                .expect("permission lookup should resolve authored ignore paths");
+        let entries = collect_fixture_required_actions(
+            &plan,
+            &crate::provider_text_fixtures::boundary(Box::new(PermissionProvider { fail: false })),
+            &schemas,
+        )
+        .expect("permission lookup should resolve authored ignore paths");
 
         assert_eq!(entries[0].action, "test:create:route53.RecordSet");
     }
@@ -1073,7 +1315,7 @@ mod tests {
 
         let error = collect_required_actions(
             &plan,
-            &PermissionProvider { fail: true },
+            &crate::provider_text_fixtures::boundary(Box::new(PermissionProvider { fail: true })),
             &SchemaRegistry::new(),
         )
         .expect_err("permission lookup failures must abort IAM preflight");

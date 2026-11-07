@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use carina_cli::wiring::LoadedProviderFactory;
 use carina_core::provider::{
     BoxFuture, CanonicalProviderConfigAttributes, InitializeOutcomeMint, ProviderFactory,
-    ProviderInitialization, ProviderReadyConfig, ProviderResult,
+    ProviderInitialization, ProviderResult,
 };
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, ValidatedConfigSchema,
@@ -31,14 +31,17 @@ impl ProviderFactory for AwsTestFactory {
         Default::default()
     }
 
-    fn validate_config(&self, _: &CanonicalProviderConfigAttributes) -> ProviderResult<()> {
+    fn validate_config(
+        &self,
+        _: &CanonicalProviderConfigAttributes,
+        _session: &carina_core::provider::ProviderValidationInputs,
+    ) -> ProviderResult<()> {
         Ok(())
     }
 
     fn create_provider(
         &self,
-        _: Option<&str>,
-        _: &ProviderReadyConfig,
+        _: &carina_core::provider::ProviderSession,
         _: InitializeOutcomeMint,
     ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
         Box::pin(async { panic!("validation tests never instantiate providers") })
