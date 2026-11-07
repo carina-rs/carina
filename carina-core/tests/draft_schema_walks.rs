@@ -8,7 +8,15 @@ use carina_core::schema::{
 use indexmap::IndexMap;
 
 fn string_with_invalid_pattern() -> AttributeType {
-    AttributeType::refined_string(None, Some("(?=x)".into()), None, None)
+    AttributeType::refined_string(
+        None,
+        Some(carina_core::schema::PatternSpec::new(
+            "(?=x)",
+            carina_core::schema::PatternMatch::Full,
+        )),
+        None,
+        None,
+    )
 }
 
 #[test]
@@ -51,9 +59,9 @@ fn draft_ref_free_walks_preserve_patterns_and_budget() {
     assert!(matches!(
         shape,
         Shape::String {
-            pattern: Some("(?=x)"),
+            pattern: Some(spec),
             ..
-        }
+        } if spec == &carina_core::schema::PatternSpec::new("(?=x)", carina_core::schema::PatternMatch::Full)
     ));
     let structure =
         AttributeType::struct_("Draft", vec![StructField::optional("name", string).build()]);
@@ -142,9 +150,9 @@ fn draft_schema_walks_resolve_definitions() {
     assert!(matches!(
         secret.shape_ref_free().unwrap(),
         Shape::String {
-            pattern: Some("(?=x)"),
+            pattern: Some(spec),
             ..
-        }
+        } if spec == &carina_core::schema::PatternSpec::new("(?=x)", carina_core::schema::PatternMatch::Full)
     ));
     let children = struct_field_type(&schema, &reference, "children").unwrap();
     let Shape::List {
@@ -248,9 +256,9 @@ fn draft_metadata_walks_support_write_only_and_enum_aliases() {
     assert!(matches!(
         leaves[0].2.shape_ref_free().unwrap(),
         Shape::String {
-            pattern: Some("(?=x)"),
+            pattern: Some(spec),
             ..
-        }
+        } if spec == &carina_core::schema::PatternSpec::new("(?=x)", carina_core::schema::PatternMatch::Full)
     ));
     assert_eq!(schema.validate().unwrap_err().pattern_errors().count(), 2);
 }

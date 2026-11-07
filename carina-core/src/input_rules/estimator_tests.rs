@@ -17,7 +17,7 @@ fn template(parts: &[&str]) -> Value {
     ))
 }
 
-fn estimate(predicate: InputPredicate<String>, value: Value) -> InputVerdict {
+fn estimate(predicate: InputPredicate<crate::schema::PatternSpec>, value: Value) -> InputVerdict {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
@@ -154,7 +154,10 @@ fn estimator_literal_templates_decide_primitives() {
 fn estimator_unsupported_regex_stays_undecided() {
     assert_eq!(
         estimate(
-            InputPredicate::Matches("^abc$".into()),
+            InputPredicate::Matches(crate::schema::PatternSpec::new(
+                "^abc$",
+                crate::schema::PatternMatch::Full
+            )),
             template(&["ab", "c"])
         ),
         InputVerdict::Undecided
@@ -178,12 +181,12 @@ fn interpolation(parts: Vec<Value>) -> Value {
         parts.into_iter().map(InterpolationPart::Expr).collect(),
     ))
 }
-fn refined(pattern: &str, min: u64, max: Option<u64>) -> AttributeType {
-    AttributeType::refined_string(None, Some(pattern.into()), Some((Some(min), max)), None)
+fn refined(pattern: crate::schema::PatternSpec, min: u64, max: Option<u64>) -> AttributeType {
+    AttributeType::refined_string(None, Some(pattern), Some((Some(min), max)), None)
 }
 
 fn typed_estimate(
-    predicate: InputPredicate<String>,
+    predicate: InputPredicate<crate::schema::PatternSpec>,
     value: Value,
     ty: AttributeType,
 ) -> InputVerdict {
@@ -191,7 +194,7 @@ fn typed_estimate(
 }
 
 fn typed_target_estimate(
-    predicate: InputPredicate<String>,
+    predicate: InputPredicate<crate::schema::PatternSpec>,
     value: Value,
     ty: AttributeType,
     keys: bool,
@@ -278,7 +281,11 @@ fn estimator_declared_types_cover_three_outcomes_per_primitive() {
                 min: Some(3),
                 max: Some(5),
             },
-            refined("^[a-z]+$", 3, Some(5)),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                3,
+                Some(5),
+            ),
             "proven",
         ),
         (
@@ -286,7 +293,11 @@ fn estimator_declared_types_cover_three_outcomes_per_primitive() {
                 min: Some(3),
                 max: Some(5),
             },
-            refined("^[a-z]+$", 6, Some(9)),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                6,
+                Some(9),
+            ),
             "violation",
         ),
         (
@@ -294,63 +305,119 @@ fn estimator_declared_types_cover_three_outcomes_per_primitive() {
                 min: Some(3),
                 max: Some(5),
             },
-            refined("^[a-z]+$", 1, Some(9)),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                1,
+                Some(9),
+            ),
             "undecided",
         ),
         (
             AllowedChars(CharSet::ascii_lowercase()),
-            refined("^[a-z]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "proven",
         ),
         (
             AllowedChars(CharSet::ascii_lowercase()),
-            refined("^[0-9]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[0-9]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "violation",
         ),
         (
             AllowedChars(CharSet::ascii_lowercase()),
-            refined("^[a-z0-9]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z0-9]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "undecided",
         ),
         (
             FirstChar(CharSet::ascii_lowercase()),
-            refined("^[a-z]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "proven",
         ),
         (
             FirstChar(CharSet::ascii_lowercase()),
-            refined("^[0-9]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[0-9]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "violation",
         ),
         (
             FirstChar(CharSet::ascii_lowercase()),
-            refined("^[a-z0-9]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z0-9]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "undecided",
         ),
         (
             LastChar(CharSet::ascii_lowercase()),
-            refined("^[a-z]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "proven",
         ),
         (
             LastChar(CharSet::ascii_lowercase()),
-            refined("^[0-9]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[0-9]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "violation",
         ),
         (
             LastChar(CharSet::ascii_lowercase()),
-            refined("^[a-z0-9]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z0-9]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "undecided",
         ),
-        (NoPrefix(token("aa")), refined("^[b]+$", 1, None), "proven"),
         (
             NoPrefix(token("aa")),
-            refined("^[a]+$", 2, None),
+            refined(
+                crate::schema::PatternSpec::new("^[b]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
+            "proven",
+        ),
+        (
+            NoPrefix(token("aa")),
+            refined(
+                crate::schema::PatternSpec::new("^[a]+$", crate::schema::PatternMatch::Full),
+                2,
+                None,
+            ),
             "violation",
         ),
         (
             NoPrefix(token("aa")),
-            refined("^[ab]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[ab]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "undecided",
         ),
         (
@@ -358,7 +425,11 @@ fn estimator_declared_types_cover_three_outcomes_per_primitive() {
                 prefix: token("AA"),
                 ignore_ascii_case: true,
             },
-            refined("^[b]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[b]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "proven",
         ),
         (
@@ -366,7 +437,11 @@ fn estimator_declared_types_cover_three_outcomes_per_primitive() {
                 prefix: token("AA"),
                 ignore_ascii_case: true,
             },
-            refined("^[aA]+$", 2, None),
+            refined(
+                crate::schema::PatternSpec::new("^[aA]+$", crate::schema::PatternMatch::Full),
+                2,
+                None,
+            ),
             "violation",
         ),
         (
@@ -374,33 +449,65 @@ fn estimator_declared_types_cover_three_outcomes_per_primitive() {
                 prefix: token("AA"),
                 ignore_ascii_case: true,
             },
-            refined("^[ab]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[ab]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "undecided",
         ),
-        (NoSuffix(token("aa")), refined("^[b]+$", 1, None), "proven"),
         (
             NoSuffix(token("aa")),
-            refined("^[a]+$", 2, None),
+            refined(
+                crate::schema::PatternSpec::new("^[b]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
+            "proven",
+        ),
+        (
+            NoSuffix(token("aa")),
+            refined(
+                crate::schema::PatternSpec::new("^[a]+$", crate::schema::PatternMatch::Full),
+                2,
+                None,
+            ),
             "violation",
         ),
         (
             NoSuffix(token("aa")),
-            refined("^[ab]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[ab]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "undecided",
         ),
         (
             NoSubstring(token("aa")),
-            refined("^[b]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[b]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "proven",
         ),
         (
             NoSubstring(token("aa")),
-            refined("^[a]+$", 2, None),
+            refined(
+                crate::schema::PatternSpec::new("^[a]+$", crate::schema::PatternMatch::Full),
+                2,
+                None,
+            ),
             "violation",
         ),
         (
             NoSubstring(token("aa")),
-            refined("^[ab]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[ab]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "undecided",
         ),
         (
@@ -408,7 +515,11 @@ fn estimator_declared_types_cover_three_outcomes_per_primitive() {
                 left: CharSet::ascii_lowercase(),
                 right: CharSet::ascii_digits(),
             },
-            refined("^[a-z]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "proven",
         ),
         (
@@ -416,7 +527,11 @@ fn estimator_declared_types_cover_three_outcomes_per_primitive() {
                 left: CharSet::ascii_lowercase(),
                 right: CharSet::ascii_lowercase(),
             },
-            refined("^[a-z]+$", 2, None),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                2,
+                None,
+            ),
             "violation",
         ),
         (
@@ -424,24 +539,58 @@ fn estimator_declared_types_cover_three_outcomes_per_primitive() {
                 left: CharSet::ascii_lowercase(),
                 right: CharSet::ascii_digits(),
             },
-            refined("^[a-z0-9]+$", 2, None),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z0-9]+$", crate::schema::PatternMatch::Full),
+                2,
+                None,
+            ),
             "undecided",
         ),
-        (NotIpv4, refined("^[a-z]+$", 1, None), "proven"),
+        (
+            NotIpv4,
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
+            "proven",
+        ),
         (
             NotIpv4,
             AttributeType::string_literal_set(vec!["1.2.3.4".into(), "255.0.0.0".into()]),
             "violation",
         ),
-        (NotIpv4, refined("^[0-9.]+$", 7, Some(15)), "undecided"),
         (
-            Matches(".*".into()),
-            refined("^[a-z]+$", 1, None),
+            NotIpv4,
+            refined(
+                crate::schema::PatternSpec::new("^[0-9.]+$", crate::schema::PatternMatch::Full),
+                7,
+                Some(15),
+            ),
             "undecided",
         ),
         (
-            NotMatches(".*".into()),
-            refined("^[a-z]+$", 1, None),
+            Matches(crate::schema::PatternSpec::new(
+                ".*",
+                crate::schema::PatternMatch::Full,
+            )),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
+            "undecided",
+        ),
+        (
+            NotMatches(crate::schema::PatternSpec::new(
+                ".*",
+                crate::schema::PatternMatch::Full,
+            )),
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             "undecided",
         ),
     ];
@@ -456,7 +605,11 @@ fn estimator_declared_types_cover_three_outcomes_per_primitive() {
 
 #[test]
 fn estimator_nullable_endpoints_and_empty_endpoint_semantics() {
-    let nullable = refined("^[a-z]*$", 0, None);
+    let nullable = refined(
+        crate::schema::PatternSpec::new("^[a-z]*$", crate::schema::PatternMatch::Full),
+        0,
+        None,
+    );
     assert_eq!(
         outcome(typed_estimate(
             InputPredicate::FirstChar(CharSet::ascii_lowercase()),
@@ -504,7 +657,11 @@ fn estimator_crossings_skip_multiple_nullable_parts_and_keep_mandatory_distinct(
             outcome(typed_estimate(
                 predicate.clone(),
                 expression.clone(),
-                refined("^[x]*$", 0, Some(2))
+                refined(
+                    crate::schema::PatternSpec::new("^[x]*$", crate::schema::PatternMatch::Full),
+                    0,
+                    Some(2)
+                )
             )),
             "undecided",
             "{predicate:?}"
@@ -513,7 +670,11 @@ fn estimator_crossings_skip_multiple_nullable_parts_and_keep_mandatory_distinct(
             outcome(typed_estimate(
                 predicate.clone(),
                 expression.clone(),
-                refined("^[x]{0}$", 0, Some(0))
+                refined(
+                    crate::schema::PatternSpec::new("^[x]{0}$", crate::schema::PatternMatch::Full),
+                    0,
+                    Some(0)
+                )
             )),
             "violation",
             "{predicate:?}"
@@ -522,7 +683,11 @@ fn estimator_crossings_skip_multiple_nullable_parts_and_keep_mandatory_distinct(
             outcome(typed_estimate(
                 predicate.clone(),
                 expression,
-                refined("^[x]+$", 1, Some(2))
+                refined(
+                    crate::schema::PatternSpec::new("^[x]+$", crate::schema::PatternMatch::Full),
+                    1,
+                    Some(2)
+                )
             )),
             "proven",
             "{predicate:?}"
@@ -537,7 +702,11 @@ fn estimator_crossings_skip_multiple_nullable_parts_and_keep_mandatory_distinct(
         outcome(typed_estimate(
             adjacency.clone(),
             expression.clone(),
-            refined("^[X]*$", 0, Some(2))
+            refined(
+                crate::schema::PatternSpec::new("^[X]*$", crate::schema::PatternMatch::Full),
+                0,
+                Some(2)
+            )
         )),
         "undecided"
     );
@@ -545,7 +714,11 @@ fn estimator_crossings_skip_multiple_nullable_parts_and_keep_mandatory_distinct(
         outcome(typed_estimate(
             adjacency,
             expression,
-            refined("^[X]+$", 1, Some(2))
+            refined(
+                crate::schema::PatternSpec::new("^[X]+$", crate::schema::PatternMatch::Full),
+                1,
+                Some(2)
+            )
         )),
         "proven"
     );
@@ -553,7 +726,11 @@ fn estimator_crossings_skip_multiple_nullable_parts_and_keep_mandatory_distinct(
         outcome(typed_estimate(
             InputPredicate::NoSubstring(token("xx")),
             interpolation(vec![reference(), reference()]),
-            refined("^[x]$", 1, Some(1))
+            refined(
+                crate::schema::PatternSpec::new("^[x]$", crate::schema::PatternMatch::Full),
+                1,
+                Some(1)
+            )
         )),
         "violation"
     );
@@ -609,7 +786,18 @@ fn estimator_enums_use_api_values_and_unions_preserve_alternatives() {
             outcome(typed_estimate(
                 InputPredicate::AllowedChars(CharSet::ascii_lowercase()),
                 reference(),
-                AttributeType::union(vec![refined(a, 1, None), refined(b, 1, None)])
+                AttributeType::union(vec![
+                    refined(
+                        crate::schema::PatternSpec::new(a, crate::schema::PatternMatch::Full),
+                        1,
+                        None
+                    ),
+                    refined(
+                        crate::schema::PatternSpec::new(b, crate::schema::PatternMatch::Full),
+                        1,
+                        None
+                    )
+                ])
             )),
             expected
         );
@@ -631,7 +819,19 @@ fn estimator_patterns_are_whole_string_and_follow_compiler_ascii_semantics() {
             outcome(typed_estimate(
                 InputPredicate::AllowedChars(CharSet::ascii_lowercase()),
                 reference(),
-                refined(pattern, 1, None)
+                refined(
+                    crate::schema::PatternSpec::new(
+                        pattern,
+                        crate::schema::PatternMatch::Substring {
+                            reason: crate::schema::PatternReason::new(
+                                "This case deliberately lacks a whole-value character-class proof"
+                            )
+                            .unwrap()
+                        }
+                    ),
+                    1,
+                    None
+                )
             )),
             "undecided",
             "{pattern}"
@@ -648,7 +848,11 @@ fn estimator_patterns_are_whole_string_and_follow_compiler_ascii_semantics() {
             outcome(typed_estimate(
                 InputPredicate::AllowedChars(chars),
                 reference(),
-                refined(pattern, 1, None)
+                refined(
+                    crate::schema::PatternSpec::new(pattern, crate::schema::PatternMatch::Full),
+                    1,
+                    None
+                )
             )),
             "proven"
         );
@@ -660,7 +864,11 @@ fn estimator_patterns_are_whole_string_and_follow_compiler_ascii_semantics() {
                 max: Some(3)
             },
             reference(),
-            refined("^[é日😀]{3}$", 0, None)
+            refined(
+                crate::schema::PatternSpec::new("^[é日😀]{3}$", crate::schema::PatternMatch::Full),
+                0,
+                None
+            )
         )),
         "proven"
     );
@@ -695,7 +903,11 @@ fn estimator_ipv4_vectors_and_impossible_octet_structure() {
             outcome(typed_estimate(
                 InputPredicate::NotIpv4,
                 interpolation(vec![reference(), literal(tail)]),
-                refined(pattern, min, max)
+                refined(
+                    crate::schema::PatternSpec::new(pattern, crate::schema::PatternMatch::Full),
+                    min,
+                    max
+                )
             )),
             "proven"
         );
@@ -709,7 +921,11 @@ fn estimator_absence_erased_unknown_functions_and_secrets_are_conservative() {
         outcome(typed_target_estimate(
             predicate.clone(),
             reference(),
-            refined("^[0-9]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[0-9]+$", crate::schema::PatternMatch::Full),
+                1,
+                None
+            ),
             false,
             true
         )),
@@ -737,7 +953,11 @@ fn estimator_absence_erased_unknown_functions_and_secrets_are_conservative() {
             max: Some(2),
         },
         value,
-        refined("^[a-z]+$", 1, None),
+        refined(
+            crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+            1,
+            None,
+        ),
     );
     assert_eq!(outcome(verdict.clone()), "violation");
     assert!(!format!("{verdict:?}").contains("DO-NOT-PRINT"));
@@ -775,9 +995,23 @@ fn estimator_map_keys_literals_and_refined_key_declarations() {
         );
     }
     for (key_ty, expected) in [
-        (refined("^[a-z]+$", 1, None), "proven"),
+        (
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
+            "proven",
+        ),
         (AttributeType::string(), "undecided"),
-        (refined("^[aAwWsS:]+$", 4, None), "undecided"),
+        (
+            refined(
+                crate::schema::PatternSpec::new("^[aAwWsS:]+$", crate::schema::PatternMatch::Full),
+                4,
+                None,
+            ),
+            "undecided",
+        ),
     ] {
         assert_eq!(
             outcome(typed_target_estimate(
@@ -795,7 +1029,14 @@ fn estimator_map_keys_literals_and_refined_key_declarations() {
         outcome(typed_target_estimate(
             InputPredicate::AllowedChars(CharSet::ascii_lowercase()),
             reference(),
-            AttributeType::map_with_key(refined("^[0-9]+$", 1, None), AttributeType::string()),
+            AttributeType::map_with_key(
+                refined(
+                    crate::schema::PatternSpec::new("^[0-9]+$", crate::schema::PatternMatch::Full),
+                    1,
+                    None
+                ),
+                AttributeType::string()
+            ),
             true,
             false
         )),
@@ -913,7 +1154,10 @@ fn estimator_resolves_definitions_nested_paths_and_reference_metadata() {
                             "label",
                             AttributeType::reference(
                                 TypeIdentity::bare("Label"),
-                                Some("^[a-z]+$".into()),
+                                Some(crate::schema::PatternSpec::new(
+                                    "^[a-z]+$",
+                                    crate::schema::PatternMatch::Full,
+                                )),
                                 Some((Some(3), Some(5))),
                             ),
                         )
@@ -1015,8 +1259,18 @@ fn estimator_follows_composition_expressions_wait_aliases_and_data_sources_for_l
         "mock",
         ResourceSchema::new("Source")
             .attribute(
-                AttributeSchema::provider_populated("value", refined("^[a-z]+$", 3, Some(5)))
-                    .build(),
+                AttributeSchema::provider_populated(
+                    "value",
+                    refined(
+                        crate::schema::PatternSpec::new(
+                            "^[a-z]+$",
+                            crate::schema::PatternMatch::Full,
+                        ),
+                        3,
+                        Some(5),
+                    ),
+                )
+                .build(),
             )
             .validate()
             .unwrap(),
@@ -1026,8 +1280,18 @@ fn estimator_follows_composition_expressions_wait_aliases_and_data_sources_for_l
         ResourceSchema::new("Lookup")
             .as_data_source()
             .attribute(
-                AttributeSchema::provider_populated("value", refined("^[a-z]+$", 3, Some(5)))
-                    .build(),
+                AttributeSchema::provider_populated(
+                    "value",
+                    refined(
+                        crate::schema::PatternSpec::new(
+                            "^[a-z]+$",
+                            crate::schema::PatternMatch::Full,
+                        ),
+                        3,
+                        Some(5),
+                    ),
+                )
+                .build(),
             )
             .validate()
             .unwrap(),
@@ -1138,7 +1402,14 @@ fn estimator_default_tags_are_checked_through_the_host_merge_for_unknown_maps() 
                 AttributeSchema::provider_populated(
                     "value",
                     AttributeType::map_with_key(
-                        refined("^[a-z]+$", 1, None),
+                        refined(
+                            crate::schema::PatternSpec::new(
+                                "^[a-z]+$",
+                                crate::schema::PatternMatch::Full,
+                            ),
+                            1,
+                            None,
+                        ),
                         AttributeType::string(),
                     ),
                 )
@@ -1251,7 +1522,11 @@ fn estimator_depth_budget_and_overflow_widen_to_pending() {
                 max: Some(10)
             },
             expression,
-            refined("^[a-z]+$", 2, Some(3))
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                2,
+                Some(3)
+            )
         )),
         "undecided"
     );
@@ -1275,7 +1550,11 @@ fn estimator_map_cardinality_is_required_to_prove_a_key_violation() {
     let predicate = InputPredicate::AllowedChars(CharSet::ascii_lowercase());
     let map = |min| {
         AttributeType::refined_map(
-            refined("^[0-9]+$", 1, None),
+            refined(
+                crate::schema::PatternSpec::new("^[0-9]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
             AttributeType::string(),
             Some((Some(min), None)),
         )
@@ -1359,7 +1638,14 @@ fn estimator_literal_map_keys_use_the_provider_api_spelling() {
     );
     for (source_key_type, expected) in [
         (key_type, "violation"),
-        (refined("^[a-z]+$", 1, None), "undecided"),
+        (
+            refined(
+                crate::schema::PatternSpec::new("^[a-z]+$", crate::schema::PatternMatch::Full),
+                1,
+                None,
+            ),
+            "undecided",
+        ),
     ] {
         schemas.insert(
             "mock",
@@ -1411,7 +1697,11 @@ fn estimator_forbidden_prefix_case_folding_is_ascii_only() {
         outcome(typed_estimate(
             predicate("AA", false),
             reference(),
-            refined("^[a]+$", 2, None)
+            refined(
+                crate::schema::PatternSpec::new("^[a]+$", crate::schema::PatternMatch::Full),
+                2,
+                None
+            )
         )),
         "proven"
     );
@@ -1419,7 +1709,11 @@ fn estimator_forbidden_prefix_case_folding_is_ascii_only() {
         outcome(typed_estimate(
             predicate("AA", true),
             reference(),
-            refined("^[aA]+$", 2, None)
+            refined(
+                crate::schema::PatternSpec::new("^[aA]+$", crate::schema::PatternMatch::Full),
+                2,
+                None
+            )
         )),
         "violation"
     );
@@ -1427,7 +1721,11 @@ fn estimator_forbidden_prefix_case_folding_is_ascii_only() {
         outcome(typed_estimate(
             predicate("É", true),
             reference(),
-            refined("^[é]+$", 2, None)
+            refined(
+                crate::schema::PatternSpec::new("^[é]+$", crate::schema::PatternMatch::Full),
+                2,
+                None
+            )
         )),
         "proven"
     );
@@ -1467,7 +1765,11 @@ fn estimator_homogeneous_summaries_never_contradict_generated_witnesses() {
         let min = (seed >> 32) % 3;
         let max = min + (seed >> 40) % 4;
         let pattern = if seed & 1 == 0 { "^[ab]*$" } else { "^[a0]*$" };
-        let ty = refined(pattern, min, Some(max));
+        let ty = refined(
+            crate::schema::PatternSpec::new(pattern, crate::schema::PatternMatch::Full),
+            min,
+            Some(max),
+        );
         let left = if seed & 2 == 0 { "a" } else { "" };
         let right = if seed & 4 == 0 { "b" } else { "0" };
         let predicates = [
@@ -1587,4 +1889,23 @@ fn estimator_unknown_composition_output_stays_pending_in_live_and_saved_contexts
         ),
         InputVerdict::Undecided
     );
+}
+
+#[test]
+fn explicit_full_pattern_mode_proves_a_whole_value_character_class() {
+    for regex in ["[a-z]+", "^[a-z]+", "[a-z]+$", "^[a-z]+$"] {
+        assert_eq!(
+            outcome(typed_estimate(
+                InputPredicate::AllowedChars(CharSet::ascii_lowercase()),
+                reference(),
+                refined(
+                    crate::schema::PatternSpec::new(regex, crate::schema::PatternMatch::Full),
+                    1,
+                    None
+                ),
+            )),
+            "proven",
+            "{regex}"
+        );
+    }
 }

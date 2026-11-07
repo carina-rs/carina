@@ -92,7 +92,7 @@ use carina_provider_protocol::types::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// Failure while projecting validated SDK schemas onto version-23 JSON.
+/// Failure while projecting validated SDK schemas onto version-24 JSON.
 #[derive(Debug)]
 pub enum SchemaSerializationError {
     Convert(carina_core::protocol_convert::ProtocolConvertError),
@@ -2719,5 +2719,71 @@ mod tests {
         assert_eq!(id.provider, "provider");
         assert_eq!(id.resource_type, "");
         assert_eq!(id.identity, "name");
+    }
+}
+
+#[cfg(test)]
+mod explicit_pattern_mode_tests {
+    use super::*;
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, PatternMatch, PatternReason, PatternSpec, ResourceSchema,
+    };
+
+    #[test]
+    fn sdk_json_preserves_pattern_modes_and_reason() {
+        let full = AttributeType::refined_string(
+            None,
+            Some(PatternSpec::new("abc", PatternMatch::Full)),
+            None,
+            None,
+        );
+        let substring = AttributeType::refined_string(
+            None,
+            Some(PatternSpec::new(
+                "abc",
+                PatternMatch::Substring {
+                    reason: PatternReason::new("The upstream contract permits surrounding text")
+                        .unwrap(),
+                },
+            )),
+            None,
+            None,
+        );
+        let config = ValidatedConfigSchema::validate(BTreeMap::from([
+            ("full".into(), full.clone()),
+            ("substring".into(), substring.clone()),
+        ]))
+        .unwrap();
+        let resource = ResourceSchema::new("test.PatternModes")
+            .attribute(AttributeSchema::optional("full", full).build())
+            .attribute(AttributeSchema::optional("substring", substring).build())
+            .validate()
+            .unwrap();
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![resource],
+            config.clone(),
+            BTreeMap::new(),
+            vec![],
+        )
+        .unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&provider_schema_to_json(&witness).unwrap()).unwrap();
+        let attrs = &json["resources"][0]["attributes"];
+        assert_eq!(
+            attrs["full"]["attr_type"]["pattern"],
+            serde_json::json!({"regex":"abc", "mode":{"kind":"full"}})
+        );
+        assert_eq!(
+            attrs["substring"]["attr_type"]["pattern"],
+            serde_json::json!({"regex":"abc", "mode":{"kind":"substring", "reason":"The upstream contract permits surrounding text"}})
+        );
+        let config_json: serde_json::Value =
+            serde_json::from_str(&provider_config_schema_to_json(&config).unwrap()).unwrap();
+        for name in ["full", "substring"] {
+            assert_eq!(
+                config_json[name]["pattern"],
+                attrs[name]["attr_type"]["pattern"]
+            );
+        }
     }
 }

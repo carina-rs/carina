@@ -3815,7 +3815,15 @@ fn provider_boundary_constraint_schemas() -> SchemaRegistry {
                     "target",
                     PatternAttributeType::refined_string(
                         None,
-                        Some("^good-".to_string()),
+                        Some(crate::schema::PatternSpec::new(
+                            "^good-",
+                            crate::schema::PatternMatch::Substring {
+                                reason: crate::schema::PatternReason::new(
+                                    "Fixture deliberately validates only the prefix",
+                                )
+                                .unwrap(),
+                            },
+                        )),
                         None,
                         None,
                     ),
@@ -3859,7 +3867,20 @@ fn deferred_child_constraint_schemas() -> SchemaRegistry {
         (PatternResourceSchema::new("test").attribute(
             PatternAttributeSchema::optional(
                 "value",
-                PatternAttributeType::refined_string(None, Some("^good-".to_string()), None, None),
+                PatternAttributeType::refined_string(
+                    None,
+                    Some(crate::schema::PatternSpec::new(
+                        "^good-",
+                        crate::schema::PatternMatch::Substring {
+                            reason: crate::schema::PatternReason::new(
+                                "Fixture deliberately validates only the prefix",
+                            )
+                            .unwrap(),
+                        },
+                    )),
+                    None,
+                    None,
+                ),
             )
             .build(),
         ))
@@ -3880,7 +3901,15 @@ fn deferred_data_source_constraint_schemas() -> SchemaRegistry {
                     "filter",
                     PatternAttributeType::refined_string(
                         None,
-                        Some("^good-".to_string()),
+                        Some(crate::schema::PatternSpec::new(
+                            "^good-",
+                            crate::schema::PatternMatch::Substring {
+                                reason: crate::schema::PatternReason::new(
+                                    "Fixture deliberately validates only the prefix",
+                                )
+                                .unwrap(),
+                            },
+                        )),
                         None,
                         None,
                     ),
@@ -4518,7 +4547,15 @@ async fn absent_entirely_write_only_struct_stays_reassert_during_apply_augmentat
                     "target",
                     PatternAttributeType::refined_string(
                         None,
-                        Some("^good-".to_string()),
+                        Some(crate::schema::PatternSpec::new(
+                            "^good-",
+                            crate::schema::PatternMatch::Substring {
+                                reason: crate::schema::PatternReason::new(
+                                    "Fixture deliberately validates only the prefix",
+                                )
+                                .unwrap(),
+                            },
+                        )),
                         None,
                         None,
                     ),
@@ -6979,7 +7016,10 @@ async fn apply_gate_does_not_revalidate_plan_normalized_literal() {
                     "marker",
                     PatternAttributeType::refined_string(
                         None,
-                        Some("^raw_dsl$".to_string()),
+                        Some(crate::schema::PatternSpec::new(
+                            "^raw_dsl$".to_string(),
+                            crate::schema::PatternMatch::Full,
+                        )),
                         None,
                         None,
                     ),
@@ -7073,7 +7113,10 @@ async fn plan_normalized_resource_without_authored_origin_is_an_invariant_error(
                 "marker",
                 PatternAttributeType::refined_string(
                     None,
-                    Some("^raw_dsl$".to_string()),
+                    Some(crate::schema::PatternSpec::new(
+                        "^raw_dsl$".to_string(),
+                        crate::schema::PatternMatch::Full,
+                    )),
                     None,
                     None,
                 ),
@@ -7198,7 +7241,10 @@ async fn apply_gate_does_not_revalidate_plan_normalized_data_source_literal() {
                     "marker",
                     PatternAttributeType::refined_string(
                         None,
-                        Some("^raw_dsl$".to_string()),
+                        Some(crate::schema::PatternSpec::new(
+                            "^raw_dsl$".to_string(),
+                            crate::schema::PatternMatch::Full,
+                        )),
                         None,
                         None,
                     ),

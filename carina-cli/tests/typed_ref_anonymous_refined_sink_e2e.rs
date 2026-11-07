@@ -100,7 +100,10 @@ impl ProviderFactory for TypedRefMockFactory {
         );
         let refined = AttributeType::refined_string(
             None,
-            Some(PATTERN.to_string()),
+            Some(carina_core::schema::PatternSpec::new(
+                PATTERN.to_string(),
+                carina_core::schema::PatternMatch::Full,
+            )),
             Some((Some(6), Some(12))),
             None,
         );

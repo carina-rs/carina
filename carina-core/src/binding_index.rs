@@ -4266,7 +4266,10 @@ let vpc = aws.ec2.Vpc {
                 name: "String(pattern=alpha)",
                 attr: crate::schema::AttributeType::refined_string(
                     None,
-                    Some("^[a-z]+$".to_string()),
+                    Some(crate::schema::PatternSpec::new(
+                        "^[a-z]+$".to_string(),
+                        crate::schema::PatternMatch::Full,
+                    )),
                     None,
                     None,
                 ),
@@ -4276,7 +4279,10 @@ let vpc = aws.ec2.Vpc {
                 name: "String(pattern=digits)",
                 attr: crate::schema::AttributeType::refined_string(
                     None,
-                    Some("^[0-9]+$".to_string()),
+                    Some(crate::schema::PatternSpec::new(
+                        "^[0-9]+$".to_string(),
+                        crate::schema::PatternMatch::Full,
+                    )),
                     None,
                     None,
                 ),
@@ -4330,7 +4336,10 @@ let vpc = aws.ec2.Vpc {
                 attr: crate::schema::AttributeType::list(
                     crate::schema::AttributeType::refined_string(
                         None,
-                        Some("^[a-z]+$".to_string()),
+                        Some(crate::schema::PatternSpec::new(
+                            "^[a-z]+$".to_string(),
+                            crate::schema::PatternMatch::Full,
+                        )),
                         None,
                         None,
                     ),

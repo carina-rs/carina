@@ -406,7 +406,7 @@ impl InputRule<Draft> {
             code,
             predicate,
         } = self;
-        let mut compile = |source: String| match CompiledPattern::try_new(&source) {
+        let mut compile = |source: super::PatternSpec| match CompiledPattern::try_new(&source) {
             Ok(pattern) => Some(pattern),
             Err(error) => {
                 let location = SchemaValidationIssueLocation::InputRule(index);

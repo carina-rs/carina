@@ -19,7 +19,7 @@ use super::{
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v11";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v12";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -79,6 +79,18 @@ impl CanonicalEncoder {
 
     fn finish(self) -> Vec<u8> {
         self.bytes
+    }
+}
+
+fn encode_pattern(encoder: &mut CanonicalEncoder, pattern: &super::PatternSpec) {
+    let super::PatternSpecParts { regex, mode } = pattern.parts();
+    encoder.string(regex);
+    match mode {
+        super::PatternMatch::Full => encoder.tag(0),
+        super::PatternMatch::Substring { reason } => {
+            encoder.tag(1);
+            encoder.string(reason.as_str());
+        }
     }
 }
 
@@ -313,11 +325,11 @@ fn encode_input_rules(encoder: &mut CanonicalEncoder, rules: &[InputRule<Compile
                 InputPredicate::NotIpv4 => encoder.tag(8),
                 InputPredicate::Matches(pattern) => {
                     encoder.tag(9);
-                    encoder.string(pattern.as_str());
+                    encode_pattern(&mut encoder, pattern.as_ref());
                 }
                 InputPredicate::NotMatches(pattern) => {
                     encoder.tag(10);
-                    encoder.string(pattern.as_str());
+                    encode_pattern(&mut encoder, pattern.as_ref());
                 }
             }
             encoder.finish()
@@ -407,7 +419,7 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
         } => {
             encoder.tag(15);
             encode_type_identity(encoder, identity);
-            encoder.option(pattern.as_deref(), CanonicalEncoder::string);
+            encoder.option(pattern.as_ref().map(AsRef::as_ref), encode_pattern);
             encode_optional_u64_range(encoder, *length);
         }
         AttrTypeKind::String {
@@ -418,7 +430,7 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
         } => {
             encoder.tag(0);
             encoder.option(binding.identity(), encode_type_identity);
-            encoder.option(pattern.as_deref(), CanonicalEncoder::string);
+            encoder.option(pattern.as_ref().map(AsRef::as_ref), encode_pattern);
             encode_optional_u64_range(encoder, *length);
             encode_callback_presence(encoder, binding.callback().is_some());
             encoder.option(to_dsl.as_ref(), encode_dsl_transform);
@@ -954,9 +966,18 @@ mod tests {
                 right: CharSet::ascii_lowercase(),
             },
             InputPredicate::NotIpv4,
-            InputPredicate::Matches("^a$".into()),
-            InputPredicate::Matches("^b$".into()),
-            InputPredicate::NotMatches("^a$".into()),
+            InputPredicate::Matches(crate::schema::PatternSpec::new(
+                "^a$",
+                crate::schema::PatternMatch::Full,
+            )),
+            InputPredicate::Matches(crate::schema::PatternSpec::new(
+                "^b$",
+                crate::schema::PatternMatch::Full,
+            )),
+            InputPredicate::NotMatches(crate::schema::PatternSpec::new(
+                "^a$",
+                crate::schema::PatternMatch::Full,
+            )),
         ];
         let mut encodings = std::collections::BTreeSet::new();
         encodings.insert(fingerprint(vec![]));
@@ -988,5 +1009,64 @@ mod tests {
             InputPredicate::AllowedChars(CharSet::new([('d', 'f'), ('a', 'd')]).unwrap()),
         );
         assert_eq!(fingerprint(vec![canonical]), fingerprint(vec![reordered]));
+    }
+}
+
+#[cfg(test)]
+mod pattern_mode_tests {
+    use super::*;
+    use crate::schema::{
+        AttributeSchema, AttributeType, PatternMatch, PatternReason, PatternSpec, ResourceSchema,
+    };
+    use std::collections::HashSet;
+
+    #[test]
+    fn reference_and_input_rule_fingerprints_include_pattern_mode_and_reason() {
+        for kind in ["reference", "matches", "not_matches"] {
+            let fingerprints: HashSet<_> = [
+                PatternMatch::Full,
+                PatternMatch::Substring {
+                    reason: PatternReason::new("first contract").unwrap(),
+                },
+                PatternMatch::Substring {
+                    reason: PatternReason::new("second contract").unwrap(),
+                },
+            ]
+            .into_iter()
+            .map(|mode| {
+                let spec = PatternSpec::new("abc", mode);
+                let ty = if kind == "reference" {
+                    AttributeType::reference(
+                        TypeIdentity::new(Some("test"), ["Pattern"], "Id"),
+                        Some(spec.clone()),
+                        None,
+                    )
+                } else {
+                    AttributeType::string()
+                };
+                let mut schema = ResourceSchema::new("test.Pattern")
+                    .attribute(AttributeSchema::optional("value", ty).build());
+                if kind != "reference" {
+                    let predicate = if kind == "matches" {
+                        InputPredicate::Matches(spec)
+                    } else {
+                        InputPredicate::NotMatches(spec)
+                    };
+                    schema = schema.input_rule(InputRule::value(
+                        InputRuleScope::EveryWrite,
+                        crate::schema::InputPath::new("value").unwrap(),
+                        crate::schema::InputRuleCode::new("test.pattern").unwrap(),
+                        predicate,
+                    ));
+                }
+                schema
+                    .validate()
+                    .unwrap()
+                    .as_schema()
+                    .semantic_fingerprint()
+            })
+            .collect();
+            assert_eq!(fingerprints.len(), 3, "{kind}");
+        }
     }
 }

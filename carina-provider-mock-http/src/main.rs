@@ -12,6 +12,7 @@ use carina_plugin_sdk::{
     PendingDelete, PhasedToken, PlanOp, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict,
     UpdateOutcome,
 };
+use carina_provider_mock::pattern_mode_schema;
 
 use carina_provider_mock_http::send_phase::{self, PreparedCreate, ProbeKind};
 
@@ -89,10 +90,12 @@ impl CarinaProvider for MockHttpProvider {
     }
 
     fn schemas(&self) -> Vec<CoreValidatedResourceSchema> {
-        vec![send_phase::schema(
-            ProbeKind::HttpWorld,
-            Some(CREATE_BEHAVIOR_ATTRIBUTE),
-        )]
+        vec![
+            send_phase::schema(ProbeKind::HttpWorld, Some(CREATE_BEHAVIOR_ATTRIBUTE)),
+            pattern_mode_schema()
+                .validate()
+                .expect("pattern mode fixture"),
+        ]
     }
 
     fn reference_forms(&self) -> carina_plugin_sdk::core::schema::ReferenceForms {

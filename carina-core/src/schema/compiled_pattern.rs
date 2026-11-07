@@ -1,9 +1,33 @@
 //! Regexes admitted by schema validation, never compiled during value validation.
+//!
+//! A refined string cannot declare a bare-string pattern.
+//!
+//! ```compile_fail,E0308
+//! use carina_core::schema::AttributeType;
+//! let _ = AttributeType::refined_string(None, Some(String::from("abc")), None, None);
+//! ```
 
-use std::{fmt, ops::Deref};
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+};
 
-use crate::provider_text::{DiagnosticText, ProviderKey};
+use super::{PatternMatch, PatternSpec, PatternSpecDisplay};
+
+use crate::provider_text::{DiagnosticText, DiagnosticTextBuilder};
 use regex_syntax::ast::{self, Ast};
+
+// Match the regex crate's authored-source budget, checked before any rewrite.
+const SOURCE_NEST_LIMIT: u32 = 250;
+// ASCII classes can add a bracketed node (Ast::ClassBracketed or
+// ClassSetItem::Bracketed) and ClassSetItem::Union. Word-boundary rewrites
+// add only one Group on a separate assertion branch, so they do not stack.
+const MAX_DIALECT_NEST_OVERHEAD: u32 = 1 + 1;
+// The Full envelope \A(?:p)\z adds Group and Concat; its assertions are leaves.
+const FULL_ENVELOPE_NEST_OVERHEAD: u32 = 1 + 1;
+// Only internal compilation and inspection receive the combined slack.
+const COMPILED_NEST_LIMIT: u32 =
+    SOURCE_NEST_LIMIT + MAX_DIALECT_NEST_OVERHEAD + FULL_ENVELOPE_NEST_OVERHEAD;
 
 mod sealed {
     pub trait Sealed {}
@@ -11,7 +35,7 @@ mod sealed {
 
 /// Pattern representation carried by a draft or admitted schema tree.
 pub trait PatternForm: sealed::Sealed + Copy + fmt::Debug + Eq + Send + Sync + 'static {
-    type Pattern: Clone + fmt::Debug + Eq + Deref<Target = str> + Send + Sync;
+    type Pattern: Clone + fmt::Debug + Eq + AsRef<PatternSpec> + Send + Sync;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,7 +48,7 @@ impl sealed::Sealed for Draft {}
 impl sealed::Sealed for Compiled {}
 
 impl PatternForm for Draft {
-    type Pattern = String;
+    type Pattern = PatternSpec;
 }
 
 impl PatternForm for Compiled {
@@ -44,41 +68,63 @@ impl PatternForm for Compiled {
 /// Source text is preserved for diagnostics, transport and fingerprints.
 #[derive(Debug, Clone)]
 pub struct CompiledPattern {
-    source: String,
+    spec: PatternSpec,
     regex: regex::Regex,
 }
 
 impl CompiledPattern {
-    pub fn try_new(source: &str) -> Result<Self, PatternCompileError> {
+    pub fn try_new(spec: &PatternSpec) -> Result<Self, PatternCompileError> {
+        let source = spec.as_str();
         let compile = || {
-            let mut ast = ast::parse::Parser::new()
+            let mut ast = ast::parse::ParserBuilder::new()
+                .nest_limit(SOURCE_NEST_LIMIT)
+                .build()
                 .parse(source)
                 .map_err(|error| PatternCompileErrorSource::Parse(Box::new(error)))?;
             // Keep compiler diagnostics and their carets tied to the original spelling.
-            regex::Regex::new(source).map_err(PatternCompileErrorSource::Regex)?;
+            regex_syntax::ParserBuilder::new()
+                .nest_limit(SOURCE_NEST_LIMIT)
+                .build()
+                .parse(source)
+                .map_err(|error| {
+                    PatternCompileErrorSource::Regex(regex::Error::Syntax(error.to_string()))
+                })?;
             translate_ascii_escapes(&mut ast)?;
             let mut translated = String::new();
             ast::print::Printer::new()
                 .print(&ast, &mut translated)
                 .expect("printing a regex AST into a String cannot fail");
-            regex::Regex::new(&translated).map_err(PatternCompileErrorSource::Regex)
+            let expression = match spec.mode() {
+                PatternMatch::Full => format!(r"\A(?:{translated})\z"),
+                PatternMatch::Substring { .. } => translated,
+            };
+            regex::RegexBuilder::new(&expression)
+                .nest_limit(COMPILED_NEST_LIMIT)
+                .build()
+                .map_err(PatternCompileErrorSource::Regex)
         };
         compile()
             .map(|regex| Self {
-                source: source.to_string(),
+                spec: spec.clone(),
                 regex,
             })
-            .map_err(|error| PatternCompileError {
-                diagnostic: DiagnosticText::new(format!(
-                    "invalid string pattern {source:?}: {error}"
-                )),
-                pattern: source.into(),
-                reason: error,
+            .map_err(|error| {
+                let mut diagnostic = DiagnosticTextBuilder::default();
+                diagnostic.push_str("invalid string pattern ");
+                PatternSpecDisplay::new(spec)
+                    .quoted()
+                    .push_to(&mut diagnostic);
+                diagnostic.push_str(&format!(": {error}"));
+                PatternCompileError {
+                    diagnostic: diagnostic.finish(),
+                    spec: spec.clone(),
+                    reason: error,
+                }
             })
     }
 
     pub fn as_str(&self) -> &str {
-        &self.source
+        self.spec.as_str()
     }
 
     pub fn is_match(&self, value: &str) -> bool {
@@ -87,25 +133,44 @@ impl CompiledPattern {
 
     /// Recognize only an absolute whole-string character class repetition.
     /// Inspect the compiler's translated dialect so `\d` and `\w` retain
-    /// their ASCII meaning. Unanchored and multiline assertions prove nothing.
+    /// their ASCII meaning. Substring patterns need authored absolute boundaries;
+    /// multiline assertions alone prove nothing.
     pub(crate) fn whole_string_class(
         &self,
     ) -> Option<(super::CharSet, super::length_interval::LengthInterval)> {
         use regex_syntax::hir::{Class, HirKind, Look};
-        let hir = regex_syntax::Parser::new()
+        let hir = regex_syntax::ParserBuilder::new()
+            .nest_limit(COMPILED_NEST_LIMIT)
+            .build()
             .parse(self.regex.as_str())
             .ok()?;
         let HirKind::Concat(parts) = hir.kind() else {
             return None;
         };
-        let [start, middle, end] = parts.as_slice() else {
-            return None;
-        };
-        if !matches!(start.kind(), HirKind::Look(Look::Start))
-            || !matches!(end.kind(), HirKind::Look(Look::End))
-        {
+        let mut parts = parts.as_slice();
+        // Full adds absolute assertions around authored anchors. Repeated
+        // absolute assertions are idempotent; retain all other assertions.
+        let original_len = parts.len();
+        while matches!(
+            parts.first().map(|part| part.kind()),
+            Some(HirKind::Look(Look::Start))
+        ) {
+            parts = &parts[1..];
+        }
+        let starts_stripped = parts.len() < original_len;
+        let before_end_len = parts.len();
+        while matches!(
+            parts.last().map(|part| part.kind()),
+            Some(HirKind::Look(Look::End))
+        ) {
+            parts = &parts[..parts.len() - 1];
+        }
+        if !starts_stripped || parts.len() == before_end_len {
             return None;
         }
+        let [middle] = parts else {
+            return None;
+        };
         let (class, min, max) = match middle.kind() {
             HirKind::Repetition(rep) => (&*rep.sub, u64::from(rep.min), rep.max.map(u64::from)),
             _ => (middle, 1, Some(1)),
@@ -139,24 +204,44 @@ impl CompiledPattern {
     }
 }
 
-impl Deref for CompiledPattern {
-    type Target = str;
+impl AsRef<PatternSpec> for CompiledPattern {
+    fn as_ref(&self) -> &PatternSpec {
+        &self.spec
+    }
+}
 
-    fn deref(&self) -> &str {
-        self.as_str()
+impl Hash for CompiledPattern {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.spec.hash(state);
+    }
+}
+impl PartialOrd for CompiledPattern {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for CompiledPattern {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.spec.cmp(&other.spec)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[error("{diagnostic}")]
 pub struct PatternCompileError {
-    pub pattern: ProviderKey,
+    spec: PatternSpec,
     /// Typed parser, dialect or regex compiler diagnostic rendered by this error.
     pub reason: PatternCompileErrorSource,
     diagnostic: DiagnosticText,
 }
 
 impl Eq for PatternCompileError {}
+
+impl AsRef<PatternSpec> for PatternCompileError {
+    fn as_ref(&self) -> &PatternSpec {
+        &self.spec
+    }
+}
 
 /// The underlying parser, dialect or regex compiler failure.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -332,13 +417,13 @@ fn ascii_class(
 
 impl fmt::Display for CompiledPattern {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+        fmt::Display::fmt(&PatternSpecDisplay::new(&self.spec), formatter)
     }
 }
 
 impl PartialEq for CompiledPattern {
     fn eq(&self, other: &Self) -> bool {
-        self.as_str() == other.as_str()
+        self.spec == other.spec
     }
 }
 
@@ -347,6 +432,26 @@ impl Eq for CompiledPattern {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_match_is_absolute_and_preserves_alternation() {
+        for (source, accepted, rejected) in [
+            ("a|ab", "ab", "xab"),
+            ("a|b$", "a", "ax"),
+            ("", "", "x"),
+            ("(?m)^a$", "a", "a\n"),
+            ("a", "a", "a\n"),
+            ("a", "a", "a\r\n"),
+        ] {
+            let pattern = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                source,
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap();
+            assert!(pattern.is_match(accepted), "{source:?}: {accepted:?}");
+            assert!(!pattern.is_match(rejected), "{source:?}: {rejected:?}");
+        }
+    }
 
     #[test]
     fn ascii_digit_and_word_escapes_reject_unicode() {
@@ -362,7 +467,11 @@ mod tests {
             (r"^[\w&&[^_]]+$", "Az09", "é"),
             (r"^[\w--[0-9]]+$", "Az_", "é"),
         ] {
-            let pattern = CompiledPattern::try_new(source).unwrap();
+            let pattern = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                source,
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap();
             assert!(pattern.is_match(ascii), "{source:?}: {ascii:?}");
             assert!(!pattern.is_match(unicode), "{source:?}: {unicode:?}");
         }
@@ -378,7 +487,11 @@ mod tests {
             (r"^[\W]+$", "-!", "Az_09", "é中١"),
             (r"^[^\w-]+$", ".!", "Az_09-", "é中١"),
         ] {
-            let pattern = CompiledPattern::try_new(source).unwrap();
+            let pattern = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                source,
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap();
             assert!(pattern.is_match(ascii), "{source:?}: {ascii:?}");
             assert!(!pattern.is_match(excluded), "{source:?}: {excluded:?}");
             assert!(pattern.is_match(unicode), "{source:?}: {unicode:?}");
@@ -396,7 +509,16 @@ mod tests {
             (r"^\b\w+\b$", "Az_09", true),
             (r"^\b\w+\b$", "é", false),
         ] {
-            let pattern = CompiledPattern::try_new(source).unwrap();
+            let pattern = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                source,
+                crate::schema::PatternMatch::Substring {
+                    reason: crate::schema::PatternReason::new(
+                        "Dialect equivalence test intentionally uses substring semantics",
+                    )
+                    .unwrap(),
+                },
+            ))
+            .unwrap();
             assert_eq!(pattern.is_match(input), expected, "{source:?}: {input:?}");
         }
     }
@@ -417,24 +539,36 @@ mod tests {
             (r"(?i:\d)", "1"),
         ] {
             assert!(
-                CompiledPattern::try_new(source).unwrap().is_match(input),
+                CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                    source,
+                    crate::schema::PatternMatch::Full
+                ))
+                .unwrap()
+                .is_match(input),
                 "{source:?}"
             );
         }
         assert!(
-            !CompiledPattern::try_new(r"(?i:a)\w")
-                .unwrap()
-                .is_match("Aé")
+            !CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                r"(?i:a)\w",
+                crate::schema::PatternMatch::Full
+            ))
+            .unwrap()
+            .is_match("Aé")
         );
     }
 
     #[test]
     fn pattern_source_text_is_preserved() {
         let source = r"^\d{2}[\w.-]\b$";
-        let pattern = CompiledPattern::try_new(source).unwrap();
+        let pattern = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+            source,
+            crate::schema::PatternMatch::Full,
+        ))
+        .unwrap();
         assert_eq!(pattern.as_str(), source);
-        assert_eq!(pattern.to_string(), source);
-        assert_eq!(&*pattern, source);
+        assert_eq!(pattern.to_string(), format!("/{source}/ (Full)"));
+        assert_eq!(pattern.as_ref().as_str(), source);
         assert_eq!(pattern, pattern.clone());
         assert!(pattern.is_match("12a"));
     }
@@ -442,7 +576,11 @@ mod tests {
     #[test]
     fn provider_text_pattern_error_diagnostic_is_sanitized_and_bounded() {
         let raw = format!("\x1b[2J{}[", "x".repeat(20 * 1024));
-        let error = CompiledPattern::try_new(&raw).unwrap_err();
+        let error = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+            &raw,
+            crate::schema::PatternMatch::Full,
+        ))
+        .unwrap_err();
         assert!(!error.to_string().contains('\x1b'));
         assert!(error.to_string().contains("truncated,"));
         assert!(error.to_string().len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
@@ -452,8 +590,12 @@ mod tests {
     #[test]
     fn pattern_errors_preserve_the_original_source() {
         let source = r"^\d{2}[$";
-        let error = CompiledPattern::try_new(source).unwrap_err();
-        assert_eq!(error.pattern, source);
+        let error = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+            source,
+            crate::schema::PatternMatch::Full,
+        ))
+        .unwrap_err();
+        assert_eq!(error.as_ref().as_str(), source);
         assert!(
             error
                 .reason
@@ -464,8 +606,12 @@ mod tests {
             matches!(error.reason, PatternCompileErrorSource::Parse(ref error) if error.pattern() == source)
         );
         let source = r"^\d\p{NotAProperty}$";
-        let error = CompiledPattern::try_new(source).unwrap_err();
-        assert_eq!(error.pattern, source);
+        let error = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+            source,
+            crate::schema::PatternMatch::Full,
+        ))
+        .unwrap_err();
+        assert_eq!(error.as_ref().as_str(), source);
         assert!(matches!(error.reason, PatternCompileErrorSource::Regex(_)));
         assert!(error.reason.to_string().contains("Unicode property"));
     }
@@ -473,16 +619,24 @@ mod tests {
     #[test]
     fn pattern_compile_diagnostic_uses_original_spelling() {
         let source = r"^\d\p{NotAProperty}$";
-        let error = CompiledPattern::try_new(source).unwrap_err();
+        let error = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+            source,
+            crate::schema::PatternMatch::Full,
+        ))
+        .unwrap_err();
         let expected = regex::Regex::new(source).unwrap_err();
-        assert_eq!(error.pattern, source);
+        assert_eq!(error.as_ref().as_str(), source);
         assert_eq!(error.reason.to_string(), expected.to_string());
     }
 
     #[test]
     fn pattern_errors_are_terminal_diagnostics() {
         for pattern in [r"(?=x)", r"^\d\p{NotAProperty}$", r"(?u:\d)"] {
-            let error = CompiledPattern::try_new(pattern).unwrap_err();
+            let error = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                pattern,
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap_err();
             let rendered = error.to_string();
             let diagnostic = error.reason.to_string();
             assert_eq!(rendered.matches(&diagnostic).count(), 1, "{rendered}");
@@ -493,19 +647,30 @@ mod tests {
     #[test]
     fn interacting_flags_are_rejected_explicitly() {
         for source in [r"(?u)\d", r"(?-u:\w)", r"(?u:é)"] {
-            let error = CompiledPattern::try_new(source).unwrap_err();
-            assert_eq!(error.pattern, source);
+            let error = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                source,
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap_err();
+            assert_eq!(error.as_ref().as_str(), source);
             assert!(error.reason.to_string().contains("Unicode"));
         }
         for source in [r"(?i:\w)", r"(?i)[^\w-]", r"(?i)(a|\W)"] {
-            let error = CompiledPattern::try_new(source).unwrap_err();
-            assert_eq!(error.pattern, source);
+            let error = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                source,
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap_err();
+            assert_eq!(error.as_ref().as_str(), source);
             assert!(error.reason.to_string().contains("case-insensitive"));
         }
         assert!(
-            CompiledPattern::try_new(r"(?i:(?-i:\w))")
-                .unwrap()
-                .is_match("A")
+            CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                r"(?i:(?-i:\w))",
+                crate::schema::PatternMatch::Full
+            ))
+            .unwrap()
+            .is_match("A")
         );
     }
 
@@ -515,36 +680,56 @@ mod tests {
         // change. Compare Unicode probes too: their explicit ASCII ranges and
         // Unicode whitespace must keep their established behavior.
         let patterns = [
-            r#"^.*$"#,
-            r#"^.+$"#,
-            r#"^AWSReservedSSO_AdministratorAccess_[0-9a-f]{16}$"#,
-            r#"^Z+$"#,
-            r#"^Z[A-Z0-9]+$"#,
-            r#"^[0-9]+$"#,
-            r#"^[A-Za-z0-9.-]+$"#,
-            r#"^[a-zA-Z0-9=:#@/\-,.][a-zA-Z0-9+=:#@/\-,.\s]+[a-zA-Z0-9+=:#@/\-,.]{1,256}$"#,
-            r#"^[a-z]+$"#,
-            r#"^a*$"#,
-            r#"^a+$"#,
-            r#"^accepted$"#,
-            r#"^allowed$"#,
-            r#"^arn:(aws|aws-cn|aws-us-gov):[^:]+:.+$"#,
-            r#"^arn:(aws|aws-cn|aws-us-gov):s3:::.+$"#,
-            r#"^base$"#,
-            r#"^base-[a-z]+$"#,
-            r#"^foo$"#,
-            r#"^good-"#,
-            r#"^good-[a-z]+$"#,
-            r#"^module-target$"#,
-            r#"^outer$"#,
-            r#"^own$"#,
-            r#"^raw_dsl$"#,
-            r#"^sibling$"#,
-            r#"^valid$"#,
-            r#"^vpc-[a-f0-9]+$"#,
-            r#"^x$"#,
-            r#"^x+$"#,
-            r#"^y$"#,
+            (r#"^.*$"#, crate::schema::PatternMatch::Full),
+            (r#"^.+$"#, crate::schema::PatternMatch::Full),
+            (
+                r#"^AWSReservedSSO_AdministratorAccess_[0-9a-f]{16}$"#,
+                crate::schema::PatternMatch::Full,
+            ),
+            (r#"^Z+$"#, crate::schema::PatternMatch::Full),
+            (r#"^Z[A-Z0-9]+$"#, crate::schema::PatternMatch::Full),
+            (r#"^[0-9]+$"#, crate::schema::PatternMatch::Full),
+            (r#"^[A-Za-z0-9.-]+$"#, crate::schema::PatternMatch::Full),
+            (
+                r#"^[a-zA-Z0-9=:#@/\-,.][a-zA-Z0-9+=:#@/\-,.\s]+[a-zA-Z0-9+=:#@/\-,.]{1,256}$"#,
+                crate::schema::PatternMatch::Full,
+            ),
+            (r#"^[a-z]+$"#, crate::schema::PatternMatch::Full),
+            (r#"^a*$"#, crate::schema::PatternMatch::Full),
+            (r#"^a+$"#, crate::schema::PatternMatch::Full),
+            (r#"^accepted$"#, crate::schema::PatternMatch::Full),
+            (r#"^allowed$"#, crate::schema::PatternMatch::Full),
+            (
+                r#"^arn:(aws|aws-cn|aws-us-gov):[^:]+:.+$"#,
+                crate::schema::PatternMatch::Full,
+            ),
+            (
+                r#"^arn:(aws|aws-cn|aws-us-gov):s3:::.+$"#,
+                crate::schema::PatternMatch::Full,
+            ),
+            (r#"^base$"#, crate::schema::PatternMatch::Full),
+            (r#"^base-[a-z]+$"#, crate::schema::PatternMatch::Full),
+            (r#"^foo$"#, crate::schema::PatternMatch::Full),
+            (
+                r#"^good-"#,
+                crate::schema::PatternMatch::Substring {
+                    reason: crate::schema::PatternReason::new(
+                        "Legacy fixture deliberately constrains only a prefix",
+                    )
+                    .unwrap(),
+                },
+            ),
+            (r#"^good-[a-z]+$"#, crate::schema::PatternMatch::Full),
+            (r#"^module-target$"#, crate::schema::PatternMatch::Full),
+            (r#"^outer$"#, crate::schema::PatternMatch::Full),
+            (r#"^own$"#, crate::schema::PatternMatch::Full),
+            (r#"^raw_dsl$"#, crate::schema::PatternMatch::Full),
+            (r#"^sibling$"#, crate::schema::PatternMatch::Full),
+            (r#"^valid$"#, crate::schema::PatternMatch::Full),
+            (r#"^vpc-[a-f0-9]+$"#, crate::schema::PatternMatch::Full),
+            (r#"^x$"#, crate::schema::PatternMatch::Full),
+            (r#"^x+$"#, crate::schema::PatternMatch::Full),
+            (r#"^y$"#, crate::schema::PatternMatch::Full),
         ];
         let probes = [
             "",
@@ -568,9 +753,10 @@ mod tests {
             "a\u{2003}b",
             "(bad)",
         ];
-        for source in patterns {
+        for (source, mode) in patterns {
             let original = regex::Regex::new(source).unwrap();
-            let translated = CompiledPattern::try_new(source).unwrap();
+            let translated =
+                CompiledPattern::try_new(&crate::schema::PatternSpec::new(source, mode)).unwrap();
             assert_eq!(translated.as_str(), source);
             for input in probes {
                 assert_eq!(
@@ -714,13 +900,188 @@ mod tests {
         }
         for source in patterns {
             let original = regex::Regex::new(source).unwrap();
-            let translated = CompiledPattern::try_new(source).unwrap();
+            let translated = CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                source,
+                crate::schema::PatternMatch::Substring {
+                    reason: crate::schema::PatternReason::new(
+                        "Dialect equivalence test intentionally uses substring semantics",
+                    )
+                    .unwrap(),
+                },
+            ))
+            .unwrap();
             for input in &inputs {
                 assert_eq!(
                     original.is_match(input),
                     translated.is_match(input),
                     "{source:?}: {input:?}"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod explicit_mode_tests {
+    use super::*;
+
+    #[test]
+    fn substring_preserves_source_and_deliberately_accepts_containing_values() {
+        let spec = PatternSpec::new(
+            "a|ab",
+            PatternMatch::Substring {
+                reason: super::super::PatternReason::new(
+                    "Upstream explicitly uses substring semantics",
+                )
+                .unwrap(),
+            },
+        );
+        let pattern = CompiledPattern::try_new(&spec).unwrap();
+        assert_eq!(pattern.as_str(), "a|ab");
+        assert_eq!(pattern.as_ref(), &spec);
+        assert!(pattern.is_match("xabx"));
+        assert!(pattern.to_string().contains("Substring"));
+        assert!(
+            pattern
+                .to_string()
+                .contains("Upstream explicitly uses substring semantics")
+        );
+    }
+
+    #[test]
+    fn full_extended_mode_trailing_comments_and_flags_stay_inside_boundaries() {
+        for source in [
+            "(?x)a # trailing comment",
+            "(?x)a # trailing comment\n",
+            "(?m)a$",
+            "(?m)a|b$",
+        ] {
+            let pattern =
+                CompiledPattern::try_new(&PatternSpec::new(source, PatternMatch::Full)).unwrap();
+            assert!(pattern.is_match("a"), "{source}");
+            assert!(!pattern.is_match("a\n"), "{source}");
+            assert!(!pattern.is_match("xa"), "{source}");
+            assert_eq!(pattern.as_str(), source);
+        }
+    }
+}
+
+#[cfg(test)]
+mod wrapper_budget_tests {
+    use super::*;
+    use crate::schema::PatternReason;
+
+    #[test]
+    fn full_wrapper_preserves_the_authored_nesting_budget() {
+        for (leaf, depth, value) in [
+            ("a", 250, "a"),
+            (r"\bA\b", 248, "A"),
+            (r"\bA\b", 249, "A"),
+            (r"\B-\B", 249, "-"),
+            (r"\w", 250, "A"),
+            (r"\W", 250, "-"),
+            (r"\d", 250, "7"),
+            (r"\D", 250, "A"),
+            (r"[\w]", 249, "A"),
+            (r"[\W]", 249, "-"),
+            (r"[\d]", 249, "7"),
+            (r"[\D]", 249, "A"),
+            (r"[a\w]", 248, "A"),
+            (r"[a\W]", 248, "-"),
+            (r"[\w&&\w]", 248, "A"),
+            (r"\b\w\b", 249, "A"),
+        ] {
+            let source = format!("{}{leaf}{}", "(".repeat(depth), ")".repeat(depth));
+            regex::Regex::new(&source).expect("authored source fits the regex nesting budget");
+            let deeper_source = format!("({source})");
+            let deeper_source_is_valid = regex::Regex::new(&deeper_source).is_ok();
+            for mode in [
+                PatternMatch::Full,
+                PatternMatch::Substring {
+                    reason: PatternReason::new("Nesting-budget parity probe").unwrap(),
+                },
+            ] {
+                let pattern = CompiledPattern::try_new(&PatternSpec::new(&source, mode.clone()))
+                    .unwrap_or_else(|error| {
+                        panic!("{leaf:?}, {depth} groups: internal rewrites must not consume the authored budget: {error}")
+                    });
+                assert!(pattern.is_match(value));
+                assert_eq!(pattern.as_str(), source);
+                let deeper = CompiledPattern::try_new(&PatternSpec::new(&deeper_source, mode));
+                assert_eq!(
+                    deeper.is_ok(),
+                    deeper_source_is_valid,
+                    "{leaf:?}, {} groups: both modes must obey the authored-source budget",
+                    depth + 1
+                );
+                if !deeper_source_is_valid {
+                    let error = deeper.unwrap_err();
+                    assert_eq!(error.as_ref().as_str(), deeper_source);
+                    assert!(matches!(
+                        &error.reason,
+                        PatternCompileErrorSource::Parse(parse)
+                            if matches!(parse.kind(), ast::ErrorKind::NestLimitExceeded(SOURCE_NEST_LIMIT))
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn both_modes_keep_compiler_size_limits_and_source_diagnostics() {
+        let source = "[a-z]{1000000}";
+        for mode in [
+            PatternMatch::Full,
+            PatternMatch::Substring {
+                reason: PatternReason::new("Compiler-budget parity probe").unwrap(),
+            },
+        ] {
+            let error = CompiledPattern::try_new(&PatternSpec::new(source, mode)).unwrap_err();
+            assert_eq!(error.as_ref().as_str(), source);
+            assert!(matches!(
+                error.reason,
+                PatternCompileErrorSource::Regex(regex::Error::CompiledTooBig(_))
+            ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod compile_error_spec_tests {
+    use super::*;
+    use crate::schema::PatternReason;
+
+    #[test]
+    fn compile_errors_preserve_mode_and_reason_in_identity_and_diagnostics() {
+        let specs = [
+            PatternSpec::new("[", PatternMatch::Full),
+            PatternSpec::new(
+                "[",
+                PatternMatch::Substring {
+                    reason: PatternReason::new("first substring contract").unwrap(),
+                },
+            ),
+            PatternSpec::new(
+                "[",
+                PatternMatch::Substring {
+                    reason: PatternReason::new("second substring contract").unwrap(),
+                },
+            ),
+        ];
+        let errors: Vec<_> = specs
+            .iter()
+            .map(|spec| CompiledPattern::try_new(spec).unwrap_err())
+            .collect();
+        for (i, error) in errors.iter().enumerate() {
+            assert_eq!(error.as_ref(), &specs[i]);
+            assert_eq!(error.as_ref().as_str(), "[");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&PatternSpecDisplay::new(&specs[i]).mode_only().to_string())
+            );
+            for (j, other) in errors.iter().enumerate() {
+                assert_eq!(error == other, i == j);
             }
         }
     }

@@ -6,7 +6,10 @@ fn schemas(named: bool) -> SchemaRegistry {
             named.then(|| {
                 carina_core::schema::TypeIdentity::from_schema_type("test", "Names", "Name")
             }),
-            Some("^[a-z]+$".into()),
+            Some(carina_core::schema::PatternSpec::new(
+                "^[a-z]+$",
+                carina_core::schema::PatternMatch::Full,
+            )),
             None,
             None,
         )
@@ -39,7 +42,7 @@ fn lsp_value_messages(diagnostics: &[tower_lsp::lsp_types::Diagnostic]) -> BTree
 
 #[test]
 fn issue_4282_sibling_lets_supply_constructed_values_to_cli_and_lsp() {
-    let pattern = "does not match required pattern /^[a-z]+$/";
+    let pattern = "does not match required pattern /^[a-z]+$/ (Full)";
     for sibling in ["a-source.crn", "z-source.crn"] {
         for bound in [false, true] {
             for (expression, input, attribute, invalid, expected_lsp) in [
@@ -194,9 +197,9 @@ fn issue_4282_split_coalesce_literal_alternative_keeps_main_diagnostics() {
         let cli = cli_diagnostics(factories_for(&schemas), &fixture);
         let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
         let expected = if bound {
-            "List item at index 0: Invalid value 'UPPER': does not match required pattern /^[a-z]+$/"
+            "List item at index 0: Invalid value 'UPPER': does not match required pattern /^[a-z]+$/ (Full)"
         } else {
-            "List item at index 0: Invalid value 'UPPER' for 'names': does not match required pattern /^[a-z]+$/"
+            "List item at index 0: Invalid value 'UPPER' for 'names': does not match required pattern /^[a-z]+$/ (Full)"
         };
         assert_eq!(
             cli_located_message_multiset(&cli),

@@ -274,9 +274,11 @@ carina \
 
 Supply overrides only for provider kinds declared by that directory. The
 trust suffix is the credential class (`aws` for both AWS providers), but the
-metadata-only checker does not receive credentials. Released protocol-v12
-provider artifacts are supported on this command's metadata-only path; normal
-plan/apply provider loading remains on the current protocol.
+metadata-only checker does not receive credentials. It requires providers built
+for the current protocol (24), just like normal plan/apply loading. Older
+artifacts, including released protocol-v12 providers, are rejected with a
+protocol-version error because their schemas do not declare pattern match
+modes. Rebuild the providers against the current SDK before running the check.
 
 A successful legacy-state check reports the number of classified rows and any
 orphan/deposed warnings, followed by `no state was written`. Already-current

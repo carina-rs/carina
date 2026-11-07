@@ -37,7 +37,10 @@ fn single_reference_interpolation_scalar_constraints_and_module_call() {
                     "digits",
                     AttributeType::refined_string(
                         Some(TypeIdentity::new(Some("test"), ["r"], "Digits")),
-                        Some("^[0-9]+$".into()),
+                        Some(carina_core::schema::PatternSpec::new(
+                            "^[0-9]+$",
+                            carina_core::schema::PatternMatch::Full,
+                        )),
                         Some((Some(2), Some(4))),
                         None,
                     ),
@@ -662,7 +665,10 @@ fn typed_ref_anonymous_refined_string_schemas() -> SchemaRegistry {
     );
     let refined = AttributeType::refined_string(
         None,
-        Some(r"^[ -~]+$".to_string()),
+        Some(carina_core::schema::PatternSpec::new(
+            r"^[ -~]+$".to_string(),
+            carina_core::schema::PatternMatch::Full,
+        )),
         Some((Some(1), Some(1024))),
         None,
     );
@@ -943,4 +949,46 @@ test.r.renamed_block {
         "expected diagnostic for Int field in repeated `rule` block (attribute is `rules`), got: {:?}",
         messages_of(&diags),
     );
+}
+
+#[test]
+fn pattern_modes_directory_typecheck() {
+    for (attribute, value, accepted) in [
+        ("full", "xabcx", false),
+        ("substring", "xabcx", true),
+        ("substring", "xyz", false),
+        ("full", "abc", true),
+    ] {
+        let source =
+            format!("let patterned = mock.test.pattern_modes {{ {attribute} = '{value}' }}\n");
+        let exports = format!("exports {{ marker = patterned.{attribute} }}\n");
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider mock {}\n"),
+            ("main.crn", &source),
+            ("exports.crn", &exports),
+        ]);
+        let mut schemas = SchemaRegistry::new();
+        for schema in carina_provider_mock::builtin_schemas() {
+            schemas.insert("mock", schema);
+        }
+        let diagnostics = analyze(&engine_with_schemas(schemas), &fixture, "main.crn");
+        assert_eq!(
+            diagnostics.is_empty(),
+            accepted,
+            "{attribute}={value}: {diagnostics:#?}"
+        );
+        if !accepted {
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+            assert_eq!(
+                diagnostics[0].severity,
+                Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+            );
+            assert!(
+                diagnostics[0]
+                    .message
+                    .contains("does not match required pattern"),
+                "{diagnostics:#?}"
+            );
+        }
+    }
 }

@@ -117,7 +117,10 @@ fn single_reference_integer_interpolation_checks_resolved_string_constraints() {
                 "digits",
                 PatternAttributeType::refined_string(
                     Some(identity.clone()),
-                    Some("^[0-9]+$".into()),
+                    Some(crate::schema::PatternSpec::new(
+                        "^[0-9]+$",
+                        crate::schema::PatternMatch::Full,
+                    )),
                     Some((Some(2), Some(4))),
                     None,
                 ),
@@ -5251,7 +5254,13 @@ fn directional_relation_rejects_plain_string_for_identified_sink() {
 fn directional_relation_accepts_plain_string_for_identityless_pattern_sink() {
     let schema = AttributeType::refined_string(
         None,
-        Some(crate::schema::CompiledPattern::try_new("^.+$").unwrap()),
+        Some(
+            crate::schema::CompiledPattern::try_new(&crate::schema::PatternSpec::new(
+                "^.+$",
+                crate::schema::PatternMatch::Full,
+            ))
+            .unwrap(),
+        ),
         None,
         None,
     );
@@ -10956,7 +10965,10 @@ fn issue_4282_deferred_builtin_results_use_existing_resolved_value_checks() {
                 "sink",
                 PatternAttributeType::refined_string(
                     Some(identity.clone()),
-                    Some("^[a-z]+$".into()),
+                    Some(crate::schema::PatternSpec::new(
+                        "^[a-z]+$",
+                        crate::schema::PatternMatch::Full,
+                    )),
                     Some((Some(1), Some(3))),
                     None,
                 ),

@@ -712,6 +712,7 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// `timestamp` to recognize saved plans before decoding format-specific
     /// fields. Their serialized names must remain stable across plan formats;
     /// the version must also remain a `u32` (guarded by a test).
+    /// Plan format 43 requires explicit schema-pattern modes and reasons.
     /// Plan format 42 retains replacement history and create-first dependency
     /// requirements for schema admission when loading saved plans.
     /// Plan format 41 encodes secret(...) only as a typed Secret node.
@@ -2144,7 +2145,7 @@ impl UnresolvedPlanFileContents {
 }
 
 impl PlanFile {
-    pub const CURRENT_VERSION: u32 = 42;
+    pub const CURRENT_VERSION: u32 = 43;
 
     #[cfg(test)]
     pub(crate) fn decode_for_test(self) -> DecodedPlanFile {
@@ -5359,6 +5360,8 @@ fn build_plan_file_contents<E>(
     let wire_plan = recorded.into_wire();
 
     let contents = PlanFileContents::<ModuleSource, UnresolvedSavedPlan> {
+        // carina#4292: bumped 42→43 — pattern modes change schema semantics;
+        // reject older headers before schema-fingerprint verification.
         // carina#4283: bumped 41→42 — retain replacement history and dependency
         // requirements; loading re-admits requests against the target schema.
         // carina#4275: bumped 40→41 — secret(...) has no ordinary FunctionCall

@@ -100,11 +100,11 @@ mod version_checked_bindings {
         info_json: String,
     }
 
-    /// Dynamically addressed metadata exports shared by protocol v12 and v13.
+    /// Dynamically addressed exports for read-only schema loading.
     ///
-    /// Keeping the component instance unbound is the important distinction
-    /// from [`WasmBindings`]: Wasmtime never attempts to interpret v12 CRUD or
-    /// initialization signatures as the v13 runtime world.
+    /// Keeping the instance unbound avoids runtime initialization and CRUD
+    /// binding construction. Metadata uses the same current-protocol gate
+    /// and strict schema decoders as [`WasmBindings`].
     pub(in crate::wasm_factory) struct SchemaOnlyBindings {
         instance: wasmtime::component::Instance,
         info_json: String,
@@ -257,7 +257,7 @@ mod version_checked_bindings {
                     source,
                 })?
                 .map_err(WasmBindingCreationError::InfoCall)?;
-            wasm_convert::check_schema_only_protocol_version(&info_json)
+            wasm_convert::check_protocol_version(&info_json)
                 .map_err(WasmBindingCreationError::ProtocolVersion)?;
             Ok(Self {
                 instance,
@@ -1437,8 +1437,6 @@ impl SchemaOnlyWasmProviderFactory {
         let (mut store, bindings) =
             create_schema_only_bindings(&engine, &component, Arc::clone(&configured.label)).await?;
         let info_json = bindings.info_json();
-        let protocol_version = wasm_convert::schema_only_protocol_version(info_json)
-            .map_err(WasmProviderLoadError::from)?;
         let (reported_name, display_name, version) = wasm_convert::json_to_provider_info(info_json)
             .map_err(|source| {
                 WasmProviderLoadError::metadata("Failed to decode provider info", source)
@@ -1491,9 +1489,8 @@ impl SchemaOnlyWasmProviderFactory {
                     source,
                 )
             })?;
-        let provider_config_types = wasm_convert::json_to_schema_only_attribute_types(
+        let provider_config_types = wasm_convert::json_to_attribute_types(
             &provider_config_types_json,
-            protocol_version,
         )
         .map_err(|source| {
             WasmProviderLoadError::metadata(
@@ -1508,12 +1505,10 @@ impl SchemaOnlyWasmProviderFactory {
                 source,
             )
         })?;
-        let schema_witness = wasm_convert::json_to_schema_only_provider_schema(
-            &schemas_json,
-            provider_config_types,
-            protocol_version,
-        )
-        .map_err(|error| provider_schema_decode_error(&name, &version.to_string(), error))?;
+        let schema_witness =
+            wasm_convert::json_to_provider_schema(&schemas_json, provider_config_types).map_err(
+                |error| provider_schema_decode_error(&name, &version.to_string(), error),
+            )?;
 
         Ok(Self {
             name,
@@ -7313,8 +7308,8 @@ pub(super) mod tests {
     #[test]
     fn pattern_diagnostics_are_rendered_once_in_provider_load_error() {
         let json = r#"{
-                "first":{"type":"String","pattern":"(?=x)"},
-                "second":{"type":"String","pattern":"["}
+                "first":{"type":"String","pattern":{"regex":"(?=x)","mode":{"kind":"full"}}},
+                "second":{"type":"String","pattern":{"regex":"[","mode":{"kind":"full"}}}
             }"#;
         let detail = wasm_convert::json_to_attribute_types(json).unwrap_err();
         let diagnostic = ProviderDiagnostic::new(detail)
@@ -7322,7 +7317,13 @@ pub(super) mod tests {
         let rendered = diagnostic.to_string();
         assert!(std::error::Error::source(&diagnostic).is_none());
         for pattern in ["(?=x)", "["] {
-            let error = carina_core::schema::CompiledPattern::try_new(pattern).unwrap_err();
+            let error = carina_core::schema::CompiledPattern::try_new(
+                &carina_core::schema::PatternSpec::new(
+                    pattern,
+                    carina_core::schema::PatternMatch::Full,
+                ),
+            )
+            .unwrap_err();
             assert_eq!(
                 rendered.matches(&error.to_string()).count(),
                 1,

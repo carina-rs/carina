@@ -83,17 +83,17 @@ impl PartialOrd for DeclarationPattern {
 }
 impl Ord for DeclarationPattern {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.0.as_str().cmp(other.0.as_str())
+        self.0.cmp(&other.0)
     }
 }
 impl Serialize for DeclarationPattern {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(self.0.as_str())
+        self.0.as_ref().serialize(serializer)
     }
 }
 impl<'de> Deserialize<'de> for DeclarationPattern {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        CompiledPattern::try_new(&String::deserialize(deserializer)?)
+        CompiledPattern::try_new(&crate::schema::PatternSpec::deserialize(deserializer)?)
             .map(Self)
             .map_err(serde::de::Error::custom)
     }
@@ -288,6 +288,56 @@ mod tests {
         );
         for raw in ["1e999", "-1e999"] {
             assert!(serde_json::from_str::<ScalarConstraints>(&json.replace("-0.0", raw)).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod pattern_mode_tests {
+    use super::*;
+    use crate::schema::{PatternMatch, PatternReason, PatternSpec};
+
+    #[test]
+    fn retained_patterns_deduplicate_and_deserialize_complete_specs_only() {
+        let patterns: Vec<_> = [
+            PatternMatch::Full,
+            PatternMatch::Substring {
+                reason: PatternReason::new("first exception").unwrap(),
+            },
+            PatternMatch::Substring {
+                reason: PatternReason::new("second exception").unwrap(),
+            },
+        ]
+        .into_iter()
+        .map(|mode| {
+            DeclarationPattern(CompiledPattern::try_new(&PatternSpec::new("abc", mode)).unwrap())
+        })
+        .collect();
+        let mut retained = ScalarConstraints {
+            scalar: ScalarConstraintKind::String {
+                length: Bounds::new(None),
+                patterns: patterns.clone(),
+            },
+            empty_intersection: false,
+        };
+        retained.intersect(&retained.clone());
+        assert_eq!(retained.patterns().count(), 3);
+        let json = serde_json::to_string(&retained).unwrap();
+        let decoded: ScalarConstraints = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, retained);
+        assert_eq!(
+            decoded
+                .patterns()
+                .filter(|pattern| pattern.is_match("xabcx"))
+                .count(),
+            2
+        );
+        for bad in [
+            serde_json::json!("abc"),
+            serde_json::json!({"regex":"abc"}),
+            serde_json::json!({"regex":"abc","mode":{"kind":"substring","reason":""}}),
+        ] {
+            assert!(serde_json::from_value::<DeclarationPattern>(bad).is_err());
         }
     }
 }

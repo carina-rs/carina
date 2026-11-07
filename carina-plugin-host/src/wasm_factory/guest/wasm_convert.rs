@@ -1983,39 +1983,6 @@ pub fn check_protocol_version(info_json: &str) -> Result<(), DiagnosticText> {
     Ok(())
 }
 
-/// Admit the metadata-only surface used by legacy state migration checks.
-///
-/// Protocol v13 changed provider initialization and create-operation WIT
-/// shapes, but retained the v12 `info`, schema, config-schema, completion, and
-/// identity-attribute function signatures. The schema JSON itself gained
-/// required fields and is upgraded by the dedicated decoders below. The
-/// migration checker invokes only those stable exports through Wasmtime's
-/// dynamic component API; it never constructs runtime bindings or calls
-/// `initialize`. Keep this compatibility window explicit rather than
-/// weakening the ordinary provider runtime gate above.
-pub fn check_schema_only_protocol_version(info_json: &str) -> Result<(), DiagnosticText> {
-    const LEGACY_SCHEMA_PROTOCOL_VERSION: u32 = 12;
-
-    if schema_only_protocol_version(info_json)? == LEGACY_SCHEMA_PROTOCOL_VERSION {
-        return Ok(());
-    }
-    check_protocol_version(info_json)
-}
-
-/// Read the protocol stamp after the schema-only compatibility gate admits it.
-pub(crate) fn schema_only_protocol_version(info_json: &str) -> Result<u32, DiagnosticText> {
-    let envelope: proto::ProviderInfoEnvelope = serde_json::from_str(info_json).map_err(|e| {
-        DiagnosticText::new(
-            [
-                "invalid provider info: ",
-                &MetadataDiagnostic::new(e).to_string(),
-            ]
-            .concat(),
-        )
-    })?;
-    Ok(envelope.protocol_version)
-}
-
 /// Deserialize JSON to validated core resource schemas.
 #[cfg(test)]
 pub fn json_to_schemas(json: &str) -> Result<Vec<CoreValidatedResourceSchema>, SchemaDecodeError> {
@@ -2050,141 +2017,6 @@ pub fn json_to_attribute_types(json: &str) -> Result<CoreValidatedConfigSchema, 
         carina_core::protocol_convert::protocol_to_config_schema(proto_types)
             .map_err(SchemaDecodeError::protocol_conversion)
     })()
-}
-
-/// Decode the schema metadata surface admitted for a migration-only provider.
-///
-/// Protocol v12 used the same metadata exports as the current protocol, but
-/// its JSON omitted keyed-update and nested-field lifecycle metadata and used
-/// a boolean identity flag. Upgrade those released bytes in memory; ordinary
-/// provider runtime loading continues to use [`json_to_attribute_types`] and
-/// remains strict.
-pub(crate) fn json_to_schema_only_attribute_types(
-    json: &str,
-    protocol_version: u32,
-) -> Result<CoreValidatedConfigSchema, SchemaDecodeError> {
-    (|| {
-        if protocol_version != 12 {
-            return json_to_attribute_types(json);
-        }
-
-        let mut value: serde_json::Value =
-            serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
-        upgrade_v12_schema_json_in_memory(&mut value);
-        let value = serde_json::to_string(&value).map_err(SchemaDecodeError::schema_json_parse)?;
-        let proto_types: BTreeMap<String, proto::AttributeType> =
-            serde_json::from_str(&value).map_err(SchemaDecodeError::schema_json_parse)?;
-        carina_core::protocol_convert::protocol_to_config_schema(proto_types)
-            .map_err(SchemaDecodeError::protocol_conversion)
-    })()
-}
-
-/// Decode v12 resource-schema JSON into the current aggregate witness used only
-/// by the read-only migration checker. V12 had no reference forms or
-/// assignability declarations, so the adapter supplies empty collections.
-pub(crate) fn json_to_schema_only_provider_schema(
-    json: &str,
-    config: CoreValidatedConfigSchema,
-    protocol_version: u32,
-) -> Result<CoreValidatedProviderSchemaWitness, SchemaDecodeError> {
-    (|| {
-        if protocol_version != 12 {
-            return json_to_provider_schema(json, config);
-        }
-
-        let mut resources: serde_json::Value =
-            serde_json::from_str(json).map_err(SchemaDecodeError::schema_json_parse)?;
-        upgrade_v12_schema_json_in_memory(&mut resources);
-        let envelope = serde_json::json!({
-            "resources": resources,
-            "reference_forms": [],
-            "assignability_edges": [],
-        });
-        let envelope =
-            serde_json::to_string(&envelope).map_err(SchemaDecodeError::schema_json_parse)?;
-        let envelope: proto::ProviderSchemaEnvelope =
-            serde_json::from_str(&envelope).map_err(SchemaDecodeError::schema_json_parse)?;
-        carina_core::protocol_convert::protocol_to_provider_schema_witness(&envelope, config)
-            .map_err(SchemaDecodeError::protocol_conversion)
-    })()
-}
-
-fn upgrade_v12_schema_json_in_memory(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Array(values) => {
-            for value in values {
-                upgrade_v12_schema_json_in_memory(value);
-            }
-        }
-        serde_json::Value::Object(object) => {
-            if object
-                .get("resource_type")
-                .is_some_and(serde_json::Value::is_string)
-                && object
-                    .get("attributes")
-                    .is_some_and(serde_json::Value::is_object)
-            {
-                object.insert("input_rules".to_string(), serde_json::json!([]));
-                let field_groups = object
-                    .remove("exclusive_required")
-                    .and_then(|value| value.as_array().cloned())
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|fields| {
-                        serde_json::json!({
-                            "kind": "exactly_one",
-                            "fields": fields,
-                        })
-                    })
-                    .collect();
-                object.insert(
-                    "field_groups".to_string(),
-                    serde_json::Value::Array(field_groups),
-                );
-                object.insert(
-                    "default_prevent_destroy".to_string(),
-                    serde_json::Value::Bool(false),
-                );
-            }
-            if object
-                .get("attr_type")
-                .is_some_and(serde_json::Value::is_object)
-                && object.get("name").is_some_and(serde_json::Value::is_string)
-                && object.contains_key("required")
-            {
-                object.insert("keyed_partial_update".to_string(), serde_json::Value::Null);
-                object.insert(
-                    "identity".to_string(),
-                    serde_json::Value::String("none".to_string()),
-                );
-            }
-            if object
-                .get("field_type")
-                .is_some_and(serde_json::Value::is_object)
-                && object.get("name").is_some_and(serde_json::Value::is_string)
-                && object.contains_key("required")
-            {
-                object.insert("create_only".to_string(), serde_json::Value::Bool(false));
-                object.insert(
-                    "identity".to_string(),
-                    serde_json::Value::String("none".to_string()),
-                );
-            }
-            if object.get("type").and_then(serde_json::Value::as_str) == Some("list") {
-                object.insert("elements".to_owned(), serde_json::json!("allow_duplicates"));
-            }
-            if object.get("type").and_then(serde_json::Value::as_str) == Some("struct") {
-                object.insert(
-                    "field_groups".to_string(),
-                    serde_json::Value::Array(Vec::new()),
-                );
-            }
-            for child in object.values_mut() {
-                upgrade_v12_schema_json_in_memory(child);
-            }
-        }
-        _ => {}
-    }
 }
 
 #[cfg(test)]
@@ -2261,22 +2093,6 @@ mod tests {
             assert!(matches!(&error, SchemaDecodeError::JsonParse(_)));
             let rendered = carina_core::executor::render_error_chain(&error);
             assert!(rendered.contains("assignability_edges"), "{rendered}");
-        }
-
-        #[test]
-        fn v12_migration_adapter_supplies_empty_assignability_edges() {
-            let witness = json_to_schema_only_provider_schema(
-                include_str!("../../../tests/fixtures/protocol-v12/released-awscc-vpc.json"),
-                CoreValidatedConfigSchema::default(),
-                12,
-            )
-            .expect("released v12 metadata must still be admitted for migration");
-            assert!(!witness.resources().is_empty());
-            assert!(witness.assignability_edges().is_empty());
-            let envelope =
-                carina_core::protocol_convert::provider_schema_to_protocol(&witness).unwrap();
-            let json = serde_json::to_value(envelope).unwrap();
-            assert_eq!(json["assignability_edges"], serde_json::json!([]));
         }
     }
 
@@ -2716,13 +2532,13 @@ mod tests {
     fn proto_custom(
         name: &str,
         base: proto::AttributeType,
-        pattern: Option<&str>,
+        pattern: Option<proto::PatternSpec>,
         length: Option<(Option<u64>, Option<u64>)>,
     ) -> proto::AttributeType {
         proto::AttributeType::Custom {
             name: name.to_string(),
             base: Box::new(base),
-            pattern: pattern.map(str::to_string),
+            pattern,
             length,
             validate: None,
             to_dsl: None,
@@ -2737,7 +2553,15 @@ mod tests {
                 "domain_name".to_string(),
                 proto_attr(
                     "domain_name",
-                    proto_custom("DomainName", proto_string(), Some("^(?!-).+$"), None),
+                    proto_custom(
+                        "DomainName",
+                        proto_string(),
+                        Some(proto::PatternSpec::new(
+                            "^(?!-).+$",
+                            proto::PatternMatch::Full,
+                        )),
+                        None,
+                    ),
                 ),
             )],
         );
@@ -2754,7 +2578,7 @@ mod tests {
             location,
             &carina_core::schema::SchemaValidationIssueLocation::Attribute("domain_name".into())
         );
-        assert_eq!(pattern_error.pattern, "^(?!-).+$");
+        assert_eq!(pattern_error.as_ref().as_str(), "^(?!-).+$");
         assert!(matches!(
             pattern_error.reason,
             carina_core::schema::PatternCompileErrorSource::Parse(_)
@@ -2907,7 +2731,10 @@ mod tests {
                     PatternAttributeType::refined_list(
                         PatternAttributeType::reference(
                             reference_identity.clone(),
-                            Some("^alias/[a-z]+$".into()),
+                            Some(carina_core::schema::PatternSpec::new(
+                                "^alias/[a-z]+$",
+                                carina_core::schema::PatternMatch::Full,
+                            )),
                             Some((Some(8), Some(12))),
                         ),
                         false,
@@ -5384,23 +5211,8 @@ mod tests {
         let error = check_protocol_version(
             r#"{"name":"old","display_name":"Old","version":"1.0.0","protocol_version":22}"#,
         )
-        .expect_err("creation declarations require protocol 23");
-        assert!(error.contains("requires at least version 23"));
-    }
-
-    #[test]
-    fn input_rules_are_supplied_only_by_v12_migration_upgrade() {
-        let json = include_str!("../../../tests/fixtures/protocol-v12/released-awscc-vpc.json");
-        let witness =
-            json_to_schema_only_provider_schema(json, CoreValidatedConfigSchema::default(), 12)
-                .unwrap();
-        for schema in witness.resources() {
-            let wire = carina_core::protocol_convert::resource_schema_to_protocol(schema).unwrap();
-            assert_eq!(
-                serde_json::to_value(wire).unwrap()["input_rules"],
-                serde_json::json!([])
-            );
-        }
+        .expect_err("current declarations require protocol 24");
+        assert!(error.contains("requires at least version 24"));
     }
 
     #[test]
@@ -5526,57 +5338,10 @@ mod tests {
                     || rendered.contains("missing field `create_only`")
                     || rendered.contains("missing field `identity`")
                     || rendered.contains("missing field `elements`")
+                    || rendered.contains("expected struct PatternSpec")
                     || rejected_legacy_identity_bool,
                 "released fixture {expected_resource_type} crossed the required-field gate: {rendered}",
             );
-
-            // Add newer metadata only in-memory so these immutable v12 bytes
-            // still exercise every older conversion rule after the required
-            // protocol-v16 field gate.
-            let mut upgraded: serde_json::Value =
-                serde_json::from_str(json).expect("released fixture is valid JSON");
-            upgrade_v12_schema_json_in_memory(&mut upgraded);
-            let upgraded = serde_json::to_string(&upgraded).expect("upgraded fixture serializes");
-            let schemas = json_to_schemas(&upgraded).unwrap_or_else(|error| {
-                panic!(
-                    "augmented released fixture {expected_resource_type} must load: {}",
-                    render_error_chain(&error)
-                )
-            });
-            assert_eq!(schemas.len(), 1);
-            assert_eq!(
-                schemas[0].as_schema().resource_type(),
-                expected_resource_type
-            );
-            match expected_resource_type {
-                "ec2.EgressOnlyInternetGateway" => {
-                    let vpc_id = schemas[0].parts().attributes["vpc_id"].attr_type();
-                    assert!(matches!(
-                        vpc_id.raw_shape(),
-                        carina_core::schema::RawShape::String {
-                            identity: Some(identity),
-                            pattern: Some("^vpc-[0-9a-f]{8,}$"),
-                            ..
-                        } if identity.to_string() == "aws.ec2.Vpc.Id"
-                    ));
-                }
-                "ec2.Vpc" => {
-                    let tenancy = schemas[0].parts().attributes["instance_tenancy"].attr_type();
-                    assert!(matches!(
-                        tenancy.raw_shape(),
-                        carina_core::schema::RawShape::Enum {
-                            identity,
-                            values: Some([first, second, third]),
-                            ..
-                        } if identity.to_string() == "aws.ec2.Vpc.InstanceTenancy"
-                            && first == "default"
-                            && second == "dedicated"
-                            && third == "host"
-                    ));
-                }
-                "acm.Certificate" => {}
-                other => panic!("unhandled released fixture {other}"),
-            }
         }
     }
 
@@ -6200,82 +5965,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_only_loads_released_protocol_v12_schema_fixtures() {
-        for (resource_type, json) in [
-            (
-                "acm.Certificate",
-                include_str!(
-                    "../../../tests/fixtures/protocol-v12/aws-acm-domain-validation-options.json"
-                ),
-            ),
-            (
-                "ec2.EgressOnlyInternetGateway",
-                include_str!(
-                    "../../../tests/fixtures/protocol-v12/released-aws-egress-only-internet-gateway.json"
-                ),
-            ),
-            (
-                "ec2.Vpc",
-                include_str!("../../../tests/fixtures/protocol-v12/released-awscc-vpc.json"),
-            ),
-        ] {
-            let witness =
-                json_to_schema_only_provider_schema(json, CoreValidatedConfigSchema::default(), 12)
-                    .expect(
-                        "released v12 schema metadata must load through the migration-only decoder",
-                    );
-            assert_eq!(witness.resources()[0].parts().resource_type, resource_type);
-        }
-    }
-
-    #[test]
-    fn schema_only_v12_upgrade_distinguishes_fields_from_attribute_names() {
-        let config = json_to_schema_only_attribute_types(
-            r#"{
-                "attr_type":{"type":"String"},
-                "nested":{
-                    "type":"struct",
-                    "name":"Nested",
-                    "fields":[{
-                        "name":"value",
-                        "field_type":{"type":"String"},
-                        "required":false,
-                        "write_only":false
-                    }]
-                }
-            }"#,
-            12,
-        )
-        .expect("v12 config metadata must be upgraded in memory");
-        assert!(config.parts().contains_key("attr_type"));
-        assert!(config.parts().contains_key("nested"));
-
-        let witness = json_to_schema_only_provider_schema(
-            r#"[{
-                "resource_type":"test.FlowLog",
-                "attributes":{
-                    "resource_type":{
-                        "name":"resource_type",
-                        "attr_type":{"type":"String"},
-                        "required":true
-                    }
-                },
-                "exclusive_required":[]
-            }]"#,
-            CoreValidatedConfigSchema::default(),
-            12,
-        )
-        .expect("an attribute named resource_type must not be mistaken for a resource schema");
-        assert_eq!(witness.resources().len(), 1);
-        assert!(
-            witness.resources()[0]
-                .parts()
-                .attributes
-                .contains_key("resource_type")
-        );
-    }
-
-    #[test]
     fn provider_text_schema_json_error_chain_sanitizes_unknown_guest_variant() {
         let raw = format!("\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
         let input = serde_json::json!({"value": {"type": raw}}).to_string();
@@ -6875,7 +6564,10 @@ mod tests {
         let proto_attr = proto::AttributeType::Custom {
             name: "awscc.wafv2.WebACL.EntityDescription".to_string(),
             base: Box::new(proto_string()),
-            pattern: Some("^x$".to_string()),
+            pattern: Some(proto::PatternSpec::new(
+                "^x$".to_string(),
+                proto::PatternMatch::Full,
+            )),
             length: Some((Some(1), Some(9))),
             validate: None,
             to_dsl: None,
@@ -6892,7 +6584,13 @@ mod tests {
                     identity.map(|id| id.kind.as_str()),
                     Some("EntityDescription")
                 );
-                assert_eq!(pattern, Some("^x$"));
+                assert_eq!(
+                    pattern,
+                    Some(&carina_core::schema::PatternSpec::new(
+                        "^x$",
+                        carina_core::schema::PatternMatch::Full
+                    ))
+                );
                 assert_eq!(length, Some((Some(1), Some(9))));
             }
             other => panic!("expected Custom, got {other:?}"),
@@ -6905,7 +6603,7 @@ mod tests {
             "type":"custom",
             "name":"aws.route53.HostedZone.Name",
             "base":{"type":"String"},
-            "pattern":"^[a-z.]+$",
+            "pattern":{"regex":"^[a-z.]+$","mode":{"kind":"full"}},
             "length":[1,1024],
             "to_dsl":{"type":"StripSuffix","value":"."}
         }"#;
@@ -6921,7 +6619,13 @@ mod tests {
                 ..
             } => {
                 assert_eq!(identity.map(|id| id.kind.as_str()), Some("Name"));
-                assert_eq!(pattern, Some("^[a-z.]+$"));
+                assert_eq!(
+                    pattern,
+                    Some(&carina_core::schema::PatternSpec::new(
+                        "^[a-z.]+$",
+                        carina_core::schema::PatternMatch::Full
+                    ))
+                );
                 assert_eq!(length, Some((Some(1), Some(1024))));
                 assert_eq!(to_dsl.unwrap().apply("example.com."), "example.com");
             }
@@ -7029,10 +6733,20 @@ mod tests {
             proto_custom(
                 "aws.ResourceId",
                 proto_string(),
-                Some("^generic-"),
+                Some(proto::PatternSpec::new(
+                    "^generic-",
+                    proto::PatternMatch::Substring {
+                        reason: proto::PatternReason::new("prefix-only metadata fixture").unwrap(),
+                    },
+                )),
                 Some((Some(1), Some(64))),
             ),
-            Some("^vpc-"),
+            Some(proto::PatternSpec::new(
+                "^vpc-",
+                proto::PatternMatch::Substring {
+                    reason: proto::PatternReason::new("prefix-only metadata fixture").unwrap(),
+                },
+            )),
             Some((Some(4), Some(32))),
         );
         let core_attr = proto_attr_type_to_core(&nested).unwrap();
@@ -7040,7 +6754,18 @@ mod tests {
             carina_core::schema::Shape::String {
                 pattern, length, ..
             } => {
-                assert_eq!(pattern, Some("^vpc-"));
+                assert_eq!(
+                    pattern,
+                    Some(&carina_core::schema::PatternSpec::new(
+                        "^vpc-",
+                        carina_core::schema::PatternMatch::Substring {
+                            reason: carina_core::schema::PatternReason::new(
+                                "prefix-only metadata fixture"
+                            )
+                            .unwrap(),
+                        }
+                    ))
+                );
                 assert_eq!(length, Some((Some(4), Some(32))));
             }
             other => panic!("expected refined String, got {other:?}"),
@@ -7051,7 +6776,12 @@ mod tests {
             proto_custom(
                 "aws.ResourceId",
                 proto_string(),
-                Some("^generic-"),
+                Some(proto::PatternSpec::new(
+                    "^generic-",
+                    proto::PatternMatch::Substring {
+                        reason: proto::PatternReason::new("prefix-only metadata fixture").unwrap(),
+                    },
+                )),
                 Some((Some(1), Some(64))),
             ),
             None,
@@ -7062,7 +6792,18 @@ mod tests {
             carina_core::schema::Shape::String {
                 pattern, length, ..
             } => {
-                assert_eq!(pattern, Some("^generic-"));
+                assert_eq!(
+                    pattern,
+                    Some(&carina_core::schema::PatternSpec::new(
+                        "^generic-",
+                        carina_core::schema::PatternMatch::Substring {
+                            reason: carina_core::schema::PatternReason::new(
+                                "prefix-only metadata fixture"
+                            )
+                            .unwrap(),
+                        }
+                    ))
+                );
                 assert_eq!(length, Some((Some(1), Some(64))));
             }
             other => panic!("expected refined String, got {other:?}"),
@@ -7103,7 +6844,18 @@ mod tests {
             "aws.ec2.Subnet.Id",
             proto_custom(
                 "aws.ResourceId",
-                proto_custom("aws.StringId", proto_string(), Some("^subnet-"), None),
+                proto_custom(
+                    "aws.StringId",
+                    proto_string(),
+                    Some(proto::PatternSpec::new(
+                        "^subnet-",
+                        proto::PatternMatch::Substring {
+                            reason: proto::PatternReason::new("prefix-only metadata fixture")
+                                .unwrap(),
+                        },
+                    )),
+                    None,
+                ),
                 None,
                 None,
             ),
@@ -7116,7 +6868,18 @@ mod tests {
                 identity, pattern, ..
             } => {
                 assert_eq!(identity.map(|id| id.kind.as_str()), Some("Id"));
-                assert_eq!(pattern, Some("^subnet-"));
+                assert_eq!(
+                    pattern,
+                    Some(&carina_core::schema::PatternSpec::new(
+                        "^subnet-",
+                        carina_core::schema::PatternMatch::Substring {
+                            reason: carina_core::schema::PatternReason::new(
+                                "prefix-only metadata fixture"
+                            )
+                            .unwrap(),
+                        }
+                    ))
+                );
             }
             other => panic!("expected refined String, got {other:?}"),
         }
@@ -7250,7 +7013,7 @@ mod tests {
             r#"{
                 "type":"String",
                 "identity":"aws.route53.HostedZone.Name",
-                "pattern":"^[a-z.]+$",
+                "pattern":{"regex":"^[a-z.]+$","mode":{"kind":"full"}},
                 "length":[1,1024],
                 "to_dsl":{"type":"StripSuffix","value":"."}
             }"#,
@@ -7276,7 +7039,13 @@ mod tests {
                     ..
                 } => {
                     assert_eq!(identity.map(|id| id.kind.as_str()), Some("Name"));
-                    assert_eq!(pattern, Some("^[a-z.]+$"));
+                    assert_eq!(
+                        pattern,
+                        Some(&carina_core::schema::PatternSpec::new(
+                            "^[a-z.]+$",
+                            carina_core::schema::PatternMatch::Full
+                        ))
+                    );
                     assert_eq!(length, Some((Some(1), Some(1024))));
                     assert_eq!(to_dsl.unwrap().apply("example.com."), "example.com");
                 }
@@ -7446,14 +7215,6 @@ mod tests {
     }
 
     #[test]
-    fn schema_only_protocol_check_admits_v12_without_weakening_runtime_check() {
-        let info = r#"{"name":"old","display_name":"Old Provider","version":"1.0.0","protocol_version":12}"#;
-
-        assert!(check_schema_only_protocol_version(info).is_ok());
-        assert!(check_protocol_version(info).is_err());
-    }
-
-    #[test]
     fn wit_decode_rejects_nan_float_attribute() {
         use std::error::Error;
         for (raw, category) in [
@@ -7511,5 +7272,177 @@ mod tests {
                 "{diagnostic}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod pattern_mode_tests {
+    use super::*;
+
+    fn declare_full(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                if object.contains_key("pattern") {
+                    object.insert(
+                        "pattern".into(),
+                        serde_json::json!({"regex":"abc","mode":{"kind":"full"}}),
+                    );
+                }
+                for child in object.values_mut() {
+                    declare_full(child);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    declare_full(value);
+                }
+            }
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::String(_) => {}
+        }
+    }
+
+    #[test]
+    fn pattern_modes_resource_and_config_json_reject_incomplete_specs() {
+        for pattern in [
+            serde_json::json!("abc"),
+            serde_json::json!({"regex": "abc"}),
+            serde_json::json!({"mode": {"kind": "full"}}),
+            serde_json::json!({"regex": "abc", "mode": {"kind": "unknown"}}),
+            serde_json::json!({"regex": "abc", "mode": {"kind": "substring"}}),
+            serde_json::json!({"regex": "abc", "mode": {"kind": "substring", "reason": ""}}),
+        ] {
+            for terminal in [
+                serde_json::json!({"type": "String", "pattern": pattern}),
+                serde_json::json!({"type": "custom", "name": "test.Name", "base": {"type": "String"}, "pattern": pattern}),
+                serde_json::json!({"type": "reference", "identity": {"provider": "test", "segments": [], "kind": "Id"}, "pattern": pattern}),
+            ] {
+                // All current-protocol metadata is present, isolating the pattern failure.
+                let nested = serde_json::json!({"type": "struct", "name": "Nested", "field_groups": [], "fields": [{
+                    "name": "value", "required": false, "read_only": false, "write_only": false,
+                    "create_only": false, "identity": "none", "field_type": terminal
+                }]});
+                for ty in [terminal, nested] {
+                    let config = serde_json::json!({"value": ty});
+                    let mut valid_config = config.clone();
+                    declare_full(&mut valid_config);
+                    json_to_attribute_types(&valid_config.to_string())
+                        .unwrap_or_else(|error| panic!("invalid control {valid_config}: {error}"));
+                    let error = json_to_attribute_types(&config.to_string())
+                        .expect_err("pattern spec must fail decode");
+                    assert!(
+                        matches!(error, SchemaDecodeError::JsonParse(_)),
+                        "wrong rejection for config {config}: {error}"
+                    );
+                    let resource = serde_json::json!([{
+                        "resource_type": "test.Pattern", "kind": "managed", "unique_name": null,
+                        "attributes": {"value": {"name": "value", "required": false,
+                            "keyed_partial_update": null, "identity": "none", "attr_type": ty}},
+                        "field_groups": [], "input_rules": [], "default_prevent_destroy": false, "defs": {}
+                    }]);
+                    let mut valid_resource = resource.clone();
+                    declare_full(&mut valid_resource);
+                    json_to_schemas(&valid_resource.to_string()).unwrap_or_else(|error| {
+                        panic!("invalid control {valid_resource}: {error}")
+                    });
+                    let error = json_to_schemas(&resource.to_string())
+                        .expect_err("pattern spec must fail decode");
+                    assert!(
+                        matches!(error, SchemaDecodeError::JsonParse(_)),
+                        "wrong rejection for resource {resource}: {error}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod removed_legacy_pattern_window_tests {
+    #[test]
+    fn pattern_specs_require_protocol_24_including_schema_only_loading() {
+        for version in [12, 22, 23] {
+            let info = serde_json::json!({"name": "old", "display_name": "Old", "version": "1.0.0", "protocol_version": version});
+            let error = super::check_protocol_version(&info.to_string()).unwrap_err();
+            assert!(error.contains("requires at least version 24"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod pattern_mode_roundtrip_tests {
+    use super::*;
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, PatternMatch, PatternReason, PatternSpec, ResourceSchema,
+        StructField, TypeIdentity, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+    };
+
+    #[test]
+    fn sdk_json_host_roundtrip_preserves_both_modes_and_reasons() {
+        let mut types = BTreeMap::new();
+        for (name, mode) in [
+            ("full", PatternMatch::Full),
+            (
+                "substring",
+                PatternMatch::Substring {
+                    reason: PatternReason::new("The upstream contract permits surrounding text")
+                        .unwrap(),
+                },
+            ),
+        ] {
+            let spec = PatternSpec::new("abc", mode);
+            types.insert(
+                name.to_string(),
+                AttributeType::refined_string(None, Some(spec.clone()), None, None),
+            );
+            types.insert(
+                format!("{name}_reference"),
+                AttributeType::reference(
+                    TypeIdentity::new(Some("test"), ["Pattern"], "Reference"),
+                    Some(spec),
+                    None,
+                ),
+            );
+        }
+        let nested = AttributeType::struct_(
+            "Nested",
+            types
+                .iter()
+                .map(|(name, ty)| StructField::optional(name, ty.clone()).build())
+                .collect(),
+        );
+        types.insert("nested".into(), nested);
+        let config = ValidatedConfigSchema::validate(types.clone()).unwrap();
+        let mut resource = ResourceSchema::new("test.PatternModes");
+        for (name, ty) in types {
+            resource = resource.attribute(AttributeSchema::optional(name, ty).build());
+        }
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![resource.validate().unwrap()],
+            config.clone(),
+            BTreeMap::new(),
+            vec![],
+        )
+        .unwrap();
+        let config_json = carina_plugin_sdk::provider_config_schema_to_json(&config).unwrap();
+        let resource_json = carina_plugin_sdk::provider_schema_to_json(&witness).unwrap();
+        let decoded_config = json_to_attribute_types(&config_json).unwrap();
+        let decoded = json_to_provider_schema(&resource_json, decoded_config.clone()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&resource_json).unwrap(),
+            serde_json::from_str::<serde_json::Value>(
+                &carina_plugin_sdk::provider_schema_to_json(&decoded).unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&config_json).unwrap(),
+            serde_json::from_str::<serde_json::Value>(
+                &carina_plugin_sdk::provider_config_schema_to_json(&decoded_config).unwrap()
+            )
+            .unwrap()
+        );
     }
 }
