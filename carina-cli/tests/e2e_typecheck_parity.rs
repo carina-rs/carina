@@ -8251,13 +8251,16 @@ fn pattern_modes_directory_validate_and_lsp_parity() {
     for (attribute, value, accepted) in [
         ("full", "xabcx", false),
         ("substring", "xabcx", true),
+        ("substring", "xyz", false),
         ("full", "abc", true),
     ] {
-        let source = format!("mock.test.pattern_modes {{ {attribute} = '{value}' }}\n");
+        let source =
+            format!("let patterned = mock.test.pattern_modes {{ {attribute} = '{value}' }}\n");
+        let exports = format!("exports {{ marker = patterned.{attribute} }}\n");
         let fixture = write_fixture(&[
             ("providers.crn", "provider mock {}\n"),
             ("main.crn", &source),
-            ("exports.crn", "exports { marker = 'directory fixture' }\n"),
+            ("exports.crn", &exports),
         ]);
         let schemas = carina_provider_mock::builtin_schemas().into_iter().fold(
             SchemaRegistry::new(),

@@ -12,6 +12,7 @@ use carina_plugin_sdk::{
     PendingDelete, PhasedToken, PlanOp, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict,
     UpdateOutcome,
 };
+use carina_provider_mock::pattern_mode_schema;
 
 use carina_provider_mock_http::send_phase::{self, PreparedCreate, ProbeKind};
 
@@ -72,45 +73,6 @@ impl MockHttpProvider {
             request_id: None,
         }
     }
-}
-
-fn pattern_mode_schema() -> carina_plugin_sdk::core::schema::ResourceSchema {
-    use carina_plugin_sdk::core::schema::{
-        AttributeSchema, AttributeType, PatternMatch, PatternReason, PatternSpec, ResourceSchema,
-    };
-    ResourceSchema::new("test.pattern_modes")
-        .attribute(
-            AttributeSchema::optional(
-                "full",
-                AttributeType::refined_string(
-                    None,
-                    Some(PatternSpec::new("abc", PatternMatch::Full)),
-                    None,
-                    None,
-                ),
-            )
-            .build(),
-        )
-        .attribute(
-            AttributeSchema::optional(
-                "substring",
-                AttributeType::refined_string(
-                    None,
-                    Some(PatternSpec::new(
-                        "abc",
-                        PatternMatch::Substring {
-                            reason: PatternReason::new(
-                                "Fixture exercises deliberate substring validation",
-                            )
-                            .unwrap(),
-                        },
-                    )),
-                    None,
-                    None,
-                ),
-            )
-            .build(),
-        )
 }
 
 impl CarinaProvider for MockHttpProvider {
