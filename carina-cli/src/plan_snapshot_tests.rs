@@ -29,6 +29,32 @@ use crate::fixture_plan::{
 use crate::moved_hint::MovedBlockHint;
 use crate::plan_summary::PlanChangeSummary;
 
+#[test]
+fn snapshot_pending_inputs() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let fixture = build_plan_from_fixture_name(&runtime, "pending_inputs").unwrap();
+    assert_eq!(fixture.checked.as_ref().unwrap().pending_inputs().len(), 1);
+    let provider = provider_router_for_plan(&runtime, &fixture.plan).unwrap();
+    let display = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(fixture.prepare_display(carina_core::detail_rows::DetailLevel::Full, &provider))
+        .unwrap()
+        .unwrap();
+    let summary = build_fixture_plan_change_summary(&fixture);
+    let output = crate::display::format_prepared_plan(
+        runtime.color_mode(),
+        &display,
+        &summary,
+        Some(&fixture.schemas),
+        &fixture.moved_origins,
+        Some(&fixture.prev_explicit),
+        None,
+        &provider,
+    )
+    .unwrap();
+    insta::assert_snapshot!("pending_inputs", output);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn format_plan<D: crate::display::HistoricalDisplaySource + ?Sized>(
     color_mode: crate::output_style::ColorMode,

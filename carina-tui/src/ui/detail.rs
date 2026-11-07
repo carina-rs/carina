@@ -91,6 +91,23 @@ fn render_detail_row_to_rows(rows: &mut Vec<Row<'_>>, row: &DetailRow, is_select
     let dim_style = Style::default().fg(Color::DarkGray);
 
     match row {
+        DetailRow::PendingInput { path, codes } => {
+            rows.push(
+                Row::new(
+                    Indent::new(2),
+                    vec![Span::raw(format!(
+                        "{} [{}]: input check pending until apply",
+                        path,
+                        codes
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))],
+                )
+                .highlighted(is_selected),
+            );
+        }
         DetailRow::Text { text } => {
             rows.push(
                 Row::new(Indent::new(2), vec![Span::raw(text.clone())]).highlighted(is_selected),

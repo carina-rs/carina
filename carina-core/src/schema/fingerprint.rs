@@ -10,15 +10,16 @@
 use sha2::{Digest, Sha256};
 
 use super::{
-    AssignabilityEdge, AttrTypeKind, CompiledAttributeSchema as AttributeSchema,
+    AssignabilityEdge, AttrTypeKind, CharSet, Compiled, CompiledAttributeSchema as AttributeSchema,
     CompiledAttributeType as AttributeType, CompiledResourceSchema as ResourceSchema,
     CompiledStructField as StructField, DslTransform, FieldGroup, FieldGroupKind, IdentityMode,
-    InputMode, OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceValidation,
-    SchemaKind, TypeIdentity, UniqueNameSpec, ValidatorType,
+    InputMode, InputPredicate, InputRule, InputRuleParts, InputRuleScope, InputRuleTarget,
+    OwnerBoundResourceSchema, ReferenceForm, ReferenceForms, ResourceValidation, SchemaKind,
+    TypeIdentity, UniqueNameSpec, ValidatorType,
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v10";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v11";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -166,6 +167,7 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
         attributes,
         description: _description,
         validation,
+        input_rules,
         kind,
         unique_name,
         operation_config,
@@ -187,6 +189,7 @@ fn encode_resource_schema(encoder: &mut CanonicalEncoder, schema: &ResourceSchem
     }
 
     encode_resource_validation(encoder, validation);
+    encode_input_rules(encoder, input_rules);
     encode_unique_name(encoder, unique_name);
     encoder.option(operation_config.as_ref(), encode_operation_config);
 
@@ -227,6 +230,103 @@ fn encode_field_groups(encoder: &mut CanonicalEncoder, groups: &[FieldGroup]) {
     encoder.usize(encoded.len());
     for group in encoded {
         encoder.bytes(&group);
+    }
+}
+
+fn encode_input_charset(encoder: &mut CanonicalEncoder, set: &CharSet) {
+    encoder.usize(set.ranges().len());
+    for (start, end) in set.ranges() {
+        encoder.u32(u32::from(*start));
+        encoder.u32(u32::from(*end));
+    }
+}
+
+fn encode_input_rules(encoder: &mut CanonicalEncoder, rules: &[InputRule<Compiled>]) {
+    let mut encoded: Vec<_> = rules
+        .iter()
+        .map(|rule| {
+            let InputRuleParts {
+                scope,
+                target,
+                code,
+                predicate,
+            } = rule.parts();
+            let mut encoder = CanonicalEncoder::default();
+            encoder.tag(match scope {
+                InputRuleScope::CreateOnly => 0,
+                InputRuleScope::EveryWrite => 1,
+            });
+            match target {
+                InputRuleTarget::Value(path) => {
+                    encoder.tag(0);
+                    encoder.string(path.as_str());
+                }
+                InputRuleTarget::MapKeys(path) => {
+                    encoder.tag(1);
+                    encoder.string(path.as_str());
+                }
+            }
+            encoder.string(code.as_str());
+            match predicate {
+                InputPredicate::Length { min, max } => {
+                    encoder.tag(0);
+                    encoder.option(*min, CanonicalEncoder::u64);
+                    encoder.option(*max, CanonicalEncoder::u64);
+                }
+                InputPredicate::AllowedChars(set) => {
+                    encoder.tag(1);
+                    encode_input_charset(&mut encoder, set);
+                }
+                InputPredicate::FirstChar(set) => {
+                    encoder.tag(2);
+                    encode_input_charset(&mut encoder, set);
+                }
+                InputPredicate::LastChar(set) => {
+                    encoder.tag(3);
+                    encode_input_charset(&mut encoder, set);
+                }
+                InputPredicate::NoSubstring(token) => {
+                    encoder.tag(4);
+                    encoder.string(token.as_str());
+                }
+                InputPredicate::NoPrefix(token) => {
+                    encoder.tag(5);
+                    encoder.string(token.as_str());
+                }
+                InputPredicate::ForbiddenPrefix {
+                    prefix,
+                    ignore_ascii_case,
+                } => {
+                    encoder.tag(11);
+                    encoder.string(prefix.as_str());
+                    encoder.bool(*ignore_ascii_case);
+                }
+                InputPredicate::NoSuffix(token) => {
+                    encoder.tag(6);
+                    encoder.string(token.as_str());
+                }
+                InputPredicate::NoAdjacent { left, right } => {
+                    encoder.tag(7);
+                    encode_input_charset(&mut encoder, left);
+                    encode_input_charset(&mut encoder, right);
+                }
+                InputPredicate::NotIpv4 => encoder.tag(8),
+                InputPredicate::Matches(pattern) => {
+                    encoder.tag(9);
+                    encoder.string(pattern.as_str());
+                }
+                InputPredicate::NotMatches(pattern) => {
+                    encoder.tag(10);
+                    encoder.string(pattern.as_str());
+                }
+            }
+            encoder.finish()
+        })
+        .collect();
+    encoded.sort();
+    encoder.usize(encoded.len());
+    for rule in encoded {
+        encoder.bytes(&rule);
     }
 }
 
@@ -783,5 +883,110 @@ mod tests {
             without, changed,
             "removing a form must change the fingerprint"
         );
+    }
+    #[test]
+    fn creation_fingerprints_encode_every_payload_and_ignore_rule_order() {
+        use super::super::{
+            CharSet, InputPath, InputPredicate, InputRule, InputRuleCode, NonEmptyString,
+        };
+        let rule = |path: &str, code: &str, predicate| {
+            InputRule::value(
+                crate::schema::InputRuleScope::CreateOnly,
+                InputPath::new(path).unwrap(),
+                InputRuleCode::new(code).unwrap(),
+                predicate,
+            )
+        };
+        let fingerprint = |rules: Vec<InputRule>| {
+            rules
+                .into_iter()
+                .fold(
+                    PatternResourceSchema::new("test.Widget")
+                        .attribute(
+                            PatternAttributeSchema::optional(
+                                "name",
+                                PatternAttributeType::string(),
+                            )
+                            .build(),
+                        )
+                        .attribute(
+                            PatternAttributeSchema::optional(
+                                "other",
+                                PatternAttributeType::string(),
+                            )
+                            .build(),
+                        ),
+                    |schema, rule| schema.input_rule(rule),
+                )
+                .validate()
+                .unwrap()
+                .as_schema()
+                .semantic_fingerprint()
+        };
+        let token = |value: &str| NonEmptyString::new(value).unwrap();
+        let predicates = vec![
+            InputPredicate::Length {
+                min: Some(1),
+                max: Some(63),
+            },
+            InputPredicate::Length {
+                min: Some(2),
+                max: Some(63),
+            },
+            InputPredicate::Length {
+                min: Some(1),
+                max: Some(64),
+            },
+            InputPredicate::AllowedChars(CharSet::ascii_lowercase()),
+            InputPredicate::AllowedChars(CharSet::ascii_digits()),
+            InputPredicate::FirstChar(CharSet::ascii_lowercase()),
+            InputPredicate::LastChar(CharSet::ascii_lowercase()),
+            InputPredicate::NoSubstring(token("ab")),
+            InputPredicate::NoSubstring(token("ac")),
+            InputPredicate::NoPrefix(token("ab")),
+            InputPredicate::NoSuffix(token("ab")),
+            InputPredicate::NoAdjacent {
+                left: CharSet::ascii_lowercase(),
+                right: CharSet::ascii_digits(),
+            },
+            InputPredicate::NoAdjacent {
+                left: CharSet::ascii_digits(),
+                right: CharSet::ascii_lowercase(),
+            },
+            InputPredicate::NotIpv4,
+            InputPredicate::Matches("^a$".into()),
+            InputPredicate::Matches("^b$".into()),
+            InputPredicate::NotMatches("^a$".into()),
+        ];
+        let mut encodings = std::collections::BTreeSet::new();
+        encodings.insert(fingerprint(vec![]));
+        for predicate in predicates {
+            assert!(encodings.insert(fingerprint(vec![rule("name", "test.rule", predicate)])));
+        }
+        let a = rule("name", "test.first", InputPredicate::NotIpv4);
+        let b = rule("other", "test.second", InputPredicate::NotIpv4);
+        assert_eq!(
+            fingerprint(vec![a.clone(), b.clone()]),
+            fingerprint(vec![b.clone(), a.clone()])
+        );
+        assert_ne!(
+            fingerprint(vec![a.clone()]),
+            fingerprint(vec![rule("other", "test.first", InputPredicate::NotIpv4)])
+        );
+        assert_ne!(
+            fingerprint(vec![a]),
+            fingerprint(vec![rule("name", "test.changed", InputPredicate::NotIpv4)])
+        );
+        let canonical = rule(
+            "name",
+            "test.chars",
+            InputPredicate::AllowedChars(CharSet::new([('a', 'f')]).unwrap()),
+        );
+        let reordered = rule(
+            "name",
+            "test.chars",
+            InputPredicate::AllowedChars(CharSet::new([('d', 'f'), ('a', 'd')]).unwrap()),
+        );
+        assert_eq!(fingerprint(vec![canonical]), fingerprint(vec![reordered]));
     }
 }

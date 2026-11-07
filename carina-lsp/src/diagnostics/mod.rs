@@ -1266,6 +1266,53 @@ impl DiagnosticRun<'_> {
             });
             let semantic_tree = semantic_file
                 .and_then(|file| carina_core::parser::AnalysisTree::try_from_file(file).ok());
+            let input_resolution = carina_core::parser::resolve_resource_refs_from_analysis(
+                preferred_tree,
+                self.provider_context,
+            );
+            let input_findings = match input_resolution {
+                Ok(resolved) => {
+                    carina_core::input_rules::check_authored_inputs(&resolved, &self.schemas)
+                }
+                Err(_) => carina_core::input_rules::check_authored_inputs(
+                    pre_expansion_input,
+                    &self.schemas,
+                ),
+            };
+            match input_findings {
+                Ok(findings) => {
+                    for finding in findings {
+                        let Some(resource) = preferred_tree
+                            .resources()
+                            .find(|resource| resource.id() == &finding.resource_id)
+                        else {
+                            continue;
+                        };
+                        let attribute = finding
+                            .violation
+                            .path()
+                            .segments()
+                            .next()
+                            .expect("admitted path is nonempty");
+                        let location = if resource.attribute_keys().iter().any(|key| matches!(key.path().first(), Some(carina_core::parser::AttributePathSegment::Attribute(name)) if name == attribute)) {
+                            resource.attribute_key_location(attribute)
+                        } else { resource.type_location() };
+                        diagnostics.extend(render_merged(
+                            doc,
+                            &carina_core::parser::Located::new(location.clone(), ()),
+                            DiagnosticSeverity::ERROR,
+                            finding.to_string(),
+                        ));
+                    }
+                }
+                Err(error) => diagnostics.push(Diagnostic {
+                    range: Range::default(),
+                    severity: Some(DiagnosticSeverity::ERROR),
+                    source: Some("carina".into()),
+                    message: error.to_string(),
+                    ..Default::default()
+                }),
+            }
             diagnostics.extend(self.check_user_function_ref_types(
                 doc,
                 preferred_tree,

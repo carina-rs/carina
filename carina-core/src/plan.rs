@@ -109,6 +109,12 @@ pub enum CreateBeforeDestroyError {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PlanErrorKind {
+    InputRule {
+        path: String,
+        code: String,
+        reason: String,
+        context: crate::input_rules::InputWriteContext,
+    },
     PreventDestroy {
         action: PreventDestroyAction,
         source: PreventDestroySource,
@@ -361,6 +367,18 @@ impl PlanErrorKind {
 
     fn fmt_context(&self, f: &mut std::fmt::Formatter<'_>, project_dir: &Path) -> std::fmt::Result {
         match self {
+            Self::InputRule { path, code, reason, context } => {
+                let operation = match context {
+                    crate::input_rules::InputWriteContext::Update => "update",
+                    crate::input_rules::InputWriteContext::AuthoredDesired => "write input",
+                    crate::input_rules::InputWriteContext::Create
+                    | crate::input_rules::InputWriteContext::Replacement { .. }
+                    | crate::input_rules::InputWriteContext::ResumeCreate
+                    | crate::input_rules::InputWriteContext::DeferredCreate
+                    | crate::input_rules::InputWriteContext::DeferredReplacement => "create",
+                };
+                write!(f, "cannot {operation}: {path} [{code}]: {reason}")
+            }
             Self::PreventDestroy { action, source } => match source {
                 PreventDestroySource::ExplicitDirective => {
                     f.write_str(Self::explicit_prevent_destroy_message(*action))
@@ -492,6 +510,7 @@ impl PlanError {
             // not a second user-facing resource identity.
             PlanErrorKind::ModuleConstraint(diagnostic) => write!(f, "{diagnostic}"),
             kind @ (PlanErrorKind::PreventDestroy { .. }
+            | PlanErrorKind::InputRule { .. }
             | PlanErrorKind::SchemaNotRegistered(_)
             | PlanErrorKind::ReplacementCannotCoexist(_)
             | PlanErrorKind::InvalidPreparedReplacementName(_)
@@ -757,7 +776,8 @@ pub type SnapshotPlan<S = ModuleSource> = Plan<S, SnapshotLeaf>;
 
 /// An immutable plan whose final effects have passed replacement admission.
 /// Transformations operate on its draft view and return a [`Plan`], so their
-/// output must cross [`Plan::admit`] before it can be rendered or executed.
+/// output must cross [`Plan::admit`] before rendering. Execution additionally
+/// requires the core-finalized [`crate::input_rules::InputCheckedPlan`] witness.
 ///
 /// A draft cannot enter the display boundary:
 ///
@@ -837,8 +857,9 @@ impl<S: Clone, V: PlanValueKind> AdmittedPlan<S, V> {
     }
 }
 
-/// Deserialized saved-plan effects before managed resources have crossed the
-/// fingerprint-checked schema-resolution boundary.
+/// Effects decoded from a user-supplied saved-plan file, before schema resolution.
+/// The CLI checks source authenticity, lineage, serial and schema fingerprints.
+/// Deserialization alone does not establish those checks.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnresolvedSavedPlan {
     effects: Vec<UnresolvedSavedEffect>,
@@ -858,8 +879,15 @@ pub struct UnresolvedSavedPlan {
     destroy_ordering_notices: Vec<DestroyOrderingNotice>,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl From<SavedPlan> for UnresolvedSavedPlan {
     fn from(plan: SavedPlan) -> Self {
+        Self::from_recorded_snapshot(plan)
+    }
+}
+
+impl UnresolvedSavedPlan {
+    pub(crate) fn from_recorded_snapshot(plan: SavedPlan) -> Self {
         let Plan {
             replacements: _replacements,
             effects,
@@ -894,7 +922,9 @@ pub struct ReplacementIntentEndpoints {
 }
 
 impl UnresolvedSavedPlan {
-    pub fn add(&mut self, effect: UnresolvedSavedEffect) {
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn add_for_test(&mut self, effect: UnresolvedSavedEffect) {
         self.effects.push(effect);
     }
 

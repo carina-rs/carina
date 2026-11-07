@@ -3,12 +3,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
+use carina_core::input_rules::{InputAdmissionFailure, InputCheckedPlan, InputTypeContext};
 use carina_core::parser::{
     ExpandedBackendConfig as BackendConfig, ExpandedInferredExportParam as InferredExportParam,
     SavedProviderConfigs,
 };
-use carina_core::plan::{AdmittedPlan, Plan};
-type ExecutableSavedPlan = AdmittedPlan<SavedModuleSource>;
+type ExecutableSavedPlan = carina_core::saved_replay::AdmittedSavedPlanReplay;
 use carina_core::provider::{PersistedAttributes, Provider, ProviderRouter, ReadRequest};
 use carina_core::resource::{
     Current, DataSource, NoPlaceholder, ResolvedResourceId, Resource, ResourceId, SavedComposition,
@@ -1069,12 +1069,10 @@ impl DesiredVerifiedPlanFile {
                 }
             }
         }
-        let rehydrated_plan =
-            carina_core::value::rehydrate_plan_historical_secrets_from_verified_states(
-                self.plan_file.plan(),
-                &redacted_states,
-                verified_planned_states,
-            )
+        let rehydrated_plan = self
+            .plan_file
+            .plan()
+            .rehydrate_historical(&redacted_states, verified_planned_states)
             .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
         *self.plan_file.plan_mut() = rehydrated_plan;
 
@@ -1089,7 +1087,7 @@ impl DesiredVerifiedPlanFile {
 ///
 /// This is still not executable: the schema-checked [`DesiredPlanFile`]
 /// transition is the only path that can wrap it in [`ExecutablePlanFile`].
-pub(crate) struct RehydratedPlanFile<P = Plan<SavedModuleSource>> {
+pub(crate) struct RehydratedPlanFile<P = carina_core::saved_replay::SavedPlanReplay> {
     plan_file: ReloadedPlanFile<NoPlaceholder, P>,
     planned_secret_hashes: PlannedSecretHashes,
 }
@@ -1148,14 +1146,28 @@ impl<P> RehydratedPlanFile<P> {
     }
 }
 
-/// The only saved-plan type accepted by the executor gateway. Construction is
-/// private to [`DesiredPlanFile::verify_historical`], so a deserialized
-/// plan cannot execute without the provider-schema comparison.
+/// Provider- and secret-verified effects awaiting input re-admission.
+/// Construction is private to [`DesiredPlanFile::verify_historical`].
 pub(super) struct ExecutablePlanFile {
     plan: RehydratedPlanFile<ExecutableSavedPlan>,
 }
 
 impl ExecutablePlanFile {
+    pub(super) fn check_inputs(
+        &self,
+        schemas: &carina_core::schema::SchemaRegistry,
+        current: &HashMap<ResourceId, Current>,
+        types: &InputTypeContext<SavedModuleSource>,
+    ) -> Result<InputCheckedExecutablePlanFile<'_>, InputAdmissionFailure<SavedModuleSource>> {
+        let plan = self
+            .plan()
+            .check_inputs_with_types(schemas, current, types)?;
+        Ok(InputCheckedExecutablePlanFile {
+            plan_file: self,
+            plan,
+        })
+    }
+
     pub(super) fn reloaded_plan_file(
         &self,
     ) -> &ReloadedPlanFile<NoPlaceholder, ExecutableSavedPlan> {
@@ -1211,6 +1223,27 @@ impl ExecutablePlanFile {
     }
 }
 
+/// Executor capability retaining both verification of this exact saved file
+/// and the non-serializable input witness rebuilt under the apply lock.
+pub(super) struct InputCheckedExecutablePlanFile<'a> {
+    plan_file: &'a ExecutablePlanFile,
+    plan: InputCheckedPlan<SavedModuleSource>,
+}
+
+impl InputCheckedExecutablePlanFile<'_> {
+    pub(super) fn plan(&self) -> &InputCheckedPlan<SavedModuleSource> {
+        &self.plan
+    }
+}
+
+impl std::ops::Deref for InputCheckedExecutablePlanFile<'_> {
+    type Target = ExecutablePlanFile;
+
+    fn deref(&self) -> &Self::Target {
+        self.plan_file
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -1220,6 +1253,7 @@ mod tests {
     use carina_core::data_source_value::DataSourceValue;
     use carina_core::effect::Effect;
     use carina_core::parser::{ExpandedProviderConfig, ProviderConfig};
+    #[cfg(test)]
     use carina_core::plan::Plan;
     use carina_core::provider::{
         BoxFuture, InitializedProvider, ProviderFactory, ProviderInstanceKey, ProviderResult,

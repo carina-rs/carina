@@ -166,6 +166,7 @@ impl Provider for NoopProvider {
         id: &carina_core::resource::ResourceId,
         identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.to_string();
@@ -179,9 +180,7 @@ impl Provider for NoopProvider {
 
     fn delete(
         &self,
-        _id: &carina_core::resource::ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: carina_core::provider::DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Ok(()) })
     }

@@ -21,12 +21,15 @@ use crate::schema::{SchemaKind, SchemaRegistry, UniqueNameSpec};
 mod plan_scheduling_tests;
 #[path = "replacement/scheduling.rs"]
 mod scheduling;
-pub use crate::executor::scheduler::CreatePermit;
 pub(crate) use crate::executor::scheduler::ScheduledBasicEffect;
+pub use crate::executor::scheduler::{CreatePermit, UpdatePermit};
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
-pub use crate::executor::scheduler::create_permit_for_test;
-pub use scheduling::{ScheduledEffect, ScheduledEffects, ScheduledPlan};
+pub use crate::executor::scheduler::{
+    create_permit_for_test, create_permit_with_schemas_for_test, update_permit_for_test,
+    update_permit_with_schemas_for_test,
+};
+pub use scheduling::{InputCheckedScheduledPlan, ScheduledEffect, ScheduledEffects, ScheduledPlan};
 
 /// State rows own all their provider generations. Routing aliases belong to
 /// the generations, not to the row's identity.
@@ -1010,6 +1013,20 @@ impl<S: Clone, P: PlanValueKind> AdmittedReplacementEffects<S, P> {
             Effect::DeferredReplace(payload) => Some((**payload).clone()),
             _ => None,
         }
+    }
+
+    pub(crate) fn input_replacement_sites(&self) -> Vec<(usize, Vec<usize>, bool)> {
+        self.scheduling
+            .replacements
+            .iter()
+            .map(|replacement| {
+                (
+                    replacement.create,
+                    replacement.deletes.clone(),
+                    replacement.order.is_create_first(),
+                )
+            })
+            .collect()
     }
 
     pub(crate) fn deferred_delete_candidates(&self, gate: usize) -> Vec<usize> {

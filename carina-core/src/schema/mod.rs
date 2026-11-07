@@ -194,8 +194,15 @@
 
 mod compile_schema;
 mod compiled_pattern;
+pub(crate) mod length_interval;
+use length_interval::length_contains;
+mod input_rules;
 pub use compiled_pattern::{
     Compiled, CompiledPattern, Draft, PatternCompileError, PatternCompileErrorSource, PatternForm,
+};
+pub use input_rules::{
+    CharSet, InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleError, InputRuleParts,
+    InputRuleScope, InputRuleTarget, InputViolation, InputViolationReason, NonEmptyString,
 };
 
 use crate::provider_text::{ProviderString, ProviderText};
@@ -5771,26 +5778,6 @@ fn validate_struct_field_assignment(
         })
 }
 
-/// Source length is contained in sink length (narrow ⊆ wide).
-/// Missing bounds are treated as unbounded on that side.
-fn length_contains(
-    source: Option<&(Option<u64>, Option<u64>)>,
-    sink: Option<&(Option<u64>, Option<u64>)>,
-) -> bool {
-    // Both representations describe the same unbounded interval.
-    let Some((s_min, s_max)) = source else {
-        return matches!(sink, None | Some((None, None)));
-    };
-    let Some((k_min, k_max)) = sink else {
-        return true;
-    };
-    let s_min = s_min.unwrap_or(0);
-    let s_max = s_max.unwrap_or(u64::MAX);
-    let k_min = k_min.unwrap_or(0);
-    let k_max = k_max.unwrap_or(u64::MAX);
-    k_min <= s_min && s_max <= k_max
-}
-
 fn pattern_compatible(source: Option<&str>, sink: Option<&str>) -> bool {
     match (source, sink) {
         (_, None) => true,
@@ -7913,6 +7900,7 @@ pub enum UniqueNameSpec {
 ///     attributes,
 ///     description,
 ///     validation,
+///     input_rules,
 ///     kind,
 ///     unique_name,
 ///     operation_config,
@@ -7927,6 +7915,7 @@ pub enum UniqueNameSpec {
 ///     attributes,
 ///     description,
 ///     validation,
+///     input_rules,
 ///     kind,
 ///     unique_name,
 ///     operation_config,
@@ -7945,6 +7934,8 @@ pub struct PatternResourceSchema<R: PatternForm = Draft> {
     pub(crate) description: Option<ProviderText>,
     /// Cross-attribute validation, including its fingerprintable source.
     pub(crate) validation: ResourceValidation,
+    /// Scoped desired-input rules; only classified write sites may evaluate them.
+    pub(crate) input_rules: Vec<InputRule<R>>,
     /// Whether this is a managed resource or a data source.
     /// Data sources must be used with the `read` keyword.
     pub(crate) kind: SchemaKind,
@@ -7989,6 +7980,7 @@ pub struct ResourceSchemaParts<'a, R: PatternForm = Draft> {
     pub attributes: &'a BTreeMap<String, PatternAttributeSchema<R>>,
     pub description: Option<&'a str>,
     pub validation: &'a ResourceValidation,
+    pub input_rules: &'a [InputRule<R>],
     pub kind: SchemaKind,
     pub unique_name: &'a UniqueNameSpec,
     pub operation_config: Option<&'a OperationConfig>,
@@ -8028,6 +8020,7 @@ pub enum SchemaValidationIssueLocation {
     Attribute(ProviderString),
     Definition(ProviderString),
     FieldGroup(usize),
+    InputRule(usize),
     UniqueName,
     DefaultPreventDestroy,
 }
@@ -8038,6 +8031,7 @@ impl SchemaValidationIssueLocation {
             Self::Attribute(path) => path.as_str().to_owned(),
             Self::Definition(path) => format!("defs.{}", path.as_str()),
             Self::FieldGroup(index) => format!("field_groups[{index}]"),
+            Self::InputRule(index) => format!("input_rules[{index}]"),
             Self::UniqueName => "unique_name".into(),
             Self::DefaultPreventDestroy => "default_prevent_destroy".into(),
         }
@@ -8047,7 +8041,10 @@ impl SchemaValidationIssueLocation {
         match self {
             Self::Attribute(path) => Self::Attribute(format!("{}{suffix}", path.as_str()).into()),
             Self::Definition(path) => Self::Definition(format!("{}{suffix}", path.as_str()).into()),
-            Self::FieldGroup(_) | Self::UniqueName | Self::DefaultPreventDestroy => {
+            Self::FieldGroup(_)
+            | Self::InputRule(_)
+            | Self::UniqueName
+            | Self::DefaultPreventDestroy => {
                 unreachable!("schema-level issue locations cannot have type-path descendants")
             }
         }
@@ -8058,6 +8055,7 @@ impl SchemaValidationIssueLocation {
             Self::Attribute(path) => Some(path.as_str()),
             Self::Definition(_)
             | Self::FieldGroup(_)
+            | Self::InputRule(_)
             | Self::UniqueName
             | Self::DefaultPreventDestroy => None,
         }
@@ -8070,6 +8068,7 @@ impl fmt::Display for SchemaValidationIssueLocation {
             Self::Attribute(path) => write!(f, "{path}"),
             Self::Definition(path) => write!(f, "defs.{path}"),
             Self::FieldGroup(index) => write!(f, "field_groups[{index}]"),
+            Self::InputRule(index) => write!(f, "input_rules[{index}]"),
             Self::UniqueName => f.write_str("unique_name"),
             Self::DefaultPreventDestroy => f.write_str("default_prevent_destroy"),
         }
@@ -8078,6 +8077,7 @@ impl fmt::Display for SchemaValidationIssueLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SchemaDefinitionIssue {
+    input_rule_error: Option<InputRuleError>,
     pattern_error: Option<PatternCompileError>,
     location: SchemaValidationIssueLocation,
     path: ProviderString,
@@ -8108,6 +8108,17 @@ pub struct ResourceSchemaValidationError {
 }
 
 impl ResourceSchemaValidationError {
+    pub fn input_rule_errors(
+        &self,
+    ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &InputRuleError)> {
+        self.issues.iter().filter_map(|issue| {
+            issue
+                .input_rule_error
+                .as_ref()
+                .map(|error| (&issue.location, error))
+        })
+    }
+
     pub fn pattern_errors(
         &self,
     ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &PatternCompileError)> {
@@ -9729,6 +9740,7 @@ fn push_schema_issue(
     message: impl Into<String>,
 ) {
     issues.push(SchemaDefinitionIssue {
+        input_rule_error: None,
         pattern_error: None,
         path: location.raw_path().into(),
         location: location.clone(),
@@ -11169,6 +11181,7 @@ impl<R: PatternForm> PatternResourceSchema<R> {
             duplicate_attributes: Vec::new(),
             description: None,
             validation: ResourceValidation::None,
+            input_rules: Vec::new(),
             kind: SchemaKind::Resource,
             unique_name: UniqueNameSpec::Conflicting,
             operation_config: None,
@@ -11186,6 +11199,7 @@ impl<R: PatternForm> PatternResourceSchema<R> {
             attributes: &self.attributes,
             description: self.description.as_deref(),
             validation: &self.validation,
+            input_rules: &self.input_rules,
             kind: self.kind,
             unique_name: &self.unique_name,
             operation_config: self.operation_config.as_ref(),
@@ -11211,6 +11225,16 @@ impl<R: PatternForm> PatternResourceSchema<R> {
 
     pub fn validation(&self) -> &ResourceValidation {
         &self.validation
+    }
+
+    /// Add a portable rule with an explicit desired-write scope and target.
+    pub fn input_rule(mut self, rule: InputRule<R>) -> Self {
+        self.input_rules.push(rule);
+        self
+    }
+
+    pub fn input_rules(&self) -> &[InputRule<R>] {
+        &self.input_rules
     }
 
     pub fn kind(&self) -> SchemaKind {
@@ -14225,6 +14249,7 @@ impl PatternResourceSchema<Draft> {
     pub fn validate(self) -> Result<ValidatedResourceSchema, ResourceSchemaValidationError> {
         let mut issues = Vec::new();
         let identity_paths = self.validate_definition(&mut issues);
+        self.validate_input_rules(&mut issues);
         let resource_type = self.resource_type.clone();
         let schema = self.compile_patterns(&mut issues);
         finish_resource_schema_validation(resource_type, schema, identity_paths, issues)

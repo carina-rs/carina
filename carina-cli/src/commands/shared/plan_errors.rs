@@ -1,24 +1,11 @@
 use crate::output_style::Colorize;
 use std::path::Path;
 
-use carina_core::plan::{Plan, PlanError, PlanErrorKind};
+use carina_core::plan::{PlanError, PlanErrorKind};
 
 use crate::error::AppError;
 
-pub(crate) fn render_plan_errors_and_abort<S>(
-    color_mode: crate::output_style::ColorMode,
-    plan: &Plan<S>,
-    project_dir: &Path,
-) -> Result<(), AppError> {
-    let errors = plan.errors();
-    if errors.is_empty() {
-        return Ok(());
-    }
-
-    Err(render_plan_errors(color_mode, errors, project_dir))
-}
-
-fn render_plan_errors(
+pub(crate) fn render_plan_errors(
     color_mode: crate::output_style::ColorMode,
     errors: &[PlanError],
     project_dir: &Path,
@@ -64,6 +51,7 @@ fn plan_error_summary(errors: &[PlanError]) -> String {
         match &err.kind {
             PlanErrorKind::PreventDestroy { .. } => prevent_destroy_count += 1,
             PlanErrorKind::SchemaNotRegistered(_)
+            | PlanErrorKind::InputRule { .. }
             | PlanErrorKind::ReplacementCannotCoexist(_)
             | PlanErrorKind::InvalidPreparedReplacementName(_)
             | PlanErrorKind::CreateBeforeDestroyRequiredByDependent { .. }
@@ -104,7 +92,7 @@ mod tests {
     use super::*;
 
     use carina_core::plan::{
-        PreventDestroyAction, PreventDestroySource, ReplacementCannotCoexistError,
+        Plan, PreventDestroyAction, PreventDestroySource, ReplacementCannotCoexistError,
         SchemaNotRegisteredError,
     };
     use carina_core::resource::ResourceId;
@@ -125,15 +113,16 @@ mod tests {
     }
 
     fn abort_summary(color_mode: crate::output_style::ColorMode, plan: &Plan) -> String {
-        render_plan_errors_and_abort(color_mode, plan, Path::new("."))
-            .expect_err("plan errors must abort")
-            .to_string()
+        render_plan_errors(color_mode, plan.errors(), Path::new(".")).to_string()
     }
 
     #[test]
-    fn empty_plan_error_helper_returns_ok() {
+    fn empty_diagnostics_return_an_error_without_panicking() {
         let color_mode = crate::output_style::ColorMode::Plain;
-        assert!(render_plan_errors_and_abort(color_mode, &Plan::new(), Path::new(".")).is_ok());
+        assert_eq!(
+            abort_summary(color_mode, &Plan::new()),
+            "plan failed with 0 error(s)"
+        );
     }
 
     #[test]

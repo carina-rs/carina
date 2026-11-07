@@ -38,6 +38,10 @@ use super::{
 #[path = "deferred_tests.rs"]
 mod deferred_tests;
 
+#[cfg(test)]
+#[path = "creation_tests.rs"]
+mod creation_tests;
+
 /// Select how a finalized deferred loop crosses the plan-time expansion seam.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeferredForExpansionChoice {
@@ -179,11 +183,21 @@ impl<'a> CascadeDependents<'a> {
 /// fn bypass(builder: PendingCascadePlan) -> Plan { builder.plan }
 /// ```
 ///
+/// Finalization always requires the complete desired-ID set, including
+/// unchanged resources that have no effect in the plan.
+///
+/// ```compile_fail,E0061
+/// use carina_core::differ::PendingCascadePlan;
+/// fn omit_desired_ids(builder: PendingCascadePlan) {
+///     let _ = builder.finish();
+/// }
+/// ```
+///
 /// ```compile_fail,E0382
 /// use carina_core::differ::PendingCascadePlan;
 /// fn finish_twice(builder: PendingCascadePlan) {
-///     let first = builder.finish(|_| {});
-///     let second = builder.finish(|_| {});
+///     let first = builder.finish(std::iter::empty(), |_| {});
+///     let second = builder.finish(std::iter::empty(), |_| {});
 /// }
 /// ```
 #[must_use = "finish planning to emit the retained deferred targets"]
@@ -195,18 +209,28 @@ pub struct PendingCascadePlan {
 
 impl PendingCascadePlan {
     /// Complete the remaining planning steps, then emit the very same deferred
-    /// targets already consulted during CBD promotion. The callback sees only
-    /// the diff plan, preserving the historical ancillary-effect ordering.
-    pub fn finish(self, complete: impl FnOnce(&mut Plan)) -> Plan {
+    /// targets already consulted during CBD promotion. The callback receives a
+    /// restricted view for state-derived ancillary edits, in their historical order.
+    pub fn finish<'a>(
+        self,
+        desired_ids: impl IntoIterator<Item = &'a ResolvedResourceId>,
+        complete: impl FnOnce(&mut crate::planning_state::PlanFinalization<'_>),
+    ) -> crate::input_rules::FinalizedPlan {
         let Self {
             mut plan,
             deferred,
             registry,
         } = self;
-        complete(&mut plan);
+        complete(&mut crate::planning_state::PlanFinalization { plan: &mut plan });
         add_deferred_create_effects(&mut plan, deferred);
         prepare_plan_replacements(&mut plan, &registry);
-        plan
+        let analysis = plan.dependency_analysis(desired_ids);
+        let analysis = match analysis {
+            Ok(analysis) => analysis,
+            Err(failure) => failure.into_parts().0,
+        };
+        plan.record_unresolved_delete_ordering_analysis(&analysis);
+        crate::input_rules::FinalizedPlan::new(plan)
     }
 }
 

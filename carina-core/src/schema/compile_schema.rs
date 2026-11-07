@@ -34,6 +34,7 @@ impl PatternAttributeType<Draft> {
                         Ok(pattern) => Some(pattern),
                         Err(error) => {
                             issues.push(SchemaDefinitionIssue {
+                                input_rule_error: None,
                                 path: location.raw_path().into(),
                                 location,
                                 message: error.to_string().into(),
@@ -58,6 +59,7 @@ impl PatternAttributeType<Draft> {
                         Ok(pattern) => Some(pattern),
                         Err(error) => {
                             issues.push(SchemaDefinitionIssue {
+                                input_rule_error: None,
                                 path: location.raw_path().into(),
                                 location,
                                 message: error.to_string().into(),
@@ -239,6 +241,7 @@ impl PatternResourceSchema<Draft> {
             duplicate_attributes,
             description,
             validation,
+            input_rules,
             kind,
             unique_name,
             operation_config,
@@ -255,12 +258,16 @@ impl PatternResourceSchema<Draft> {
             let location = SchemaValidationIssueLocation::Definition(name.clone().into());
             ty.compile_patterns(location, issues).map(|ty| (name, ty))
         });
+        let input_rules = compile_all(input_rules.into_iter().enumerate(), |(index, rule)| {
+            rule.compile_patterns(index, issues)
+        });
         Some(PatternResourceSchema {
             resource_type,
             attributes: attributes?,
             duplicate_attributes,
             description,
             validation,
+            input_rules: input_rules?,
             kind,
             unique_name,
             operation_config,

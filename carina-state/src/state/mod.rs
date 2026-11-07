@@ -1250,6 +1250,68 @@ impl StateFile {
         validate_resource_identities(&self.resources)
     }
 
+    /// Copy typed stored rows into core's immutable planning source.
+    /// All fields have already crossed state decoding; projection is infallible.
+    pub fn planning_rows(&self) -> carina_core::planning_state::PlanningStateRows {
+        use carina_core::planning_state::{
+            PlanningCurrentKind, PlanningDeposedRow, PlanningStateRow,
+        };
+        self.resources
+            .iter()
+            .map(|row| {
+                PlanningStateRow::from_persisted(
+                    ResolvedResourceId::with_provider_identity(
+                        row.provider.clone(),
+                        row.resource_type.clone(),
+                        row.identity.clone(),
+                        row.directives.provider_instance.clone(),
+                    ),
+                    row.identifier().cloned(),
+                    match row.current() {
+                        CurrentInstance::None => PlanningCurrentKind::None,
+                        CurrentInstance::Applied { .. } => PlanningCurrentKind::Applied,
+                        CurrentInstance::MissingIdentifier { .. } => {
+                            PlanningCurrentKind::MissingIdentifier
+                        }
+                        CurrentInstance::CreateInFlight { .. } => {
+                            PlanningCurrentKind::CreateInFlight
+                        }
+                        CurrentInstance::CreateOutcomeUnknown { .. } => {
+                            PlanningCurrentKind::CreateOutcomeUnknown
+                        }
+                    },
+                    row.binding.clone(),
+                    row.directives.clone(),
+                    row.dependency_bindings.clone(),
+                    row.deposed
+                        .iter()
+                        .map(|old| {
+                            PlanningDeposedRow::from_persisted(
+                                old.key.clone(),
+                                old.identifier.clone(),
+                                old.provider_instance.clone(),
+                                old.dependency_bindings.clone(),
+                                old.persisted_attributes().to_values(),
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Project authenticated observations without changing stored rows or serial.
+    /// An exact row-key match, including provider instance, supplies the refreshed
+    /// identifier. Otherwise the persisted identifier and instance remain in force.
+    /// Historical-generation diagnostics always use the persisted identifier.
+    /// The CLI authenticates the observation map.
+    pub fn planning_rows_after_refresh(
+        &self,
+        current: &HashMap<ResourceId, Current>,
+    ) -> carina_core::planning_state::PlanningStateRows {
+        self.planning_rows().with_current_observations(current)
+    }
+
     /// Borrow all managed resource rows.
     ///
     /// Mutation is intentionally routed through the identity-preserving state

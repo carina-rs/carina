@@ -468,7 +468,7 @@ impl ResourceProviderPreparationError {
         &self.resource
     }
 
-    /// Typed terminal preparation diagnostic.
+    /// Typed preparation diagnostic.
     pub fn preparation_error(&self) -> &carina_core::executor::ProviderPreparationError {
         &self.source
     }
@@ -481,15 +481,27 @@ impl std::fmt::Display for ResourceProviderPreparationError {
         }
         write!(
             f,
-            "[{}.{}] {}",
+            "[{}.{}] ",
             self.resource.resource_type,
             self.resource.identity_display(),
-            self.source,
-        )
+        )?;
+        if std::error::Error::source(self.source.as_ref()).is_some() {
+            f.write_str("Failed to prepare resource before provider dispatch")
+        } else {
+            self.source.fmt(f)
+        }
     }
 }
 
-impl std::error::Error for ResourceProviderPreparationError {}
+impl std::error::Error for ResourceProviderPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Terminal preparation diagnostics retain their complete Display.
+        // Chained errors expose the typed preparation context to the caller's
+        // chain renderer instead of embedding that chain in Display.
+        std::error::Error::source(self.source.as_ref())
+            .map(|_| self.source.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// Provider preparation failure while creating the managed state bucket.
 #[derive(Debug)]
@@ -498,7 +510,7 @@ pub struct StateBucketPreparationError {
 }
 
 impl StateBucketPreparationError {
-    /// Typed terminal preparation diagnostic.
+    /// Typed preparation diagnostic.
     pub fn preparation_error(&self) -> &carina_core::executor::ProviderPreparationError {
         &self.source
     }
@@ -506,15 +518,20 @@ impl StateBucketPreparationError {
 
 impl std::fmt::Display for StateBucketPreparationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Failed to prepare state bucket before create: {}",
-            self.source
-        )
+        f.write_str("Failed to prepare state bucket before create")?;
+        if std::error::Error::source(self.source.as_ref()).is_none() {
+            write!(f, ": {}", self.source)?;
+        }
+        Ok(())
     }
 }
 
-impl std::error::Error for StateBucketPreparationError {}
+impl std::error::Error for StateBucketPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(self.source.as_ref())
+            .map(|_| self.source.as_ref() as &(dyn std::error::Error + 'static))
+    }
+}
 
 /// A classified state-bucket create failure, optionally accompanied by the
 /// failure to persist the recovery row. Both classified failures remain
@@ -1044,6 +1061,12 @@ pub enum AppError {
     /// Identity assignment was incomplete at a resolved-only pipeline boundary.
     #[error(transparent)]
     PendingResourceIdentity(#[from] carina_core::resource::PendingResourceIdentityError),
+
+    #[error(transparent)]
+    DestroyPlan(#[from] carina_core::planning_state::DestroyPlanError),
+
+    #[error(transparent)]
+    DeleteSchedule(#[from] carina_core::executor::DeleteScheduleError),
 
     /// A post-expansion handle or dependency operand could not be mapped to
     /// one complete scheduler address.
@@ -1787,6 +1810,66 @@ mod tests {
             },
         )
         .await
+    }
+
+    #[test]
+    fn round2_input_discharge_cli_wrappers_render_diagnostics_once() {
+        for state_bucket in [false, true] {
+            let preparation = carina_core::executor::ProviderPreparationError::InputDischarge(
+                carina_core::executor::EffectFailureKind::UnresolvedInputRule {
+                    path: carina_core::schema::InputPath::new("name").unwrap(),
+                    code: carina_core::schema::InputRuleCode::new("test.name.not_ipv4").unwrap(),
+                },
+            );
+            let error = if state_bucket {
+                AppError::from_state_bucket_preparation(preparation)
+            } else {
+                AppError::from_resource_preparation(
+                    ResourceId::with_identity("test", "example"),
+                    preparation,
+                )
+            };
+            let rendered = format_error_with_source_chain(&error);
+            assert_eq!(
+                rendered.matches("test.name.not_ipv4").count(),
+                1,
+                "{rendered}"
+            );
+            assert!(rendered.contains("could not be discharged"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn round3_input_discharge_cli_wrappers_expose_typed_sources() {
+        use carina_core::executor::{EffectFailureKind, ProviderPreparationError};
+        for state_bucket in [false, true] {
+            let preparation =
+                ProviderPreparationError::InputDischarge(EffectFailureKind::UnresolvedInputRule {
+                    path: carina_core::schema::InputPath::new("name").unwrap(),
+                    code: carina_core::schema::InputRuleCode::new("test.name.not_ipv4").unwrap(),
+                });
+            let error = if state_bucket {
+                AppError::from_state_bucket_preparation(preparation)
+            } else {
+                AppError::from_resource_preparation(
+                    ResourceId::with_identity("test", "example"),
+                    preparation,
+                )
+            };
+            assert!(!error.to_string().contains("test.name.not_ipv4"));
+            let source =
+                std::error::Error::source(&error).expect("wrapper exposes preparation source");
+            assert!(matches!(
+                source.downcast_ref::<ProviderPreparationError>(),
+                Some(ProviderPreparationError::InputDischarge(_))
+            ));
+            assert!(matches!(
+                source
+                    .source()
+                    .and_then(|source| source.downcast_ref::<EffectFailureKind>()),
+                Some(EffectFailureKind::UnresolvedInputRule { .. })
+            ));
+        }
     }
 
     fn dependency_analysis_failure() -> carina_core::effect::deps::DependencyAnalysisFailure {

@@ -208,15 +208,15 @@ impl Provider for Mock {
         _: &ResourceId,
         _: &AppliedIdentifier,
         _: UpdateRequest,
+        _: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         Box::pin(async { panic!("unexpected update") })
     }
     fn delete(
         &self,
-        _: &ResourceId,
-        identifier: &AppliedIdentifier,
-        _: DeleteRequest,
+        attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
+        let identifier = attempt.identifier();
         let mut cloud = self.0.0.lock().unwrap();
         cloud.operations.push(format!("delete:{identifier}"));
         if cloud.fail_child_delete && identifier.as_str().starts_with("dns:") {

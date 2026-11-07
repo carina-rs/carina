@@ -412,6 +412,11 @@ fn combine_with_desired_secret_shape(
 /// Both CLI and TUI consume these to render effect details.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DetailRow {
+    /// Input eligibility cannot yet be decided for this exact desired write slot.
+    PendingInput {
+        path: crate::schema::InputPath,
+        codes: Vec<crate::schema::InputRuleCode>,
+    },
     /// A preformatted informational line.
     Text { text: String },
     /// A provider-retained keyed list entry released from authored state.
@@ -703,7 +708,7 @@ pub enum ListOfMapsDiffField {
 /// ```
 #[derive(Debug)]
 pub struct PreparedPlanDisplay {
-    plan: std::sync::Arc<AdmittedPlan>,
+    plan: std::sync::Arc<crate::input_rules::InputCheckedPlan>,
     historical: HistoricalDisplayAttributes,
     detail: DetailLevel,
     rows: Vec<Vec<DetailRow>>,
@@ -712,7 +717,7 @@ pub struct PreparedPlanDisplay {
 impl PreparedPlanDisplay {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build(
-        plan: std::sync::Arc<AdmittedPlan>,
+        plan: std::sync::Arc<crate::input_rules::InputCheckedPlan>,
         historical: HistoricalDisplayAttributes,
         detail: DetailLevel,
         registry: &SchemaRegistry,
@@ -729,7 +734,7 @@ impl PreparedPlanDisplay {
                 .iter()
                 .enumerate()
                 .map(|(index, effect)| {
-                    if let (Effect::Create(to), Some(replacement)) =
+                    let mut rows = if let (Effect::Create(to), Some(replacement)) =
                         (effect, replacements.get(&index))
                     {
                         build_replace_detail_rows_from_display(
@@ -753,7 +758,9 @@ impl PreparedPlanDisplay {
                             provider,
                             DetailComparisons::Planning(references),
                         )
-                    }
+                    }?;
+                    rows.extend(plan.pending_rows(index));
+                    Ok(rows)
                 })
                 .collect::<ProviderResult<Vec<_>>>()?
         };
@@ -766,6 +773,10 @@ impl PreparedPlanDisplay {
     }
 
     pub fn plan(&self) -> &AdmittedPlan {
+        &self.plan
+    }
+
+    pub fn checked_plan(&self) -> &crate::input_rules::InputCheckedPlan {
         &self.plan
     }
 

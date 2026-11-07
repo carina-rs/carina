@@ -191,6 +191,50 @@ impl<S: Clone> crate::plan::AdmittedPlan<S> {
     }
 }
 
+/// A schedule retaining the input obligations of its exact source plan.
+/// Only scheduling an [`crate::input_rules::InputCheckedPlan`] constructs it.
+#[derive(Debug, Clone)]
+pub struct InputCheckedScheduledPlan<'plan, S = crate::resource::ModuleSource> {
+    checked: &'plan crate::input_rules::InputCheckedPlan<S>,
+    scheduled: ScheduledPlan<'plan, S>,
+}
+
+impl<'plan, S> Deref for InputCheckedScheduledPlan<'plan, S> {
+    type Target = ScheduledPlan<'plan, S>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.scheduled
+    }
+}
+
+impl<'plan, S: Clone> InputCheckedScheduledPlan<'plan, S> {
+    pub(crate) fn execution_input_checks(&self) -> Vec<crate::input_rules::PendingInputObligation> {
+        self.checked.execution_input_checks()
+    }
+
+    pub(crate) fn expand_deferred_replacements(
+        self,
+    ) -> (
+        ScheduledPlan<'plan, S>,
+        std::collections::HashSet<usize>,
+        Vec<usize>,
+    ) {
+        self.scheduled.expand_deferred_replacements()
+    }
+}
+
+impl<S: Clone> crate::input_rules::InputCheckedPlan<S> {
+    pub fn schedule(
+        &self,
+        current: &HashMap<ResourceId, Current>,
+    ) -> InputCheckedScheduledPlan<'_, S> {
+        InputCheckedScheduledPlan {
+            checked: self,
+            scheduled: self.plan().schedule(current),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,7 +342,10 @@ mod tests {
                 panic!("old generation must have a scheduled Delete capability");
             };
             assert_eq!(permit.instance(), &key);
-            assert_eq!(permit.id().provider_instance, id.provider_instance);
+            assert_eq!(
+                permit.instance().id().provider_instance,
+                id.provider_instance
+            );
         }
     }
 
@@ -437,8 +484,11 @@ mod tests {
                     )),
                 )]),
             });
-            let admitted = draft.admit(&schemas).unwrap();
-            let scheduled = admitted.schedule(&Default::default());
+            let admitted = draft
+                .admit(&schemas)
+                .unwrap()
+                .check_inputs(&schemas, &HashMap::new())
+                .unwrap();
             let mut configuration = crate::parser::ExpandedInferredFile::default();
             configuration.resources.push(
                 target
@@ -448,6 +498,13 @@ mod tests {
             );
             let graph =
                 crate::resolved_graph::resolve_expanded_graph(configuration.into()).unwrap();
+            // Exercise a replacement cohort through the same scheduler release;
+            // public bootstrap construction only produces a single create.
+            let checked = crate::resolved_graph::InputCheckedInitialCreatePlan {
+                graph: graph.into_parts().1,
+                checked: admitted,
+            };
+            let scheduled = checked.checked.schedule(&Default::default());
             let bindings = crate::binding_index::ResolvedBindings::default();
             let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
             crate::validation::deferred_types::with_session_for_test_async(
@@ -462,10 +519,9 @@ mod tests {
                         &schemas,
                         type_checks,
                     );
-                    let permit =
-                        crate::executor::prepare_initial_create(&scheduled, &graph, &context)
-                            .await
-                            .unwrap();
+                    let permit = crate::executor::prepare_initial_create(&checked, &context)
+                        .await
+                        .unwrap();
                     if create_first {
                         let permit =
                             permit.expect("a checked create-first endpoint is initially ready");

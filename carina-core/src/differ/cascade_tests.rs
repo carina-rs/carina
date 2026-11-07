@@ -1,5 +1,6 @@
 use super::*;
 use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
+use std::ops::Deref;
 
 use crate::resource::{ResolvedDependencies, ResolvedResourceId};
 use std::collections::HashSet;
@@ -184,7 +185,9 @@ fn plan_from_resolved_fixture(
         &crate::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed")
-    .finish(|_| {})
+    .finish(std::iter::empty(), |_| {})
+    .deref()
+    .clone()
 }
 
 fn standard_states() -> HashMap<ResourceId, State> {
@@ -1115,7 +1118,7 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
         &crate::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed")
-    .finish(|_| {});
+    .finish(std::iter::empty(), |_| {});
 
     let deferred_replace = plan
         .effects()
@@ -1257,7 +1260,7 @@ fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
             &crate::references::prepare_empty_for_tests(),
         )
         .unwrap()
-        .finish(|_| {});
+        .finish(std::iter::empty(), |_| {});
         assert!(
             !replacement_metadata(&plan, &id).create_before_destroy,
             "the loop-local vpc must not refer to the top-level producer"
@@ -1334,8 +1337,8 @@ fn deferred_create_cbd_plan(
         &crate::references::prepare_empty_for_tests(),
     )
     .unwrap()
-    .finish(|_| {});
-    (plan, id)
+    .finish(std::iter::empty(), |_| {});
+    (plan.deref().clone(), id)
 }
 
 #[test]
@@ -1766,7 +1769,7 @@ fn issue_4283_known_conflicting_child_cbd_rejected_before_parent_applies() {
         &crate::references::prepare_empty_for_tests(),
     )
     .expect("test provider hints should succeed")
-    .finish(|_| {});
+    .finish(std::iter::empty(), |_| {});
 
     assert!(
         plan.has_errors(),

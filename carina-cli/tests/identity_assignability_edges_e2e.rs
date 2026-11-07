@@ -16,9 +16,9 @@ use carina_core::executor::{
 use carina_core::plan::PlanErrorKind;
 use carina_core::provider::{
     AppliedIdentifier, BoxFuture, CreateAttempt, CreateFailure, CreateOutcome, CreateRequest,
-    DeleteRequest, NoopNormalizer, Provider, ProviderFactory, ProviderReadyDataSource,
-    ProviderResult, ReadOutcome, ReadRequest, ResumeCreateRequest, ResumeFailure, ResumeOutcome,
-    Sent, UpdateOutcome, UpdateRequest,
+    NoopNormalizer, Provider, ProviderFactory, ProviderReadyDataSource, ProviderResult,
+    ReadOutcome, ReadRequest, ResumeCreateRequest, ResumeFailure, ResumeOutcome, Sent,
+    UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{ConcreteValue, Current, ResourceId, State, Value};
 use carina_core::schema::{
@@ -478,15 +478,14 @@ impl Provider for OutputMock {
         _: &ResourceId,
         _: &AppliedIdentifier,
         _: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         Box::pin(async { unreachable!("this fixture never updates") })
     }
 
     fn delete(
         &self,
-        _: &ResourceId,
-        _: &AppliedIdentifier,
-        _: DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { unreachable!("this fixture never deletes") })
     }
@@ -540,7 +539,7 @@ fn identity_edges_apply_checks_unknown_value_before_consumer_create() {
         creates: Mutex::new(Vec::new()),
     };
     let input = LiveExecutionInput {
-        plan: &fixture.plan.clone().admit(&fixture.schemas).unwrap(),
+        plan: &creation_fixture::checked(fixture.plan.clone(), &fixture.schemas),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &origins,
             data_source_origins: &[],
@@ -634,3 +633,6 @@ fn identity_edges_use_the_data_source_input_owner() {
         }
     }
 }
+
+#[path = "../../carina-core/tests/support/creation.rs"]
+mod creation_fixture;

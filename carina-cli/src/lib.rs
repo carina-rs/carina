@@ -241,6 +241,9 @@ pub(crate) fn fixture_resource_state_metadata(
 
 #[cfg(test)]
 enum FixtureCreateResult {
+    Unknown {
+        error: carina_core::provider::ProviderError,
+    },
     NotCreated {
         error: carina_core::provider::ProviderError,
     },
@@ -315,6 +318,10 @@ impl carina_core::provider::Provider for FixtureCreateProvider {
             .expect("fixture create is dispatched once");
         Box::pin(async move {
             match result {
+                FixtureCreateResult::Unknown { error } => {
+                    Err(attempt
+                        .outcome_unknown(carina_core::provider::EgressSent::for_test(), error))
+                }
                 FixtureCreateResult::NotCreated { error } => Err(attempt.not_created(error)),
                 FixtureCreateResult::Pending {
                     token,
@@ -377,6 +384,7 @@ impl carina_core::provider::Provider for FixtureCreateProvider {
         _id: &carina_core::resource::ResourceId,
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: carina_core::provider::UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> carina_core::provider::BoxFuture<
         '_,
         carina_core::provider::ProviderResult<carina_core::provider::UpdateOutcome>,
@@ -390,9 +398,7 @@ impl carina_core::provider::Provider for FixtureCreateProvider {
 
     fn delete(
         &self,
-        _id: &carina_core::resource::ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: carina_core::provider::DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> carina_core::provider::BoxFuture<'_, carina_core::provider::ProviderResult<()>> {
         Box::pin(async {
             Err(carina_core::provider::ProviderError::internal(
@@ -430,7 +436,7 @@ fn dispatch_fixture_create(
 ) -> carina_core::provider::CreateFailure {
     let mut resource = carina_core::resource::Resource::from_id(id.clone());
     let sent = match &result {
-        FixtureCreateResult::NotCreated { .. } => {
+        FixtureCreateResult::NotCreated { .. } | FixtureCreateResult::Unknown { .. } => {
             &carina_core::provider::Sent::AllRequestAttributes
         }
         FixtureCreateResult::Pending { sent, .. } | FixtureCreateResult::Observed { sent, .. } => {
@@ -470,13 +476,26 @@ fn dispatch_fixture_create(
             let provider = FixtureCreateProvider {
                 result: std::sync::Mutex::new(Some(result)),
             };
-            let (create, _cancellation) = carina_core::executor::dispatch_create(
-                &provider,
-                carina_core::replacement::create_permit_for_test(request),
-            );
+            let prepared = carina_core::replacement::create_permit_for_test(request);
+            let (create, _cancellation) =
+                carina_core::executor::dispatch_create(&provider, prepared);
             block_on_ready(create).expect_err("fixture create returns a classified failure")
         },
     )
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_unknown_create_outcome(
+    id: &carina_core::resource::ResourceId,
+    error: carina_core::provider::ProviderError,
+) -> carina_core::provider::UnknownCreateOutcome {
+    let failure = dispatch_fixture_create(id, FixtureCreateResult::Unknown { error });
+    let carina_core::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } =
+        failure.into_kind()
+    else {
+        panic!("the egress witness must mint an unknown outcome");
+    };
+    unknown
 }
 
 #[cfg(test)]

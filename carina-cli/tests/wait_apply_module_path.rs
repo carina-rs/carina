@@ -281,6 +281,7 @@ impl Provider for NoopProvider {
         id: &carina_core::resource::ResourceId,
         identifier: &carina_core::provider::AppliedIdentifier,
         _r: carina_core::provider::UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.to_string();
@@ -293,9 +294,7 @@ impl Provider for NoopProvider {
     }
     fn delete(
         &self,
-        _id: &carina_core::resource::ResourceId,
-        _i: &carina_core::provider::AppliedIdentifier,
-        _r: carina_core::provider::DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async move { Ok(()) })
     }
@@ -727,7 +726,7 @@ async fn run_apply_chain(cert_publishes_arn: bool) -> (usize, usize, Vec<String>
         provider_context: carina_core::parser::ProviderContext::clone(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan.clone().admit(ctx.schemas()).unwrap(),
+        plan: &creation_fixture::checked(plan.clone(), ctx.schemas()),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &data_source_origins,
@@ -801,3 +800,6 @@ async fn apply_chain_repros_when_wait_state_lacks_published_attr() {
          got: {failures:?}"
     );
 }
+
+#[path = "../../carina-core/tests/support/creation.rs"]
+mod creation_fixture;

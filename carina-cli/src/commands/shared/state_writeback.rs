@@ -2805,15 +2805,10 @@ mod apply_state_save_tests {
         let resource = Resource::with_provider("mock", "test.Resource", "unknown", None);
         let id = resource.id.clone();
         let resolved_resource = resolved(resource);
-        let failure = carina_core::provider::CreateAttempt::for_test(id.clone()).outcome_unknown(
-            carina_core::provider::EgressSent::for_test(),
+        let unknown = crate::fixture_unknown_create_outcome(
+            &id,
             carina_core::provider::ProviderError::api_error("guest trapped"),
         );
-        let carina_core::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } =
-            failure.into_kind()
-        else {
-            panic!("the witness-gated fixture must mint an unknown outcome")
-        };
 
         let state = build_state_after_apply(
             ApplyStateSave {

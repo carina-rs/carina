@@ -11,13 +11,13 @@ use crate::binding_index::{
     SecretPreservingAttributes,
 };
 use crate::differ::secret_grafted_comparison_view;
-use crate::effect::{DeletedInstanceKey, Effect, EffectGeneration};
+use crate::effect::{DeletedInstanceKey, Effect};
 use crate::executor::provider_ready::{
     CheckInput, DataSourceCheckInput, ProviderPreparationContext, ResolvedCheckInput,
     ResourceCheckInput, managed_update_schema, prepare_provider_ready_resource_after_resolution,
 };
 use crate::provider::{
-    AppliedIdentifier, CompletedResume, CreateFailureKind, DeleteRequest, PartialReadDiagnostic,
+    AppliedIdentifier, CompletedResume, CreateFailureKind, CreateRequest, PartialReadDiagnostic,
     PartialResume, Provider, ProviderReadyResource, ProviderRouter, ReadBackEnd, ReadRequest,
     ResumeFailureKind, ResumeOutcomeKind, UpdateRequest,
 };
@@ -29,7 +29,6 @@ use crate::resource::{
     AbsoluteBindingAddress, ConcreteValue, Current, DataSource, DeferredValue, DiagnosticPath,
     DiagnosticScope, ReferencePath, ResourceId, SnapshotState as State, Value,
 };
-use crate::schema::SchemaKind;
 use crate::value::{SerializationContext, SerializationError};
 
 use super::wait::{InFlightStart, StartedEffect};
@@ -899,16 +898,184 @@ pub(super) struct BasicEffectCtx<'a, S> {
     pub(super) total: usize,
 }
 
+/// Requests admitted for scheduled dispatch. A raw ProviderReadyResource cannot
+/// enter the execution path; construction and discharge happen in preparation.
+pub(super) enum PreparedBasicRequest {
+    Create(super::PreparedWrite<CreateRequest>),
+    Resume(super::PreparedWrite<CreateRequest>),
+    Update(super::PreparedWrite<UpdateRequest>),
+    Delete(super::DeletePermit),
+}
+
+impl PreparedBasicRequest {
+    pub(super) fn delete_receipts(&self) -> Vec<super::input_discharge::DeleteDischargeReceipt> {
+        match self {
+            Self::Create(write) | Self::Resume(write) => write.delete_receipts(),
+            Self::Update(write) => write.delete_receipts(),
+            Self::Delete(_) => Vec::new(),
+        }
+    }
+}
+
+pub(super) async fn prepare_basic_request<S: Clone>(
+    effect: &Effect<S>,
+    ctx: &BasicEffectCtx<'_, S>,
+    check: super::input_discharge::WriteCheck,
+    delete: Option<super::DeletePermit>,
+) -> Result<PreparedBasicRequest, EffectFailureKind> {
+    match effect {
+        Effect::Create(resource) | Effect::ResumeCreate { resource, .. } => {
+            let input = ctx
+                .provider_check_inputs
+                .resource_input(resource.as_inner(), ctx.runtime_authored);
+            let (ready, writeback) = resolve_resource(input, ctx.preparation).await?;
+            let write = check.prepare_create(
+                CreateRequest::checked(ready),
+                writeback,
+                ctx.preparation.schemas(),
+            )?;
+            if matches!(effect, Effect::ResumeCreate { .. }) {
+                Ok(PreparedBasicRequest::Resume(write))
+            } else {
+                Ok(PreparedBasicRequest::Create(write))
+            }
+        }
+        Effect::Update {
+            from,
+            to,
+            changed_attributes,
+            ..
+        } => prepare_update_request_for_dispatch(from, to, changed_attributes, ctx, check)
+            .await
+            .map(PreparedBasicRequest::Update),
+        Effect::Delete { .. } => delete
+            .map(PreparedBasicRequest::Delete)
+            .ok_or_else(|| EffectFailureKind::message("delete dispatch authorization missing")),
+        _ => Err(EffectFailureKind::message("effect is not a provider write")),
+    }
+}
+
+async fn prepare_update_request_for_dispatch<S: Clone>(
+    from: &State,
+    to: &crate::resource::ResolvedResource<S>,
+    changed_attributes: &[String],
+    ctx: &BasicEffectCtx<'_, S>,
+    check: super::input_discharge::WriteCheck,
+) -> Result<super::PreparedWrite<UpdateRequest>, EffectFailureKind> {
+    let preparation = ctx.preparation;
+    let check_input = ctx
+        .provider_check_inputs
+        .resource_input(to.as_inner(), ctx.runtime_authored);
+    let resolve_source_attributes = check_input
+        .as_ref()
+        .ok()
+        .and_then(|input| match input {
+            CheckInput::Authored(_) => None,
+            CheckInput::PlanNormalized { authored, .. } => Some(authored.attributes.clone()),
+        })
+        .unwrap_or_else(|| to.attributes.clone());
+    let (resolved_to, resolved_desired_attributes) =
+        resolve_resource(check_input, preparation).await?;
+    // Augment plan-time `changed_attributes` with any
+    // ResourceRef-derived attributes whose resolved value at
+    // apply time differs from `from`. This catches the case
+    // where a dependency was just replaced (and the binding
+    // map flipped to a new computed value) but the plan-time
+    // diff did not see the change because both the old and
+    // new ResourceRef expressions are syntactically identical.
+    // Without this, the patch would omit the changed
+    // reference value and the provider would never be told
+    // to update it.
+    let mut effective_changed: Vec<String> = changed_attributes.to_vec();
+    let resolved_resource = resolved_to.as_resource();
+    let schema = managed_update_schema(preparation.schemas(), resolved_resource)
+        .map_err(EffectFailureKind::execution)?;
+    let owner_schema = preparation
+        .schemas()
+        .get_for(resolved_resource)
+        .expect("managed_update_schema proved that the owner-bound schema exists");
+    let mut candidates = HashMap::new();
+    for (key, new_value) in &resolved_resource.attributes {
+        if effective_changed.contains(key) || resolve_source_attributes.get(key) == Some(new_value)
+        {
+            continue;
+        }
+        if let Some(value) = secret_grafted_comparison_view(
+            &new_value.to_snapshot(),
+            resolve_source_attributes
+                .get(key)
+                .map(Value::to_snapshot)
+                .as_ref(),
+        ) {
+            candidates.insert(key.clone(), value.into_owned());
+        }
+    }
+    if !candidates.is_empty() {
+        // A concrete plan value can be re-resolved from its authored
+        // ResourceRef at apply (PlanNormalized retains that origin).
+        // Patch membership is a planning decision, so compare fresh
+        // identities before checked request construction. Only keys
+        // actually changed by resolution enter this preparation.
+        let current = crate::resource::CanonicalComparisonAttributes::canonicalize(
+            from.attributes
+                .iter()
+                .filter(|(key, _)| candidates.contains_key(*key))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            schema,
+        );
+        let desired =
+            crate::resource::CanonicalComparisonAttributes::canonicalize_preserving_secret_shapes(
+                candidates, schema,
+            );
+        let masked = resolved_to.ignore_changes().mask_comparison_attributes(
+            &desired,
+            &current,
+            None,
+            Some(schema),
+        );
+        let additional = crate::references::ReferencePreparation::default()
+            .apply_time(&resolved_to, &masked, owner_schema, ctx.comparison_provider)
+            .await
+            .map_err(|error| match error {
+                crate::differ::ApplyTimeComparisonError::Secret(error) => {
+                    EffectFailureKind::execution(error)
+                }
+                crate::differ::ApplyTimeComparisonError::CreateOnly(error) => {
+                    EffectFailureKind::execution(error)
+                }
+                crate::differ::ApplyTimeComparisonError::Reference(error) => {
+                    EffectFailureKind::provider(error)
+                }
+            })?;
+        effective_changed.extend(additional.value);
+    }
+    let request = UpdateRequest::checked(from.clone(), &effective_changed, &resolved_to, schema)
+        .map_err(EffectFailureKind::execution)?;
+    check.prepare_update(
+        &to.id,
+        request,
+        resolved_desired_attributes,
+        preparation.schemas(),
+    )
+}
+
 /// Execute a single Create, Update, or Delete effect.
 ///
-/// Takes an admitted scheduling endpoint. Raw effects
-/// cannot enter this boundary: creates, resends and old-generation Deletes
-/// must carry the capabilities minted by replacement admission.
+/// Takes a [`BasicEffect`] — a type-level narrowing of `Effect` to the
+/// three variants this function actually handles. Non-basic variants
+/// (`Replace`/`Read`/`Import`/`Remove`/`Move`/`Wait`) cannot reach this
+/// function because [`Effect::as_basic`] is the only constructor and
+/// returns `None` for them. This contract used to live in caller-side
+/// filters with an `unreachable!()` backstop; a missed filter
+/// (carina#3164) panicked apply with `execute_basic_effect called
+/// with non-basic effect`. The type now enforces it.
 ///
 /// Returns a started result whose token must be consumed to emit the terminal
 /// event before callers process its state changes.
 pub(super) async fn execute_basic_effect<'observer, S: Clone>(
     basic: ScheduledBasicEffect<S>,
+    prepared: Result<PreparedBasicRequest, EffectFailureKind>,
     ctx: &BasicEffectCtx<'_, S>,
     in_flight_start: InFlightStart<S>,
     observer: &'observer dyn ExecutionObserver<S>,
@@ -926,29 +1093,31 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
     let effect = basic.as_effect();
     let mut started_effect = in_flight_start.emit_started(observer, effect, progress);
 
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            return StartedBasicEffectResult::new(
+                started_effect,
+                started,
+                BasicEffectResult::Failure {
+                    failure,
+                    refresh: None,
+                },
+            );
+        }
+    };
+
     let outcome = match basic {
         ScheduledBasicEffect::Create {
             resource, create, ..
         } => {
-            let (permit, resolved_attrs) = match create
-                .prepare(ctx.provider_check_inputs, ctx.runtime_authored, preparation)
-                .await
-            {
-                Ok(prepared) => prepared,
-                Err(failure) => {
-                    return StartedBasicEffectResult::new(
-                        started_effect,
-                        started,
-                        BasicEffectResult::Failure {
-                            failure,
-                            refresh: None,
-                        },
-                    );
-                }
+            let PreparedBasicRequest::Create(write) = prepared else {
+                unreachable!("prepared create variant")
             };
-            let accepted_request = AcceptedRequest::from_create_request(permit.request())
+            let resolved_attrs = write.writeback().clone();
+            let accepted_request = AcceptedRequest::from_create_request(write.request())
                 .with_resolved_desired_attributes(resolved_attrs.clone());
-            let (create, cancellation) = super::dispatch_create(provider, permit);
+            let (create, cancellation) = super::dispatch_create(provider, create.authorize(write));
             started_effect.track_create_cancellation(cancellation);
             match create.await {
                 Ok(outcome) => {
@@ -1021,14 +1190,10 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
         ScheduledBasicEffect::ResumeCreate {
             resource, resume, ..
         } => {
-            let (request, resolved_attrs, accepted_request) = match resume
-                .prepare(
-                    &resource,
-                    ctx.provider_check_inputs,
-                    ctx.runtime_authored,
-                    preparation,
-                )
-                .await
+            let PreparedBasicRequest::Resume(write) = prepared else {
+                unreachable!("prepared resume variant")
+            };
+            let (request, resolved_attrs, accepted_request) = match resume.prepare(&resource, write)
             {
                 Ok(prepared) => prepared,
                 Err(failure) => {
@@ -1131,156 +1296,21 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
             }
         }
         ScheduledBasicEffect::Update {
-            from,
             identifier,
             to,
-            changed_attributes,
+            update,
             ..
         } => {
             let id = &to.id;
-            let check_input = ctx
-                .provider_check_inputs
-                .resource_input(to.as_inner(), ctx.runtime_authored);
-            let resolve_source_attributes = check_input
-                .as_ref()
-                .ok()
-                .and_then(|input| match input {
-                    CheckInput::Authored(_) => None,
-                    CheckInput::PlanNormalized { authored, .. } => {
-                        Some(authored.attributes.clone())
-                    }
-                })
-                .unwrap_or_else(|| to.attributes.clone());
-            let (resolved_to, resolved_desired_attributes) =
-                match resolve_resource(check_input, preparation).await {
-                    Ok(r) => r,
-                    Err(failure) => {
-                        return StartedBasicEffectResult::new(
-                            started_effect,
-                            started,
-                            BasicEffectResult::Failure {
-                                failure,
-                                refresh: None,
-                            },
-                        );
-                    }
-                };
-            // Augment plan-time `changed_attributes` with any
-            // ResourceRef-derived attributes whose resolved value at
-            // apply time differs from `from`. This catches the case
-            // where a dependency was just replaced (and the binding
-            // map flipped to a new computed value) but the plan-time
-            // diff did not see the change because both the old and
-            // new ResourceRef expressions are syntactically identical.
-            // Without this, the patch would omit the changed
-            // reference value and the provider would never be told
-            // to update it.
-            let mut effective_changed: Vec<String> = changed_attributes.to_vec();
-            let resolved_resource = resolved_to.as_resource();
-            let schema = match managed_update_schema(preparation.schemas(), resolved_resource) {
-                Ok(schema) => schema,
-                Err(error) => {
-                    return StartedBasicEffectResult::new(
-                        started_effect,
-                        started,
-                        BasicEffectResult::Failure {
-                            failure: EffectFailureKind::execution(error),
-                            refresh: None,
-                        },
-                    );
-                }
+            let PreparedBasicRequest::Update(write) = prepared else {
+                unreachable!("prepared update variant")
             };
-            let owner_schema = preparation
-                .schemas()
-                .get_for(resolved_resource)
-                .expect("managed_update_schema proved that the owner-bound schema exists");
-            let mut candidates = HashMap::new();
-            for (key, new_value) in &resolved_resource.attributes {
-                if effective_changed.contains(key)
-                    || resolve_source_attributes.get(key) == Some(new_value)
-                {
-                    continue;
-                }
-                if let Some(value) = secret_grafted_comparison_view(
-                    &new_value.to_snapshot(),
-                    resolve_source_attributes
-                        .get(key)
-                        .map(Value::to_snapshot)
-                        .as_ref(),
-                ) {
-                    candidates.insert(key.clone(), value.into_owned());
-                }
-            }
-            if !candidates.is_empty() {
-                // A concrete plan value can be re-resolved from its authored
-                // ResourceRef at apply (PlanNormalized retains that origin).
-                // Patch membership is a planning decision, so compare fresh
-                // identities before checked request construction. Only keys
-                // actually changed by resolution enter this preparation.
-                let current = crate::resource::CanonicalComparisonAttributes::canonicalize(
-                    from.attributes
-                        .iter()
-                        .filter(|(key, _)| candidates.contains_key(*key))
-                        .map(|(key, value)| (key.clone(), value.clone()))
-                        .collect(),
-                    schema,
-                );
-                let desired = crate::resource::CanonicalComparisonAttributes::canonicalize_preserving_secret_shapes(candidates, schema);
-                let masked = resolved_to.ignore_changes().mask_comparison_attributes(
-                    &desired,
-                    &current,
-                    None,
-                    Some(schema),
-                );
-                let additional = crate::references::ReferencePreparation::default()
-                    .apply_time(&resolved_to, &masked, owner_schema, ctx.comparison_provider)
-                    .await;
-                match additional {
-                    Ok(additional) => effective_changed.extend(additional.value),
-                    Err(error) => {
-                        let failure = match error {
-                            crate::differ::ApplyTimeComparisonError::Secret(error) => {
-                                EffectFailureKind::execution(error)
-                            }
-                            crate::differ::ApplyTimeComparisonError::CreateOnly(error) => {
-                                EffectFailureKind::execution(error)
-                            }
-                            crate::differ::ApplyTimeComparisonError::Reference(error) => {
-                                EffectFailureKind::provider(error)
-                            }
-                        };
-                        return StartedBasicEffectResult::new(
-                            started_effect,
-                            started,
-                            BasicEffectResult::Failure {
-                                failure,
-                                refresh: None,
-                            },
-                        );
-                    }
-                }
-            }
-            let request = match UpdateRequest::checked(
-                *from.clone(),
-                &effective_changed,
-                &resolved_to,
-                schema,
-            ) {
-                Ok(request) => request,
-                Err(error) => {
-                    return StartedBasicEffectResult::new(
-                        started_effect,
-                        started,
-                        BasicEffectResult::Failure {
-                            failure: EffectFailureKind::execution(error),
-                            refresh: None,
-                        },
-                    );
-                }
-            };
-            let accepted_request =
-                AcceptedRequest::from_update_request(&request, resolved_desired_attributes.clone());
-            match provider.update(id, &identifier, request).await {
+            let resolved_desired_attributes = write.writeback().clone();
+            let accepted_request = AcceptedRequest::from_update_request(
+                write.request(),
+                resolved_desired_attributes.clone(),
+            );
+            match super::dispatch_update(provider, update.authorize(write)).await {
                 Ok(outcome) => {
                     let diagnostic = outcome.diagnostic().cloned();
                     let read_back_end = outcome.read_back_end();
@@ -1315,29 +1345,13 @@ pub(super) async fn execute_basic_effect<'observer, S: Clone>(
                 },
             }
         }
-        ScheduledBasicEffect::Delete {
-            directives, permit, ..
-        } => {
-            let id = permit.id();
-            let identifier = permit.identifier();
-            let generation = permit.instance().generation();
-            let resolved_directives =
-                preparation
-                    .schemas()
-                    .resolve_directives(id, SchemaKind::Resource, &directives);
-            let request = DeleteRequest::from_resolved(resolved_directives);
-            match provider.delete(id, identifier, request).await {
-                Ok(()) => BasicEffectResult::Deleted {
-                    instance_key: permit.instance().clone(),
-                },
-                Err(error) => BasicEffectResult::Failure {
-                    failure: EffectFailureKind::provider(error),
-                    refresh: match generation {
-                        EffectGeneration::Current => Some((id.clone(), identifier.clone())),
-                        EffectGeneration::Deposed(_) => None,
-                    },
-                },
-            }
+        ScheduledBasicEffect::Delete { .. } => {
+            let PreparedBasicRequest::Delete(authorization) = prepared else {
+                unreachable!("authorized delete variant")
+            };
+            authorization
+                .dispatch(provider, preparation.schemas())
+                .await
         }
     };
     StartedBasicEffectResult::new(started_effect, started, outcome)

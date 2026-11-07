@@ -6201,6 +6201,25 @@ fn canonical_map_key_text<H: ValueKind, B: BindingAddress>(
     }
 }
 
+/// The exact authored-key pipeline used by map canonicalization. Static input
+/// admission must inspect API spelling, including enum aliases, before proving
+/// facts about a literal map's keys. Errors provide no static evidence.
+pub(crate) fn canonicalize_authored_map_key_text(
+    key: &str,
+    key_type: &AttributeType,
+    defs: &std::collections::BTreeMap<String, AttributeType>,
+) -> Result<String, crate::schema::TypeError> {
+    let lifted: Value = crate::schema::lift_map_key(key_type, key, defs);
+    let canonical = canonicalize_desired_with_type_and_ancestry(
+        lifted,
+        key_type,
+        defs,
+        crate::schema::FieldAncestry::WRITABLE,
+        DesiredValueSource::AuthoredDsl,
+    )?;
+    canonical_map_key_text(canonical)
+}
+
 fn type_contains_enum(
     attr_type: &AttributeType,
     defs: &std::collections::BTreeMap<String, AttributeType>,

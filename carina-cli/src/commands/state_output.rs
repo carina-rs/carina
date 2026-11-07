@@ -345,9 +345,7 @@ fn redact_nested_write_only_leaf(value: &mut serde_json::Value, path: &LeafPath)
 mod tests {
     use std::collections::HashMap;
 
-    use carina_core::provider::{
-        CreateAttempt, CreateFailureKind, EgressSent, ProviderError, Sent,
-    };
+    use carina_core::provider::{ProviderError, Sent};
     use carina_core::resource::{ResolvedResource, ResolvedResourceId, Resource, ResourceId};
     use carina_core::schema::{LeafPath, LeafPathSegment};
     use carina_state::{DeposedInstance, DeposedKey, ResourceState, StateFile};
@@ -458,13 +456,10 @@ mod tests {
             ResourceId::with_provider_identity("mock", "test.resource", "unknown-resource", None);
         let unknown_resource: ResolvedResource =
             ResolvedResource::new((Resource::from_id(unknown_id.clone())).into_value_snapshot());
-        let failure = CreateAttempt::for_test(unknown_id).outcome_unknown(
-            EgressSent::for_test(),
+        let unknown = crate::fixture_unknown_create_outcome(
+            &unknown_id,
             ProviderError::api_error("guest trapped"),
         );
-        let CreateFailureKind::OutcomeUnknown { unknown, .. } = failure.into_kind() else {
-            panic!("the egress witness must mint an unknown outcome")
-        };
         let mut unknown = ResourceState::from_unknown_create_outcome(
             &unknown_resource,
             &unknown,

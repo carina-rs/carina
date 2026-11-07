@@ -24,9 +24,9 @@ use carina_core::executor::{
 use carina_core::plan::PlanErrorKind;
 use carina_core::provider::{
     AppliedIdentifier, BoxFuture, CreateAttempt, CreateFailure, CreateOutcome, CreateRequest,
-    DeleteRequest, NoopNormalizer, Provider, ProviderFactory, ProviderReadyDataSource,
-    ProviderResult, ReadOutcome, ReadRequest, ResumeCreateRequest, ResumeFailure, ResumeOutcome,
-    Sent, UpdateOutcome, UpdateRequest,
+    NoopNormalizer, Provider, ProviderFactory, ProviderReadyDataSource, ProviderResult,
+    ReadOutcome, ReadRequest, ResumeCreateRequest, ResumeFailure, ResumeOutcome, Sent,
+    UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{ConcreteValue, Current, DeferredValue, ResourceId, State, Value};
 use carina_core::schema::{
@@ -532,15 +532,14 @@ impl Provider for OutputMock {
         _: &ResourceId,
         _: &AppliedIdentifier,
         _: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         Box::pin(async { unreachable!("this fixture never updates") })
     }
 
     fn delete(
         &self,
-        _: &ResourceId,
-        _: &AppliedIdentifier,
-        _: DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { unreachable!("this fixture never deletes") })
     }
@@ -598,7 +597,7 @@ fn apply_unknown_outputs(attributes: &str, output: Value, port: i64) -> Executio
         creates: Mutex::new(Vec::new()),
     };
     let input = LiveExecutionInput {
-        plan: &fixture.plan.clone().admit(&fixture.schemas).unwrap(),
+        plan: &creation_fixture::checked(fixture.plan.clone(), &fixture.schemas),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &origins,
             data_source_origins: &[],
@@ -759,5 +758,7 @@ fn typed_ref_secret_constraint_error_does_not_leak_value() {
     }
 }
 
+#[path = "../../carina-core/tests/support/creation.rs"]
+mod creation_fixture;
 #[path = "typed_ref_anonymous_refined_sink_e2e/review_round2_4282.rs"]
 mod review_round2_4282;

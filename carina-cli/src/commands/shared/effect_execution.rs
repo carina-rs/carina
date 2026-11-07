@@ -286,8 +286,7 @@ mod tests {
     use carina_core::executor::ExecutionResult;
     use carina_core::plan::Plan;
     use carina_core::provider::{
-        CreateRequest, DeleteRequest, Provider, ProviderError, ProviderResult, ReadRequest,
-        UpdateRequest,
+        CreateRequest, Provider, ProviderError, ProviderResult, ReadRequest, UpdateRequest,
     };
     use carina_core::resource::{
         ApplyTimeUnknown, ConcreteValue, DeferredValue, InterpolationPart, ResourceId, State, Value,
@@ -415,15 +414,14 @@ mod tests {
             _id: &ResourceId,
             _identifier: &carina_core::provider::AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: carina_core::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             unreachable!("import path must not call update")
         }
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &carina_core::provider::AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: carina_core::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             unreachable!("import path must not call delete")
         }

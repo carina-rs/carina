@@ -4,9 +4,9 @@ use carina_core::config_loader::get_base_dir;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::effect::{Effect, ResolvedMovePairs, UnresolvedSavedEffect};
 use carina_core::provider::{
-    AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, DeleteRequest, NoopNormalizer,
-    PatchOp, Provider, ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult,
-    ReadOutcome, ReadRequest, UpdateRequest,
+    AppliedIdentifier, AppliedState, BoxFuture, CreateRequest, NoopNormalizer, PatchOp, Provider,
+    ProviderError, ProviderFactory, ProviderNormalizer, ProviderResult, ReadOutcome, ReadRequest,
+    UpdateRequest,
 };
 use carina_core::resource::{
     DataSource, DeferredValue, LiveComposition, LiveCompositionArgument, LiveCompositionSignature,
@@ -467,7 +467,7 @@ async fn execute_mock_http_plan(
             provider_context: carina_core::parser::ProviderContext::clone(
                 &carina_core::parser::LoadedProviderContext::empty_for_test(),
             ),
-            plan: &plan.clone().admit(schemas).unwrap(),
+            plan: &crate::test_support::creation_fixture::checked(plan.clone(), schemas),
             provider_check_inputs: carina_core::executor::ProviderCheckInputs::Authored,
             compositions: &[],
             bindings: Default::default(),
@@ -3173,6 +3173,7 @@ impl Provider for FailBCreateProvider {
         id: &ResourceId,
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
         Box::pin(async move { Err(ProviderError::internal("unexpected update").for_resource(id)) })
@@ -3180,10 +3181,9 @@ impl Provider for FailBCreateProvider {
 
     fn delete(
         &self,
-        id: &ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = attempt.id();
         let id = id.clone();
         Box::pin(async move { Err(ProviderError::internal("unexpected delete").for_resource(id)) })
     }
@@ -3650,6 +3650,7 @@ impl Provider for ApplyCascadeProvider {
         id: &ResourceId,
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
         Box::pin(async move { Err(ProviderError::internal("unexpected update").for_resource(id)) })
@@ -3657,10 +3658,10 @@ impl Provider for ApplyCascadeProvider {
 
     fn delete(
         &self,
-        id: &ResourceId,
-        identifier: &carina_core::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = attempt.id();
+        let identifier = attempt.identifier();
         let id = id.clone();
         let identifier = identifier.to_string();
         let shared = self.shared.clone();
@@ -4043,6 +4044,7 @@ impl Provider for ApplyTimeReadProvider {
         id: &ResourceId,
         identifier: &carina_core::provider::AppliedIdentifier,
         request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.clone();
@@ -4096,10 +4098,9 @@ impl Provider for ApplyTimeReadProvider {
 
     fn delete(
         &self,
-        id: &ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
+        let id = attempt.id();
         let id = id.clone();
         Box::pin(async move { Err(ProviderError::internal("unexpected delete").for_resource(id)) })
     }
@@ -7418,15 +7419,14 @@ impl Provider for BootstrapRecordingProvider {
         _id: &ResourceId,
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("unexpected update")) })
     }
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
     }
@@ -7446,7 +7446,10 @@ fn bootstrap_test_backend() -> (tempfile::TempDir, Box<dyn StateBackend>) {
     (temp, backend)
 }
 
-struct BootstrapWriteFailureBackend;
+#[derive(Default)]
+struct BootstrapWriteFailureBackend {
+    create_calls: AtomicUsize,
+}
 
 #[async_trait::async_trait]
 impl StateBackend for BootstrapWriteFailureBackend {
@@ -7505,6 +7508,7 @@ impl StateBackend for BootstrapWriteFailureBackend {
     }
 
     async fn create_bucket(&self) -> carina_state::BackendResult<()> {
+        self.create_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
@@ -7758,10 +7762,13 @@ async fn declared_state_bucket_successful_create_seed_write_failure_is_actionabl
         create_calls: AtomicUsize::new(0),
         behavior: BootstrapCreateBehavior::Success,
     };
-    let error =
-        bootstrap_declared_state_bucket(color_mode, &provider, &BootstrapWriteFailureBackend)
-            .await
-            .expect_err("a successful create followed by a seed write failure must be actionable");
+    let error = bootstrap_declared_state_bucket(
+        color_mode,
+        &provider,
+        &BootstrapWriteFailureBackend::default(),
+    )
+    .await
+    .expect_err("a successful create followed by a seed write failure must be actionable");
 
     let AppError::StateBucketSeed(seed) = &error else {
         panic!("seed write failure lost its bootstrap context: {error:?}");
@@ -7870,6 +7877,56 @@ async fn invalid_state_bucket_bootstrap_resource_never_reaches_provider_create()
     );
     assert!(std::error::Error::source(&error).is_none());
     assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn creation_constrained_state_bucket_bootstrap_is_admitted_before_dispatch() {
+    use carina_core::schema::{InputPath, InputPredicate, InputRule, InputRuleCode};
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::Success,
+    };
+    let resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("192.168.1.1".into())),
+    );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        PatternResourceSchema::new("s3.Bucket")
+            .attribute(
+                PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+            )
+            .input_rule(InputRule::value(
+                carina_core::schema::InputRuleScope::CreateOnly,
+                InputPath::new("bucket").unwrap(),
+                InputRuleCode::new("bucket.not_ipv4").unwrap(),
+                InputPredicate::NotIpv4,
+            ))
+            .validate()
+            .unwrap(),
+    );
+    let provider_configs = empty_resolved_provider_configs();
+    let (_temp, backend) = bootstrap_test_backend();
+    let parsed = resolve_file_for_test(carina_core::parser::InferredFile::default());
+    let result = create_checked_bootstrap_resource_for_test(
+        crate::output_style::ColorMode::Plain,
+        &provider,
+        resource,
+        BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            backend: backend.as_ref(),
+            parsed: &parsed,
+            provider_configs: &provider_configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
+    )
+    .await;
+    assert!(matches!(result, Err(AppError::Validation(_))), "{result:?}");
+    assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
+    assert!(backend.read_state().await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -8263,7 +8320,7 @@ async fn bootstrap_seed_write_failure_keeps_classified_create_and_token() {
         resource,
         BootstrapCreateContext {
             provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
-            backend: &BootstrapWriteFailureBackend,
+            backend: &BootstrapWriteFailureBackend::default(),
             parsed: &carina_core::parser::ExpandedInferredFile::default(),
             provider_configs: &provider_configs,
             normalizer: &NoopNormalizer,
@@ -12213,8 +12270,254 @@ fn saved_plan_reloaded_resolved_data_source_retains_folded_module_dependency() {
     );
 }
 
+#[tokio::test]
+async fn auto_create_backend_bucket_does_not_require_provider_schema() {
+    let backend = BootstrapWriteFailureBackend::default();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "other",
+        PatternResourceSchema::new("other").validate().unwrap(),
+    );
+    assert!(
+        schemas
+            .get(
+                "aws",
+                "s3.Bucket",
+                carina_core::schema::SchemaKind::Resource
+            )
+            .is_none()
+    );
+    create_auto_bootstrap_bucket(&backend).await.unwrap();
+    assert_eq!(backend.create_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn auto_create_backend_bucket_is_outside_provider_input_admission() {
+    let backend = BootstrapWriteFailureBackend::default();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        PatternResourceSchema::new("s3.Bucket")
+            .attribute(
+                PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+            )
+            .input_rule(carina_core::schema::InputRule::value(
+                carina_core::schema::InputRuleScope::CreateOnly,
+                carina_core::schema::InputPath::new("bucket").unwrap(),
+                carina_core::schema::InputRuleCode::new("bucket.not_ipv4").unwrap(),
+                carina_core::schema::InputPredicate::NotIpv4,
+            ))
+            .validate()
+            .unwrap(),
+    );
+    create_auto_bootstrap_bucket(&backend).await.unwrap();
+    assert_eq!(backend.create_calls.load(Ordering::SeqCst), 1);
+}
+
 #[path = "tests/issue_4283.rs"]
 pub(super) mod issue_4283;
+
+#[tokio::test]
+async fn round3_bootstrap_default_tag_keys_are_plan_diagnostics() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::Success,
+    };
+    let resource: Resource =
+        Resource::with_provider("mock", "test.input_constrained", "state", None).with_attribute(
+            "name",
+            Value::Concrete(ConcreteValue::String("state-bucket".into())),
+        );
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        carina_provider_mock::desired_input_rule_schema()
+            .validate()
+            .unwrap(),
+    );
+    let mut parsed = carina_core::parser::InferredFile::default();
+    parsed.providers.push(ProviderConfig {
+        name: "mock".into(),
+        attributes: IndexMap::new(),
+        default_tags: IndexMap::from([(
+            "AWS:reserved".into(),
+            Value::Concrete(ConcreteValue::String("value".into())),
+        )]),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: IndexMap::new(),
+        binding: None,
+    });
+    let provider_configs = resolved_provider_configs(&parsed);
+    let mut expanded = carina_core::parser::ExpandedInferredFile::default();
+    expanded.providers = expanded_provider_configs(&parsed);
+    expanded.resources = vec![resource.clone()];
+    let parsed = expanded;
+    let (_temp, backend) = bootstrap_test_backend();
+    let error = create_checked_bootstrap_resource_for_test(
+        crate::output_style::ColorMode::Plain,
+        &provider,
+        resource,
+        BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            backend: backend.as_ref(),
+            parsed: &parsed,
+            provider_configs: &provider_configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
+    )
+    .await
+    .expect_err("reserved default tag must reject bootstrap admission");
+    assert!(
+        matches!(error, AppError::Validation(_)),
+        "expected plan diagnostics, got {error:?}"
+    );
+    assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
+    assert!(backend.read_state().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn round2_bootstrap_rejects_unknown_dependency_before_dispatch() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::Success,
+    };
+    let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".into())),
+    );
+    resource
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("missing"));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        PatternResourceSchema::new("s3.Bucket")
+            .attribute(
+                PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let (_temp, backend) = bootstrap_test_backend();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+    parsed.resources.push(resource.clone()); // allow: direct — fixture test inspection
+    // A persisted-only alias resolves authored operands but is absent from
+    // this plan's configured scheduling targets. Reach the readiness check,
+    // rather than failing earlier on an unresolvable authored name.
+    let missing = ResourceId::with_provider_identity("aws", "s3.Bucket", "missing", None);
+    let Current::Absent(missing) = Current::absent(missing) else {
+        unreachable!()
+    };
+    let mut orphans = carina_core::differ::Orphans::new();
+    orphans.insert(carina_core::differ::Orphan::absent(
+        missing,
+        Some(absolute_binding("missing")),
+        Default::default(),
+    ));
+    let graph = carina_core::resolved_graph::resolve_expanded_graph(
+        carina_core::resolved_graph::ConfiguredGraphInput::from(parsed).with_prior_orphans(orphans),
+    )
+    .unwrap();
+    let checked = graph
+        .initial_create_plan_for_test(resource, &schemas)
+        .expect("authored dependency resolves before scheduler readiness")
+        .check_inputs_with_types(
+            &schemas,
+            &carina_core::input_rules::InputTypeContext::empty(),
+        )
+        .unwrap();
+    let bindings = ResolvedBindings::default();
+    let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+    let result: Result<(), AppError> =
+        carina_core::validation::deferred_types::with_session_for_test_async(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            async |session| {
+                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &NoopNormalizer,
+                    &[],
+                    &schemas,
+                    session,
+                );
+                let permit = prepare_bootstrap_permit(&checked, &preparation).await?;
+                let (create, _cancellation) =
+                    carina_core::executor::dispatch_create(&provider, permit);
+                create
+                    .await
+                    .expect("fixture provider succeeds if erroneously released");
+                Ok(())
+            },
+        )
+        .await;
+    assert!(
+        matches!(&result, Err(AppError::StateBucketPreparation(error)) if matches!(error.preparation_error(), carina_core::executor::ProviderPreparationError::InitialCreateNotReady)),
+        "bootstrap must reject an unresolved scheduler dependency: {result:?}"
+    );
+    assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
+    assert!(backend.read_state().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn bootstrap_rejects_unknown_authored_binding_through_real_entrypoint() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::Success,
+    };
+    let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".into())),
+    );
+    resource
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("missing"));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        PatternResourceSchema::new("s3.Bucket")
+            .attribute(
+                PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let (_temp, backend) = bootstrap_test_backend();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+    parsed.resources.push(resource.clone()); // allow: direct — fixture test inspection
+    let configs = empty_resolved_provider_configs();
+    let error = create_checked_bootstrap_resource_for_test(
+        crate::output_style::ColorMode::Plain,
+        &provider,
+        resource,
+        BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            backend: backend.as_ref(),
+            parsed: &parsed,
+            provider_configs: &configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
+    )
+    .await
+    .expect_err("unknown authored binding must fail before dispatch");
+    assert!(
+        matches!(&error,
+            AppError::ExpandedGraphResolution(error)
+            if matches!(error.as_ref(), carina_core::resolved_graph::ExpandedGraphResolutionError::MissingDependency { reference, .. } if reference == "missing")
+        ),
+        "expected missing dependency, got {error:?}"
+    );
+    assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
+    assert!(backend.read_state().await.unwrap().is_none());
+}
 
 #[tokio::test]
 async fn bootstrap_unresolved_reference_returns_typed_preparation_error() {

@@ -1306,7 +1306,7 @@ mod tests {
 
     #[test]
     fn continuation_order_uses_the_supplied_schedule() {
-        use carina_core::provider::{CreateAttempt, PendingToken, Sent};
+        use carina_core::provider::Sent;
         use carina_core::resource::{Current, DeposedKey};
         use carina_core::schema::{PatternResourceSchema, SchemaRegistry};
 
@@ -1321,18 +1321,12 @@ mod tests {
         for identified in [true, false] {
             let resource = resolved_one(named_resource("pending", &[]));
             let id = resource.id.clone();
-            let attempt = CreateAttempt::for_test(id.clone());
-            let pending = if identified {
-                attempt
-                    .issued(
-                        AppliedIdentifier::new("new-id").unwrap(),
-                        Sent::AllRequestAttributes,
-                    )
-                    .pending(PendingToken::new("poll"), 1)
-            } else {
-                attempt.pending(PendingToken::new("resend"), Sent::AllRequestAttributes, 1)
-            }
-            .persist(Default::default(), Default::default());
+            let pending = crate::fixture_in_flight_create(
+                &id,
+                if identified { "poll" } else { "resend" },
+                if identified { Some("new-id") } else { None },
+                Sent::AllRequestAttributes,
+            );
             let mut plan = Plan::new();
             plan.add_resume_create(resource, pending.started_at().clone());
             let mut cleanup = delete("pending", &[]);

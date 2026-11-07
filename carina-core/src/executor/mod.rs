@@ -13,6 +13,8 @@
 
 pub(crate) mod basic;
 mod deferred_dispatch;
+mod delete;
+pub(crate) mod input_discharge;
 pub mod normalized;
 #[cfg(test)]
 mod normalized_tests;
@@ -25,6 +27,14 @@ pub(super) mod scheduler;
 pub(crate) mod wait;
 
 pub use deferred_dispatch::{AnonymousIdentityCollisionSource, DeferredCreateFailure};
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub use delete::delete_permit_for_test;
+pub use delete::{
+    DeleteCompletion, DeleteRelease, DeleteScheduleError, DeleteScheduler, ScheduledDelete,
+    dispatch_delete, prepare_initial_delete,
+};
+pub use input_discharge::{DeletePermit, PreparedWrite};
 pub use parallel::classify_stalled_effects;
 pub use scheduler::prepare_initial_create;
 pub use wait::StartMarker;
@@ -165,6 +175,36 @@ pub const TEST_UNCAPPED: NonZeroUsize = NonZeroUsize::new(usize::MAX).unwrap();
 ///     let _ = dispatch_create(provider, target);
 /// }
 /// ```
+/// The former raw dispatch shape cannot bypass either admission check:
+///
+/// ```compile_fail,E0061
+/// use carina_core::{executor::dispatch_create, provider::{CreateRequest, Provider}, resource::ResourceId};
+/// fn bypass(provider: &dyn Provider, id: &ResourceId, request: CreateRequest) {
+///     let _ = dispatch_create(provider, id, request);
+/// }
+/// ```
+///
+/// A discharged request alone cannot bypass scheduler readiness:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::{dispatch_create, PreparedWrite}, provider::{CreateRequest, Provider}};
+/// fn bypass(provider: &dyn Provider, discharged: PreparedWrite<CreateRequest>) {
+///     let _ = dispatch_create(provider, discharged);
+/// }
+/// ```
+///
+/// Preparing and checking a raw request cannot manufacture scheduler readiness:
+///
+/// ```compile_fail,E0277
+/// use carina_core::{
+///     executor::{prepare_create_request, ProviderPreparationContext},
+///     replacement::CreatePermit, resource::Resource,
+/// };
+/// async fn bypass(raw: Resource, context: &ProviderPreparationContext<'_>) -> CreatePermit {
+///     let request = prepare_create_request(raw, context).await.unwrap();
+///     request.into()
+/// }
+/// ```
 pub fn dispatch_create<'a, P: Provider + ?Sized>(
     provider: &'a P,
     permit: crate::replacement::CreatePermit,
@@ -177,6 +217,38 @@ pub fn dispatch_create<'a, P: Provider + ?Sized>(
         dispatch_create_with_attempt(provider, permit, attempt),
         cancellation,
     )
+}
+
+/// Scheduled update dispatch also consumes the exact checked patch.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::dispatch_update, provider::{Provider, AppliedIdentifier, UpdateRequest}};
+/// fn bypass(provider: &dyn Provider, id: &AppliedIdentifier, raw: UpdateRequest) {
+///     let _ = dispatch_update(provider, raw);
+/// }
+/// ```
+///
+/// Even an input-discharged update cannot construct scheduler readiness:
+///
+/// ```compile_fail,E0451
+/// use carina_core::{
+///     executor::PreparedWrite,
+///     provider::{AppliedIdentifier, UpdateRequest},
+///     replacement::UpdatePermit,
+/// };
+/// fn bypass(identifier: AppliedIdentifier, write: PreparedWrite<UpdateRequest>) -> UpdatePermit {
+///     UpdatePermit { write, identifier }
+/// }
+/// ```
+pub async fn dispatch_update<P: Provider + ?Sized>(
+    provider: &P,
+    permit: crate::replacement::UpdatePermit,
+) -> crate::provider::ProviderResult<crate::provider::UpdateOutcome> {
+    let id = permit.write.resource_id().clone();
+    let request = permit.write.request().clone();
+    let identifier = permit.identifier.clone();
+    let attempt = crate::provider::UpdateAttempt::new(permit);
+    provider.update(&id, &identifier, request, attempt).await
 }
 
 async fn dispatch_create_with_attempt<P: Provider + ?Sized>(
@@ -484,8 +556,13 @@ pub enum Applied {
 }
 
 /// Input data required to execute a plan.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::LiveExecutionInput, plan::Plan};
+/// fn bypass<'a>(input: &mut LiveExecutionInput<'a>, raw: &'a Plan) { input.plan = raw; }
+/// ```
 pub struct LiveExecutionInput<'a> {
-    pub plan: &'a crate::plan::AdmittedPlan,
+    pub plan: &'a crate::input_rules::InputCheckedPlan,
     /// Explicitly identifies whether provider-bound effects contain authored
     /// values or plan-normalized values paired with their authored origins.
     /// The executor never infers this from a missing map entry.
@@ -538,8 +615,15 @@ pub struct LiveExecutionInput<'a> {
 ///
 /// Keeping the composition slice in a distinct input type prevents a
 /// deserialized plan from entering the live validation/expansion lifecycle.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{executor::SavedExecutionInput, plan::Plan, resource::SavedModuleSource};
+/// fn bypass<'a>(input: &mut SavedExecutionInput<'a>, raw: &'a Plan<SavedModuleSource>) {
+///     input.plan = raw;
+/// }
+/// ```
 pub struct SavedExecutionInput<'a> {
-    pub plan: &'a crate::plan::AdmittedPlan<SavedModuleSource>,
+    pub plan: &'a crate::input_rules::InputCheckedPlan<SavedModuleSource>,
     pub provider_check_inputs: ProviderCheckInputs<'a, SavedModuleSource>,
     pub compositions: &'a [crate::resource::SavedComposition<crate::resource::NoPlaceholder>],
     pub bindings: ResolvedBindings,
@@ -576,6 +660,7 @@ impl RuntimeCompositions<'_> {
 }
 
 pub(super) struct RuntimeExecutionInput<'a, S = ModuleSource> {
+    input_checks: Vec<crate::input_rules::PendingInputObligation>,
     pub(super) plan: &'a crate::plan::AdmittedPlan<S>,
     pub(super) provider_check_inputs: ProviderCheckInputs<'a, S>,
     pub(super) compositions: RuntimeCompositions<'a>,
@@ -620,6 +705,7 @@ impl<'a> LiveExecutionInput<'a> {
             checkpoint_sink,
         } = self;
         RuntimeExecutionInput {
+            input_checks: plan.execution_input_checks(),
             plan,
             provider_check_inputs,
             compositions: RuntimeCompositions::Live(compositions),
@@ -663,6 +749,7 @@ impl<'a> SavedExecutionInput<'a> {
             checkpoint_sink,
         } = self;
         RuntimeExecutionInput {
+            input_checks: plan.execution_input_checks(),
             plan,
             provider_check_inputs,
             compositions: RuntimeCompositions::Saved(compositions),
@@ -1166,6 +1253,13 @@ impl std::fmt::Display for UnsatisfiedDependency {
 /// Typed reason an effect did not complete successfully.
 #[derive(Debug, Clone)]
 pub enum EffectFailureKind {
+    InputRule {
+        violation: crate::schema::InputViolation,
+    },
+    UnresolvedInputRule {
+        path: crate::schema::InputPath,
+        code: crate::schema::InputRuleCode,
+    },
     Provider {
         error: ReportedError,
         note: Option<crate::provider_text::ProviderText>,
@@ -1197,6 +1291,8 @@ impl EffectFailureKind {
     /// Short final-summary label. The observer renders the full cause once.
     pub fn label(&self) -> &'static str {
         match self {
+            Self::InputRule { .. } => "input rule violation",
+            Self::UnresolvedInputRule { .. } => "input rule unresolved",
             Self::Provider { .. } => "provider error",
             Self::Execution { .. } => "execution error",
             Self::DeferredMaterialization { .. } => "deferred materialization failure",
@@ -1282,6 +1378,8 @@ impl EffectFailureKind {
             Self::Provider { error, .. } | Self::Execution { error } => Some(error.as_error()),
             Self::DeferredMaterialization { failure } => Some(failure.as_ref()),
             Self::MissingDependency { .. }
+            | Self::InputRule { .. }
+            | Self::UnresolvedInputRule { .. }
             | Self::DependencyCycle { .. }
             | Self::BlockedByDependencyCycle { .. }
             | Self::NoProgress { .. }
@@ -1293,6 +1391,11 @@ impl EffectFailureKind {
 impl std::fmt::Display for EffectFailureKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InputRule { violation } => violation.fmt(formatter),
+            Self::UnresolvedInputRule { path, code } => write!(
+                formatter,
+                "input rule {code} at {path} could not be discharged"
+            ),
             Self::Provider { error, note } => {
                 error.fmt(formatter)?;
                 if let Some(note) = note {
@@ -1333,6 +1436,12 @@ impl std::fmt::Display for EffectFailureKind {
             }
             Self::ModuleConstraint { failure } => failure.fmt(formatter),
         }
+    }
+}
+
+impl std::error::Error for EffectFailureKind {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.reported_error()
     }
 }
 
@@ -1430,6 +1539,7 @@ pub enum FailureReport<'a, S> {
         kind: EffectFailureKind,
         context: FailureEventContext<'a>,
     },
+    InputChecks(ReportedError),
     ModuleConstraint(Box<ModuleConstraintFailure>),
     ModuleConstraintResolution(crate::module_resolver::ModuleConstraintResolutionError),
 }
@@ -1446,6 +1556,13 @@ impl FailureSink {
                 kind,
                 context,
             } => (EffectFailure::new(effect, kind), Some((effect, context))),
+            FailureReport::InputChecks(error) => (
+                EffectFailure {
+                    endpoint: None,
+                    kind: EffectFailureKind::Execution { error },
+                },
+                None,
+            ),
             FailureReport::ModuleConstraint(failure) => {
                 (EffectFailure::module_constraint(failure), None)
             }

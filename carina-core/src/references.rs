@@ -631,7 +631,7 @@ impl ReferencePreparation {
     #[allow(clippy::too_many_arguments)]
     pub async fn display(
         &mut self,
-        plan: crate::plan::AdmittedPlan,
+        plan: crate::input_rules::InputCheckedPlan,
         planning: &ResolvedReferences,
         historical: crate::detail_rows::HistoricalDisplayAttributes,
         detail: crate::detail_rows::DetailLevel,
@@ -761,22 +761,27 @@ impl ReferencePreparation {
                 },
             )
             .await?;
-        let plan = prepared.value;
-        if plan.has_errors() {
-            return Ok(PreparedComparison {
-                value: plan,
-                references: prepared.references,
-            });
-        }
-        let admitted = plan
-            .clone()
-            .admit(registry)
-            .expect("successful fixture plan admits");
+        let plan = match crate::input_rules::FinalizedPlan::new(prepared.value).check_inputs(
+            registry,
+            &prior
+                .materialize_current_states(desired, registry)
+                .into_iter()
+                .map(|(id, input)| (id, input.into_current()))
+                .collect(),
+        ) {
+            Ok(plan) => plan,
+            Err(plan) => {
+                return Ok(PreparedComparison {
+                    value: plan.into_plan(),
+                    references: prepared.references,
+                });
+            }
+        };
         let historical =
             crate::detail_rows::HistoricalDisplayAttributes::for_planning(&plan, saved);
         let display = self
             .display(
-                admitted,
+                plan.clone(),
                 &prepared.references,
                 historical,
                 crate::detail_rows::DetailLevel::Full,
@@ -786,7 +791,7 @@ impl ReferencePreparation {
             )
             .await?;
         Ok(PreparedComparison {
-            value: plan,
+            value: plan.plan().clone().into_unadmitted(),
             references: display.references,
         })
     }
@@ -900,7 +905,7 @@ impl<'run> RecordingSession<'run> {
     #[allow(clippy::too_many_arguments)]
     fn render(
         self,
-        plan: Arc<crate::plan::AdmittedPlan>,
+        plan: Arc<crate::input_rules::InputCheckedPlan>,
         planning: &ResolvedReferences,
         historical: crate::detail_rows::HistoricalDisplayAttributes,
         detail: crate::detail_rows::DetailLevel,

@@ -318,6 +318,9 @@ pub struct UnresolvedRequiredDependency {
 }
 
 impl UnresolvedRequiredDependency {
+    pub(crate) fn remap_effect_index(&mut self, index: usize) {
+        self.effect_index = index;
+    }
     pub fn effect_index(&self) -> usize {
         self.effect_index
     }

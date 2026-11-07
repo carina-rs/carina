@@ -12,8 +12,8 @@ use carina_core::executor::{
     UnresolvedResource,
 };
 use carina_core::provider::{
-    AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
-    ProviderResult, ReadOutcome, ReadRequest, Sent, UpdateOutcome, UpdateRequest,
+    AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, ProviderResult,
+    ReadOutcome, ReadRequest, Sent, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resource::{
     ResolvedResource, ResolvedResourceId, Resource, ResourceId, ResourceIdentity, State, Value,
@@ -756,15 +756,14 @@ impl Provider for RawEnumStateProvider {
         _id: &ResourceId,
         _identifier: &AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         Box::pin(async { panic!("raw enum test must not update") })
     }
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { panic!("raw enum test must not delete") })
     }
@@ -4384,15 +4383,14 @@ impl Provider for CascadeCreateProvider {
         _id: &ResourceId,
         _identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         Box::pin(async { Err(ProviderError::internal("update not used")) })
     }
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async { Ok(()) })
     }
@@ -4490,6 +4488,7 @@ impl Provider for ReadWithRetryProvider {
         id: &ResourceId,
         identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.to_string();
@@ -4503,9 +4502,7 @@ impl Provider for ReadWithRetryProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async move { Ok(()) })
     }
@@ -4790,15 +4787,8 @@ async fn read_with_retry_does_not_retry_not_found() {
 async fn outcome_unknown_refresh_preserves_managed_and_orphan_rows_without_provider_read() {
     let provider = ReadWithRetryProvider::new(ReadBehavior::Success);
     let id = ResourceId::with_provider_identity("test", "test.Resource", "unknown", None);
-    let failure = carina_core::provider::CreateAttempt::for_test(id.clone()).outcome_unknown(
-        carina_core::provider::EgressSent::for_test(),
-        ProviderError::api_error("guest trapped"),
-    );
-    let carina_core::provider::CreateFailureKind::OutcomeUnknown { unknown, .. } =
-        failure.into_kind()
-    else {
-        panic!("the egress witness must mint an unknown outcome")
-    };
+    let unknown =
+        crate::fixture_unknown_create_outcome(&id, ProviderError::api_error("guest trapped"));
 
     let refreshed = refresh_loaded_resource_with_retry(
         &provider,
@@ -9426,7 +9416,10 @@ async fn anonymous_cascade_child_create_uses_unresolved_source_after_state_ident
         provider_context: carina_core::parser::ProviderContext::clone(
             &carina_core::parser::LoadedProviderContext::empty_for_test(),
         ),
-        plan: &plan_ctx.plan.clone().admit(ctx.schemas()).unwrap(),
+        plan: match &plan_ctx.plan {
+            PlanOutcome::Planned(plan) => plan.checked(),
+            PlanOutcome::Diagnostics(_) => panic!("expected checked plan"),
+        },
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &data_source_origins,
@@ -11749,6 +11742,7 @@ mod read_with_retry_identifier_tests {
             id: &ResourceId,
             identifier: &carina_core::provider::AppliedIdentifier,
             _request: carina_core::provider::UpdateRequest,
+            _attempt: carina_core::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
             let id = id.clone();
             let identifier = identifier.to_string();
@@ -11762,9 +11756,7 @@ mod read_with_retry_identifier_tests {
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &carina_core::provider::AppliedIdentifier,
-            _request: carina_core::provider::DeleteRequest,
+            _attempt: carina_core::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Ok(()) })
         }
@@ -14061,7 +14053,7 @@ mod resolved_value_constraint_gate {
     use carina_core::parser::{CompareOp, ValidateExpr};
     use carina_core::plan::PlanErrorKind;
     use carina_core::provider::{
-        AppliedIdentifier, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest, ProviderFactory,
+        AppliedIdentifier, BoxFuture, CreateOutcome, CreateRequest, ProviderFactory,
         ProviderNormalizer, ProviderResult, ReadOutcome, ReadRequest, UpdateOutcome, UpdateRequest,
         ready_noop,
     };
@@ -14318,15 +14310,14 @@ mod resolved_value_constraint_gate {
             _id: &ResourceId,
             _identifier: &carina_core::provider::AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: carina_core::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async { Err(ProviderError::internal("unexpected update")) })
         }
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &carina_core::provider::AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: carina_core::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async { Err(ProviderError::internal("unexpected delete")) })
         }
@@ -15368,10 +15359,12 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                 let request = carina_core::executor::prepare_create_request(resource, &preparation)
                     .await
                     .unwrap();
-                let (create, cancellation) = carina_core::executor::dispatch_create(
-                    &provider,
-                    carina_core::replacement::create_permit_for_test(request),
+                let prepared = carina_core::replacement::create_permit_with_schemas_for_test(
+                    request,
+                    ctx.schemas(),
                 );
+                let (create, cancellation) =
+                    carina_core::executor::dispatch_create(&provider, prepared);
                 create.await.unwrap();
                 drop(cancellation);
                 let identifier = carina_core::provider::AppliedIdentifier::new("mock-id").unwrap();
@@ -15390,17 +15383,17 @@ async fn builtin_wiring_keeps_alias_storage_and_normalizer_observations_scoped()
                         .into_state()
                         .exists
                 );
-                provider
-                    .delete(
-                        &read_id,
-                        &identifier,
-                        carina_core::provider::DeleteRequest::resolve(
-                            &Directives::default(),
-                            carina_core::provider::ProviderDirectiveSchema::Unavailable,
-                        ),
-                    )
-                    .await
-                    .unwrap();
+                carina_core::executor::dispatch_delete(
+                    &provider,
+                    carina_core::executor::delete_permit_for_test(
+                        read_id.clone(),
+                        identifier.clone(),
+                        Directives::default(),
+                    ),
+                    &carina_core::schema::SchemaRegistry::new(),
+                )
+                .await
+                .unwrap();
                 assert!(
                     !provider
                         .read(&id, &identifier, carina_core::provider::ReadRequest)

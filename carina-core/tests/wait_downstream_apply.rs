@@ -39,9 +39,9 @@ use carina_core::executor::{
 use carina_core::module_resolver::resolve_modules_providerless as resolve_modules;
 use carina_core::parser::ProviderContext;
 use carina_core::provider::{
-    AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, DeleteRequest,
-    InitializedProvider, NoopNormalizer, Provider, ProviderInstanceKey, ProviderResult,
-    ProviderRouter, ReadOutcome, ReadRequest, UpdateOutcome, UpdateRequest,
+    AppliedIdentifier, AppliedState, BoxFuture, CreateOutcome, CreateRequest, InitializedProvider,
+    NoopNormalizer, Provider, ProviderInstanceKey, ProviderResult, ProviderRouter, ReadOutcome,
+    ReadRequest, UpdateOutcome, UpdateRequest,
 };
 use carina_core::resolver::resolve_refs_with_state_and_remote;
 use carina_core::resource::{
@@ -282,6 +282,7 @@ impl Provider for MockProvider {
         id: &ResourceId,
         identifier: &carina_core::provider::AppliedIdentifier,
         _request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.to_string();
@@ -295,9 +296,7 @@ impl Provider for MockProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &carina_core::provider::AppliedIdentifier,
-        _request: DeleteRequest,
+        _attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
         Box::pin(async move { Ok(()) })
     }
@@ -510,7 +509,7 @@ async fn module_wait_binding_survives_expansion_and_synchronizes_downstream() {
         provider_context: carina_core::parser::ProviderContext::clone(
             provider_types.provider_context(),
         ),
-        plan: &plan.clone().admit(&registry).unwrap(),
+        plan: &creation_fixture::checked(plan.clone(), &registry),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &[],
@@ -718,7 +717,7 @@ async fn nested_module_wait_binding_survives_two_expansions() {
         provider_context: carina_core::parser::ProviderContext::clone(
             provider_types.provider_context(),
         ),
-        plan: &plan.clone().admit(&registry).unwrap(),
+        plan: &creation_fixture::checked(plan.clone(), &registry),
         provider_check_inputs: ProviderCheckInputs::PlanNormalized {
             resource_origins: &unresolved_resources,
             data_source_origins: &[],
@@ -916,3 +915,5 @@ async fn carina3085_distribution_wait_ref_resolves_no_phantom_via_real_pipeline(
          dependency edge — both halves of the wait binding must hold"
     );
 }
+#[path = "support/creation.rs"]
+mod creation_fixture;

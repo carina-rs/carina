@@ -668,7 +668,7 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
         &crate::references::prepare_empty_for_tests(),
     )
     .unwrap()
-    .finish(|_| {});
+    .finish(std::iter::empty(), |_| {});
 
     assert!(plan.effects().is_empty());
     assert_eq!(plan.errors().len(), 1);
@@ -1190,6 +1190,7 @@ impl crate::provider::Provider for HintProvider {
         _id: &ResourceId,
         _identifier: &crate::provider::AppliedIdentifier,
         _request: crate::provider::UpdateRequest,
+        _attempt: crate::provider::UpdateAttempt,
     ) -> crate::provider::BoxFuture<
         '_,
         crate::provider::ProviderResult<crate::provider::UpdateOutcome>,
@@ -1199,9 +1200,7 @@ impl crate::provider::Provider for HintProvider {
 
     fn delete(
         &self,
-        _id: &ResourceId,
-        _identifier: &crate::provider::AppliedIdentifier,
-        _request: crate::provider::DeleteRequest,
+        _attempt: crate::provider::DeleteAttempt,
     ) -> crate::provider::BoxFuture<'_, crate::provider::ProviderResult<()>> {
         Box::pin(async { panic!("unexpected delete") })
     }

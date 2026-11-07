@@ -21,7 +21,7 @@ use crate::effect::deps::UnresolvedRequiredDependency;
 /// let permit = CreatePermit { request: todo!() };
 /// ```
 pub struct CreatePermit {
-    request: Box<crate::provider::CreateRequest>,
+    request: Box<super::PreparedWrite<crate::provider::CreateRequest>>,
 }
 
 impl std::fmt::Debug for CreatePermit {
@@ -35,37 +35,177 @@ impl std::fmt::Debug for CreatePermit {
 
 impl CreatePermit {
     pub fn target(&self) -> &crate::resource::ResourceId {
-        &self.request.resource().id
+        &self.request.request().resource().id
     }
     pub fn request(&self) -> &crate::provider::CreateRequest {
-        &self.request
+        self.request.request()
     }
     pub(crate) fn into_request(self) -> crate::provider::CreateRequest {
-        *self.request
+        (*self.request).into_parts().0
     }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
 #[doc(hidden)]
 pub fn create_permit_for_test(request: crate::provider::CreateRequest) -> CreatePermit {
-    CreatePermit {
-        request: Box::new(request),
+    create_permit_with_schemas_for_test(request, &crate::schema::SchemaRegistry::new())
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn create_permit_with_schemas_for_test(
+    request: crate::provider::CreateRequest,
+    schemas: &crate::schema::SchemaRegistry,
+) -> CreatePermit {
+    let (ready, check) = fixture_write_authority(
+        Effect::Create(request.resource().as_inner().clone()),
+        schemas,
+    );
+    let attributes = request.resource().as_resource().resolved_attributes();
+    let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
+        &attributes,
+        &attributes,
+    );
+    let write = check
+        .prepare_create(request, writeback, schemas)
+        .expect("fixture input discharge");
+    let ScheduledBasicEffect::Create { create, .. } = ready else {
+        unreachable!("fixture create slot")
+    };
+    create.authorize(write)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn update_permit_for_test(
+    identifier: crate::provider::AppliedIdentifier,
+    request: crate::provider::UpdateRequest,
+) -> UpdatePermit {
+    update_permit_with_schemas_for_test(identifier, request, &crate::schema::SchemaRegistry::new())
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn update_permit_with_schemas_for_test(
+    identifier: crate::provider::AppliedIdentifier,
+    request: crate::provider::UpdateRequest,
+    schemas: &crate::schema::SchemaRegistry,
+) -> UpdatePermit {
+    let id = request.from().id.clone();
+    let mut desired = crate::resource::Resource::from_id(id.clone());
+    desired.attributes = request.patch().sent_projection();
+    let (ready, check) = fixture_write_authority(
+        Effect::Update {
+            from: Box::new(request.from().clone()),
+            identifier,
+            to: crate::resource::ResolvedResource::new(desired.into()),
+            changed_attributes: request
+                .patch()
+                .ops
+                .iter()
+                .map(|op| op.key().to_owned())
+                .collect(),
+        },
+        schemas,
+    );
+    let attributes = request.patch().sent_projection().into_iter().collect();
+    let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
+        &attributes,
+        &attributes,
+    );
+    let write = check
+        .prepare_update(&id, request, writeback, schemas)
+        .expect("fixture input discharge");
+    let ScheduledBasicEffect::Update { update, .. } = ready else {
+        unreachable!("fixture update slot")
+    };
+    update.authorize(write)
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+fn fixture_write_authority(
+    effect: Effect<crate::resource::ProviderModuleSource>,
+    schemas: &crate::schema::SchemaRegistry,
+) -> (
+    ScheduledBasicEffect<crate::resource::ProviderModuleSource>,
+    super::input_discharge::WriteCheck,
+) {
+    let mut plan = crate::plan::Plan::default();
+    plan.add(effect);
+    let checked = crate::input_rules::FinalizedPlan::new(plan)
+        .check_inputs(schemas, &HashMap::new())
+        .expect("fixture plan admission");
+    let scheduled = checked.schedule(&HashMap::new());
+    let dependencies = build_scheduler_deps(&scheduled, std::iter::empty());
+    assert!(dependencies.unresolved.is_empty());
+    let ready = release_ready_effect(
+        &scheduled,
+        0,
+        &dependencies.deps_of,
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .expect("fixture slot is dependency ready")
+    .expect("fixture has no failed dependencies")
+    .into_basic()
+    .expect("fixture provider write");
+    let check = super::input_discharge::ExecutionInputChecks::new(
+        checked.execution_input_checks(),
+        scheduled.effects(),
+        &[0],
+    )
+    .expect("fixture input checks")
+    .take_write(0)
+    .expect("unconsumed fixture slot");
+    (ready, check)
+}
+
+pub(crate) struct ReadyDelete {
+    instance: crate::effect::DeletedInstanceKey,
+}
+impl ReadyDelete {
+    pub(crate) fn instance(&self) -> &crate::effect::DeletedInstanceKey {
+        &self.instance
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test(instance: crate::effect::DeletedInstanceKey) -> Self {
+        Self { instance }
     }
 }
 
-pub(crate) struct DeletePermit {
-    instance: crate::effect::DeletedInstanceKey,
+/// Dependency-ready authority to send one exact, input-discharged update.
+///
+/// ```compile_fail,E0277
+/// use carina_core::{replacement::UpdatePermit, provider::UpdateRequest};
+/// fn bypass(request: UpdateRequest) -> UpdatePermit { request.into() }
+/// ```
+pub struct UpdatePermit {
+    pub(super) write: super::PreparedWrite<crate::provider::UpdateRequest>,
+    pub(super) identifier: crate::provider::AppliedIdentifier,
+}
+pub(crate) struct ReadyUpdate {
+    target: crate::resource::ResourceId,
     identifier: crate::provider::AppliedIdentifier,
 }
-impl DeletePermit {
-    pub(crate) fn id(&self) -> &crate::resource::ResourceId {
-        self.instance.id()
+impl ReadyUpdate {
+    pub(super) fn authorize(
+        self,
+        write: super::PreparedWrite<crate::provider::UpdateRequest>,
+    ) -> UpdatePermit {
+        assert_eq!(
+            &self.target,
+            write.resource_id(),
+            "scheduled update target changed"
+        );
+        UpdatePermit {
+            write,
+            identifier: self.identifier,
+        }
     }
-    pub(crate) fn identifier(&self) -> &crate::provider::AppliedIdentifier {
-        &self.identifier
-    }
-    pub(crate) fn instance(&self) -> &crate::effect::DeletedInstanceKey {
-        &self.instance
+}
+impl UpdatePermit {
+    pub fn request(&self) -> &crate::provider::UpdateRequest {
+        self.write.request()
     }
 }
 
@@ -79,26 +219,18 @@ impl<S: Clone> ReadyCreate<S> {
         &self.resource.id
     }
 
-    pub(super) async fn prepare(
+    pub(super) fn authorize(
         self,
-        inputs: &super::ProviderCheckInputs<'_, S>,
-        runtime_authored: bool,
-        context: &super::ProviderPreparationContext<'_>,
-    ) -> Result<
-        (
-            CreatePermit,
-            crate::binding_index::SecretPreservingAttributes,
-        ),
-        super::EffectFailureKind,
-    > {
-        let input = inputs.resource_input(self.resource.as_inner(), runtime_authored);
-        let (resolved, attributes) = super::basic::resolve_resource(input, context).await?;
-        Ok((
-            CreatePermit {
-                request: Box::new(crate::provider::CreateRequest::checked(resolved)),
-            },
-            attributes,
-        ))
+        request: super::PreparedWrite<crate::provider::CreateRequest>,
+    ) -> CreatePermit {
+        assert_eq!(
+            &self.resource.id,
+            request.resource_id(),
+            "scheduled create target changed"
+        );
+        CreatePermit {
+            request: Box::new(request),
+        }
     }
 }
 
@@ -116,12 +248,10 @@ pub(super) enum PreparedResume {
     Poll(crate::provider::PollCreateRequest),
 }
 impl<S: Clone> ScheduledResume<S> {
-    pub(super) async fn prepare(
+    pub(super) fn prepare(
         self,
         resource: &crate::resource::ResolvedResource<S>,
-        inputs: &super::ProviderCheckInputs<'_, S>,
-        runtime_authored: bool,
-        context: &super::ProviderPreparationContext<'_>,
+        write: super::PreparedWrite<crate::provider::CreateRequest>,
     ) -> Result<
         (
             PreparedResume,
@@ -130,39 +260,26 @@ impl<S: Clone> ScheduledResume<S> {
         ),
         super::EffectFailureKind,
     > {
-        let (request, attributes, pending) = match self {
-            Self::Resend { pending, create } => {
-                let (permit, attributes) =
-                    create.prepare(inputs, runtime_authored, context).await?;
-                let accepted = super::AcceptedRequest::from_create_request(permit.request())
-                    .with_resolved_desired_attributes(attributes.clone());
-                let request = crate::provider::ResumeCreateRequest::new(*pending, permit)
-                    .map_err(super::EffectFailureKind::execution)?;
-                return Ok((PreparedResume::Resend(request), attributes, accepted));
-            }
-            Self::Poll(pending) => {
-                let input = inputs.resource_input(resource.as_inner(), runtime_authored);
-                let (resolved, attributes) = super::basic::resolve_resource(input, context).await?;
-                (
-                    crate::provider::CreateRequest::checked(resolved),
-                    attributes,
-                    pending,
-                )
-            }
+        let attributes = write.writeback().clone();
+        let accepted = super::AcceptedRequest::from_create_request(write.request())
+            .with_resolved_desired_attributes(attributes.clone());
+        let request = match self {
+            Self::Resend { pending, create } => PreparedResume::Resend(
+                crate::provider::ResumeCreateRequest::new(*pending, create.authorize(write))
+                    .map_err(super::EffectFailureKind::execution)?,
+            ),
+            Self::Poll(pending) => PreparedResume::Poll(
+                crate::provider::PollCreateRequest::new(*pending, write.into_parts().0)
+                    .map_err(super::EffectFailureKind::execution)?,
+            ),
             Self::Missing => {
-                let input = inputs.resource_input(resource.as_inner(), runtime_authored);
-                super::basic::resolve_resource(input, context).await?;
                 return Err(super::EffectFailureKind::message(format!(
                     "saved create continuation for {} changed before dispatch",
                     resource.id
                 )));
             }
         };
-        let accepted = super::AcceptedRequest::from_create_request(&request)
-            .with_resolved_desired_attributes(attributes.clone());
-        let request = crate::provider::PollCreateRequest::new(*pending, request)
-            .map_err(super::EffectFailureKind::execution)?;
-        Ok((PreparedResume::Poll(request), attributes, accepted))
+        Ok((request, attributes, accepted))
     }
 }
 
@@ -185,15 +302,13 @@ pub(crate) enum ScheduledBasicEffect<S> {
     },
     Update {
         effect: Effect<S>,
-        from: Box<crate::resource::SnapshotState>,
         identifier: crate::provider::AppliedIdentifier,
         to: crate::resource::ResolvedResource<S>,
-        changed_attributes: Vec<String>,
+        update: ReadyUpdate,
     },
     Delete {
         effect: Effect<S>,
-        directives: crate::resource::Directives,
-        permit: DeletePermit,
+        permit: ReadyDelete,
     },
 }
 impl<S> ScheduledBasicEffect<S> {
@@ -243,22 +358,23 @@ impl<S: Clone> ReadyEffect<S> {
                 }
             }
             Effect::Update {
-                from,
+                from: _,
                 identifier,
                 to,
-                changed_attributes,
+                changed_attributes: _,
             } => ScheduledBasicEffect::Update {
                 effect,
-                from,
+                update: ReadyUpdate {
+                    target: to.id.clone(),
+                    identifier: identifier.clone(),
+                },
                 identifier,
                 to,
-                changed_attributes,
             },
             Effect::Delete {
                 id,
                 generation,
                 identifier,
-                directives,
                 ..
             } => {
                 let instance = crate::effect::DeletedInstanceKey::new(
@@ -268,11 +384,7 @@ impl<S: Clone> ReadyEffect<S> {
                 );
                 ScheduledBasicEffect::Delete {
                     effect,
-                    directives,
-                    permit: DeletePermit {
-                        instance,
-                        identifier,
-                    },
+                    permit: ReadyDelete { instance },
                 }
             }
             Effect::Read { .. }
@@ -297,6 +409,26 @@ pub(super) fn release_ready_effect<S: Clone>(
     completed: &HashSet<usize>,
     failed: &HashSet<usize>,
 ) -> Option<Result<ReadyEffect<S>, FailedDependency>> {
+    release_ready_effect_mapped(
+        scheduled,
+        index,
+        index,
+        scheduled.effects(),
+        dependencies,
+        completed,
+        failed,
+    )
+}
+
+pub(super) fn release_ready_effect_mapped<S: Clone>(
+    scheduled: &crate::replacement::ScheduledPlan<'_, S>,
+    source: usize,
+    index: usize,
+    effects: &[Effect<S>],
+    dependencies: &HashMap<usize, HashSet<usize>>,
+    completed: &HashSet<usize>,
+    failed: &HashSet<usize>,
+) -> Option<Result<ReadyEffect<S>, FailedDependency>> {
     if !dependencies
         .get(&index)?
         .iter()
@@ -305,11 +437,11 @@ pub(super) fn release_ready_effect<S: Clone>(
         return None;
     }
     if let Some(failed) =
-        FailureView::new(scheduled.effects(), dependencies, failed).find_failed_dependency(index)
+        FailureView::new(effects, dependencies, failed).find_failed_dependency(index)
     {
         return Some(Err(failed));
     }
-    let effect = scheduled.effects().get(index)?.clone();
+    let effect = scheduled.effects().get(source)?.clone();
     let continuation = scheduled.continuation(effect.resource_id()).cloned();
     Some(Ok(ReadyEffect {
         effect,
@@ -320,13 +452,50 @@ pub(super) fn release_ready_effect<S: Clone>(
 /// Prepare an initially ready create without starting a full apply, for
 /// bootstrap callers. This uses the executor's release and the sealed target;
 /// an endpoint with pending prerequisites yields no permission.
+/// A schedule without input admission cannot authorize bootstrap dispatch:
+///
+/// ```compile_fail,E0308
+/// use carina_core::{
+///     executor::{prepare_initial_create, ProviderPreparationContext},
+///     replacement::ScheduledPlan,
+/// };
+/// async fn bypass(
+///     scheduled: &ScheduledPlan<'_>,
+///     context: &ProviderPreparationContext<'_>,
+/// ) {
+///     let _ = prepare_initial_create(scheduled, context).await;
+/// }
+/// ```
+///
+/// Input admission cannot be paired with a caller-chosen readiness graph:
+///
+/// ```compile_fail,E0061
+/// use carina_core::{
+///     executor::{prepare_initial_create, ProviderPreparationContext},
+///     replacement::InputCheckedScheduledPlan, resolved_graph::ExpandedBindingIndex,
+/// };
+/// async fn swap_graph(
+///     scheduled: &InputCheckedScheduledPlan<'_>, graph: &ExpandedBindingIndex,
+///     context: &ProviderPreparationContext<'_>,
+/// ) {
+///     let _ = prepare_initial_create(scheduled, graph, context).await;
+/// }
+/// ```
 pub async fn prepare_initial_create(
-    scheduled: &crate::replacement::ScheduledPlan<'_>,
-    graph: &crate::resolved_graph::ExpandedBindingIndex,
+    plan: &crate::resolved_graph::InputCheckedInitialCreatePlan,
     context: &super::ProviderPreparationContext<'_>,
 ) -> Result<Option<CreatePermit>, super::ProviderPreparationError> {
-    let (scheduled, _, _) = scheduled.clone().expand_deferred_replacements();
-    let dependencies = build_scheduler_deps(&scheduled, graph.scheduler_target_ids());
+    let scheduled = plan.checked.schedule(&HashMap::new());
+    let obligations = scheduled.execution_input_checks();
+    let (scheduled, _, sources) = scheduled.clone().expand_deferred_replacements();
+    let input_error = super::ProviderPreparationError::InputDischarge;
+    let mut checks = super::input_discharge::ExecutionInputChecks::new(
+        obligations,
+        scheduled.effects(),
+        &sources,
+    )
+    .map_err(|error| input_error(super::EffectFailureKind::execution(error)))?;
+    let dependencies = build_scheduler_deps(&scheduled, plan.graph.scheduler_target_ids());
     let completed = HashSet::new();
     for index in 0..scheduled.effects().len() {
         if dependencies
@@ -347,14 +516,21 @@ pub async fn prepare_initial_create(
         };
         if let Some(ScheduledBasicEffect::Create { create, .. }) = ready.into_basic() {
             let resource = super::provider_ready::prepare_provider_ready_resource(
-                (*create.resource).into_inner(),
+                create.resource.as_inner().clone(),
                 context,
             )
             .await?;
             let request = crate::provider::CreateRequest::checked(resource);
-            return Ok(Some(CreatePermit {
-                request: Box::new(request),
-            }));
+            let attributes = request.resource().as_resource().resolved_attributes();
+            let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
+                &create.resource.resolved_attributes(),
+                &attributes,
+            );
+            let write = checks
+                .take_write(index)
+                .and_then(|check| check.prepare_create(request, writeback, context.schemas()))
+                .map_err(input_error)?;
+            return Ok(Some(create.authorize(write)));
         }
     }
     Ok(None)
@@ -381,6 +557,162 @@ pub(crate) fn release_basic_for_test<S: Clone>(
 pub(super) struct SchedulerDeps {
     pub(super) deps_of: HashMap<usize, HashSet<usize>>,
     pub(super) unresolved: Vec<UnresolvedRequiredDependency>,
+}
+
+/// Internal preparation nodes mirror their write solely for diagnostics. They
+/// are excluded from effect analysis, so they cannot become value producers.
+#[derive(Default)]
+pub(super) struct PreparationNodes {
+    writes: HashMap<usize, usize>,
+    pairs: Vec<(usize, usize, Vec<usize>)>,
+    replacement_templates: HashMap<usize, HashSet<usize>>,
+    schedule_to_runtime: Vec<usize>,
+}
+
+impl PreparationNodes {
+    pub(super) fn install<S: Clone>(
+        effects: &mut Vec<Effect<S>>,
+        input_checks: &super::input_discharge::ExecutionInputChecks,
+    ) -> Self {
+        let mut nodes = Self {
+            schedule_to_runtime: (0..effects.len()).collect(),
+            replacement_templates: input_checks
+                .checks
+                .keys()
+                .copied()
+                .filter(|&index| matches!(effects[index], Effect::DeferredReplace(_)))
+                .map(|index| {
+                    (
+                        index,
+                        input_checks
+                            .absorbed
+                            .get(&index)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect(),
+            ..Self::default()
+        };
+        let mut pairs = input_checks
+            .paired
+            .iter()
+            .filter(|(write, _)| {
+                matches!(
+                    effects[**write],
+                    Effect::Create(_) | Effect::ResumeCreate { .. }
+                )
+            })
+            .collect::<Vec<_>>();
+        pairs.sort_by_key(|(write, _)| *write);
+        for (&write, deletes) in pairs {
+            let preparation = effects.len();
+            effects.push(effects[write].clone());
+            nodes.writes.insert(preparation, write);
+            nodes.pairs.push((preparation, write, deletes.clone()));
+        }
+        nodes
+    }
+
+    pub(super) fn write(&self, node: usize) -> Option<usize> {
+        self.writes.get(&node).copied()
+    }
+
+    pub(super) fn dependencies<S>(
+        &self,
+        effects: &[Effect<S>],
+        deps: &mut HashMap<usize, HashSet<usize>>,
+    ) {
+        for (&template, absorbed) in &self.replacement_templates {
+            // Only the template's own expanded teardown slots can form the
+            // template <-> absorbed-delete cycle. Preserve anonymous identity
+            // gates, DependsOn, and every other scheduler prerequisite.
+            if let Some(dependencies) = deps.get_mut(&template) {
+                dependencies.retain(|index| !absorbed.contains(index));
+            }
+        }
+        for (preparation, write, deletes) in &self.pairs {
+            // A request's value prerequisites do not include teardown/order
+            // edges. Inheriting the paired Delete here creates a false cycle.
+            let inputs = deps
+                .get(write)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&index| {
+                    let (Effect::Create(resource) | Effect::ResumeCreate { resource, .. }) =
+                        &effects[*write]
+                    else {
+                        unreachable!("preparation write")
+                    };
+                    !matches!(effects[index], Effect::Delete { .. })
+                        && resource
+                            .value_dependencies()
+                            .iter()
+                            .any(|id| id.as_inner() == effects[index].resource_id())
+                })
+                .collect();
+            deps.insert(*preparation, inputs);
+            deps.entry(*write).or_default().insert(*preparation);
+            for delete in deletes {
+                deps.entry(*delete).or_default().insert(*preparation);
+            }
+        }
+    }
+
+    pub(super) fn schedule_index(&self, runtime: usize) -> Option<usize> {
+        self.schedule_to_runtime
+            .iter()
+            .position(|&index| index == runtime)
+    }
+    pub(super) fn runtime_index(&self, scheduled: usize) -> usize {
+        self.schedule_to_runtime[scheduled]
+    }
+    pub(super) fn synchronize<S: Clone>(
+        &mut self,
+        effects: &mut Vec<Effect<S>>,
+        admitted: &crate::replacement::AdmittedReplacementEffects<S>,
+    ) {
+        for (index, effect) in admitted.effects().iter().enumerate() {
+            if let Some(&runtime) = self.schedule_to_runtime.get(index) {
+                effects[runtime] = effect.clone();
+            } else {
+                self.schedule_to_runtime.push(effects.len());
+                effects.push(effect.clone());
+            }
+        }
+    }
+    pub(super) fn rebuild<'a, S: Clone>(
+        &self,
+        effects: &[Effect<S>],
+        admitted: &crate::replacement::AdmittedReplacementEffects<S>,
+        origins: impl IntoIterator<Item = &'a ResolvedResourceId>,
+    ) -> SchedulerDeps {
+        let SchedulerDeps {
+            deps_of,
+            mut unresolved,
+        } = build_scheduler_deps(admitted, origins);
+        let mut deps = deps_of
+            .into_iter()
+            .map(|(index, dependencies)| {
+                (
+                    self.runtime_index(index),
+                    dependencies
+                        .into_iter()
+                        .map(|index| self.runtime_index(index))
+                        .collect(),
+                )
+            })
+            .collect();
+        for dependency in &mut unresolved {
+            dependency.remap_effect_index(self.runtime_index(dependency.effect_index()));
+        }
+        self.dependencies(effects, &mut deps);
+        SchedulerDeps {
+            deps_of: deps,
+            unresolved,
+        }
+    }
 }
 
 pub(super) struct PureMetaStep<'a, S> {

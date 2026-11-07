@@ -84,6 +84,59 @@ impl CompiledPattern {
     pub fn is_match(&self, value: &str) -> bool {
         self.regex.is_match(value)
     }
+
+    /// Recognize only an absolute whole-string character class repetition.
+    /// Inspect the compiler's translated dialect so `\d` and `\w` retain
+    /// their ASCII meaning. Unanchored and multiline assertions prove nothing.
+    pub(crate) fn whole_string_class(
+        &self,
+    ) -> Option<(super::CharSet, super::length_interval::LengthInterval)> {
+        use regex_syntax::hir::{Class, HirKind, Look};
+        let hir = regex_syntax::Parser::new()
+            .parse(self.regex.as_str())
+            .ok()?;
+        let HirKind::Concat(parts) = hir.kind() else {
+            return None;
+        };
+        let [start, middle, end] = parts.as_slice() else {
+            return None;
+        };
+        if !matches!(start.kind(), HirKind::Look(Look::Start))
+            || !matches!(end.kind(), HirKind::Look(Look::End))
+        {
+            return None;
+        }
+        let (class, min, max) = match middle.kind() {
+            HirKind::Repetition(rep) => (&*rep.sub, u64::from(rep.min), rep.max.map(u64::from)),
+            _ => (middle, 1, Some(1)),
+        };
+        let ranges = match class.kind() {
+            HirKind::Class(Class::Unicode(class)) => class
+                .ranges()
+                .iter()
+                .map(|r| (r.start(), r.end()))
+                .collect(),
+            HirKind::Class(Class::Bytes(class)) => class
+                .ranges()
+                .iter()
+                .map(|r| (char::from(r.start()), char::from(r.end())))
+                .collect(),
+            HirKind::Literal(literal) => {
+                let text = std::str::from_utf8(&literal.0).ok()?;
+                let mut chars = text.chars();
+                let ch = chars.next()?;
+                if chars.next().is_some() {
+                    return None;
+                }
+                vec![(ch, ch)]
+            }
+            _ => return None,
+        };
+        Some((
+            super::CharSet::new(ranges).ok()?,
+            super::length_interval::LengthInterval { min, max },
+        ))
+    }
 }
 
 impl Deref for CompiledPattern {

@@ -7467,6 +7467,7 @@ impl Provider for WasmProvider {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
+        _attempt: carina_core::provider::UpdateAttempt,
     ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
         let id = id.clone();
         let identifier = identifier.as_str().to_string();
@@ -7483,14 +7484,14 @@ impl Provider for WasmProvider {
 
     fn delete(
         &self,
-        id: &ResourceId,
-        identifier: &AppliedIdentifier,
-        request: DeleteRequest,
+        attempt: carina_core::provider::DeleteAttempt,
     ) -> BoxFuture<'_, ProviderResult<()>> {
-        let id = id.clone();
-        let identifier = identifier.as_str().to_string();
+        let id = attempt.id().clone();
+        let identifier = attempt.identifier().as_str().to_string();
+        let request = attempt.request().clone();
         let budgets = self.operation_budgets(&id, carina_provider_protocol::OperationKind::Delete);
         Box::pin(async move {
+            let _attempt = attempt;
             let initial = self.call_delete(id.clone(), identifier, request);
             self.drive_operation("delete", id, budgets, initial, |pending, _finality| {
                 self.call_poll_delete(*pending)
@@ -8728,7 +8729,9 @@ mod tests {
         }
     }
 
-    struct PendingFixtureProvider;
+    struct PendingFixtureProvider {
+        captured_attempt: Option<std::sync::Mutex<Option<CreateAttempt>>>,
+    }
 
     impl Provider for PendingFixtureProvider {
         fn name(&self) -> &str {
@@ -8761,6 +8764,10 @@ mod tests {
             _request: CreateRequest,
             attempt: CreateAttempt,
         ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+            if let Some(captured) = &self.captured_attempt {
+                *captured.lock().unwrap() = Some(attempt);
+                return Box::pin(std::future::pending());
+            }
             Box::pin(async move {
                 let pending = attempt
                     .issued(
@@ -8790,6 +8797,7 @@ mod tests {
             _id: &ResourceId,
             _identifier: &AppliedIdentifier,
             _request: UpdateRequest,
+            _attempt: carina_core::provider::UpdateAttempt,
         ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
             Box::pin(async {
                 Err(ProviderError::internal(
@@ -8800,9 +8808,7 @@ mod tests {
 
         fn delete(
             &self,
-            _id: &ResourceId,
-            _identifier: &AppliedIdentifier,
-            _request: DeleteRequest,
+            _attempt: carina_core::provider::DeleteAttempt,
         ) -> BoxFuture<'_, ProviderResult<()>> {
             Box::pin(async {
                 Err(ProviderError::internal(
@@ -8818,6 +8824,62 @@ mod tests {
         ) -> ProviderResult<Vec<String>> {
             Ok(Vec::new())
         }
+    }
+
+    fn create_attempt_for_test(id: ResourceId) -> CreateAttempt {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let bindings = carina_core::binding_index::ResolvedBindings::default();
+        let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = carina_core::schema::SchemaRegistry::new();
+        let provider = PendingFixtureProvider {
+            captured_attempt: Some(std::sync::Mutex::new(None)),
+        };
+        let mut resource = Resource::from_id(id);
+        resource.set_attr("name", test_string_value("example"));
+        carina_core::validation::deferred_types::with_session_for_test(
+            &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let preparation = carina_core::executor::ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &carina_core::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                let mut prepare = std::pin::pin!(carina_core::executor::prepare_create_request(
+                    resource,
+                    &preparation
+                ));
+                let Poll::Ready(request) = prepare
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                else {
+                    panic!("fixture preparation must complete synchronously");
+                };
+                let request = request.expect("fixture passes provider preparation");
+                // Pure dispatch fixture with no schema input rules.
+                let prepared = carina_core::replacement::create_permit_for_test(request);
+                let (create, _cancellation) =
+                    carina_core::executor::dispatch_create(&provider, prepared);
+                let mut create = std::pin::pin!(create);
+                assert!(
+                    create
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+            },
+        );
+        provider
+            .captured_attempt
+            .unwrap()
+            .into_inner()
+            .unwrap()
+            .unwrap()
     }
 
     async fn pending_create_with_issued_identifier() -> PendingCreate {
@@ -8847,10 +8909,13 @@ mod tests {
                 let request =
                     carina_core::executor::prepare_create_request(resource, &preparation).await;
                 let request = request.expect("fixture resource passes provider preparation");
-                let (create, _cancellation) = carina_core::executor::dispatch_create(
-                    &PendingFixtureProvider,
-                    carina_core::replacement::create_permit_for_test(request),
-                );
+                // Pure dispatch fixture with no schema input rules.
+                let prepared = carina_core::replacement::create_permit_for_test(request);
+                let provider = PendingFixtureProvider {
+                    captured_attempt: None,
+                };
+                let (create, _cancellation) =
+                    carina_core::executor::dispatch_create(&provider, prepared);
                 let failure = create.await.expect_err("fixture create remains pending");
                 let pending = match failure.into_kind() {
                     CreateFailureKind::InFlight {
@@ -8888,7 +8953,7 @@ mod tests {
 
     fn pending_create_without_identifier() -> PendingCreate {
         let (id, wit_id, wit_request) = boundary_resource();
-        let pending = CreateAttempt::for_test(id.clone()).pending(
+        let pending = create_attempt_for_test(id.clone()).pending(
             proto::PendingToken::new("original-token"),
             sent_name_only(),
             1,
@@ -9165,7 +9230,7 @@ mod tests {
     #[test]
     fn initial_create_read_back_in_flight_keeps_the_continuation() {
         let (id, _wit_id, wit_request) = boundary_resource();
-        let attempt = CreateAttempt::for_test(id.clone());
+        let attempt = create_attempt_for_test(id.clone());
         let verdict: wasm_convert::DecodedCreateVerdict =
             proto::CreateVerdict::InFlight(proto::CreateInFlight {
                 pending: proto::PendingCreate {
@@ -9217,7 +9282,7 @@ mod tests {
     fn poll_in_flight_phase_regression_is_protocol_violation_and_preserves_continuation() {
         let (id, wit_id, wit_request) = boundary_resource();
         let starting = PendingCreate {
-            pending: CreateAttempt::for_test(id.clone())
+            pending: create_attempt_for_test(id.clone())
                 .issued(
                     AppliedIdentifier::new("issued-id").unwrap(),
                     sent_name_only(),
@@ -9521,7 +9586,7 @@ mod tests {
                 pending_id.clone(),
                 pending_wit_id,
                 pending_wit_request,
-                CreateAttempt::for_test(pending_id),
+                create_attempt_for_test(pending_id),
                 proto::CreateStep::Pending(pending_payload.clone()),
             ),
             "invalid-sent-token",
@@ -9534,7 +9599,7 @@ mod tests {
             WasmProvider::initial_create_verdict(
                 verdict_id.clone(),
                 &verdict_wit_request,
-                CreateAttempt::for_test(verdict_id),
+                create_attempt_for_test(verdict_id),
                 proto::CreateVerdict::InFlight(proto::CreateInFlight {
                     pending: pending_payload,
                     error: ProviderError::timeout("provider error must not hide boundary error"),
