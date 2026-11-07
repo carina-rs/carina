@@ -23,6 +23,7 @@ Since v0.5.0, the first release that checks the version, every release has set t
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
+| v0.12.1 | 23 | 23 |
 | v0.12.0 | 23 | 23 |
 | Development snapshot after v0.11.0 (unreleased) | 22 | 22 |
 | v0.11.0 | 21 | 21 |
@@ -40,7 +41,7 @@ Since v0.5.0, the first release that checks the version, every release has set t
 | v0.6.0 | 10 | 10 |
 | v0.5.0 | 10 | 10 |
 
-Carina v0.12.0 uses protocol 23; v0.11.0 uses protocol 21 and v0.10.0 uses protocol 19. Protocol 23 requires every resource schema to carry an `input_rules` array, `[]` when the resource declares no rules. Each rule names a scope (`create_only` or `every_write`), a typed target, a stable diagnostic code and a predicate, and Carina checks it on the inputs of the writes in that scope, never on read-back or state values. Protocol 22 added an optional entry-count bound to map attribute types, the same `length` shape that list types use. Providers built for protocol 22 or earlier must rebuild against the current SDK.
+Carina v0.12.0 and v0.12.1 use protocol 23; v0.11.0 uses protocol 21 and v0.10.0 uses protocol 19. Protocol 23 requires every resource schema to carry an `input_rules` array, `[]` when the resource declares no rules. Each rule names a scope (`create_only` or `every_write`), a typed target, a stable diagnostic code and a predicate, and Carina checks it on the inputs of the writes in that scope, never on read-back or state values. Protocol 22 added an optional entry-count bound to map attribute types, the same `length` shape that list types use. Providers built for protocol 22 or earlier must rebuild against the current SDK.
 
 The protocol 21 schema envelope requires `assignability_edges`, even when empty, and SDK providers must implement `CarinaProvider::assignability_edges`. Both endpoints must be declared by that provider as scalar String, Int, or Float identities with the same scalar kind. Enum, Reference, and core built-in identities cannot be endpoints; self edges, duplicates, and cycles are rejected. Each provider's transitive closure is retained separately, so paths never combine different providers' declarations.
 

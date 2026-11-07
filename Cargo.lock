@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "carina-cli"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "carina-core"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "argon2",
  "carina-core",
@@ -1127,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "carina-credentials-aws"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "aws-config",
  "aws-credential-types",
@@ -1144,7 +1144,7 @@ dependencies = [
 
 [[package]]
 name = "carina-lsp"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "carina-core",
  "carina-plugin-host",
@@ -1166,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "carina-plugin-bindings-aws"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "carina-plugin-bindings-aws-credentials",
  "wasi 0.14.7+wasi-0.2.4",
@@ -1175,14 +1175,14 @@ dependencies = [
 
 [[package]]
 name = "carina-plugin-bindings-aws-credentials"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "wit-bindgen 0.54.0",
 ]
 
 [[package]]
 name = "carina-plugin-bindings-http"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "wasi 0.14.7+wasi-0.2.4",
  "wit-bindgen 0.54.0",
@@ -1190,14 +1190,14 @@ dependencies = [
 
 [[package]]
 name = "carina-plugin-bindings-provider"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "wit-bindgen 0.54.0",
 ]
 
 [[package]]
 name = "carina-plugin-host"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "argon2",
  "carina-core",
@@ -1237,7 +1237,7 @@ dependencies = [
 
 [[package]]
 name = "carina-plugin-sdk"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "aws-smithy-runtime-api",
  "aws-smithy-types",
@@ -1257,7 +1257,7 @@ dependencies = [
 
 [[package]]
 name = "carina-provider-mock"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "carina-core",
  "carina-plugin-sdk",
@@ -1272,7 +1272,7 @@ dependencies = [
 
 [[package]]
 name = "carina-provider-mock-http"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "aws-smithy-runtime-api",
  "carina-plugin-sdk",
@@ -1292,7 +1292,7 @@ dependencies = [
 
 [[package]]
 name = "carina-provider-resolver"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "base64 0.22.1",
  "carina-core",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "carina-sigstore-tlog"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "base64 0.22.1",
  "p256",
@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "carina-state"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "argon2",
  "async-trait",
@@ -1361,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "carina-tui"
-version = "0.12.0"
+version = "0.12.1"
 dependencies = [
  "carina-core",
  "crossterm",
