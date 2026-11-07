@@ -1250,6 +1250,13 @@ impl StateFile {
         validate_resource_identities(&self.resources)
     }
 
+    /// Decode the stored rows into core's immutable planning source.
+    pub fn planning_rows(&self) -> carina_core::planning_state::PlanningStateRows {
+        let bytes = serde_json::to_vec(self.resources()).expect("typed persisted rows serialize");
+        carina_core::planning_state::PlanningStateRows::from_state_rows_json(&bytes)
+            .expect("typed persisted rows retain their validated addresses and values")
+    }
+
     /// Borrow all managed resource rows.
     ///
     /// Mutation is intentionally routed through the identity-preserving state

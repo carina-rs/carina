@@ -3,15 +3,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::{Orphan, Orphans, restore_current_move_source};
-use carina_core::input_rules::{
-    FinalizedPlan, InputAdmissionFailure, InputCheckedPlan, InputTypeContext,
-};
+use carina_core::input_rules::{InputAdmissionFailure, InputCheckedPlan, InputTypeContext};
 use carina_core::parser::{
     ExpandedBackendConfig as BackendConfig, ExpandedInferredExportParam as InferredExportParam,
     SavedProviderConfigs,
 };
-use carina_core::plan::{AdmittedPlan, Plan};
-type ExecutableSavedPlan = AdmittedPlan<SavedModuleSource>;
+type ExecutableSavedPlan = carina_core::saved_replay::AdmittedSavedPlanReplay;
 use carina_core::provider::{PersistedAttributes, Provider, ProviderRouter, ReadRequest};
 use carina_core::resource::{
     Current, DataSource, NoPlaceholder, ResolvedResourceId, Resource, ResourceId, SavedComposition,
@@ -1072,12 +1069,10 @@ impl DesiredVerifiedPlanFile {
                 }
             }
         }
-        let rehydrated_plan =
-            carina_core::value::rehydrate_plan_historical_secrets_from_verified_states(
-                self.plan_file.plan(),
-                &redacted_states,
-                verified_planned_states,
-            )
+        let rehydrated_plan = self
+            .plan_file
+            .plan()
+            .rehydrate_historical(&redacted_states, verified_planned_states)
             .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
         *self.plan_file.plan_mut() = rehydrated_plan;
 
@@ -1092,7 +1087,7 @@ impl DesiredVerifiedPlanFile {
 ///
 /// This is still not executable: the schema-checked [`DesiredPlanFile`]
 /// transition is the only path that can wrap it in [`ExecutablePlanFile`].
-pub(crate) struct RehydratedPlanFile<P = Plan<SavedModuleSource>> {
+pub(crate) struct RehydratedPlanFile<P = carina_core::saved_replay::SavedPlanReplay> {
     plan_file: ReloadedPlanFile<NoPlaceholder, P>,
     planned_secret_hashes: PlannedSecretHashes,
 }
@@ -1164,7 +1159,8 @@ impl ExecutablePlanFile {
         current: &HashMap<ResourceId, Current>,
         types: &InputTypeContext<SavedModuleSource>,
     ) -> Result<InputCheckedExecutablePlanFile<'_>, InputAdmissionFailure<SavedModuleSource>> {
-        let plan = FinalizedPlan::from_saved_plan(self.plan().clone().into_unadmitted())
+        let plan = self
+            .plan()
             .check_inputs_with_types(schemas, current, types)?;
         Ok(InputCheckedExecutablePlanFile {
             plan_file: self,
@@ -1257,6 +1253,7 @@ mod tests {
     use carina_core::data_source_value::DataSourceValue;
     use carina_core::effect::Effect;
     use carina_core::parser::{ExpandedProviderConfig, ProviderConfig};
+    #[cfg(test)]
     use carina_core::plan::Plan;
     use carina_core::provider::{
         BoxFuture, InitializedProvider, ProviderFactory, ProviderInstanceKey, ProviderResult,

@@ -776,7 +776,8 @@ pub type SnapshotPlan<S = ModuleSource> = Plan<S, SnapshotLeaf>;
 
 /// An immutable plan whose final effects have passed replacement admission.
 /// Transformations operate on its draft view and return a [`Plan`], so their
-/// output must cross [`Plan::admit`] before it can be rendered or executed.
+/// output must cross [`Plan::admit`] before rendering. Execution additionally
+/// requires the core-finalized [`crate::input_rules::InputCheckedPlan`] witness.
 ///
 /// A draft cannot enter the display boundary:
 ///
@@ -877,8 +878,15 @@ pub struct UnresolvedSavedPlan {
     destroy_ordering_notices: Vec<DestroyOrderingNotice>,
 }
 
+#[cfg(any(test, feature = "test-utils"))]
 impl From<SavedPlan> for UnresolvedSavedPlan {
     fn from(plan: SavedPlan) -> Self {
+        Self::from_recorded_snapshot(plan)
+    }
+}
+
+impl UnresolvedSavedPlan {
+    pub(crate) fn from_recorded_snapshot(plan: SavedPlan) -> Self {
         let Plan {
             replacements: _replacements,
             effects,
@@ -913,7 +921,9 @@ pub struct ReplacementIntentEndpoints {
 }
 
 impl UnresolvedSavedPlan {
-    pub fn add(&mut self, effect: UnresolvedSavedEffect) {
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn add_for_test(&mut self, effect: UnresolvedSavedEffect) {
         self.effects.push(effect);
     }
 

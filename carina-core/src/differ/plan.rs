@@ -209,19 +209,19 @@ pub struct PendingCascadePlan {
 
 impl PendingCascadePlan {
     /// Complete the remaining planning steps, then emit the very same deferred
-    /// targets already consulted during CBD promotion. The callback sees only
-    /// the diff plan, preserving the historical ancillary-effect ordering.
+    /// targets already consulted during CBD promotion. The callback receives a
+    /// restricted view for state-derived ancillary edits, in their historical order.
     pub fn finish<'a>(
         self,
         desired_ids: impl IntoIterator<Item = &'a ResolvedResourceId>,
-        complete: impl FnOnce(&mut Plan),
+        complete: impl FnOnce(&mut crate::planning_state::PlanFinalization<'_>),
     ) -> crate::input_rules::FinalizedPlan {
         let Self {
             mut plan,
             deferred,
             registry,
         } = self;
-        complete(&mut plan);
+        complete(&mut crate::planning_state::PlanFinalization { plan: &mut plan });
         add_deferred_create_effects(&mut plan, deferred);
         prepare_plan_replacements(&mut plan, &registry);
         let analysis = plan.dependency_analysis(desired_ids);

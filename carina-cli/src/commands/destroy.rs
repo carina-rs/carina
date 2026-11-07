@@ -1,8 +1,7 @@
 #[cfg(test)]
 use carina_core::config_loader::get_base_dir;
 use carina_core::effect::deps::KeptDestroyTargets;
-use carina_core::resource::{ResolvedDependencies, ResolvedResource};
-use carina_core::wait::ResolvedWaitBinding;
+use carina_core::resource::ResolvedResource;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::num::NonZeroUsize;
@@ -19,18 +18,17 @@ use crate::output_style::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 
 use carina_core::config_loader::load_configuration_with_config;
-use carina_core::effect::deps::DestroyWaitAlias;
+use carina_core::effect::Effect;
 #[cfg(test)]
-use carina_core::effect::deps::{
-    DependencyAnalysis, ScheduleInputs, build_effect_dependency_analysis,
-};
-use carina_core::effect::{Effect, EffectGeneration};
+use carina_core::effect::EffectGeneration;
 use carina_core::executor::{
     DeleteRelease, DeleteScheduleError, DeleteScheduler, EffectFailure, EffectFailureKind,
     ExecutionEvent, ExecutionObserver, FailureEventContext, FailureReport, FailureSink,
     ProgressInfo, classify_stalled_effects as classify_destroy_stall,
 };
-use carina_core::plan::{Plan, PlanError};
+use carina_core::plan::Plan;
+#[cfg(test)]
+use carina_core::plan::PlanError;
 use carina_core::provider::ProviderError;
 #[cfg(test)]
 use carina_core::resource::State;
@@ -742,9 +740,10 @@ async fn run_destroy_locked_owned(
     };
     let (ctx, destroy_graph) = validated.config.context_and_resources();
     let parsed = destroy_graph.configuration();
-    let resolved_wait_bindings = destroy_graph.configuration().wait_bindings.iter()
-        .map(|wait| destroy_graph.resolve_wait_binding(wait))
-        .collect::<Result<Vec<_>, _>>()?;
+    // Preserve wait validation before any migrated-state writeback.
+    for wait in &parsed.wait_bindings {
+        destroy_graph.resolve_wait_binding(wait)?;
+    }
     if let Some(migrated) = validated.migrated_state {
         state_file = Some(migrated);
         if let Some(state) = state_file.as_ref() {
@@ -893,34 +892,27 @@ async fn run_destroy_locked_owned(
         )
         .filter(|id| !destroyed_ids.contains(id))
         .collect();
-    let (delete_effects, identifier_errors) = build_destroy_delete_effects(
-        &resolved_resources_to_destroy,
-        &managed_current,
-        state_file.as_ref(),
-        &protected_row_keys,
-    );
-    if !identifier_errors.is_empty() {
-        let mut error_plan = Plan::new();
-        for error in identifier_errors {
-            error_plan.add_error(error);
+    let rows = state_file.as_ref().map(StateFile::planning_rows).unwrap_or_default();
+    let execution_plan = match carina_core::planning_state::DestroyPlan::from_state(
+        &resources_to_destroy, &managed_current, &rows, destroy_graph,
+        &protected_row_keys, kept_targets, ctx.schemas(),
+    ) {
+        Ok(plan) => plan,
+        Err(carina_core::planning_state::DestroyPlanError::State(errors)) => {
+            let mut error_plan = Plan::new();
+            for error in errors { error_plan.add_error(error); }
+            render_plan_errors_and_abort(color_mode, &error_plan, &base_dir.source_label())?;
+            unreachable!("invalid destroy state has diagnostics")
         }
-        render_plan_errors_and_abort(color_mode, &error_plan, &base_dir.source_label())?;
-    }
-
-    let wait_aliases = build_destroy_wait_aliases(&resolved_wait_bindings, &delete_effects);
-    let mut execution_plan = Plan::new();
-    for effect in &delete_effects {
-        execution_plan.add(effect.clone());
-    }
-    let execution_plan = execution_plan.admit(ctx.schemas())?;
-    let mut delete_scheduler =
-        DeleteScheduler::for_destroy(&execution_plan, &wait_aliases, &kept_targets)
-            .map_err(|error| match error {
-                DeleteScheduleError::Dependencies(error) => {
-                    AppError::from(DestroyDependencyAnalysisError::new(error))
-                }
-                error => AppError::Config(error.to_string()),
-            })?;
+        Err(carina_core::planning_state::DestroyPlanError::Graph(error)) => return Err(error.into()),
+        Err(carina_core::planning_state::DestroyPlanError::Admission(error)) => return Err(error.into()),
+    };
+    let delete_effects = execution_plan.plan().effects();
+    let mut delete_scheduler = DeleteScheduler::for_destroy(&execution_plan)
+        .map_err(|error| match error {
+            DeleteScheduleError::Dependencies(error) => AppError::from(DestroyDependencyAnalysisError::new(error)),
+            error => AppError::Config(error.to_string()),
+        })?;
     let delete_count = delete_effects.len();
     let deletion_deps = delete_scheduler.dependencies();
     let delete_depths = compute_delete_depths(delete_count, deletion_deps);
@@ -1878,145 +1870,15 @@ fn observe_destroy_success_for_tests(
 ) {
 }
 
-fn build_destroy_wait_aliases(
-    wait_bindings: &[ResolvedWaitBinding],
-    delete_effects: &[Effect],
-) -> Vec<DestroyWaitAlias> {
-    let delete_dependencies: Vec<(ResolvedResourceId, ResolvedDependencies)> = delete_effects
-        .iter()
-        .filter_map(|effect| match effect {
-            Effect::Delete {
-                id, dependencies, ..
-            } => Some((id.clone(), dependencies.to_resolved_dependencies())),
-            Effect::Read { .. }
-            | Effect::Create(_)
-            | Effect::ResumeCreate { .. }
-            | Effect::Update { .. }
-            | Effect::Import { .. }
-            | Effect::Remove { .. }
-            | Effect::Move { .. }
-            | Effect::ReleaseListKeys { .. }
-            | Effect::Wait { .. }
-            | Effect::DeferredCreate { .. }
-            | Effect::DeferredReplace(_) => None,
-        })
-        .collect();
-    let destroy_targets: HashSet<&ResolvedResourceId> =
-        delete_dependencies.iter().map(|(id, _)| id).collect();
-    let referenced_bindings: HashSet<&ResolvedResourceId> = delete_dependencies
-        .iter()
-        .flat_map(|(_, dependencies)| dependencies.iter())
-        .collect();
-
-    wait_bindings
-        .iter()
-        .filter(|wait| referenced_bindings.contains(&wait.id))
-        .filter_map(|wait| {
-            if !destroy_targets.contains(wait.target_id.id()) {
-                return None;
-            }
-            let mut consumers = delete_dependencies
-                .iter()
-                .filter(|(_, dependencies)| dependencies.contains(&wait.id))
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            consumers.sort();
-            consumers.dedup();
-
-            DestroyWaitAlias::new(
-                wait.id.clone(),
-                wait.target_id.id().clone(),
-                wait.explicit_dependencies.clone(),
-                consumers,
-            )
-        })
-        .collect()
-}
-
+#[cfg(test)]
 fn build_destroy_delete_effects(
-    resources_to_destroy: &[ResolvedResource],
-    managed_current: &HashMap<ResourceId, Current>,
-    state_file: Option<&StateFile>,
-    protected_row_keys: &HashSet<StateRowKey>,
+    resources: &[ResolvedResource],
+    current: &HashMap<ResourceId, Current>,
+    state: Option<&StateFile>,
+    protected: &HashSet<StateRowKey>,
 ) -> (Vec<Effect>, Vec<PlanError>) {
-    let mut delete_effects = Vec::with_capacity(resources_to_destroy.len());
-    let mut errors = Vec::new();
-    for resource in resources_to_destroy {
-        let identifier = match managed_current.get(&resource.id) {
-            Some(Current::Present(present)) => present.identifier().clone(),
-            Some(Current::Absent(_state)) => {
-                errors.push(PlanError::new(
-                    resource.id.clone(),
-                    carina_core::plan::PlanErrorKind::MissingProviderIdentifier,
-                ));
-                continue;
-            }
-            Some(Current::MissingIdentifier(_state)) => {
-                errors.push(PlanError::new(
-                    resource.id.clone(),
-                    carina_core::plan::PlanErrorKind::MissingProviderIdentifier,
-                ));
-                continue;
-            }
-            Some(Current::CreateInFlight(_pending)) => {
-                errors.push(PlanError::new(
-                    resource.id.clone(),
-                    carina_core::plan::PlanErrorKind::DestroyCreateInFlight,
-                ));
-                continue;
-            }
-            Some(Current::CreateOutcomeUnknown(unknown)) => {
-                errors.push(PlanError::create_outcome_unknown(unknown.id().clone()));
-                continue;
-            }
-            None => {
-                errors.push(PlanError::new(
-                    resource.id.clone(),
-                    carina_core::plan::PlanErrorKind::MissingProviderIdentifier,
-                ));
-                continue;
-            }
-        };
-        let mut dependencies = resource.persisted_value_destroy_dependencies().clone();
-        dependencies.extend_projected(resource.persisted_explicit_destroy_dependencies());
-        let mut explicit_dependencies = resource.explicit_dependencies().clone();
-        if let Some(row) = state_file.and_then(|state| {
-            state.find_resource(
-                resource.id.provider.as_str(),
-                resource.id.resource_type.as_str(),
-                resource.identity_str(),
-            )
-        }) {
-            dependencies.extend_projected(&row.dependency_bindings);
-            dependencies.extend_projected(&row.directives.depends_on);
-            explicit_dependencies.extend(row.directives.depends_on.iter().cloned());
-        }
-        delete_effects.push(Effect::Delete {
-            id: resource.resolved_id(),
-            identifier,
-            generation: EffectGeneration::Current,
-            directives: resource.directives.clone(),
-            binding: resource.binding.clone(),
-            dependencies,
-            explicit_dependencies,
-            blocked_by_updates: ResolvedDependencies::default(),
-        });
-    }
-    if let Some(sf) = state_file {
-        for row in sf.resources() {
-            if protected_row_keys.contains(&state_row_key_from_parts(
-                &row.provider,
-                &row.resource_type,
-                row.identity.as_str(),
-            )) {
-                continue;
-            }
-            let (effects, row_errors) = crate::wiring::deposed_delete_effects_for_row(row, &[]);
-            delete_effects.extend(effects.iter().map(|old| old.to_delete_effect()));
-            errors.extend(row_errors);
-        }
-    }
-    (delete_effects, errors)
+    let rows = state.map(StateFile::planning_rows).unwrap_or_default();
+    carina_core::planning_state::build_destroy_delete_effects(resources, current, &rows, protected)
 }
 
 type StateRowKey = (String, String, String);
@@ -2145,45 +2007,6 @@ fn state_row_key_from_parts(provider: &str, resource_type: &str, identity: &str)
         resource_type.to_string(),
         identity.to_string(),
     )
-}
-
-#[cfg(test)]
-fn transitive_delete_deps(
-    analysis: &DependencyAnalysis,
-    delete_count: usize,
-) -> HashMap<usize, HashSet<usize>> {
-    (0..delete_count)
-        .map(|idx| {
-            let mut deps = HashSet::new();
-            let mut seen = HashSet::new();
-            collect_delete_deps(idx, analysis, delete_count, &mut seen, &mut deps);
-            (idx, deps)
-        })
-        .collect()
-}
-
-#[cfg(test)]
-fn collect_delete_deps(
-    idx: usize,
-    analysis: &DependencyAnalysis,
-    delete_count: usize,
-    seen: &mut HashSet<usize>,
-    deps: &mut HashSet<usize>,
-) {
-    let Some(children) = analysis.deps_of(idx) else {
-        return;
-    };
-
-    for &child in children {
-        if !seen.insert(child) {
-            continue;
-        }
-        if child < delete_count {
-            deps.insert(child);
-        } else {
-            collect_delete_deps(child, analysis, delete_count, seen, deps);
-        }
-    }
 }
 
 fn topological_delete_order(
@@ -2441,7 +2264,7 @@ mod tests {
         }
         let schemas = SchemaRegistry::new();
         let plan = plan.admit(&schemas).unwrap();
-        let mut scheduler = DeleteScheduler::for_destroy(&plan, &[], &Default::default()).unwrap();
+        let mut scheduler = DeleteScheduler::for_test(&plan, &[], &Default::default()).unwrap();
         assert!(scheduler.release(0).is_none(), "parent must wait for child");
         let Some(DeleteRelease::Ready(child_delete)) = scheduler.release(1) else {
             panic!("scheduler must release the leaf first");
@@ -3915,22 +3738,22 @@ mod tests {
             } if dependencies == &crate::test_support::persisted([network_id, parent_id.clone()]) && explicit_dependencies == &std::iter::once(parent_id).collect()
         ));
 
-        let analysis = build_effect_dependency_analysis(
-            &effects,
-            std::iter::empty(),
-            ScheduleInputs::Destroy {
-                aliases: &[],
-                kept_targets: &Default::default(),
-            },
-        )
-        .expect("destroy dependency analysis must resolve");
-        let deletion_deps = transitive_delete_deps(&analysis, effects.len());
-        let depths = compute_delete_depths(effects.len(), &deletion_deps);
+        let mut plan = Plan::new();
+        for effect in &effects {
+            plan.add(effect.clone());
+        }
+        let admitted = plan
+            .admit(&carina_core::schema::SchemaRegistry::new())
+            .unwrap();
+        let scheduler = DeleteScheduler::for_test(&admitted, &[], &Default::default())
+            .expect("destroy dependency analysis must resolve");
+        let deletion_deps = scheduler.dependencies();
+        let depths = compute_delete_depths(effects.len(), deletion_deps);
         let names = effects
             .iter()
             .map(|effect| effect.binding_address().unwrap().to_string())
             .collect::<Vec<_>>();
-        let order = topological_delete_order(effects.len(), &deletion_deps, &depths, &names)
+        let order = topological_delete_order(effects.len(), deletion_deps, &depths, &names)
             .expect("orphan dependency graph must be acyclic");
         assert_eq!(
             order

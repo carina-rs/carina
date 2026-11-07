@@ -1,27 +1,7 @@
-//! Test fixtures use the real differ-owned finalization boundary, including
-//! ancillary effects installed by the finalization callback.
+//! Hand-built execution fixtures use the explicitly gated core test API.
 
 pub fn finalize(plan: carina_core::plan::Plan) -> carina_core::input_rules::FinalizedPlan {
-    use carina_core::{differ::*, provider::*, resource::*};
-    use std::collections::{HashMap, HashSet};
-    let schemas = fixture_schemas(&plan);
-    let desired = plan_input_desired_resources(&[], &schemas);
-    create_plan_with_cascades(
-        &desired,
-        CascadeDependents::new(&[], ResolvedDeferredCreateTargets::default()),
-        &[],
-        &ProviderRouter::new(),
-        PlanPriorStates::new(&HashMap::new(), &Orphans::new()),
-        &HashMap::new(),
-        &schemas,
-        &RawSavedAttrs::default().lift(&schemas),
-        &HashMap::new(),
-        &[],
-        &HashSet::new(),
-        &carina_core::references::prepare_empty_for_tests(),
-    )
-    .unwrap()
-    .finish(std::iter::empty(), |final_plan| *final_plan = plan)
+    carina_core::input_rules::finalize_plan_for_test(plan)
 }
 
 pub fn checked(plan: carina_core::plan::Plan) -> carina_core::input_rules::InputCheckedPlan {

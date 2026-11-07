@@ -74,6 +74,10 @@ pub enum ExpandedGraphResolutionError {
         evaluated: Box<ResourceId>,
         authored: Box<ResourceId>,
     },
+    #[error("bootstrap resource {id} is absent from the parsed configuration")]
+    MissingBootstrapResource { id: Box<ResourceId> },
+    #[error("{0}")]
+    BackendResource(String),
     #[error(transparent)]
     Resource(#[from] crate::resource::ResolvedResourceError),
 }
@@ -310,6 +314,51 @@ pub struct AdmittedInitialDeletePlan {
 }
 
 impl ResolvedInitialDeletePlan {
+    /// Derive the implicit bucket's target and identifier from the backend configuration.
+    /// Provider and resource type describe the backend implementation, not a physical target.
+    pub fn from_backend_configuration(
+        configuration: &crate::parser::ExpandedInferredFile,
+        provider: &str,
+        resource_type: &str,
+        schemas: &SchemaRegistry,
+    ) -> Result<Self, ExpandedGraphResolutionError> {
+        let name = configuration
+            .backend
+            .as_ref()
+            .and_then(|backend| backend.attributes.get("bucket"))
+            .and_then(|value| match value {
+                Value::Concrete(ConcreteValue::String(name)) => Some(name.expose_plaintext()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                ExpandedGraphResolutionError::BackendResource(
+                    "Backend has no resolved bucket name".to_owned(),
+                )
+            })?;
+        let identifier = crate::provider::AppliedIdentifier::new(name)
+            .map_err(|error| ExpandedGraphResolutionError::BackendResource(error.to_string()))?;
+        let identity = ResourceIdentity::try_from(name.to_owned())
+            .map_err(|error| ExpandedGraphResolutionError::BackendResource(error.to_string()))?;
+        let resource = Resource::from_id(ResourceId::with_provider_identity(
+            provider,
+            resource_type,
+            identity,
+            None,
+        ));
+        if schemas
+            .get(provider, resource_type, crate::schema::SchemaKind::Resource)
+            .is_none()
+        {
+            return Err(ExpandedGraphResolutionError::BackendResource(format!(
+                "No managed resource schema registered for state bucket type '{provider}.{resource_type}'"
+            )));
+        }
+        let mut bucket_configuration = crate::parser::ExpandedInferredFile::default();
+        bucket_configuration.resources.push(resource.clone());
+        let graph = resolve_expanded_graph(bucket_configuration.into())?;
+        graph.initial_delete_plan(resource, identifier, schemas)
+    }
+
     pub fn admit(
         self,
         schemas: &SchemaRegistry,
@@ -322,6 +371,24 @@ impl ResolvedInitialDeletePlan {
 }
 
 impl ResolvedInitialCreatePlan {
+    /// Select the bootstrap target from the parsed configuration and retain its own graph.
+    pub fn from_configuration(
+        configuration: crate::parser::ExpandedInferredFile,
+        id: &ResourceId,
+        schemas: &SchemaRegistry,
+    ) -> Result<Self, ExpandedGraphResolutionError> {
+        let resource = configuration
+            .resources
+            .iter()
+            .find(|resource| &resource.id == id)
+            .cloned()
+            .ok_or_else(|| ExpandedGraphResolutionError::MissingBootstrapResource {
+                id: Box::new(id.clone()),
+            })?;
+        let graph = resolve_expanded_graph(configuration.into())?;
+        graph.initial_create_plan(resource, schemas)
+    }
+
     /// Admit the resolved effects and retain their input obligations together
     /// with the graph that will judge readiness at dispatch.
     pub fn check_inputs_with_types(
@@ -506,8 +573,18 @@ fn rewrite_handle_output_refs<P: PlaceholderKind>(
 }
 
 impl ExpandedBindingIndex {
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn initial_create_plan_for_test(
+        &self,
+        resource: Resource,
+        schemas: &SchemaRegistry,
+    ) -> Result<ResolvedInitialCreatePlan, ExpandedGraphResolutionError> {
+        self.initial_create_plan(resource, schemas)
+    }
+
     /// Resolve a standalone delete and retain this graph through dispatch.
-    pub fn initial_delete_plan(
+    pub(crate) fn initial_delete_plan(
         &self,
         resource: Resource,
         identifier: crate::provider::AppliedIdentifier,
@@ -536,7 +613,7 @@ impl ExpandedBindingIndex {
     /// Resolve and finalize one bootstrap create, retaining this exact graph
     /// for the executor's dependency-ready release. No resolved plan can be
     /// attached by the caller after this transition.
-    pub fn initial_create_plan(
+    pub(crate) fn initial_create_plan(
         &self,
         resource: Resource,
         schemas: &SchemaRegistry,

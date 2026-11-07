@@ -12424,7 +12424,7 @@ async fn round2_bootstrap_rejects_unknown_dependency_before_dispatch() {
     )
     .unwrap();
     let checked = graph
-        .initial_create_plan(resource, &schemas)
+        .initial_create_plan_for_test(resource, &schemas)
         .expect("authored dependency resolves before scheduler readiness")
         .check_inputs_with_types(
             &schemas,
@@ -12459,6 +12459,61 @@ async fn round2_bootstrap_rejects_unknown_dependency_before_dispatch() {
     assert!(
         matches!(&result, Err(AppError::StateBucketPreparation(error)) if matches!(error.preparation_error(), carina_core::executor::ProviderPreparationError::InitialCreateNotReady)),
         "bootstrap must reject an unresolved scheduler dependency: {result:?}"
+    );
+    assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
+    assert!(backend.read_state().await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn bootstrap_rejects_unknown_authored_binding_through_real_entrypoint() {
+    let provider = BootstrapRecordingProvider {
+        create_calls: AtomicUsize::new(0),
+        behavior: BootstrapCreateBehavior::Success,
+    };
+    let mut resource = Resource::with_provider("aws", "s3.Bucket", "state", None).with_attribute(
+        "bucket",
+        Value::Concrete(ConcreteValue::String("state-bucket".into())),
+    );
+    resource
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("missing"));
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        PatternResourceSchema::new("s3.Bucket")
+            .attribute(
+                PatternAttributeSchema::optional("bucket", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let (_temp, backend) = bootstrap_test_backend();
+    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+    parsed.resources.push(resource.clone()); // allow: direct — fixture test inspection
+    let configs = empty_resolved_provider_configs();
+    let error = create_checked_bootstrap_resource_for_test(
+        crate::output_style::ColorMode::Plain,
+        &provider,
+        resource,
+        BootstrapCreateContext {
+            provider_context: &carina_core::parser::LoadedProviderContext::empty_for_test(),
+            backend: backend.as_ref(),
+            parsed: &parsed,
+            provider_configs: &configs,
+            normalizer: &NoopNormalizer,
+            factories: &[],
+            schemas: &schemas,
+        },
+    )
+    .await
+    .expect_err("unknown authored binding must fail before dispatch");
+    assert!(
+        matches!(&error,
+            AppError::ExpandedGraphResolution(error)
+            if matches!(error.as_ref(), carina_core::resolved_graph::ExpandedGraphResolutionError::MissingDependency { reference, .. } if reference == "missing")
+        ),
+        "expected missing dependency, got {error:?}"
     );
     assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
     assert!(backend.read_state().await.unwrap().is_none());

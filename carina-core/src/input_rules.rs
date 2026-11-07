@@ -567,11 +567,18 @@ impl<S> Deref for FinalizedPlan<S> {
     }
 }
 
+/// Explicit fixture-only bridge from a hand-built plan into execution admission.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub fn finalize_plan_for_test<S>(plan: Plan<S>) -> FinalizedPlan<S> {
+    FinalizedPlan::new(plan)
+}
+
 impl FinalizedPlan<crate::resource::SavedModuleSource> {
     /// Seal the saved effects after the caller has verified and rehydrated
     /// them. This performs no diff or effect rewrite and grants no execution
     /// authority until the ordinary input-admission transition succeeds.
-    pub fn from_saved_plan(plan: Plan<crate::resource::SavedModuleSource>) -> Self {
+    pub(crate) fn from_saved_plan(plan: Plan<crate::resource::SavedModuleSource>) -> Self {
         Self::new(plan)
     }
 }
@@ -1113,9 +1120,10 @@ impl<S> InputCheckedPlan<S> {
     }
 }
 
+#[cfg(test)]
 impl<S: Clone> crate::plan::AdmittedPlan<S> {
     /// Check the admitted, prepared effects and retain both witnesses for execution.
-    pub fn check_inputs(
+    pub(crate) fn check_inputs(
         self,
         schemas: &SchemaRegistry,
         current: &HashMap<ResourceId, Current>,
@@ -1124,7 +1132,7 @@ impl<S: Clone> crate::plan::AdmittedPlan<S> {
     }
 
     /// Finalize the admitted effects and check them against retained declarations.
-    pub fn check_inputs_with_types(
+    pub(crate) fn check_inputs_with_types(
         self,
         schemas: &SchemaRegistry,
         current: &HashMap<ResourceId, Current>,

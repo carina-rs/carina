@@ -225,25 +225,23 @@ struct BootstrapCreateContext<'a> {
 
 async fn prepare_bootstrap_creation(
     color_mode: crate::output_style::ColorMode,
-    resource: Resource,
+    resource_id: &ResourceId,
     context: &BootstrapCreateContext<'_>,
     session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<carina_core::replacement::CreatePermit, AppError> {
-    let graph = carina_core::resolved_graph::resolve_expanded_graph(context.parsed.clone().into())?;
-    let bootstrap_plan = graph.initial_create_plan(resource.clone(), context.schemas)?;
-    let mut input_sources = context
+    let bootstrap_plan =
+        carina_core::resolved_graph::ResolvedInitialCreatePlan::from_configuration(
+            context.parsed.clone(),
+            resource_id,
+            context.schemas,
+        )?;
+    let input_sources = context
         .parsed
         .resources
         .iter()
         .cloned()
         .map(UnresolvedResource::from_pre_resolve)
         .collect::<Vec<_>>();
-    if !input_sources
-        .iter()
-        .any(|source| source.as_resource().id == resource.id)
-    {
-        input_sources.push(UnresolvedResource::from_pre_resolve(resource.clone()));
-    }
     let wait_aliases = context
         .parsed
         .wait_bindings
@@ -257,7 +255,7 @@ async fn prepare_bootstrap_creation(
         &wait_aliases,
         context.provider_configs.as_provider_configs(),
         context.schemas,
-        [&resource.id],
+        [resource_id],
     )?;
     let checked = match bootstrap_plan.check_inputs_with_types(context.schemas, &input_types) {
         Ok(checked) => checked,
@@ -319,7 +317,7 @@ async fn create_checked_bootstrap_resource(
             async |session| {
                 let id = resource.id.clone();
                 let prepared =
-                    prepare_bootstrap_creation(color_mode, resource, &context, session).await?;
+                    prepare_bootstrap_creation(color_mode, &id, &context, session).await?;
                 let request = prepared.request();
                 let BootstrapCreateContext {
                     provider_context: _provider_context,
@@ -470,6 +468,14 @@ async fn create_checked_bootstrap_resource_for_test(
         factories,
         schemas: _schemas,
     } = context;
+    let mut parsed = parsed.clone();
+    if !parsed
+        .resources
+        .iter()
+        .any(|source| source.id == resource.id)
+    {
+        parsed.resources.push(resource.clone()); // allow: direct — fixture test inspection
+    }
     create_checked_bootstrap_resource(
         color_mode,
         operation_provider,
@@ -478,7 +484,7 @@ async fn create_checked_bootstrap_resource_for_test(
         BootstrapCreateContext {
             provider_context,
             backend,
-            parsed,
+            parsed: &parsed,
             provider_configs,
             normalizer,
             factories,
@@ -3366,14 +3372,15 @@ fn rehydrate_desired_plan_file_from_parts(
                 let import_identifiers =
                     import_identifiers_from_current_config(plan_file.plan(), parsed, session)?;
 
-                let rehydrated_plan = carina_core::value::rehydrate_plan_desired_secrets(
-                    plan_file.plan(),
-                    &resource_candidates,
-                    &data_source_candidates,
-                    &import_identifiers,
-                    parsed.deferred_for_expressions(),
-                )
-                .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
+                let rehydrated_plan = plan_file
+                    .plan()
+                    .rehydrate_desired(
+                        &resource_candidates,
+                        &data_source_candidates,
+                        &import_identifiers,
+                        parsed.deferred_for_expressions(),
+                    )
+                    .map_err(|error| saved_plan_secret_rehydration_error(error, apply_target))?;
 
                 let sorted_resources = rehydrate_saved_resource_like(
                     plan_file.sorted_resources(),

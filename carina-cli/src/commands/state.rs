@@ -1583,22 +1583,25 @@ async fn run_state_bucket_delete(
     // Delete the bucket resource (identifier is the bucket name)
     // Backend bucket is provider-default; named-instance routing is
     // a DSL concern that doesn't apply to the implicit state bucket.
-    let bucket_identity = ResourceIdentity::try_from(bucket_name.to_string()).map_err(|error| {
+    ResourceIdentity::try_from(bucket_name.to_string()).map_err(|error| {
         AppError::InvalidStateBucketIdentity {
             bucket_name: bucket_name.to_string(),
             error,
         }
     })?;
-    let bucket_identifier = AppliedIdentifier::new(bucket_name).map_err(|error| {
+    AppliedIdentifier::new(bucket_name).map_err(|error| {
         AppError::InvalidStateBucketProviderIdentifier {
             bucket_name: bucket_name.to_string(),
             error,
         }
     })?;
-    let bucket_id =
-        ResourceId::with_provider_identity(provider_name, resource_type, bucket_identity, None);
     let schemas = validated_config.context().schemas();
-    let permit = state_bucket_delete_permit(schemas, &bucket_id, bucket_identifier)?;
+    let permit = state_bucket_delete_permit(
+        schemas,
+        validated_config.resources(),
+        provider_name,
+        resource_type,
+    )?;
     match carina_core::executor::dispatch_delete(bucket_provider.provider(), permit, schemas).await
     {
         Ok(()) => {
@@ -1616,45 +1619,21 @@ async fn run_state_bucket_delete(
 
 fn state_bucket_delete_permit(
     schemas: &carina_core::schema::SchemaRegistry,
-    resource_id: &ResourceId,
-    identifier: AppliedIdentifier,
+    configuration: &carina_core::parser::ExpandedInferredFile,
+    provider: &str,
+    resource_type: &str,
 ) -> Result<carina_core::executor::DeletePermit, AppError> {
-    // Require the managed bucket schema, preserving the request's directive
-    // resolution and the existing missing-schema diagnostic.
-    state_bucket_delete_request(schemas, resource_id)?;
-    let resource = carina_core::resource::Resource::from_id(resource_id.clone());
-    let mut parsed = carina_core::parser::ExpandedInferredFile::default();
-    parsed.resources.push(resource.clone()); // allow: direct — topology (dependency sort), implicit bucket's own graph
-    let graph = carina_core::resolved_graph::resolve_expanded_graph(parsed.into())?;
-    let admitted = graph
-        .initial_delete_plan(resource, identifier, schemas)?
+    let admitted =
+        carina_core::resolved_graph::ResolvedInitialDeletePlan::from_backend_configuration(
+            configuration,
+            provider,
+            resource_type,
+            schemas,
+        )?
         .admit(schemas)?;
     carina_core::executor::prepare_initial_delete(&admitted).ok_or_else(|| {
         AppError::Config("State bucket delete is not ready for scheduler dispatch".to_owned())
     })
-}
-
-fn state_bucket_delete_request(
-    schemas: &carina_core::schema::SchemaRegistry,
-    resource_id: &ResourceId,
-) -> Result<carina_core::provider::DeleteRequest, AppError> {
-    let directives = carina_core::resource::Directives::default();
-    let resolved = schemas
-        .try_resolve_directives(
-            resource_id,
-            carina_core::schema::SchemaKind::Resource,
-            &directives,
-        )
-        .ok_or_else(|| {
-            AppError::Config(format!(
-                "No managed resource schema registered for state bucket type \
-                 '{}.{}'",
-                resource_id.provider, resource_id.resource_type
-            ))
-        })?;
-    Ok(carina_core::provider::DeleteRequest::from_resolved(
-        resolved,
-    ))
 }
 
 async fn load_state_bucket_delete_provider_inputs<E>(
@@ -3642,8 +3621,93 @@ mod tests {
         );
     }
 
-    #[test]
-    fn state_bucket_delete_request_resolves_the_bucket_schema() {
+    fn bucket_delete_configuration(name: &str) -> carina_core::parser::ExpandedInferredFile {
+        let mut parsed = carina_core::parser::ExpandedInferredFile::default();
+        parsed.backend = Some(carina_core::parser::ExpandedBackendConfig {
+            backend_type: "s3".into(),
+            attributes: HashMap::from([(
+                "bucket".into(),
+                Value::Concrete(ConcreteValue::String(name.into())),
+            )]),
+            attribute_spans: HashMap::new(),
+        });
+        parsed
+    }
+
+    #[derive(Default)]
+    struct BucketDeleteRecorder {
+        request: std::sync::Mutex<Option<carina_core::provider::DeleteRequest>>,
+    }
+    impl Provider for BucketDeleteRecorder {
+        fn name(&self) -> &str {
+            "bucket-delete-recorder"
+        }
+        fn read(
+            &self,
+            _: &ResourceId,
+            _: &AppliedIdentifier,
+            _: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::ReadOutcome>> {
+            unreachable!()
+        }
+        fn read_data_source(
+            &self,
+            _: &carina_core::provider::ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            unreachable!()
+        }
+        fn create(
+            &self,
+            _: &ResourceId,
+            _: CreateRequest,
+            _: carina_core::provider::CreateAttempt,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::CreateOutcome, carina_core::provider::CreateFailure>,
+        > {
+            unreachable!()
+        }
+        fn resume_create(
+            &self,
+            _: carina_core::provider::ResumeCreateRequest,
+        ) -> BoxFuture<
+            '_,
+            Result<carina_core::provider::ResumeOutcome, carina_core::provider::ResumeFailure>,
+        > {
+            unreachable!()
+        }
+        fn update(
+            &self,
+            _: &ResourceId,
+            _: &AppliedIdentifier,
+            _: UpdateRequest,
+            _: carina_core::provider::UpdateAttempt,
+        ) -> BoxFuture<'_, ProviderResult<carina_core::provider::UpdateOutcome>> {
+            unreachable!()
+        }
+        fn required_permissions(
+            &self,
+            _: &ResourceId,
+            _: carina_core::effect::PlanOp,
+        ) -> ProviderResult<Vec<String>> {
+            Ok(Vec::new())
+        }
+        fn delete(
+            &self,
+            attempt: carina_core::provider::DeleteAttempt,
+        ) -> BoxFuture<'_, ProviderResult<()>> {
+            assert_eq!(attempt.id().identity_str(), Some("state"));
+            assert_eq!(attempt.identifier().as_str(), "state");
+            *self.request.lock().unwrap() = Some(attempt.request().clone());
+            Box::pin(async move {
+                drop(attempt);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn state_bucket_delete_request_resolves_the_bucket_schema() {
         let mut schemas = SchemaRegistry::new();
         schemas.insert(
             "aws",
@@ -3653,9 +3717,23 @@ mod tests {
                 .expect("bucket schema must validate"),
         );
 
-        let id = ResourceId::with_provider_identity("aws", "s3.Bucket", "state", None);
-        let request = state_bucket_delete_request(&schemas, &id)
-            .expect("the registered bucket schema must resolve");
+        let provider = BucketDeleteRecorder::default();
+        let permit = state_bucket_delete_permit(
+            &schemas,
+            &bucket_delete_configuration("state"),
+            "aws",
+            "s3.Bucket",
+        )
+        .expect("the registered bucket schema must resolve");
+        carina_core::executor::dispatch_delete(&provider, permit, &schemas)
+            .await
+            .unwrap();
+        let request = provider
+            .request
+            .lock()
+            .unwrap()
+            .take()
+            .expect("provider received delete");
 
         assert!(request.directives().prevent_destroy());
     }
@@ -3681,9 +3759,13 @@ mod tests {
         .create_provider();
         let mut schemas = SchemaRegistry::new();
         schemas.insert("mock", ResourceSchema::new("s3.Bucket").validate().unwrap());
-        let id = ResourceId::with_provider_identity("mock", "s3.Bucket", "state", None);
-        let identifier = AppliedIdentifier::new("bucket-provider-id").unwrap();
-        let permit = state_bucket_delete_permit(&schemas, &id, identifier).unwrap();
+        let permit = state_bucket_delete_permit(
+            &schemas,
+            &bucket_delete_configuration("state"),
+            "mock",
+            "s3.Bucket",
+        )
+        .unwrap();
         carina_core::executor::dispatch_delete(&provider, permit, &schemas)
             .await
             .unwrap();

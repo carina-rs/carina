@@ -610,7 +610,7 @@ fn delete_schedule_chain() -> crate::plan::AdmittedPlan {
 async fn scheduler_delete_retry_keeps_ancestors_blocked() {
     let schemas = crate::schema::SchemaRegistry::new();
     let plan = delete_schedule_chain();
-    let mut scheduler = DeleteScheduler::for_destroy(&plan, &[], &Default::default()).unwrap();
+    let mut scheduler = DeleteScheduler::for_test(&plan, &[], &Default::default()).unwrap();
     let provider = MockProvider::new();
     provider.push_delete(Err(ProviderError::api_error("DependencyViolation")));
     for _ in 0..3 {
@@ -651,7 +651,7 @@ async fn scheduler_delete_retry_keeps_ancestors_blocked() {
 async fn scheduler_delete_failure_skips_ancestors_without_dispatch() {
     let schemas = crate::schema::SchemaRegistry::new();
     let plan = delete_schedule_chain();
-    let mut scheduler = DeleteScheduler::for_destroy(&plan, &[], &Default::default()).unwrap();
+    let mut scheduler = DeleteScheduler::for_test(&plan, &[], &Default::default()).unwrap();
     let provider = MockProvider::new();
     provider.push_delete(Err(ProviderError::api_error("delete failed")));
     let Some(DeleteRelease::Ready(delete)) = scheduler.release(0) else {
@@ -705,7 +705,7 @@ fn delete_scheduler_rejects_non_delete_effects() {
     });
     let plan = plan.admit(&crate::schema::SchemaRegistry::new()).unwrap();
     assert!(matches!(
-        DeleteScheduler::for_destroy(&plan, &[], &Default::default()),
+        DeleteScheduler::for_test(&plan, &[], &Default::default()),
         Err(DeleteScheduleError::NonDelete { index: 0 })
     ));
 }

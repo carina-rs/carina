@@ -42,7 +42,7 @@ pub enum DeleteScheduleError {
     Dependencies(#[from] DependencyAnalysisFailure),
 }
 
-/// Stateful readiness for an admitted delete-only plan. Completion and retry
+/// Stateful readiness for a core-built destroy plan. Completion and retry
 /// require a receipt returned by a finished provider call; caller-chosen index
 /// sets cannot release dependencies.
 pub struct DeleteScheduler<'plan, S = ModuleSource> {
@@ -96,6 +96,23 @@ impl ScheduledDelete {
 
 impl<'plan, S: Clone> DeleteScheduler<'plan, S> {
     pub fn for_destroy(
+        plan: &'plan crate::planning_state::DestroyPlan<S>,
+    ) -> Result<Self, DeleteScheduleError> {
+        Self::from_admitted(&plan.admitted, &plan.aliases, &plan.kept_targets)
+    }
+
+    /// Fixture-only scheduling of hand-built effects.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn for_test(
+        plan: &'plan AdmittedPlan<S>,
+        aliases: &[DestroyWaitAlias],
+        kept_targets: &KeptDestroyTargets,
+    ) -> Result<Self, DeleteScheduleError> {
+        Self::from_admitted(plan, aliases, kept_targets)
+    }
+
+    pub(crate) fn from_admitted(
         plan: &'plan AdmittedPlan<S>,
         aliases: &[DestroyWaitAlias],
         kept_targets: &KeptDestroyTargets,
@@ -310,7 +327,7 @@ pub fn delete_permit_for_test(
     let plan = plan
         .admit(&SchemaRegistry::new())
         .expect("fixture delete admission");
-    let mut scheduler = DeleteScheduler::for_destroy(&plan, &[], &Default::default())
+    let mut scheduler = DeleteScheduler::from_admitted(&plan, &[], &Default::default())
         .expect("fixture delete schedule");
     let Some(DeleteRelease::Ready(delete)) = scheduler.release(0) else {
         unreachable!("fixture ready delete")
