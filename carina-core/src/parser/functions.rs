@@ -607,7 +607,7 @@ pub fn custom_type_lookup_for_factory(
     Lookup(factory)
 }
 
-fn custom_type_canonicalization_error(
+pub(crate) fn custom_type_canonicalization_error(
     owner: &str,
     declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
     error: crate::schema::TypeError,

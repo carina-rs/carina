@@ -1301,6 +1301,10 @@ impl ProviderCustomTypes {
         }
     }
 
+    pub(crate) fn same_snapshot(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.state, &other.state)
+    }
+
     pub fn is_loaded(&self) -> bool {
         matches!(
             self.state.as_ref(),

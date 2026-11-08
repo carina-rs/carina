@@ -236,13 +236,13 @@ use crate::value::{
     CanonicalState, CanonicalizationPurpose, DesiredValueSource, RenderedValue, render_value,
 };
 
-mod assignability;
+pub(crate) mod assignability;
 mod assignability_edges;
 mod fingerprint;
 mod resolved_attr_type;
 mod resolved_union_members;
 mod type_identity;
-mod value_validation;
+pub(crate) mod value_validation;
 pub use value_validation::{
     LocallyValidatedCustomType, ResourceValueValidation, ValidatedCustomTypeLookup, ValueStructure,
     ValueValidationFindings,
@@ -2397,14 +2397,24 @@ impl fmt::Display for FieldPathStep {
 /// a particular [`TypeError`]. Used by [`AttrTypeKind::validate_collect`]
 /// so the LSP can map errors back to source positions without
 /// re-running validation itself (#2214).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default)]
 pub struct FieldPath {
     steps: Vec<FieldPathStep>,
+    canonical: Vec<LeafPathSegment>,
 }
+impl PartialEq for FieldPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.steps == other.steps
+    }
+}
+impl Eq for FieldPath {}
 
 impl FieldPath {
     pub fn new() -> Self {
-        Self { steps: Vec::new() }
+        Self {
+            steps: Vec::new(),
+            canonical: Vec::new(),
+        }
     }
 
     pub fn steps(&self) -> &[FieldPathStep] {
@@ -2420,7 +2430,9 @@ impl FieldPath {
     /// < 5).
     pub fn push_field(&self, name: impl Into<String>) -> Self {
         let mut next = self.clone();
-        next.steps.push(FieldPathStep::Field(name.into()));
+        let name = name.into();
+        next.steps.push(FieldPathStep::Field(name.clone()));
+        next.canonical.push(LeafPathSegment::StructField(name));
         next
     }
 
@@ -2428,21 +2440,39 @@ impl FieldPath {
     pub fn push_index(&self, index: usize) -> Self {
         let mut next = self.clone();
         next.steps.push(FieldPathStep::Index(index));
+        next.canonical.push(LeafPathSegment::ListIndex(index));
+        next
+    }
+
+    pub(crate) fn canonical(&self) -> LeafPath {
+        LeafPath::from_segments(self.canonical.iter().cloned())
+    }
+
+    pub(crate) fn push_map_key(&self, key: impl Into<String>) -> Self {
+        let key = key.into();
+        let mut next = self.clone();
+        next.steps.push(FieldPathStep::Field(key.clone()));
+        next.canonical.push(LeafPathSegment::MapKey(key.into()));
         next
     }
 
     fn prepend_field(&self, name: impl Into<String>) -> Self {
+        let name = name.into();
+        let mut canonical = vec![LeafPathSegment::StructField(name.clone())];
+        canonical.extend(self.canonical.iter().cloned());
         let mut steps = Vec::with_capacity(self.steps.len() + 1);
-        steps.push(FieldPathStep::Field(name.into()));
+        steps.push(FieldPathStep::Field(name));
         steps.extend(self.steps.iter().cloned());
-        Self { steps }
+        Self { steps, canonical }
     }
 
     fn prepend_index(&self, index: usize) -> Self {
+        let mut canonical = vec![LeafPathSegment::ListIndex(index)];
+        canonical.extend(self.canonical.iter().cloned());
         let mut steps = Vec::with_capacity(self.steps.len() + 1);
         steps.push(FieldPathStep::Index(index));
         steps.extend(self.steps.iter().cloned());
-        Self { steps }
+        Self { steps, canonical }
     }
 }
 
@@ -7327,6 +7357,7 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
         | TypeError::StringLiteralExpectedEnum { .. }
         | TypeError::ValidationFailed { .. }
         | TypeError::Knowledge { .. }
+        | TypeError::Reference { .. }
         | TypeError::CustomTypeValidation { .. }
         | TypeError::ResourceValidationFailed { .. }
         | TypeError::MissingRequired { .. }
@@ -7477,6 +7508,16 @@ pub enum TypeError {
     #[error("{}: {error}", if attribute.is_some() { "Resource validation failed" } else { "Validation failed" })]
     Knowledge {
         error: Box<crate::resource::knowledge::KnowledgeDiagnostic>,
+        attribute: Option<String>,
+    },
+
+    #[error("{error}")]
+    Reference {
+        error: Box<
+            crate::resource::SecretDiagnosticError<
+                crate::validation::admission::AdmissionReferenceError,
+            >,
+        >,
         attribute: Option<String>,
     },
 
@@ -7785,7 +7826,7 @@ impl TypeError {
             }
             // Knowledge failures retain typed terminal metadata; their Display
             // already includes the complete diagnostic, without a logical child.
-            Self::Knowledge { .. } => ValidationDiagnostic::Plain(self),
+            Self::Knowledge { .. } | Self::Reference { .. } => ValidationDiagnostic::Plain(self),
             Self::TypeMismatch { .. }
             | Self::BindingShadowsEnumMember(_)
             | Self::InvalidEnumVariant { .. }
@@ -7818,7 +7859,8 @@ impl TypeError {
             }
             | TypeError::StringLiteralExpectedEnum { attribute, .. }
             | TypeError::ResourceValidationFailed { attribute, .. }
-            | TypeError::Knowledge { attribute, .. } => attribute.as_deref(),
+            | TypeError::Knowledge { attribute, .. }
+            | TypeError::Reference { attribute, .. } => attribute.as_deref(),
             TypeError::ReadOnlyAttribute { name }
             | TypeError::UnknownAttribute { name, .. }
             | TypeError::BlockSyntaxNotAllowed { attribute: name } => Some(name),
@@ -7876,6 +7918,13 @@ impl TypeError {
                 error,
                 attribute: existing,
             } => TypeError::Knowledge {
+                error,
+                attribute: existing.or(Some(attribute)),
+            },
+            TypeError::Reference {
+                error,
+                attribute: existing,
+            } => TypeError::Reference {
                 error,
                 attribute: existing.or(Some(attribute)),
             },
@@ -9620,6 +9669,7 @@ impl<'a> EffectiveSchemaNode<'a> {
 /// A resource schema that has passed every whole-schema rule.
 #[derive(Debug, Clone)]
 pub struct ValidatedResourceSchema {
+    pub(crate) admission_identity: crate::validation::admission::DeclarationId,
     schema: PatternResourceSchema<Compiled>,
     identity_paths: Vec<IdentityPath>,
 }
@@ -14692,6 +14742,7 @@ impl std::ops::Deref for OwnerBoundResourceSchema<'_> {
 /// See `notes/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-2).
 #[derive(Debug, Clone, Default)]
 pub struct SchemaRegistry {
+    pub(crate) unavailable_admission_identity: crate::validation::admission::DeclarationId,
     managed: HashMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
     data_sources: HashMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
     reference_forms: BTreeMap<String, ReferenceForms>,
@@ -14824,6 +14875,7 @@ impl SchemaRegistry {
     /// be identical; fixture-only insertions carry no competing declarations.
     pub fn extend(&mut self, other: SchemaRegistry) -> Result<(), SchemaRegistryError> {
         let SchemaRegistry {
+            unavailable_admission_identity: _,
             managed,
             data_sources,
             reference_forms,
@@ -15170,6 +15222,7 @@ fn finish_resource_schema_validation(
         Some(mut schema) if issues.is_empty() => {
             schema.duplicate_attributes.clear();
             Ok(ValidatedResourceSchema {
+                admission_identity: Default::default(),
                 schema,
                 identity_paths,
             })
@@ -15721,9 +15774,22 @@ pub(crate) fn assignment_catalog_without_edges_for_test()
     &CATALOG
 }
 
+impl crate::resource::InsideSecret for LeafPath {
+    fn inside_secret(self) -> Self {
+        Self::from_segments(self.0.into_iter().map(|segment| match segment {
+            LeafPathSegment::StructField(_) => {
+                LeafPathSegment::StructField(SECRET_VALUE_MASK.to_owned())
+            }
+            LeafPathSegment::MapKey(_) => LeafPathSegment::MapKey(SECRET_VALUE_MASK.into()),
+            LeafPathSegment::ListIndex(index) => LeafPathSegment::ListIndex(index),
+        }))
+    }
+}
+
 impl crate::resource::InsideSecret for FieldPath {
     fn inside_secret(self) -> Self {
         Self {
+            canonical: LeafPath::from_segments(self.canonical).inside_secret().0,
             steps: self
                 .steps
                 .into_iter()
@@ -15801,6 +15867,10 @@ impl crate::resource::InsideSecret for TypeError {
                 type_name,
                 expected,
                 extra_message: extra_message.map(ProviderValidation::inside_secret),
+            },
+            TypeError::Reference { error, attribute } => TypeError::Reference {
+                error: Box::new((*error).inside_secret()),
+                attribute,
             },
             TypeError::Knowledge { error, attribute } => TypeError::Knowledge {
                 error: Box::new((*error).inside_secret()),

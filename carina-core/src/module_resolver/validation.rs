@@ -615,6 +615,7 @@ fn evaluate_pending_constraint_views<'a>(
                     Err(
                         error @ (crate::resolver::ResolutionError::InsideSecret { .. }
                         | crate::resolver::ResolutionError::Knowledge(_)
+                        | crate::resolver::ResolutionError::AdmissionConstraints(_)
                         | crate::resolver::ResolutionError::Context { .. }),
                     ) => {
                         resolution_errors.insert(name.clone(), error);
@@ -713,6 +714,7 @@ fn resolve_bound_constraint_values(
             Err(
                 error @ (crate::resolver::ResolutionError::InsideSecret { .. }
                 | crate::resolver::ResolutionError::Knowledge(_)
+                | crate::resolver::ResolutionError::AdmissionConstraints(_)
                 | crate::resolver::ResolutionError::Context { .. }),
             ) => {
                 errors.insert(argument.to_string(), error);

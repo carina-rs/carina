@@ -309,6 +309,15 @@ impl RefTypeMismatch {
 }
 
 impl ResolvedRefType {
+    /// Admission must retain both the declaration and every forwarded source.
+    pub(crate) fn constraints(
+        &self,
+    ) -> impl Iterator<Item = TypeInSchema<'_, crate::schema::Compiled>> {
+        std::iter::once(self.authoritative.constraint())
+            .chain(&self.evidence)
+            .map(ResolvedTypeConstraint::type_in_schema)
+    }
+
     pub(crate) fn mismatch_type_names(
         &self,
         expected: TypeInSchema<'_, crate::schema::Compiled>,

@@ -1,6 +1,7 @@
 //! Validation utilities for resources and modules
 
 use crate::resource::{DiagnosticPath, DiagnosticScope, InsideSecret, SecretDiagnosticError};
+pub mod admission;
 pub mod deferred_populate;
 pub mod deferred_types;
 pub mod depends_on;

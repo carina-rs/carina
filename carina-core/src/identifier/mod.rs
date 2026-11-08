@@ -3527,6 +3527,7 @@ fn resolve_deferred_create_only_value(
         | Err(
             crate::resolver::ResolutionError::Message(_)
             | crate::resolver::ResolutionError::Knowledge(_)
+            | crate::resolver::ResolutionError::AdmissionConstraints(_)
             | crate::resolver::ResolutionError::Context { .. }
             | crate::resolver::ResolutionError::InsideSecret { .. },
         ) => Ok(None),

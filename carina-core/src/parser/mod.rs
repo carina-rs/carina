@@ -151,8 +151,9 @@ pub use functions::{
     validate_schema_custom_type,
 };
 pub(crate) use functions::{
-    contains_module_argument_matching, custom_type_lookup_for_schema, function_argument_as_eval,
-    substitute_fn_params, validate_builtin_custom_type, validate_schema_custom_type_with_context,
+    contains_module_argument_matching, custom_type_canonicalization_error,
+    custom_type_lookup_for_schema, function_argument_as_eval, substitute_fn_params,
+    validate_builtin_custom_type, validate_schema_custom_type_with_context,
 };
 pub use resolve::{
     ProviderConfigInvariantError, ProviderConfigResolutionError, ResolvedProviderConfig,
