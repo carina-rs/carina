@@ -73,6 +73,7 @@ pub mod upstream_exports;
 pub mod utils;
 pub mod validation;
 pub mod value;
+pub mod value_walk;
 pub mod version_constraint;
 pub mod wait;
 

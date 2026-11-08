@@ -31,6 +31,19 @@ impl<P: PlaceholderKind> ValueKind for SnapshotLeaf<P> {
             .and_then(ValuePathSegmentResult::into_value)
     }
 
+    fn rebuild_access<B: BindingAddress>(
+        access: &AccessExpr<Self, B>,
+        base: Value<Self, B>,
+    ) -> Result<Value<Self, B>, ValueAccessError> {
+        let result = apply_snapshot_path_segment(
+            base,
+            access.step().clone(),
+            access.source_line(),
+            AccessMissPolicy::Error,
+        )?;
+        access.restore_rebuild_result(result).into_value()
+    }
+
     type DirectiveBool<B: BindingAddress> = P::DirectiveBool<B>;
     type DirectivePreventDestroy<B: BindingAddress> = P::DirectivePreventDestroy<B>;
 
