@@ -284,7 +284,11 @@ impl ProviderValidationDeduplicator {
             .lock()
             .expect("provider validation diagnostic lock must not be poisoned")
             .insert((
-                error.provider_name().unwrap_or("<unknown>").to_string(),
+                error
+                    .provider_name()
+                    .as_deref()
+                    .unwrap_or("<unknown>")
+                    .to_string(),
                 input_id,
             ))
     }

@@ -9,9 +9,9 @@ A provider is tested at two levels. Unit tests run its operations on the host ta
 
 The [`widget` provider](/providers/writing/implementing-operations/) takes its API client as a type parameter, so tests can give it a fake. They are ordinary Rust tests and run with `cargo test` on the host; you do not need the `wasm32-wasip2` target for them.
 
-There is one wrinkle. A `CreateAttempt` can only be created by the SDK, so a test cannot call `create` directly. Call `carina_plugin_sdk::dispatch_create` instead: it is the entry point the component's generated code uses, so it mints the attempt and returns the outcome in the wire form the host receives. `dispatch_poll_create` and `dispatch_resume_create` do the same for the other create calls. `update`, `delete` and `read` take no typestate, so tests call them directly.
+There is one wrinkle. A `CreateAttempt` can only be created by the SDK, so a test cannot call `create` directly. Call `carina_plugin_sdk::dispatch_create` instead: it is the entry point the component's generated code uses, so it mints the attempt and returns the protocol-shaped outcome with native opaque errors and diagnostics. Encoding into WIT happens afterward. `dispatch_poll_create` and `dispatch_resume_create` do the same for the other create calls. `update`, `delete` and `read` take no typestate, so tests call them directly.
 
-For native assertions on provider errors, enable `carina-core`'s `test-utils` feature in your dev-dependency. `NativeWireFixture` encodes an error through the real `ProviderBoundary`; `BindProviderText` binds it through that boundary so tests can inspect host diagnostics. Use `context` to register secrets when checking redaction. These helpers are available only in test builds or with `test-utils` enabled.
+For native assertions on provider errors, enable `carina-core`'s `test-utils` feature in your dev-dependency. `NativeWireFixture` encodes an error or partial diagnostic through the real `ProviderBoundary`; `BindProviderText` binds it through that boundary so tests can inspect host diagnostics. Use `context` to register secrets when checking redaction. These helpers are available only in test builds or with `test-utils` enabled.
 
 ```rust
 use carina_core::provider::ProviderError;
@@ -34,6 +34,28 @@ let error = ProviderError::api_error("password rejected")
     .with_secrets_for_test(&context(&["password"]));
 assert_eq!(error.to_string(), "(secret) rejected");
 ```
+
+`source()` advances one logical causal link, including through opaque and shared diagnostics. `source_is::<T>()` searches descendants; `matches_for_test::<T>(fn(&T) -> bool)` searches the current node and descendants. `is` and `downcast_ref` inspect only the current node, and downcasts return opaque views. Test predicates must be non-capturing. Binding a cloned diagnostic must leave the other handle's secret inventory unchanged.
+
+Check partial reasons before encoding as well as through the boundary:
+
+```rust
+use carina_core::provider::{NonEmptyMissingAttributes, PartialReadDiagnostic, ProviderError};
+use carina_core::provider_text::{ProviderDiagnostic, Retryability};
+use carina_core::test_utils::provider_text::{BindProviderText, NativeWireFixture, context};
+
+let missing = NonEmptyMissingAttributes::try_from(vec!["name".to_owned()]).unwrap();
+let reason = ProviderError::api_error_caused_by("read failed", std::io::Error::other("password"))
+    .with_retryability(Retryability::Transient);
+let partial = PartialReadDiagnostic::new(ProviderDiagnostic::new(reason), missing);
+assert!(partial.diagnostic().source_is::<std::io::Error>());
+assert_eq!(partial.diagnostic().retryability(), Retryability::Transient);
+let host = partial.with_secrets_for_test(&context(&["password"]));
+assert_eq!(host.reason(), "read failed: (secret)");
+assert!(host.diagnostic().source_is::<std::io::Error>());
+```
+
+Wire and persistence round trips retain textual reasons, not the original typed cause or retryability. Test empty wire partials separately: decoders deliberately normalize them to success.
 
 ```rust
 #[cfg(test)]

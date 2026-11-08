@@ -997,12 +997,6 @@ impl WasmDiagnostic {
             redacted: Some(redacted),
         }
     }
-    pub(super) fn from_guest(error: wasmtime::Error, inline: bool) -> Self {
-        Self {
-            text: Self::capture_chain(&error, inline),
-            redacted: None,
-        }
-    }
     fn capture_chain(error: &wasmtime::Error, inline: bool) -> ProviderText {
         let mut text = ProviderText::default();
         for (index, cause) in error.chain().enumerate() {
@@ -1029,7 +1023,7 @@ impl PoisonReason {
         Self::Trap {
             operation,
             trap,
-            root_cause: ProviderText::new(root_cause),
+            root_cause: root_cause.to_owned(),
             secrets: secrets.cloned(),
             before_request_root: secrets.is_none().then(|| DiagnosticText::new(root_cause)),
             root_is_trap,
@@ -1037,36 +1031,19 @@ impl PoisonReason {
     }
 
     pub(super) fn opaque_text(&self) -> ProviderText {
+        let text = ProviderText::new(self.capture_text());
         match self {
             Self::Trap {
-                operation,
-                trap,
-                root_cause,
-                root_is_trap,
-                secrets,
+                secrets: Some(secrets),
                 ..
-            } => {
-                let context =
-                    ["WASM provider instance unusable after trap in ", operation].concat();
-                if secrets.is_none() {
-                    return root_cause.with_context(&context);
-                }
-                match trap {
-                    Some(trap) if *root_is_trap => {
-                        ProviderText::new(trap.to_string()).with_context(&context)
-                    }
-                    Some(trap) => root_cause
-                        .with_context(&[context.as_str(), ": ", &trap.to_string()].concat()),
-                    None => root_cause.with_context(&context),
-                }
-            }
-            _ => ProviderText::new(self.to_string()),
+            } => text.with_redaction(secrets),
+            _ => text,
         }
     }
     pub(super) fn fail_fast_error(&self, operation: &'static str) -> ProviderError {
         let mut text = self.opaque_text();
         text.append_host([" (operation '", operation, "'); re-run the command"].concat());
-        ProviderError::from_text(carina_core::provider::ProviderErrorKind::Internal, text)
+        ProviderError::internal(text)
     }
 }
 
@@ -1084,27 +1061,26 @@ pub(super) fn wasm_trap_provider_error(
         Err(error) => error,
     };
     let timed_out = error.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt);
-    let (kind, context, call_context, text_context) = if timed_out {
+    let (context, call_context) = if timed_out {
         (
-            carina_core::provider::ProviderErrorKind::Timeout,
             "WASM plugin timed out",
             WasmGuestCallContext::ComputeBudgetExceeded { operation },
-            [operation, " exceeded the guest compute budget"].concat(),
         )
     } else {
         (
-            carina_core::provider::ProviderErrorKind::Internal,
             "WASM guest trapped",
             WasmGuestCallContext::Trap { operation },
-            [operation, " call failed"].concat(),
         )
     };
     let cause = WasmGuestCallError {
         context: Some(call_context),
-        source: WasmDiagnostic::from_guest(error, true),
+        source: error,
     };
-    let text = cause.source.text.with_context(&text_context);
-    ProviderError::from_diagnostic(kind, context, ProviderDiagnostic::from_text(cause, text))
+    if timed_out {
+        ProviderError::timeout_caused_by(context, cause)
+    } else {
+        ProviderError::internal_caused_by(context, cause)
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -1966,19 +1942,9 @@ impl WasmProvider {
         detail: &'static str,
         source: ProviderError,
     ) -> ProviderError {
-        let mut text = ProviderText::new(detail);
-        text.append_host(": ");
-        text.append(&source.clone().into());
-        ProviderError::from_diagnostic(
-            carina_core::provider::ProviderErrorKind::Internal,
+        ProviderError::internal_caused_by(
             "invalid WASM create result",
-            ProviderDiagnostic::from_text(
-                InvalidWasmCreateResult {
-                    detail,
-                    _source: source,
-                },
-                text,
-            ),
+            ProviderError::internal_caused_by(detail, source),
         )
         .for_resource(id.clone())
     }
@@ -4427,11 +4393,8 @@ pub(super) mod tests {
             WasmProviderLoadError::Instantiation(source) => {
                 Some(WasmProviderLoadError::Instantiation(source.clone()))
             }
-            WasmProviderLoadError::Metadata { context, source } => {
-                Some(WasmProviderLoadError::Metadata {
-                    context: context.clone(),
-                    source: source.clone(),
-                })
+            WasmProviderLoadError::Metadata(source) => {
+                Some(WasmProviderLoadError::Metadata(source.clone()))
             }
             _ => None,
         };
@@ -6334,7 +6297,7 @@ pub(super) mod tests {
         assert!(rendered.contains("expected ident"), "{rendered}");
         assert!(rendered.contains("line 1 column 2"), "{rendered}");
         assert_eq!(rendered.matches("expected ident").count(), 1, "{rendered}");
-        assert!(std::error::Error::source(&error).is_none());
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
@@ -6532,7 +6495,12 @@ pub(super) mod tests {
 
         assert_eq!(error.variant_name(), "internal");
         assert_eq!(
-            error.detail().operation.as_deref(),
+            error
+                .detail()
+                .operation
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
             Some("normalize_desired"),
             "the guest boundary error must retain its export operation"
         );
@@ -6580,7 +6548,12 @@ pub(super) mod tests {
 
         assert_eq!(error.variant_name(), "internal");
         assert_eq!(
-            error.detail().operation.as_deref(),
+            error
+                .detail()
+                .operation
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
             Some("hydrate_read_state"),
             "the structured operation must be the bare export name"
         );
@@ -6991,11 +6964,12 @@ pub(super) mod tests {
             ),
         ];
         for error in errors {
+            let metadata = matches!(error, WasmProviderLoadError::Metadata(..));
+            assert_eq!(std::error::Error::source(&error).is_some(), metadata);
             let rendered = error.to_string();
             assert!(!rendered.contains(['\x1b', '\x07']));
             assert!(rendered.contains("\\u{1b}"));
             assert!(rendered.contains("truncated,"));
-            assert!(std::error::Error::source(&error).is_none());
         }
         let trap = wasm_trap_provider_error_for_test(
             "read",
@@ -7341,7 +7315,7 @@ pub(super) mod tests {
             wasm_convert::json_to_attribute_types(json).unwrap_err(),
         );
         assert_eq!(error.to_string().matches(&rendered).count(), 1);
-        assert!(std::error::Error::source(&error).is_none());
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
@@ -9235,7 +9209,8 @@ pub(super) mod tests {
             1,
             "{rendered}"
         );
-        assert!(cause.source().is_none());
+        assert!(cause.source().is_some());
+        assert!(cause.source_is::<wasmtime::Trap>());
     }
 
     #[tokio::test]
@@ -9388,11 +9363,32 @@ pub(super) mod tests {
             assert!(matches!(mapped, ProviderError::ApiError(_)));
         }
         let detail = mapped.detail();
-        assert_eq!(detail.provider_name.as_deref(), Some("awscc"));
-        assert_eq!(detail.operation.as_deref(), Some("sts.GetCallerIdentity"));
+        assert_eq!(
+            detail
+                .provider_name
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("awscc")
+        );
+        assert_eq!(
+            detail
+                .operation
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("sts.GetCallerIdentity")
+        );
         assert_eq!(detail.status, Some(403));
-        assert_eq!(detail.code(), Some("AccessDenied"));
-        assert_eq!(detail.request_id.as_deref(), Some("request-123"));
+        assert_eq!(detail.code().as_deref(), Some("AccessDenied"));
+        assert_eq!(
+            detail
+                .request_id
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("request-123")
+        );
         assert_eq!(
             mapped.to_string(),
             "Initialization request failed\n  operation: sts.GetCallerIdentity\n  status: 403 AccessDenied\n  request_id: request-123\n  cause: credential service rejected the request"
@@ -10396,5 +10392,158 @@ pub(super) mod tests {
             "guest initialization reason was lost: {text}"
         );
         assert!(!text.contains("<provider text>"));
+    }
+
+    #[test]
+    fn rebuild_metadata_source_reaches_the_wall_budget_error() {
+        let error = rebuild_provider_error(
+            PoisonReason::Cancelled,
+            wall_budget_load_error(
+                "instantiate",
+                WallBudgetExceeded {
+                    wall: std::time::Duration::from_secs(30),
+                },
+            ),
+        );
+        assert!(
+            error
+                .detail()
+                .cause()
+                .unwrap()
+                .source_is::<WasmWallBudgetError>()
+        );
+        let host = error.into_host_for_test();
+        assert!(
+            host.detail()
+                .cause()
+                .unwrap()
+                .source_is::<WasmWallBudgetError>()
+        );
+    }
+
+    #[test]
+    fn standalone_metadata_display_retains_its_cause() {
+        let error = WasmProviderLoadError::metadata(
+            "metadata failed",
+            std::io::Error::other("useful reason"),
+        );
+        assert_eq!(error.to_string(), "metadata failed: useful reason");
+    }
+
+    #[test]
+    fn load_metadata_renders_each_source_once_standalone_and_captured() {
+        let error = WasmProviderLoadError::metadata(
+            "metadata failed",
+            std::io::Error::other("useful metadata reason"),
+        );
+        // This is the standalone text on main, including the metadata context.
+        assert_eq!(error.to_string(), "metadata failed: useful metadata reason");
+        assert!(std::error::Error::source(&error).is_some());
+        let error = ProviderError::internal_caused_by(
+            "Failed to create WASM provider validation instance",
+            error,
+        );
+        assert!(
+            error
+                .detail()
+                .cause()
+                .unwrap()
+                .source_is::<std::io::Error>()
+        );
+        let host = error.into_host_for_test();
+        let wire = host.to_wire();
+        assert_eq!(
+            wire.cause.as_deref(),
+            Some("metadata failed: useful metadata reason"),
+        );
+        assert_eq!(
+            host.to_string().matches("useful metadata reason").count(),
+            1
+        );
+        assert!(host.detail().cause().unwrap().source_is::<std::io::Error>());
+    }
+
+    #[test]
+    fn load_egress_lock_renders_each_source_once_standalone_and_captured() {
+        let error = WasmProviderLoadError::EgressLock(
+            carina_provider_resolver::LockedEgressLoadError::LockFile(
+                carina_provider_resolver::LockFileError::Read {
+                    path: "carina-providers.lock".into(),
+                    source: std::io::Error::other("lock read reason"),
+                },
+            ),
+        );
+        let expected = "Failed to read carina-providers.lock: lock read reason";
+        assert_eq!(error.to_string(), expected);
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "resolver errors render their sources inline"
+        );
+        let host = ProviderError::internal_caused_by("load failed", error).into_host_for_test();
+        assert_eq!(host.to_wire().cause.as_deref(), Some(expected));
+        assert_eq!(host.to_string().matches("lock read reason").count(), 1);
+    }
+
+    #[test]
+    fn load_egress_consent_renders_once_standalone_and_captured() {
+        let error = WasmProviderLoadError::EgressConsent(
+            carina_provider_resolver::EgressConsentError::SourceMismatch {
+                locked: "locked-source".into(),
+                loaded: "loaded-source".into(),
+            },
+        );
+        let expected = "locked egress source locked-source does not match loaded provider source loaded-source";
+        assert_eq!(error.to_string(), expected);
+        assert!(std::error::Error::source(&error).is_none());
+        let host = ProviderError::internal_caused_by("load failed", error).into_host_for_test();
+        assert_eq!(host.to_wire().cause.as_deref(), Some(expected));
+        assert_eq!(host.to_string().matches("locked egress source").count(), 1);
+    }
+
+    #[test]
+    fn rebuild_metadata_keeps_the_complete_opaque_diagnostic() {
+        let message = format!("{}metadata-tail", "x".repeat(16_384));
+        let error = rebuild_provider_error(
+            PoisonReason::Cancelled,
+            WasmProviderLoadError::metadata(
+                "metadata failed",
+                std::io::Error::other(message.clone()),
+            ),
+        )
+        .into_host_for_test();
+        let wire = error.to_wire();
+        let cause = wire.cause.unwrap();
+        assert!(
+            cause.contains(&message),
+            "full opaque metadata must survive before diagnostic truncation"
+        );
+        assert_eq!(cause.matches("metadata-tail").count(), 1);
+        assert!(
+            error
+                .detail()
+                .cause()
+                .unwrap()
+                .source_is::<std::io::Error>()
+        );
+    }
+
+    #[test]
+    fn rebuild_display_hides_guest_roots_and_binding_keeps_the_poison_inventory() {
+        let secrets = crate::provider_text_fixtures::context(&["poison-private"]);
+        let poison = PoisonReason::from_trap(
+            "validate_config",
+            &wasmtime::Error::msg("poison-private useful detail"),
+            secrets.session().redaction_set(),
+        );
+        let rebuilt = WasmProviderRebuildError {
+            previous_poison: poison.clone(),
+            load_error: WasmProviderLoadError::Other("replacement failed".into()),
+        };
+        assert!(!rebuilt.to_string().contains("poison-private"));
+        let error = rebuild_provider_error(poison, rebuilt.load_error).into_host_for_test();
+        let wire = error.to_wire();
+        let rendered = format!("{error} {error:?} {wire:?}");
+        assert!(!rendered.contains("poison-private"), "{rendered}");
+        assert!(wire.cause.unwrap().contains("(secret) useful detail"));
     }
 }

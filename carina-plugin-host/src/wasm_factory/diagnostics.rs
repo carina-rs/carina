@@ -6,6 +6,25 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::time::Duration;
 
+/// The wire has already flattened this cause; only the host decoder can
+/// rehydrate its text before core captures and binds the diagnostic.
+#[derive(Debug)]
+pub(in crate::wasm_factory) struct FlattenedWireCause(String);
+
+impl FlattenedWireCause {
+    pub(in crate::wasm_factory) fn new(text: String) -> Self {
+        Self(text)
+    }
+}
+
+impl fmt::Display for FlattenedWireCause {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FlattenedWireCause {}
+
 /// Error raised when provider-emitted schema wire data cannot be decoded.
 ///
 /// External provider metadata is version-gated but still untrusted at this
@@ -385,8 +404,9 @@ impl MetadataDiagnostic {
             text.push_str(&cause.to_string());
             source = cause.source();
         }
+        let source = ProviderDiagnostic::new(error);
         Self {
-            source: ProviderDiagnostic::new(error),
+            source,
             opaque: ProviderText::new(text.clone()),
             projection: DiagnosticText::new(text),
         }
@@ -411,3 +431,51 @@ impl fmt::Display for MetadataDiagnostic {
     }
 }
 impl std::error::Error for MetadataDiagnostic {}
+
+/// One immutable metadata failure, with a bounded standalone display and the
+/// complete typed diagnostic used when the load error becomes a cause.
+#[derive(Clone, Debug)]
+pub struct MetadataLoadDiagnostic {
+    context: DiagnosticText,
+    source: MetadataDiagnostic,
+    captured: carina_core::provider_text::RenderedGuestDiagnostic,
+}
+
+impl MetadataLoadDiagnostic {
+    pub(in crate::wasm_factory) fn new(
+        context: impl Into<String>,
+        error: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        let context = context.into();
+        let source = MetadataDiagnostic::new(error);
+        let captured =
+            ProviderDiagnostic::new(carina_core::provider::ProviderError::internal_caused_by(
+                ProviderText::new(context.clone()),
+                source.source.clone(),
+            ));
+        let captured = captured.into();
+        Self {
+            context: DiagnosticText::new(context),
+            source,
+            captured,
+        }
+    }
+
+    pub(in crate::wasm_factory) fn captured(&self) -> &(dyn std::error::Error + 'static) {
+        &self.captured
+    }
+
+    pub fn is<T: std::error::Error + 'static>(&self) -> bool {
+        self.source.is::<T>()
+    }
+
+    pub fn as_cause(&self) -> ProviderCause<'_> {
+        self.source.as_cause()
+    }
+}
+
+impl fmt::Display for MetadataLoadDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.context, self.source)
+    }
+}

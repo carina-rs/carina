@@ -202,10 +202,11 @@ fn native_binding_fixture_keeps_carried_secrets_across_nested_errors() {
 #[test]
 fn native_binding_fixture_binds_partial_read_diagnostics() {
     let diagnostic = carina_core::provider::PartialReadDiagnostic::new(
-        "read password".into(),
-        vec!["name".into()],
+        carina_core::provider_text::ProviderDiagnostic::message("read password".into()),
+        (vec!["name".into()])
+            .try_into()
+            .expect("nonempty partial attributes"),
     )
-    .unwrap()
     .with_secrets_for_test(&context(&["password"]));
     assert_eq!(diagnostic.reason(), "read (secret)");
     assert_eq!(diagnostic.missing_attributes()[0].as_str(), "name");

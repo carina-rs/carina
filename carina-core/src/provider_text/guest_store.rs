@@ -5,6 +5,43 @@ use std::ops::{Deref, DerefMut};
 use super::{GuestCredentialHandoff, GuestInputInventory};
 use crate::resource::{AbsoluteBindingAddress, NoPlaceholder, SecretPayload};
 
+/// Delegate an enclosing error's captured rendering to an existing diagnostic.
+///
+/// The diagnostic already owns its complete text, typed cause, retry policy,
+/// and redaction inventories. This identity wrapper accepts no replacement
+/// text and grants no binding or plaintext access. Core applies its ordinary
+/// redaction rules when capturing it, including when a foreign error returns
+/// it from `Error::source()` to avoid rendering its own inline cause twice.
+/// Raw `Error` walkers cannot expose the stored text or underlying source.
+///
+/// ```compile_fail,E0423
+/// use carina_core::provider_text::{ProviderDiagnostic, RenderedGuestDiagnostic};
+/// let source = ProviderDiagnostic::new(std::io::Error::other("typed leaf"));
+/// let _ = RenderedGuestDiagnostic(source);
+/// ```
+///
+/// ```
+/// use carina_core::provider_text::{ProviderDiagnostic, RenderedGuestDiagnostic};
+/// let source = ProviderDiagnostic::new(std::io::Error::other("typed leaf"));
+/// let _ = RenderedGuestDiagnostic::from(source);
+/// ```
+#[derive(Clone, Debug)]
+pub struct RenderedGuestDiagnostic(pub(super) super::ProviderDiagnostic);
+
+impl From<super::ProviderDiagnostic> for RenderedGuestDiagnostic {
+    fn from(source: super::ProviderDiagnostic) -> Self {
+        Self(source)
+    }
+}
+
+impl std::fmt::Display for RenderedGuestDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<provider cause>")
+    }
+}
+
+impl std::error::Error for RenderedGuestDiagnostic {}
+
 /// Guest data whose append-only inventory is installed together with its host
 /// state. There is no standalone constructor or conversion from an inventory.
 /// Calls observe this same inventory before ingesting the guest's diagnostics.

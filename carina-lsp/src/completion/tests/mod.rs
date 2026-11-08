@@ -419,7 +419,7 @@ pub(super) fn test_provider_with_vpc_and_security_group() -> CompletionProvider 
         carina_core::schema::TypeIdentity::bare("VpcId"),
         None,
         None,
-        legacy_validator(noop_validate),
+        legacy_validator(move |value| noop_validate(value).map_err(Into::into)),
         None,
     );
     let vpc = ResourceSchema::new("ec2.Vpc")
@@ -454,7 +454,7 @@ pub(super) fn test_provider_with_custom_semantic_attr() -> CompletionProvider {
         carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
-        legacy_validator(noop_validate),
+        legacy_validator(move |value| noop_validate(value).map_err(Into::into)),
         None,
     );
     let principal_type = AttributeType::enum_(

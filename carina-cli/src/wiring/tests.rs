@@ -64,9 +64,9 @@ fn review3_resolved_constraint_origins_mask_secret_paths() {
 #[test]
 fn throttling_error_uses_wire_message_before_display_truncation() {
     for marker in ["ThrottlingException", "Rate exceeded"] {
-        let mut wire = ProviderError::api_error("request failed").to_wire();
-        wire.message = format!("{} {marker}", "x".repeat(9 * 1024));
-        let error = ProviderError::from_wire(wire).into_host_for_test();
+        let error = ProviderError::api_error(format!("{} {marker}", "x".repeat(9 * 1024)))
+            .round_trip()
+            .into_host_for_test();
 
         assert!(!error.to_string().contains(marker));
         assert!(is_throttling_error(&error), "missing raw marker {marker}");
@@ -3761,7 +3761,15 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
         panic!("expected provider error, got {error}");
     };
     assert_eq!(error.to_string(), "normalizer initialization failed");
-    assert_eq!(error.detail().provider_name.as_deref(), Some("failing"));
+    assert_eq!(
+        error
+            .detail()
+            .provider_name
+            .as_ref()
+            .map(|text| text.as_diagnostic())
+            .as_deref(),
+        Some("failing")
+    );
 }
 
 #[test]
@@ -4033,8 +4041,24 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
     let AppError::Provider(error) = error else {
         panic!("expected provider error")
     };
-    assert_eq!(error.detail().provider_name.as_deref(), Some("aws"));
-    assert_eq!(error.detail().operation.as_deref(), Some("initialize"));
+    assert_eq!(
+        error
+            .detail()
+            .provider_name
+            .as_ref()
+            .map(|text| text.as_diagnostic())
+            .as_deref(),
+        Some("aws")
+    );
+    assert_eq!(
+        error
+            .detail()
+            .operation
+            .as_ref()
+            .map(|text| text.as_diagnostic())
+            .as_deref(),
+        Some("initialize")
+    );
 }
 
 struct ProviderConfigConstraintFactory {
@@ -15632,4 +15656,22 @@ async fn round2_binding_stability_reuses_normalized_inputs() {
         },
     )
     .await;
+}
+
+#[test]
+fn retry_policy_inherits_transient_causes_and_respects_explicit_overrides() {
+    use carina_core::provider_text::Retryability;
+    let cause = ProviderError::api_error_caused_by(
+        "read failed",
+        std::io::Error::other("transport failure"),
+    )
+    .with_retryability(Retryability::Transient);
+    let error = ProviderError::internal_caused_by("read-back failed", cause).into_host_for_test();
+    assert!(is_throttling_error(&error));
+    assert!(!is_throttling_error(
+        &error.with_retryability(Retryability::Unclassified)
+    ));
+    assert!(!is_throttling_error(
+        &ProviderError::timeout("deadline").into_host_for_test()
+    ));
 }

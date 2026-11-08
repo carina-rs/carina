@@ -1114,10 +1114,13 @@ impl Provider for MockProvider {
                             ),
                         )]),
                         crate::provider::PartialReadDiagnostic::new(
-                            "resumed read-back is incomplete".into(),
-                            vec!["computed".into()],
-                        )
-                        .expect("fixture has a missing attribute"),
+                            crate::provider_text::ProviderDiagnostic::message(
+                                "resumed read-back is incomplete".into(),
+                            ),
+                            (vec!["computed".into()])
+                                .try_into()
+                                .expect("nonempty partial attributes"),
+                        ),
                     ))
                 }
                 ResumeFixture::IdentifierReportedFound => {
@@ -6867,17 +6870,20 @@ async fn partial_create_records_state_and_diagnostic() {
     let rid = resource.id.clone();
     let diagnostic = crate::provider::PartialReadDiagnostic::new(
         "mock partial create".into(),
-        vec!["computed".to_string()],
-    )
-    .expect("missing attributes are non-empty");
+        (vec!["computed".to_string()])
+            .try_into()
+            .expect("nonempty partial attributes"),
+    );
 
     let mut plan = Plan::new();
     plan.add(create_effect(resource));
 
     provider.push_create_outcome(Ok(crate::provider::CreateOutcome::partial_success(
         applied_state_for_test(ok_state(&rid)),
-        "mock partial create".into(),
-        vec!["computed".to_string()],
+        crate::provider_text::ProviderDiagnostic::message("mock partial create".into()),
+        (vec!["computed".to_string()])
+            .try_into()
+            .expect("nonempty partial attributes"),
     )));
 
     let input = ExecutionInput {
@@ -14694,4 +14700,22 @@ fn review2_context_error_drops_untyped_secret_context() {
     )
     .inside_secret();
     assert!(!render_error_chain(error.as_error()).contains("private-"));
+}
+
+#[test]
+fn retry_policy_inherits_transient_causes_and_respects_explicit_overrides() {
+    use crate::provider_text::Retryability;
+    let cause = ProviderError::api_error_caused_by(
+        "read failed",
+        std::io::Error::other("transport failure"),
+    )
+    .with_retryability(Retryability::Transient);
+    let error = ProviderError::internal_caused_by("read-back failed", cause).into_host_for_test();
+    assert!(is_throttling_error(&error));
+    assert!(!is_throttling_error(
+        &error.with_retryability(Retryability::Unclassified)
+    ));
+    assert!(!is_throttling_error(
+        &ProviderError::timeout("deadline").into_host_for_test()
+    ));
 }

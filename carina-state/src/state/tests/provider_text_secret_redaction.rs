@@ -37,7 +37,7 @@ async fn persisted_read_back_failure(incomplete: bool) -> String {
     // This is the classified observation produced when create reports an ID
     // and its finishing read-back fails. Keep the wire error round-trip.
     let detail = format!("mock read-back rejected password {SECRET}; public=read-context-4305");
-    let error = ProviderError::from_wire(ProviderError::api_error(detail.clone()).to_wire());
+    let error = ProviderError::api_error(detail.clone()).round_trip();
     let failed = super::create_attempt_for_test(desired.id.clone())
         .issued(
             AppliedIdentifier::new("mock-id").unwrap(),
@@ -51,13 +51,12 @@ async fn persisted_read_back_failure(incomplete: bool) -> String {
         panic!("read-back failure must retain the created identifier");
     };
     let identified = if incomplete {
-        identified.with_partial_read_for_test(
-            carina_core::provider::PartialReadDiagnostic::new(
-                detail.into(),
-                vec!["computed".into()],
-            )
-            .unwrap(),
-        )
+        identified.with_partial_read_for_test(carina_core::provider::PartialReadDiagnostic::new(
+            carina_core::provider_text::ProviderDiagnostic::message(detail.into()),
+            (vec!["computed".into()])
+                .try_into()
+                .expect("nonempty partial attributes"),
+        ))
     } else {
         identified
     };

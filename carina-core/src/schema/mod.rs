@@ -490,19 +490,106 @@ impl RefinementBinding {
     }
 }
 
+/// Validation text or a complete opaque cause. Typed validation failures remain
+/// opaque until the provider validation boundary binds their diagnostic.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderValidation(Box<ValidationBody>);
+#[derive(Clone, Debug, PartialEq)]
+enum ValidationBody {
+    Message(DiagnosticText),
+    Diagnostic(crate::provider_text::ProviderDiagnostic),
+    Structured(Box<TypeError>),
+}
+impl From<String> for ProviderValidation {
+    fn from(message: String) -> Self {
+        Self(Box::new(ValidationBody::Message(message.into())))
+    }
+}
+impl From<&str> for ProviderValidation {
+    fn from(message: &str) -> Self {
+        Self(Box::new(ValidationBody::Message(message.into())))
+    }
+}
+impl From<DiagnosticText> for ProviderValidation {
+    fn from(message: DiagnosticText) -> Self {
+        Self(Box::new(ValidationBody::Message(message)))
+    }
+}
+impl From<crate::provider_text::ProviderDiagnostic> for ProviderValidation {
+    fn from(diagnostic: crate::provider_text::ProviderDiagnostic) -> Self {
+        Self(Box::new(ValidationBody::Diagnostic(diagnostic)))
+    }
+}
+impl From<TypeError> for ProviderValidation {
+    fn from(error: TypeError) -> Self {
+        Self(Box::new(ValidationBody::Structured(Box::new(error))))
+    }
+}
+impl ProviderValidation {
+    fn inside_secret(self) -> Self {
+        match *self.0 {
+            ValidationBody::Message(_) => format!("{SECRET_VALUE_MASK} failed validation").into(),
+            ValidationBody::Diagnostic(diagnostic) => diagnostic.into(),
+            ValidationBody::Structured(error) => {
+                crate::resource::InsideSecret::inside_secret(*error).into()
+            }
+        }
+    }
+    pub(crate) fn diagnostic(&self) -> Option<&crate::provider_text::ProviderDiagnostic> {
+        match self.0.as_ref() {
+            ValidationBody::Diagnostic(diagnostic) => Some(diagnostic),
+            ValidationBody::Message(_) | ValidationBody::Structured(_) => None,
+        }
+    }
+    pub(crate) fn category(&self) -> Option<&TypeError> {
+        match self.0.as_ref() {
+            ValidationBody::Structured(error) => Some(error),
+            ValidationBody::Message(_) | ValidationBody::Diagnostic(_) => None,
+        }
+    }
+    pub(crate) fn capture_text<S: crate::provider_text::TextState>(
+        &self,
+    ) -> crate::provider_text::ErrorText<S> {
+        use crate::provider_text::{Diagnostic, ErrorText};
+        match self.0.as_ref() {
+            ValidationBody::Message(message) => ErrorText::new(message.as_str()),
+            ValidationBody::Diagnostic(diagnostic) => {
+                ErrorText::from_opaque_for_state(diagnostic.opaque())
+            }
+            ValidationBody::Structured(error) => Diagnostic::<S>::capture(error.as_ref()),
+        }
+    }
+    pub(crate) fn retryability(&self) -> crate::provider_text::Retryability {
+        match self.0.as_ref() {
+            ValidationBody::Diagnostic(diagnostic) => diagnostic.retryability(),
+            ValidationBody::Structured(error) => {
+                crate::provider_text::ProviderDiagnostic::new(error.as_ref().clone()).retryability()
+            }
+            ValidationBody::Message(_) => crate::provider_text::Retryability::Unclassified,
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderValidation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.as_ref() {
+            ValidationBody::Message(message) => message.fmt(f),
+            ValidationBody::Diagnostic(_) => f.write_str("<provider diagnostic>"),
+            ValidationBody::Structured(error) => error.fmt(f),
+        }
+    }
+}
+impl std::error::Error for ProviderValidation {}
+
 /// Build a [`CustomValidator`] from a closure that still uses the legacy
-/// `Result<(), String>` shape. The returned message is wrapped in
+/// message/diagnostic shape. The returned reason is wrapped in
 /// `TypeError::ValidationFailed`. Use this for builtins that haven't yet
 /// been migrated to structured errors.
 pub fn legacy_validator<F>(f: F) -> CustomValidator
 where
-    F: Fn(&Value) -> Result<(), String> + Send + Sync + 'static,
+    F: Fn(&Value) -> Result<(), ProviderValidation> + Send + Sync + 'static,
 {
-    Arc::new(move |v| {
-        f(v).map_err(|message| TypeError::ValidationFailed {
-            message: message.into(),
-        })
-    })
+    Arc::new(move |v| f(v).map_err(|message| TypeError::ValidationFailed { message }))
 }
 
 /// Provider dispatch consumes the sealed proof made by the combined value walk.
@@ -3470,8 +3557,7 @@ impl PatternAttributeType<Compiled> {
                 expected,
                 extra_message: validation_result
                     .and_then(Result::err)
-                    .map(validation_error_message)
-                    .map(DiagnosticText::new),
+                    .map(validation_error_message),
             });
         }
 
@@ -4500,10 +4586,10 @@ pub fn enum_identity(name: &str, namespace: Option<&str>) -> TypeIdentity {
     }
 }
 
-fn validation_error_message(err: TypeError) -> String {
+fn validation_error_message(err: TypeError) -> ProviderValidation {
     match err {
-        TypeError::ValidationFailed { message } => message.to_string(),
-        other => other.to_string(),
+        TypeError::ValidationFailed { message } => message,
+        other => other.into(),
     }
 }
 
@@ -5957,7 +6043,7 @@ fn format_string_literal_expected_enum(
     attribute: Option<&str>,
     type_name: &str,
     expected: &[ExpectedEnumVariant],
-    extra_message: Option<&str>,
+    extra_message: Option<&ProviderValidation>,
 ) -> String {
     let target = match attribute {
         Some(a) => format!("'{}' ({})", a, type_name),
@@ -5968,7 +6054,7 @@ fn format_string_literal_expected_enum(
     // tail reads "Use one of: <validator message>" — byte-identical to
     // the pre-#2220 string-vec rendering.
     let tail = if expected.is_empty() {
-        extra_message.unwrap_or("").to_string()
+        extra_message.map(ToString::to_string).unwrap_or_default()
     } else {
         join_expected(expected)
     };
@@ -6810,7 +6896,7 @@ pub enum TypeError {
     /// See #2094.
     #[error(
         "{}",
-        DiagnosticText::new(format_string_literal_expected_enum(user_typed, attribute.as_deref(), type_name, expected, extra_message.as_deref()))
+        DiagnosticText::new(format_string_literal_expected_enum(user_typed, attribute.as_deref(), type_name, expected, extra_message.as_ref()))
     )]
     StringLiteralExpectedEnum {
         /// The string the user typed between the quotes, or a secret mask.
@@ -6832,11 +6918,11 @@ pub enum TypeError {
         /// path, where the validator does not enumerate variants. When
         /// `expected` is non-empty, this field is silently ignored by
         /// the renderer; callers should not set both at once.
-        extra_message: Option<DiagnosticText>,
+        extra_message: Option<ProviderValidation>,
     },
 
     #[error("Validation failed: {message}")]
-    ValidationFailed { message: DiagnosticText },
+    ValidationFailed { message: ProviderValidation },
 
     #[error("{error}")]
     CustomTypeValidation {
@@ -6846,7 +6932,7 @@ pub enum TypeError {
 
     #[error("Resource validation failed: {message}")]
     ResourceValidationFailed {
-        message: DiagnosticText,
+        message: ProviderValidation,
         /// Optional attribute name for precise diagnostic positioning.
         attribute: Option<String>,
     },
@@ -6916,6 +7002,81 @@ pub enum TypeError {
     )]
     BlockSyntaxNotAllowed { attribute: String },
 }
+
+/// The complete causal shape of a validation category. Rendering and logical
+/// sources consume this same value; neither guesses from a second variant map.
+pub(crate) enum ValidationDiagnostic<'a> {
+    Reason {
+        prefix: String,
+        reason: &'a ProviderValidation,
+    },
+    Child {
+        prefix: String,
+        child: &'a (dyn std::error::Error + 'static),
+    },
+    Alternatives(&'a UnionArmFailures),
+    // The category retains this cause but deliberately omits its rendered text.
+    HiddenChild {
+        message: String,
+        child: &'a (dyn std::error::Error + 'static),
+    },
+    Plain(&'a (dyn std::error::Error + 'static)),
+}
+
+impl ValidationDiagnostic<'_> {
+    pub(crate) fn capture_text<S: crate::provider_text::TextState>(
+        &self,
+    ) -> crate::provider_text::ErrorText<S> {
+        use crate::provider_text::{Diagnostic, ErrorText};
+        let text = match self {
+            Self::Reason { prefix, reason } => {
+                let mut text = ErrorText::new(prefix);
+                text.append(&reason.capture_text());
+                text
+            }
+            Self::Child { prefix, child } => {
+                let mut text = ErrorText::new(prefix);
+                text.append(&Diagnostic::<S>::capture(*child));
+                text
+            }
+            Self::Alternatives(failures) => {
+                let mut text = ErrorText::new("No union alternative accepts this value: ");
+                for (index, arm) in failures.iter().enumerate() {
+                    if index != 0 {
+                        text.append_host("; or ");
+                    }
+                    let nested = contains_union_alternatives_mismatch(arm);
+                    if nested {
+                        text.append_host("(");
+                    }
+                    text.append(&Diagnostic::<S>::capture(arm));
+                    if nested {
+                        text.append_host(")");
+                    }
+                }
+                text
+            }
+            Self::HiddenChild { message, child } => {
+                let inventory = Diagnostic::<S>::capture(*child).redaction_context();
+                ErrorText::new(message).with_redaction_context(&inventory)
+            }
+            Self::Plain(error) => ErrorText::new(error.to_string()),
+        };
+        // Every alternative's inventory protects the complete diagnostic,
+        // including sibling text, before any boundary chooses how to bind it.
+        let inventory = text.redaction_context();
+        text.with_redaction_context(&inventory)
+    }
+}
+
+// Raw Error walkers stop at the opaque alternatives node. ProviderCause uses
+// its typed arms and carries the complete union's redaction inventory.
+impl fmt::Display for UnionArmFailures {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<union alternatives>")
+    }
+}
+impl std::error::Error for UnionArmFailures {}
 
 impl From<crate::parser::CustomTypeValidationError> for TypeError {
     fn from(error: crate::parser::CustomTypeValidationError) -> Self {
@@ -6989,6 +7150,87 @@ impl TypeError {
                 field: field.to_string(),
                 inner: Box::new(inner),
             },
+        }
+    }
+
+    /// Classify every category once for capture, rendering, and traversal.
+    /// New TypeError variants must choose a shape here before they compile.
+    pub(crate) fn diagnostic_shape(&self) -> ValidationDiagnostic<'_> {
+        match self {
+            Self::ValidationFailed { message } => ValidationDiagnostic::Reason {
+                prefix: "Validation failed: ".into(),
+                reason: message,
+            },
+            Self::ResourceValidationFailed { message, .. } => ValidationDiagnostic::Reason {
+                prefix: "Resource validation failed: ".into(),
+                reason: message,
+            },
+            Self::StringLiteralExpectedEnum {
+                user_typed,
+                attribute,
+                type_name,
+                expected,
+                extra_message,
+            } => {
+                if let Some(reason) = extra_message {
+                    let message = format_string_literal_expected_enum(
+                        user_typed,
+                        attribute.as_deref(),
+                        type_name,
+                        expected,
+                        None,
+                    );
+                    if expected.is_empty() {
+                        ValidationDiagnostic::Reason {
+                            prefix: message,
+                            reason,
+                        }
+                    } else {
+                        ValidationDiagnostic::HiddenChild {
+                            message,
+                            child: reason,
+                        }
+                    }
+                } else {
+                    ValidationDiagnostic::Plain(self)
+                }
+            }
+            Self::ListItemError { index, inner } => ValidationDiagnostic::Child {
+                prefix: format!("List item at index {index}: "),
+                child: inner.as_ref(),
+            },
+            Self::MapKeyError { key, inner } => ValidationDiagnostic::Child {
+                prefix: format!("Map key '{}': ", DiagnosticText::new(key)),
+                child: inner.as_ref(),
+            },
+            Self::MapValueError { key, inner } => ValidationDiagnostic::Child {
+                prefix: format!("Map value for key '{}': ", DiagnosticText::new(key)),
+                child: inner.as_ref(),
+            },
+            Self::StructFieldError { field, inner } => ValidationDiagnostic::Child {
+                prefix: format!("Struct field '{}': ", DiagnosticText::new(field)),
+                child: inner.as_ref(),
+            },
+            Self::CustomTypeValidation { error, .. } => ValidationDiagnostic::Child {
+                prefix: String::new(),
+                child: error.as_ref(),
+            },
+            Self::UnionAlternativesMismatch { failures } => {
+                ValidationDiagnostic::Alternatives(failures)
+            }
+            Self::TypeMismatch { .. }
+            | Self::BindingShadowsEnumMember(_)
+            | Self::InvalidEnumVariant { .. }
+            | Self::PatternMismatch { .. }
+            | Self::LengthOutOfRange { .. }
+            | Self::DuplicateListElement { .. }
+            | Self::MissingRequired { .. }
+            | Self::FieldGroupViolation { .. }
+            | Self::ReadOnlyAttribute { .. }
+            | Self::UnknownAttribute { .. }
+            | Self::UnknownStructField { .. }
+            | Self::UnionStructMismatch { .. }
+            | Self::BlockSyntaxNotAllowed { .. } => ValidationDiagnostic::Plain(self),
         }
     }
 
@@ -7171,11 +7413,17 @@ impl TypeError {
     }
 
     /// Provider name retained from provider-backed validation.
-    pub fn provider_name(&self) -> Option<&str> {
+    pub fn provider_name(&self) -> Option<DiagnosticText> {
         match self {
-            TypeError::CustomTypeValidation { error, .. } => error
-                .provider_error()
-                .and_then(|error| error.detail().provider_name.as_deref()),
+            TypeError::CustomTypeValidation { error, .. } => {
+                error.provider_error().and_then(|error| {
+                    error
+                        .detail()
+                        .provider_name
+                        .as_ref()
+                        .map(|name| name.as_diagnostic())
+                })
+            }
             TypeError::ListItemError { inner, .. }
             | TypeError::MapKeyError { inner, .. }
             | TypeError::MapValueError { inner, .. }
@@ -12369,10 +12617,10 @@ pub mod types {
                         if *n > 0 {
                             Ok(())
                         } else {
-                            Err("Value must be positive".to_string())
+                            Err(("Value must be positive".to_string()).into())
                         }
                     } else {
-                        Err("Expected integer".to_string())
+                        Err(("Expected integer".to_string()).into())
                     }
                 }),
             )
@@ -12390,9 +12638,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_ipv4_cidr(s.expose_plaintext())
+                        validate_ipv4_cidr(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -12411,9 +12659,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_ipv4_address(s.expose_plaintext())
+                        validate_ipv4_address(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -12432,9 +12680,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_ipv6_address(s.expose_plaintext())
+                        validate_ipv6_address(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -12453,9 +12701,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_ipv6_cidr(s.expose_plaintext())
+                        validate_ipv6_cidr(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -12483,9 +12731,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_email(s.expose_plaintext())
+                        validate_email(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -12512,9 +12760,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_domain_name(s.expose_plaintext())
+                        validate_domain_name(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -12538,9 +12786,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_wildcard_domain_name(s.expose_plaintext())
+                        validate_wildcard_domain_name(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -12578,9 +12826,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_https_url(s.expose_plaintext())
+                        validate_https_url(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -12604,9 +12852,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_http_response_status_code(s.expose_plaintext())
+                        validate_http_response_status_code(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -12632,9 +12880,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_redirect_protocol(s.expose_plaintext())
+                        validate_redirect_protocol(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -12659,9 +12907,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_redirect_host(s.expose_plaintext())
+                        validate_redirect_host(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -12686,9 +12934,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_redirect_port(s.expose_plaintext())
+                        validate_redirect_port(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -12713,9 +12961,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_redirect_path(s.expose_plaintext())
+                        validate_redirect_path(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -12740,9 +12988,9 @@ pub mod types {
                 None,
                 legacy_validator(|value| {
                     if let Value::Concrete(ConcreteValue::String(s)) = value {
-                        validate_redirect_query(s.expose_plaintext())
+                        validate_redirect_query(s.expose_plaintext()).map_err(Into::into)
                     } else {
-                        Err("Expected string".to_string())
+                        Err(("Expected string".to_string()).into())
                     }
                 }),
                 None,
@@ -14831,11 +15079,10 @@ impl crate::resource::InsideSecret for TypeError {
                 attribute,
                 type_name,
                 expected,
-                extra_message: extra_message
-                    .map(|_| format!("{SECRET_VALUE_MASK} failed validation").into()),
+                extra_message: extra_message.map(ProviderValidation::inside_secret),
             },
-            TypeError::ValidationFailed { .. } => TypeError::ValidationFailed {
-                message: format!("{SECRET_VALUE_MASK} failed validation").into(),
+            TypeError::ValidationFailed { message } => TypeError::ValidationFailed {
+                message: message.inside_secret(),
             },
             TypeError::CustomTypeValidation { error, attribute } => {
                 TypeError::CustomTypeValidation {
@@ -14843,9 +15090,9 @@ impl crate::resource::InsideSecret for TypeError {
                     attribute,
                 }
             }
-            TypeError::ResourceValidationFailed { attribute, .. } => {
+            TypeError::ResourceValidationFailed { attribute, message } => {
                 TypeError::ResourceValidationFailed {
-                    message: format!("{SECRET_VALUE_MASK} failed validation").into(),
+                    message: message.inside_secret(),
                     attribute,
                 }
             }

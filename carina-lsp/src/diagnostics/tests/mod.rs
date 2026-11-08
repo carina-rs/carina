@@ -765,7 +765,9 @@ pub(super) fn test_engine_with_custom_namespaced_attr() -> DiagnosticEngine {
         carina_core::schema::enum_identity("Mode", Some("test.r")),
         None,
         vec![],
-        Some(legacy_validator(validate_mode)),
+        Some(legacy_validator(move |value| {
+            validate_mode(value).map_err(Into::into)
+        })),
         None,
     );
 

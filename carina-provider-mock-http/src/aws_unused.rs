@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use carina_plugin_sdk::core::provider_text::{ProviderDiagnostic, ProviderText};
 use carina_plugin_sdk::core::schema::{
     ReferenceForms, ValidatedConfigSchema, ValidatedResourceSchema,
 };
@@ -18,17 +19,15 @@ struct MockHttpAwsUnusedProvider;
 
 impl MockHttpAwsUnusedProvider {
     fn error(id: &ResourceId, message: impl Into<String>) -> ProviderError {
-        ProviderError {
-            kind: ProviderErrorKind::InvalidInput,
-            message: message.into(),
-            resource_id: Some(id.clone()),
-            cause: None,
-            provider_name: Some("mock_http_aws_unused".to_string()),
-            operation: None,
-            status: None,
-            code: None,
-            request_id: None,
-        }
+        let message: String = message.into();
+        ProviderError::from_diagnostic(
+            ProviderErrorKind::InvalidInput,
+            ProviderDiagnostic::message(ProviderText::new(message)),
+        )
+        .for_resource(
+            carina_plugin_sdk::core::protocol_convert::protocol_to_resource_id(&(id.clone())),
+        )
+        .for_provider("mock_http_aws_unused".to_string())
     }
 }
 

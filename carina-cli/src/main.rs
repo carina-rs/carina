@@ -751,16 +751,33 @@ fn render_app_error(
         error::AppError::Provider(pe) => {
             let detail = pe.detail();
             let rendered = pe.to_string();
-            let body =
-                error::format_account_guard_error(&rendered, detail.provider_name.as_deref())
-                    .unwrap_or_else(|| {
-                        match (detail.operation.as_deref(), detail.provider_name.as_deref()) {
-                            (Some("initialize"), Some(provider_name)) => {
-                                format!("Provider: {provider_name}\n{rendered}")
-                            }
-                            _ => rendered,
-                        }
-                    });
+            let body = error::format_account_guard_error(
+                &rendered,
+                detail
+                    .provider_name
+                    .as_ref()
+                    .map(|text| text.as_diagnostic())
+                    .as_deref(),
+            )
+            .unwrap_or_else(|| {
+                match (
+                    detail
+                        .operation
+                        .as_ref()
+                        .map(|text| text.as_diagnostic())
+                        .as_deref(),
+                    detail
+                        .provider_name
+                        .as_ref()
+                        .map(|text| text.as_diagnostic())
+                        .as_deref(),
+                ) {
+                    (Some("initialize"), Some(provider_name)) => {
+                        format!("Provider: {provider_name}\n{rendered}")
+                    }
+                    _ => rendered,
+                }
+            });
             AppErrorRendering {
                 stderr: format_error_lines(color_mode, &body),
                 exit_code: 1,
@@ -1130,7 +1147,14 @@ mod error_format_tests {
                     // This is the wiring boundary used by both ordinary and
                     // source-loaded provider construction.
                     .for_provider(provider_name);
-            assert_eq!(pe.detail().operation.as_deref(), Some("initialize"));
+            assert_eq!(
+                pe.detail()
+                    .operation
+                    .as_ref()
+                    .map(|text| text.as_diagnostic())
+                    .as_deref(),
+                Some("initialize")
+            );
             let app_err: error::AppError = pe.into();
             let rendered = render_app_error(color_mode, &app_err);
 

@@ -2263,8 +2263,8 @@ mod tests {
                                 ) if *value == accepted => Ok(()),
                                 crate::resource::ExpandedValue::Concrete(
                                     crate::resource::ExpandedConcreteValue::Int(value),
-                                ) => Err(format!("expected {accepted}, got {value}")),
-                                _ => Err("Expected integer".to_string()),
+                                ) => Err((format!("expected {accepted}, got {value}")).into()),
+                                _ => Err(("Expected integer".to_string()).into()),
                             }),
                         ),
                     )

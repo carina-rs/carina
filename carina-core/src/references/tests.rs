@@ -56,7 +56,12 @@ impl Provider for TableProvider {
                     match self.table.get(&request.value).cloned().unwrap_or_else(|| {
                         Ok(wire::ReferenceOutcome::Resolved(request.value.clone()))
                     }) {
-                        Ok(outcome) => ReferenceOutcome::from_guest(outcome),
+                        Ok(wire::ReferenceOutcome::Resolved(value)) => {
+                            ReferenceOutcome::from_guest(value)
+                        }
+                        Ok(wire::ReferenceOutcome::NotFound(error)) => {
+                            Ok(ReferenceOutcome::NotFound(ProviderError::from_wire(*error)))
+                        }
                         Err(wire::ReferenceError::AccessDenied(error)) => Err(
                             ReferenceError::AccessDenied(ProviderError::from_wire(*error).into()),
                         ),

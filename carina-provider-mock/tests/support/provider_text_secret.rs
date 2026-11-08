@@ -67,7 +67,7 @@ pub fn password(attributes: &WireAttributes) -> String {
 }
 
 pub fn round_trip(error: ProviderError) -> ProviderError {
-    ProviderError::from_wire(error.to_wire())
+    error.round_trip()
 }
 
 pub struct EchoMock {
@@ -198,17 +198,20 @@ impl Provider for EchoMock {
                 .partial(
                     std::collections::HashMap::new(),
                     carina_core::provider::PartialReadDiagnostic::new(
-                        format!("public incomplete read {plaintext}").into(),
-                        vec![
+                        carina_core::provider_text::ProviderDiagnostic::message(
+                            format!("public incomplete read {plaintext}").into(),
+                        ),
+                        (vec![
                             match self.failure {
                                 Failure::ShortMissing => "subnet_1_id",
                                 Failure::UnknownMissing => "not_in_schema",
                                 _ => "password",
                             }
                             .into(),
-                        ],
-                    )
-                    .unwrap(),
+                        ])
+                        .try_into()
+                        .expect("nonempty partial attributes"),
+                    ),
                 );
             return Box::pin(async { Ok(outcome) });
         }
@@ -216,7 +219,7 @@ impl Provider for EchoMock {
             Failure::HostStatus => ProviderError::api_error("provider digits 404").with_status(404),
             Failure::Transient => {
                 ProviderError::api_error(format!("transient rejected password {plaintext}"))
-                    .with_transient(true)
+                    .with_retryability(carina_core::provider_text::Retryability::Transient)
             }
             Failure::HostRelay => carina_core::provider::HostError::internal(format!(
                 "mock create rejected password {plaintext}; public={PUBLIC}"
