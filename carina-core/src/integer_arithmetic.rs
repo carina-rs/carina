@@ -280,6 +280,10 @@ impl<P: ValueKind, B: BindingAddress> ValidatedIntegerExpr<P, B> {
         &self.rhs
     }
 
+    pub(crate) fn into_parts(self) -> (Value<P, B>, IntegerOp, Value<P, B>, IntegerOperatorSpan) {
+        (*self.lhs, self.op, *self.rhs, self.operator_span)
+    }
+
     pub fn operator_span(&self) -> IntegerOperatorSpan {
         self.operator_span.clone()
     }

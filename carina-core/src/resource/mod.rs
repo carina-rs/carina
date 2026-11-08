@@ -3497,6 +3497,15 @@ impl<P: ValueKind, B: BindingAddress> FunctionArgument<P, B> {
         self.operand.try_visit_values(visit)
     }
 
+    pub(crate) fn try_map_values<E>(
+        self,
+        mut map: impl FnMut(Value<P, B>) -> Result<Value<P, B>, E>,
+    ) -> Result<Self, E> {
+        Ok(Self {
+            operand: self.operand.try_map_stage(&mut map)?,
+        })
+    }
+
     pub(crate) fn try_map_value<E>(
         &self,
         map: impl FnOnce(&Value<P, B>) -> Result<Value<P, B>, E>,
@@ -4120,6 +4129,14 @@ impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
         &self.base
     }
 
+    pub(crate) fn try_map_base<E>(
+        mut self,
+        map: impl FnOnce(Value<P, B>) -> Result<Value<P, B>, E>,
+    ) -> Result<Self, E> {
+        self.base = Box::new(map(*self.base)?);
+        Ok(self)
+    }
+
     pub fn step(&self) -> &PathSegment {
         &self.step
     }
@@ -4168,47 +4185,53 @@ impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
     where
         P: PlaceholderKind,
     {
-        apply_value_path_segment(base, step, self.source_line, miss_policy).map(|result| {
-            let restore_display_root = |value: Value<P, B>| match &self.display_root {
-                Some(LoopAccessDisplayRoot::Rooted(root))
-                    if matches!(
-                        &value,
-                        Value::Deferred(DeferredValue::Access(access))
-                            if access.is_rooted_at_loop_slot()
-                    ) =>
-                {
-                    value.with_access_display_root(root.clone())
-                }
-                Some(LoopAccessDisplayRoot::DeferredMiss(root)) => {
-                    value.with_deferred_miss_display_root(root.clone())
-                }
-                Some(LoopAccessDisplayRoot::Rooted(_)) | None => value,
-            };
-            match result {
-                ValuePathSegmentResult::Resolved(value) => {
-                    ValuePathSegmentResult::Resolved(restore_display_root(value))
-                }
-                ValuePathSegmentResult::Deferred(mut value) => {
-                    if let Some(locations) = self.reference.locations() {
-                        match &mut value {
-                            Value::Deferred(DeferredValue::ResourceRef { path }) => {
-                                if let Some(locations) = locations.for_path(&path.reference) {
-                                    path.set_reference_locations(locations);
-                                }
-                            }
-                            Value::Deferred(DeferredValue::Access(access)) => {
-                                access.reference = self.reference.clone()
-                            }
-                            _ => {}
-                        }
-                    }
-                    ValuePathSegmentResult::Deferred(restore_display_root(value))
-                }
-                ValuePathSegmentResult::DeferredMiss(error) => {
-                    ValuePathSegmentResult::DeferredMiss(error)
-                }
+        apply_value_path_segment(base, step, self.source_line, miss_policy)
+            .map(|result| self.restore_rebuild_result(result))
+    }
+
+    fn restore_rebuild_result(
+        &self,
+        result: ValuePathSegmentResult<P, B>,
+    ) -> ValuePathSegmentResult<P, B> {
+        let restore_display_root = |value: Value<P, B>| match &self.display_root {
+            Some(LoopAccessDisplayRoot::Rooted(root))
+                if matches!(
+                    &value,
+                    Value::Deferred(DeferredValue::Access(access))
+                        if access.is_rooted_at_loop_slot()
+                ) =>
+            {
+                value.with_access_display_root(root.clone())
             }
-        })
+            Some(LoopAccessDisplayRoot::DeferredMiss(root)) => {
+                value.with_deferred_miss_display_root(root.clone())
+            }
+            Some(LoopAccessDisplayRoot::Rooted(_)) | None => value,
+        };
+        match result {
+            ValuePathSegmentResult::Resolved(value) => {
+                ValuePathSegmentResult::Resolved(restore_display_root(value))
+            }
+            ValuePathSegmentResult::Deferred(mut value) => {
+                if let Some(locations) = self.reference.locations() {
+                    match &mut value {
+                        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+                            if let Some(locations) = locations.for_path(&path.reference) {
+                                path.set_reference_locations(locations);
+                            }
+                        }
+                        Value::Deferred(DeferredValue::Access(access)) => {
+                            access.reference = self.reference.clone()
+                        }
+                        _ => {}
+                    }
+                }
+                ValuePathSegmentResult::Deferred(restore_display_root(value))
+            }
+            ValuePathSegmentResult::DeferredMiss(error) => {
+                ValuePathSegmentResult::DeferredMiss(error)
+            }
+        }
     }
 
     pub(crate) fn rebuild(
@@ -6310,6 +6333,12 @@ pub trait ValueKind: Clone + PartialEq + fmt::Debug + fmt::Display + serde::Seri
         source_line: usize,
         policy: AccessMissPolicy,
     ) -> Result<Value<Self, B>, ValueAccessError>;
+
+    /// Rebuild a changed access through this stage's existing access primitive.
+    fn rebuild_access<B: BindingAddress>(
+        access: &AccessExpr<Self, B>,
+        base: Value<Self, B>,
+    ) -> Result<Value<Self, B>, ValueAccessError>;
     /// Lifecycle settings follow the same authored-to-expanded phase as values.
     type DirectiveBool<B: BindingAddress>: Clone + fmt::Debug + PartialEq + Default + Send + Sync;
     type DirectivePreventDestroy<B: BindingAddress>: Clone
@@ -6428,6 +6457,13 @@ impl ValueKind for NoPlaceholder {
             .and_then(ValuePathSegmentResult::into_value)
     }
 
+    fn rebuild_access<B: BindingAddress>(
+        access: &AccessExpr<Self, B>,
+        base: Value<Self, B>,
+    ) -> Result<Value<Self, B>, ValueAccessError> {
+        access.rebuild_with_base(base, AccessMissPolicy::Error)
+    }
+
     type DirectiveBool<B: BindingAddress> = bool;
     type DirectivePreventDestroy<B: BindingAddress> = PreventDestroy;
     fn rebind_directives<B: BindingAddress, C: BindingAddress>(
@@ -6469,6 +6505,13 @@ impl ValueKind for LoopSlot {
     ) -> Result<Value<Self, B>, ValueAccessError> {
         apply_value_path_segment(base, step, source_line, policy)
             .and_then(ValuePathSegmentResult::into_value)
+    }
+
+    fn rebuild_access<B: BindingAddress>(
+        access: &AccessExpr<Self, B>,
+        base: Value<Self, B>,
+    ) -> Result<Value<Self, B>, ValueAccessError> {
+        access.rebuild_with_base(base, AccessMissPolicy::Error)
     }
 
     type DirectiveBool<B: BindingAddress> = LoopDirective<bool, B>;
@@ -6519,6 +6562,13 @@ impl ValueKind for ParserPlaceholder {
     ) -> Result<Value<Self, B>, ValueAccessError> {
         apply_value_path_segment(base, step, source_line, policy)
             .and_then(ValuePathSegmentResult::into_value)
+    }
+
+    fn rebuild_access<B: BindingAddress>(
+        access: &AccessExpr<Self, B>,
+        base: Value<Self, B>,
+    ) -> Result<Value<Self, B>, ValueAccessError> {
+        access.rebuild_with_base(base, AccessMissPolicy::Error)
     }
 
     type DirectiveBool<B: BindingAddress> = Option<DirectiveExpr<B>>;
