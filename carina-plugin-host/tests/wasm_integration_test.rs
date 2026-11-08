@@ -9,7 +9,7 @@ mod provider_config_error_fixture;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,6 +37,10 @@ use carina_core::resource::{
     absolute_binding_address_for_test,
 };
 use carina_core::schema::{CompiledAttributeType as AttributeType, TypeIdentity};
+use carina_core::test_utils::loopback::{
+    ArmedLoopbackServer, LoopbackListener, http_request_content_length, read_http_request,
+    read_http_request_head,
+};
 
 use carina_core::value::PersistedValue;
 use carina_plugin_host::{
@@ -1029,37 +1033,8 @@ fn http_probe_outcome(state: &SnapshotState) -> &str {
     outcome.expose_plaintext()
 }
 
-fn read_http_request_head(stream: &mut impl Read) -> Vec<u8> {
-    // Read exactly the head so the early-response server cannot accidentally
-    // drain any of the body along with the last header read.
-    let mut head = Vec::new();
-    while !head.ends_with(b"\r\n\r\n") {
-        let mut byte = [0];
-        stream.read_exact(&mut byte).expect("read request head");
-        head.push(byte[0]);
-        assert!(head.len() <= 32 * 1024, "request head is too large");
-    }
-    head
-}
-
-fn http_request_content_length(head: &[u8]) -> usize {
-    std::str::from_utf8(head)
-        .expect("request head is ASCII")
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length").then(|| {
-                value
-                    .trim()
-                    .parse()
-                    .expect("Content-Length is a byte count")
-            })
-        })
-        .expect("the SDK must frame the request with Content-Length")
-}
-
-fn spawn_http_ok_server() -> Option<(SocketAddr, std::thread::JoinHandle<usize>)> {
-    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+fn spawn_http_ok_server() -> Option<(SocketAddr, ArmedLoopbackServer<usize>)> {
+    let listener = match LoopbackListener::bind() {
         Ok(listener) => listener,
         Err(error) => {
             eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
@@ -1069,37 +1044,22 @@ fn spawn_http_ok_server() -> Option<(SocketAddr, std::thread::JoinHandle<usize>)
     let address = listener
         .local_addr()
         .expect("bound loopback listener has an address");
-    listener
-        .set_nonblocking(true)
-        .expect("set loopback listener nonblocking");
-    let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    // wall-clock-ok: hang guard for the real loopback server accept.
-                    assert!(Instant::now() < deadline, "server accept timed out");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("server accept failed: {error}"),
-            }
+    let server = listener.spawn_armed(move |listener| {
+        let Some(mut stream) = listener
+            .accept_within(Duration::from_secs(30))
+            .expect("accept loopback client")
+        else {
+            return 0;
         };
-        stream
-            .set_nonblocking(false)
-            .expect("set accepted socket blocking");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set server read timeout");
-        let head = read_http_request_head(&mut stream);
-        let mut body = vec![0; http_request_content_length(&head)];
-        stream
-            .read_exact(&mut body)
-            .expect("read the whole dispatched request body before responding");
+        let request = read_http_request(&mut stream)
+            .expect("read the whole dispatched request before responding");
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .expect("write successful HTTP response");
-        head.len() + body.len()
+        request.len()
     });
     Some((address, server))
 }
@@ -1144,9 +1104,11 @@ async fn initial_create_trap_after_dispatched_egress_is_outcome_unknown() {
         "trap_after_send",
     );
 
+    let request = create_request_for_test(resource).await;
+    server.arm().expect("arm HTTP request");
     let failure = provider
         .provider()
-        .create_for_test(&id, create_request_for_test(resource).await)
+        .create_for_test(&id, request)
         .await
         .expect_err("the guest must trap after the request completes");
     let bytes_read = server.join().expect("loopback server should finish");
@@ -1187,9 +1149,11 @@ async fn initial_create_unencodable_pending_token_after_egress_is_outcome_unknow
         "pending_nan_after_send",
     );
 
+    let request = create_request_for_test(resource).await;
+    server.arm().expect("arm HTTP request");
     let failure = provider
         .provider()
-        .create_for_test(&id, create_request_for_test(resource).await)
+        .create_for_test(&id, request)
         .await
         .expect_err("the guest must trap while encoding the NaN continuation token");
     let bytes_read = server.join().expect("loopback server should finish");
@@ -1267,9 +1231,11 @@ async fn provider_declared_not_created_remains_not_created_after_egress() {
         "not_created_after_send",
     );
 
+    let request = create_request_for_test(resource).await;
+    server.arm().expect("arm HTTP request");
     let failure = provider
         .provider()
-        .create_for_test(&id, create_request_for_test(resource).await)
+        .create_for_test(&id, request)
         .await
         .expect_err("the provider must return its declared verdict");
     let bytes_read = server.join().expect("loopback server should finish");
@@ -1899,10 +1865,12 @@ async fn declared_host_is_allowed_before_the_test_route_replaces_resolution() {
         "declared",
     );
 
+    let request = create_request_for_test(resource).await;
+    server.arm().expect("arm HTTP request");
     let state = create_state_for_writeback(
         provider
             .provider()
-            .create_for_test(&id, create_request_for_test(resource).await)
+            .create_for_test(&id, request)
             .await
             .expect("the declared request should be dispatched"),
     );
@@ -2258,7 +2226,7 @@ async fn wasm_guest_classifies_post_body_closed_tcp_port_as_not_sent() {
 async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
     let path = skip_if_no_http_wasm!();
     let body = http_probe_body();
-    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+    let listener = match LoopbackListener::bind() {
         Ok(listener) => listener,
         Err(error) => {
             eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
@@ -2268,9 +2236,6 @@ async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
     let server_address = listener
         .local_addr()
         .expect("bound listener has an address");
-    listener
-        .set_nonblocking(true)
-        .expect("set loopback listener nonblocking");
 
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", server_address);
@@ -2293,22 +2258,11 @@ async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
 
     // Component compilation and provider initialization can be slow under
     // parallel load, so start the accept deadline only once the guest is ready.
+    let request = create_request_for_test(resource).await;
     let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    // wall-clock-ok: hang guard for the real loopback server accept.
-                    assert!(Instant::now() < deadline, "server accept timed out");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("server accept failed: {error}"),
-            }
-        };
-        stream
-            .set_nonblocking(false)
-            .expect("set accepted socket blocking");
+        let mut stream = listener
+            .accept_within(Duration::from_secs(30))
+            .expect("accept loopback client");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set server read timeout");
@@ -2321,7 +2275,7 @@ async fn wasm_guest_classifies_post_body_closed_after_request_as_maybe_sent() {
     let state = create_state_for_writeback(
         provider
             .provider()
-            .create_for_test(&id, create_request_for_test(resource).await)
+            .create_for_test(&id, request)
             .await
             .expect("the mock transport probe should report its phase"),
     );
@@ -2342,7 +2296,7 @@ async fn probe_early_http_response(response: &'static [u8], check_outcome: impl 
         // default), plus the host's two-chunk outgoing-body channel.
         socket.set_recv_buffer_size(16 * 1024)?;
         socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
-        socket.listen(1)?.into_std()
+        LoopbackListener::from_std(socket.listen(1)?.into_std()?)
     }) {
         Ok(listener) => listener,
         Err(error) => {
@@ -2375,28 +2329,17 @@ async fn probe_early_http_response(response: &'static [u8], check_outcome: impl 
 
     // Start the accept deadline after compilation and request preparation.
     let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    // wall-clock-ok: hang guard for the real loopback server accept.
-                    assert!(Instant::now() < deadline, "server accept timed out");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("server accept failed: {error}"),
-            }
-        };
-        stream
-            .set_nonblocking(false)
-            .expect("set accepted socket blocking");
+        let mut stream = listener
+            .accept_within(Duration::from_secs(30))
+            .expect("accept loopback client");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set server read timeout");
 
-        let head = read_http_request_head(&mut stream);
+        let head = read_http_request_head(&mut stream).expect("read request head");
         assert_eq!(
-            http_request_content_length(&head),
+            http_request_content_length(&head)
+                .expect("the SDK must frame the request with Content-Length"),
             BODY_BYTES,
             "the guest must dispatch the entire large body"
         );
@@ -2476,7 +2419,7 @@ async fn wasm_guest_connection_reset_after_request_head_is_maybe_sent() {
         // Keep the large body in flight when the server resets the connection.
         socket.set_recv_buffer_size(16 * 1024)?;
         socket.bind((Ipv4Addr::LOCALHOST, 0).into())?;
-        socket.listen(1)?.into_std()
+        LoopbackListener::from_std(socket.listen(1)?.into_std()?)
     }) {
         Ok(listener) => listener,
         Err(error) => {
@@ -2509,28 +2452,17 @@ async fn wasm_guest_connection_reset_after_request_head_is_maybe_sent() {
 
     // Start the accept deadline after compilation and request preparation.
     let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    // wall-clock-ok: hang guard for the real loopback server accept.
-                    assert!(Instant::now() < deadline, "server accept timed out");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("server accept failed: {error}"),
-            }
-        };
-        stream
-            .set_nonblocking(false)
-            .expect("set accepted socket blocking");
+        let mut stream = listener
+            .accept_within(Duration::from_secs(30))
+            .expect("accept loopback client");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set server read timeout");
 
-        let head = read_http_request_head(&mut stream);
+        let head = read_http_request_head(&mut stream).expect("read request head");
         assert_eq!(
-            http_request_content_length(&head),
+            http_request_content_length(&head)
+                .expect("the SDK must frame the request with Content-Length"),
             BODY_BYTES,
             "the guest must dispatch the entire large body"
         );
@@ -2567,7 +2499,7 @@ async fn wasm_guest_connection_reset_after_request_head_is_maybe_sent() {
 async fn wasm_guest_classifies_post_body_first_byte_timeout_as_maybe_sent() {
     let path = skip_if_no_http_wasm!();
     let body = http_probe_body();
-    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+    let listener = match LoopbackListener::bind() {
         Ok(listener) => listener,
         Err(error) => {
             eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
@@ -2577,9 +2509,6 @@ async fn wasm_guest_classifies_post_body_first_byte_timeout_as_maybe_sent() {
     let server_address = listener
         .local_addr()
         .expect("bound listener has an address");
-    listener
-        .set_nonblocking(true)
-        .expect("set loopback listener nonblocking");
 
     let (factory, _cache) = load_http_factory(&path).await;
     let factory = factory.with_http_test_route("phase-test.invalid", server_address);
@@ -2603,22 +2532,11 @@ async fn wasm_guest_classifies_post_body_first_byte_timeout_as_maybe_sent() {
     let (release_server, wait_for_release) = std::sync::mpsc::channel();
     // Start both the accept deadline and the silent-server lifetime only after
     // component compilation and provider initialization have completed.
+    let request = create_request_for_test(resource).await;
     let server = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
-        let (mut stream, _) = loop {
-            match listener.accept() {
-                Ok(connection) => break connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    // wall-clock-ok: hang guard for the real loopback server accept.
-                    assert!(Instant::now() < deadline, "server accept timed out");
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(error) => panic!("server accept failed: {error}"),
-            }
-        };
-        stream
-            .set_nonblocking(false)
-            .expect("set accepted socket blocking");
+        let mut stream = listener
+            .accept_within(Duration::from_secs(30))
+            .expect("accept loopback client");
         stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("set server read timeout");
@@ -2634,10 +2552,7 @@ async fn wasm_guest_classifies_post_body_first_byte_timeout_as_maybe_sent() {
         bytes_read
     });
 
-    let outcome = provider
-        .provider()
-        .create_for_test(&id, create_request_for_test(resource).await)
-        .await;
+    let outcome = provider.provider().create_for_test(&id, request).await;
     release_server
         .send(())
         .expect("silent server should still be waiting");

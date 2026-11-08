@@ -4493,6 +4493,7 @@ pub(super) mod tests {
     use super::*;
     use carina_core::provider::SentRecord;
     use carina_core::resource::{ConcreteValue, Current, DeferredValue, ModuleSource};
+    use carina_core::test_utils::loopback::LoopbackListener;
 
     use std::borrow::Cow;
     use std::io::{Read, Write};
@@ -8461,7 +8462,7 @@ pub(super) mod tests {
     async fn close_after_receiving_request_is_reported_as_maybe_sent() {
         use wasmtime_wasi_http::p2::bindings::http::types::ErrorCode;
 
-        let listener = match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+        let listener = match LoopbackListener::bind() {
             Ok(listener) => listener,
             Err(error) => {
                 eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
@@ -8469,7 +8470,6 @@ pub(super) mod tests {
             }
         };
         let server_address = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
         let request = hyper::Request::builder()
             .uri(format!(
                 "http://phase-test.invalid:{}/",
@@ -8495,24 +8495,9 @@ pub(super) mod tests {
             test_destination,
         );
         let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let (mut stream, _) = loop {
-                match listener.accept() {
-                    Ok(connection) => break connection,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        // wall-clock-ok: hang guard for the real loopback server accept.
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "server accept timed out"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("server accept failed: {error:?}"),
-                }
-            };
-            stream
-                .set_nonblocking(false)
-                .expect("set accepted socket blocking");
+            let mut stream = listener
+                .accept_within(std::time::Duration::from_secs(5))
+                .expect("accept loopback client");
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(2)))
                 .unwrap();
@@ -8535,7 +8520,7 @@ pub(super) mod tests {
     async fn redirect_response_is_surfaced_and_follow_up_is_rechecked() {
         use wasmtime_wasi::p2::Pollable;
 
-        let listener = match std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+        let listener = match LoopbackListener::bind() {
             Ok(listener) => listener,
             Err(error) => {
                 eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
@@ -8543,37 +8528,6 @@ pub(super) mod tests {
             }
         };
         let server_address = listener.local_addr().unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let server = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            let (mut stream, _) = loop {
-                match listener.accept() {
-                    Ok(connection) => break connection,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        // wall-clock-ok: hang guard for the real loopback server accept.
-                        assert!(
-                            std::time::Instant::now() < deadline,
-                            "server accept timed out"
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("server accept failed: {error:?}"),
-                }
-            };
-            stream
-                .set_nonblocking(false)
-                .expect("set accepted socket blocking");
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
-                .unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).unwrap();
-            stream
-                .write_all(
-                    b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                )
-                .unwrap();
-        });
 
         let mut hooks = AllowListHttpHooks::with_test_route(
             local_provider_label("mock_http"),
@@ -8596,6 +8550,22 @@ pub(super) mod tests {
             first_byte_timeout: std::time::Duration::from_secs(2),
             between_bytes_timeout: std::time::Duration::from_secs(2),
         };
+
+        let server = std::thread::spawn(move || {
+            let mut stream = listener
+                .accept_within(std::time::Duration::from_secs(5))
+                .expect("accept loopback client");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 302 Found\r\nLocation: http://169.254.169.254/latest/meta-data/\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .unwrap();
+        });
 
         let mut response =
             wasmtime_wasi_http::p2::WasiHttpHooks::send_request(&mut hooks, request, config)
