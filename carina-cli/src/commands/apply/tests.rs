@@ -17,15 +17,16 @@ use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, Schema
 use carina_core::schema::{
     PatternAttributeSchema, PatternAttributeType, PatternResourceSchema, PatternStructField,
 };
+use carina_core::test_utils::loopback::{ArmedLoopbackServer, LoopbackListener, read_http_request};
 use carina_state::{DeposedInstance, DeposedKey, NameOverride, ResourceState};
 use indexmap::IndexMap;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener};
+use std::io::Write;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[path = "tests/cancellation_fixture.rs"]
 mod cancellation_fixture;
@@ -323,8 +324,8 @@ fn mock_http_test_egress(
 
 fn spawn_mock_http_server(
     expected_requests: usize,
-) -> Option<(SocketAddr, std::thread::JoinHandle<Vec<usize>>)> {
-    let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) {
+) -> Option<(SocketAddr, ArmedLoopbackServer<Vec<usize>>)> {
+    let listener = match LoopbackListener::bind() {
         Ok(listener) => listener,
         Err(error) => {
             eprintln!("SKIP: sandbox cannot bind the loopback test server: {error}");
@@ -332,33 +333,23 @@ fn spawn_mock_http_server(
         }
     };
     let address = listener.local_addr().expect("loopback listener address");
-    listener
-        .set_nonblocking(true)
-        .expect("set loopback listener nonblocking");
-    let server = std::thread::spawn(move || {
+    let server = listener.spawn_armed(move |listener| {
         let mut request_sizes = Vec::with_capacity(expected_requests);
-        let deadline = Instant::now() + Duration::from_secs(30);
         while request_sizes.len() < expected_requests {
-            let (mut stream, _) = loop {
-                match listener.accept() {
-                    Ok(connection) => break connection,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        // wall-clock-ok: hang guard for the real loopback server accept; no speed property is asserted.
-                        assert!(Instant::now() < deadline, "server accept timed out");
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("server accept failed: {error}"),
-                }
+            let Some(mut stream) = listener
+                .accept_within(Duration::from_secs(30))
+                .expect("accept loopback client")
+            else {
+                break;
             };
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("set server read timeout");
-            let mut request = vec![0_u8; 32 * 1024];
-            let bytes_read = stream.read(&mut request).expect("read dispatched request");
+            let request = read_http_request(&mut stream).expect("read dispatched request");
             stream
                 .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                 .expect("write HTTP response");
-            request_sizes.push(bytes_read);
+            request_sizes.push(request.len());
         }
         request_sizes
     });
@@ -540,6 +531,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
     let fresh_resources = vec![resolved(fresh_resource)];
     let mut fresh_plan = Plan::new();
     fresh_plan.add(Effect::Create(fresh_resources[0].clone()));
+    server.arm().expect("arm fresh mock HTTP request");
     let fresh_result = execute_mock_http_plan(
         &fresh_provider,
         &factories,
@@ -676,6 +668,7 @@ async fn wasm_trap_after_egress_writeback_preserves_fresh_and_replacement_recove
         .upsert_resource(old_row)
         .expect("insert old applied state");
 
+    server.arm().expect("arm replacement mock HTTP request");
     let replacement_result = execute_mock_http_plan(
         &replacement_provider,
         &factories,
