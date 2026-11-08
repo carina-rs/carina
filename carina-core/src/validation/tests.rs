@@ -5239,7 +5239,7 @@ fn directional_relation_rejects_plain_string_for_identified_sink() {
         TypeIdentity::bare("VpcId"),
         None,
         None,
-        legacy_validator(noop),
+        legacy_validator(move |value| noop(value).map_err(Into::into)),
         None,
     );
     assert!(
@@ -5294,7 +5294,7 @@ fn directional_relation_accepts_string_through_plain_union_member() {
             TypeIdentity::bare("VpcId"),
             None,
             None,
-            legacy_validator(noop),
+            legacy_validator(move |value| noop(value).map_err(Into::into)),
             None,
         ),
     ]);
@@ -5322,7 +5322,7 @@ fn directional_relation_rejects_string_for_union_of_only_identified_sinks() {
             TypeIdentity::bare(name),
             None,
             None,
-            legacy_validator(noop),
+            legacy_validator(move |value| noop(value).map_err(Into::into)),
             None,
         )
     };
@@ -5375,7 +5375,7 @@ fn lifted_simple_vpc_id_accepts_matching_custom_identity() {
         TypeIdentity::bare("VpcId"),
         None,
         None,
-        legacy_validator(noop),
+        legacy_validator(move |value| noop(value).map_err(Into::into)),
         None,
     );
     // Parser normalizes `: VpcId` to crate::parser::bare_type_for_test("vpc_id") (snake).

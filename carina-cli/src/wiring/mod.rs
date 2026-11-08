@@ -5022,7 +5022,7 @@ fn source_provider_kind_mismatch_from_load_error(
         | carina_plugin_host::WasmProviderLoadError::AwsCredentials(_)
         | carina_plugin_host::WasmProviderLoadError::AwsCredentialsImportMissing
         | carina_plugin_host::WasmProviderLoadError::AwsCredentialsRequired
-        | carina_plugin_host::WasmProviderLoadError::Metadata { .. }
+        | carina_plugin_host::WasmProviderLoadError::Metadata(..)
         | carina_plugin_host::WasmProviderLoadError::Other(_) => None,
     }
 }

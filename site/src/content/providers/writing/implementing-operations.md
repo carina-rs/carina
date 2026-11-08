@@ -19,6 +19,7 @@ pub struct Widget {
     pub size: i64,
 }
 
+#[derive(Debug)]
 pub enum ApiError {
     /// The API rejected the request; nothing was changed.
     Rejected(String),
@@ -27,6 +28,16 @@ pub enum ApiError {
     /// The outcome is unknown: a timeout, a dropped connection, a 5xx.
     Unknown(String),
 }
+
+impl std::fmt::Display for ApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(message) | Self::Unknown(message) => f.write_str(message),
+            Self::NotFound => f.write_str("widget not found"),
+        }
+    }
+}
+impl std::error::Error for ApiError {}
 
 pub enum CreateStatus {
     InProgress,
@@ -60,6 +71,7 @@ use std::collections::BTreeMap;
 
 use carina_plugin_sdk::core::schema::ReferenceForms;
 use carina_plugin_sdk::types::*;
+use carina_plugin_sdk::core::provider_text::{ProviderDiagnostic, ProviderText};
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never,
     Pending, PhasedToken, Poll, PollFinality, PollRequest, PollVerdict, Resume,
@@ -118,29 +130,23 @@ The component exports one concrete type, for example `export_provider!(WidgetPro
 // --- errors ---------------------------------------------------------------
 
 fn error(kind: ProviderErrorKind, message: impl Into<String>) -> ProviderError {
-    ProviderError {
+    let message = message.into();
+    let error = ProviderError::from_diagnostic(
         kind,
-        message: message.into(),
-        resource_id: None,
-        cause: None,
-        provider_name: Some("widget".to_string()),
-        operation: None,
-        status: None,
-        code: None,
-        request_id: None,
-    }
+        ProviderDiagnostic::message(ProviderText::new(message)),
+    );
+    error.for_provider("widget")
 }
 
 fn api_error(operation: &str, err: ApiError) -> ProviderError {
-    let (kind, message) = match err {
-        ApiError::Rejected(message) => (ProviderErrorKind::InvalidInput, message),
-        ApiError::NotFound => (ProviderErrorKind::NotFound, "widget not found".to_string()),
-        ApiError::Unknown(message) => (ProviderErrorKind::ApiError, message),
+    let kind = match &err {
+        ApiError::Rejected(_) => ProviderErrorKind::InvalidInput,
+        ApiError::NotFound => ProviderErrorKind::NotFound,
+        ApiError::Unknown(_) => ProviderErrorKind::ApiError,
     };
-    ProviderError {
-        operation: Some(operation.to_string()),
-        ..error(kind, message)
-    }
+    ProviderError::from_diagnostic(kind, err)
+        .for_provider("widget")
+        .with_operation(operation)
 }
 
 // --- attributes -----------------------------------------------------------
@@ -166,16 +172,43 @@ fn desired(resource: &Resource) -> Result<(String, i64), ProviderError> {
 }
 
 fn identifier(id: &str) -> Result<AppliedIdentifier, ProviderError> {
-    AppliedIdentifier::new(id).map_err(|_| {
-        error(
-            ProviderErrorKind::Internal,
-            "the API returned an empty widget ID",
-        )
+    AppliedIdentifier::new(id).map_err(|source| {
+        ProviderError::internal_caused_by("the API returned an empty widget ID", source)
+            .for_provider("widget")
     })
 }
 ```
 
-`ProviderError` carries a `kind` and a message, and optional details: `cause` (the underlying error, flattened to text), and from a cloud API, `operation`, `status`, `code` and `request_id`. Fill the details when they come from an API response; Carina shows them on separate lines. The kinds are `InvalidInput`, `ApiError`, `NotFound`, `Timeout` and `Internal`.
+`ProviderError` is the core opaque error, including in SDK authoring code. Message-only constructors accept strings or `ProviderText`. The five kinds are `InvalidInput`, `ApiError`, `NotFound`, `Timeout` and `Internal`. Attach cloud metadata with `with_operation`, `with_status`, `with_code` and `with_request_id`; Carina displays it on separate lines.
+
+### Composing errors
+
+Use the corresponding `*_caused_by(context, cause)` constructor to add context to a foreign error, a `ProviderError`, or a `ProviderDiagnostic`. Static strings convert to `ProviderContext`; wrap runtime context in `ProviderText`. This single operation preserves the complete cause, carried secret inventories and retry policy:
+
+```rust
+use carina_plugin_sdk::core::provider::ProviderError;
+use carina_plugin_sdk::core::provider_text::{ProviderDiagnostic, ProviderText, Retryability};
+
+let read = ProviderError::api_error_caused_by(
+    "read failed", std::io::Error::other("service failure"),
+).with_retryability(Retryability::Transient);
+let context = ProviderText::new(format!("missing attributes: {}", "name"))
+    .with_context("post-update read-back incomplete");
+let error = ProviderError::api_error_caused_by(context, read);
+assert!(error.is_transient());
+assert!(error.detail().cause().unwrap().source_is::<std::io::Error>());
+
+// Capture once when an observation and a verdict report the same failure.
+let source = ProviderDiagnostic::new(error);
+let observation = ProviderError::internal_caused_by("read-back failed", source.clone());
+let verdict = ProviderError::internal_caused_by("read-back failed", source);
+```
+
+`from_diagnostic(kind, source)` adopts the complete diagnostic without adding context. Its text is rendered once. `ProviderDiagnostic::message(ProviderText)` creates an explicitly message-only reason. Errors and diagnostics do not convert to `ProviderText`; there is no `from_text` replacement-text API.
+
+A cause-bearing error inherits retryability automatically. Foreign errors start as `Unclassified`; attach SDK or provider policy to the composed error with `with_retryability(Retryability::Transient)`. `with_retryability(Retryability::Unclassified)` explicitly clears inherited retryability. A foreign wrapper inherits the nearest `Transient` classification in its source chain. `is_transient()` is true only for `Transient`; the `Timeout` kind alone does not imply it.
+
+Diagnostics share immutable causal storage when cloned. Each handle has its own text view, so binding one handle does not change another. There is one causal parent; combining independent typed causes is unsupported. SDK encoding flattens native causes and partial reasons to the existing version-24 wire records. In wasm provider code, encoding returns plain wire records containing flattened text and metadata. These records retain neither typed sources nor retryability, and the wire decoder is private to the host. Keep the authored error or diagnostic when composing another failure; use the encoded record for transport.
 
 ## read
 
@@ -332,17 +365,14 @@ fn poll_create(
                     .into()),
                 // The deadline poll must finish. Preserve the applied state
                 // and tell Carina which value still needs a later refresh.
-                Err(_) if poll_request.finality == PollFinality::FinalAttempt => {
+                Err(reason) if poll_request.finality == PollFinality::FinalAttempt => {
                     Ok(issued.partial(
                         BTreeMap::new(),
-                        PartialReadDiagnostic {
-                            reason: "widget read-back is still pending".to_string(),
-                            missing_attributes: vec![
-                                "name".to_string(),
-                                "size".to_string(),
-                                "status".to_string(),
-                            ],
-                        },
+                        PartialReadDiagnostic::new(
+                            carina_plugin_sdk::core::provider_text::ProviderDiagnostic::new(reason),
+                            vec!["name".to_string(), "size".to_string(), "status".to_string()]
+                                .try_into().expect("missing attributes are nonempty"),
+                        ),
                     ))
                 }
                 // Keep the read-back continuation and surface the read error.
@@ -389,14 +419,13 @@ fn poll_create(
                         // identifier and settle without starting another poll.
                         Ok(issued.partial(
                             BTreeMap::new(),
-                            PartialReadDiagnostic {
-                                reason: "widget read-back is still pending".to_string(),
-                                missing_attributes: vec![
-                                    "name".to_string(),
-                                    "size".to_string(),
-                                    "status".to_string(),
-                                ],
-                            },
+                            PartialReadDiagnostic::new(
+                            carina_plugin_sdk::core::provider_text::ProviderDiagnostic::message(
+                                "widget read-back is still pending".into(),
+                            ),
+                            vec!["name".to_string(), "size".to_string(), "status".to_string()]
+                                .try_into().expect("missing attributes are nonempty"),
+                        ),
                         ))
                     } else {
                         Ok(issued.pending(CreateToken::ReadBack, 1))
@@ -531,7 +560,7 @@ fn update(
     }
     let state = request.state_after_patch();
     Ok(UpdateOutcome::Done(
-        carina_plugin_sdk::protocol::UpdateOutcome::Success {
+        carina_plugin_sdk::types::UpdateOutcome::Success {
             state: AppliedPersistedState {
                 id: id.clone(),
                 identifier: identifier.clone(),
@@ -542,11 +571,11 @@ fn update(
 }
 ```
 
-Apply exactly the operations in the patch and nothing else. Check every operation before the first API call, so an operation the provider cannot apply does not leave the others half done. `request.from` is the last persisted state, and `request.state_after_patch()` returns it with the patch applied, which is usually what the update should report. The SDK's `UpdateOutcome` is either `Done` or `Pending`. `Done` wraps the protocol's own `UpdateOutcome`, whose `Success` variant carries an `AppliedPersistedState`: the resource's identifier and its attributes after the update. `Add` and `Replace` both mean "set this value". `Remove` means the attribute was dropped from the configuration: unset it, or reset it to the API's default, and `state_after_patch` drops the key. `Reassert` carries an unchanged write-only value that the API needs again; send it like `Replace`. In `widget`, `size` is required and `name` is create-only, so no `Remove` and no change to `name` ever reaches `update`; the catch-all arm rejects anything the schema should have prevented.
+Apply exactly the operations in the patch and nothing else. Check every operation before the first API call, so an operation the provider cannot apply does not leave the others half done. `request.from` is the last persisted state, and `request.state_after_patch()` returns it with the patch applied, which is usually what the update should report. The SDK's `UpdateOutcome` is either `Done` or `Pending`. `Done` wraps the SDK's `types::UpdateOutcome`, whose `Success` variant carries an `AppliedPersistedState`: the resource's identifier and its attributes after the update. `Add` and `Replace` both mean "set this value". `Remove` means the attribute was dropped from the configuration: unset it, or reset it to the API's default, and `state_after_patch` drops the key. `Reassert` carries an unchanged write-only value that the API needs again; send it like `Replace`. In `widget`, `size` is required and `name` is create-only, so no `Remove` and no change to `name` ever reaches `update`; the catch-all arm rejects anything the schema should have prevented.
 
 `from` holds a secret value as a hash, never the secret itself. If the update needs a secret, it is in the patch.
 
-If the update succeeded but reading the result back failed, return `PartialSuccess` with a `PartialReadDiagnostic` that names the missing attributes, instead of an error. The update did happen, and Carina records it.
+If the update succeeded but reading the result back failed, return `PartialSuccess` with a `PartialReadDiagnostic`. Construct it with `PartialReadDiagnostic::new(ProviderDiagnostic::new(error), missing)`, where `missing` is a `NonEmptyMissingAttributes` obtained with `TryFrom<Vec<String>>`. Check the attributes before moving the error. Create, resumed-create and update partials retain the typed reason and its retryability until SDK encoding. Persistence and the wire keep the existing reason string. Incoming empty wire partials still decode as success.
 
 ## delete
 
@@ -573,7 +602,7 @@ Treat "already gone" as success. Carina does not special-case a `NotFound` error
 
 ## Secrets
 
-Create, update and data-source input attributes reach the provider in plain text, including values the configuration wrapped in `secret(...)`. Desired normalization keeps secret leaves opaque, as described below. Carina masks them in plan output and stores only a hash in state, but inside the provider they are ordinary strings. Never put attribute values into error messages, `cause`, logs or pending tokens. That includes API error text that repeats request values back, which many validation errors do; replace it with your own message when the request contains a secret. Error messages and causes are printed, and create tokens are written to state.
+Create, update and data-source input attributes reach the provider in plain text, including values the configuration wrapped in `secret(...)`. Desired normalization keeps secret leaves opaque, as described below. Carina masks them in plan output and stores only a hash in state, but inside the provider they are ordinary strings. Return API errors as typed causes so Carina can bind their text to the provider's input-secret inventory before rendering. Avoid copying raw attribute values into logs or pending tokens; tokens are written to state. Carina redacts carried context, causes and provider metadata together, including after cloning and nested composition.
 
 ## Data sources
 
@@ -665,7 +694,7 @@ fn normalize_wasm(resource: DesiredResource) -> Result<NormalizedResource, Provi
 }
 ```
 
-Native builders and `finish()` return core `ProviderResult`, attaching the original resource id including its provider instance. Use `?` to propagate them; the terminal `ProviderError` retains the typed `NormalizationError` through `detail().cause()`, with nested conversion errors reachable through that cause's `source()`. Guest normalization errors convert through `?` to the protocol's string-only diagnostic channel.
+Native builders and `finish()` return core `ProviderResult`, attaching the original resource id including its provider instance. Use `?` to propagate them; the terminal `ProviderError` retains the typed `NormalizationError` through `detail().cause()`, with nested conversion errors reachable through that cause's `source()`. Guest normalization errors convert through `?` to the core opaque error; SDK encoding flattens them into the protocol diagnostic channel.
 
 ## Next steps
 

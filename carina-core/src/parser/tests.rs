@@ -12792,8 +12792,8 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
                             ) if *value == accepted => Ok(()),
                             crate::resource::ExpandedValue::Concrete(
                                 crate::resource::ExpandedConcreteValue::Int(value),
-                            ) => Err(format!("expected {accepted}, got {value}")),
-                            _ => Err("Expected integer".to_string()),
+                            ) => Err((format!("expected {accepted}, got {value}")).into()),
+                            _ => Err(("Expected integer".to_string()).into()),
                         }),
                     ),
                 )

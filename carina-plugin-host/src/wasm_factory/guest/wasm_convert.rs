@@ -51,8 +51,8 @@ use super::version_checked_bindings::{WitPlanOp, wit_types as wit};
 pub use super::super::diagnostics::SchemaDecodeError;
 pub(super) use super::super::diagnostics::WasmAppliedStateDecodeError;
 use super::super::diagnostics::{
-    AppliedStateOperation, PendingToken, WasmValueDecodeError, WasmValueDecodeErrorKind,
-    WitValueVariant,
+    AppliedStateOperation, FlattenedWireCause, PendingToken, WasmValueDecodeError,
+    WasmValueDecodeErrorKind, WitValueVariant,
 };
 
 fn decode_float(value: f64) -> Result<carina_provider_protocol::FiniteF64, WasmValueDecodeError> {
@@ -1310,13 +1310,20 @@ pub(crate) fn wit_to_core_create_step(
             decode_created_attributes(state, id, Some(proto::Sent::AllRequestAttributes), None).map(
                 |decoded| {
                     decoded.map(|(identifier, attributes)| {
-                        match CorePartialReadDiagnostic::new(reason.into(), missing_attributes) {
-                            Some(diagnostic) => proto::CreateStep::PartialSuccess {
+                        match carina_core::provider::NonEmptyMissingAttributes::try_from(
+                            missing_attributes,
+                        ) {
+                            Ok(missing) => proto::CreateStep::PartialSuccess {
                                 identifier,
                                 attributes,
-                                diagnostic,
+                                diagnostic: CorePartialReadDiagnostic::new(
+                                    carina_core::provider_text::ProviderDiagnostic::message(
+                                        reason.into(),
+                                    ),
+                                    missing,
+                                ),
                             },
-                            None => proto::CreateStep::Success {
+                            Err(_) => proto::CreateStep::Success {
                                 identifier,
                                 attributes,
                             },
@@ -1445,13 +1452,20 @@ pub(crate) fn wit_to_core_resume_step(
             } = diagnostic;
             decode_created_attributes(state, id, None, None).map(|decoded| {
                 decoded.map(|(identifier, attributes)| {
-                    match CorePartialReadDiagnostic::new(reason.into(), missing_attributes) {
-                        Some(diagnostic) => proto::ResumeStep::PartialSuccess {
+                    match carina_core::provider::NonEmptyMissingAttributes::try_from(
+                        missing_attributes,
+                    ) {
+                        Ok(missing) => proto::ResumeStep::PartialSuccess {
                             identifier,
                             attributes,
-                            diagnostic,
+                            diagnostic: CorePartialReadDiagnostic::new(
+                                carina_core::provider_text::ProviderDiagnostic::message(
+                                    reason.into(),
+                                ),
+                                missing,
+                            ),
                         },
-                        None => proto::ResumeStep::Completed {
+                        Err(_) => proto::ResumeStep::Completed {
                             identifier,
                             attributes,
                         },
@@ -1546,13 +1560,18 @@ pub(crate) fn wit_to_core_update_outcome(
                 reason,
                 missing_attributes,
             } = diagnostic;
-            Ok(WasmUpdateOutcome::Done(Box::new(
-                CoreUpdateOutcome::partial_success(
-                    wit_to_core_applied_persisted_state(state, id)?,
-                    reason.into(),
-                    missing_attributes,
+            let state = wit_to_core_applied_persisted_state(state, id)?;
+            let outcome = match carina_core::provider::NonEmptyMissingAttributes::try_from(
+                missing_attributes,
+            ) {
+                Ok(missing) => CoreUpdateOutcome::partial_success(
+                    state,
+                    carina_core::provider_text::ProviderDiagnostic::message(reason.into()),
+                    missing,
                 ),
-            )))
+                Err(_) => CoreUpdateOutcome::success(state),
+            };
+            Ok(WasmUpdateOutcome::Done(Box::new(outcome)))
         }
         wit::UpdateOutcome::Pending(pending) => Ok(WasmUpdateOutcome::Pending(
             UpdatePendingOperation(PendingOperation::from_wit(pending)),
@@ -1695,12 +1714,63 @@ pub(crate) fn wit_to_wire_provider_error(err: wit::ProviderError) -> proto::Prov
     }
 }
 
+/// Rehydrate untrusted wire text only inside the native host decoder.
+/// Provider authoring has no entry point accepting this record.
+fn decode_provider_error(error: proto::ProviderError) -> CoreProviderError {
+    use carina_core::provider::ProviderErrorKind;
+    use carina_core::provider_text::{ProviderDiagnostic, ProviderErrorText, ProviderText};
+    let kind = match error.kind {
+        proto::ProviderErrorKind::InvalidInput => ProviderErrorKind::InvalidInput,
+        proto::ProviderErrorKind::ApiError => ProviderErrorKind::ApiError,
+        proto::ProviderErrorKind::NotFound => ProviderErrorKind::NotFound,
+        proto::ProviderErrorKind::Timeout => ProviderErrorKind::Timeout,
+        proto::ProviderErrorKind::Internal => ProviderErrorKind::Internal,
+    };
+    let mut decoded = match error.cause {
+        Some(cause) => {
+            let context = ProviderText::new(error.message);
+            let cause = FlattenedWireCause::new(cause);
+            match kind {
+                ProviderErrorKind::InvalidInput => {
+                    CoreProviderError::invalid_input_caused_by(context, cause)
+                }
+                ProviderErrorKind::ApiError => {
+                    CoreProviderError::api_error_caused_by(context, cause)
+                }
+                ProviderErrorKind::NotFound => {
+                    CoreProviderError::not_found_caused_by(context, cause)
+                }
+                ProviderErrorKind::Timeout => CoreProviderError::timeout_caused_by(context, cause),
+                ProviderErrorKind::Internal => {
+                    CoreProviderError::internal_caused_by(context, cause)
+                }
+            }
+        }
+        None => CoreProviderError::from_diagnostic(
+            kind,
+            ProviderDiagnostic::message(error.message.into()),
+        ),
+    };
+    if let Some(id) = error.resource_id {
+        decoded = decoded.for_resource(carina_core::protocol_convert::protocol_to_resource_id(&id));
+    }
+    if let Some(code) = error.code {
+        decoded = decoded.with_code(code);
+    }
+    let detail = decoded.detail_mut();
+    detail.provider_name = error.provider_name.map(ProviderErrorText::new);
+    detail.operation = error.operation.map(ProviderErrorText::new);
+    detail.status = error.status;
+    detail.request_id = error.request_id.map(ProviderErrorText::new);
+    decoded
+}
+
 /// Convert a WIT [`wit::ProviderError`] into the host-side core
 /// [`CoreProviderError`]. The variant is preserved exactly; the
 /// flattened `cause` string is rehydrated as a typed `FlattenedWireCause` inside
-/// [`CoreProviderError::from_wire`].
+/// the host-private wire decoder.
 pub(crate) fn wit_to_core_provider_error(err: wit::ProviderError) -> CoreProviderError {
-    CoreProviderError::from_wire(wit_to_wire_provider_error(err))
+    decode_provider_error(wit_to_wire_provider_error(err))
 }
 
 pub(crate) fn decode_reference_results(
@@ -1712,9 +1782,7 @@ pub(crate) fn decode_reference_results(
     results
         .into_iter()
         .map(|result| match result {
-            Ok(wit::ReferenceOutcome::Resolved(value)) => {
-                ReferenceOutcome::from_guest(proto::ReferenceOutcome::Resolved(value))
-            }
+            Ok(wit::ReferenceOutcome::Resolved(value)) => ReferenceOutcome::from_guest(value),
             Ok(wit::ReferenceOutcome::NotFound(error)) => Ok(ReferenceOutcome::NotFound(
                 wit_to_core_provider_error(error),
             )),
@@ -1824,8 +1892,10 @@ mod reference_tests {
 /// configured name in both built-in and source-loaded paths. Keeping the
 /// decoded [`CoreProviderError`] intact preserves its kind, source text,
 /// resource id, and structured cloud fields.
-pub fn decode_provider_initialization_error(error: proto::ProviderError) -> CoreProviderError {
-    let mut error = CoreProviderError::from_wire(error);
+pub(crate) fn decode_provider_initialization_error(
+    error: proto::ProviderError,
+) -> CoreProviderError {
+    let mut error = decode_provider_error(error);
     if error.detail().operation.is_none() {
         error.detail_mut().operation = Some("initialize".into());
     }
@@ -2809,7 +2879,7 @@ mod tests {
                         None,
                         legacy_validator(|value| match value {
                             CoreValue::Concrete(ConcreteValue::Int(value)) if *value > 0 => Ok(()),
-                            _other => Err("count must be positive".to_string()),
+                            _other => Err(("count must be positive".to_string()).into()),
                         }),
                     ),
                 )
@@ -4717,6 +4787,8 @@ mod tests {
             !decoded
                 .detail()
                 .provider_name
+                .as_ref()
+                .map(|text| text.as_diagnostic())
                 .as_deref()
                 .unwrap()
                 .contains('\x1b')
@@ -4840,11 +4912,32 @@ mod tests {
         assert!(matches!(back, CoreProviderError::ApiError(_)));
         let detail = back.detail();
         assert_eq!(detail.context(), "Failed to read");
-        assert_eq!(detail.provider_name.as_deref(), Some("aws"));
-        assert_eq!(detail.operation.as_deref(), Some("s3.HeadBucket"));
+        assert_eq!(
+            detail
+                .provider_name
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("aws")
+        );
+        assert_eq!(
+            detail
+                .operation
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("s3.HeadBucket")
+        );
         assert_eq!(detail.status, Some(503));
-        assert_eq!(detail.code(), Some("ServiceUnavailable"));
-        assert_eq!(detail.request_id.as_deref(), Some("request-123"));
+        assert_eq!(detail.code().as_deref(), Some("ServiceUnavailable"));
+        assert_eq!(
+            detail
+                .request_id
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("request-123")
+        );
         let rid = detail
             .resource_id
             .as_ref()
@@ -4883,11 +4976,22 @@ mod tests {
         let wit_err = wire_to_wit_provider_error(err.to_wire());
         let back = wit_to_core_provider_error(wit_err).into_host_for_test();
         let detail = back.detail();
-        assert_eq!(detail.operation.as_deref(), Some("iam.ListRoles"));
-        assert_eq!(detail.status, Some(403));
-        assert_eq!(detail.code(), Some("AccessDenied"));
         assert_eq!(
-            detail.request_id.as_deref(),
+            detail
+                .operation
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("iam.ListRoles")
+        );
+        assert_eq!(detail.status, Some(403));
+        assert_eq!(detail.code().as_deref(), Some("AccessDenied"));
+        assert_eq!(
+            detail
+                .request_id
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
             Some("997aa923-2aa4-4d2b-8d16-44fd21c81368"),
         );
     }

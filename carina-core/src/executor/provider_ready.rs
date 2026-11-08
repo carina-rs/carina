@@ -681,8 +681,7 @@ impl From<ProviderWireError> for ProviderConfigPreparationError {
 
 impl From<ProviderConfigPreparationError> for crate::provider::HostError {
     fn from(error: ProviderConfigPreparationError) -> Self {
-        Self::from_diagnostic(
-            crate::provider::ProviderErrorKind::Internal,
+        Self::internal_caused_by(
             "Failed to prepare provider configuration",
             crate::provider_text::HostDiagnostic::capture_host_or_provider(error),
         )

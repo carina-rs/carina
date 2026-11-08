@@ -5591,7 +5591,9 @@ fn resource_ref_type_check_helper_regression() {
                     carina_core::schema::enum_identity("MyId", Some("test")),
                     None,
                     vec![],
-                    Some(legacy_validator(dummy_validate)),
+                    Some(legacy_validator(move |value| {
+                        dummy_validate(value).map_err(Into::into)
+                    })),
                     None,
                 ),
             )
@@ -5627,7 +5629,9 @@ fn resource_ref_type_check_helper_regression() {
                     carina_core::schema::enum_identity("MyId", Some("test")),
                     None,
                     vec![],
-                    Some(legacy_validator(dummy_validate)),
+                    Some(legacy_validator(move |value| {
+                        dummy_validate(value).map_err(Into::into)
+                    })),
                     None,
                 ),
             )
@@ -6275,7 +6279,7 @@ fn distinct_semantic_customs_are_rejected() {
                     ),
                     None,
                     None,
-                    legacy_validator(validate_account_id),
+                    legacy_validator(move |value| validate_account_id(value).map_err(Into::into)),
                     None,
                 ),
             )
@@ -6294,7 +6298,7 @@ fn distinct_semantic_customs_are_rejected() {
                 ),
                 None,
                 None,
-                legacy_validator(validate_target_id),
+                legacy_validator(move |value| validate_target_id(value).map_err(Into::into)),
                 None,
             ),
         )
@@ -6614,11 +6618,12 @@ fn exports_cross_file_ref_no_false_positive() {
             {
                 Ok(())
             }
-            Value::Concrete(ConcreteValue::String(s)) => Err(format!(
+            Value::Concrete(ConcreteValue::String(s)) => Err((format!(
                 "must be exactly 12 digits, got {} characters",
                 s.expose_plaintext().len()
-            )),
-            _ => Err("expected string".to_string()),
+            ))
+            .into()),
+            _ => Err(("expected string".to_string()).into()),
         }),
         None,
     );

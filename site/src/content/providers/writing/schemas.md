@@ -427,7 +427,7 @@ assert!(color.validate(&black).is_err());
 assert!(color.validate(&red).is_ok());
 ```
 
-`validator` takes a closure that returns a `TypeError`. `legacy_validator` takes one that returns `Result<(), String>` and wraps the message for you.
+`validator` takes a closure that returns a `TypeError`. `legacy_validator` takes one that returns `Result<(), ProviderValidation>` and wraps it in `TypeError::ValidationFailed`. Convert message strings with `.into()`, or use `ProviderDiagnostic::new(source).into()` to retain a typed cause. The custom-type dispatch carrier keeps the complete `TypeError`, including enum and quick-fix data; it becomes an opaque provider error at the validation boundary.
 
 The closure runs inside the provider's WebAssembly component. When the host validates a value, it sends the type identity and the value to the provider, which runs every validator it registered for that identity. The identity is therefore the type's name across the whole provider, not just one attribute: if two schemas declare the same identity with different validators, a value of that type must pass both. Give each distinct type its own identity, reuse one only for types that mean the same thing, and use the same scalar kind for every declaration of it (`validate()` rejects an identity used as both a string and an int). Even without a validator, an identity names the type in diagnostics and in the editor.
 

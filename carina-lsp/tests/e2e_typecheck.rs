@@ -369,7 +369,9 @@ fn region_schemas() -> SchemaRegistry {
         carina_core::schema::enum_identity("Region", Some("test")),
         None,
         vec![],
-        Some(legacy_validator(validate_region)),
+        Some(legacy_validator(move |value| {
+            validate_region(value).map_err(Into::into)
+        })),
         Some(carina_core::schema::DslTransform::HyphenToUnderscore),
     );
 

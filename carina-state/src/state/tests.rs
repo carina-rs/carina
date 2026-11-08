@@ -8209,7 +8209,12 @@ fn provider_text_partial_create_writeback_preserves_raw_missing_attribute_keys()
                 PersistedAttributes::default(),
             );
         let reason = format!("incomplete {key}");
-        let diagnostic = PartialReadDiagnostic::new(reason.clone(), vec![key.clone()]).unwrap();
+        let diagnostic = PartialReadDiagnostic::new(
+            reason.clone(),
+            (vec![key.clone()])
+                .try_into()
+                .expect("nonempty partial attributes"),
+        );
         assert_eq!(diagnostic.raw_reason(), reason);
         assert!(!diagnostic.reason().contains('\x1b'));
         assert!(diagnostic.reason().len() <= carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES);
@@ -8278,9 +8283,10 @@ fn resumed_partial_create_records_exact_missing_attributes() {
     .unwrap();
     let diagnostic = PartialReadDiagnostic::new(
         "read-back remained incomplete".to_string(),
-        vec!["computed".to_string()],
-    )
-    .unwrap();
+        (vec!["computed".to_string()])
+            .try_into()
+            .expect("nonempty partial attributes"),
+    );
     let created = IdentifiedCreate::from_in_flight_for_test(
         pending,
         identifier.clone(),

@@ -1521,9 +1521,12 @@ mod process_basic_result_tests {
         let resource: Resource = Resource::with_provider("mock", "test.resource", "r1", None);
         let id = resource.id.clone();
         let state = State::existing(id.clone(), HashMap::new()).with_identifier("mock-id");
-        let diagnostic =
-            PartialReadDiagnostic::new("mock partial create".into(), vec!["computed".to_string()])
-                .expect("missing attributes are non-empty");
+        let diagnostic = PartialReadDiagnostic::new(
+            "mock partial create".into(),
+            (vec!["computed".to_string()])
+                .try_into()
+                .expect("nonempty partial attributes"),
+        );
         let writeback_state = diagnostic.clone().into_state_for_writeback(state.clone());
         let (mut accumulator, _) = ExecutionAccumulator::new(empty_execution_result());
         let mut failed_indices = HashSet::new();
@@ -1631,9 +1634,10 @@ mod process_basic_result_tests {
         .with_identifier("mock-id");
         let diagnostic = PartialReadDiagnostic::new(
             "computed is not visible yet".to_string(),
-            vec!["computed".to_string()],
-        )
-        .expect("missing attributes are non-empty");
+            (vec!["computed".to_string()])
+                .try_into()
+                .expect("nonempty partial attributes"),
+        );
         let writeback_state = diagnostic.clone().into_state_for_writeback(state);
         let (mut accumulator, _) = ExecutionAccumulator::new(empty_execution_result());
         let mut failed_indices = HashSet::new();
@@ -1689,9 +1693,10 @@ mod process_basic_result_tests {
         .with_identifier("mock-id");
         let diagnostic = PartialReadDiagnostic::new(
             "computed is not visible yet".to_string(),
-            vec!["computed".to_string()],
-        )
-        .expect("missing attributes are non-empty");
+            (vec!["computed".to_string()])
+                .try_into()
+                .expect("nonempty partial attributes"),
+        );
         let writeback_state = diagnostic.clone().into_state_for_writeback(state);
         let (mut accumulator, _) = ExecutionAccumulator::new(empty_execution_result());
         let mut failed_indices = HashSet::new();
@@ -1750,9 +1755,10 @@ mod process_basic_result_tests {
         let state = State::existing(id.clone(), HashMap::new()).with_identifier("mock-id");
         let diagnostic = PartialReadDiagnostic::new(
             "computed is not visible yet".to_string(),
-            vec!["computed".to_string()],
-        )
-        .expect("missing attributes are non-empty");
+            (vec!["computed".to_string()])
+                .try_into()
+                .expect("nonempty partial attributes"),
+        );
         let (mut accumulator, _) = ExecutionAccumulator::new(empty_execution_result());
         let mut failed_indices = HashSet::new();
         let mut pending_refreshes = HashMap::new();
@@ -1956,9 +1962,10 @@ mod assert_known_attribute_tests {
         for end in [ReadBackEnd::ProviderReported, ReadBackEnd::HostDeadline] {
             let diagnostic = PartialReadDiagnostic::new(
                 "DVO is not populated yet".into(),
-                vec!["domain_validation_options".into()],
-            )
-            .unwrap();
+                (vec!["domain_validation_options".into()])
+                    .try_into()
+                    .expect("nonempty partial attributes"),
+            );
             let mut bindings = ResolvedBindings::default();
             bindings.set_with_completeness(
                 "cert",
@@ -2000,9 +2007,10 @@ mod assert_known_attribute_tests {
         ] {
             let diagnostic = crate::provider::PartialReadDiagnostic::new(
                 "DVO is not populated yet".to_string(),
-                vec!["domain_validation_options".to_string()],
-            )
-            .expect("missing attributes are non-empty");
+                (vec!["domain_validation_options".to_string()])
+                    .try_into()
+                    .expect("nonempty partial attributes"),
+            );
             let mut bindings = ResolvedBindings::default();
             bindings.set_with_completeness(
                 "cert",
@@ -2041,9 +2049,10 @@ mod assert_known_attribute_tests {
     fn final_attempt_partial_read_back_reports_budget_without_wait_hint() {
         let diagnostic = crate::provider::PartialReadDiagnostic::new(
             "DVO is not populated yet".to_string(),
-            vec!["domain_validation_options".to_string()],
-        )
-        .expect("missing attributes are non-empty");
+            (vec!["domain_validation_options".to_string()])
+                .try_into()
+                .expect("nonempty partial attributes"),
+        );
         let mut bindings = ResolvedBindings::default();
         bindings.set_with_completeness(
             "cert",

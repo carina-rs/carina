@@ -4,6 +4,8 @@
 mod provider_text_fixtures;
 use carina_plugin_host::wasm_factory::PollEventForTest;
 use provider_text_fixtures::InitializeFixture;
+#[path = "../../carina-core/tests/support/provider_config_error.rs"]
+mod provider_config_error_fixture;
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io::{Read, Write};
@@ -2903,7 +2905,10 @@ async fn test_wasm_identifierless_read_back_resume_ends_invalid_continuation() {
         error.to_string().contains("requires an identifier"),
         "{error}"
     );
-    assert_eq!(error.detail().code(), Some("READ_BACK_WITHOUT_IDENTIFIER"));
+    assert_eq!(
+        error.detail().code().as_deref(),
+        Some("READ_BACK_WITHOUT_IDENTIFIER")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -6268,6 +6273,68 @@ async fn sdk_configuration_failures_preserve_typed_causes_with_redaction() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn secret_configuration_errors_have_native_and_wasm_parity() {
+    use carina_core::provider::ProviderError as NativeError;
+    const SECRET: &str = "configuration-secret-round2";
+    let path = wasm_path().expect("the mock wasm fixture is required for native/wasm parity");
+    let (wasm, _cache) = load_factory(&path).await;
+    for captured in [false, true] {
+        let attribute = if captured {
+            "__mock_validate_config_captured_cause__"
+        } else {
+            "__mock_validate_config_cause__"
+        };
+        let error = if captured {
+            NativeError::from_diagnostic(
+                ProviderErrorKind::ApiError,
+                std::io::Error::other(format!("original validation failure: {SECRET}")),
+            )
+        } else {
+            NativeError::api_error_caused_by(
+                "mock configuration request failed",
+                std::io::Error::other(SECRET),
+            )
+        }
+        .with_status(403);
+        let native = provider_config_error_fixture::NativeConfigErrorFactory(error);
+        let attributes = indexmap::IndexMap::from([(
+            attribute.into(),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(SECRET.into()))).into(),
+            )),
+        )]);
+        let config = resolved_provider_config("mock", attributes);
+        let mut results = Vec::new();
+        for factory in [&native as &dyn ProviderFactory, &wasm] {
+            let failure =
+                carina_core::executor::prepare_provider_ready_config(factory, &config).unwrap_err();
+            let error = failure.provider_error().unwrap();
+            let wire = error.to_wire();
+            let rendered = format!("{failure} {failure:?} {error} {error:?} {wire:?}");
+            assert!(!rendered.contains(SECRET), "{rendered}");
+            assert!(
+                !rendered.contains("original validation failure"),
+                "{rendered}"
+            );
+            assert!(
+                !rendered.contains("mock configuration request failed"),
+                "{rendered}"
+            );
+            assert_eq!(
+                wire.message,
+                "configuration containing a secret failed validation"
+            );
+            assert_eq!(
+                wire.cause.as_deref(),
+                if captured { None } else { Some("(secret)") }
+            );
+            results.push(serde_json::to_value(wire).unwrap());
+        }
+        assert_eq!(results[0], results[1]);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn test_wasm_normalizer_rejects_missing_and_extra_state_keys_atomically() {
     let path = skip_if_no_wasm!();
     let (factory, _cache) = load_factory(&path).await;
@@ -6794,7 +6861,15 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         Some(&desired_id),
         "the guest resource id must survive the WIT conversion"
     );
-    assert_eq!(error.detail().provider_name.as_deref(), Some("mock"));
+    assert_eq!(
+        error
+            .detail()
+            .provider_name
+            .as_ref()
+            .map(|text| text.as_diagnostic())
+            .as_deref(),
+        Some("mock")
+    );
     assert_eq!(
         desired_resources, desired_before,
         "provider normalizer errors must be atomic and restore stripped attributes"

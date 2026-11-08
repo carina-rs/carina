@@ -7386,10 +7386,13 @@ impl Provider for BootstrapRecordingProvider {
                 let identifier = AppliedIdentifier::new("state-bucket")
                     .expect("fixture identifier is non-empty");
                 let diagnostic = carina_core::provider::PartialReadDiagnostic::new(
-                    "bootstrap read incomplete".into(),
-                    vec!["versioning".to_string()],
-                )
-                .expect("fixture diagnostic has a missing attribute");
+                    carina_core::provider_text::ProviderDiagnostic::message(
+                        "bootstrap read incomplete".into(),
+                    ),
+                    (vec!["versioning".to_string()])
+                        .try_into()
+                        .expect("nonempty partial attributes"),
+                );
                 Box::pin(async move {
                     Ok(attempt
                         .issued(
@@ -7689,8 +7692,12 @@ async fn declared_state_bucket_bootstrap_partial_success_seeds_partial_read_stat
 #[test]
 fn provider_text_partial_state_bucket_warning_sanitizes_guest_text() {
     let raw = "\x1b]52;c;ZXZpbA==\x07\x1b[2J";
-    let diagnostic =
-        carina_core::provider::PartialReadDiagnostic::new(raw.into(), vec![raw.into()]).unwrap();
+    let diagnostic = carina_core::provider::PartialReadDiagnostic::new(
+        raw.into(),
+        (vec![raw.into()])
+            .try_into()
+            .expect("nonempty partial attributes"),
+    );
     let identifier = carina_core::provider_text::DiagnosticText::new(raw);
     let rendered = format_partial_state_bucket_create_warning(
         crate::output_style::ColorMode::Plain,
@@ -7707,9 +7714,10 @@ fn partial_state_bucket_warning_color_spans_do_not_cross_newlines() {
 
     let diagnostic = carina_core::provider::PartialReadDiagnostic::new(
         "bootstrap read incomplete".into(),
-        vec!["versioning".to_string()],
-    )
-    .expect("fixture diagnostic has a missing attribute");
+        (vec!["versioning".to_string()])
+            .try_into()
+            .expect("nonempty partial attributes"),
+    );
     let rendered = {
         format_partial_state_bucket_create_warning(color_mode, &"state-bucket".into(), &diagnostic)
     };

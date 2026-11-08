@@ -37,6 +37,9 @@ use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
 #[path = "e2e_typecheck_parity/round4.rs"]
 mod round4;
 
+#[path = "e2e_typecheck_parity/error_composition.rs"]
+mod error_composition;
+
 // ============================================================================
 // Fixture + helpers (mirror carina-lsp/tests/e2e_typecheck.rs)
 // ============================================================================
@@ -5432,7 +5435,9 @@ fn region_schemas() -> SchemaRegistry {
         carina_core::schema::enum_identity("Region", Some("test")),
         None,
         vec![],
-        Some(legacy_validator(validate_region)),
+        Some(legacy_validator(move |value| {
+            validate_region(value).map_err(Into::into)
+        })),
         Some(carina_core::schema::DslTransform::HyphenToUnderscore),
     );
 
@@ -7546,7 +7551,7 @@ fn vpc_id_custom_type_2358() -> AttributeType {
         carina_core::schema::TypeIdentity::bare("VpcId"),
         None,
         None,
-        legacy_validator(vpc_id_validate_2358),
+        legacy_validator(move |value| vpc_id_validate_2358(value).map_err(Into::into)),
         None,
     )
 }

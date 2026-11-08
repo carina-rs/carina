@@ -2,6 +2,273 @@ use crate::resource::InsideSecret;
 
 mod rejected_findings;
 
+#[test]
+fn union_provider_diagnostic_retains_text_secret_inventory_and_every_arm_cause() {
+    use crate::provider::{ProviderError, ProviderErrorKind};
+    use crate::provider_text::{ProviderDiagnostic, RedactionSet, Retryability};
+    fn arm(kind: std::io::ErrorKind, text: &str, secrets: &[&str]) -> TypeError {
+        let source: ProviderError = ProviderError::api_error_caused_by(
+            "provider arm",
+            std::io::Error::new(kind, text.to_string()),
+        )
+        .with_retryability(Retryability::Transient)
+        .with_secrets(&RedactionSet::for_test(secrets))
+        .into();
+        TypeError::ValidationFailed {
+            message: ProviderDiagnostic::new(source).into(),
+        }
+    }
+    let union = TypeError::from_union_arm_errors(
+        arm(
+            std::io::ErrorKind::PermissionDenied,
+            "union-private first reason",
+            &["union-private"],
+        ),
+        [arm(
+            std::io::ErrorKind::TimedOut,
+            "union-private second reason",
+            &[],
+        )],
+    );
+    let expected = "No union alternative accepts this value: Validation failed: provider arm: (secret) first reason; or Validation failed: provider arm: (secret) second reason";
+    let diagnostic = ProviderDiagnostic::new(union);
+    assert_eq!(
+        diagnostic
+            .clone()
+            .with_secrets(&RedactionSet::for_test(&[]))
+            .to_string(),
+        expected,
+        "an inventory carried by one alternative protects the whole diagnostic"
+    );
+    let error = ProviderError::from_diagnostic(ProviderErrorKind::InvalidInput, diagnostic);
+    let cause = error.detail().cause().unwrap();
+    assert!(cause.source_is::<std::io::Error>());
+    assert!(cause.as_cause().matches_for_test(
+        |leaf: &std::io::Error| leaf.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    assert!(
+        cause
+            .as_cause()
+            .matches_for_test(|leaf: &std::io::Error| leaf.kind() == std::io::ErrorKind::TimedOut)
+    );
+    assert!(error.is_transient());
+    let error = error.with_secrets(&RedactionSet::for_test(&[]));
+    assert_eq!(error.to_string(), expected);
+    let text = format!("{error} {error:?} {:?}", error.to_wire());
+    assert!(!text.contains("union-private"), "{text}");
+    let cause = error.detail().cause().unwrap();
+    assert!(cause.as_cause().matches_for_test(
+        |leaf: &std::io::Error| leaf.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    assert!(
+        cause
+            .as_cause()
+            .matches_for_test(|leaf: &std::io::Error| leaf.kind() == std::io::ErrorKind::TimedOut)
+    );
+    let mut node = Some(cause.as_cause());
+    let mut leaves = Vec::new();
+    while let Some(current) = node {
+        assert!(
+            !current
+                .redact(&RedactionSet::for_test(&[]))
+                .as_str()
+                .contains("union-private")
+        );
+        if current.is::<std::io::Error>() {
+            leaves.push(current.matches_for_test(|leaf: &std::io::Error| {
+                leaf.kind() == std::io::ErrorKind::PermissionDenied
+            }));
+        }
+        node = current.source();
+    }
+    assert_eq!(
+        leaves,
+        [true, false],
+        "visit both typed leaves in declaration order"
+    );
+}
+
+#[test]
+fn enum_ignored_validation_tail_keeps_typed_source_and_retryability() {
+    use crate::provider::{ProviderError, ProviderErrorKind};
+    use crate::provider_text::{ProviderDiagnostic, RedactionSet, Retryability};
+    let source: ProviderError = ProviderError::api_error_caused_by(
+        "hidden provider reason",
+        std::io::Error::other("enum-private"),
+    )
+    .with_retryability(Retryability::Transient)
+    .with_secrets(&RedactionSet::for_test(&["enum-private"]))
+    .into();
+    let category = TypeError::StringLiteralExpectedEnum {
+        user_typed: "literal".into(),
+        attribute: Some("reference".into()),
+        type_name: "Reference".into(),
+        expected: vec![ExpectedEnumVariant::from_namespaced(
+            None,
+            "Reference",
+            "VALUE",
+            false,
+        )],
+        extra_message: Some(ProviderDiagnostic::new(source).into()),
+    };
+    let expected = category.to_string();
+    let error = ProviderError::from_diagnostic(ProviderErrorKind::InvalidInput, category);
+    assert!(
+        error
+            .detail()
+            .cause()
+            .unwrap()
+            .source_is::<std::io::Error>()
+    );
+    assert_eq!(error.retryability(), Retryability::Transient);
+    let error = error.with_secrets(&RedactionSet::for_test(&[]));
+    assert_eq!(error.to_string(), expected);
+    assert!(
+        error
+            .detail()
+            .cause()
+            .unwrap()
+            .source_is::<std::io::Error>()
+    );
+    let rendered = format!("{error} {error:?} {:?}", error.to_wire());
+    assert!(!rendered.contains("hidden provider reason"));
+    assert!(!rendered.contains("enum-private"));
+}
+
+#[test]
+fn nested_union_diagnostic_traversal_resumes_outer_alternatives() {
+    use crate::provider::{ProviderError, ProviderErrorKind};
+    use crate::provider_text::{ProviderDiagnostic, RedactionSet};
+    let reason = |kind| TypeError::ValidationFailed {
+        message: ProviderDiagnostic::new(std::io::Error::new(
+            kind,
+            format!("typed union leaf {kind:?}"),
+        ))
+        .into(),
+    };
+    let inner = TypeError::from_union_arm_errors(
+        reason(std::io::ErrorKind::PermissionDenied),
+        [reason(std::io::ErrorKind::TimedOut)],
+    );
+    let outer = TypeError::from_union_arm_errors(
+        TypeError::ListItemError {
+            index: 2,
+            inner: Box::new(inner),
+        },
+        [reason(std::io::ErrorKind::NotFound)],
+    );
+    let error = ProviderError::from_diagnostic(ProviderErrorKind::InvalidInput, outer)
+        .with_secrets(&RedactionSet::for_test(&[]));
+    let cause = error.detail().cause().unwrap();
+    for kind in [
+        std::io::ErrorKind::PermissionDenied,
+        std::io::ErrorKind::TimedOut,
+        std::io::ErrorKind::NotFound,
+    ] {
+        let mut node = Some(cause.as_cause());
+        let mut found = false;
+        while let Some(current) = node {
+            if current.is::<std::io::Error>() {
+                let projected = current
+                    .project_redacted::<std::io::Error>(|leaf| format!("{:?}", leaf.kind()))
+                    .unwrap();
+                found |= projected.as_str() == format!("{kind:?}");
+            }
+            node = current.source();
+        }
+        assert!(found, "lost {kind:?}");
+    }
+    assert_eq!(error.to_string().matches("typed union leaf").count(), 3);
+}
+
+#[test]
+fn custom_type_validation_inner_retains_diagnostic_and_typed_leaf() {
+    use crate::provider::{ProviderError, ProviderErrorKind};
+    use crate::provider_text::{ProviderDiagnostic, RedactionSet};
+    let inner = TypeError::ValidationFailed {
+        message: ProviderDiagnostic::new(std::io::Error::other("custom-private useful reason"))
+            .into(),
+    };
+    let category = TypeError::CustomTypeValidation {
+        error: Box::new(
+            crate::parser::CustomTypeValidationError::InvalidDeclarationValue {
+                owner: "test".into(),
+                identity: TypeIdentity::bare("Custom"),
+                error: Box::new(inner),
+            },
+        ),
+        attribute: None,
+    };
+    let error = ProviderError::from_diagnostic(ProviderErrorKind::InvalidInput, category);
+    assert!(
+        error
+            .detail()
+            .cause()
+            .unwrap()
+            .source_is::<std::io::Error>()
+    );
+    assert!(
+        error
+            .detail()
+            .cause()
+            .unwrap()
+            .source_is::<crate::parser::CustomTypeValidationError>()
+    );
+    let error = error.with_secrets(&RedactionSet::for_test(&["custom-private"]));
+    assert_eq!(
+        error.to_string(),
+        "test rejected `Custom`: Validation failed: (secret) useful reason"
+    );
+    assert!(!format!("{error:?} {:?}", error.to_wire()).contains("custom-private"));
+}
+
+#[test]
+fn custom_type_provider_rejection_keeps_masking_and_walkable_cause() {
+    use crate::provider::{ProviderError, ProviderErrorKind};
+    use crate::provider_text::RedactionSet;
+    let source = ProviderError::api_error_caused_by(
+        "provider rejection",
+        std::io::Error::other("custom-private useful reason"),
+    )
+    .with_secrets(&RedactionSet::for_test(&["custom-private"]));
+    for masked in [false, true] {
+        let category = TypeError::CustomTypeValidation {
+            error: Box::new(crate::parser::CustomTypeValidationError::ProviderRejected {
+                owner: "test".into(),
+                identity: TypeIdentity::bare("Custom"),
+                error: std::sync::Arc::new(source.clone()),
+                masked,
+            }),
+            attribute: None,
+        };
+        let error = ProviderError::from_diagnostic(ProviderErrorKind::InvalidInput, category);
+        assert!(
+            error
+                .detail()
+                .cause()
+                .unwrap()
+                .source_is::<std::io::Error>()
+        );
+        let error = error.with_secrets(&RedactionSet::for_test(&[]));
+        assert_eq!(
+            error.to_string(),
+            if masked {
+                "test rejected `Custom`: (secret) failed validation"
+            } else {
+                "test rejected `Custom`: provider rejection: (secret) useful reason"
+            }
+        );
+        assert!(
+            error
+                .detail()
+                .cause()
+                .unwrap()
+                .source_is::<std::io::Error>()
+        );
+        assert!(!format!("{error:?} {:?}", error.to_wire()).contains("custom-private"));
+    }
+}
+
 static TEST_OWNER: std::sync::LazyLock<crate::parser::SchemaTypeOwner> =
     std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
 
@@ -5406,7 +5673,7 @@ fn with_attribute_tags_leaf_validator_failures_for_diagnostics() {
         TypeError::ResourceValidationFailed {
             message,
             attribute: Some(attribute),
-        } if message == "invalid CIDR" && attribute == "cidr_block"
+        } if message.to_string() == "invalid CIDR" && attribute == "cidr_block"
     ));
 }
 
@@ -5687,7 +5954,9 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
                     PatternAttributeType::string(),
                     None,
                     vec![],
-                    Some(legacy_validator(validate_mode)),
+                    Some(legacy_validator(move |value| {
+                        validate_mode(value).map_err(Into::into)
+                    })),
                     None,
                 ),
             )
@@ -6867,7 +7136,7 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
             TypeError::ResourceValidationFailed {
                 message,
                 attribute: Some(name),
-            } if message.contains("outside allowed range") && name == "range"
+            } if message.to_string().contains("outside allowed range") && name == "range"
         )),
         "missing range error: {errors:?}"
     );
@@ -6877,7 +7146,7 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
             TypeError::ResourceValidationFailed {
                 message,
                 attribute: Some(name),
-            } if message == "custom value rejected" && name == "custom"
+            } if message.to_string() == "custom value rejected" && name == "custom"
         )),
         "missing custom lookup error: {errors:?}"
     );
@@ -6952,9 +7221,9 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
         None,
         None,
         legacy_validator(|value| match value {
-            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(value)) => Err(
-                format!("schema validator rejected {}", value.expose_plaintext()),
-            ),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(value)) => {
+                Err((format!("schema validator rejected {}", value.expose_plaintext())).into())
+            }
             _ => Ok(()),
         }),
         None,
@@ -7135,8 +7404,10 @@ fn secret_enum_literal_masks_typed_value_and_validator_message() {
                     Some(legacy_validator(|value| match value {
                         crate::resource::Value::Concrete(
                             crate::resource::ConcreteValue::String(value),
-                        ) => Err(format!("provider rejected {}", value.expose_plaintext())),
-                        _ => Err("expected a string".to_string()),
+                        ) => {
+                            Err((format!("provider rejected {}", value.expose_plaintext())).into())
+                        }
+                        _ => Err(("expected a string".to_string()).into()),
                     })),
                     None,
                 ),
@@ -7204,7 +7475,7 @@ fn secret_enum_literal_masks_typed_value_and_validator_message() {
     };
     assert!(matches!(user_typed, DiagnosticValue::Masked));
     assert_eq!(
-        extra_message.as_deref(),
+        extra_message.as_ref().map(ToString::to_string).as_deref(),
         Some("(secret) failed validation"),
         "StringLiteralExpectedEnum.extra_message leaked {validator_plaintext}"
     );
@@ -7622,13 +7893,10 @@ fn validate_union_type() {
                 if s.expose_plaintext().starts_with("a-") {
                     Ok(())
                 } else {
-                    Err(format!(
-                        "Expected 'a-' prefix, got '{}'",
-                        s.expose_plaintext()
-                    ))
+                    Err((format!("Expected 'a-' prefix, got '{}'", s.expose_plaintext())).into())
                 }
             } else {
-                Err("Expected string".to_string())
+                Err(("Expected string".to_string()).into())
             }
         }),
         None,
@@ -7642,13 +7910,10 @@ fn validate_union_type() {
                 if s.expose_plaintext().starts_with("b-") {
                     Ok(())
                 } else {
-                    Err(format!(
-                        "Expected 'b-' prefix, got '{}'",
-                        s.expose_plaintext()
-                    ))
+                    Err((format!("Expected 'b-' prefix, got '{}'", s.expose_plaintext())).into())
                 }
             } else {
-                Err("Expected string".to_string())
+                Err(("Expected string".to_string()).into())
             }
         }),
         None,
@@ -13247,7 +13512,7 @@ mod validate_collect_tests {
                     && matches!(
                         inner.as_ref(),
                         TypeError::ValidationFailed { message }
-                            if message == "rejected while collecting diagnostics"
+                            if message.to_string() == "rejected while collecting diagnostics"
                     )
         ));
     }
@@ -13639,7 +13904,9 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
                     PatternAttributeType::string(),
                     None,
                     vec![],
-                    Some(legacy_validator(validate_mode)),
+                    Some(legacy_validator(move |value| {
+                        validate_mode(value).map_err(Into::into)
+                    })),
                     None,
                 ),
             )
@@ -13672,15 +13939,16 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
         "Custom-namespaced reshape leaves structured variants empty"
     );
     let msg = extra_message
-        .as_deref()
-        .expect("validator text must be carried on extra_message");
+        .as_ref()
+        .expect("validator text must be carried on extra_message")
+        .to_string();
     assert!(
         msg.contains("invalid Mode") && msg.contains("expected fast"),
         "extra_message must carry validator text, got: {msg}"
     );
     let rendered = reshaped.to_string();
     assert!(
-        rendered.contains(msg),
+        rendered.contains(&msg),
         "Display must surface extra_message text in tail, got: {rendered}"
     );
     assert!(
@@ -14710,14 +14978,14 @@ fn tied_scalar_union_reports_every_distinct_failure_in_declaration_order() {
             TypeIdentity::bare("FirstScalar"),
             None,
             None,
-            legacy_validator(reject_first),
+            legacy_validator(move |value| reject_first(value).map_err(Into::into)),
             None,
         ),
         AttributeType::refined_string_with_validator(
             TypeIdentity::bare("SecondScalar"),
             None,
             None,
-            legacy_validator(reject_second),
+            legacy_validator(move |value| reject_second(value).map_err(Into::into)),
             None,
         ),
     ]);
@@ -15450,7 +15718,7 @@ fn union_string_vs_custom_picks_custom_error_for_string_input() {
             TypeIdentity::bare("Arn"),
             None,
             None,
-            legacy_validator(must_be_arn),
+            legacy_validator(move |value| must_be_arn(value).map_err(Into::into)),
             None,
         ),
     ]);
@@ -15460,7 +15728,7 @@ fn union_string_vs_custom_picks_custom_error_for_string_input() {
     match err {
         TypeError::ValidationFailed { ref message } => {
             assert!(
-                message.contains("must start with 'arn:'"),
+                message.to_string().contains("must start with 'arn:'"),
                 "expected the Custom validator's actual message, got: {message}"
             );
         }
@@ -15515,7 +15783,7 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
         AttributeType::refined_int_with_validator(
             TypeIdentity::bare("PositiveInt"),
             None,
-            legacy_validator(must_be_positive),
+            legacy_validator(move |value| must_be_positive(value).map_err(Into::into)),
         ),
         AttributeType::bool(),
     ]);
@@ -15525,7 +15793,7 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
     match err {
         TypeError::ValidationFailed { ref message } => {
             assert!(
-                message.contains("must be positive"),
+                message.to_string().contains("must be positive"),
                 "expected the Custom validator's actual message, got: {message}"
             );
         }
@@ -15609,7 +15877,10 @@ fn custom_validator_can_capture_external_state() {
         .unwrap_err();
     match err {
         TypeError::ValidationFailed { message } => {
-            assert!(message.contains("ap-northeast-1") && message.contains("us-east-1"));
+            assert!(
+                message.to_string().contains("ap-northeast-1")
+                    && message.to_string().contains("us-east-1")
+            );
         }
         other => panic!("expected ValidationFailed, got: {other:?}"),
     }
@@ -18048,4 +18319,160 @@ fn knowledge_projection_errors_keep_their_typed_cause() {
     );
     assert!(matches!(error, TypeError::Knowledge { error, .. }
         if matches!(*error, crate::resource::knowledge::KnowledgeDiagnostic::Absolute(crate::resource::knowledge::KnowledgeError::InvalidStage { .. }))));
+}
+
+#[test]
+fn knowledge_diagnostic_shape_stays_typed_and_terminal() {
+    let cause: crate::resource::knowledge::KnowledgeError =
+        crate::resource::knowledge::KnowledgeError::InvalidStage {
+            operation: "known-value projection",
+        };
+    let error = TypeError::from(cause);
+    assert!(std::error::Error::source(&error).is_none());
+    assert!(matches!(
+        error.diagnostic_shape(),
+        ValidationDiagnostic::Plain(_)
+    ));
+    let message = error.to_string();
+    let composed = crate::provider::ProviderError::from_diagnostic(
+        crate::provider::ProviderErrorKind::InvalidInput,
+        error,
+    )
+    .into_host_for_test();
+    assert_eq!(composed.to_string(), message);
+    assert!(
+        composed
+            .detail()
+            .cause()
+            .unwrap()
+            .as_cause()
+            .matches_for_test(|category: &TypeError| matches!(
+                category,
+                TypeError::Knowledge { .. }
+            ))
+    );
+}
+
+#[test]
+fn enum_validation_tail_retains_diagnostic_source_and_quick_fix_category() {
+    let reason = TypeError::ValidationFailed {
+        message: crate::provider_text::ProviderDiagnostic::new(
+            crate::provider::ProviderError::api_error_caused_by(
+                "invalid reference",
+                std::io::Error::other("validation-private"),
+            )
+            .with_retryability(crate::provider_text::Retryability::Transient),
+        )
+        .into(),
+    };
+    let error = TypeError::StringLiteralExpectedEnum {
+        user_typed: "literal".into(),
+        attribute: Some("reference".into()),
+        type_name: "Reference".into(),
+        expected: Vec::new(),
+        extra_message: Some(validation_error_message(reason)),
+    };
+    let error = crate::provider::ProviderError::from_diagnostic(
+        crate::provider::ProviderErrorKind::InvalidInput,
+        error,
+    );
+    assert!(
+        error
+            .detail()
+            .cause()
+            .unwrap()
+            .source_is::<std::io::Error>()
+    );
+    assert_eq!(
+        error.retryability(),
+        crate::provider_text::Retryability::Transient
+    );
+    let error = error.with_secrets(&crate::provider_text::RedactionSet::for_test(&[
+        "validation-private",
+    ]));
+    assert!(error.to_string().contains("invalid reference: (secret)"));
+    assert!(!error.to_string().contains("validation-private"));
+    assert!(error.detail().cause().unwrap().as_cause().matches_for_test(|category: &TypeError| {
+        matches!(category, TypeError::StringLiteralExpectedEnum { attribute: Some(attribute), type_name, .. } if attribute == "reference" && type_name == "Reference")
+    }));
+}
+
+fn diagnostic_validation_reason() -> TypeError {
+    TypeError::ValidationFailed {
+        message: crate::provider_text::ProviderDiagnostic::new(
+            crate::provider::ProviderError::api_error_caused_by(
+                "invalid reference",
+                std::io::Error::other("validation-private"),
+            )
+            .with_retryability(crate::provider_text::Retryability::Transient),
+        )
+        .into(),
+    }
+}
+
+#[test]
+fn validation_containers_preserve_one_diagnostic_parent() {
+    for kind in 0..4 {
+        let inner = Box::new(diagnostic_validation_reason());
+        let category = match kind {
+            0 => TypeError::ListItemError { index: 3, inner },
+            1 => TypeError::MapKeyError {
+                key: "entry".into(),
+                inner,
+            },
+            2 => TypeError::MapValueError {
+                key: "entry".into(),
+                inner,
+            },
+            _ => TypeError::StructFieldError {
+                field: "reference".into(),
+                inner,
+            },
+        };
+        let error = crate::provider::ProviderError::from_diagnostic(
+            crate::provider::ProviderErrorKind::InvalidInput,
+            crate::provider::CustomTypeDispatchError::Validation(Box::new(category)),
+        );
+        assert!(
+            error
+                .detail()
+                .cause()
+                .unwrap()
+                .source_is::<std::io::Error>()
+        );
+        assert_eq!(
+            error.retryability(),
+            crate::provider_text::Retryability::Transient
+        );
+        let error = error.with_secrets(&crate::provider_text::RedactionSet::for_test(&[
+            "validation-private",
+        ]));
+        assert!(error.to_string().contains("invalid reference: (secret)"));
+        assert_eq!(error.to_string().matches("invalid reference").count(), 1);
+    }
+}
+
+#[test]
+fn secret_validation_keeps_opaque_causes_until_the_provider_boundary() {
+    use crate::resource::InsideSecret as _;
+    let category = diagnostic_validation_reason().inside_secret();
+    let error = crate::provider::ProviderError::from_diagnostic(
+        crate::provider::ProviderErrorKind::InvalidInput,
+        crate::provider::CustomTypeDispatchError::Validation(Box::new(category)),
+    );
+    assert!(
+        error
+            .detail()
+            .cause()
+            .unwrap()
+            .source_is::<std::io::Error>()
+    );
+    assert_eq!(
+        error.retryability(),
+        crate::provider_text::Retryability::Transient
+    );
+    let error = error.with_secrets(&crate::provider_text::RedactionSet::for_test(&[
+        "validation-private",
+    ]));
+    assert_eq!(error.to_string(), "invalid reference: (secret)");
 }

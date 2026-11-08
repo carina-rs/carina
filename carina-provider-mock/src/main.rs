@@ -192,31 +192,16 @@ impl MockProcessProvider {
     }
 
     fn operation_error(operation: &str, id: &ResourceId) -> ProviderError {
-        ProviderError {
-            kind: ProviderErrorKind::Internal,
-            message: format!("intentional mock {operation} error"),
-            resource_id: Some(id.clone()),
-            cause: None,
-            provider_name: Some("mock".to_string()),
-            operation: None,
-            status: None,
-            code: None,
-            request_id: None,
-        }
+        ProviderError::internal(format!("intentional mock {operation} error"))
+            .for_resource(carina_core::protocol_convert::protocol_to_resource_id(
+                &(id.clone()),
+            ))
+            .for_provider("mock".to_string())
     }
 
     fn configuration_error(message: impl Into<String>) -> ProviderError {
-        ProviderError {
-            kind: ProviderErrorKind::InvalidInput,
-            message: message.into(),
-            resource_id: None,
-            cause: None,
-            provider_name: None,
-            operation: None,
-            status: None,
-            code: None,
-            request_id: None,
-        }
+        let message: String = message.into();
+        ProviderError::invalid_input(message)
     }
 
     fn pending_polls(attributes: &BTreeMap<String, Value>, operation_key: &str) -> u32 {
@@ -333,10 +318,12 @@ impl MockProcessProvider {
     }
 
     fn partial_read_diagnostic() -> PartialReadDiagnostic {
-        PartialReadDiagnostic {
-            reason: "mock read-back is still pending".to_string(),
-            missing_attributes: vec!["computed".to_string()],
-        }
+        PartialReadDiagnostic::new(
+            carina_core::provider_text::ProviderDiagnostic::message(
+                "mock read-back is still pending".into(),
+            ),
+            vec!["computed".to_owned()].try_into().unwrap(),
+        )
     }
 
     fn create_mode(attributes: &BTreeMap<String, Value>) -> CreateMode {
@@ -464,17 +451,12 @@ impl MockProcessProvider {
     }
 
     fn create_mode_error(id: &ResourceId, mode: CreateMode) -> ProviderError {
-        ProviderError {
-            kind: ProviderErrorKind::Internal,
-            message: format!("intentional mock {mode:?} create verdict"),
-            resource_id: Some(id.clone()),
-            cause: None,
-            provider_name: Some("mock".to_string()),
-            operation: Some("create".to_string()),
-            status: None,
-            code: None,
-            request_id: None,
-        }
+        ProviderError::internal(format!("intentional mock {mode:?} create verdict"))
+            .for_resource(carina_core::protocol_convert::protocol_to_resource_id(
+                &(id.clone()),
+            ))
+            .for_provider("mock".to_string())
+            .with_operation("create".to_string())
     }
 
     fn update_pending_polls(request: &UpdateRequest) -> u32 {
@@ -582,7 +564,7 @@ impl MockProcessProvider {
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
         polls_served: Option<u32>,
-    ) -> carina_provider_protocol::UpdateOutcome {
+    ) -> carina_plugin_sdk::types::UpdateOutcome {
         // Apply the patch on top of `from` while preserving typed persisted
         // values that were not mentioned by the patch. Also echo the patch op
         // kinds into a sentinel attribute so integration tests can assert the
@@ -653,7 +635,7 @@ impl MockProcessProvider {
             attributes: state.attributes,
         };
 
-        carina_provider_protocol::UpdateOutcome::Success { state }
+        carina_plugin_sdk::types::UpdateOutcome::Success { state }
     }
 
     fn update_read_back_done(
@@ -661,9 +643,9 @@ impl MockProcessProvider {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
-    ) -> carina_provider_protocol::UpdateOutcome {
+    ) -> carina_plugin_sdk::types::UpdateOutcome {
         let outcome = self.update_done(id, identifier, request, None);
-        let carina_provider_protocol::UpdateOutcome::Success { mut state } = outcome else {
+        let carina_plugin_sdk::types::UpdateOutcome::Success { mut state } = outcome else {
             unreachable!("mock update_done always succeeds")
         };
         state.attributes.insert(
@@ -671,7 +653,7 @@ impl MockProcessProvider {
             Value::String("ready".to_string()).into(),
         );
         let _attributes = self.complete_read_back(&state.identifier);
-        carina_provider_protocol::UpdateOutcome::Success { state }
+        carina_plugin_sdk::types::UpdateOutcome::Success { state }
     }
 
     fn update_read_back_partial(
@@ -679,12 +661,12 @@ impl MockProcessProvider {
         id: &ResourceId,
         identifier: &AppliedIdentifier,
         request: UpdateRequest,
-    ) -> carina_provider_protocol::UpdateOutcome {
+    ) -> carina_plugin_sdk::types::UpdateOutcome {
         let outcome = self.update_done(id, identifier, request, None);
-        let carina_provider_protocol::UpdateOutcome::Success { state } = outcome else {
+        let carina_plugin_sdk::types::UpdateOutcome::Success { state } = outcome else {
             unreachable!("mock update_done always succeeds")
         };
-        carina_provider_protocol::UpdateOutcome::PartialSuccess {
+        carina_plugin_sdk::types::UpdateOutcome::PartialSuccess {
             state,
             diagnostic: Self::partial_read_diagnostic(),
         }
@@ -800,7 +782,8 @@ impl CarinaProvider for MockProcessProvider {
                             None,
                             None,
                             legacy_validator(|_value| {
-                                Err("intentional SDK schema validator rejection".to_string())
+                                Err(("intentional SDK schema validator rejection".to_string())
+                                    .into())
                             }),
                             None,
                         ),
@@ -913,12 +896,19 @@ impl CarinaProvider for MockProcessProvider {
     }
 
     fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), ProviderError> {
+        if let Some(Value::String(cause)) = attrs.get("__mock_validate_config_captured_cause__") {
+            return Err(ProviderError::from_diagnostic(
+                carina_plugin_sdk::types::ProviderErrorKind::ApiError,
+                std::io::Error::other(format!("original validation failure: {cause}")),
+            )
+            .with_status(403));
+        }
         if let Some(Value::String(cause)) = attrs.get("__mock_validate_config_cause__") {
-            let mut error = Self::configuration_error("mock configuration request failed");
-            error.kind = ProviderErrorKind::ApiError;
-            error.cause = Some(cause.clone());
-            error.status = Some(403);
-            return Err(error);
+            return Err(ProviderError::api_error_caused_by(
+                "mock configuration request failed",
+                std::io::Error::other(cause.clone()),
+            )
+            .with_status(403));
         }
         if attrs.contains_key("__mock_validate_config_trap__") {
             panic!("intentional mock validate_config trap");
@@ -936,15 +926,16 @@ impl CarinaProvider for MockProcessProvider {
         attrs: &BTreeMap<String, Value>,
     ) -> Result<ReferenceScope, ProviderError> {
         if let Some(Value::String(cause)) = attrs.get("__mock_initialize_cause__") {
-            let mut error = Self::configuration_error("mock initialization request failed");
-            error.kind = ProviderErrorKind::ApiError;
-            error.cause = Some(cause.clone());
-            error.status = Some(403);
-            return Err(error);
+            return Err(ProviderError::api_error_caused_by(
+                "mock initialization request failed",
+                std::io::Error::other(cause.clone()),
+            )
+            .with_status(403));
         }
         if let Some(Value::String(table)) = attrs.get("reference_table") {
-            self.reference_table = serde_json::from_str(table)
-                .map_err(|error| Self::configuration_error(error.to_string()))?;
+            self.reference_table = serde_json::from_str(table).map_err(|error| {
+                ProviderError::from_diagnostic(ProviderErrorKind::InvalidInput, error)
+            })?;
         }
         if attrs.contains_key("__mock_initialize_error__") {
             return Err(Self::configuration_error(
@@ -953,8 +944,9 @@ impl CarinaProvider for MockProcessProvider {
         }
         match attrs.get("__mock_reference_scope_region__") {
             Some(Value::String(region)) => {
-                ReferenceScope::available("mock", region.clone(), "test-account")
-                    .map_err(|error| Self::configuration_error(error.to_string()))
+                ReferenceScope::available("mock", region.clone(), "test-account").map_err(|error| {
+                    ProviderError::from_diagnostic(ProviderErrorKind::InvalidInput, error)
+                })
             }
             Some(_) | None => Ok(ReferenceScope::Unavailable),
         }
@@ -964,7 +956,7 @@ impl CarinaProvider for MockProcessProvider {
         &self,
         requests: Vec<ReferenceRequest>,
     ) -> Result<Vec<Result<ReferenceOutcome, ReferenceError>>, ProviderError> {
-        Ok(carina_provider_mock::references::resolve(
+        Ok(carina_provider_mock::references::resolve_authoring(
             &self.reference_table,
             requests,
         ))
@@ -1032,17 +1024,11 @@ impl CarinaProvider for MockProcessProvider {
             panic!("intentional mock create trap");
         }
         if id.identity == "__mock_create_error__" {
-            return Err(attempt.not_created(ProviderError {
-                kind: ProviderErrorKind::Internal,
-                message: "intentional mock create error".to_string(),
-                resource_id: Some(id.clone()),
-                cause: None,
-                provider_name: None,
-                operation: None,
-                status: None,
-                code: None,
-                request_id: None,
-            }));
+            return Err(attempt.not_created(
+                ProviderError::internal("intentional mock create error".to_string()).for_resource(
+                    carina_core::protocol_convert::protocol_to_resource_id(&(id.clone())),
+                ),
+            ));
         }
 
         let unencodable_token_create_done_identifier = matches!(
@@ -1870,9 +1856,7 @@ impl CarinaProvider for MockProcessProvider {
                 && matches!(view.attribute("primary"), Some(DesiredValue::Known(_)))
                 && view.attribute("companion").is_none()
             {
-                return Err(ProviderError { kind: ProviderErrorKind::InvalidInput,
-                    message: "test.normalize_required_together companion is required when primary is present".into(),
-                    resource_id: Some(id), cause: None, provider_name: Some("mock".into()), operation: None, status: None, code: None, request_id: None });
+                return Err(ProviderError::invalid_input("test.normalize_required_together companion is required when primary is present").for_resource(carina_core::protocol_convert::protocol_to_resource_id(&(id))).for_provider("mock"));
             }
             if id.resource_type == "test.normalize_leaf" {
                 use carina_plugin_sdk::{DesiredMap, DesiredScalar, DesiredValueMut};

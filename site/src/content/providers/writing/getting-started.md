@@ -74,6 +74,7 @@ use carina_plugin_sdk::core::schema::{
     ValidatedResourceSchema,
 };
 use carina_plugin_sdk::types::*;
+use carina_plugin_sdk::core::provider_text::{ProviderDiagnostic, ProviderText};
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending,
     PendingDelete, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
@@ -85,17 +86,12 @@ use carina_plugin_sdk::{
 struct HelloProvider;
 
 fn error(kind: ProviderErrorKind, message: impl Into<String>) -> ProviderError {
-    ProviderError {
+    let message = message.into();
+    let error = ProviderError::from_diagnostic(
         kind,
-        message: message.into(),
-        resource_id: None,
-        cause: None,
-        provider_name: Some("hello".to_string()),
-        operation: None,
-        status: None,
-        code: None,
-        request_id: None,
-    }
+        ProviderDiagnostic::message(ProviderText::new(message)),
+    );
+    error.for_provider("hello")
 }
 
 fn greeting(name: &str) -> BTreeMap<String, Value> {

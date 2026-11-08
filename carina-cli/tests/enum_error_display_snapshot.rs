@@ -244,7 +244,9 @@ fn string_literal_expected_enum_custom_namespaced_display() {
                 carina_core::schema::TypeIdentity::new(Some("test"), ["r"], "Mode"),
                 None,
                 vec![],
-                Some(legacy_validator(validate_mode)),
+                Some(legacy_validator(move |value| {
+                    validate_mode(value).map_err(Into::into)
+                })),
                 None,
             ),
         )

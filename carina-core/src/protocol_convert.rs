@@ -3034,7 +3034,7 @@ pub fn try_update_outcome_to_protocol(
             } = diagnostic;
             Ok(protocol::UpdateOutcome::PartialSuccess {
                 state: try_applied_update_state_to_protocol(state, state_after_patch)?,
-                diagnostic: reason.partial_read_wire(
+                diagnostic: reason.text().partial_read_wire(
                     missing_attributes
                         .iter()
                         .map(|name| name.as_str().to_owned())
@@ -3074,11 +3074,19 @@ pub fn protocol_update_outcome_to_core(
                 reason,
                 missing_attributes,
             } = diagnostic;
-            Ok(UpdateOutcome::partial_success(
-                protocol_applied_persisted_state_to_core(state)?,
-                reason.clone().into(),
-                missing_attributes.clone(),
-            ))
+            let state = protocol_applied_persisted_state_to_core(state)?;
+            Ok(
+                match crate::provider::NonEmptyMissingAttributes::try_from(
+                    missing_attributes.clone(),
+                ) {
+                    Ok(missing) => UpdateOutcome::partial_success(
+                        state,
+                        crate::provider_text::ProviderDiagnostic::message(reason.clone().into()),
+                        missing,
+                    ),
+                    Err(_) => UpdateOutcome::success(state),
+                },
+            )
         }
     }
 }
