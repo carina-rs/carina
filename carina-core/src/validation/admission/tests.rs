@@ -6,6 +6,44 @@ use crate::schema::{
 use crate::validation::deferred_types::with_session_for_test;
 use std::collections::HashMap;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AdmissionWork {
+    candidates: usize,
+    contracts: usize,
+    references: usize,
+}
+thread_local! {
+    static ADMISSION_WORK: std::cell::Cell<Option<AdmissionWork>> = const { std::cell::Cell::new(None) };
+}
+fn record_work(record: impl FnOnce(&mut AdmissionWork)) {
+    ADMISSION_WORK.with(|work| {
+        if let Some(mut counts) = work.get() {
+            record(&mut counts);
+            work.set(Some(counts));
+        }
+    });
+}
+pub(super) fn candidate_constructed() {
+    record_work(|counts| counts.candidates += 1);
+}
+pub(super) fn contract_constructed() {
+    record_work(|counts| counts.contracts += 1);
+}
+pub(super) fn reference_judged() {
+    record_work(|counts| counts.references += 1);
+}
+fn count_admission_work<R>(operation: impl FnOnce() -> R) -> (R, AdmissionWork) {
+    struct Reset(Option<AdmissionWork>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ADMISSION_WORK.set(self.0);
+        }
+    }
+    let _reset = Reset(ADMISSION_WORK.replace(Some(AdmissionWork::default())));
+    let result = operation();
+    (result, ADMISSION_WORK.get().unwrap())
+}
+
 fn text(value: &str) -> Value {
     Value::Concrete(crate::resource::ConcreteValue::String(value.into()))
 }
@@ -92,6 +130,267 @@ fn validate<K: DestinationKind>(
         session,
     );
     admit(destination, candidate, &context)
+}
+
+#[test]
+fn destination_contracts_share_the_registered_schema_allocation() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("Sink")
+            .with_def("Entry", AttributeType::string())
+            .attribute(AttributeSchema::optional("first", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("second", AttributeType::int()).build())
+            .validate()
+            .unwrap(),
+    );
+    let catalog = crate::parser::LoadedProviderContext::empty_for_test();
+    let id = crate::resource::ResourceId::with_provider_identity("test", "Sink", "sink", None);
+    let registered = schemas
+        .get("test", "Sink", crate::schema::SchemaKind::Resource)
+        .unwrap();
+    for name in ["first", "second"] {
+        let destination = schemas
+            .resource_attribute_destination(&id, name, &catalog)
+            .unwrap();
+        for destination in [&destination, &destination.clone()] {
+            let contract = destination.contract.as_deref().unwrap();
+            assert!(std::ptr::eq(
+                contract.schema.as_ref(),
+                registered.schema().as_schema()
+            ));
+            assert!(std::ptr::eq(
+                contract.defs(),
+                registered.schema().as_schema().defs()
+            ));
+            assert!(std::ptr::eq(
+                contract.attr(),
+                registered
+                    .effective_attribute_by_authored_name(name)
+                    .unwrap()
+                    .field_type(),
+            ));
+        }
+    }
+}
+
+#[test]
+fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
+    let catalog = crate::parser::LoadedProviderContext::empty_for_test();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "test",
+        ResourceSchema::new("Source")
+            .attribute(AttributeSchema::optional("output", AttributeType::string()).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "test",
+        ResourceSchema::new("Sink")
+            .attribute(
+                AttributeSchema::optional("first", AttributeType::list(AttributeType::string()))
+                    .build(),
+            )
+            .attribute(
+                AttributeSchema::optional("second", AttributeType::list(AttributeType::string()))
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    for leaf in ["input", "\"${input}\"", "\"${producer.output}\""] {
+        for count in [1, 64] {
+            let items = vec![leaf; count].join(", ");
+            let parsed = crate::parser::parse_file(
+                &format!("arguments {{ input: String }}\nlet producer = test.Source {{}}\nlet sink = test.Sink {{ first = [{items}] second = [{items}] }}"),
+                std::path::Path::new("admission-work.crn"),
+                &catalog,
+            ).unwrap();
+            let configuration =
+                crate::config_loader::load_buffer_configuration(&parsed, &schemas, &catalog);
+            let judged = configuration.judged();
+            let tree = crate::parser::AnalysisTree::try_from_file(judged.file()).unwrap();
+            let resource = tree
+                .resources()
+                .find(|resource| resource.id().resource_type == "Sink")
+                .unwrap();
+            let bindings = BindingIndex::from_parsed(judged.file(), &schemas, &catalog);
+            let resource_attributes = resource.attributes();
+            let attributes = crate::resource::knowledge::collect_classified_attributes(
+                resource_attributes
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value)),
+                &KnowledgeContext::validation(),
+                |_, error| panic!("classification: {error:?}"),
+            );
+            let report = judged.report().for_resource(resource.id()).unwrap();
+            with_session_for_test(&catalog, |session| {
+                let (findings, work) = count_admission_work(|| {
+                    attributes::resource_attribute_admissions(
+                        resource,
+                        judged.file(),
+                        resource.schema(&schemas).unwrap(),
+                        &attributes,
+                        resource.quoted_string_attrs(),
+                        report,
+                        &bindings,
+                        session,
+                        &schemas,
+                    )
+                });
+                assert_eq!(findings.errors().count(), 0, "{leaf}: {findings:?}");
+                assert_eq!(
+                    findings.symbolic_errors().count(),
+                    0,
+                    "{leaf}: {findings:?}"
+                );
+                assert_eq!(
+                    work,
+                    AdmissionWork {
+                        candidates: 2,
+                        contracts: 2,
+                        references: 2 * count
+                    },
+                    "{leaf}, {count} leaves"
+                );
+            });
+        }
+    }
+}
+
+#[test]
+fn ambiguous_union_keeps_existence_checks_and_defers_value_checks_to_apply() {
+    fixture(
+        AttributeType::int(),
+        AttributeType::union(vec![
+            AttributeType::map(AttributeType::string()),
+            AttributeType::struct_(
+                "Count",
+                vec![StructField::optional("count", AttributeType::string()).build()],
+            ),
+        ]),
+        |catalog, _, bindings, destination| {
+            with_session_for_test(catalog, |session| {
+                let map = |value| {
+                    Value::Concrete(crate::resource::ConcreteValue::Map(
+                        indexmap::IndexMap::from([("count".into(), value)]),
+                    ))
+                };
+                let pending = validate(destination, &map(reference()), bindings, session)
+                    .unwrap()
+                    .ready()
+                    .unwrap_err();
+                assert!(pending.local_obligation().is_some());
+                assert!(
+                    validate(
+                        destination,
+                        &map(Value::root_resource_ref("missing", "output", vec![])),
+                        bindings,
+                        session,
+                    )
+                    .is_err()
+                );
+                let mut resolved = ResolvedBindings::default();
+                resolved.set(
+                    "producer",
+                    HashMap::from([(
+                        "output".into(),
+                        Value::Concrete(crate::resource::ConcreteValue::Int(1)),
+                    )]),
+                    BindingValueSource::Local,
+                );
+                assert!(pending.discharge(&resolved, session).is_err());
+            });
+        },
+    );
+}
+
+#[test]
+fn ambiguous_union_module_argument_keeps_schema_requirement() {
+    ambiguous_union_strict_kind_keeps_schema_requirement::<kind::ModuleArgument>();
+}
+
+#[test]
+fn ambiguous_union_export_keeps_schema_requirement() {
+    ambiguous_union_strict_kind_keeps_schema_requirement::<kind::Export>();
+}
+
+#[test]
+fn ambiguous_union_other_strict_kinds_keep_schema_requirement() {
+    ambiguous_union_strict_kind_keeps_schema_requirement::<kind::ProviderConfigAttribute>();
+    ambiguous_union_strict_kind_keeps_schema_requirement::<kind::BackendAttribute>();
+    ambiguous_union_strict_kind_keeps_schema_requirement::<kind::AnnotatedAttribute>();
+    ambiguous_union_strict_kind_keeps_schema_requirement::<kind::UpstreamExport>();
+}
+
+fn ambiguous_union_strict_kind_keeps_schema_requirement<K: DestinationKind + std::fmt::Debug>() {
+    fixture(
+        AttributeType::int(),
+        AttributeType::union(vec![
+            AttributeType::map(AttributeType::string()),
+            AttributeType::struct_(
+                "Count",
+                vec![StructField::optional("count", AttributeType::string()).build()],
+            ),
+        ]),
+        |catalog, _, bindings, destination| {
+            let destination: Destination<K> = Destination {
+                identity: destination.identity.clone(),
+                label: destination.label.clone(),
+                contract: destination.contract.clone(),
+                kind: PhantomData,
+            };
+            with_session_for_test(catalog, |session| {
+                let value = Value::Concrete(crate::resource::ConcreteValue::Map(
+                    indexmap::IndexMap::from([("count".into(), reference())]),
+                ));
+                let (candidate, context) = Candidate::validation_classified(
+                    value
+                        .knowledge(&KnowledgeContext::validation())
+                        .unwrap()
+                        .into_classification(),
+                    Some(bindings),
+                    session,
+                );
+                let contract = destination.contract.as_deref().unwrap();
+                let path = join(
+                    &contract.path,
+                    &crate::schema::FieldPath::new()
+                        .push_map_key("count")
+                        .canonical(),
+                );
+                let assignment::CandidateOrigin::Reference(reference) =
+                    assignment::CandidateOrigin::of(&reference())
+                else {
+                    panic!("reference origin")
+                };
+                let mut findings = crate::schema::value_validation::AssignmentFindings::default();
+                reference
+                    .judge_at::<K>(
+                        contract,
+                        contract.attr(),
+                        &path,
+                        &assignment::ReferenceContext::from(&context),
+                        &mut findings,
+                    )
+                    .unwrap();
+                assert!(findings.local.is_empty());
+                assert!(!findings.schema.is_empty());
+                assert!(matches!(
+                    assignment::judge_with_findings(&destination, &candidate, &context)
+                        .unwrap()
+                        .verdict,
+                    AssignmentVerdict::NeedsSchema(schema) if !schema.is_empty()
+                ));
+                let pending = admit(&destination, candidate, &context)
+                    .unwrap()
+                    .ready()
+                    .unwrap_err();
+                assert!(pending.local_obligation().is_none());
+            });
+        },
+    );
 }
 
 #[test]
@@ -197,7 +496,10 @@ fn needs_local_without_pending_sites_remains_pending() {
                 );
                 let local_check = |_: &CompiledAttributeType, _: &Value, path: &LeafPath| {
                     Ok(crate::schema::value_validation::AssignmentFindings {
-                        local: vec![path.clone()],
+                        local: vec![assignment::LocalPath::for_recheck(
+                            kind::ResourceAttribute,
+                            path.clone(),
+                        )],
                         ..Default::default()
                     })
                 };
@@ -993,7 +1295,7 @@ fn different_identity_edges_do_not_relax_local_containment() {
                 let contract = destination.contract.as_deref().unwrap();
                 assert!(matches!(
                     source.constraints().next().unwrap().assignment_to(
-                        contract.attr.in_schema(&contract.defs).with_authority(
+                        contract.attr().in_schema(contract.defs()).with_authority(
                             &catalog.custom_types,
                             crate::schema::SinkAuthority::Owner(&contract.owner)
                         )

@@ -39,6 +39,10 @@ use crate::schema::{
 use crate::validation::admission::{RechecksResolved, attributes::AdmittedAttributes, kind};
 use crate::value::SerializationError;
 
+#[cfg(test)]
+#[path = "provider_ready_admission_tests.rs"]
+mod attribute_admission_tests;
+
 /// An immutable value that passed the provider-boundary constraint gate.
 ///
 /// The fields are deliberately private. There is no `new`, `From`,

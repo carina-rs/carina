@@ -682,7 +682,7 @@ struct CanonicalLeafError<'a> {
 /// It never classifies a value or walks children.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct AssignmentFindings {
-    pub(crate) local: Vec<LeafPath>,
+    pub(crate) local: Vec<crate::validation::admission::LocalPath>,
     pub(crate) schema: crate::validation::admission::SchemaObligation,
     pub(crate) errors: Vec<(LeafPath, TypeError)>,
 }

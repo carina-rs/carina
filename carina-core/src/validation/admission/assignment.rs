@@ -37,15 +37,22 @@ fn reference_judgement_uses_the_contract_already_found() {
                 let contract = destination.contract.as_deref().unwrap();
                 let mut findings = crate::schema::value_validation::AssignmentFindings::default();
                 reference
-                    .judge_at::<kind::ResourceAttribute, NoPlaceholder>(
+                    .judge_at::<kind::ResourceAttribute>(
                         contract,
-                        &contract.attr,
+                        contract.attr(),
                         &contract.path,
-                        &context,
+                        &ReferenceContext::from(&context),
                         &mut findings,
                     )
                     .unwrap();
-                assert_eq!(findings.local, vec![contract.path.clone()]);
+                assert_eq!(
+                    findings
+                        .local
+                        .into_iter()
+                        .map(LocalPath::into_path)
+                        .collect::<Vec<_>>(),
+                    vec![contract.path.clone()]
+                );
             });
         },
     );
@@ -54,6 +61,28 @@ fn reference_judgement_uses_the_contract_already_found() {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssignmentProof<K: DestinationKind> {
     destination: Destination<K>,
+}
+
+/// Only a kind that rechecks resolved values can mint a local-path token.
+/// The shared value traversal may collect and protect tokens, but cannot
+/// manufacture one from a path or a strict destination kind.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalPath(LeafPath);
+
+impl LocalPath {
+    pub(super) fn for_recheck<K: RechecksResolved>(_: K, path: LeafPath) -> Self {
+        Self(path)
+    }
+
+    pub(super) fn into_path(self) -> LeafPath {
+        self.0
+    }
+}
+
+impl crate::resource::InsideSecret for LocalPath {
+    fn inside_secret(self) -> Self {
+        Self(self.0.inside_secret())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -67,6 +96,10 @@ enum SchemaRequirement {
     Destination,
 }
 impl SchemaObligation {
+    pub(super) fn require_reference(&mut self) {
+        self.requirements.push(SchemaRequirement::Reference);
+    }
+
     pub(crate) fn extend(&mut self, other: Self) {
         self.requirements.extend(other.requirements);
     }
@@ -168,6 +201,24 @@ pub struct ReferenceCandidate<B: BindingAddress = AbsoluteBindingAddress> {
     pub(super) reference: ReferencePath<B>,
 }
 
+/// Reference checks borrow boundary authority without copying a value proof.
+pub(crate) struct ReferenceContext<'a, B: BindingAddress> {
+    pub(super) bindings: Option<&'a BindingIndex<'a, B>>,
+    pub(super) provider: &'a dyn ProviderTypeCheckContext,
+    pub(super) declaration: Option<(&'a str, &'a crate::binding_index::DeclaredValueSource)>,
+}
+impl<'a, P: PlaceholderKind, B: BindingAddress> From<&AdmissionContext<'a, P, B>>
+    for ReferenceContext<'a, B>
+{
+    fn from(context: &AdmissionContext<'a, P, B>) -> Self {
+        Self {
+            bindings: context.bindings,
+            provider: context.provider,
+            declaration: context.declaration,
+        }
+    }
+}
+
 impl<B: BindingAddress> ReferenceCandidate<B> {
     /// This entry is available only on reference evidence. Placement still
     /// requires `admit`, which also checks the boundary proof and actual value.
@@ -182,11 +233,11 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
             ));
         };
         let mut findings = crate::schema::value_validation::AssignmentFindings::default();
-        self.judge_at::<K, P>(
+        self.judge_at::<K>(
             contract,
-            &contract.attr,
+            contract.attr(),
             &contract.path,
-            context,
+            &ReferenceContext::from(context),
             &mut findings,
         )
         .map_err(|error| {
@@ -198,14 +249,16 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
         Ok(verdict(destination, findings))
     }
 
-    pub(super) fn judge_at<K: DestinationKind, P: PlaceholderKind>(
+    pub(super) fn judge_at<K: DestinationKind>(
         &self,
         contract: &DestinationContract,
         attr: &CompiledAttributeType,
         path: &LeafPath,
-        context: &AdmissionContext<'_, P, B>,
+        context: &ReferenceContext<'_, B>,
         findings: &mut crate::schema::value_validation::AssignmentFindings,
     ) -> Result<(), TypeError> {
+        #[cfg(test)]
+        super::tests::reference_judged();
         let Some(bindings) = context.bindings else {
             findings
                 .schema
@@ -213,7 +266,7 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
                 .push(SchemaRequirement::Reference);
             return Ok(());
         };
-        let sink = attr.in_schema(&contract.defs).with_authority(
+        let sink = attr.in_schema(contract.defs()).with_authority(
             &context.provider.catalog().custom_types,
             SinkAuthority::Owner(&contract.owner),
         );
@@ -246,7 +299,7 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
             match AssignmentRelation::all([relation, original]) {
                 AssignmentRelation::Assignable => {}
                 AssignmentRelation::NeedsLocal(missing) => {
-                    findings.local.push(path.clone());
+                    defer_reference_check::<K>(path, findings);
                     if let Some(missing) = missing {
                         findings
                             .schema
@@ -276,6 +329,13 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
         };
         match source {
             RefType::Typed(source) => {
+                if !contract.has_reference_sink_at(path) {
+                    // A Union supplies a nested sink only when its collection
+                    // shape identifies one member. Existence was checked above;
+                    // only rechecking kinds may defer a local Union check.
+                    defer_reference_check::<K>(path, findings);
+                    return Ok(());
+                }
                 if source.resource_handle_type().is_some() {
                     return Err(reference_error(AdmissionReferenceError::ResourceHandle {
                         reference: self.reference.as_ref().to_dot_string(),
@@ -289,7 +349,7 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
                 ) {
                     AssignmentRelation::Assignable => {}
                     AssignmentRelation::NeedsLocal(missing) => {
-                        findings.local.push(path.clone());
+                        defer_reference_check::<K>(path, findings);
                         if let Some(missing) = missing {
                             findings
                                 .schema
@@ -351,6 +411,16 @@ pub(super) fn reference_error(error: AdmissionReferenceError) -> TypeError {
     }
 }
 
+fn defer_reference_check<K: DestinationKind>(
+    path: &LeafPath,
+    findings: &mut crate::schema::value_validation::AssignmentFindings,
+) {
+    match K::defer_reference_check(path) {
+        Some(local) => findings.local.push(local),
+        None => findings.schema.require_reference(),
+    }
+}
+
 fn verdict<K: DestinationKind>(
     destination: &Destination<K>,
     findings: crate::schema::value_validation::AssignmentFindings,
@@ -360,17 +430,12 @@ fn verdict<K: DestinationKind>(
         schema,
         errors: _,
     } = findings;
-    if !paths.is_empty() {
-        // Only the sealed migrated kinds can have produced these paths.
-        let obligation =
-            K::local(destination, paths, schema).expect("reference policy owns local obligations");
-        AssignmentVerdict::NeedsLocal(obligation)
-    } else if schema.is_empty() {
-        AssignmentVerdict::Proven(AssignmentProof {
+    match K::local(destination, paths, schema) {
+        Ok(obligation) => AssignmentVerdict::NeedsLocal(obligation),
+        Err(schema) if schema.is_empty() => AssignmentVerdict::Proven(AssignmentProof {
             destination: destination.clone(),
-        })
-    } else {
-        AssignmentVerdict::NeedsSchema(schema)
+        }),
+        Err(schema) => AssignmentVerdict::NeedsSchema(schema),
     }
 }
 
@@ -428,6 +493,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
             findings: Default::default(),
         });
     };
+    let reference_context = ReferenceContext::from(context);
     let check = |attr: &CompiledAttributeType, value: &Value<P, B>, path: &LeafPath| {
         let path = join(&contract.path, path);
         let origin = if std::ptr::eq(
@@ -444,7 +510,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
         let mut findings = crate::schema::value_validation::AssignmentFindings::default();
         match origin {
             CandidateOrigin::Reference(reference) => {
-                reference.judge_at::<K, P>(contract, attr, &path, context, &mut findings)?
+                reference.judge_at::<K>(contract, attr, &path, &reference_context, &mut findings)?
             }
             CandidateOrigin::Expression => {
                 if let Some(check) = context.assignment {
@@ -462,26 +528,26 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
     let mut checked = match &context.proof {
         AdmissionProof::Validation(proof) => {
             crate::schema::value_validation::validate_value_for_admission(
-                &contract.attr,
+                contract.attr(),
                 proof,
-                &contract.defs,
+                contract.defs(),
                 contract.ancestry,
                 lookup,
                 Some(&check),
             )
         }
         AdmissionProof::Plan(proof) => crate::schema::value_validation::validate_value_with_lookup(
-            &contract.attr,
+            contract.attr(),
             proof.knowledge(),
-            &contract.defs,
+            contract.defs(),
             contract.ancestry,
             lookup,
         ),
         AdmissionProof::Apply(proof) => {
             crate::schema::value_validation::validate_value_with_lookup(
-                &contract.attr,
+                contract.attr(),
                 &crate::resource::knowledge::Classification::<P, B>::Known(proof.clone()),
-                &contract.defs,
+                contract.defs(),
                 contract.ancestry,
                 lookup,
             )
@@ -712,8 +778,8 @@ mod discharge_tests {
                     let (mut candidate, context) = Candidate::plan(proof, session);
                     let contract = destination.contract.as_deref().unwrap();
                     let crate::schema::TypeAssignability::Unchecked(missing) = source
-                        .in_schema(&contract.defs)
-                        .assignment_to(contract.attr.in_schema(&contract.defs).with_authority(
+                        .in_schema(contract.defs())
+                        .assignment_to(contract.attr().in_schema(contract.defs()).with_authority(
                             &catalog.custom_types,
                             SinkAuthority::Owner(&contract.owner),
                         ))

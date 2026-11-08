@@ -9670,13 +9670,17 @@ impl<'a> EffectiveSchemaNode<'a> {
 #[derive(Debug, Clone)]
 pub struct ValidatedResourceSchema {
     pub(crate) admission_identity: crate::validation::admission::DeclarationId,
-    schema: PatternResourceSchema<Compiled>,
+    schema: Arc<PatternResourceSchema<Compiled>>,
     identity_paths: Vec<IdentityPath>,
 }
 
 impl ValidatedResourceSchema {
     pub fn as_schema(&self) -> &PatternResourceSchema<Compiled> {
         &self.schema
+    }
+
+    pub(crate) fn shared_schema(&self) -> Arc<CompiledResourceSchema> {
+        Arc::clone(&self.schema)
     }
 
     pub fn parts(&self) -> ResourceSchemaParts<'_, Compiled> {
@@ -15116,7 +15120,7 @@ fn finish_resource_schema_validation(
             schema.duplicate_attributes.clear();
             Ok(ValidatedResourceSchema {
                 admission_identity: Default::default(),
-                schema,
+                schema: Arc::new(schema),
                 identity_paths,
             })
         }

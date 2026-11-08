@@ -138,17 +138,19 @@ pub mod attributes;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use assignment::LocalPath;
 pub use assignment::{AssignmentProof, AssignmentVerdict, ReferenceCandidate, SchemaObligation};
 
 mod sealed {
     pub trait Sealed: Sized {
         fn local(
             destination: &super::Destination<Self>,
-            paths: Vec<super::LeafPath>,
+            paths: Vec<super::assignment::LocalPath>,
             schema: super::SchemaObligation,
-        ) -> Option<<Self as super::DestinationKind>::LocalObligation>
+        ) -> Result<<Self as super::DestinationKind>::LocalObligation, super::SchemaObligation>
         where
             Self: super::DestinationKind;
+        fn defer_reference_check(path: &super::LeafPath) -> Option<super::assignment::LocalPath>;
         fn schema(
             obligation: &<Self as super::DestinationKind>::LocalObligation,
         ) -> &super::SchemaObligation
@@ -178,7 +180,8 @@ pub mod kind {
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
             pub struct $name;
             impl super::sealed::Sealed for $name {
-                fn local(_: &super::Destination<Self>, _: Vec<super::LeafPath>, _: super::SchemaObligation) -> Option<<Self as super::DestinationKind>::LocalObligation> { None }
+                fn local(_: &super::Destination<Self>, _: Vec<super::assignment::LocalPath>, schema: super::SchemaObligation) -> Result<<Self as super::DestinationKind>::LocalObligation, super::SchemaObligation> { Err(schema) }
+                fn defer_reference_check(_: &super::LeafPath) -> Option<super::assignment::LocalPath> { None }
                 fn schema(obligation: &<Self as super::DestinationKind>::LocalObligation) -> &super::SchemaObligation { match *obligation {} }
                 fn reference_assignment<'a, B: super::BindingAddress>(
                     source: crate::schema::TypeInSchema<'a, crate::schema::Compiled>,
@@ -211,8 +214,14 @@ pub mod kind {
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
             pub struct $name;
             impl super::sealed::Sealed for $name {
-                fn local(destination: &super::Destination<Self>, paths: Vec<super::LeafPath>, schema: super::SchemaObligation) -> Option<<Self as super::DestinationKind>::LocalObligation> {
-                    Some(super::DeferredLocal { destination: destination.clone(), paths, schema })
+                fn local(destination: &super::Destination<Self>, paths: Vec<super::assignment::LocalPath>, schema: super::SchemaObligation) -> Result<<Self as super::DestinationKind>::LocalObligation, super::SchemaObligation> {
+                    if paths.is_empty() {
+                        return Err(schema);
+                    }
+                    Ok(super::DeferredLocal { destination: destination.clone(), paths: paths.into_iter().map(super::assignment::LocalPath::into_path).collect(), schema })
+                }
+                fn defer_reference_check(path: &super::LeafPath) -> Option<super::assignment::LocalPath> {
+                    Some(super::assignment::LocalPath::for_recheck(Self, path.clone()))
                 }
                 fn schema(obligation: &<Self as super::DestinationKind>::LocalObligation) -> &super::SchemaObligation { &obligation.schema }
                 fn reference_assignment<'a, B: super::BindingAddress>(
@@ -302,12 +311,41 @@ struct DestinationIdentity {
 }
 
 #[derive(Debug, Clone)]
-struct DestinationContract {
-    attr: CompiledAttributeType,
-    defs: std::collections::BTreeMap<String, CompiledAttributeType>,
+pub(crate) struct DestinationContract {
+    schema: std::sync::Arc<crate::schema::CompiledResourceSchema>,
+    attribute: String,
     owner: crate::parser::SchemaTypeOwner,
     ancestry: FieldAncestry,
     path: LeafPath,
+}
+impl DestinationContract {
+    fn attr(&self) -> &CompiledAttributeType {
+        &self.schema.attributes()[&self.attribute].attr_type
+    }
+
+    fn defs(&self) -> &std::collections::BTreeMap<String, CompiledAttributeType> {
+        self.schema.defs()
+    }
+
+    fn has_reference_sink_at(&self, path: &LeafPath) -> bool {
+        let root = crate::validation::RefSink::EffectiveType {
+            attr_type: self.attr(),
+            defs: self.defs(),
+            owner: &self.owner,
+            ancestry: self.ancestry,
+        };
+        path.segments()
+            .iter()
+            .skip(self.path.segments().len())
+            .try_fold(root, |sink, step| match step {
+                crate::schema::LeafPathSegment::StructField(name) => sink.map_entry(name),
+                crate::schema::LeafPathSegment::MapKey(key) => {
+                    sink.map_entry(key.expose_plaintext())
+                }
+                crate::schema::LeafPathSegment::ListIndex(_) => sink.list_element(),
+            })
+            .is_some()
+    }
 }
 
 /// Minted only by the owning catalog, binding declaration, instance and snapshot.
@@ -479,6 +517,8 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         bindings: Option<&'a BindingIndex<'a, B>>,
         provider: &'a dyn ProviderTypeCheckContext,
     ) -> (Self, AdmissionContext<'a, P, B>) {
+        #[cfg(test)]
+        tests::candidate_constructed();
         let identity = DeclarationId::default();
         (
             Self {

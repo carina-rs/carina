@@ -110,9 +110,11 @@ impl crate::schema::OwnerBoundResourceSchema<'_> {
         let mut destination =
             Destination::catalogued(identity(self, id, catalog), attribute.into());
         destination.identity.path.push(ordinal);
+        #[cfg(test)]
+        super::tests::contract_constructed();
         destination.contract = Some(Box::new(DestinationContract {
-            attr: effective.field_type().clone(),
-            defs: self.schema().as_schema().defs.clone(),
+            schema: self.schema().shared_schema(),
+            attribute: effective.name().into(),
             owner: self.schema_type_owner().clone(),
             ancestry: FieldAncestry::from_input_mode(effective.effective_input_mode()),
             path: LeafPath::from_segments([LeafPathSegment::StructField(attribute.into())]),
@@ -178,7 +180,8 @@ pub fn admit_plan_attributes<K: RechecksResolved>(
         )
 }
 
-/// Minted only after every selected attribute has produced a placement.
+/// Every selected writable attribute declared by the schema passed apply admission.
+/// The `KnownWritableOnly` walk skips keys absent from the schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdmittedAttributes<K: RechecksResolved> {
     kind: PhantomData<K>,
@@ -376,6 +379,8 @@ type ValidationAssignmentCheck<'a, P, B> = Option<
         &CompiledAttributeType,
         &Value<P, B>,
         &LeafPath,
+        &DestinationContract,
+        &assignment::ReferenceContext<'_, B>,
     ) -> Result<crate::schema::value_validation::AssignmentFindings, TypeError>,
 >;
 
@@ -417,9 +422,23 @@ pub(crate) fn admit_validation_attributes<
             boundary.declaration = declarations
                 .and_then(|sources| sources.get(name))
                 .map(|(name, source)| (name.as_str(), source));
+            // Retained expressions use the same attribute contract and binding
+            // authority. Their leaf references have no top-level declaration.
+            let reference_context = assignment::ReferenceContext {
+                bindings,
+                provider: session,
+                declaration: None,
+            };
             let assignment =
                 |attr: &CompiledAttributeType, value: &Value<P, B>, path: &LeafPath| match check {
-                    Some(check) => check(name, attr, value, path),
+                    Some(check) => check(
+                        name,
+                        attr,
+                        value,
+                        path,
+                        destination.contract.as_deref().expect("typed assignment"),
+                        &reference_context,
+                    ),
                     None => Ok(Default::default()),
                 };
             let untyped = || {
@@ -590,7 +609,9 @@ fn typed_resource_attribute_admissions<
     let check = |name: &str,
                  attr: &CompiledAttributeType,
                  value: &Value<ParserPlaceholder, B>,
-                 _path: &LeafPath| {
+                 _path: &LeafPath,
+                 contract: &DestinationContract,
+                 boundary: &assignment::ReferenceContext<'_, B>| {
         match value {
             Value::Deferred(
                 DeferredValue::Interpolation(_)
@@ -646,25 +667,10 @@ fn typed_resource_attribute_admissions<
             let reference = crate::resource::module_argument_reference_path(value)?;
             let origin = format!("from {}", reference.as_ref().to_dot_string());
             let reference = ReferenceCandidate { reference };
-            let contract = DestinationContract {
-                attr: attr.clone(),
-                defs: schema.schema().as_schema().defs().clone(),
-                owner: schema.schema_type_owner().clone(),
-                ancestry: FieldAncestry::WRITABLE,
-                path: _path.clone(),
-            };
-            let (_, boundary) =
-                Candidate::validation_classified(attributes[name].clone(), Some(bindings), session);
             let mut findings = Default::default();
             Some(
                 reference
-                    .judge_at::<K, ParserPlaceholder>(
-                        &contract,
-                        attr,
-                        _path,
-                        &boundary,
-                        &mut findings,
-                    )
+                    .judge_at::<K>(contract, attr, _path, boundary, &mut findings)
                     .map(|()| findings)
                     .map_err(|error| match error {
                         TypeError::TypeMismatch { types } => {
@@ -762,26 +768,8 @@ fn typed_resource_attribute_admissions<
             if let assignment::CandidateOrigin::Reference(reference) =
                 assignment::CandidateOrigin::of(expression.assignment_value(value))
             {
-                let contract = DestinationContract {
-                    attr: attr.clone(),
-                    defs: schema.schema().as_schema().defs().clone(),
-                    owner: schema.schema_type_owner().clone(),
-                    ancestry: FieldAncestry::WRITABLE,
-                    path: _path.clone(),
-                };
-                let (_, boundary) = Candidate::validation_classified(
-                    attributes[name].clone(),
-                    Some(bindings),
-                    session,
-                );
                 let mut findings = Default::default();
-                reference.judge_at::<K, ParserPlaceholder>(
-                    &contract,
-                    attr,
-                    _path,
-                    &boundary,
-                    &mut findings,
-                )?;
+                reference.judge_at::<K>(contract, attr, _path, boundary, &mut findings)?;
                 return Ok(findings);
             }
         }

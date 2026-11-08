@@ -45,6 +45,17 @@ type ExpandedAnalysis<'a> = carina_core::parser::AnalysisTree<
     >,
     AbsoluteBindingAddress,
 >;
+type ExpandedResource<'a> = carina_core::parser::AnalysisResourceRef<
+    'a,
+    ParserPlaceholder,
+    ParserPlaceholder,
+    carina_core::parser::ResolvedDeferredForPhase<
+        ParserPlaceholder,
+        ParserPlaceholder,
+        AbsoluteBindingAddress,
+    >,
+    AbsoluteBindingAddress,
+>;
 type RootAnalysis<'a> = carina_core::parser::AnalysisTree<
     'a,
     ParserPlaceholder,
@@ -328,7 +339,7 @@ type ExpandedConfiguration<'a> = carina_core::parser::retained::JudgedFile<
 >;
 struct ExpandedDiagnosticValidationInputs<'a> {
     configuration: &'a ExpandedConfiguration<'a>,
-    tree: ExpandedAnalysis<'a>,
+    resources: HashMap<&'a carina_core::resource::ResourceId, &'a ExpandedResource<'a>>,
     binding_index: carina_core::binding_index::BindingIndex<'a, AbsoluteBindingAddress>,
 }
 
@@ -339,10 +350,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::schema::ResourceValueValidation> {
         use carina_core::validation::admission::attributes::resource_attribute_admissions;
-        let resource = self
-            .tree
-            .resources()
-            .find(|resource| resource.id() == resource_id)?;
+        let resource = *self.resources.get(resource_id)?;
         let schemas = self.configuration.schemas();
         let schema = resource.schema(schemas)?;
         let attributes = resource.attributes();
@@ -1162,13 +1170,22 @@ impl DiagnosticRun<'_> {
                     self.provider_context.catalog(),
                 )
             });
+            let expanded_validation_tree =
+                expanded_configuration.as_ref().and_then(|configuration| {
+                    carina_core::parser::AnalysisTree::try_from_file(configuration.judged().file())
+                        .ok()
+                });
             let expanded_validation_inputs = expanded_configuration.as_ref().and_then(|configuration| {
                 let configuration = configuration.judged();
                 let graph = configuration.file();
-                let tree = carina_core::parser::AnalysisTree::try_from_file(graph).ok()?;
+                let tree = expanded_validation_tree.as_ref()?;
+                let mut resources = HashMap::new();
+                for resource in tree.resources() {
+                    resources.entry(resource.id()).or_insert(resource);
+                }
                 Some(ExpandedDiagnosticValidationInputs {
                     configuration,
-                    tree,
+                    resources,
                     binding_index:
                         carina_core::binding_index::BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
                             graph, &self.schemas, Some(&expanded_upstream_exports), &module_signatures, self.provider_context,
