@@ -3521,10 +3521,13 @@ fn resolve_deferred_create_only_value(
     match crate::resolver::project_ref_value_status(value, &bindings, provider_context) {
         Ok(crate::resolver::ValueResolution::Present(resolved)) => Ok(Some(resolved)),
         Ok(
-            crate::resolver::ValueResolution::Absent | crate::resolver::ValueResolution::Unknown(_),
+            crate::resolver::ValueResolution::Absent(_)
+            | crate::resolver::ValueResolution::Unknown(_),
         )
         | Err(
             crate::resolver::ResolutionError::Message(_)
+            | crate::resolver::ResolutionError::Knowledge(_)
+            | crate::resolver::ResolutionError::Context { .. }
             | crate::resolver::ResolutionError::InsideSecret { .. },
         ) => Ok(None),
         Err(crate::resolver::ResolutionError::UnavailableSecret(error)) => Err(error),

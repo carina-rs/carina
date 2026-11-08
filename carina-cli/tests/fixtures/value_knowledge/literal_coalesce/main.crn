@@ -1,0 +1,2 @@
+let producer = mock.test.resource { name = "producer" }
+for item in ([producer.identifier] ?? []) { mock.test.resource { name = item } }

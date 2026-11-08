@@ -944,3 +944,55 @@ pub(super) fn custom_engine(schemas: SchemaRegistry) -> DiagnosticEngine {
         .collect();
     DiagnosticEngine::new(loaded_providers_from_factories(factories), provider_names)
 }
+
+#[test]
+fn attribute_classification_error_retains_siblings_and_each_attribute_name() {
+    use carina_core::resource::knowledge::{KnowledgeContext, KnowledgeError};
+    let first: GenericValue<carina_core::resource::NoPlaceholder, AbsoluteBindingAddress> =
+        GenericValue::Concrete(ConcreteValue::Int(7));
+    let last: GenericValue<carina_core::resource::NoPlaceholder, AbsoluteBindingAddress> =
+        GenericValue::Concrete(ConcreteValue::Bool(false));
+    let reference = |binding| {
+        GenericValue::<
+            carina_core::resource::NoPlaceholder,
+            carina_core::resource::RelativeBindingName,
+        >::resource_ref(binding, "value", vec![])
+        .resolve_root_for_test()
+    };
+    let broken_first = reference("first_cycle");
+    let broken_last = reference("last_cycle");
+    let mut bindings = carina_core::binding_index::ResolvedBindings::default();
+    for (name, value) in [("first_cycle", &broken_first), ("last_cycle", &broken_last)] {
+        bindings.set(
+            name,
+            std::collections::HashMap::from([("value".into(), value.clone())]),
+            carina_core::binding_index::BindingValueSource::Local,
+        );
+    }
+    let mut errors = Vec::new();
+    let classified = collect_classified_attributes(
+        [
+            ("broken_first".to_owned(), &broken_first),
+            ("known_first".to_owned(), &first),
+            ("broken_last".to_owned(), &broken_last),
+            ("known_last".to_owned(), &last),
+        ],
+        &KnowledgeContext::plan(&bindings),
+        |name, error| errors.push((name.to_owned(), error)),
+    );
+    assert_eq!(classified.len(), 4);
+    assert!(matches!(
+        classified["broken_first"],
+        carina_core::resource::knowledge::Classification::Failed(_)
+    ));
+    assert!(matches!(
+        classified["broken_last"],
+        carina_core::resource::knowledge::Classification::Failed(_)
+    ));
+    assert!(classified.contains_key("known_first"));
+    assert!(classified.contains_key("known_last"));
+    assert!(
+        matches!(errors.as_slice(), [(first, KnowledgeError::Cycle { .. }), (last, KnowledgeError::Cycle { .. })]
+        if first == "broken_first" && last == "broken_last")
+    );
+}

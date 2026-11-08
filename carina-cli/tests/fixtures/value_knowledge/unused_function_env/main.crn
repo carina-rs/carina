@@ -1,0 +1,5 @@
+fn example(): String {
+ let unused = env("CARINA_4316_UNUSED_MISSING")
+ "kept"
+}
+mock.test.resource { name = example() }

@@ -1,0 +1,93 @@
+{
+  "version": 21,
+  "exports_version": 1,
+  "serial": 2,
+  "lineage": "a5b15bf9-01cb-47b7-a818-de1d1c96ee8a",
+  "carina_version": "0.12.2",
+  "resources": [
+    {
+      "resource_type": "test.resource",
+      "identity": "producer",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "name": "producer",
+          "identifier": "producer-id"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": "producer",
+      "dependency_bindings": []
+    },
+    {
+      "resource_type": "example.consumer",
+      "identity": "mock_example_consumer_c0440601002a1730",
+      "provider": "mock",
+      "current": {
+        "kind": "applied",
+        "identifier": "mock-id",
+        "attributes": {
+          "list": [
+            "producer-id"
+          ],
+          "name": "consumer"
+        },
+        "nested_write_only": {}
+      },
+      "protected": false,
+      "directives": {
+        "force_delete": false,
+        "create_before_destroy": false,
+        "prevent_destroy": {
+          "kind": "unspecified"
+        }
+      },
+      "prefixes": {},
+      "name_overrides": {},
+      "explicit": {
+        "kind": "struct",
+        "children": {
+          "list": {
+            "kind": "list-elements",
+            "elements": [
+              {
+                "kind": "leaf"
+              }
+            ]
+          },
+          "name": {
+            "kind": "leaf"
+          }
+        }
+      },
+      "binding": null,
+      "dependency_bindings": [
+        {
+          "provider": "mock",
+          "resource_type": "test.resource",
+          "identity": "producer"
+        }
+      ]
+    }
+  ]
+}

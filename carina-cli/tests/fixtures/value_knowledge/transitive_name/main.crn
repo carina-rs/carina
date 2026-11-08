@@ -1,0 +1,3 @@
+let other = mock.test.resource { name = "other" }
+let producer = mock.test.resource { name = "x-${other.identifier}" }
+mock.test.resource { name = "consumer" comment = producer.name ?? "d" }

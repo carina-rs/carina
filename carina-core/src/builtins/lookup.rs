@@ -1,55 +1,30 @@
-//! `lookup(map, key, default)` built-in function
-
-use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
-
+//! Select a key with exact map membership; the selected leaf may remain pending.
 use super::value_type_name;
-
-/// `lookup(map, key, default)` - Look up a key in a map, returning a default if not found.
-///
-/// - First argument: map (Map)
-/// - Second argument: key (String)
-/// - Third argument: default value (any Value)
-/// - Returns: the value at key if it exists, otherwise the default
-///
-/// Examples:
-/// ```text
-/// lookup({a: "one", b: "two"}, "a", "default")  // => "one"
-/// lookup({a: "one", b: "two"}, "c", "default")  // => "default"
-/// ```
-pub(crate) fn builtin_lookup<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
+use crate::resource::knowledge::{Classification, KnownValue, PlanIterable};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
+pub fn builtin_lookup<B: BindingAddress>(
+    map: &PlanIterable<'_, NoPlaceholder, B>,
+    key: &KnownValue<'_, NoPlaceholder, B>,
+    default: &Classification<'_, NoPlaceholder, B>,
 ) -> Result<Value<NoPlaceholder, B>, String> {
-    if args.len() != 3 {
+    let map = map.for_expansion();
+    let Value::Concrete(ConcreteValue::Map(map)) = map else {
         return Err(format!(
-            "lookup() expects 3 arguments (map, key, default), got {}",
-            args.len()
+            "lookup() first argument must be a map, got {}",
+            value_type_name(&map)
         ));
-    }
-
-    let map = match &args[0] {
-        Value::Concrete(ConcreteValue::Map(m)) => m,
-        other => {
-            return Err(format!(
-                "lookup() first argument must be a map, got {}",
-                value_type_name(other)
-            ));
-        }
     };
-
-    let key = match &args[1] {
-        Value::Concrete(ConcreteValue::String(s)) => s,
-        other => {
-            return Err(format!(
-                "lookup() second argument must be a string, got {}",
-                value_type_name(other)
-            ));
-        }
+    let key = key.to_value();
+    let Value::Concrete(ConcreteValue::String(key)) = key else {
+        return Err(format!(
+            "lookup() second argument must be a string, got {}",
+            value_type_name(&key)
+        ));
     };
-
     Ok(map
         .get(key.expose_plaintext())
         .cloned()
-        .unwrap_or_else(|| args[2].clone()))
+        .unwrap_or_else(|| default.to_value()))
 }
 
 #[cfg(test)]

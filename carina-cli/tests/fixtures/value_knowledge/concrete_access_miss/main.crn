@@ -1,0 +1,2 @@
+let role = mock.test.resource { name = "role" tags = {} }
+mock.test.resource { name = "consumer" comment = values(role.tags)[0] }

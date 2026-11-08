@@ -352,6 +352,103 @@ fn coalesced_upstream_iterable_stays_deferred_when_state_is_unavailable() {
 }
 
 #[test]
+fn directory_removed_authored_attribute_selects_default_from_desired_view() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_common_files(&project);
+    fs::write(project.join("exports.crn"), "exports {}\n").unwrap();
+    fs::write(
+        project.join("main.crn"),
+        "let producer = mock.test.resource { name = \"producer\" comment = \"configured\" }\nlet consumer = mock.test.resource { name = producer.comment ?? \"fallback\" }\n",
+    )
+    .unwrap();
+    assert_success(&run_cli(&project, &["init", "."]), "init removed attribute");
+    assert_success(
+        &run_cli(&project, &["apply", "--auto-approve", "."]),
+        "apply configured attribute",
+    );
+    fs::write(
+        project.join("main.crn"),
+        "let producer = mock.test.resource { name = \"producer\" }\nlet consumer = mock.test.resource { name = producer.comment ?? \"fallback\" }\n",
+    )
+    .unwrap();
+    let plan = plan_json(&project);
+    assert_eq!(created_names(&plan), ["fallback"]);
+    assert_success(
+        &run_cli(&project, &["apply", "--auto-approve", "."]),
+        "apply removed attribute",
+    );
+    assert_converged(&project, "removed attribute convergence");
+}
+
+#[test]
+fn directory_partial_read_does_not_turn_unknown_identifier_into_absence() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("project");
+    write_common_files(&project);
+    fs::write(project.join("exports.crn"), "exports {}\n").unwrap();
+    fs::write(
+        project.join("main.crn"),
+        "let producer = mock.test.resource { name = \"producer\" }\n",
+    )
+    .unwrap();
+    assert_success(&run_cli(&project, &["init", "."]), "init partial read");
+    let mock_state = project.join("mock-state.json");
+    let mock_state = mock_state.to_str().unwrap();
+    let partial = run_cli_with_env(
+        &project,
+        &["apply", "--auto-approve", "."],
+        &[
+            ("CARINA_MOCK_STATE_FILE", mock_state),
+            ("CARINA_MOCK_PARTIAL_CREATE_FOR", "*"),
+            ("CARINA_MOCK_PARTIAL_CREATE_MISSING", "identifier"),
+        ],
+    );
+    assert_eq!(
+        partial.status.code(),
+        Some(2),
+        "partial create:\n{}\n{}",
+        String::from_utf8_lossy(&partial.stdout),
+        String::from_utf8_lossy(&partial.stderr),
+    );
+    fs::write(
+        project.join("main.crn"),
+        "let producer = mock.test.resource { name = \"producer\" }\nlet consumer = mock.test.resource { name = producer.identifier ?? \"fallback\" }\n",
+    )
+    .unwrap();
+    let output = run_cli_with_env(
+        &project,
+        &["plan", "--refresh=false", "--json", "."],
+        &[("CARINA_MOCK_STATE_FILE", mock_state)],
+    );
+    assert_success(&output, "plan without refreshing partial read");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let plan: PlanFile = serde_json::from_str(&stdout[stdout.find('{').unwrap()..]).unwrap();
+    let consumer = plan
+        .plan
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            Effect::Create(resource)
+                if resource.as_resource().binding.as_ref().map(|b| b.as_str())
+                    == Some("consumer") =>
+            {
+                Some(resource.as_resource())
+            }
+            _ => None,
+        })
+        .expect("consumer create");
+    assert!(matches!(
+        consumer.get_attr("name"),
+        Some(Value::Deferred(_))
+    ));
+    assert_ne!(
+        consumer.get_attr("name"),
+        Some(&Value::Concrete(ConcreteValue::String("fallback".into()))),
+    );
+}
+
+#[test]
 fn unchanged_ref_authored_managed_producer_defaults_at_plan_and_apply() {
     let root = tempfile::tempdir().expect("create temporary root");
     let project = root.path().join("project");

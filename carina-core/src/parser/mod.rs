@@ -188,9 +188,7 @@ pub(crate) use context::{ParseContext, extract_key_string, first_inner, next_pai
 pub use expressions::for_expr::ForBinding;
 pub use expressions::validate_expr::CompareOp;
 pub(crate) use let_binding::{LetBindingKind, LetBindingRhs, if_structural_handle};
-pub(crate) use static_eval::{
-    decide_if_condition, evaluate_static_value, is_static_eval, is_static_value,
-};
+pub(crate) use static_eval::{decide_if_condition, evaluate_static_value, is_static_eval};
 
 #[cfg(test)]
 mod tests;

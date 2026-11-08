@@ -10294,10 +10294,7 @@ impl Provider for CascadeReplaceProvider {
 #[tokio::test(start_paused = true)]
 async fn cascading_replacement_child_create_uses_new_parent_binding() {
     use crate::binding_index::{LivePreApplyInputs, ResolvedBindings};
-    use crate::differ::{
-        CascadeDependents, DeferredCreateTargets, DeferredForExpansionChoice,
-        create_plan_with_cascades,
-    };
+    use crate::differ::{CascadeDependents, DeferredCreateTargets, create_plan_with_cascades};
     use crate::schema::SchemaRegistry;
 
     fn string(value: &str) -> Value {
@@ -10445,7 +10442,8 @@ async fn cascading_replacement_child_create_uses_new_parent_binding() {
             crate::test_support::resolved_targets(
                 DeferredCreateTargets::partition_for_expansion(
                     crate::parser::ExpandedFile::<()>::default().into_deferred_for_expressions(),
-                    |_| DeferredForExpansionChoice::Retain,
+                    &crate::binding_index::IterableBindings::from_upstream_only(Default::default()),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .1,
             ),
@@ -10675,7 +10673,7 @@ async fn test_wait_effect_polls_then_unblocks_downstream() {
 /// `test_wait_effect_polls_then_unblocks_downstream`. If the nested-map
 /// `ResourceRef` to the wait binding does not produce a scheduler edge
 /// to the `Effect::Wait`, the Distribution is dispatched before the
-/// wait records `cert_issued`'s attributes and `assert_fully_resolved`
+/// wait records `cert_issued`'s attributes and `assert_known_attribute`
 /// rejects the still-`Deferred` ref with the self-contradicting
 /// "add a `wait` block" error.
 #[tokio::test]
@@ -12565,7 +12563,7 @@ fn cert_state_for_deferred_replace_deadlock(id: &ResourceId) -> State {
 // `read aws.*` data source must resolve from the data source's
 // pre-refreshed `data_source_states` row at apply time. Pre-fix, the
 // pre-apply binding view never merged the data source's `State.attributes`
-// into its binding, so the executor's `assert_fully_resolved` rejected
+// into its binding, so the executor's `assert_known_attribute` rejected
 // the unresolved `ResourceRef` with the misleading "add a `wait` block"
 // message that does not apply to data sources.
 // -----------------------------------------------------------------------
@@ -14700,6 +14698,79 @@ fn review2_context_error_drops_untyped_secret_context() {
     )
     .inside_secret();
     assert!(!render_error_chain(error.as_error()).contains("private-"));
+}
+
+#[tokio::test]
+async fn plan_normalized_secret_reference_keeps_apply_constraint_checks() {
+    use crate::binding_index::BindingValueSource;
+
+    let plaintext = "apply-time-plaintext";
+    let provider = MockProvider::new();
+    let mut resource = make_resource("invalid-secret-create", &[]);
+    resource.set_attr(
+        "target",
+        Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::root_resource_ref("secret-source", "value", vec![])).into(),
+        )),
+    );
+    let id = resource.id.clone();
+    let unresolved = HashMap::from([(
+        ResolvedResourceId::new(id.clone()),
+        UnresolvedResource::from_pre_resolve(resource.clone()),
+    )]);
+    let mut bindings = ResolvedBindings::default();
+    bindings.set(
+        "secret-source",
+        HashMap::from([(
+            "value".to_string(),
+            Value::Deferred(DeferredValue::Secret(
+                Box::new(Value::Concrete(ConcreteValue::String(
+                    plaintext.to_string().into(),
+                )))
+                .into(),
+            )),
+        )]),
+        BindingValueSource::Local,
+    );
+    let mut plan = Plan::new();
+    plan.add(create_effect(resource));
+    provider.push_create(Ok(ok_state(&id)));
+    let schemas = provider_boundary_constraint_schemas();
+    let observer = MockObserver::new();
+    let input = ExecutionInput {
+        provider_context: crate::parser::ProviderContext::clone(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+        ),
+        plan: &checked_fixture_plan(&plan),
+        provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+            resource_origins: &unresolved,
+            data_source_origins: &[],
+        },
+        compositions: &[],
+        bindings,
+        managed_current: HashMap::new(),
+        data_source_values: ExecutableDataSourceValues::empty(),
+        normalizer: &NoopNormalizer,
+        provider_configs: &[],
+        factories: &[],
+        schemas: &schemas,
+        parallelism: crate::executor::TEST_UNCAPPED,
+        precompleted_success_count: 0,
+        checkpoint_sink: crate::executor::ExecutionCheckpointSink::noop(),
+    };
+
+    let result =
+        completed_result(execute_plan(&provider, input, &observer, uncancelled_shutdown()).await);
+    let events = observer.events().join("\n");
+
+    assert_eq!(result.success_count, 0);
+    assert_eq!(result.failure_count(), 1);
+    assert!(provider.calls().is_empty());
+    assert!(events.contains("(secret)"), "events: {events}");
+    assert!(
+        !events.contains(plaintext),
+        "secret leaked in apply error: {events}"
+    );
 }
 
 #[test]

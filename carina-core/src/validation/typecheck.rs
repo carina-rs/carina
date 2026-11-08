@@ -10,7 +10,7 @@ use crate::parser::{
 };
 use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, PlaceholderKind, Value};
 
-// This mode is private to the checker. Only a ResolvedConstraintValue can
+// This mode is private to the checker. Only a KnownValue can
 // enter the resolved branch; authored APIs always require JudgedExpr.
 #[derive(Clone, Copy)]
 enum ValueCheckEvidence<'a> {
@@ -27,17 +27,6 @@ impl<'a> ValueCheckEvidence<'a> {
             Self::Authored(expression) => f(expression).map(Self::Authored),
             Self::Resolved => Ok(self),
         }
-    }
-}
-
-/// A resolved projection can be checked for concrete constraints. This type
-/// cannot wrap deferred authored values and provides no static admission.
-pub(crate) struct ResolvedConstraintValue<'a, P: PlaceholderKind, B: BindingAddress>(
-    &'a Value<P, B>,
-);
-impl<'a, P: PlaceholderKind, B: BindingAddress> ResolvedConstraintValue<'a, P, B> {
-    pub(crate) fn new(value: &'a Value<P, B>) -> Option<Self> {
-        value.is_fully_resolved().then_some(Self(value))
     }
 }
 
@@ -189,11 +178,12 @@ impl<'a> TypecheckProviderContext<'a> {
     pub(crate) fn check_resolved_constraints<P: PlaceholderKind, B: BindingAddress>(
         self,
         expected: &TypeExpr,
-        value: &ResolvedConstraintValue<'_, P, B>,
+        value: &crate::resource::knowledge::KnownValue<'_, P, B>,
     ) -> TypeExprValueCheck<'a> {
+        let resolved_value = value.to_value();
         check_type_expr_value_inner_with_mode(
             expected,
-            value.0,
+            &resolved_value,
             self.as_provider_context(),
             ValueCheckEvidence::Resolved,
             if self.requires_provider_schemas() {
@@ -207,7 +197,7 @@ impl<'a> TypecheckProviderContext<'a> {
     pub(crate) fn check_resolved_constraints_at<P: PlaceholderKind, B: BindingAddress>(
         self,
         expected: &TypeExpr,
-        value: &ResolvedConstraintValue<'_, P, B>,
+        value: &crate::resource::knowledge::KnownValue<'_, P, B>,
         site: super::deferred_types::ProviderTypeCheckSite,
     ) -> Result<(), TypeExprValueError> {
         let check = self.check_resolved_constraints(expected, value);
@@ -679,7 +669,10 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
             }
             match expression.static_type() {
                 Ok(actual)
-                    if !value.is_fully_resolved()
+                    if !value
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .is_ok_and(|value| value.into_known().is_ok())
                         && matches!(
                             inferred_type_assignment(expected, actual, &config.custom_types),
                             crate::schema::TypeAssignability::Mismatch
@@ -699,7 +692,10 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
             ) {
                 return deferred_provider_check(expected, value);
             }
-            if !value.is_fully_resolved()
+            if !value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .is_ok_and(|value| value.into_known().is_ok())
                 && (expression.requires_declared_assignment()
                     || (expression.is_single_string_construction()
                         && admission
@@ -712,7 +708,10 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
                     _ => Assignable,
                 };
             }
-            let inference = if value.is_fully_resolved()
+            let inference = if value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .is_ok_and(|value| value.into_known().is_ok())
                 && (expression.is_value_dependent() || expression.requires_declared_assignment())
             {
                 ValueCheckEvidence::Resolved
@@ -883,7 +882,21 @@ fn check_constraint_value<'s, P: PlaceholderKind, B: BindingAddress>(
         TypeExpr::Simple(name) => {
             let declaration = name.declaration();
             TypeExprValueCheck::from_result(
-                validate_builtin_custom_type(declaration, value).map_err(|error| match error {
+                match value
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                {
+                    Ok(crate::resource::knowledge::Classification::Known(value)) => {
+                        validate_builtin_custom_type(declaration, &value)
+                    }
+                    Ok(
+                        crate::resource::knowledge::Classification::ShapeKnown(_)
+                        | crate::resource::knowledge::Classification::Pending(_)
+                        | crate::resource::knowledge::Classification::Failed(_),
+                    )
+                    | Err(_) => Ok(()),
+                }
+                .map_err(|error| match error {
                     crate::schema::TypeError::TypeMismatch { .. } => mismatch(expected, value),
                     error => validation_mismatch(expected, value, error.to_string()),
                 }),
@@ -950,7 +963,20 @@ fn check_constraint_value<'s, P: PlaceholderKind, B: BindingAddress>(
             }
             match provider_custom_types {
                 ProviderCustomTypeValidation::Loaded => {
-                    match validate_schema_custom_type_with_context(owned, value, config) {
+                    match match value
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                    {
+                        Ok(crate::resource::knowledge::Classification::Known(value)) => {
+                            validate_schema_custom_type_with_context(owned, &value, config)
+                        }
+                        Ok(
+                            crate::resource::knowledge::Classification::ShapeKnown(_)
+                            | crate::resource::knowledge::Classification::Pending(_)
+                            | crate::resource::knowledge::Classification::Failed(_),
+                        )
+                        | Err(_) => Ok(()),
+                    } {
                         Ok(()) => Assignable,
                         Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded) => {
                             deferred_provider_check(expected, value)
@@ -961,7 +987,20 @@ fn check_constraint_value<'s, P: PlaceholderKind, B: BindingAddress>(
                     }
                 }
                 ProviderCustomTypeValidation::Providerless if config.custom_types.is_partial() => {
-                    match validate_schema_custom_type_with_context(owned, value, config) {
+                    match match value
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                    {
+                        Ok(crate::resource::knowledge::Classification::Known(value)) => {
+                            validate_schema_custom_type_with_context(owned, &value, config)
+                        }
+                        Ok(
+                            crate::resource::knowledge::Classification::ShapeKnown(_)
+                            | crate::resource::knowledge::Classification::Pending(_)
+                            | crate::resource::knowledge::Classification::Failed(_),
+                        )
+                        | Err(_) => Ok(()),
+                    } {
                         Ok(()) => Assignable,
                         Err(
                             error @ crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
@@ -2292,7 +2331,16 @@ mod tests {
                 )]),
                 Box::new(move |target, value| {
                     declaration
-                        .validate_identified_scalar_value(value)
+                        .validate_identified_scalar_value(
+                            &(value)
+                                .knowledge(
+                                    &crate::resource::knowledge::KnowledgeContext::validation(),
+                                )
+                                .map(|proof| proof.into_classification())
+                                .unwrap()
+                                .into_known()
+                                .unwrap(),
+                        )
                         .map_err(|error| {
                             crate::parser::fixture_invalid_custom_type_value(target, error)
                         })

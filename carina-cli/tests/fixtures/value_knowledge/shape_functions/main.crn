@@ -1,0 +1,5 @@
+let producer_a = mock.test.resource { name = "producer-a" }
+let producer_b = mock.test.resource { name = "producer-b" }
+for (i, item) in flatten([[producer_a.identifier], [producer_b.identifier]]) {
+  mock.test.resource { name = "child-${i}" parent_name = item }
+}

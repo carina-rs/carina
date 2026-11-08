@@ -54,7 +54,24 @@ fn render_first_error(
     let result = registry
         .get("test", &resource_type, SchemaKind::Resource)
         .expect("snapshot schema must be owner-bound")
-        .validate_with_resolver(&attrs, &|_| string_literal, &resolver);
+        .validate_with_resolver(
+            &attrs
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        value
+                            .knowledge(
+                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
+                            )
+                            .map(|proof| proof.into_classification())
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+            &|_| string_literal,
+            &resolver,
+        );
     let errs = result.expect_err("schema must reject the input under test");
     errs.first()
         .expect("at least one error expected")

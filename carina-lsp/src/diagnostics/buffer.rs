@@ -257,6 +257,13 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             DiagnosticSeverity::ERROR,
             message.clone(),
         ),
+        ParseError::Evaluation { line, error } => carina_diagnostic(
+            (*line as u32).saturating_sub(1),
+            0,
+            100,
+            DiagnosticSeverity::ERROR,
+            error.to_string(),
+        ),
         ParseError::InvalidFloatLiteral { line, source } => carina_diagnostic(
             (*line as u32).saturating_sub(1),
             0,
@@ -508,6 +515,26 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typed_evaluation_error_preserves_the_existing_parse_diagnostic() {
+        let cause = carina_core::resource::knowledge::KnowledgeError::<
+            carina_core::resource::AbsoluteBindingAddress,
+        >::InvalidStage {
+            operation: "known-value projection",
+        };
+        let typed = carina_core::parser::ParseError::Evaluation {
+            line: 7,
+            error: Box::new(cause.into()),
+        };
+        let original = carina_core::parser::ParseError::InvalidExpression {
+            line: 7,
+            message: "known-value projection is not valid at this resolution boundary".into(),
+        };
+        assert_eq!(
+            super::parse_error_to_diagnostic(&typed),
+            super::parse_error_to_diagnostic(&original)
+        );
+    }
     use super::*;
     #[test]
     fn overflowing_float_diagnostics_point_at_the_literal_token() {

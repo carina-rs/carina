@@ -1,0 +1,1 @@
+let result = if env("CARINA_KNOWLEDGE_CONDITION_MISSING") { true } else { false }

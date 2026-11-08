@@ -1,7 +1,28 @@
 //! Built-in functions for the Carina DSL
 //!
 //! Provides a registry of built-in functions that can be called from DSL expressions.
-//! Functions take `&[Value]` arguments and return `Result<Value, String>`.
+//! Scalar functions take `&[KnownValue]` arguments and return typed evaluation errors.
+//!
+//! ```compile_fail,E0308
+//! use carina_core::{builtins::evaluate_builtin_to_value,parser::ProviderContext,resource::Value};
+//! fn bypass(raw:Value,config:&ProviderContext){let _=evaluate_builtin_to_value("upper",&[raw],config);}
+//! ```
+//! ```compile_fail,E0308
+//! use carina_core::{builtins::builtin_length,resource::Value};
+//! fn bypass(raw:Value){let _=builtin_length(&raw);}
+//! ```
+//! ```compile_fail,E0308
+//! use carina_core::{builtins::builtin_keys,resource::Value};
+//! fn bypass(raw:Value){let _=builtin_keys(&raw);}
+//! ```
+//! ```compile_fail,E0308
+//! use carina_core::{builtins::evaluate_builtin_to_value,parser::ProviderContext,resource::knowledge::Classification};
+//! fn bypass(raw:Classification,config:&ProviderContext){let _=evaluate_builtin_to_value("upper",&[raw],config);}
+//! ```
+//! ```compile_fail,E0308
+//! use carina_core::{builtins::evaluate_builtin_to_value,parser::ProviderContext,resource::knowledge::ShapeKnown};
+//! fn bypass(raw:ShapeKnown,config:&ProviderContext){let _=evaluate_builtin_to_value("upper",&[raw],config);}
+//! ```
 
 mod cidr_subnet;
 mod concat;
@@ -20,8 +41,16 @@ mod split;
 mod trim;
 mod upper_lower;
 
+pub use concat::builtin_concat;
+pub use flatten::builtin_flatten;
+pub use keys_values::{builtin_keys, builtin_values};
+pub use length::builtin_length;
+pub use lookup::builtin_lookup;
+pub use map::builtin_map;
+
 use crate::eval_value::EvalValue;
 use crate::parser::ProviderContext;
+use crate::resolver::ResolutionError;
 use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, NoPlaceholder, Value};
 
 /// Authored builtin syntax. Secret is an intrinsic value constructor and
@@ -109,10 +138,184 @@ impl Builtin {
 /// The value boundary peels, protects errors and rewraps the result together.
 fn evaluate_secret_arguments<B: BindingAddress>(
     args: Vec<Value<NoPlaceholder, B>>,
-    handler: impl FnOnce(&[Value<NoPlaceholder, B>]) -> Result<Value<NoPlaceholder, B>, String>,
-) -> Result<EvalValue<B>, String> {
-    crate::resource::with_secret_values(args, |args| handler(&args))
-        .map(EvalValue::from_expanded_value)
+    handler: impl FnOnce(
+        &[crate::resource::knowledge::KnownValue<'_, NoPlaceholder, B>],
+    ) -> Result<Value<NoPlaceholder, B>, ResolutionError>,
+) -> Result<EvalValue<B>, ResolutionError> {
+    crate::resource::with_secret_values(args, |args| {
+        let arguments = args
+            .iter()
+            .map(|value| {
+                value
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(ResolutionError::from)?
+                    .into_known()
+                    .map_err(|_| {
+                        ResolutionError::from("value requires resolution before scalar evaluation")
+                    })
+            })
+            .collect::<Result<Vec<_>, ResolutionError>>()?;
+        handler(&arguments)
+    })
+    .map(EvalValue::from_expanded_value)
+}
+
+/// Builtins whose evaluation consumes classified collection shape.
+#[derive(Clone, Copy)]
+#[allow(non_camel_case_types)]
+enum ShapeBuiltin {
+    length,
+    keys,
+    values,
+    concat,
+    lookup,
+    map,
+    flatten,
+}
+impl ShapeBuiltin {
+    fn function(self) -> BuiltinFunction {
+        match self {
+            Self::length => BuiltinFunction::length,
+            Self::keys => BuiltinFunction::keys,
+            Self::values => BuiltinFunction::values,
+            Self::concat => BuiltinFunction::concat,
+            Self::lookup => BuiltinFunction::lookup,
+            Self::map => BuiltinFunction::map,
+            Self::flatten => BuiltinFunction::flatten,
+        }
+    }
+}
+
+fn evaluate_shape_arguments<B: BindingAddress>(
+    name: ShapeBuiltin,
+    args: Vec<Value<NoPlaceholder, B>>,
+    source_line: crate::resource::DiagnosticSourceLine,
+) -> Result<EvalValue<B>, ResolutionError> {
+    crate::resource::with_secret_values(args, |args| {
+        use crate::resource::knowledge::KnowledgeContext;
+        let arity = name.function().arity();
+        if args.len() != arity {
+            return Err(ResolutionError::from(match name {
+                ShapeBuiltin::lookup => format!(
+                    "lookup() expects 3 arguments (map, key, default), got {}",
+                    args.len()
+                ),
+                ShapeBuiltin::concat => format!(
+                    "concat() expects 2 arguments (items, base_list), got {}",
+                    args.len()
+                ),
+                ShapeBuiltin::map => format!("map() requires 2 arguments, got {}", args.len()),
+                _ => format!(
+                    "{}() expects {} argument{}, got {}",
+                    name.function(),
+                    arity,
+                    if arity == 1 { "" } else { "s" },
+                    args.len()
+                ),
+            }));
+        }
+        let knowledge = args
+            .iter()
+            .map(|value| {
+                value
+                    .knowledge(&KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(ResolutionError::from)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        dispatch_shape_knowledge(name, &knowledge, source_line)
+    })
+    .map(EvalValue::from_expanded_value)
+}
+
+fn dispatch_shape_knowledge<B: BindingAddress>(
+    name: ShapeBuiltin,
+    knowledge: &[crate::resource::knowledge::Classification<'_, NoPlaceholder, B>],
+    source_line: crate::resource::DiagnosticSourceLine,
+) -> Result<Value<NoPlaceholder, B>, ResolutionError> {
+    use crate::resource::knowledge::{Classification, KnownValue, PlanIterable};
+    fn collection<'a, B: BindingAddress>(
+        value: &Classification<'a, NoPlaceholder, B>,
+        message: &str,
+    ) -> Result<PlanIterable<'a, NoPlaceholder, B>, ResolutionError> {
+        match value {
+            Classification::Known(value) => {
+                PlanIterable::from_known(value.clone()).ok_or_else(|| {
+                    ResolutionError::from(format!(
+                        "{message}{}",
+                        value_type_name(&value.to_value())
+                    ))
+                })
+            }
+            Classification::ShapeKnown(value) => {
+                PlanIterable::from_shape(value.clone()).map_err(ResolutionError::from)
+            }
+            Classification::Failed(value) => Err(value.error().into()),
+            Classification::Pending(_) => {
+                Err(format!("{message}{}", value_type_name(&value.to_value())).into())
+            }
+        }
+    }
+    fn known<'a, B: BindingAddress>(
+        value: &Classification<'a, NoPlaceholder, B>,
+        message: &str,
+    ) -> Result<KnownValue<'a, NoPlaceholder, B>, ResolutionError> {
+        match value {
+            Classification::Known(value) => Ok(value.clone()),
+            Classification::Failed(value) => Err(value.error().into()),
+            Classification::ShapeKnown(_) | Classification::Pending(_) => {
+                Err(format!("{message}{}", value_type_name(&value.to_value())).into())
+            }
+        }
+    }
+    match name {
+        ShapeBuiltin::length => length::builtin_length(&knowledge[0]),
+        ShapeBuiltin::keys => keys_values::builtin_keys(&collection(
+            &knowledge[0],
+            "keys() argument must be a Map, got ",
+        )?)
+        .map_err(ResolutionError::from),
+        ShapeBuiltin::values => keys_values::builtin_values(&collection(
+            &knowledge[0],
+            "values() argument must be a Map, got ",
+        )?)
+        .map_err(ResolutionError::from),
+        ShapeBuiltin::concat => concat::builtin_concat(
+            &collection(
+                &knowledge[0],
+                "concat() first argument must be a list, got ",
+            )?,
+            &collection(
+                &knowledge[1],
+                "concat() second argument must be a list, got ",
+            )?,
+        )
+        .map_err(ResolutionError::from),
+        ShapeBuiltin::lookup => lookup::builtin_lookup(
+            &collection(&knowledge[0], "lookup() first argument must be a map, got ")?,
+            &known(
+                &knowledge[1],
+                "lookup() second argument must be a string, got ",
+            )?,
+            &knowledge[2],
+        )
+        .map_err(ResolutionError::from),
+        ShapeBuiltin::map => map::builtin_map(
+            &known(
+                &knowledge[0],
+                "map() first argument must be a field accessor, got ",
+            )?,
+            &collection(
+                &knowledge[1],
+                "map() second argument must be a list or map, got ",
+            )?,
+        ),
+        ShapeBuiltin::flatten => flatten::builtin_flatten(
+            &collection(&knowledge[0], "flatten() argument must be a List, got ")?,
+            source_line,
+        ),
+    }
 }
 
 /// A builtin's result type and the evidence it supplies at an authored sink.
@@ -163,14 +366,31 @@ pub struct BuiltinFunctionInfo {
 /// Generates both `evaluate_builtin_with_config()` (dispatch) and `builtin_functions()` (metadata)
 /// from one definition, ensuring they never get out of sync.
 macro_rules! register_builtins {
-    (@evaluate env, $handler:expr, $lowered:expr, $config:expr) => {
-        evaluate_secret_arguments($lowered, |args| $handler(args, &$config.environment))
+    (@known length, $handler:expr, $args:expr, $config:expr) => { dispatch_shape_knowledge(ShapeBuiltin::length,&$args.iter().cloned().map(crate::resource::knowledge::Classification::Known).collect::<Vec<_>>(),crate::resource::DiagnosticSourceLine::synthetic()) };
+    (@known keys, $handler:expr, $args:expr, $config:expr) => { dispatch_shape_knowledge(ShapeBuiltin::keys,&$args.iter().cloned().map(crate::resource::knowledge::Classification::Known).collect::<Vec<_>>(),crate::resource::DiagnosticSourceLine::synthetic()) };
+    (@known values, $handler:expr, $args:expr, $config:expr) => { dispatch_shape_knowledge(ShapeBuiltin::values,&$args.iter().cloned().map(crate::resource::knowledge::Classification::Known).collect::<Vec<_>>(),crate::resource::DiagnosticSourceLine::synthetic()) };
+    (@known concat, $handler:expr, $args:expr, $config:expr) => { dispatch_shape_knowledge(ShapeBuiltin::concat,&$args.iter().cloned().map(crate::resource::knowledge::Classification::Known).collect::<Vec<_>>(),crate::resource::DiagnosticSourceLine::synthetic()) };
+    (@known lookup, $handler:expr, $args:expr, $config:expr) => { dispatch_shape_knowledge(ShapeBuiltin::lookup,&$args.iter().cloned().map(crate::resource::knowledge::Classification::Known).collect::<Vec<_>>(),crate::resource::DiagnosticSourceLine::synthetic()) };
+    (@known map, $handler:expr, $args:expr, $config:expr) => { dispatch_shape_knowledge(ShapeBuiltin::map,&$args.iter().cloned().map(crate::resource::knowledge::Classification::Known).collect::<Vec<_>>(),crate::resource::DiagnosticSourceLine::synthetic()) };
+    (@known flatten, $handler:expr, $args:expr, $config:expr) => { dispatch_shape_knowledge(ShapeBuiltin::flatten,&$args.iter().cloned().map(crate::resource::knowledge::Classification::Known).collect::<Vec<_>>(),crate::resource::DiagnosticSourceLine::synthetic()) };
+    (@known env, $handler:expr, $args:expr, $config:expr) => { $handler($args,&$config.environment).map_err(ResolutionError::from) };
+    (@known decrypt, $handler:expr, $args:expr, $config:expr) => { $handler($args,$config).map_err(ResolutionError::from) };
+    (@known $name:ident, $handler:expr, $args:expr, $config:expr) => { $handler($args).map_err(ResolutionError::from) };
+    (@evaluate length, $handler:expr, $lowered:expr, $config:expr, $line:expr) => { evaluate_shape_arguments(ShapeBuiltin::length, $lowered, $line) };
+    (@evaluate keys, $handler:expr, $lowered:expr, $config:expr, $line:expr) => { evaluate_shape_arguments(ShapeBuiltin::keys, $lowered, $line) };
+    (@evaluate values, $handler:expr, $lowered:expr, $config:expr, $line:expr) => { evaluate_shape_arguments(ShapeBuiltin::values, $lowered, $line) };
+    (@evaluate concat, $handler:expr, $lowered:expr, $config:expr, $line:expr) => { evaluate_shape_arguments(ShapeBuiltin::concat, $lowered, $line) };
+    (@evaluate lookup, $handler:expr, $lowered:expr, $config:expr, $line:expr) => { evaluate_shape_arguments(ShapeBuiltin::lookup, $lowered, $line) };
+    (@evaluate map, $handler:expr, $lowered:expr, $config:expr, $line:expr) => { evaluate_shape_arguments(ShapeBuiltin::map, $lowered, $line) };
+    (@evaluate flatten, $handler:expr, $lowered:expr, $config:expr, $line:expr) => { evaluate_shape_arguments(ShapeBuiltin::flatten, $lowered, $line) };
+    (@evaluate env, $handler:expr, $lowered:expr, $config:expr, $line:expr) => {
+        evaluate_secret_arguments($lowered, |args| $handler(args, &$config.environment).map_err(ResolutionError::from))
     };
-    (@evaluate decrypt, $handler:expr, $lowered:expr, $config:expr) => {
-        evaluate_secret_arguments($lowered, |args| $handler(args, $config))
+    (@evaluate decrypt, $handler:expr, $lowered:expr, $config:expr, $line:expr) => {
+        evaluate_secret_arguments($lowered, |args| $handler(args, $config).map_err(ResolutionError::from))
     };
-    (@evaluate $name:ident, $handler:expr, $lowered:expr, $config:expr) => {
-        evaluate_secret_arguments($lowered, $handler)
+    (@evaluate $name:ident, $handler:expr, $lowered:expr, $config:expr, $line:expr) => {
+        evaluate_secret_arguments($lowered, |args| $handler(args).map_err(ResolutionError::from))
     };
     (@collect [$($info:tt)*] [$($functions:tt)*]) => {
         register_builtins!(@generate [$($info)*] [$($functions)*]);
@@ -195,6 +415,10 @@ macro_rules! register_builtins {
         impl Builtin {
             pub fn from_name(name: &str) -> Option<Self> {
                 match name { $( stringify!($info_name) => Some($($kind)*), )* _ => None }
+            }
+
+            pub const fn arity(self) -> usize {
+                match self { $( $($kind)* => $info_arity, )* }
             }
 
             pub const fn result_typing(self) -> BuiltinResultTyping {
@@ -301,21 +525,22 @@ macro_rules! register_builtins {
             name: &str,
             args: &[EvalValue<B>],
             config: &ProviderContext,
-        ) -> Result<EvalValue<B>, String> {
+            source_line: crate::resource::DiagnosticSourceLine,
+        ) -> Result<EvalValue<B>, ResolutionError> {
             let builtin = Builtin::from_name(name).ok_or_else(|| format!("Unknown built-in function: {name}"))?;
-            let arity = builtin_arity(name).expect("registered builtin");
+            let arity = builtin.arity();
             if !args.is_empty() && args.len() < arity {
                 return Ok(EvalValue::closure(name, args.to_vec(), arity - args.len()));
             }
             let lowered = args.iter().cloned().map(|arg| arg.into_expanded_value()
                 .map(crate::resource::FunctionArgument::from_value)
                 .map_err(|error| format!("{name}: {error}"))).collect::<Result<Vec<_>, _>>()?;
-            builtin.dispatch(lowered, Ok::<_, String>, EvalValue::from_expanded_value, |function, args| {
+            builtin.dispatch(lowered, Ok::<_, ResolutionError>, EvalValue::from_expanded_value, |function, args| {
                 let lowered = args.into_iter().map(|arg| arg.into_value().ok_or_else(|| format!("{name}: expected a value argument"))).collect::<Result<Vec<_>, _>>()?;
                 match function {
-                    $( BuiltinFunction::$name => register_builtins!(@evaluate $name, $handler, lowered, config), )*
+                    $( BuiltinFunction::$name => register_builtins!(@evaluate $name, $handler, lowered, config, source_line), )*
                 }
-            }, |message| message)
+            }, ResolutionError::from)
         }
 
         /// Public alias that lowers an `EvalValue` result to a `Value`
@@ -324,16 +549,27 @@ macro_rules! register_builtins {
         /// produce"). Returns `Err` if the call would produce a closure.
         pub fn evaluate_builtin_to_value<B: BindingAddress>(
             name: &str,
-            args: &[Value<NoPlaceholder, B>],
+            args: &[crate::resource::knowledge::KnownValue<'_,NoPlaceholder,B>],
             config: &ProviderContext,
-        ) -> Result<Value<NoPlaceholder, B>, String> {
+        ) -> Result<Value<NoPlaceholder, B>, ResolutionError> {
+            let builtin=Builtin::from_name(name).ok_or_else(||format!("Unknown built-in function: {name}"))?;
+            let arity=builtin.arity();
+            let protected=args.iter().any(|value|value.visit(|_|false,|_|true));
+            if !protected && args.len()==arity {
+                return match builtin {
+                    Builtin::Secret=>Ok(args[0].to_value().into_secret()),
+                    Builtin::Function(function)=>match function {
+                        $(BuiltinFunction::$name=>register_builtins!(@known $name,$handler,args,config),)*
+                    },
+                };
+            }
             let eval_args: Vec<EvalValue<B>> = args
                 .iter()
-                .cloned()
+                .map(|value| value.to_value())
                 .map(EvalValue::from_expanded_value)
                 .collect();
-            let result = evaluate_builtin_with_config(name, &eval_args, config)?;
-            result.into_expanded_value()
+            let result = evaluate_builtin_with_config(name, &eval_args, config, crate::resource::DiagnosticSourceLine::synthetic())?;
+            result.into_expanded_value().map_err(ResolutionError::from)
         }
     };
     ($($entry:tt)*) => { register_builtins!(@collect [] [] $($entry)*); };
@@ -449,14 +685,15 @@ pub(crate) fn apply_closure_with_config<B: BindingAddress>(
     remaining_arity: usize,
     new_args: &[EvalValue<B>],
     config: &ProviderContext,
-) -> Result<EvalValue<B>, String> {
+) -> Result<EvalValue<B>, ResolutionError> {
     // Handle composed closures: pipe the argument through each function in sequence
     if name == "__compose__" {
         if new_args.len() != 1 {
             return Err(format!(
                 "composed function expects exactly 1 argument, got {}",
                 new_args.len(),
-            ));
+            )
+            .into());
         }
         let mut result = new_args[0].clone();
         for func in captured_args {
@@ -474,7 +711,7 @@ pub(crate) fn apply_closure_with_config<B: BindingAddress>(
                     config,
                 )?;
             } else {
-                return Err("composed function chain contains a non-function value".to_string());
+                return Err("composed function chain contains a non-function value".into());
             }
         }
         return Ok(result);
@@ -487,13 +724,19 @@ pub(crate) fn apply_closure_with_config<B: BindingAddress>(
             remaining_arity,
             if remaining_arity == 1 { "" } else { "s" },
             new_args.len(),
-        ));
+        )
+        .into());
     }
     let mut all_args = captured_args.to_vec();
     all_args.extend_from_slice(new_args);
     let new_remaining = remaining_arity - new_args.len();
     if new_remaining == 0 {
-        evaluate_builtin_with_config(name, &all_args, config)
+        evaluate_builtin_with_config(
+            name,
+            &all_args,
+            config,
+            crate::resource::DiagnosticSourceLine::synthetic(),
+        )
     } else {
         Ok(EvalValue::closure(name, all_args, new_remaining))
     }
@@ -523,7 +766,9 @@ pub(crate) fn evaluate_builtin_for_tests<B: BindingAddress>(
         name,
         &eval_args,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        crate::resource::DiagnosticSourceLine::synthetic(),
     )
+    .map_err(|error| error.to_string())
 }
 
 /// Supply an explicit empty test context for pure-builtin assertions.
@@ -532,11 +777,19 @@ pub(crate) fn evaluate_builtin_to_value_for_tests<B: BindingAddress>(
     name: &str,
     args: &[Value<NoPlaceholder, B>],
 ) -> Result<Value<NoPlaceholder, B>, String> {
-    evaluate_builtin_to_value(
+    let arguments = args
+        .iter()
+        .cloned()
+        .map(EvalValue::from_expanded_value)
+        .collect::<Vec<_>>();
+    evaluate_builtin_with_config(
         name,
-        args,
+        &arguments,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        crate::resource::DiagnosticSourceLine::synthetic(),
     )
+    .map_err(|error| error.to_string())?
+    .into_expanded_value()
 }
 
 /// `evaluate_builtin_with_config`'s `Value`-friendly counterpart for
@@ -549,11 +802,23 @@ pub(crate) fn evaluate_builtin_with_config_to_value<B: BindingAddress>(
     args: &[Value<NoPlaceholder, B>],
     config: &ProviderContext,
 ) -> Result<Value<NoPlaceholder, B>, String> {
-    evaluate_builtin_to_value(name, args, config)
+    let arguments = args
+        .iter()
+        .cloned()
+        .map(EvalValue::from_expanded_value)
+        .collect::<Vec<_>>();
+    evaluate_builtin_with_config(
+        name,
+        &arguments,
+        config,
+        crate::resource::DiagnosticSourceLine::synthetic(),
+    )
+    .map_err(|error| error.to_string())?
+    .into_expanded_value()
 }
 
 /// Return a human-readable type name for a Value
-fn value_type_name<B: BindingAddress>(value: &Value<NoPlaceholder, B>) -> &'static str {
+pub(crate) fn value_type_name<B: BindingAddress>(value: &Value<NoPlaceholder, B>) -> &'static str {
     match value {
         Value::Concrete(ConcreteValue::String(_)) => "String",
         Value::Concrete(ConcreteValue::EnumIdentifier(_)) => "EnumIdentifier",
@@ -637,7 +902,9 @@ mod tests {
                         let mut args = vec![string("public"); argument_count];
                         args[position] = shape;
                         if let Err(error) =
-                            super::evaluate_builtin_to_value(builtin.name, &args, &config)
+                            super::evaluate_builtin_to_value(builtin.name,
+&(args).iter().map(|value|value.knowledge(&crate::resource::knowledge::KnowledgeContext::validation()).map(|proof| proof.into_classification()).unwrap().into_known().unwrap()).collect::<Vec<_>>(),
+&config)
                         {
                             for text in [error.to_string(), format!("{error:?}")] {
                                 assert!(
@@ -795,12 +1062,13 @@ mod tests {
                 func.name,
                 &args,
                 &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+                crate::resource::DiagnosticSourceLine::synthetic(),
             );
             // The call may fail due to wrong arguments, but it must NOT fail
             // with "Unknown built-in function".
             if let Err(ref msg) = result {
                 assert!(
-                    !msg.contains("Unknown built-in function"),
+                    !msg.to_string().contains("Unknown built-in function"),
                     "builtin_functions() lists '{}' but evaluate_builtin_with_config() does not handle it",
                     func.name,
                 );
@@ -848,11 +1116,13 @@ mod tests {
             "nonexistent_function",
             &args,
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            crate::resource::DiagnosticSourceLine::synthetic(),
         );
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
+                .to_string()
                 .contains("Unknown built-in function: nonexistent_function")
         );
     }

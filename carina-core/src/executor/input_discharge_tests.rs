@@ -97,7 +97,12 @@ async fn input_discharge_enum_identifier_is_proven_on_its_wire_string() {
             );
             assert_eq!(
                 crate::protocol_convert::try_core_to_protocol_value(
-                    &provider.captured_create_resources()[0].attributes["name"]
+                    &(provider.captured_create_resources()[0].attributes["name"])
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .unwrap()
+                        .into_known()
+                        .unwrap()
                 )
                 .unwrap(),
                 carina_provider_protocol::Value::String("valid-name".into())

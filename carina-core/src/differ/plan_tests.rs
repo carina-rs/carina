@@ -651,7 +651,8 @@ fn import_replacement_suppresses_only_the_matching_provider_instance() {
             crate::test_support::resolved_targets(
                 DeferredCreateTargets::partition_for_expansion(
                     crate::parser::ExpandedFile::<()>::default().into_deferred_for_expressions(),
-                    |_| DeferredForExpansionChoice::Retain,
+                    &crate::binding_index::IterableBindings::from_upstream_only(Default::default()),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .1,
             ),

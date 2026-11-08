@@ -1,0 +1,11 @@
+let roles = read mock.iam.Roles {
+  name_regex = "x"
+}
+
+let roles_again = read mock.iam.Roles {
+  name_regex = roles.names[0]
+}
+
+let one = mock.test.resource {
+  name = roles_again.names[0]
+}

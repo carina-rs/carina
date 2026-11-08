@@ -2844,7 +2844,7 @@ impl ResolvedBindings {
     ///    this layer the read attributes are missing from the binding
     ///    entirely; a downstream `ResourceRef` like
     ///    `admin_access_roles.arns` resolves to nothing and the
-    ///    executor's `assert_fully_resolved` rejects it with the
+    ///    executor's `assert_known_attribute` rejects it with the
     ///    misleading "add a `wait` block" message that does not apply
     ///    to data sources.
     ///
@@ -3327,6 +3327,17 @@ impl<'a> IterableBindings<'a> {
     /// as final.
     pub fn source(&self, binding: &str) -> Option<&BindingValueSource> {
         self.bindings.source(binding)
+    }
+
+    pub fn knowledge_context(
+        &self,
+    ) -> crate::resource::knowledge::KnowledgeContext<
+        '_,
+        crate::resource::NoPlaceholder,
+        AbsoluteBindingAddress,
+        crate::resource::knowledge::Plan,
+    > {
+        crate::resource::knowledge::KnowledgeContext::plan(self.bindings.as_ref())
     }
 
     /// Resolve a complete deferred iterable through the same three-state
@@ -5606,7 +5617,7 @@ mod resolved_bindings_tests {
     /// `DataSource.attributes` (the `path_prefix` / `name_regex` filters),
     /// so a downstream managed resource referencing
     /// `admin_access_roles.arns` saw nothing in the binding map and the
-    /// executor's `assert_fully_resolved` rejected the unresolved
+    /// executor's `assert_known_attribute` rejected the unresolved
     /// `ResourceRef` with the misleading "add a `wait` block" message.
     ///
     /// The fix mirrors `build_managed_core`: pre-apply layering for a

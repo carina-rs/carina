@@ -1,0 +1,3 @@
+let producer = mock.test.resource { name = "producer" }
+let items = [producer.identifier] ?? []
+mock.example.consumer { name = "consumer" list = items }

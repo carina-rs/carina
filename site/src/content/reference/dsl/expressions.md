@@ -234,7 +234,7 @@ Access on a value that is already known is evaluated immediately. Access whose b
 
 ## Coalesce Operator (`??`)
 
-`ref ?? default` uses the referenced value when it exists and `default` when it is absent. The left side may be a value expression (`up.accounts`, `vpc.tags`, or a literal); both sides are type-checked, so a default of the wrong type is rejected by `validate`. A known concrete value is returned immediately, while unresolved references retain fallback behavior.
+`ref ?? default` uses the referenced value when it exists and `default` when it is absent. The left side may be a value expression (`up.accounts`, `vpc.tags`, or a literal); both sides are type-checked, so a default of the wrong type is rejected by `validate`. A recursively known value is returned immediately, while unresolved references retain fallback behavior.
 
 ```crn
 let orgs = upstream_state {
@@ -256,6 +256,12 @@ Which side is used is decided when the reference resolves, not when the file is 
 | Exists (an upstream export, or a resource attribute that has a value) | The referenced value |
 | Absent (the loaded upstream state does not export it, or the attribute is unset) | `default` |
 | Not known yet (upstream state not available, or a value computed during apply) | Deferred; resolved at apply time |
+
+A secret attribute whose inputs are still pending also keeps `??` deferred; secrecy does not establish that its value is ready.
+
+An unknown value is not absence. An incomplete read, an unavailable upstream state, a wrong collection kind, or a failed computation cannot select the default. The default is evaluated only after a definitive missing selection; an unused failing default stays lazy.
+
+A list or map can have known membership while some elements remain pending; that membership can drive managed-resource expansion. During parsing, a concrete left value is selected when its presence is already established. A computed collection can retain `??` until its references are resolved. When the left operand still needs selection, such as a reference, `??` retains its alternatives until presence or definitive absence is established; it evaluates the default only when selected.
 
 Without `??`, iterating over an export that the upstream state does not have is an error. `??` chains are right-associative: `a ?? b ?? c` is `a ?? (b ?? c)`.
 

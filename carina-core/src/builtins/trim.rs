@@ -15,8 +15,13 @@ use super::value_type_name;
 /// trim("\n hello \t") // => "hello"
 /// ```
 pub(crate) fn builtin_trim<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
+    args: &[crate::resource::knowledge::KnownValue<'_, NoPlaceholder, B>],
 ) -> Result<Value<NoPlaceholder, B>, String> {
+    let values = args
+        .iter()
+        .map(|value| value.to_value())
+        .collect::<Vec<_>>();
+    let args = values.as_slice();
     if args.len() != 1 {
         return Err(format!(
             "trim() expects 1 argument (string), got {}",

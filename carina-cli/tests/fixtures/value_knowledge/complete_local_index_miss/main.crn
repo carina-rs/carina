@@ -1,0 +1,2 @@
+let role = mock.iam.Roles { names = ["one"] }
+mock.test.resource { name = "consumer" comment = role.names[3] }

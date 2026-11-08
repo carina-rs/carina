@@ -326,7 +326,12 @@ mod tests {
         assert_eq!(format!("{protected:?}"), "(secret)");
         assert!(
             payload
-                .try_inspect(|value| Ok::<_, String>(value.is_fully_resolved()))
+                .try_inspect(|value| Ok::<_, String>(matches!(
+                    (value)
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification()),
+                    Ok(crate::resource::knowledge::Classification::Known(_))
+                )))
                 .unwrap()
         );
         assert_eq!(
@@ -397,8 +402,24 @@ mod tests {
             crate::value::value_to_json(&plain).unwrap()
         );
         assert_eq!(
-            crate::protocol_convert::try_core_to_protocol_value(marked).unwrap(),
-            crate::protocol_convert::try_core_to_protocol_value(&plain).unwrap()
+            crate::protocol_convert::try_core_to_protocol_value(
+                &(marked)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                    .into_known()
+                    .unwrap()
+            )
+            .unwrap(),
+            crate::protocol_convert::try_core_to_protocol_value(
+                &plain
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                    .into_known()
+                    .unwrap()
+            )
+            .unwrap()
         );
     }
 

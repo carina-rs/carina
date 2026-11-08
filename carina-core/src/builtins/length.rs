@@ -1,42 +1,38 @@
-//! `length(value)` built-in function
-
-use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
-
+//! Collection length uses shape without requiring its leaves.
 use super::value_type_name;
-
-/// `length(value)` - Return the length of a list, map, or string.
-///
-/// - Single argument: a List, Map, or String
-/// - Returns: Int (the number of elements or characters)
-///
-/// Examples:
-/// ```text
-/// length([1, 2, 3])     // => 3
-/// length({a: 1, b: 2})  // => 2
-/// length("hello")       // => 5
-/// ```
-pub(crate) fn builtin_length<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
-) -> Result<Value<NoPlaceholder, B>, String> {
-    if args.len() != 1 {
-        return Err(format!("length() expects 1 argument, got {}", args.len()));
-    }
-
-    match &args[0] {
-        Value::Concrete(ConcreteValue::List(items)) => {
-            Ok(Value::Concrete(ConcreteValue::Int(items.len() as i64)))
+use crate::resolver::ResolutionError;
+use crate::resource::knowledge::{Classification, KnownView};
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
+pub fn builtin_length<B: BindingAddress>(
+    value: &Classification<'_, NoPlaceholder, B>,
+) -> Result<Value<NoPlaceholder, B>, ResolutionError> {
+    let length = match value {
+        Classification::Known(known) => known.visit(
+            |view| -> Result<usize, ResolutionError> {
+                match view {
+                    KnownView::List(v) => Ok(v.len()),
+                    KnownView::Map(v) => Ok(v.len()),
+                    KnownView::String(v) => Ok(v.expose_plaintext().len()),
+                    _ => Err(format!(
+                        "length() argument must be a List, Map, or String, got {}",
+                        value_type_name(&known.to_value())
+                    )
+                    .into()),
+                }
+            },
+            |_| Err("length() argument must be a List, Map, or String, got Secret".into()),
+        ),
+        Classification::ShapeKnown(shape) => Ok(shape.len()),
+        Classification::Failed(value) => Err(value.error().into()),
+        Classification::Pending(_) => {
+            return Err(format!(
+                "length() argument must be a List, Map, or String, got {}",
+                value_type_name(&value.to_value())
+            )
+            .into());
         }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            Ok(Value::Concrete(ConcreteValue::Int(map.len() as i64)))
-        }
-        Value::Concrete(ConcreteValue::String(s)) => Ok(Value::Concrete(ConcreteValue::Int(
-            s.expose_plaintext().len() as i64,
-        ))),
-        other => Err(format!(
-            "length() argument must be a List, Map, or String, got {}",
-            value_type_name(other)
-        )),
-    }
+    }?;
+    Ok(Value::Concrete(ConcreteValue::Int(length as i64)))
 }
 
 #[cfg(test)]

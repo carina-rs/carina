@@ -178,6 +178,23 @@ pub(super) async fn refresh_pending_states<S: Clone>(
     }
 }
 
+fn authored_requires_resolution(
+    knowledge: Result<
+        crate::resource::knowledge::Classification<'_>,
+        crate::resource::knowledge::KnowledgeError,
+    >,
+) -> bool {
+    match knowledge {
+        Ok(crate::resource::knowledge::Classification::Known(_)) => false,
+        Ok(
+            crate::resource::knowledge::Classification::ShapeKnown(_)
+            | crate::resource::knowledge::Classification::Pending(_)
+            | crate::resource::knowledge::Classification::Failed(_),
+        )
+        | Err(_) => true,
+    }
+}
+
 /// Resolve a resource's attributes using the current bindings.
 /// Secret values are unwrapped so the provider receives the plain inner value.
 ///
@@ -205,7 +222,7 @@ pub(super) async fn resolve_resource<S: Clone>(
             for (key, expr) in &source.attributes {
                 let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
                     .map_err(EffectFailureKind::execution)?;
-                assert_fully_resolved(&resolved_value, key, bindings)
+                assert_known_attribute(&resolved_value, key, bindings)
                     .map_err(|error| EffectFailureKind::Execution { error })?;
                 resolved.attributes.insert(key.clone(), resolved_value);
             }
@@ -220,13 +237,19 @@ pub(super) async fn resolve_resource<S: Clone>(
             let mut apply_resolved_attributes = HashSet::new();
             for (key, target_expr) in &target.attributes {
                 let source_expr = source.attributes.get(key);
-                let resolves_at_apply = source_expr.is_some_and(needs_apply_resolution);
+                let resolves_at_apply = source_expr.is_some_and(|value| {
+                    authored_requires_resolution(
+                        value
+                            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                            .map(|proof| proof.into_classification()),
+                    )
+                });
                 let expr = source_expr
-                    .filter(|source_expr| needs_apply_resolution(source_expr))
+                    .filter(|_| resolves_at_apply)
                     .unwrap_or(target_expr);
                 let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
                     .map_err(EffectFailureKind::execution)?;
-                assert_fully_resolved(&resolved_value, key, bindings)
+                assert_known_attribute(&resolved_value, key, bindings)
                     .map_err(|error| EffectFailureKind::Execution { error })?;
                 if resolves_at_apply {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
@@ -241,9 +264,13 @@ pub(super) async fn resolve_resource<S: Clone>(
                 let resolved_value =
                     resolve_ref_value(source_expr, bindings, context.type_checks())
                         .map_err(EffectFailureKind::execution)?;
-                assert_fully_resolved(&resolved_value, key, bindings)
+                assert_known_attribute(&resolved_value, key, bindings)
                     .map_err(|error| EffectFailureKind::Execution { error })?;
-                if needs_apply_resolution(source_expr) {
+                if authored_requires_resolution(
+                    source_expr
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification()),
+                ) {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
                     apply_resolved_attributes.insert(key.clone());
                 }
@@ -266,38 +293,6 @@ pub(super) async fn resolve_resource<S: Clone>(
     Ok((provider_ready, resolved_desired_attributes))
 }
 
-fn needs_apply_resolution(value: &Value) -> bool {
-    match value {
-        Value::Deferred(
-            DeferredValue::ModuleIf(_)
-            | DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::Coalesce { .. }
-            | DeferredValue::IntegerArithmetic(_)
-            | DeferredValue::Interpolation(_)
-            | DeferredValue::FunctionCall { .. }
-            | DeferredValue::Unavailable { .. }
-            | DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::Access(_)
-            | DeferredValue::Unknown(_),
-        ) => true,
-        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(needs_apply_resolution),
-        Value::Concrete(ConcreteValue::List(items)) => items.iter().any(needs_apply_resolution),
-        Value::Concrete(ConcreteValue::Map(map)) => map.values().any(needs_apply_resolution),
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        ) => false,
-        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
-    }
-}
-
 pub(super) fn resolve_data_source<S: Clone>(
     input: Result<DataSourceCheckInput<S>, String>,
     context: &ProviderPreparationContext<'_>,
@@ -314,7 +309,7 @@ pub(super) fn resolve_data_source<S: Clone>(
             for (key, expr) in &source.attributes {
                 let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
                     .map_err(ReportedError::new)?;
-                assert_fully_resolved(&resolved_value, key, bindings)?;
+                assert_known_attribute(&resolved_value, key, bindings)?;
                 resolved.attributes.insert(key.clone(), resolved_value);
             }
             ResolvedCheckInput::authored(resolved)
@@ -328,13 +323,19 @@ pub(super) fn resolve_data_source<S: Clone>(
             let mut apply_resolved_attributes = HashSet::new();
             for (key, target_expr) in &target.attributes {
                 let source_expr = source.attributes.get(key);
-                let resolves_at_apply = source_expr.is_some_and(needs_apply_resolution);
+                let resolves_at_apply = source_expr.is_some_and(|value| {
+                    authored_requires_resolution(
+                        value
+                            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                            .map(|proof| proof.into_classification()),
+                    )
+                });
                 let expr = source_expr
-                    .filter(|source_expr| needs_apply_resolution(source_expr))
+                    .filter(|_| resolves_at_apply)
                     .unwrap_or(target_expr);
                 let resolved_value = resolve_ref_value(expr, bindings, context.type_checks())
                     .map_err(ReportedError::new)?;
-                assert_fully_resolved(&resolved_value, key, bindings)?;
+                assert_known_attribute(&resolved_value, key, bindings)?;
                 if resolves_at_apply {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
                     apply_resolved_attributes.insert(key.clone());
@@ -348,8 +349,12 @@ pub(super) fn resolve_data_source<S: Clone>(
                 let resolved_value =
                     resolve_ref_value(source_expr, bindings, context.type_checks())
                         .map_err(ReportedError::new)?;
-                assert_fully_resolved(&resolved_value, key, bindings)?;
-                if needs_apply_resolution(source_expr) {
+                assert_known_attribute(&resolved_value, key, bindings)?;
+                if authored_requires_resolution(
+                    source_expr
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification()),
+                ) {
                     validation_attributes.insert(key.clone(), resolved_value.clone());
                     apply_resolved_attributes.insert(key.clone());
                 }
@@ -369,7 +374,10 @@ pub(super) fn resolve_data_source<S: Clone>(
 pub(super) fn resolved_resource(
     resource: Resource,
 ) -> Result<crate::resource::ResolvedResource, SerializationError> {
-    crate::resource::assert_resource_fully_resolved(&resource)?;
+    crate::resource::assert_resource_known_for_apply(
+        &resource,
+        &crate::resource::knowledge::KnowledgeContext::apply(&ResolvedBindings::default()),
+    )?;
     Ok(crate::resource::ResolvedResource::new(
         resource.with_dependency_phase(()),
     ))
@@ -384,38 +392,83 @@ pub(super) fn resolved_resource(
 /// be resolved before reaching the provider (the executor unwraps
 /// secrets just downstream of this check).
 ///
-fn assert_fully_resolved(
+#[derive(Debug, thiserror::Error)]
+#[error("Attribute '{attribute}' could not be resolved: {error}")]
+struct AttributeKnowledgeError {
+    attribute: String,
+    error: crate::resource::knowledge::KnowledgeError,
+}
+fn knowledge_attribute_diagnostic(
+    attribute: &str,
+    error: crate::resource::knowledge::KnowledgeError,
+) -> ReportedError {
+    ReportedError::new(AttributeKnowledgeError {
+        attribute: attribute.to_owned(),
+        error,
+    })
+}
+
+fn assert_known_attribute(
     value: &Value,
     attribute_key: &str,
     bindings: &ResolvedBindings,
 ) -> Result<(), ReportedError> {
-    match value {
-        Value::Concrete(ConcreteValue::List(items)) => {
-            for item in items {
-                assert_fully_resolved(item, attribute_key, bindings)?;
-            }
-            Ok(())
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            for v in map.values() {
-                assert_fully_resolved(v, attribute_key, bindings)?;
-            }
-            Ok(())
-        }
-        Value::Deferred(DeferredValue::Secret(inner)) => inner
-            .try_inspect(|value| assert_fully_resolved(value, attribute_key, bindings))
-            .map_err(|error| {
+    let knowledge = value
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::apply(
+            bindings,
+        ))
+        .map_err(|error| {
+            let error = knowledge_attribute_diagnostic(attribute_key, error);
+            if matches!(value, Value::Deferred(DeferredValue::Secret(_))) {
                 error.with_public_context(super::PublicReportContext::SecretAttribute {
-                    attribute: attribute_key.to_string(),
+                    attribute: attribute_key.to_owned(),
+                })
+            } else {
+                error
+            }
+        })?;
+    crate::resource::knowledge::KnownValue::from_apply(knowledge)
+        .map(|_| ())
+        .map_err(|error| {
+            unresolved_attribute_diagnostic(value, attribute_key, bindings)
+                .unwrap_or_else(|| knowledge_attribute_diagnostic(attribute_key, error))
+        })
+}
+
+// This formatter selects an established diagnostic after the proof gate
+// rejects a value. None describes a known diagnostic leaf; it never admits it.
+fn unresolved_attribute_diagnostic(
+    value: &Value,
+    attribute_key: &str,
+    bindings: &ResolvedBindings,
+) -> Option<ReportedError> {
+    match value {
+        Value::Concrete(ConcreteValue::List(items)) => items
+            .iter()
+            .find_map(|item| unresolved_attribute_diagnostic(item, attribute_key, bindings)),
+        Value::Concrete(ConcreteValue::Map(items)) => items
+            .values()
+            .find_map(|item| unresolved_attribute_diagnostic(item, attribute_key, bindings)),
+        Value::Deferred(DeferredValue::Secret(inner)) => inner
+            .try_inspect(|value| {
+                match unresolved_attribute_diagnostic(value, attribute_key, bindings) {
+                    Some(error) => Err(error),
+                    None => Ok(()),
+                }
+            })
+            .err()
+            .map(|error| {
+                error.with_public_context(super::PublicReportContext::SecretAttribute {
+                    attribute: attribute_key.to_owned(),
                 })
             }),
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
-        Value::Deferred(DeferredValue::ModuleIf(_)) => Err(ReportedError::message(format!(
+        Value::Deferred(DeferredValue::ModuleIf(_)) => Some(ReportedError::message(format!(
             "Attribute '{}' contains an unresolved module-template conditional",
             attribute_key
         ))),
 
-        Value::Deferred(DeferredValue::ResourceRef { path }) => Err(unresolved_binding_message(
+        Value::Deferred(DeferredValue::ResourceRef { path }) => Some(unresolved_binding_message(
             attribute_key,
             UnresolvedSite::Ref {
                 path: path.to_dot_string(),
@@ -426,7 +479,7 @@ fn assert_fully_resolved(
             bindings,
             value,
         )),
-        Value::Deferred(DeferredValue::BindingRef { binding }) => Err(unresolved_binding_message(
+        Value::Deferred(DeferredValue::BindingRef { binding }) => Some(unresolved_binding_message(
             attribute_key,
             UnresolvedSite::Ref {
                 path: binding.to_string(),
@@ -439,13 +492,13 @@ fn assert_fully_resolved(
             value,
         )),
         Value::Deferred(DeferredValue::Coalesce { .. }) => {
-            Err(ReportedError::new(SerializationError::UnresolvedCoalesce {
+            Some(ReportedError::new(SerializationError::UnresolvedCoalesce {
                 context: SerializationContext::WasmBoundary,
             }))
         }
         Value::Deferred(DeferredValue::IntegerArithmetic(_)) => {
             let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
-            Err(unresolved_binding_message(
+            Some(unresolved_binding_message(
                 attribute_key,
                 UnresolvedSite::IntegerArithmetic {
                     expression: crate::value::format_value(value),
@@ -457,7 +510,7 @@ fn assert_fully_resolved(
         }
         Value::Deferred(DeferredValue::Interpolation(_)) => {
             let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
-            Err(unresolved_binding_message(
+            Some(unresolved_binding_message(
                 attribute_key,
                 UnresolvedSite::Interpolation,
                 leaf,
@@ -469,7 +522,7 @@ fn assert_fully_resolved(
             DeferredValue::FunctionCall { name, .. } | DeferredValue::Unavailable { name, .. },
         ) => {
             let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
-            Err(unresolved_binding_message(
+            Some(unresolved_binding_message(
                 attribute_key,
                 UnresolvedSite::FunctionCall {
                     name: name.to_string(),
@@ -481,7 +534,7 @@ fn assert_fully_resolved(
         }
         Value::Deferred(DeferredValue::ResolvedFunctionCall { function, .. }) => {
             let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
-            Err(unresolved_binding_message(
+            Some(unresolved_binding_message(
                 attribute_key,
                 UnresolvedSite::FunctionCall {
                     name: function.name.clone(),
@@ -493,7 +546,7 @@ fn assert_fully_resolved(
         }
         Value::Deferred(DeferredValue::Access(_)) => {
             let leaf = pick_unresolved_binding_for_diagnostic(value, bindings);
-            Err(unresolved_binding_message(
+            Some(unresolved_binding_message(
                 attribute_key,
                 UnresolvedSite::Access {
                     expression: crate::value::format_value(value),
@@ -504,7 +557,7 @@ fn assert_fully_resolved(
             ))
         }
         Value::Deferred(DeferredValue::Unknown(reason)) => {
-            Err(ReportedError::new(SerializationError::UnknownNotAllowed {
+            Some(ReportedError::new(SerializationError::UnknownNotAllowed {
                 reason: Box::new(reason.clone()),
                 context: SerializationContext::WasmBoundary,
             }))
@@ -516,7 +569,7 @@ fn assert_fully_resolved(
         | Value::Concrete(ConcreteValue::Float(_))
         | Value::Concrete(ConcreteValue::Bool(_))
         | Value::Concrete(ConcreteValue::Duration(_))
-        | Value::Concrete(ConcreteValue::StringList(_)) => Ok(()),
+        | Value::Concrete(ConcreteValue::StringList(_)) => None,
     }
 }
 
@@ -1737,7 +1790,7 @@ mod process_basic_result_tests {
 }
 
 #[cfg(test)]
-mod assert_fully_resolved_tests {
+mod assert_known_attribute_tests {
     //! Unit-level coverage of the apply-time fail-fast contract added
     //! for carina#3032 (the "did not resolve at apply" matrix) and
     //! the kind-aware diagnostic added for carina#3334 (upstream_state
@@ -1801,7 +1854,7 @@ mod assert_fully_resolved_tests {
             source_line: 0.into(),
         });
         let bindings = bindings_with("private_producer", BindingValueSource::Upstream);
-        let error = assert_fully_resolved(&value, "password", &bindings).unwrap_err();
+        let error = assert_known_attribute(&value, "password", &bindings).unwrap_err();
         let rendered = crate::executor::render_error_chain(error.as_error());
         assert!(!rendered.contains("private_"), "{rendered}");
         assert!(!format!("{error:?}").contains("private_"));
@@ -1821,7 +1874,7 @@ mod assert_fully_resolved_tests {
             )))
             .into(),
         ));
-        let error = assert_fully_resolved(&value, "password", &empty_bindings()).unwrap_err();
+        let error = assert_known_attribute(&value, "password", &empty_bindings()).unwrap_err();
         let mut cause: Option<&(dyn std::error::Error + 'static)> = Some(error.as_error());
         let mut found = false;
         while let Some(error) = cause {
@@ -1845,7 +1898,7 @@ mod assert_fully_resolved_tests {
             ))
             .into(),
         ));
-        let error = assert_fully_resolved(&value, "password", &empty_bindings()).unwrap_err();
+        let error = assert_known_attribute(&value, "password", &empty_bindings()).unwrap_err();
         let diagnostic = format!("{error} {error:?}");
         assert!(diagnostic.contains("password"), "{diagnostic}");
         assert!(!diagnostic.contains("private-"), "{diagnostic}");
@@ -1854,7 +1907,7 @@ mod assert_fully_resolved_tests {
     #[test]
     fn concrete_value_is_fully_resolved() {
         assert!(
-            assert_fully_resolved(
+            assert_known_attribute(
                 &Value::Concrete(ConcreteValue::String("ok".into())),
                 "name",
                 &empty_bindings(),
@@ -1870,7 +1923,7 @@ mod assert_fully_resolved_tests {
                 binding: absolute_binding("upstream"),
             },
         ));
-        let err = assert_fully_resolved(&v, "name", &empty_bindings())
+        let err = assert_known_attribute(&v, "name", &empty_bindings())
             .expect_err("Unknown must be rejected at apply seam");
         assert!(
             err.to_string().contains("value is not yet known"),
@@ -1891,7 +1944,7 @@ mod assert_fully_resolved_tests {
 
     #[test]
     fn direct_chained_resource_ref_is_rejected_with_path_and_wait_hint() {
-        let err = assert_fully_resolved(&dvo_chained_ref(), "name", &empty_bindings())
+        let err = assert_known_attribute(&dvo_chained_ref(), "name", &empty_bindings())
             .expect_err("direct ResourceRef must be rejected at apply seam");
         assert!(
             err.to_string()
@@ -1936,7 +1989,7 @@ mod assert_fully_resolved_tests {
                     binding: absolute_binding("cert"),
                 }),
             ] {
-                let error = assert_fully_resolved(&value, "records", &bindings)
+                let error = assert_known_attribute(&value, "records", &bindings)
                     .expect_err("unresolved unlisted reference")
                     .to_string();
                 assert!(error.contains("add a `wait` block"), "{error}");
@@ -1972,7 +2025,7 @@ mod assert_fully_resolved_tests {
                 ),
             );
 
-            let error = assert_fully_resolved(&dvo_chained_ref(), "records", &bindings)
+            let error = assert_known_attribute(&dvo_chained_ref(), "records", &bindings)
                 .expect_err("the partial read-back must keep the missing value unresolved")
                 .to_string();
             assert!(
@@ -2014,7 +2067,7 @@ mod assert_fully_resolved_tests {
             ),
         );
 
-        let error = assert_fully_resolved(&dvo_chained_ref(), "records", &bindings)
+        let error = assert_known_attribute(&dvo_chained_ref(), "records", &bindings)
             .expect_err("the partial read-back must keep the missing value unresolved")
             .to_string();
         assert!(
@@ -2038,7 +2091,7 @@ mod assert_fully_resolved_tests {
         // The exact carina#3032 failing form: `resource_records =
         // [cert.dvo[0].rrv]`. The list literal must be walked.
         let v = Value::Concrete(ConcreteValue::List(vec![dvo_chained_ref()]));
-        let err = assert_fully_resolved(&v, "resource_records", &empty_bindings())
+        let err = assert_known_attribute(&v, "resource_records", &empty_bindings())
             .expect_err("list-wrapped ResourceRef must be rejected");
         assert!(
             err.to_string().contains("resource_record_value"),
@@ -2050,7 +2103,7 @@ mod assert_fully_resolved_tests {
     fn map_wrapped_chained_ref_is_rejected() {
         let mut m: indexmap::IndexMap<String, Value> = indexmap::IndexMap::new();
         m.insert("nested".to_string(), dvo_chained_ref());
-        let err = assert_fully_resolved(
+        let err = assert_known_attribute(
             &Value::Concrete(ConcreteValue::Map(m)),
             "tags",
             &empty_bindings(),
@@ -2068,7 +2121,7 @@ mod assert_fully_resolved_tests {
         // secret tag would survive but the ref would still be
         // unresolved at the WASM boundary.
         let v = Value::Deferred(DeferredValue::Secret(Box::new(dvo_chained_ref()).into()));
-        let err = assert_fully_resolved(&v, "password", &empty_bindings())
+        let err = assert_known_attribute(&v, "password", &empty_bindings())
             .expect_err("Secret wrapping does not exempt unresolved refs");
         assert!(
             err.to_string().contains("password") && err.to_string().contains("secret(...)"),
@@ -2081,7 +2134,7 @@ mod assert_fully_resolved_tests {
         let v = Value::Deferred(DeferredValue::BindingRef {
             binding: crate::resource::RootScope::new().resolve("vpc".into()),
         });
-        let err = assert_fully_resolved(&v, "vpc_id", &empty_bindings())
+        let err = assert_known_attribute(&v, "vpc_id", &empty_bindings())
             .expect_err("bare BindingRef must be rejected");
         assert!(err.to_string().contains("vpc"), "got: {err}");
         assert!(err.to_string().contains("wait"), "got: {err}");
@@ -2093,7 +2146,7 @@ mod assert_fully_resolved_tests {
             InterpolationPart::Literal("prefix-".into()),
             InterpolationPart::Expr(dvo_chained_ref()),
         ]));
-        let err = assert_fully_resolved(&v, "name", &empty_bindings())
+        let err = assert_known_attribute(&v, "name", &empty_bindings())
             .expect_err("Interpolation that did not collapse must be rejected");
         assert!(err.to_string().contains("interpolation"), "got: {err}");
     }
@@ -2105,7 +2158,7 @@ mod assert_fully_resolved_tests {
             args: vec![dvo_chained_ref().into()],
             source_line: (0).into(),
         });
-        let err = assert_fully_resolved(&v, "name", &empty_bindings())
+        let err = assert_known_attribute(&v, "name", &empty_bindings())
             .expect_err("FunctionCall that did not evaluate must be rejected");
         assert!(err.to_string().contains("concat"), "got: {err}");
     }
@@ -2141,7 +2194,7 @@ mod assert_fully_resolved_tests {
             |session| resolve_ref_value(&value, &bindings, session),
         )
         .map_err(ReportedError::new)
-        .and_then(|resolved| assert_fully_resolved(&resolved, "name", &bindings))
+        .and_then(|resolved| assert_known_attribute(&resolved, "name", &bindings))
         .expect_err("the apply path must reject the final computed list access");
 
         assert!(matches!(
@@ -2181,7 +2234,7 @@ mod assert_fully_resolved_tests {
         let v = Value::Deferred(DeferredValue::ResourceRef { path });
         let bindings = bindings_with("infra", BindingValueSource::Upstream);
 
-        let err = assert_fully_resolved(&v, "policy_document", &bindings)
+        let err = assert_known_attribute(&v, "policy_document", &bindings)
             .expect_err("ResourceRef against unpublished upstream_state must be rejected");
 
         assert!(
@@ -2215,7 +2268,7 @@ mod assert_fully_resolved_tests {
         ]));
         let bindings = bindings_with("infra", BindingValueSource::Upstream);
 
-        let err = assert_fully_resolved(&v, "policy_document", &bindings)
+        let err = assert_known_attribute(&v, "policy_document", &bindings)
             .expect_err("Interpolation containing upstream_state ref must be rejected");
 
         assert!(
@@ -2245,7 +2298,7 @@ mod assert_fully_resolved_tests {
         .expect("resource arithmetic remains deferred");
         let bindings = bindings_with("infra", BindingValueSource::Upstream);
 
-        let error = assert_fully_resolved(&value, "port", &bindings)
+        let error = assert_known_attribute(&value, "port", &bindings)
             .expect_err("unresolved arithmetic must fail before provider dispatch");
         assert!(
             error.to_string().contains("infra"),
@@ -2268,7 +2321,7 @@ mod assert_fully_resolved_tests {
         });
         let bindings = bindings_with("infra", BindingValueSource::Upstream);
 
-        let err = assert_fully_resolved(&v, "policy_document", &bindings)
+        let err = assert_known_attribute(&v, "policy_document", &bindings)
             .expect_err("BindingRef against upstream_state binding must be rejected");
 
         assert!(
@@ -2309,7 +2362,7 @@ mod assert_fully_resolved_tests {
         bindings.set("cert", HashMap::new(), BindingValueSource::Local);
         bindings.set("infra", HashMap::new(), BindingValueSource::Upstream);
 
-        let err = assert_fully_resolved(&v, "policy_document", &bindings)
+        let err = assert_known_attribute(&v, "policy_document", &bindings)
             .expect_err("Interpolation with unresolved upstream ref must be rejected");
 
         assert!(
@@ -2333,7 +2386,7 @@ mod assert_fully_resolved_tests {
         let v = Value::Deferred(DeferredValue::ResourceRef { path });
         let bindings = bindings_with("cert", BindingValueSource::Local);
 
-        let err = assert_fully_resolved(&v, "resource_records", &bindings)
+        let err = assert_known_attribute(&v, "resource_records", &bindings)
             .expect_err("Local ResourceRef must still be rejected with wait hint");
 
         assert!(
@@ -2344,5 +2397,45 @@ mod assert_fully_resolved_tests {
             !err.to_string().contains("upstream_state"),
             "local-binding error must not invoke upstream_state wording; got: {err}",
         );
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    #[test]
+    fn classification_failure_is_a_typed_attribute_diagnostic() {
+        let error = super::knowledge_attribute_diagnostic(
+            "comment",
+            crate::resource::knowledge::KnowledgeError::Cycle {
+                operation: "user function",
+            },
+        );
+        let cause = error
+            .as_error()
+            .downcast_ref::<super::AttributeKnowledgeError>()
+            .unwrap();
+        assert!(matches!(
+            cause.error,
+            crate::resource::knowledge::KnowledgeError::Cycle { .. }
+        ));
+    }
+    #[test]
+    fn known_scalar_is_admitted_without_an_unresolved_diagnostic() {
+        let value = crate::resource::Value::Concrete(crate::resource::ConcreteValue::Int(7));
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        assert!(super::assert_known_attribute(&value, "comment", &bindings).is_ok());
+        assert!(super::unresolved_attribute_diagnostic(&value, "comment", &bindings).is_none());
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+    #[test]
+    fn executor_gate_rejects_an_unevaluated_known_shape() {
+        let bindings = ResolvedBindings::default();
+        for value in crate::resource::known_value_gate_tests::coalesces() {
+            assert!(assert_known_attribute(&value, "records", &bindings).is_err());
+        }
     }
 }

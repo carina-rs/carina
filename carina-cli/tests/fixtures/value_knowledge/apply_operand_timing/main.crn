@@ -1,0 +1,7 @@
+let source = mock.test.read_back { create_read_back_pending_polls = 1 }
+let direct = mock.test.read_back { present = validated(source.computed) }
+let builtin = mock.test.read_back { present = upper(validated(source.computed)) }
+let interpolation = mock.test.read_back { present = "prefix-${validated(source.computed)}" }
+let arithmetic = mock.test.read_back { create_read_back_pending_polls = length(validated(source.computed)) + 1 }
+let access = mock.test.read_back { present = wrapped(source.computed).present }
+let coalesce = mock.test.read_back { present = validated(source.computed) ?? "d" }

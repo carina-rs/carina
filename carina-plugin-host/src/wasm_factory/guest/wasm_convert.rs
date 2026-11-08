@@ -6381,7 +6381,11 @@ mod tests {
         let err = registry
             .get("awscc", "awscc.ec2.Vpc", CoreSchemaKind::Resource)
             .expect("decoded fixture must be owner-bound")
-            .validate_with_resolver(&HashMap::<String, CoreValue>::new(), &|_| false, &resolver)
+            .validate_with_resolver(
+                &HashMap::<String, carina_core::resource::knowledge::Classification<'_>>::new(),
+                &|_| false,
+                &resolver,
+            )
             .unwrap_err();
         assert!(
             err.iter().any(|e| e
@@ -7294,7 +7298,23 @@ mod tests {
         );
         assert!(
             bound_schema
-                .validate_with_resolver(&attrs, &|_| false, &resolver)
+                .validate_with_resolver(
+                    &attrs
+                        .iter()
+                        .map(|(name, value)| (
+                            name.clone(),
+                            value
+                                .knowledge(
+                                    &carina_core::resource::knowledge::KnowledgeContext::validation(
+                                    )
+                                )
+                                .map(|proof| proof.into_classification())
+                                .unwrap()
+                        ))
+                        .collect(),
+                    &|_| false,
+                    &resolver
+                )
                 .is_err()
         );
 
@@ -7313,7 +7333,23 @@ mod tests {
         );
         assert!(
             bound_schema
-                .validate_with_resolver(&attrs, &|_| false, &resolver)
+                .validate_with_resolver(
+                    &attrs
+                        .iter()
+                        .map(|(name, value)| (
+                            name.clone(),
+                            value
+                                .knowledge(
+                                    &carina_core::resource::knowledge::KnowledgeContext::validation(
+                                    )
+                                )
+                                .map(|proof| proof.into_classification())
+                                .unwrap()
+                        ))
+                        .collect(),
+                    &|_| false,
+                    &resolver
+                )
                 .is_ok()
         );
     }

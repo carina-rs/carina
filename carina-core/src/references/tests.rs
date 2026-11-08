@@ -393,7 +393,7 @@ async fn round5_ordered_list_detail_rows_record_the_pairs_the_renderer_compares(
 
 #[tokio::test]
 async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs() {
-    use crate::differ::{CascadeDependents, DeferredCreateTargets, DeferredForExpansionChoice};
+    use crate::differ::{CascadeDependents, DeferredCreateTargets};
     use crate::schema::AttributeType;
     let mut fixture = round5_list_fixture(false, true);
     fixture.registry.insert(
@@ -467,7 +467,8 @@ async fn round5_cascade_unordered_list_with_resource_ref_records_its_own_pairs()
         &unresolved,
         DeferredCreateTargets::partition_for_expansion(
             crate::parser::ExpandedFile::<()>::default().into_deferred_for_expressions(),
-            |_| DeferredForExpansionChoice::Retain,
+            &crate::binding_index::IterableBindings::from_upstream_only(Default::default()),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .1
         .resolve_graph(&graph)
@@ -2688,7 +2689,12 @@ fn round2_reference_validation_is_offline_for_declarations_and_annotations() {
     validate_custom_type_value(
         &custom_types,
         CustomTypeValidationTarget::Annotation(&owned),
-        &string("alias/valid"),
+        &(string("alias/valid"))
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap()
+            .into_known()
+            .unwrap(),
     )
     .unwrap();
     assert_eq!(
@@ -2700,7 +2706,12 @@ fn round2_reference_validation_is_offline_for_declarations_and_annotations() {
         validate_custom_type_value(
             &custom_types,
             CustomTypeValidationTarget::Annotation(&owned),
-            &string("bad")
+            &(string("bad"))
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap()
+                .into_known()
+                .unwrap()
         )
         .is_err()
     );

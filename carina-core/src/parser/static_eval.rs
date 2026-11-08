@@ -11,10 +11,8 @@ use crate::parser::{ParsedFunctionArgument as FunctionArgument, ParsedValue as V
 use crate::resource::{
     AccessMissPolicy, AuthoredConcreteValue as ConcreteValue,
     AuthoredDeferredValue as DeferredValue, AuthoredInterpolationPart as InterpolationPart,
-    BindingAddress, ConcreteValue as GenericConcreteValue, DeferredValue as GenericDeferredValue,
-    InterpolationPart as GenericInterpolationPart, ParserPlaceholder, Value as GenericValue,
+    ParserPlaceholder,
 };
-use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IfConditionDependency {
@@ -36,124 +34,37 @@ impl IfConditionDependency {
     }
 }
 
-pub(crate) fn classify_if_condition(value: &Value) -> IfConditionDependency {
-    if is_static_value(value) {
-        IfConditionDependency::Static
-    } else {
-        classify_non_static_if_condition(value, false, &mut HashSet::new())
-    }
-}
-
-fn classify_non_static_if_condition(
-    value: &Value,
-    function_placeholders_static: bool,
-    visiting_functions: &mut HashSet<usize>,
+pub(crate) fn classify_if_condition(
+    value: &crate::resource::knowledge::Classification<
+        '_,
+        ParserPlaceholder,
+        crate::resource::RelativeBindingName,
+    >,
 ) -> IfConditionDependency {
-    if is_static_value(value) {
-        return IfConditionDependency::Static;
+    use crate::resource::knowledge::PendingReason;
+    if value.failure().is_some() {
+        return IfConditionDependency::Runtime;
     }
 
-    let classify = |value, visiting_functions: &mut HashSet<usize>| {
-        classify_non_static_if_condition(value, function_placeholders_static, visiting_functions)
-    };
-    match value {
-        Value::Concrete(ConcreteValue::List(items)) => items
-            .iter()
-            .fold(IfConditionDependency::Static, |dependency, item| {
-                dependency.combine(classify(item, visiting_functions))
-            }),
-        Value::Concrete(ConcreteValue::Map(map)) => map
-            .values()
-            .fold(IfConditionDependency::Static, |dependency, item| {
-                dependency.combine(classify(item, visiting_functions))
-            }),
-        Value::Concrete(_) => IfConditionDependency::Static,
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
-            .values()
-            .into_iter()
-            .fold(IfConditionDependency::Static, |dependency, value| {
-                dependency.combine(classify(value, visiting_functions))
-            }),
-        Value::Deferred(DeferredValue::FunctionCall { args, .. }) => {
-            args.iter()
-                .fold(IfConditionDependency::Static, |dependency, argument| {
-                    if argument.handle().is_some() {
-                        dependency
-                    } else {
-                        dependency.combine(classify(argument.walker_value(), visiting_functions))
-                    }
-                })
-        }
-        Value::Deferred(DeferredValue::ResolvedFunctionCall { function, args, .. }) => {
-            let argument_dependency =
-                args.iter()
-                    .fold(IfConditionDependency::Static, |dependency, argument| {
-                        if argument.handle().is_some() {
-                            dependency
-                        } else {
-                            dependency
-                                .combine(classify(argument.walker_value(), visiting_functions))
-                        }
-                    });
-            if argument_dependency == IfConditionDependency::Runtime {
-                return argument_dependency;
-            }
-
-            let function_id = std::sync::Arc::as_ptr(function) as usize;
-            if !visiting_functions.insert(function_id) {
-                return IfConditionDependency::Runtime;
-            }
-            let body_dependency = function
-                .local_lets
-                .iter()
-                .map(|(_, value, _)| value)
-                .chain(std::iter::once(&function.body.value))
-                .fold(IfConditionDependency::Static, |dependency, value| {
-                    dependency.combine(classify_non_static_if_condition(
-                        value,
-                        true,
-                        visiting_functions,
-                    ))
-                });
-            visiting_functions.remove(&function_id);
-            argument_dependency.combine(body_dependency)
-        }
-        Value::Deferred(DeferredValue::Access(access)) => {
-            classify(access.base(), visiting_functions)
-        }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().fold(
-            IfConditionDependency::Static,
-            |dependency, part| match part {
-                InterpolationPart::Literal(_) => dependency,
-                InterpolationPart::Expr(value) => {
-                    dependency.combine(classify(value, visiting_functions))
-                }
-            },
-        ),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit(|value| classify(value, visiting_functions))
-        }
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            classify(value, visiting_functions).combine(classify(default, visiting_functions))
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            classify(expression.lhs(), visiting_functions)
-                .combine(classify(expression.rhs(), visiting_functions))
-        }
-        Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
-            ..
-        })) => IfConditionDependency::ModuleDependent,
-        Value::Deferred(DeferredValue::Placeholder(
-            ParserPlaceholder::FnParam { .. } | ParserPlaceholder::FnLocal { .. },
-        )) if function_placeholders_static => IfConditionDependency::Static,
-        Value::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::BindingRef { .. }
-            | DeferredValue::Unavailable { .. }
-            | DeferredValue::Unknown(_)
-            | DeferredValue::Placeholder(_),
-        ) => IfConditionDependency::Runtime,
-    }
+    value
+        .sites()
+        .fold(IfConditionDependency::Static, |dependency, site| {
+            dependency.combine(match site.reason() {
+                PendingReason::Evaluation(_) => IfConditionDependency::Static,
+                PendingReason::ModuleArgument => IfConditionDependency::ModuleDependent,
+                PendingReason::ResourceSelection
+                | PendingReason::BindingSelection
+                | PendingReason::UpstreamExport
+                | PendingReason::UpstreamAllExports
+                | PendingReason::ReadBack
+                | PendingReason::FunctionParameter
+                | PendingReason::FunctionLocal
+                | PendingReason::LoopKey
+                | PendingReason::LoopIndex
+                | PendingReason::LoopValue
+                | PendingReason::IncompleteExpression => IfConditionDependency::Runtime,
+            })
+        })
 }
 
 pub(crate) const RUNTIME_IF_CONDITION_MESSAGE: &str =
@@ -201,81 +112,51 @@ pub(crate) fn decide_if_condition(
     value: &Value,
     config: &ProviderContext,
 ) -> Result<Option<bool>, IfConditionDecisionError> {
-    match classify_if_condition(value) {
+    let knowledge = value
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        .map_err(|_| IfConditionDecisionError::Runtime)?;
+    match classify_if_condition(&knowledge) {
         IfConditionDependency::ModuleDependent => Ok(None),
         IfConditionDependency::Runtime => Err(IfConditionDecisionError::Runtime),
         IfConditionDependency::Static => {
             let evaluated = evaluate_static_value(value.clone(), config)
                 .map_err(IfConditionDecisionError::Evaluation)?;
-            match evaluated {
-                Value::Concrete(ConcreteValue::Bool(condition)) => Ok(Some(condition)),
-                other => Err(IfConditionDecisionError::NonBool(
-                    crate::ValueDescription::of(&other).to_string(),
-                )),
-            }
+            let known = evaluated
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .ok()
+                .and_then(|value| value.into_known().ok());
+            known
+                .as_ref()
+                .and_then(crate::resource::knowledge::known_bool)
+                .map(Some)
+                .ok_or_else(|| {
+                    IfConditionDecisionError::NonBool(
+                        crate::ValueDescription::of(&evaluated).to_string(),
+                    )
+                })
         }
     }
 }
 
-/// Check whether a Value is fully static (no runtime dependencies).
-pub(crate) fn is_static_value<B: BindingAddress>(
-    value: &GenericValue<ParserPlaceholder, B>,
-) -> bool {
-    match value {
-        GenericValue::Concrete(GenericConcreteValue::String(_))
-        | GenericValue::Concrete(GenericConcreteValue::EnumIdentifier(_))
-        | GenericValue::Concrete(GenericConcreteValue::CanonicalEnum(_))
-        | GenericValue::Concrete(GenericConcreteValue::Int(_))
-        | GenericValue::Concrete(GenericConcreteValue::Float(_))
-        | GenericValue::Concrete(GenericConcreteValue::Bool(_))
-        | GenericValue::Concrete(GenericConcreteValue::Duration(_))
-        | GenericValue::Concrete(GenericConcreteValue::StringList(_)) => true,
-        GenericValue::Concrete(GenericConcreteValue::List(items)) => {
-            items.iter().all(is_static_value)
-        }
-        GenericValue::Concrete(GenericConcreteValue::Map(map)) => map.values().all(is_static_value),
-        GenericValue::Deferred(
-            GenericDeferredValue::FunctionCall { args, .. }
-            | GenericDeferredValue::ResolvedFunctionCall { args, .. },
-        ) => args.iter().all(|argument| {
-            argument.handle().is_some() || argument.value().is_some_and(is_static_value)
-        }),
-        GenericValue::Deferred(GenericDeferredValue::Access(access)) => {
-            is_static_value(access.base())
-        }
-        GenericValue::Deferred(GenericDeferredValue::IntegerArithmetic(expression)) => {
-            is_static_value(expression.lhs()) && is_static_value(expression.rhs())
-        }
-        GenericValue::Deferred(GenericDeferredValue::Interpolation(parts)) => {
-            parts.iter().all(|part| match part {
-                GenericInterpolationPart::Literal(_) => true,
-                GenericInterpolationPart::Expr(value) => is_static_value(value),
-            })
-        }
-        GenericValue::Deferred(GenericDeferredValue::ModuleIf(_))
-        | GenericValue::Deferred(GenericDeferredValue::ResourceRef { .. })
-        | GenericValue::Deferred(GenericDeferredValue::BindingRef { .. })
-        | GenericValue::Deferred(GenericDeferredValue::Coalesce { .. })
-        | GenericValue::Deferred(GenericDeferredValue::Unavailable { .. })
-        | GenericValue::Deferred(GenericDeferredValue::Unknown(_))
-        | GenericValue::Deferred(GenericDeferredValue::Placeholder(_)) => false,
-        GenericValue::Deferred(GenericDeferredValue::Secret(inner)) => {
-            inner.visit(|secret_value| is_static_value(secret_value))
-        }
-    }
-}
-
-/// `is_static_value` for the evaluator-internal `EvalValue` type.
+/// Scheduling for evaluator metadata uses Value::knowledge for value inputs.
 /// A closure's static-ness is decided by whether all of its captured
 /// args are themselves static. The pipe/compose paths use this when
 /// they need to decide whether to eagerly apply a partial application.
 pub(crate) fn is_static_eval(value: &EvalValue) -> bool {
     match value {
-        EvalValue::User(v) => is_static_value(v),
+        EvalValue::User(v) => (v)
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .is_ok_and(|knowledge| knowledge.permits_static_evaluation()),
         EvalValue::UnexpandedStructuralHandle(_) => true,
         EvalValue::PendingValue(_) => false,
         EvalValue::ProvisionalReference { .. } => false,
-        EvalValue::ComputedWithUnexpandedStructuralHandles { value, .. } => is_static_value(value),
+        EvalValue::ComputedWithUnexpandedStructuralHandles { value, .. } => (value)
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .is_ok_and(|knowledge| knowledge.permits_static_evaluation()),
         EvalValue::DeferredForValue { .. } => false,
         EvalValue::Closure { captured_args, .. } => captured_args.iter().all(is_static_eval),
     }
@@ -319,9 +200,15 @@ pub(crate) fn evaluate_static_value(
             Ok(Value::Deferred(DeferredValue::Interpolation(evaluated)).canonicalize())
         }
         Value::Deferred(DeferredValue::FunctionCall {
-            ref name, ref args, ..
+            ref name,
+            ref args,
+            source_line,
         }) => {
-            if !is_static_value(&value) {
+            if !value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .is_ok_and(|knowledge| knowledge.permits_static_evaluation())
+            {
                 return Err(ParseError::InvalidExpression {
                     line: 0,
                     message: format!(
@@ -342,11 +229,16 @@ pub(crate) fn evaluate_static_value(
                 .iter()
                 .map(crate::parser::functions::function_argument_as_eval)
                 .collect();
-            let result = crate::builtins::evaluate_builtin_with_config(name, &eval_args, config)
-                .map_err(|e| ParseError::InvalidExpression {
-                    line: 0,
-                    message: format!("for iterable function call '{name}' failed: {e}"),
-                })?;
+            let result = crate::builtins::evaluate_builtin_with_config(
+                name,
+                &eval_args,
+                config,
+                source_line,
+            )
+            .map_err(|e| ParseError::InvalidExpression {
+                line: 0,
+                message: format!("for iterable function call '{name}' failed: {e}"),
+            })?;
             result
                 .into_value()
                 .map_err(|error| ParseError::from_eval_value(error, 0))
@@ -357,7 +249,11 @@ pub(crate) fn evaluate_static_value(
             ref args,
             source_line,
         }) => {
-            if !is_static_value(&value) {
+            if !value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .is_ok_and(|knowledge| knowledge.permits_static_evaluation())
+            {
                 return Err(ParseError::InvalidExpression {
                     line: source_line.get().unwrap_or(function.body.source_line),
                     message: format!(
@@ -436,10 +332,60 @@ pub(crate) fn evaluate_static_value(
 /// parse. Invalid or runtime-dependent calls remain deferred for their own
 /// diagnostics.
 pub fn evaluate_static_value_for_validation(
-    value: &Value,
+    value: &crate::resource::knowledge::Classification<
+        '_,
+        crate::resource::ParserPlaceholder,
+        crate::resource::RelativeBindingName,
+    >,
     config: &ProviderContext,
 ) -> Option<Value> {
-    is_static_value(value)
-        .then(|| evaluate_static_value(value.clone(), config))
+    Some(value)
+        .is_some_and(|knowledge| knowledge.permits_static_evaluation())
+        .then(|| evaluate_static_value(value.to_value(), config))
         .and_then(Result::ok)
+}
+
+#[cfg(test)]
+mod condition_dependency_tests {
+    use super::*;
+    #[test]
+    fn attempted_failure_condition_is_runtime() {
+        let value = Value::Deferred(DeferredValue::Unavailable {
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![],
+            reason: crate::resource::UnavailableReason::from_builtin_error(
+                "already attempted".into(),
+            ),
+            source_line: 1.into(),
+        });
+        let proof = value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap();
+        assert_eq!(
+            classify_if_condition(&proof),
+            IfConditionDependency::Runtime
+        );
+        assert!(matches!(
+            decide_if_condition(
+                &value,
+                &ProviderContext::new(crate::EnvironmentSnapshot::empty())
+            ),
+            Err(IfConditionDecisionError::Runtime)
+        ));
+    }
+    #[test]
+    fn shape_length_of_pending_members_is_one() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse_file(
+            "let result = length([aws_x.id])",
+            std::path::Path::new("main.crn"),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(
+            evaluate_static_value(parsed.variables["result"].clone(), &config).unwrap(),
+            Value::Concrete(ConcreteValue::Int(1))
+        );
+    }
 }

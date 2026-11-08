@@ -1,0 +1,2 @@
+fn prefix(value: String): String { "pre-${value}" }
+fn names(value: String): list(String) { [prefix(value)] }

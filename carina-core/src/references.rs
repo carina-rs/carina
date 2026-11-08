@@ -1282,7 +1282,12 @@ impl ReferenceValidation<'_> {
             ),
             LeafPathSegment::MapKey(name) => (
                 ty.map_value(),
-                format!("{path}[{}]", crate::parser::display_string_literal(name)),
+                format!(
+                    "{path}[{}]",
+                    name.diagnostic_literal()
+                        .map(crate::parser::display_string_literal)
+                        .unwrap_or_else(|| "<sensitive string>".to_owned())
+                ),
             ),
             LeafPathSegment::ListIndex(index) => (ty.list_element(), format!("{path}[{index}]")),
         };

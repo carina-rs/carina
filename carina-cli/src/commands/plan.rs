@@ -821,7 +821,7 @@ pub struct PlanFileContents<S = ModuleSource, P = SnapshotPlan<S>, V: PlanValueK
     /// compositions and apply-from-plan passed `&[]` into the executor —
     /// any composition-rooted ref would survive resolution as a
     /// `ResourceRef` and fail-fast at the executor's
-    /// `assert_fully_resolved` check, or produce a spurious diff if
+    /// `assert_known_attribute` check, or produce a spurious diff if
     /// it reached the differ (carina#3246).
     ///
     /// Empty when the configuration declares no module calls /

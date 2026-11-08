@@ -769,7 +769,12 @@ impl<R: ReferenceEquality> ComparisonContext<'_, R> {
             path = match segment {
                 crate::schema::LeafPathSegment::StructField(name) => format!("{path}.{name}"),
                 crate::schema::LeafPathSegment::MapKey(key) => {
-                    format!("{path}[{}]", crate::parser::display_string_literal(key))
+                    format!(
+                        "{path}[{}]",
+                        key.diagnostic_literal()
+                            .map(crate::parser::display_string_literal)
+                            .unwrap_or_else(|| "<sensitive string>".to_owned())
+                    )
                 }
                 crate::schema::LeafPathSegment::ListIndex(index) => format!("{path}[{index}]"),
             };

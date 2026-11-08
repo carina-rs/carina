@@ -5710,6 +5710,18 @@ fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
     core_registry.insert("test", validated_schema);
     let core_factories = Arc::new(factories_for(&core_registry));
     let core_resolver = carina_core::provider::provider_custom_types_from_factories(core_factories);
+    let classified_attributes = attributes
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                value
+                    .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap(),
+            )
+        })
+        .collect();
     let core_errors = core_registry
         .get(
             "test",
@@ -5718,7 +5730,7 @@ fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
         )
         .expect("test schema must be owner-bound")
         .validate_with_resolver(
-            &attributes,
+            &classified_attributes,
             &|name| name == "hosted_zone_id",
             &core_resolver,
         )
@@ -8368,4 +8380,66 @@ fn pattern_reason_controls_are_escaped_in_cli_and_lsp_diagnostics() {
             assert!(!diagnostic.contains('\u{1b}'), "{diagnostic:?}");
         }
     }
+}
+
+fn assert_round2_attribute_siblings(name: &str) {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/value_knowledge")
+        .join(name);
+    let fixture = tempfile::tempdir().unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), fixture.path().join(entry.file_name())).unwrap();
+    }
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("test.resource")
+            .attribute(AttributeSchema::required("name", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::provider_populated("identifier", AttributeType::string()).build(),
+            )
+            .attribute(AttributeSchema::optional("parent_name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("comment", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .with_unique_name_attribute("name")
+            .validate()
+            .unwrap(),
+    );
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    let errors: Vec<_> = lsp
+        .iter()
+        .filter(|d| {
+            matches!(
+                d.severity,
+                Some(DiagnosticSeverity::ERROR | DiagnosticSeverity::WARNING)
+            )
+        })
+        .collect();
+    assert_eq!(cli.len(), 2, "CLI: {cli:#?}");
+    assert_eq!(errors.len(), cli.len(), "LSP: {errors:#?}\nCLI: {cli:#?}");
+    for cause in ["expected Map<String>, got Int", "expected String, got Bool"] {
+        assert!(
+            cli.iter().any(|message| message.contains(cause)),
+            "{cli:#?}"
+        );
+        assert!(
+            errors.iter().any(|finding| finding.message.contains(cause)),
+            "{errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn failed_attribute_preserves_cli_lsp_sibling_findings() {
+    assert_round2_attribute_siblings("multi_attribute");
+}
+
+#[test]
+fn guarded_failure_preserves_cli_lsp_sibling_findings() {
+    assert_round2_attribute_siblings("guarded_failure_siblings");
 }

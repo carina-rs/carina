@@ -17,9 +17,14 @@ use super::value_type_name;
 /// env("DB_PASSWORD")   // => "s3cret"
 /// ```
 pub(crate) fn builtin_env<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
+    args: &[crate::resource::knowledge::KnownValue<'_, NoPlaceholder, B>],
     environment: &EnvironmentSnapshot,
 ) -> Result<Value<NoPlaceholder, B>, String> {
+    let values = args
+        .iter()
+        .map(|value| value.to_value())
+        .collect::<Vec<_>>();
+    let args = values.as_slice();
     let name = parse_env_args(args)?;
     let value = environment
         .get(name.expose_plaintext())
@@ -70,14 +75,27 @@ mod tests {
         )]));
         let args = [Value::Concrete(ConcreteValue::String("VARIABLE".into()))];
         assert_eq!(
-            crate::builtins::evaluate_builtin_to_value("env", &args, &config).unwrap(),
+            crate::builtins::evaluate_builtin_to_value(
+                "env",
+                &(args)
+                    .iter()
+                    .map(|value| value
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .unwrap()
+                        .into_known()
+                        .unwrap())
+                    .collect::<Vec<_>>(),
+                &config
+            )
+            .unwrap(),
             Value::Concrete(ConcreteValue::String("captured".into())),
         );
         let invalid = crate::builtins::evaluate_builtin_to_value::<
             crate::resource::RelativeBindingName,
         >("env", &[], &config)
         .unwrap_err();
-        assert!(invalid.contains("expects 1 argument"));
+        assert!(invalid.to_string().contains("expects 1 argument"));
     }
 
     #[test]

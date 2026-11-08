@@ -6,7 +6,6 @@ use super::ProviderContext;
 use super::ast::{ExportParamLike, File, ParsedFile, ProviderConfig};
 use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
-use super::static_eval::is_static_value;
 use super::{ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value};
 use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue,
@@ -462,6 +461,17 @@ mod saved_provider_config_secret_tests {
         }
     }
 
+    #[test]
+    fn provider_config_gate_rejects_coalesce_with_known_collection_children() {
+        for value in crate::resource::known_value_gate_tests::coalesces() {
+            let mut config = provider("unused");
+            config.attributes = IndexMap::from([("token".into(), value)]);
+            assert!(matches!(validate_resolved_provider_configs(&[config]),
+                Err(ProviderConfigInvariantError::UnresolvedAttribute { error, .. })
+                    if matches!(*error, crate::value::SerializationError::UnresolvedCoalesce { .. })));
+        }
+    }
+
     fn snapshot_configs(configs: &SavedProviderConfigs<NoPlaceholder>) -> SavedProviderConfigs {
         SavedProviderConfigs(
             configs
@@ -534,13 +544,16 @@ fn validate_resolved_provider_configs(
 ) -> Result<(), ProviderConfigInvariantError> {
     for config in configs {
         for (attribute, value) in &config.attributes {
-            crate::resource::assert_value_fully_resolved(value).map_err(|error| {
-                ProviderConfigInvariantError::UnresolvedAttribute {
+            (value)
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(crate::resource::knowledge_serialization_error)
+                .and_then(crate::resource::require_known_value)
+                .map_err(|error| ProviderConfigInvariantError::UnresolvedAttribute {
                     provider: config.name.clone(),
                     attribute: attribute.clone(),
                     error: Box::new(error),
-                }
-            })?;
+                })?;
         }
     }
     Ok(())
@@ -1704,8 +1717,13 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 preserve_failed_user_calls,
                 scope,
             )?;
-            if matches!(left, GenericValue::Concrete(_)) {
-                Ok(left)
+            if let Ok(crate::resource::knowledge::Classification::Known(known)) =
+                left.knowledge(&crate::resource::knowledge::KnowledgeContext::validation()).map(|proof| proof.into_classification())
+                // Keep protected authored alternatives for type diagnostics;
+                // the runtime presence owner selects their known value later.
+                && !known.is_secret()
+            {
+                Ok(crate::resource::knowledge::take_present(known))
             } else {
                 // Carry the fallback through the same directory fixed point as
                 // the left operand, while preserving failures as deferred calls
@@ -1840,14 +1858,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
         }) => {
             // External inputs can remain unavailable below a secret until
             // planning/apply. Deterministic builtin failures still fail validation.
-            if defer_unknown_functions
-                || (scope.is_secret()
-                    && matches!(
-                        name,
-                        crate::builtins::BuiltinFunction::env
-                            | crate::builtins::BuiltinFunction::decrypt
-                    ))
-            {
+            if defer_unknown_functions || is_protected_external_input(*name, scope) {
                 Ok(value.clone())
             } else {
                 Err(unavailable_builtin_error(*name, reason, *source_line))
@@ -1914,14 +1925,25 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
             let resolved_args = resolved_args?;
 
             let all_args_resolved = resolved_args.iter().all(|argument| {
-                argument.handle().is_some() || argument.value().is_some_and(is_static_value)
+                argument.handle().is_some()
+                    || argument.value().is_some_and(|value| {
+                        (value)
+                            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                            .map(|proof| proof.into_classification())
+                            .is_ok_and(|knowledge| knowledge.permits_static_evaluation())
+                    })
             });
 
             let eval_args: Vec<_> = resolved_args
                 .iter()
                 .map(super::functions::function_argument_as_eval)
                 .collect();
-            match crate::builtins::evaluate_builtin_with_config(name.as_str(), &eval_args, config) {
+            match crate::builtins::evaluate_builtin_with_config(
+                name.as_str(),
+                &eval_args,
+                config,
+                *source_line,
+            ) {
                 Ok(result) => result.into_value().map_err(|error| match authored_line {
                     Some(line) => ParseError::from_eval_value(error, line),
                     None => ParseError::UserFunctionError(error.to_string()),
@@ -1931,9 +1953,9 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                         let reason = if scope.is_secret() {
                             UnavailableReason::inside_secret()
                         } else {
-                            UnavailableReason::from_builtin_error(e)
+                            UnavailableReason::from_builtin_error(e.to_string())
                         };
-                        if defer_unknown_functions {
+                        if defer_unknown_functions || is_protected_external_input(*name, scope) {
                             Ok(GenericValue::Deferred(DeferredValue::Unavailable {
                                 name: *name,
                                 args: resolved_args,
@@ -2000,6 +2022,20 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
             | DeferredValue::Placeholder(_),
         ) => Ok(value.clone()),
     }
+}
+
+// Failure-retention policy, shared by an already-attempted input and the
+// first evaluation of its call. Validation retains protected external inputs;
+// plan/apply value admission still rejects their typed failure evidence.
+fn is_protected_external_input(
+    name: crate::builtins::BuiltinFunction,
+    scope: DiagnosticScope,
+) -> bool {
+    scope.is_secret()
+        && matches!(
+            name,
+            crate::builtins::BuiltinFunction::env | crate::builtins::BuiltinFunction::decrypt
+        )
 }
 
 fn unavailable_builtin_error(
@@ -2595,8 +2631,18 @@ let item = mock.test.resource {{
             }
             other => panic!("failed ready call must be Unavailable, got {other:?}"),
         }
-        assert!(!comment(&failed).is_fully_resolved());
-        assert!(!is_static_value(comment(&failed)));
+        assert!(!matches!(
+            (comment(&failed))
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification()),
+            Ok(crate::resource::knowledge::Classification::Known(_))
+        ));
+        assert!(
+            !(comment(&failed))
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .is_ok_and(|knowledge| knowledge.permits_static_evaluation())
+        );
 
         let mut pending = crate::parser::parse(
             r#"

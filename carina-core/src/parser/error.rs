@@ -37,13 +37,14 @@ pub enum DeferredForIterableResolution {
 /// Details for a deferred `for` body that cannot cross the final module
 /// expansion seam.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{}", format_deferred_for_body_unsupported(*line, header, body, *iterable_resolution))]
+#[error("{}", format_deferred_for_body_unsupported(*line, header, body, *iterable_resolution,phase_detail.as_deref()))]
 pub struct DeferredForBodyUnsupportedError {
     pub line: usize,
     pub header: String,
     pub body: DeferredForBodyKind,
     pub span: SourceSpan,
     pub iterable_resolution: DeferredForIterableResolution,
+    pub phase_detail: Option<String>,
 }
 
 /// Typed identity and authored token span for an unresolved declaration type.
@@ -169,6 +170,12 @@ pub enum ParseError {
 
     #[error("Invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
+
+    #[error("Invalid expression at line {line}: {error}")]
+    Evaluation {
+        line: usize,
+        error: Box<crate::resolver::ResolutionError>,
+    },
 
     #[error("Invalid float literal at line {line}")] // error-chain: caller-renders-sources
     InvalidFloatLiteral {
@@ -352,8 +359,9 @@ fn format_deferred_for_body_unsupported(
     header: &str,
     body: &DeferredForBodyKind,
     iterable_resolution: DeferredForIterableResolution,
+    phase_detail: Option<&str>,
 ) -> String {
-    match iterable_resolution {
+    let message = match iterable_resolution {
         DeferredForIterableResolution::StillDeferred => format!(
             "Deferred `for` expression `{header}` at line {line} cannot use {body}: its iterable \
              is still unresolved after module expansion, and only a managed resource body can be \
@@ -373,7 +381,8 @@ fn format_deferred_for_body_unsupported(
              expansion is not supported. Move the loop to the caller where the iterable is known \
              during parsing, or put managed resources directly in the loop body"
         ),
-    }
+    };
+    phase_detail.map_or_else(|| message.clone(), |detail| format!("{message}. {detail}"))
 }
 
 /// Render the `UndefinedIdentifier` message. When a close match exists
@@ -438,6 +447,20 @@ pub struct ParseWarning {
 }
 
 impl ParseError {
+    pub(crate) fn from_resolution(error: crate::resolver::ResolutionError, line: usize) -> Self {
+        use crate::resolver::ResolutionError;
+        match error {
+            ResolutionError::Message(message) => Self::InvalidExpression { line, message },
+            ResolutionError::UnavailableSecret(error) => Self::UnavailableSecret(error),
+            ResolutionError::InsideSecret {} => Self::InsideSecret { line },
+            error @ (ResolutionError::Knowledge(_) | ResolutionError::Context { .. }) => {
+                Self::Evaluation {
+                    line,
+                    error: Box::new(error),
+                }
+            }
+        }
+    }
     pub(crate) fn inside_secret_at(self, fallback_line: usize) -> Self {
         match self {
             Self::Located { path, error } => Self::Located {
@@ -456,6 +479,7 @@ impl ParseError {
             error => {
                 let line = match error {
                     Self::InvalidExpression { line, .. }
+                    | Self::Evaluation { line, .. }
                     | Self::IntegerArithmetic { line, .. }
                     | Self::SecretInConstraint { line }
                     | Self::UnknownFunction { line, .. }

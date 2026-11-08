@@ -16,7 +16,7 @@
 //! prefixed. `create_plan` emits no `Effect::Wait`, the Distribution
 //! gets no dependency edge, dispatches immediately, and fails at 0.0s
 //! with the self-contradicting "add a `wait` block" error
-//! (`assert_fully_resolved` on the still-`Deferred`
+//! (`assert_known_attribute` on the still-`Deferred`
 //! `cert_issued.certificate_arn`).
 //!
 //! Per CLAUDE.md "directory-scoped, never single-file": the fixture is

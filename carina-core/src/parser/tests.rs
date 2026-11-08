@@ -12477,7 +12477,12 @@ fn parse_decrypt_without_decryptor_errors() {
 fn builtin_custom_type_validation_uses_declared_scalar_kind() {
     let error = validate_custom_type(
         &TypeIdentity::bare("PositiveInt"),
-        &ExpandedValue::Concrete(ExpandedConcreteValue::String("5".into())),
+        &(ExpandedValue::Concrete(ExpandedConcreteValue::String("5".into())))
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap()
+            .into_known()
+            .unwrap(),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .expect_err("a string cannot satisfy an Int refinement")
@@ -12509,7 +12514,12 @@ fn unresolved_simple_custom_type_never_falls_back_to_a_provider_validator() {
 
     let error = validate_custom_type(
         &TypeIdentity::bare("CustomType"),
-        &ExpandedValue::Concrete(ExpandedConcreteValue::String("valid-data".into())),
+        &(ExpandedValue::Concrete(ExpandedConcreteValue::String("valid-data".into())))
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap()
+            .into_known()
+            .unwrap(),
         &config,
     )
     .expect_err("provider-owned bare types must be represented as SchemaType");
@@ -12555,10 +12565,14 @@ fn provider_context_lookup_preserves_typed_custom_validation_errors() {
         .expect("typed-error fixture schema must be registered");
     let error = schema
         .validate_with_resolver(
-            &std::collections::HashMap::<String, ExpandedValue>::from([(
+            &crate::schema::classified_attributes(&std::collections::HashMap::<
+                String,
+                ExpandedValue,
+            >::from([(
                 "value".to_string(),
                 ExpandedValue::Concrete(ExpandedConcreteValue::String("value".into())),
-            )]),
+            )]))
+            .unwrap(),
             &|_| false,
             config.custom_type_resolver(),
         )
@@ -12591,7 +12605,12 @@ fn schema_custom_type_validation_accepts_a_loaded_context_witness() {
 
     validate_schema_custom_type(
         &owned,
-        &ExpandedValue::Concrete(ExpandedConcreteValue::String("widget-1".into())),
+        &(ExpandedValue::Concrete(ExpandedConcreteValue::String("widget-1".into())))
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap()
+            .into_known()
+            .unwrap(),
         &crate::parser::LoadedProviderContext::empty_for_test(),
     )
     .expect("the loaded fixture resolver accepts the annotation");
@@ -12628,8 +12647,17 @@ fn schema_custom_type_validation_preserves_bridge_decode_error_chain() {
         crate::resource::RawEnumIdentifier::parse("not_an_integer"),
     ));
 
-    let error = super::functions::validate_schema_custom_type_with_context(&owned, &value, &config)
-        .expect_err("invalid integer bridge text must fail decoding");
+    let error = super::functions::validate_schema_custom_type_with_context(
+        &owned,
+        &value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap()
+            .into_known()
+            .unwrap(),
+        &config,
+    )
+    .expect_err("invalid integer bridge text must fail decoding");
     let message = error.to_string();
     assert!(
         message.contains("invalid integer bridge value"),
@@ -12662,12 +12690,17 @@ fn secret_custom_type_values_do_not_reach_the_provider_resolver() {
             identity,
             crate::schema::RefinedScalarKind::String,
         ),
-        &ExpandedValue::Deferred(ExpandedDeferredValue::Secret(
+        &(ExpandedValue::Deferred(ExpandedDeferredValue::Secret(
             Box::new(ExpandedValue::Concrete(ExpandedConcreteValue::String(
                 "do-not-leak".into(),
             )))
             .into(),
-        )),
+        )))
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        .unwrap()
+        .into_known()
+        .unwrap(),
         &config,
     )
     .expect("a secret value defers custom-type validation");
@@ -12724,7 +12757,12 @@ fn provider_context_validator_receives_canonical_numeric_text() {
 
         validate_schema_custom_type(
             &crate::parser::OwnedTypeIdentity::provider("test", identity.clone(), kind),
-            &value,
+            &value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap()
+                .into_known()
+                .unwrap(),
             &config,
         )
         .expect("supported scalar must reach the provider-context validator");
@@ -12806,12 +12844,30 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
                 };
                 match owner {
                     "one" => one_type
-                        .validate_identified_scalar_value(value)
+                        .validate_identified_scalar_value(
+                            &(value)
+                                .knowledge(
+                                    &crate::resource::knowledge::KnowledgeContext::validation(),
+                                )
+                                .map(|proof| proof.into_classification())
+                                .unwrap()
+                                .into_known()
+                                .unwrap(),
+                        )
                         .map_err(|error| {
                             crate::parser::fixture_invalid_custom_type_value(target, error)
                         }),
                     "two" => two_type
-                        .validate_identified_scalar_value(value)
+                        .validate_identified_scalar_value(
+                            &(value)
+                                .knowledge(
+                                    &crate::resource::knowledge::KnowledgeContext::validation(),
+                                )
+                                .map(|proof| proof.into_classification())
+                                .unwrap()
+                                .into_known()
+                                .unwrap(),
+                        )
                         .map_err(|error| {
                             crate::parser::fixture_invalid_custom_type_value(target, error)
                         }),
@@ -12831,7 +12887,12 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
             identity.clone(),
             crate::schema::RefinedScalarKind::Int,
         ),
-        &ExpandedValue::Concrete(ExpandedConcreteValue::Int(5)),
+        &(ExpandedValue::Concrete(ExpandedConcreteValue::Int(5)))
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap()
+            .into_known()
+            .unwrap(),
         &config,
     )
     .expect("owner one must get its own verdict");
@@ -12841,7 +12902,12 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
             identity.clone(),
             crate::schema::RefinedScalarKind::Int,
         ),
-        &ExpandedValue::Concrete(ExpandedConcreteValue::Int(7)),
+        &(ExpandedValue::Concrete(ExpandedConcreteValue::Int(7)))
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap()
+            .into_known()
+            .unwrap(),
         &config,
     )
     .expect("owner two must get its own verdict");
@@ -12852,8 +12918,13 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
                 identity.clone(),
                 crate::schema::RefinedScalarKind::Int
             ),
-            &ExpandedValue::Concrete(ExpandedConcreteValue::Int(7)),
-            &config,
+            &(ExpandedValue::Concrete(ExpandedConcreteValue::Int(7)))
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap()
+                .into_known()
+                .unwrap(),
+            &config
         )
         .is_err()
     );
@@ -12864,8 +12935,13 @@ fn owner_routing_precedes_identity_collisions_and_preserves_typed_ints() {
                 identity.clone(),
                 crate::schema::RefinedScalarKind::Int
             ),
-            &ExpandedValue::Concrete(ExpandedConcreteValue::Int(5)),
-            &config,
+            &(ExpandedValue::Concrete(ExpandedConcreteValue::Int(5)))
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap()
+                .into_known()
+                .unwrap(),
+            &config
         )
         .is_err()
     );
@@ -12922,14 +12998,24 @@ fn parse_custom_validator_rejects_invalid() {
     );
     let valid_result = validate_schema_custom_type(
         &owned,
-        &ExpandedValue::Concrete(ExpandedConcreteValue::String("valid-data".into())),
+        &(ExpandedValue::Concrete(ExpandedConcreteValue::String("valid-data".into())))
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap()
+            .into_known()
+            .unwrap(),
         &config,
     );
     assert!(valid_result.is_ok());
 
     let invalid_result = validate_schema_custom_type(
         &owned,
-        &ExpandedValue::Concrete(ExpandedConcreteValue::String("invalid".into())),
+        &(ExpandedValue::Concrete(ExpandedConcreteValue::String("invalid".into())))
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap()
+            .into_known()
+            .unwrap(),
         &config,
     );
     assert!(invalid_result.is_err());

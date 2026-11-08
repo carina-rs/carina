@@ -118,6 +118,11 @@ pub enum SerializationError {
         expression: String,
         context: SerializationContext,
     },
+    #[error("cannot serialize at {context}: unresolved access {error}")]
+    Knowledge {
+        error: Box<crate::resource::knowledge::KnowledgeDiagnostic>,
+        context: SerializationContext,
+    },
     /// A coalesce expression reached a concrete-only serialization boundary
     /// before its left operand became present or definitively absent.
     #[error("cannot serialize at {context}: unresolved coalesce expression")]
@@ -183,6 +188,7 @@ impl crate::resource::InsideSecret for SerializationError {
                 SecretSerializationErrorKind::UnresolvedFunctionCall
             }
             Self::UnresolvedAccess { .. } => SecretSerializationErrorKind::UnresolvedAccess,
+            Self::Knowledge { .. } => SecretSerializationErrorKind::UnresolvedAccess,
             Self::UnresolvedCoalesce { .. } => SecretSerializationErrorKind::UnresolvedCoalesce,
             Self::UnresolvedIntegerArithmetic { .. } => {
                 SecretSerializationErrorKind::UnresolvedIntegerArithmetic
@@ -5547,7 +5553,10 @@ impl<P: PlaceholderKind> CanonicalizationLeaf for P {
     ) -> Option<crate::schema::Fit<'a>> {
         crate::schema::fit_value_to_resolved_type_on_path(
             attr,
-            value,
+            &value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .ok()?,
             defs,
             ancestry,
             purpose,
@@ -6129,9 +6138,13 @@ fn canonicalize_with_fit<H: ValueKind, B: BindingAddress, P: CanonicalizationErr
                 .collect::<Result<IndexMap<_, _>, P::Error>>()?;
             Ok(Value::Concrete(ConcreteValue::Map(fields)))
         }
-        (value, crate::schema::FitKind::PassThrough | crate::schema::FitKind::Deferred) => {
-            Ok(value)
-        }
+        (
+            value,
+            crate::schema::FitKind::PassThrough
+            | crate::schema::FitKind::Deferred(_)
+            | crate::schema::FitKind::Failed
+            | crate::schema::FitKind::HistoricalOpaque,
+        ) => Ok(value),
         (value, _) => {
             debug_assert!(false, "fit witness and value shape diverged");
             Ok(value)
@@ -7986,7 +7999,10 @@ mod tests {
         assert!(
             crate::schema::fit_value_to_resolved_type_on_path(
                 resolved.as_attr(),
-                &settings,
+                &(settings)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap(),
                 &schema.as_schema().defs,
                 crate::schema::FieldAncestry::from_input_mode(attribute.input_mode()),
                 CanonicalizationPurpose::State,
@@ -8009,7 +8025,10 @@ mod tests {
         assert!(
             crate::schema::fit_value_to_resolved_type_on_path(
                 resolved.as_attr(),
-                &canonical_settings,
+                &(canonical_settings)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap(),
                 &schema.as_schema().defs,
                 crate::schema::FieldAncestry::from_input_mode(attribute.input_mode()),
                 CanonicalizationPurpose::State,
@@ -13690,7 +13709,10 @@ mod tests {
                 let value: Value = Value::Concrete(ConcreteValue::Int(n));
                 let fit = crate::schema::fit_value_to_resolved_type_on_path(
                     &attr,
-                    &value,
+                    &(value)
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .unwrap(),
                     defs,
                     crate::schema::FieldAncestry::WRITABLE,
                     purpose,

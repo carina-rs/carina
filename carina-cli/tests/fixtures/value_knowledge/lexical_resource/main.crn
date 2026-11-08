@@ -1,0 +1,4 @@
+let producer = mock.test.resource { name = "r" }
+for name in names(producer) {
+  mock.test.resource { name = name }
+}

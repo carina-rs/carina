@@ -307,10 +307,12 @@ fn value_at_segments<'a, P: super::ValueKind>(
 ) -> Option<&'a Value<P>> {
     for segment in segments {
         value = match (segment, value) {
-            (
-                LeafPathSegment::StructField(name) | LeafPathSegment::MapKey(name),
-                Value::Concrete(ConcreteValue::Map(values)),
-            ) => values.get(name)?,
+            (LeafPathSegment::StructField(name), Value::Concrete(ConcreteValue::Map(values))) => {
+                values.get(name)?
+            }
+            (LeafPathSegment::MapKey(key), Value::Concrete(ConcreteValue::Map(values))) => {
+                values.get(key.expose_plaintext())?
+            }
             (LeafPathSegment::ListIndex(index), Value::Concrete(ConcreteValue::List(values))) => {
                 values.get(*index)?
             }
@@ -332,22 +334,11 @@ fn set_leaf<P: super::ValueKind>(
         return;
     };
     match (segment, value) {
-        (
-            LeafPathSegment::StructField(name) | LeafPathSegment::MapKey(name),
-            Value::Concrete(ConcreteValue::Map(values)),
-        ) => {
-            if rest.is_empty() {
-                match replacement {
-                    Some(replacement) => {
-                        values.insert(name.clone(), replacement);
-                    }
-                    None => {
-                        values.shift_remove(name);
-                    }
-                }
-            } else if let Some(child) = values.get_mut(name) {
-                set_leaf(child, rest, replacement);
-            }
+        (LeafPathSegment::StructField(name), Value::Concrete(ConcreteValue::Map(values))) => {
+            set_map_leaf(values, name, rest, replacement)
+        }
+        (LeafPathSegment::MapKey(key), Value::Concrete(ConcreteValue::Map(values))) => {
+            set_map_leaf(values, key.expose_plaintext(), rest, replacement)
         }
         (LeafPathSegment::ListIndex(index), Value::Concrete(ConcreteValue::List(values))) => {
             if let Some(child) = values.get_mut(*index) {
@@ -355,6 +346,26 @@ fn set_leaf<P: super::ValueKind>(
             }
         }
         _ => {}
+    }
+}
+
+fn set_map_leaf<P: super::ValueKind>(
+    values: &mut indexmap::IndexMap<String, Value<P>>,
+    name: &str,
+    rest: &[LeafPathSegment],
+    replacement: Option<Value<P>>,
+) {
+    if rest.is_empty() {
+        match replacement {
+            Some(replacement) => {
+                values.insert(name.to_owned(), replacement);
+            }
+            None => {
+                values.shift_remove(name);
+            }
+        }
+    } else if let Some(child) = values.get_mut(name) {
+        set_leaf(child, rest, replacement);
     }
 }
 
@@ -542,7 +553,7 @@ fn resolve_one_ignore_change<S, P: ValueKind, B: BindingAddress, D>(
                         };
                         let value = values.get(key)?;
                         let mut leaf = cursor.leaf;
-                        leaf.push(LeafPathSegment::MapKey(key.clone()));
+                        leaf.push(LeafPathSegment::MapKey(key.clone().into()));
                         Some(ValueCursor { leaf, value })
                     })
                     .collect();

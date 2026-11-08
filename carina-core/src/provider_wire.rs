@@ -302,7 +302,12 @@ pub(crate) fn project_plaintext(value: &Value) -> Result<protocol::Value, Protoc
             })
             .collect::<Result<_, _>>()
             .map(protocol::Value::Map),
-        value => try_core_to_protocol_value(value),
+        value => try_core_to_protocol_value(&crate::protocol_convert::require_known_for_protocol(
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(crate::protocol_convert::protocol_knowledge_error)?,
+        )?),
     }
 }
 

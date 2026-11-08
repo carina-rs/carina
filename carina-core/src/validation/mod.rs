@@ -2324,13 +2324,13 @@ fn visit_refs_with_sink_inner<'a, P: PlaceholderKind, B: BindingAddress>(
                 visit_refs_with_sink_inner(value, sink, usage, scope, f)
             }),
         GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { value, default }) => {
-            let value_usage = if value.is_coalesce_optional_operand() {
+            let value_usage = if value.optional_operand().is_some() {
                 crate::resource::ResourceRefUsage::CoalesceValue
             } else {
                 crate::resource::ResourceRefUsage::Required
             };
             let default_usage = if usage == crate::resource::ResourceRefUsage::CoalesceValue
-                && default.is_coalesce_optional_operand()
+                && default.optional_operand().is_some()
             {
                 crate::resource::ResourceRefUsage::CoalesceValue
             } else {
@@ -4997,8 +4997,14 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
     match schema {
         Some(schema) => {
             let is_string_literal = |attr: &str| quoted_string_attrs.contains(attr);
+            let mut classification_errors = Vec::new();
+            let classified = crate::resource::knowledge::collect_classified_attributes(
+                attributes.iter().map(|(name, value)| (name.clone(), value)),
+                &crate::resource::knowledge::KnowledgeContext::validation(),
+                |name, error| classification_errors.push((name.to_owned(), error)),
+            );
             if let Err(errors) = schema.validate_with_resolver(
-                &crate::resource::attrs_to_hashmap(attributes),
+                &classified,
                 &is_string_literal,
                 context.provider_context.custom_type_resolver(),
             ) {
@@ -5006,6 +5012,11 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
                     .all_errors
                     .extend(errors.into_iter().map(|error| format!("{id}: {error}")));
             }
+            context.all_errors.extend(
+                classification_errors
+                    .into_iter()
+                    .map(|(name, error)| format!("{id}.{name}: {error}")),
+            );
         }
         None => {
             let provider = id.provider.as_str();
@@ -5589,6 +5600,14 @@ impl std::fmt::Display for DeferredForIterableTypeDiagnostic {
             self.expression, self.message
         )
     }
+}
+
+/// Module and read expansion need collection membership before apply.
+/// Missing validation facts alone never prove an apply-only requirement.
+pub fn validate_module_iteration_shape<P: PlaceholderKind, B: BindingAddress>(
+    value: &crate::resource::knowledge::Classification<'_, P, B>,
+) -> Result<(), crate::resource::knowledge::PhaseViolation<B>> {
+    value.module_iteration_violation().map_or(Ok(()), Err)
 }
 
 /// Validate every deferred `for` iterable against its binding pattern.
@@ -7579,41 +7598,6 @@ pub fn validate_no_exports_in_module<E>(parsed: &crate::parser::File<E>) -> Resu
         );
     }
     Ok(())
-}
-
-/// Returns `true` if `value` contains any deferred sub-value that the
-/// WASM provider boundary would reject (ResourceRef, BindingRef,
-/// Interpolation, FunctionCall, Access, Unknown). Used by
-/// [`validate_provider_config`] to skip the plugin-side `validate_config`
-/// call for attributes whose refs cannot be substituted at validate
-/// time. `Secret` is transparent — its inner value is unwrapped because
-/// the secret wrapper survives WASM serialization but the inner value
-/// must still be checked. carina#3182.
-pub fn value_contains_unresolved_ref<P: PlaceholderKind>(value: &GenericValue<P>) -> bool {
-    match value {
-        GenericValue::Deferred(crate::resource::DeferredValue::ModuleIf(_))
-        | GenericValue::Deferred(crate::resource::DeferredValue::IntegerArithmetic(_))
-        | GenericValue::Deferred(crate::resource::DeferredValue::ResourceRef { .. })
-        | GenericValue::Deferred(crate::resource::DeferredValue::BindingRef { .. })
-        | GenericValue::Deferred(crate::resource::DeferredValue::Coalesce { .. })
-        | GenericValue::Deferred(crate::resource::DeferredValue::Interpolation(_))
-        | GenericValue::Deferred(crate::resource::DeferredValue::FunctionCall { .. })
-        | GenericValue::Deferred(crate::resource::DeferredValue::Unavailable { .. })
-        | GenericValue::Deferred(crate::resource::DeferredValue::ResolvedFunctionCall { .. })
-        | GenericValue::Deferred(crate::resource::DeferredValue::Access(_))
-        | GenericValue::Deferred(crate::resource::DeferredValue::Unknown(_))
-        | GenericValue::Deferred(crate::resource::DeferredValue::Placeholder(_)) => true,
-        GenericValue::Deferred(crate::resource::DeferredValue::Secret(inner)) => {
-            inner.visit(|secret_value| value_contains_unresolved_ref(secret_value))
-        }
-        GenericValue::Concrete(crate::resource::ConcreteValue::List(items)) => {
-            items.iter().any(value_contains_unresolved_ref)
-        }
-        GenericValue::Concrete(crate::resource::ConcreteValue::Map(map)) => {
-            map.values().any(value_contains_unresolved_ref)
-        }
-        GenericValue::Concrete(_) => false,
-    }
 }
 
 /// Validate provider configuration attributes.

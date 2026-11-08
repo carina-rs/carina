@@ -9,6 +9,7 @@ use crate::numeric::NumericPair;
 use crate::parser::{
     ArgumentParameter, CompareOp, ModuleCallId, RequireBlock, ValidateExpr, display_string_literal,
 };
+use crate::resolver::ResolutionError;
 use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue, DeferredValue,
     LiveComposition, ModuleConstraintId, NoPlaceholder, PendingModuleConstraint, PlaceholderKind,
@@ -159,7 +160,7 @@ pub enum ConstraintEvaluation {
     Satisfied,
     Pending,
     Violated(ModuleConstraintViolation),
-    EvalError(String),
+    EvalError(ResolutionError),
 }
 
 /// Where a module constraint is declared, and therefore which arguments are
@@ -383,9 +384,9 @@ pub fn evaluate_module_constraints<P: PlaceholderKind, B: BindingAddress>(
                 .iter()
                 .find(|argument| !declared_arguments.contains(*argument));
             let evaluation = if let Some(argument) = unknown_argument {
-                ConstraintEvaluation::EvalError(format!(
-                    "unknown variable '{argument}' in constraint expression"
-                ))
+                ConstraintEvaluation::EvalError(
+                    format!("unknown variable '{argument}' in constraint expression").into(),
+                )
             } else {
                 match &kind {
                     ModuleConstraintKind::ArgumentValidation { argument } => {
@@ -451,7 +452,7 @@ fn evaluate_constraint_inner<P: PlaceholderKind, B: BindingAddress>(
     expr: &ValidateExpr<P, B>,
     arguments: &HashMap<String, Value<P, B>>,
     message: String,
-) -> Result<ConstraintEvaluation, String> {
+) -> Result<ConstraintEvaluation, ResolutionError> {
     let referenced = referenced_constraint_arguments(expr);
     if !constraint_inputs_are_concrete(expr, arguments)? {
         return Ok(ConstraintEvaluation::Pending);
@@ -462,7 +463,8 @@ fn evaluate_constraint_inner<P: PlaceholderKind, B: BindingAddress>(
         return Err(format!(
             "constraint expression must return a boolean, got {}",
             result.kind_name()
-        ));
+        )
+        .into());
     };
     if satisfied {
         return Ok(ConstraintEvaluation::Satisfied);
@@ -610,12 +612,16 @@ fn evaluate_pending_constraint_views<'a>(
                             error,
                         });
                     }
-                    Err(error @ crate::resolver::ResolutionError::InsideSecret { .. }) => {
-                        resolution_errors.insert(name.clone(), error.to_string());
+                    Err(
+                        error @ (crate::resolver::ResolutionError::InsideSecret { .. }
+                        | crate::resolver::ResolutionError::Knowledge(_)
+                        | crate::resolver::ResolutionError::Context { .. }),
+                    ) => {
+                        resolution_errors.insert(name.clone(), error);
                         resolved_arguments.insert(name.clone(), argument.clone());
                     }
                     Err(crate::resolver::ResolutionError::Message(message)) => {
-                        resolution_errors.insert(name.clone(), message);
+                        resolution_errors.insert(name.clone(), ResolutionError::Message(message));
                         resolved_arguments.insert(name.clone(), argument.clone());
                     }
                 }
@@ -697,19 +703,23 @@ fn evaluate_pending_constraint_views<'a>(
 fn resolve_bound_constraint_values(
     expression: &ValidateExpr,
     bindings: &ResolvedBindings,
-    errors: &mut HashMap<String, String>,
+    errors: &mut HashMap<String, ResolutionError>,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<ValidateExpr, crate::resource::UnavailableSecretError> {
     expression.try_map_bound_arguments(&mut |argument, _, value| {
         match crate::resolver::resolve_ref_value(value, bindings, session) {
             Ok(value) => Ok(value),
             Err(crate::resolver::ResolutionError::UnavailableSecret(error)) => Err(error),
-            Err(error @ crate::resolver::ResolutionError::InsideSecret { .. }) => {
-                errors.insert(argument.to_string(), error.to_string());
+            Err(
+                error @ (crate::resolver::ResolutionError::InsideSecret { .. }
+                | crate::resolver::ResolutionError::Knowledge(_)
+                | crate::resolver::ResolutionError::Context { .. }),
+            ) => {
+                errors.insert(argument.to_string(), error);
                 Ok(value.clone())
             }
             Err(crate::resolver::ResolutionError::Message(message)) => {
-                errors.insert(argument.to_string(), message);
+                errors.insert(argument.to_string(), ResolutionError::Message(message));
                 Ok(value.clone())
             }
         }
@@ -863,18 +873,6 @@ fn format_constraint_actual<P: PlaceholderKind, B: BindingAddress>(value: &Value
     }
 }
 
-fn is_recursively_concrete<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, B>) -> bool {
-    match value {
-        Value::Concrete(ConcreteValue::List(items)) => items.iter().all(is_recursively_concrete),
-        Value::Concrete(ConcreteValue::Map(map)) => map.values().all(is_recursively_concrete),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.visit(|secret_value| is_recursively_concrete(secret_value))
-        }
-        Value::Concrete(_) => true,
-        Value::Deferred(_) => false,
-    }
-}
-
 #[derive(Clone)]
 enum EvalValue<P: PlaceholderKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress> {
     Value(Value<P, B>),
@@ -918,25 +916,22 @@ impl<P: PlaceholderKind, B: BindingAddress> EvalValue<P, B> {
         }
     }
 
-    fn bool(self, context: &str) -> Result<bool, String> {
+    fn bool(self, context: &str) -> Result<bool, ResolutionError> {
         match self {
             Self::Value(Value::Concrete(ConcreteValue::Bool(value))) => Ok(value),
             Self::Value(Value::Deferred(DeferredValue::Secret(payload))) => {
                 payload.try_inspect(|value| EvalValue::Value(value.clone()).bool(context))
             }
-            other => Err(format!(
-                "{context} must be boolean, got {}",
-                other.kind_name()
-            )),
+            other => Err(format!("{context} must be boolean, got {}", other.kind_name()).into()),
         }
     }
-    fn require_int(&self, context: &str) -> Result<(), String> {
+    fn require_int(&self, context: &str) -> Result<(), ResolutionError> {
         match self {
             Self::Value(Value::Concrete(ConcreteValue::Int(_))) => Ok(()),
             Self::Value(Value::Deferred(DeferredValue::Secret(payload))) => {
                 payload.try_inspect(|value| EvalValue::Value(value.clone()).require_int(context))
             }
-            other => Err(format!("{context} must be int, got {}", other.kind_name())),
+            other => Err(format!("{context} must be int, got {}", other.kind_name()).into()),
         }
     }
 }
@@ -944,7 +939,7 @@ impl<P: PlaceholderKind, B: BindingAddress> EvalValue<P, B> {
 fn eval_expr<P: PlaceholderKind, B: BindingAddress>(
     expr: &ValidateExpr<P, B>,
     arguments: &HashMap<String, Value<P, B>>,
-) -> Result<EvalValue<P, B>, String> {
+) -> Result<EvalValue<P, B>, ResolutionError> {
     match expr {
         ValidateExpr::Bool(value) => Ok(value_from(ConcreteValue::Bool(*value))),
         ValidateExpr::Int(value) => Ok(value_from(ConcreteValue::Int(*value))),
@@ -955,7 +950,11 @@ fn eval_expr<P: PlaceholderKind, B: BindingAddress>(
         ValidateExpr::Var(name) => arguments
             .get(name)
             .map(value_for_evaluation)
-            .ok_or_else(|| format!("unknown variable '{name}' in constraint expression")),
+            .ok_or_else(|| {
+                ResolutionError::from(format!(
+                    "unknown variable '{name}' in constraint expression"
+                ))
+            }),
         ValidateExpr::Access { argument, path } => {
             let base = arguments
                 .get(argument)
@@ -979,13 +978,15 @@ fn eval_expr<P: PlaceholderKind, B: BindingAddress>(
             };
             crate::integer_arithmetic::evaluate_integer_values(lhs, *op, rhs, operator_span.clone())
                 .map(EvalValue::Value)
-                .map_err(|error| error.to_string())
+                .map_err(|error| ResolutionError::from(error.to_string()))
         }
         ValidateExpr::Compare { lhs, op, rhs } => {
             let left = eval_expr(lhs, arguments)?;
             let right = eval_expr(rhs, arguments)?;
             Ok(value_from(ConcreteValue::Bool(compare_values(
-                &left, op, &right,
+                &left.known()?,
+                op,
+                &right.known()?,
             )?)))
         }
         ValidateExpr::And(lhs, rhs) => {
@@ -1013,11 +1014,11 @@ fn eval_expr<P: PlaceholderKind, B: BindingAddress>(
 fn apply_constraint_path<P: PlaceholderKind, B: BindingAddress>(
     mut value: Value<P, B>,
     path: &[crate::resource::PathSegment],
-) -> Result<Value<P, B>, String> {
+) -> Result<Value<P, B>, ResolutionError> {
     for step in path {
         value = apply_value_path_segment(value, step.clone(), 0, AccessMissPolicy::Error)
             .and_then(crate::resource::ValuePathSegmentResult::into_value)
-            .map_err(|error| error.to_string())?;
+            .map_err(ResolutionError::from)?;
     }
     Ok(value)
 }
@@ -1025,20 +1026,35 @@ fn apply_constraint_path<P: PlaceholderKind, B: BindingAddress>(
 fn constraint_inputs_are_concrete<P: PlaceholderKind, B: BindingAddress>(
     expr: &ValidateExpr<P, B>,
     arguments: &HashMap<String, Value<P, B>>,
-) -> Result<bool, String> {
+) -> Result<bool, ResolutionError> {
     match expr {
         ValidateExpr::Var(name) => arguments
             .get(name)
-            .map(is_recursively_concrete)
-            .ok_or_else(|| format!("unknown variable '{name}' in constraint expression")),
+            .map(|value| {
+                value
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .is_ok_and(|value| value.into_known().is_ok())
+            })
+            .ok_or_else(|| {
+                ResolutionError::from(format!(
+                    "unknown variable '{name}' in constraint expression"
+                ))
+            }),
         ValidateExpr::Access { argument, path } => {
             let base = arguments
                 .get(argument)
                 .cloned()
                 .ok_or_else(|| format!("unknown variable '{argument}' in constraint expression"))?;
-            Ok(is_recursively_concrete(&apply_constraint_path(base, path)?))
+            Ok(apply_constraint_path(base, path)?
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .is_ok_and(|knowledge| knowledge.into_known().is_ok()))
         }
-        ValidateExpr::BoundArgument { value, .. } => Ok(is_recursively_concrete(value)),
+        ValidateExpr::BoundArgument { value, .. } => Ok(value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .is_ok_and(|value| value.into_known().is_ok())),
         ValidateExpr::Compare { lhs, rhs, .. }
         | ValidateExpr::IntegerArithmetic { lhs, rhs, .. }
         | ValidateExpr::And(lhs, rhs)
@@ -1074,11 +1090,41 @@ fn value_for_evaluation<P: PlaceholderKind, B: BindingAddress>(
     EvalValue::Value(value.clone())
 }
 
+enum KnownOperand<'a, P: PlaceholderKind, B: BindingAddress> {
+    Value(crate::resource::knowledge::KnownValue<'a, P, B>),
+    Null,
+}
+impl<P: PlaceholderKind, B: BindingAddress> KnownOperand<'_, P, B> {
+    fn to_eval(&self) -> EvalValue<P, B> {
+        match self {
+            Self::Null => EvalValue::Null,
+            Self::Value(value) => EvalValue::Value(value.to_value()),
+        }
+    }
+}
+impl<P: PlaceholderKind, B: BindingAddress> EvalValue<P, B> {
+    fn known(&self) -> Result<KnownOperand<'_, P, B>, ResolutionError> {
+        match self {
+            Self::Null => Ok(KnownOperand::Null),
+            Self::Value(value) => value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(ResolutionError::from)?
+                .into_known()
+                .map(KnownOperand::Value)
+                .map_err(|_| ResolutionError::from("constraint input is unresolved")),
+        }
+    }
+}
+
 fn compare_values<P: PlaceholderKind, B: BindingAddress>(
-    left: &EvalValue<P, B>,
+    left: &KnownOperand<'_, P, B>,
     op: &CompareOp,
-    right: &EvalValue<P, B>,
-) -> Result<bool, String> {
+    right: &KnownOperand<'_, P, B>,
+) -> Result<bool, ResolutionError> {
+    let left_value = left.to_eval();
+    let right_value = right.to_eval();
+    let (left, right) = (&left_value, &right_value);
     match (left, right) {
         (EvalValue::Null, EvalValue::Null) => return Ok(matches!(op, CompareOp::Eq)),
         (EvalValue::Null, _) | (_, EvalValue::Null) => {
@@ -1093,18 +1139,18 @@ fn compare_values<P: PlaceholderKind, B: BindingAddress>(
     if let Value::Deferred(DeferredValue::Secret(payload)) = left {
         return payload.try_inspect(|value| {
             compare_values(
-                &EvalValue::Value(value.clone()),
+                &EvalValue::Value(value.clone()).known()?,
                 op,
-                &EvalValue::Value(right.clone()),
+                &EvalValue::Value(right.clone()).known()?,
             )
         });
     }
     if let Value::Deferred(DeferredValue::Secret(payload)) = right {
         return payload.try_inspect(|value| {
             compare_values(
-                &EvalValue::Value(left.clone()),
+                &EvalValue::Value(left.clone()).known()?,
                 op,
-                &EvalValue::Value(value.clone()),
+                &EvalValue::Value(value.clone()).known()?,
             )
         });
     }
@@ -1138,7 +1184,8 @@ fn compare_values<P: PlaceholderKind, B: BindingAddress>(
             "cannot compare {} with {}",
             EvalValue::Value(left.clone()).kind_name(),
             EvalValue::Value(right.clone()).kind_name()
-        )),
+        )
+        .into()),
     }
 }
 
@@ -1153,7 +1200,7 @@ fn ordering_satisfies(op: &CompareOp, ordering: Ordering) -> bool {
     }
 }
 
-fn compare_ordered<T: Ord>(left: &T, op: &CompareOp, right: &T) -> Result<bool, String> {
+fn compare_ordered<T: Ord>(left: &T, op: &CompareOp, right: &T) -> Result<bool, ResolutionError> {
     Ok(ordering_satisfies(op, left.cmp(right)))
 }
 
@@ -1162,11 +1209,11 @@ fn compare_equality<T: PartialEq>(
     op: &CompareOp,
     right: &T,
     kind: &str,
-) -> Result<bool, String> {
+) -> Result<bool, ResolutionError> {
     match op {
         CompareOp::Eq => Ok(left == right),
         CompareOp::Ne => Ok(left != right),
-        _ => Err(format!("{kind} only support == and != comparisons")),
+        _ => Err(format!("{kind} only support == and != comparisons").into()),
     }
 }
 
@@ -1174,36 +1221,55 @@ fn eval_function<P: PlaceholderKind, B: BindingAddress>(
     name: &str,
     args: &[ValidateExpr<P, B>],
     arguments: &HashMap<String, Value<P, B>>,
-) -> Result<EvalValue<P, B>, String> {
+) -> Result<EvalValue<P, B>, ResolutionError> {
     match name {
         "len" | "length" => {
             if args.len() != 1 {
-                return Err(format!("{}() expects 1 argument, got {}", name, args.len()));
+                return Err(format!("{}() expects 1 argument, got {}", name, args.len()).into());
             }
             let value = eval_expr(&args[0], arguments)?;
             match value {
-                EvalValue::Value(value) => constraint_length(&value, name).map(EvalValue::Value),
+                EvalValue::Value(value) => constraint_length(
+                    &value
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .map_err(ResolutionError::from)?
+                        .into_known()
+                        .map_err(|_| ResolutionError::from("constraint input is unresolved"))?,
+                    name,
+                )
+                .map(EvalValue::Value),
                 other => Err(format!(
                     "{}() argument must be a string, list, or map, got {}",
                     name,
                     other.kind_name()
-                )),
+                )
+                .into()),
             }
         }
-        _ => Err(format!(
-            "unknown function '{name}' in constraint expression"
-        )),
+        _ => Err(format!("unknown function '{name}' in constraint expression").into()),
     }
 }
 
 fn constraint_length<P: PlaceholderKind, B: BindingAddress>(
-    value: &Value<P, B>,
+    value: &crate::resource::knowledge::KnownValue<'_, P, B>,
     name: &str,
-) -> Result<Value<P, B>, String> {
-    let length = match value {
+) -> Result<Value<P, B>, ResolutionError> {
+    let raw = value.to_value();
+    let length = match &raw {
         Value::Deferred(DeferredValue::Secret(payload)) => {
             return payload
-                .try_map(|value| constraint_length(value, name))
+                .try_map(|value| {
+                    constraint_length(
+                        &value
+                            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                            .map(|proof| proof.into_classification())
+                            .map_err(ResolutionError::from)?
+                            .into_known()
+                            .map_err(|_| ResolutionError::from("constraint input is unresolved"))?,
+                        name,
+                    )
+                })
                 .map(|payload| Value::Deferred(DeferredValue::Secret(payload)));
         }
         Value::Concrete(ConcreteValue::String(value)) => value.expose_plaintext().len(),
@@ -1215,7 +1281,8 @@ fn constraint_length<P: PlaceholderKind, B: BindingAddress>(
                 "{}() argument must be a string, list, or map, got {}",
                 name,
                 EvalValue::Value(other.clone()).kind_name()
-            ));
+            )
+            .into());
         }
     };
     Ok(Value::Concrete(ConcreteValue::Int(length as i64)))
@@ -1223,6 +1290,39 @@ fn constraint_length<P: PlaceholderKind, B: BindingAddress>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn constraint_resolution_keeps_typed_errors_in_its_map() {
+        let expression = crate::parser::ValidateExpr::BoundArgument {
+            argument: "input".into(),
+            operand: "input".into(),
+            value: crate::resource::Value::Deferred(crate::resource::DeferredValue::Unavailable {
+                name: crate::builtins::BuiltinFunction::env,
+                args: vec![],
+                reason: crate::resource::UnavailableReason::from_builtin_error(
+                    "missing test variable".into(),
+                ),
+                source_line: 1.into(),
+            }),
+        };
+        let mut errors =
+            std::collections::HashMap::<String, crate::resolver::ResolutionError>::new();
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            |session| {
+                super::resolve_bound_constraint_values(
+                    &expression,
+                    &crate::binding_index::ResolvedBindings::default(),
+                    &mut errors,
+                    session,
+                )
+                .unwrap();
+            },
+        );
+        assert!(
+            matches!(errors.get("input"), Some(crate::resolver::ResolutionError::Message(message)) if message == "env(): missing test variable")
+        );
+    }
+
     use indexmap::IndexMap;
 
     use super::*;
@@ -1398,7 +1498,7 @@ mod tests {
                 )]),
                 "positive",
             ),
-            ConstraintEvaluation::EvalError(error) if error.contains("division by zero")
+            ConstraintEvaluation::EvalError(error) if error.to_string().contains("division by zero")
         ));
     }
 
@@ -1594,7 +1694,9 @@ mod tests {
         assert_eq!(
             evaluated[0].evaluation(),
             &ConstraintEvaluation::EvalError(
-                "unknown variable 'y' in constraint expression".to_string()
+                "unknown variable 'y' in constraint expression"
+                    .to_string()
+                    .into()
             )
         );
     }

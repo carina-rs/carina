@@ -9,6 +9,10 @@ Carina supports `for` and `if` expressions to dynamically generate resources. Th
 
 A `for` expression creates multiple resources by iterating over a list or map.
 
+Expansion needs the collection's length or keys. Its elements can still depend on resources created during apply: `[producer_a.identifier, producer_b.identifier]` has two elements, so its managed-resource loop produces two planned children with the original reference dependencies. Known indices and map keys are available to the body immediately.
+
+When the collection's membership is unknown, a managed-resource loop remains a deferred block with an unknown count. It does not count as zero children. Module-call and `read` bodies must have their iterable available before module expansion; they cannot be deferred until apply. A provider output's length or keys are not inferred from unrelated inputs.
+
 ### Iterating over a list
 
 The simplest form iterates over a list of values:
@@ -191,6 +195,8 @@ attributes {
   environment: String = if identity(production) { 'prod' } else { 'dev' }
 }
 ```
+
+A shape-only computation can be static even when collection elements are pending: `length([resource.identifier])` is `1` without reading the identifier. A pure function can use that count to produce a static `Bool` condition.
 
 The caller can instantiate the module with either value. Resource attributes are runtime values, so they cannot be used as `if` conditions; the condition must be known from literals, module arguments, and pure computations when the module is expanded.
 

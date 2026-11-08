@@ -1,0 +1,3 @@
+let query_module = use { source = "./queries" }
+let next = mock.test.resource { name = "next" }
+let child = query_module { pattern = next.name }

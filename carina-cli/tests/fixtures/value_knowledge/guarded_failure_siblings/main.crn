@@ -1,0 +1,7 @@
+let role = mock.test.resource { name = "producer" }
+mock.test.resource {
+  name = "consumer"
+  parent_name = role.identifier ?? env("CARINA_KNOWLEDGE_MISSING_INPUT")
+  comment = false
+  tags = 7
+}

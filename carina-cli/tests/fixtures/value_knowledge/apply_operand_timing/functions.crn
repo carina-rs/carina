@@ -1,0 +1,5 @@
+fn validated(value: mock.test.sdk_validator.Guarded): String { value }
+
+fn wrapped(value: mock.test.sdk_validator.Guarded): map(String) {
+  { present = value }
+}

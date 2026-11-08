@@ -1384,7 +1384,7 @@ pub enum EffectWithSource<S, V: PlanValueKind = NoPlaceholder> {
         /// deferred at plan-time remains a
         /// `Value::Deferred(DeferredValue::Interpolation)` for display
         /// rather than being silently substituted to empty (carina#3329).
-        /// The executor calls `assert_fully_resolved` before passing the
+        /// The executor calls `assert_known_attribute` before passing the
         /// identifier to the provider, so by apply time this is always
         /// a `Value::Concrete(ConcreteValue::String)`.
         identifier: Value<V>,
@@ -2758,7 +2758,31 @@ pub fn format_import_identifier<P: crate::resource::ValueKind>(
     "import identifier did not resolve to a concrete string at apply time (got {got}). A referenced upstream value has not been published yet — apply the upstream stack first, then re-run apply here."
 )]
 pub struct ImportIdentifierError {
-    got: String,
+    got: ImportIdentifierCause,
+}
+
+#[derive(Debug)]
+enum ImportIdentifierCause {
+    Value(String),
+    Knowledge(Box<crate::resource::knowledge::KnowledgeDiagnostic>),
+}
+impl From<String> for ImportIdentifierCause {
+    fn from(value: String) -> Self {
+        Self::Value(value)
+    }
+}
+impl From<&str> for ImportIdentifierCause {
+    fn from(value: &str) -> Self {
+        Self::Value(value.to_owned())
+    }
+}
+impl std::fmt::Display for ImportIdentifierCause {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Value(value) => value.fmt(f),
+            Self::Knowledge(error) => error.fmt(f),
+        }
+    }
 }
 
 impl crate::resource::InsideSecret for ImportIdentifierError {
@@ -2769,33 +2793,72 @@ impl crate::resource::InsideSecret for ImportIdentifierError {
     }
 }
 
-/// Resolve an [`Effect::Import`] identifier to the concrete string the
-/// provider's `read()` needs, or return a structured error describing
-/// which deferred segment prevented resolution.
+/// Check the supported import identifier kind without unwrapping Secret.
 ///
-/// Centralizing the check means a future apply-side caller cannot
-/// silently ship a `Value::Deferred(…)` to the provider by rolling its
-/// own incomplete `match`: the only public path from a `Value` import
-/// identifier to a provider-ready `&str` goes through this helper.
-/// Plan-time display still calls
-/// [`crate::value::format_value_with_key`] on the same field, so a
-/// deferred upstream-state ref renders as
-/// `(known after upstream apply: …)` rather than being silently
-/// substituted to empty — see carina#3329.
-pub fn resolve_import_identifier(
-    identifier: &crate::resource::Value,
-) -> Result<&str, ImportIdentifierError> {
-    use crate::resource::{ConcreteValue, DeferredValue, Value};
-    match identifier {
-        Value::Concrete(ConcreteValue::String(s)) => Ok(s.expose_plaintext()),
-        Value::Concrete(ConcreteValue::EnumIdentifier(s)) => Ok(s.as_str()),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.try_project_plaintext(resolve_import_identifier)
+/// ```compile_fail,E0308
+/// use carina_core::{effect::resolve_import_identifier, resource::Value};
+/// fn bypass(raw:Value) { let _=resolve_import_identifier(&raw); }
+/// ```
+pub fn resolve_import_identifier<'a>(
+    identifier: &crate::resource::knowledge::KnownValue<'a>,
+) -> Result<crate::resource::knowledge::KnownValue<'a>, ImportIdentifierError> {
+    use crate::resource::knowledge::KnownView;
+    identifier.visit(
+        |view| match view {
+            KnownView::String(_) | KnownView::EnumIdentifier(_) => Ok(identifier.clone()),
+            KnownView::CanonicalEnum(_)
+            | KnownView::Int(_)
+            | KnownView::Float(_)
+            | KnownView::Bool(_)
+            | KnownView::Duration(_)
+            | KnownView::List(_)
+            | KnownView::StringList(_)
+            | KnownView::Map(_) => Err(ImportIdentifierError {
+                got: crate::value::format_value_with_key(&identifier.to_value(), Some("id")).into(),
+            }),
+        },
+        |secret| {
+            if secret.permits_import_identifier() {
+                Ok(identifier.clone())
+            } else {
+                Err(ImportIdentifierError {
+                    got: crate::resource::INSIDE_SECRET_MESSAGE.into(),
+                })
+            }
+        },
+    )
+}
+
+/// The existing import owner requires a known value after resolving it. An
+/// unknown reference cannot be mistaken for absence or shipped to read().
+pub fn require_import_value(
+    knowledge: crate::resource::knowledge::Classification<'_>,
+) -> Result<crate::resource::knowledge::KnownValue<'_>, ImportIdentifierError> {
+    let got = crate::value::format_value_with_key(&knowledge.to_value(), Some("id"));
+    knowledge
+        .into_known()
+        .map_err(|_| ImportIdentifierError { got: got.into() })
+}
+impl ImportIdentifierError {
+    pub fn knowledge_failure(error: crate::resource::knowledge::KnowledgeError) -> Self {
+        Self {
+            got: ImportIdentifierCause::Knowledge(Box::new(error.into())),
         }
-        other => Err(ImportIdentifierError {
-            got: crate::value::format_value_with_key(other, Some("id")),
-        }),
     }
+}
+#[derive(Debug, thiserror::Error)]
+pub enum ImportDispatchError {
+    #[error(transparent)]
+    Value(#[from] ImportIdentifierError),
+    #[error(transparent)]
+    Empty(#[from] crate::provider::EmptyAppliedIdentifier),
+}
+/// Project only at the named provider-import transport boundary.
+pub fn applied_import_identifier(
+    identifier: &crate::resource::knowledge::KnownValue<'_>,
+) -> Result<crate::provider::AppliedIdentifier, ImportDispatchError> {
+    let identifier = resolve_import_identifier(identifier)?;
+    identifier.project_applied_import().map_err(Into::into)
 }
 
 #[cfg(test)]
@@ -2810,11 +2873,42 @@ mod tests {
     type DeferredValue = crate::resource::ExpandedDeferredValue;
 
     #[test]
+    fn import_knowledge_diagnostic_retains_a_terminal_typed_cause() {
+        let error = ImportIdentifierError::knowledge_failure(
+            crate::resource::knowledge::KnowledgeError::InvalidStage {
+                operation: "known-value projection",
+            },
+        );
+        assert_eq!(
+            error.to_string(),
+            "import identifier did not resolve to a concrete string at apply time (got known-value projection is not valid at this resolution boundary). A referenced upstream value has not been published yet — apply the upstream stack first, then re-run apply here."
+        );
+        assert!(std::error::Error::source(&error).is_none());
+        assert!(matches!(error.got, ImportIdentifierCause::Knowledge(error)
+            if matches!(*error, crate::resource::knowledge::KnowledgeDiagnostic::Absolute(crate::resource::knowledge::KnowledgeError::InvalidStage { .. }))));
+    }
+
+    #[test]
     fn secret_origin_4275_round2_import_identifier_masks_invalid_secret() {
         let value = Value::Deferred(DeferredValue::Secret(
             Box::new(Value::Concrete(ConcreteValue::Int(424_242))).into(),
         ));
-        let error = resolve_import_identifier(&value).unwrap_err();
+        let error = value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .map_err(ImportIdentifierError::knowledge_failure)
+            .and_then(require_import_value)
+            .and_then(|known| resolve_import_identifier(&known))
+            .and_then(|known| {
+                applied_import_identifier(&known).map_err(|error| match error {
+                    ImportDispatchError::Value(error) => error,
+                    ImportDispatchError::Empty(error) => ImportIdentifierError {
+                        got: error.to_string().into(),
+                    },
+                })
+            })
+            .map(|id| id.into_inner())
+            .unwrap_err();
         for rendered in [error.to_string(), format!("{error:?}")] {
             assert!(!rendered.contains("424242"), "{rendered}");
             assert!(
@@ -3190,9 +3284,44 @@ mod tests {
     fn resolve_import_identifier_accepts_concrete_string() {
         use crate::resource::{ConcreteValue, DeferredValue, Value};
         let v = Value::Concrete(ConcreteValue::String("vpc-0abc".into()));
-        assert_eq!(resolve_import_identifier(&v).unwrap(), "vpc-0abc");
+        assert_eq!(
+            v.knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(ImportIdentifierError::knowledge_failure)
+                .and_then(require_import_value)
+                .and_then(|known| resolve_import_identifier(&known))
+                .and_then(
+                    |known| applied_import_identifier(&known).map_err(|error| match error {
+                        ImportDispatchError::Value(error) => error,
+                        ImportDispatchError::Empty(error) => ImportIdentifierError {
+                            got: error.to_string().into()
+                        },
+                    })
+                )
+                .map(|id| id.into_inner())
+                .unwrap(),
+            "vpc-0abc"
+        );
         let secret = Value::Deferred(DeferredValue::Secret(Box::new(v).into()));
-        assert_eq!(resolve_import_identifier(&secret).unwrap(), "vpc-0abc");
+        assert_eq!(
+            secret
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(ImportIdentifierError::knowledge_failure)
+                .and_then(require_import_value)
+                .and_then(|known| resolve_import_identifier(&known))
+                .and_then(
+                    |known| applied_import_identifier(&known).map_err(|error| match error {
+                        ImportDispatchError::Value(error) => error,
+                        ImportDispatchError::Empty(error) => ImportIdentifierError {
+                            got: error.to_string().into()
+                        },
+                    })
+                )
+                .map(|id| id.into_inner())
+                .unwrap(),
+            "vpc-0abc"
+        );
     }
 
     #[test]
@@ -3216,7 +3345,22 @@ mod tests {
             ))),
             InterpolationPart::Literal("|tail".into()),
         ]));
-        let err = resolve_import_identifier(&v).unwrap_err();
+        let err = v
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .map_err(ImportIdentifierError::knowledge_failure)
+            .and_then(require_import_value)
+            .and_then(|known| resolve_import_identifier(&known))
+            .and_then(|known| {
+                applied_import_identifier(&known).map_err(|error| match error {
+                    ImportDispatchError::Value(error) => error,
+                    ImportDispatchError::Empty(error) => ImportIdentifierError {
+                        got: error.to_string().into(),
+                    },
+                })
+            })
+            .map(|id| id.into_inner())
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("did not resolve to a concrete string"),
@@ -3224,7 +3368,24 @@ mod tests {
         );
         // Sanity: still passes for a concrete String/EnumIdentifier.
         let s = Value::Concrete(ConcreteValue::enum_identifier("ENUM_X"));
-        assert_eq!(resolve_import_identifier(&s).unwrap(), "ENUM_X");
+        assert_eq!(
+            s.knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(ImportIdentifierError::knowledge_failure)
+                .and_then(require_import_value)
+                .and_then(|known| resolve_import_identifier(&known))
+                .and_then(
+                    |known| applied_import_identifier(&known).map_err(|error| match error {
+                        ImportDispatchError::Value(error) => error,
+                        ImportDispatchError::Empty(error) => ImportIdentifierError {
+                            got: error.to_string().into()
+                        },
+                    })
+                )
+                .map(|id| id.into_inner())
+                .unwrap(),
+            "ENUM_X"
+        );
     }
 
     #[test]

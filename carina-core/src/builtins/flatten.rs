@@ -1,55 +1,114 @@
-//! `flatten(list)` built-in function
-
-use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
-
+//! Flatten one known level; an element whose shape is pending retains the call.
 use super::value_type_name;
-
-/// `flatten(list)` - Flatten a list of lists by one level.
-///
-/// - Single argument: a List
-/// - Returns: List with one level of nesting removed
-///
-/// Elements that are lists are expanded into the result;
-/// non-list elements are kept as-is.
-///
-/// Examples:
-/// ```text
-/// flatten([[1, 2], [3, 4]])      // => [1, 2, 3, 4]
-/// flatten([["a", "b"], ["c"]])   // => ["a", "b", "c"]
-/// flatten([[1, 2], 3, [4]])      // => [1, 2, 3, 4]
-/// ```
-pub(crate) fn builtin_flatten<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
-) -> Result<Value<NoPlaceholder, B>, String> {
-    if args.len() != 1 {
-        return Err(format!("flatten() expects 1 argument, got {}", args.len()));
-    }
-
-    let items = match &args[0] {
-        Value::Concrete(ConcreteValue::List(items)) => items,
-        other => {
-            return Err(format!(
-                "flatten() argument must be a List, got {}",
-                value_type_name(other)
-            ));
+use crate::resource::knowledge::{Classification, KnownView, PlanIterable, ShapeView};
+use crate::resource::{BindingAddress, ConcreteValue, DeferredValue, NoPlaceholder, Value};
+pub fn builtin_flatten<B: BindingAddress>(
+    collection: &PlanIterable<'_, NoPlaceholder, B>,
+    source_line: crate::resource::DiagnosticSourceLine,
+) -> Result<Value<NoPlaceholder, B>, crate::resolver::ResolutionError> {
+    let flatten = |items: &[Classification<'_, NoPlaceholder, B>]| {
+        let mut result = Vec::new();
+        for item in items {
+            match item.flatten_item()? {
+                Some(item) => item.append_to(&mut result),
+                None => return Ok(retained(collection, source_line)),
+            }
         }
+        Ok(Value::Concrete(ConcreteValue::List(result)))
     };
-
-    let mut result = Vec::new();
-    for item in items {
-        match item {
-            Value::Concrete(ConcreteValue::List(inner)) => result.extend(inner.iter().cloned()),
-            other => result.push(other.clone()),
-        }
-    }
-
-    Ok(Value::Concrete(ConcreteValue::List(result)))
+    collection.visit(
+        |view| match view {
+            KnownView::List(items) => flatten(
+                &items
+                    .iter()
+                    .map(|value| Classification::Known(value.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+            _ => Err(format!(
+                "flatten() argument must be a List, got {}",
+                value_type_name(&collection.source_value())
+            )
+            .into()),
+        },
+        |view| match view {
+            ShapeView::List(items) => flatten(items),
+            ShapeView::Map(_) => Err("flatten() argument must be a List, got Map".into()),
+        },
+        |_| Err("flatten() argument must be a List, got Secret".into()),
+    )
+}
+fn retained<B: BindingAddress>(
+    collection: &PlanIterable<'_, NoPlaceholder, B>,
+    source_line: crate::resource::DiagnosticSourceLine,
+) -> Value<NoPlaceholder, B> {
+    Value::Deferred(DeferredValue::FunctionCall {
+        name: super::BuiltinFunction::flatten,
+        args: vec![collection.source_value().into()],
+        source_line,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use crate::builtins::evaluate_builtin_to_value_for_tests as evaluate_builtin;
     use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
+
+    #[test]
+    fn flatten_retains_a_pending_secret_item() {
+        use crate::resource::knowledge::{Classification, KnowledgeContext, PlanIterable};
+        let source = Value::Concrete(ConcreteValue::List(vec![
+            Value::root_resource_ref("producer", "identifier", vec![]).into_secret(),
+        ]));
+        let Classification::ShapeKnown(shape) = source
+            .knowledge(&KnowledgeContext::validation())
+            .unwrap()
+            .into_classification()
+        else {
+            panic!("outer membership is known");
+        };
+        let iterable = PlanIterable::from_shape(shape).unwrap();
+        let result = super::builtin_flatten(
+            &iterable,
+            crate::resource::DiagnosticSourceLine::synthetic(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                result,
+                Value::Deferred(crate::resource::DeferredValue::FunctionCall {
+                    name: crate::builtins::BuiltinFunction::flatten,
+                    ..
+                })
+            ),
+            "pending protected inner shape must retain flatten"
+        );
+    }
+
+    #[test]
+    fn retained_flatten_keeps_the_authored_line() {
+        use crate::eval_value::EvalValue;
+        use crate::parser::ProviderContext;
+        let argument = Value::Concrete(ConcreteValue::List(vec![Value::root_resource_ref(
+            "producer",
+            "identifier",
+            vec![],
+        )]));
+        let result = super::super::evaluate_builtin_with_config(
+            "flatten",
+            &[EvalValue::from_expanded_value(argument)],
+            &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            crate::resource::DiagnosticSourceLine::authored(42),
+        )
+        .unwrap()
+        .into_expanded_value()
+        .unwrap();
+        assert!(
+            matches!(result, Value::Deferred(crate::resource::DeferredValue::FunctionCall {
+            source_line, ..
+        }) if source_line.get() == Some(42)),
+            "retention must preserve the call's authored line"
+        );
+    }
 
     #[test]
     fn flatten_nested_lists() {

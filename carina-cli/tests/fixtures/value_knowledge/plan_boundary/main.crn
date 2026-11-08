@@ -1,0 +1,2 @@
+let first = mock.example.consumer { name = "first" plain = "first" }
+let second = mock.example.consumer { name = "second" plain = "second" }

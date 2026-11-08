@@ -383,7 +383,7 @@ impl<B: BindingAddress> DirectiveExpr<B> {
         resource: &ResourceId,
         schema: ProviderDirectiveSchema<'_>,
     ) -> Result<bool, DirectiveResolutionError> {
-        resolve_bool(
+        resolve_directive_value(
             self.value,
             self.source,
             self.argument_sources,
@@ -446,7 +446,7 @@ impl<B: BindingAddress> DirectiveExpr<B> {
     }
 }
 
-fn resolve_bool<P: PlaceholderKind, B: BindingAddress>(
+fn resolve_directive_value<P: PlaceholderKind, B: BindingAddress>(
     value: Value<P, B>,
     source: DiagnosticSourceSpan,
     argument_sources: DirectiveArgumentSources,
@@ -455,66 +455,120 @@ fn resolve_bool<P: PlaceholderKind, B: BindingAddress>(
     resource: &ResourceId,
     schema_protects: bool,
 ) -> Result<bool, DirectiveResolutionError> {
-    match value {
-        Value::Concrete(ConcreteValue::Bool(value)) => {
-            if !value && directive == LifecycleDirective::PreventDestroy && schema_protects {
-                match origin {
-                    ArgumentValueOrigin::Explicit => {}
-                    ArgumentValueOrigin::Defaulted(default) => {
-                        return Err(DirectiveResolutionError(Box::new(
-                            DirectiveResolutionErrorDetails {
-                                directive,
-                                resource: resource.to_string(),
-                                found: String::new(),
-                                source,
-                                argument_sources,
-                                pending: PendingDirectiveValue::Other,
-                                defaulted_opt_out: Some(default),
-                            },
-                        )));
-                    }
-                }
+    let known = value
+        .knowledge(&super::knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        .ok()
+        .and_then(|value| value.into_known().ok());
+    match known {
+        Some(known) => resolve_bool(
+            &known,
+            source,
+            argument_sources,
+            origin,
+            directive,
+            resource,
+            schema_protects,
+        ),
+        None => directive_value_error(
+            value,
+            source,
+            argument_sources,
+            origin,
+            directive,
+            resource,
+            schema_protects,
+        ),
+    }
+}
+
+fn resolve_bool<P: PlaceholderKind, B: BindingAddress>(
+    value: &super::knowledge::KnownValue<'_, P, B>,
+    source: DiagnosticSourceSpan,
+    argument_sources: DirectiveArgumentSources,
+    origin: ArgumentValueOrigin,
+    directive: LifecycleDirective,
+    resource: &ResourceId,
+    schema_protects: bool,
+) -> Result<bool, DirectiveResolutionError> {
+    let Some(boolean) = super::knowledge::known_bool(value) else {
+        return directive_value_error(
+            value.to_value(),
+            source,
+            argument_sources,
+            origin,
+            directive,
+            resource,
+            schema_protects,
+        );
+    };
+    let value = boolean;
+
+    if !value && directive == LifecycleDirective::PreventDestroy && schema_protects {
+        match origin {
+            ArgumentValueOrigin::Explicit => {}
+            ArgumentValueOrigin::Defaulted(default) => {
+                return Err(DirectiveResolutionError(Box::new(
+                    DirectiveResolutionErrorDetails {
+                        directive,
+                        resource: resource.to_string(),
+                        found: String::new(),
+                        source,
+                        argument_sources,
+                        pending: PendingDirectiveValue::Other,
+                        defaulted_opt_out: Some(default),
+                    },
+                )));
             }
-            Ok(value)
-        }
-        value => {
-            let pending = match &value {
-                Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
-                    if let Some(name) = placeholder.module_argument_name() {
-                        PendingDirectiveValue::Argument(name.to_owned())
-                    } else if let Some(slot) = placeholder.loop_slot() {
-                        PendingDirectiveValue::Loop(slot)
-                    } else {
-                        PendingDirectiveValue::Other
-                    }
-                }
-                Value::Deferred(_) => {
-                    let mut module_arguments = false;
-                    let mut loop_slots = false;
-                    value.visit_placeholders(&mut |placeholder, _| {
-                        module_arguments |= placeholder.module_argument_name().is_some();
-                        loop_slots |= placeholder.loop_slot().is_some();
-                    });
-                    PendingDirectiveValue::Computed {
-                        module_arguments,
-                        loop_slots,
-                    }
-                }
-                Value::Concrete(_) => PendingDirectiveValue::Other,
-            };
-            Err(DirectiveResolutionError(Box::new(
-                DirectiveResolutionErrorDetails {
-                    directive,
-                    resource: resource.to_string(),
-                    found: directive_value_kind(&value),
-                    source,
-                    argument_sources,
-                    pending,
-                    defaulted_opt_out: None,
-                },
-            )))
         }
     }
+    Ok(value)
+}
+
+fn directive_value_error<P: PlaceholderKind, B: BindingAddress>(
+    value: Value<P, B>,
+    source: DiagnosticSourceSpan,
+    argument_sources: DirectiveArgumentSources,
+    _origin: ArgumentValueOrigin,
+    directive: LifecycleDirective,
+    resource: &ResourceId,
+    _schema_protects: bool,
+) -> Result<bool, DirectiveResolutionError> {
+    let pending = match &value {
+        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
+            if let Some(name) = placeholder.module_argument_name() {
+                PendingDirectiveValue::Argument(name.to_owned())
+            } else if let Some(slot) = placeholder.loop_slot() {
+                PendingDirectiveValue::Loop(slot)
+            } else {
+                PendingDirectiveValue::Other
+            }
+        }
+        Value::Deferred(_) => {
+            let mut module_arguments = false;
+            let mut loop_slots = false;
+            value.visit_placeholders(&mut |placeholder, _| {
+                module_arguments |= placeholder.module_argument_name().is_some();
+                loop_slots |= placeholder.loop_slot().is_some();
+            });
+            PendingDirectiveValue::Computed {
+                module_arguments,
+                loop_slots,
+            }
+        }
+        Value::Concrete(_) => PendingDirectiveValue::Other,
+    };
+    Err(DirectiveResolutionError(Box::new(
+        DirectiveResolutionErrorDetails {
+            directive,
+            resource: resource.to_string(),
+            found: directive_value_kind(&value),
+            source,
+            argument_sources,
+            pending,
+            defaulted_opt_out: None,
+        },
+    )))
 }
 
 fn loop_expression_is_local<P: PlaceholderKind, B: BindingAddress>(value: &Value<P, B>) -> bool {
@@ -1032,7 +1086,26 @@ impl<B: BindingAddress> Directives<B, ParserPlaceholder> {
         let result = if loop_template {
             self.clone()
                 .into_loop_template(resource, schema, element_type)
-                .and_then(|template| template.validate_known_elements(resource, iterable, context))
+                .and_then(|template| {
+                    let iterable = iterable
+                        .and_then(|value| {
+                            value
+                                .knowledge(&super::knowledge::KnowledgeContext::validation())
+                                .map(|proof| proof.into_classification())
+                                .ok()
+                        })
+                        .and_then(|value| match value {
+                            super::knowledge::Classification::Known(value) => {
+                                super::knowledge::PlanIterable::from_known(value)
+                            }
+                            super::knowledge::Classification::ShapeKnown(value) => {
+                                super::knowledge::PlanIterable::from_shape(value).ok()
+                            }
+                            super::knowledge::Classification::Pending(_)
+                            | super::knowledge::Classification::Failed(_) => None,
+                        });
+                    template.validate_known_elements(resource, iterable.as_ref(), context)
+                })
         } else {
             self.clone().resolve(resource, schema).map(|_| ())
         };
@@ -1183,7 +1256,7 @@ impl<T, B: BindingAddress> LoopDirective<T, B> {
                         defaulted_opt_out: None,
                     }))
                 })?;
-                resolve_bool(
+                resolve_directive_value(
                     value,
                     source,
                     expression.argument_sources,
@@ -1202,17 +1275,24 @@ impl<B: BindingAddress> Directives<B, LoopSlot> {
     fn validate_known_elements(
         &self,
         resource: &ResourceId,
-        iterable: Option<&Value<ParserPlaceholder, B>>,
+        iterable: Option<&super::knowledge::PlanIterable<'_, ParserPlaceholder, B>>,
         context: &crate::parser::ProviderContext,
     ) -> Result<(), DirectiveResolutionErrors> {
-        let Some(iterable) = iterable.filter(|value| value.is_fully_resolved()) else {
+        let Some(iterable) = iterable else {
             return Ok(());
         };
-        let Ok(iterable) = iterable.clone().into_expanded() else {
+        let Ok(iterable) = iterable.for_expansion().into_expanded() else {
             return Ok(());
         };
         let mut errors = Vec::new();
-        let mut element = |index, key, value| {
+        let mut element = |index, key, value: &Value<NoPlaceholder, B>| {
+            if !value
+                .knowledge(&super::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .is_ok_and(|knowledge| knowledge.into_known().is_ok())
+            {
+                return;
+            }
             if let Err(error) =
                 self.clone()
                     .substitute(resource, Path::new("<loop>"), |expression| {

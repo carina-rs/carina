@@ -1,0 +1,6 @@
+mock.test.resource {
+  name = "consumer"
+  parent_name = "x-${secret(env("CARINA_KNOWLEDGE_MISSING_INPUT"))}"
+  comment = false
+  tags = 7
+}

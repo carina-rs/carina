@@ -993,15 +993,16 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
                 &resource.id,
                 schema,
                 &resource.resolved_attributes(),
+                None,
                 &resource.quoted_string_attrs,
                 context.custom_type_resolver(),
             )?,
             ResourceValueCheck::ApplyResolved { attributes, names } => {
-                validate_selected_provider_values(
+                validate_known_provider_values(
                     &resource.id,
                     schema,
                     &attributes,
-                    &names,
+                    Some(&names),
                     &resource.quoted_string_attrs,
                     context.custom_type_resolver(),
                 )?;
@@ -1016,7 +1017,10 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
     )
     .await?;
     let resource = normalized.into_resource();
-    crate::resource::assert_resource_fully_resolved(&resource)?;
+    crate::resource::assert_resource_known_for_apply(
+        &resource,
+        &crate::resource::knowledge::KnowledgeContext::apply(context.bindings),
+    )?;
     let resource =
         ResolvedResource::resolve_with_schemas(resource.into_provider_resource(), context.schemas)?;
     // Conversion diagnostics still use the protected tree. Remove only the
@@ -1082,15 +1086,16 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
                 &resource.id,
                 schema,
                 &crate::resource::attrs_to_hashmap(&resource.attributes),
+                None,
                 &resource.quoted_string_attrs,
                 context.custom_type_resolver(),
             )?,
             ResourceValueCheck::ApplyResolved { attributes, names } => {
-                validate_selected_provider_values(
+                validate_known_provider_values(
                     &resource.id,
                     schema,
                     &attributes,
-                    &names,
+                    Some(&names),
                     &resource.quoted_string_attrs,
                     context.custom_type_resolver(),
                 )?;
@@ -1102,7 +1107,12 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
         context.schemas,
     )?;
     for value in value.attributes.values() {
-        crate::resource::assert_value_fully_resolved(value)?;
+        (value)
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::apply(
+                context.bindings,
+            ))
+            .map_err(crate::resource::knowledge_serialization_error)
+            .and_then(crate::resource::require_known_for_apply)?;
     }
     let mut value = value.into_provider_data_source();
     let diagnostic_attributes = value.attributes.clone();
@@ -1166,38 +1176,48 @@ fn validate_known_provider_values(
     id: &ResourceId,
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     attributes: &HashMap<String, Value>,
+    selected: Option<&HashSet<String>>,
     quoted_string_attrs: &HashSet<String>,
     resolver: &dyn crate::parser::CustomTypeResolver,
 ) -> Result<(), ProviderPreparationError> {
     let is_string_literal = |attribute: &str| quoted_string_attrs.contains(attribute);
-    schema
-        .validate_known_values_with_resolver(attributes, &is_string_literal, resolver)
-        .map_err(|errors| ProviderPreparationError::ValueConstraint {
-            resource: Box::new(id.clone()),
-            errors: errors.into(),
+    let classified = attributes
+        .iter()
+        .map(|(key, value)| {
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map(|value| (key.clone(), value))
         })
-}
-
-fn validate_selected_provider_values(
-    id: &ResourceId,
-    schema: crate::schema::OwnerBoundResourceSchema<'_>,
-    attributes: &HashMap<String, Value>,
-    selected: &HashSet<String>,
-    quoted_string_attrs: &HashSet<String>,
-    resolver: &dyn crate::parser::CustomTypeResolver,
-) -> Result<(), ProviderPreparationError> {
-    let is_string_literal = |attribute: &str| quoted_string_attrs.contains(attribute);
-    schema
-        .validate_selected_known_values_with_resolver(
-            attributes,
-            selected,
-            &is_string_literal,
-            resolver,
-        )
-        .map_err(|errors| ProviderPreparationError::ValueConstraint {
+        .collect::<Result<HashMap<_, _>, _>>()
+        .map_err(|error| ProviderPreparationError::ValueConstraint {
             resource: Box::new(id.clone()),
-            errors: errors.into(),
-        })
+            errors: vec![TypeError::from(error)].into(),
+        })?;
+    let result = {
+        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, schema);
+        match selected {
+            Some(selected) => schema
+                .schema()
+                .validate_selected_known_values_with_origins_and_lookup(
+                    &classified,
+                    selected,
+                    &is_string_literal,
+                    &lookup,
+                ),
+            None => schema
+                .schema()
+                .validate_known_values_with_origins_and_lookup(
+                    &classified,
+                    &is_string_literal,
+                    &lookup,
+                ),
+        }
+    };
+    result.map_err(|errors| ProviderPreparationError::ValueConstraint {
+        resource: Box::new(id.clone()),
+        errors: errors.into(),
+    })
 }
 
 #[cfg(test)]
@@ -1513,9 +1533,23 @@ mod provider_config_tests {
             crate::parser::validate_custom_type_value(
                 &resolver,
                 CustomTypeValidationTarget::Annotation(&owned),
-                &value,
+                &(value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                    .into_known()
+                    .unwrap(),
             ),
-            crate::parser::validate_schema_custom_type(&owned, &value, snapshot.provider_context()),
+            crate::parser::validate_schema_custom_type(
+                &owned,
+                &value
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                    .into_known()
+                    .unwrap(),
+                snapshot.provider_context(),
+            ),
         ] {
             assert_eq!(
                 result,
@@ -1863,7 +1897,16 @@ mod provider_config_tests {
     ) -> crate::parser::CustomTypeValidatorFn {
         let resolver = crate::provider::FactoryCustomTypeResolver::new(factories);
         Box::new(move |target, value| {
-            crate::parser::validate_custom_type_value(&resolver, target, value)
+            crate::parser::validate_custom_type_value(
+                &resolver,
+                target,
+                &(value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                    .into_known()
+                    .unwrap(),
+            )
         })
     }
 
@@ -2009,7 +2052,12 @@ mod provider_config_tests {
                 owner: "missing",
                 declaration,
             },
-            &Value::Concrete(ConcreteValue::String("value".into())),
+            &(Value::Concrete(ConcreteValue::String("value".into())))
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap()
+                .into_known()
+                .unwrap(),
         )
         .expect_err("an owner absent from the shared index must not disable validation");
 
@@ -2341,7 +2389,12 @@ mod provider_config_tests {
                 factory.declaration.clone(),
             ))
             .expect("fixture declaration is identified"),
-            &Value::Concrete(ConcreteValue::String("5".into())),
+            &(Value::Concrete(ConcreteValue::String("5".into())))
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap()
+                .into_known()
+                .unwrap(),
         )
         .expect_err("an Int declaration must not accept bridge-shaped String input");
 
@@ -2454,14 +2507,28 @@ mod provider_config_tests {
         let resolver = test_schema_path_resolver(&factories);
         let attributes = HashMap::from([("value".to_string(), value.clone())]);
         for errors in [
-            schema.validate_with_resolver(&attributes, &|_| false, &resolver),
-            schema.validate_known_values_with_resolver(&attributes, &|_| false, &resolver),
-            schema.validate_selected_known_values_with_resolver(
-                &attributes,
-                &HashSet::from(["value".to_string()]),
+            schema.validate_with_resolver(
+                &crate::schema::classified_attributes(&attributes).unwrap(),
                 &|_| false,
                 &resolver,
             ),
+            schema.validate_known_values_with_resolver(
+                &crate::schema::classified_attributes(&attributes)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(name, value)| (name, value.into_known().unwrap()))
+                    .collect(),
+                &|_| false,
+                &resolver,
+            ),
+            schema
+                .schema()
+                .validate_selected_known_values_with_origins_and_lookup(
+                    &crate::schema::classified_attributes(&attributes).unwrap(),
+                    &HashSet::from(["value".to_string()]),
+                    &|_| false,
+                    &crate::parser::custom_type_lookup_for_schema(&resolver, schema),
+                ),
         ] {
             assert_eq!(
                 errors.unwrap_err(),
@@ -3103,6 +3170,73 @@ mod provider_config_tests {
     }
 
     #[test]
+    fn data_source_gate_rejects_coalesce_with_known_collection_children() {
+        let bindings = ResolvedBindings::default();
+        let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = SchemaRegistry::new();
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &module_gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                for value in crate::resource::known_value_gate_tests::coalesces() {
+                    let source = DataSource::with_provider("test", "lookup", "example", None)
+                        .with_attribute("value", value);
+                    let error = prepare_provider_ready_data_source(source, &context).unwrap_err();
+                    assert!(matches!(
+                        error,
+                        ProviderPreparationError::Serialization(
+                            SerializationError::UnresolvedCoalesce { .. }
+                        )
+                    ));
+                }
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_dispatch_gates_use_apply_binding_evidence() {
+        use crate::resource::knowledge::{KnowledgeDiagnostic, KnowledgeError};
+        let value = Value::root_resource_ref("cycle", "value", vec![]);
+        let mut bindings = ResolvedBindings::default();
+        bindings.set(
+            "cycle",
+            HashMap::from([("value".into(), value.clone())]),
+            crate::binding_index::BindingValueSource::Local,
+        );
+        let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
+        let schemas = SchemaRegistry::new();
+        crate::validation::deferred_types::with_session_for_test_async(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            async |type_checks| {
+                let context = ProviderPreparationContext::new(
+                    &bindings, &module_gate, &[], &crate::provider::NoopNormalizer,
+                    &[], &schemas, type_checks,
+                );
+                let managed = Resource::with_provider("test", "widget", "example", None)
+                    .with_attribute("value", value.clone());
+                let source = DataSource::with_provider("test", "lookup", "example", None)
+                    .with_attribute("value", value.clone());
+                let managed_error = prepare_provider_ready_resource(managed, &context).await.unwrap_err();
+                let source_error = prepare_provider_ready_data_source(source, &context).unwrap_err();
+                for error in [managed_error, source_error] {
+                    assert!(matches!(error,
+                        ProviderPreparationError::Serialization(SerializationError::Knowledge { error, .. })
+                            if matches!(*error, KnowledgeDiagnostic::Absolute(KnowledgeError::Cycle { .. }))
+                    ), "dispatch must classify with the supplied apply bindings");
+                }
+            },
+        ).await;
+    }
+
+    #[test]
     fn provider_boundary_rejects_unresolved_secret_coalesce() {
         let secret = |value: &str| {
             Value::Deferred(DeferredValue::Secret(
@@ -3114,7 +3248,11 @@ mod provider_config_tests {
             default: Box::new(secret("right")),
         });
         assert!(matches!(
-            crate::resource::assert_value_fully_resolved(&value),
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(crate::resource::knowledge_serialization_error)
+                .and_then(crate::resource::require_known_value),
             Err(crate::value::SerializationError::UnresolvedCoalesce { .. })
         ));
     }
