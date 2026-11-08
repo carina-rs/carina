@@ -17868,6 +17868,25 @@ fn review_r4_wait_admission_matches_validation_across_files() {
 }
 
 #[test]
+fn admission_dispatch_covers_every_analysis_item_kind() {
+    use carina_core::parser::AnalysisItemKind;
+    for kind in [
+        AnalysisItemKind::Resource,
+        AnalysisItemKind::Composition,
+        AnalysisItemKind::DeferredResource,
+        AnalysisItemKind::Wait,
+    ] {
+        assert!(
+            uses_resource_attribute_admission(kind),
+            "{kind:?} must use resource admission"
+        );
+    }
+    assert!(!uses_resource_attribute_admission(
+        AnalysisItemKind::DataSource
+    ));
+}
+
+#[test]
 fn review_r7_skipped_lookup_does_not_suppress_a_list_constraint() {
     use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
     let mut schemas = SchemaRegistry::new();

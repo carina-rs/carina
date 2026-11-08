@@ -454,10 +454,68 @@ pub(crate) fn admit_validation_attributes<
     )
 }
 
-/// Retained expressions supply computed-access and arithmetic evidence to admit.
-/// This adapter borrows the existing validator's descent; it has no value walker.
+/// Exhaustive resource/data-source policy shared by all analysis adapters.
+pub fn uses_resource_attribute_admission(kind: crate::parser::AnalysisItemKind) -> bool {
+    use crate::parser::AnalysisItemKind;
+    match kind {
+        AnalysisItemKind::DataSource => false,
+        AnalysisItemKind::Resource
+        | AnalysisItemKind::Composition
+        | AnalysisItemKind::DeferredResource
+        | AnalysisItemKind::Wait => true,
+    }
+}
+
+/// Admit every analysis item using the same destination-kind policy.
 #[allow(clippy::too_many_arguments)]
 pub fn resource_attribute_admissions<
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<
+            crate::resource::ParserPlaceholder,
+            crate::resource::ParserPlaceholder,
+            B,
+        >,
+    E,
+>(
+    resource: &crate::parser::AnalysisResourceRef<
+        '_,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
+    parsed: &crate::parser::File<
+        E,
+        crate::resource::ParserPlaceholder,
+        crate::resource::ParserPlaceholder,
+        D,
+        B,
+    >,
+    schema: crate::schema::OwnerBoundResourceSchema<'_>,
+    attributes: &std::collections::HashMap<
+        String,
+        crate::resource::knowledge::Classification<'_, crate::resource::ParserPlaceholder, B>,
+    >,
+    quoted: &std::collections::HashSet<String>,
+    report: &crate::parser::retained::ExpressionReport<B>,
+    bindings: &BindingIndex<'_, B>,
+    session: &dyn ProviderTypeCheckContext,
+    schemas: &SchemaRegistry,
+) -> crate::schema::ResourceValueValidation {
+    if uses_resource_attribute_admission(resource.kind()) {
+        typed_resource_attribute_admissions::<kind::ResourceAttribute, _, _, _>(
+            resource, parsed, schema, attributes, quoted, report, bindings, session, schemas,
+        )
+    } else {
+        typed_resource_attribute_admissions::<kind::DataSourceAttribute, _, _, _>(
+            resource, parsed, schema, attributes, quoted, report, bindings, session, schemas,
+        )
+    }
+}
+
+/// Retained expressions supply computed-access and arithmetic evidence to admit.
+#[allow(clippy::too_many_arguments)]
+fn typed_resource_attribute_admissions<
     K: RechecksResolved,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<

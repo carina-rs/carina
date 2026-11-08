@@ -5370,21 +5370,6 @@ fn resource_admission_report<
     let report = parsed.expression_report();
     let tree = crate::parser::AnalysisTree::try_from_file(parsed)?;
 
-    let locations = parsed
-        .iter_all_resources()
-        .map(|resource| {
-            let location = match resource.context() {
-                crate::parser::ResourceContext::Direct => resource.id().to_string(),
-                crate::parser::ResourceContext::Deferred(deferred) => format!(
-                    "for-body `{}` {}",
-                    D::deferred_header(deferred),
-                    resource.id()
-                ),
-            };
-            (resource.id().clone(), location)
-        })
-        .collect::<HashMap<_, _>>();
-
     // Validate declarations directly instead of relying on a later resource
     // attribute to happen to expose an expression. Keep the authored
     // operator keys so a let substituted into an attribute is not reported a
@@ -5400,7 +5385,9 @@ fn resource_admission_report<
         crate::validation::deferred_types::TypeCheckSession::run(
             bindings.provider_context(),
             |session| {
-                for resource in tree.resources() {
+                // Match the main-branch project walk. Parser-side deferred read
+                // templates are checked at expansion, not admitted here.
+                for resource in tree.project_resources() {
                     let Some(schema) = resource.schema(registry) else {
                         continue;
                     };
@@ -5417,48 +5404,18 @@ fn resource_admission_report<
                             continue;
                         }
                     };
-                    let values = match resource.kind() {
-                        crate::parser::AnalysisItemKind::DataSource => {
-                            admission::attributes::resource_attribute_admissions::<
-                                admission::kind::DataSourceAttribute,
-                                _,
-                                D,
-                                _,
-                            >(
-                                resource,
-                                parsed,
-                                schema,
-                                &classified,
-                                resource.quoted_string_attrs(),
-                                report,
-                                bindings,
-                                session,
-                                registry,
-                            )
-                        }
-                        crate::parser::AnalysisItemKind::Resource
-                        | crate::parser::AnalysisItemKind::Composition
-                        | crate::parser::AnalysisItemKind::DeferredResource
-                        | crate::parser::AnalysisItemKind::Wait => {
-                            admission::attributes::resource_attribute_admissions::<
-                                admission::kind::ResourceAttribute,
-                                _,
-                                D,
-                                _,
-                            >(
-                                resource,
-                                parsed,
-                                schema,
-                                &classified,
-                                resource.quoted_string_attrs(),
-                                report,
-                                bindings,
-                                session,
-                                registry,
-                            )
-                        }
-                    };
-                    let location = &locations[resource.id()];
+                    let values = admission::attributes::resource_attribute_admissions(
+                        resource,
+                        parsed,
+                        schema,
+                        &classified,
+                        resource.quoted_string_attrs(),
+                        report,
+                        bindings,
+                        session,
+                        registry,
+                    );
+                    let location = resource.diagnostic_label();
                     for (attribute, path, error) in values.symbolic_errors() {
                         match error {
                             TypeError::Reference { error, .. } => match error.as_ref() {

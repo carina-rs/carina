@@ -78,6 +78,43 @@ impl SchemaObligation {
             requirements: vec![SchemaRequirement::Destination],
         }
     }
+
+    fn has_unavailable_type(&self, catalog: &ProviderContext) -> bool {
+        fn unavailable(ty: &crate::parser::TypeExpr, catalog: &ProviderContext) -> bool {
+            use crate::parser::TypeExpr;
+            match ty {
+                TypeExpr::UnloadedSchemaType(unloaded) => catalog
+                    .custom_types
+                    .may_defer(unloaded.identity().provider.as_deref()),
+                TypeExpr::SchemaType { owned } => owned
+                    .provider_names()
+                    .any(|owner| catalog.custom_types.may_defer(Some(owner))),
+                TypeExpr::Ref(path) | TypeExpr::DottedUnresolved(path) => {
+                    catalog.custom_types.may_defer(Some(&path.provider))
+                }
+                TypeExpr::List(inner) | TypeExpr::Map(inner) => unavailable(inner, catalog),
+                TypeExpr::Union(members) => members.iter().any(|ty| unavailable(ty, catalog)),
+                TypeExpr::Struct { fields } => {
+                    fields.iter().any(|(_, ty)| unavailable(ty, catalog))
+                }
+                TypeExpr::String
+                | TypeExpr::Bool
+                | TypeExpr::Int
+                | TypeExpr::Float
+                | TypeExpr::Duration
+                | TypeExpr::Simple(_)
+                | TypeExpr::StringLiteral(_) => false,
+            }
+        }
+        self.requirements
+            .iter()
+            .any(|requirement| match requirement {
+                SchemaRequirement::Type(ty) => unavailable(ty, catalog),
+                // A KnownValue and the freshly checked destination contract supply
+                // the authority that these validation-stage obligations lacked.
+                SchemaRequirement::Reference | SchemaRequirement::Destination => false,
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -451,31 +488,34 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
         }
     };
     let mut assignment = checked.take_assignment();
-    assignment
-        .schema
-        .extend(candidate.obligations.schema.clone());
+    // Apply just rechecked the known value against the complete destination
+    // contract above. That discharges missing reference/destination evidence;
+    // any earlier type obligation still needs its provider authority below.
+    if !context.is_apply() {
+        assignment
+            .schema
+            .extend(candidate.obligations.schema.clone());
+    }
     checked.symbolic = std::mem::take(&mut assignment.errors);
     let mut errors = Vec::new();
     for (path, error) in checked.clone().into_located() {
-        match error {
-            TypeError::CustomTypeValidation {
-                ref error,
-                attribute: _,
-            } if matches!(
-                error.as_ref(),
-                crate::parser::CustomTypeValidationError::ProvidersNotLoaded
-            ) =>
-            {
-                assignment
-                    .schema
-                    .requirements
-                    .push(SchemaRequirement::Destination);
-            }
-            error => errors.push(AdmissionFinding {
-                path: join(&contract.path, &path),
-                error: error.with_attribute(&destination.label),
-            }),
-        }
+        errors.push(AdmissionFinding {
+            path: join(&contract.path, &path),
+            error: error.with_attribute(&destination.label),
+        });
+    }
+    if errors.is_empty()
+        && context.is_apply()
+        && candidate
+            .obligations
+            .schema
+            .has_unavailable_type(context.provider.catalog())
+    {
+        return Err(constraints(vec![AdmissionFinding {
+            path: contract.path.clone(),
+            error: TypeError::from(crate::parser::CustomTypeValidationError::ProvidersNotLoaded)
+                .with_attribute(&destination.label),
+        }]));
     }
     if !errors.is_empty() {
         let mut error = constraints(errors);
@@ -515,5 +555,215 @@ impl crate::schema::ValidatedCustomTypeLookup for ContractLookup<'_> {
                 .validate_validated(owner, value)
                 .map_err(Into::into),
         }
+    }
+}
+
+#[cfg(test)]
+mod discharge_tests {
+    use super::*;
+    use crate::binding_index::BindingValueSource;
+    use crate::schema::{AttrTypeKind, AttributeType, TypeIdentity};
+    use crate::validation::deferred_types::with_session_for_test;
+    use std::collections::HashMap;
+
+    fn text(value: &str) -> Value {
+        Value::Concrete(crate::resource::ConcreteValue::String(value.into()))
+    }
+
+    fn pending_schema(pending: &PendingAdmission<kind::ResourceAttribute>) -> &SchemaObligation {
+        let AssignmentVerdict::NeedsSchema(schema) = &pending.inner.assignment else {
+            panic!("expected a pending schema obligation");
+        };
+        schema
+    }
+
+    fn check_discharge(
+        pending: PendingAdmission<kind::ResourceAttribute>,
+        session: &dyn ProviderTypeCheckContext,
+    ) {
+        assert!(!pending_schema(&pending).is_empty());
+        let mut resolved = ResolvedBindings::default();
+        resolved.set(
+            "producer",
+            HashMap::from([("output".into(), text("too long"))]),
+            BindingValueSource::Local,
+        );
+        let error = pending.clone().discharge(&resolved, session).unwrap_err();
+        let ResolutionError::AdmissionConstraints(findings) = error.resolution_error() else {
+            panic!("expected a destination error: {error:?}");
+        };
+        assert_eq!(findings.findings()[0].path.to_string(), "target");
+        assert!(matches!(
+            findings.findings()[0].error,
+            TypeError::LengthOutOfRange { max: Some(4), .. }
+        ));
+        resolved.set(
+            "producer",
+            HashMap::from([("output".into(), text("fits"))]),
+            BindingValueSource::Local,
+        );
+        assert_eq!(
+            pending
+                .discharge(&resolved, session)
+                .unwrap()
+                .ready()
+                .unwrap()
+                .value(),
+            &text("fits")
+        );
+    }
+
+    fn target() -> AttributeType {
+        AttributeType::refined_string(None, None, Some((None, Some(4))), None)
+    }
+
+    #[test]
+    fn discharge_rejudges_reference_without_validation_bindings() {
+        super::super::tests::fixture(
+            AttributeType::string(),
+            target(),
+            |catalog, _, _, destination| {
+                with_session_for_test(catalog, |session| {
+                    let value = Value::root_resource_ref("producer", "output", vec![]);
+                    let (candidate, context) = Candidate::validation_classified(
+                        value
+                            .knowledge(&KnowledgeContext::validation())
+                            .unwrap()
+                            .into_classification(),
+                        None,
+                        session,
+                    );
+                    let pending = admit(destination, candidate, &context)
+                        .unwrap()
+                        .ready()
+                        .unwrap_err();
+                    assert_eq!(
+                        pending_schema(&pending).requirements,
+                        [SchemaRequirement::Reference]
+                    );
+                    check_discharge(pending, session);
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn discharge_rejudges_unchecked_reference_type() {
+        super::super::tests::fixture(
+            AttributeType::string(),
+            target(),
+            |catalog, schemas, _, destination| {
+                let parsed = crate::parser::parse_file(
+                    "let producer = upstream_state { source = './up' }",
+                    std::path::Path::new("unchecked.crn"),
+                    catalog,
+                )
+                .unwrap()
+                .resolve_root_for_test();
+                let bindings = BindingIndex::from_parsed(&parsed, schemas, catalog);
+                assert!(matches!(
+                    bindings.ref_type(&crate::resource::AccessPath::root("producer", "output")),
+                    RefType::Unchecked
+                ));
+                with_session_for_test(catalog, |session| {
+                    let value = Value::root_resource_ref("producer", "output", vec![]);
+                    let (candidate, context) = Candidate::validation_classified(
+                        value
+                            .knowledge(&KnowledgeContext::validation())
+                            .unwrap()
+                            .into_classification(),
+                        Some(&bindings),
+                        session,
+                    );
+                    let pending = admit(destination, candidate, &context)
+                        .unwrap()
+                        .ready()
+                        .unwrap_err();
+                    assert_eq!(
+                        pending_schema(&pending).requirements,
+                        [SchemaRequirement::Reference]
+                    );
+                    check_discharge(pending, session);
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn discharge_rejudges_unchecked_assignability() {
+        let source = CompiledAttributeType {
+            kind: AttrTypeKind::UnloadedSchemaType(
+                crate::parser::UnloadedSchemaType::try_from(TypeIdentity::bare("SourceId"))
+                    .unwrap(),
+            ),
+        };
+        super::super::tests::fixture(
+            AttributeType::string(),
+            target(),
+            |catalog, _, _, destination| {
+                with_session_for_test(catalog, |session| {
+                    let value = Value::root_resource_ref("producer", "output", vec![]);
+                    let proof = PlanResolved::try_from(
+                        value
+                            .knowledge(&KnowledgeContext::plan(&ResolvedBindings::default()))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let (mut candidate, context) = Candidate::plan(proof, session);
+                    let contract = destination.contract.as_deref().unwrap();
+                    let crate::schema::TypeAssignability::Unchecked(missing) = source
+                        .in_schema(&contract.defs)
+                        .assignment_to(contract.attr.in_schema(&contract.defs).with_authority(
+                            &catalog.custom_types,
+                            SinkAuthority::Owner(&contract.owner),
+                        ))
+                    else {
+                        panic!("unloaded source annotation must defer assignment");
+                    };
+                    candidate
+                        .obligations
+                        .schema
+                        .requirements
+                        .extend(missing.into_types().map(SchemaRequirement::Type));
+                    let pending = admit(destination, candidate, &context)
+                        .unwrap()
+                        .ready()
+                        .unwrap_err();
+                    assert!(matches!(
+                        pending_schema(&pending).requirements.as_slice(),
+                        [SchemaRequirement::Type(_)]
+                    ));
+                    check_discharge(pending, session);
+                });
+            },
+        );
+    }
+
+    #[test]
+    fn discharge_rejudges_inherited_destination_schema_obligation() {
+        super::super::tests::fixture(
+            AttributeType::string(),
+            target(),
+            |catalog, _, _, destination| {
+                with_session_for_test(catalog, |session| {
+                    let value = Value::root_resource_ref("producer", "output", vec![]);
+                    let proof = PlanResolved::try_from(
+                        value
+                            .knowledge(&KnowledgeContext::plan(&ResolvedBindings::default()))
+                            .unwrap(),
+                    )
+                    .unwrap();
+                    let (mut candidate, context) = Candidate::plan(proof, session);
+                    // Retain an earlier destination obligation (for example a
+                    // ProvidersNotLoaded finding) while its current contract fits.
+                    candidate.obligations.schema = SchemaObligation::destination();
+                    let pending = admit(destination, candidate, &context)
+                        .unwrap()
+                        .ready()
+                        .unwrap_err();
+                    check_discharge(pending, session);
+                });
+            },
+        );
     }
 }

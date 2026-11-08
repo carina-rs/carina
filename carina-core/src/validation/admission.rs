@@ -579,8 +579,7 @@ pub struct PendingAdmission<
 struct PendingCandidate<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> {
     findings: crate::schema::ValueValidationFindings,
     candidate: Candidate<P, B>,
-    local: Option<K::LocalObligation>,
-    schema: Option<SchemaObligation>,
+    assignment: AssignmentVerdict<K>,
     sites: Vec<PendingSite<B>>,
 }
 #[derive(Debug, Clone, PartialEq)]
@@ -768,36 +767,33 @@ pub fn admit<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
     let assignment::AssignmentJudgement { verdict, findings } =
         assignment::judge_with_findings(destination, &candidate, context)?;
     let sites = context.sites();
-    let (local, schema) = match verdict {
-        AssignmentVerdict::Proven(_) => (None, None),
-        AssignmentVerdict::NeedsLocal(obligation) => (Some(obligation), None),
-        AssignmentVerdict::NeedsSchema(obligation) => (None, Some(obligation)),
-    };
-    // Validation may place literals, while symbolic values remain owned work.
-    // Apply has already consumed KnownValue::from_apply; missing authority is
-    // still an unresolved boundary rather than successful unchecked placement.
-    if !sites.is_empty() || schema.is_some() {
-        if context.is_apply() {
-            return Err(KnowledgeError::<B>::UnresolvedAtBoundary { sites }.into());
-        }
-        return Ok(Admission::Pending(PendingAdmission {
-            destination: destination.clone(),
-            inner: Box::new(PendingCandidate {
+    match verdict {
+        AssignmentVerdict::Proven(_) if sites.is_empty() => Ok(Admission::Ready(PlacedValue {
+            inner: Box::new(PlacedInner {
                 findings,
-                candidate,
-                local,
-                schema,
-                sites,
+                destination: destination.clone(),
+                value: candidate.value,
             }),
-        }));
+        })),
+        assignment @ (AssignmentVerdict::Proven(_)
+        | AssignmentVerdict::NeedsLocal(_)
+        | AssignmentVerdict::NeedsSchema(_)) => {
+            // Every unproven verdict remains owned work, even with no pending
+            // sites. Apply must prove assignment after checking the known value.
+            if context.is_apply() {
+                return Err(KnowledgeError::<B>::UnresolvedAtBoundary { sites }.into());
+            }
+            Ok(Admission::Pending(PendingAdmission {
+                destination: destination.clone(),
+                inner: Box::new(PendingCandidate {
+                    findings,
+                    candidate,
+                    assignment,
+                    sites,
+                }),
+            }))
+        }
     }
-    Ok(Admission::Ready(PlacedValue {
-        inner: Box::new(PlacedInner {
-            findings,
-            destination: destination.clone(),
-            value: candidate.value,
-        }),
-    }))
 }
 impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> PendingAdmission<K, P, B> {
     pub fn discharge(
@@ -810,15 +806,13 @@ impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> PendingAdmission
         let value =
             crate::resolver::resolve_ref_value(&self.inner.candidate.value, resolved, context)?;
         let mut candidate = self.inner.candidate;
-        candidate
-            .obligations
-            .schema
-            .extend(self.inner.schema.unwrap_or_default());
-        if let Some(local) = self.inner.local {
-            candidate
+        match self.inner.assignment {
+            AssignmentVerdict::Proven(_) => {}
+            AssignmentVerdict::NeedsLocal(local) => candidate
                 .obligations
                 .schema
-                .extend(K::schema(&local).clone());
+                .extend(K::schema(&local).clone()),
+            AssignmentVerdict::NeedsSchema(schema) => candidate.obligations.schema.extend(schema),
         }
         let (candidate, boundary) = candidate.at_apply(
             value.knowledge(&KnowledgeContext::apply(resolved))?,
@@ -830,7 +824,10 @@ impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> PendingAdmission
         &self.inner.sites
     }
     pub fn local_obligation(&self) -> Option<&K::LocalObligation> {
-        self.inner.local.as_ref()
+        match &self.inner.assignment {
+            AssignmentVerdict::NeedsLocal(local) => Some(local),
+            AssignmentVerdict::Proven(_) | AssignmentVerdict::NeedsSchema(_) => None,
+        }
     }
 }
 

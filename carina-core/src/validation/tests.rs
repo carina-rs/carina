@@ -10751,6 +10751,56 @@ fn review_r9_nested_symbolic_findings_are_rendered_once_per_path() {
     assert_eq!(error.lines().count(), 2, "{error}");
 }
 
+#[test]
+fn admission_deferred_read_keeps_main_verdict_across_files() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/admission_deferred_read");
+    let catalog = LoadedProviderContext::empty_for_test();
+    let catalog = catalog.as_provider_context();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("iam.Roles")
+            .as_data_source()
+            .attribute(
+                PatternAttributeSchema::required("name_regex", PatternAttributeType::string())
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    // Main leaves these parser-side read templates to the expansion seam.
+    // Even a literal mismatch must not introduce a new rejection here.
+    for replacement in ["n", "42"] {
+        let directory = tempfile::tempdir().unwrap();
+        for name in ["main.crn", "exports.crn", "providers.crn", "backend.crn"] {
+            let source = std::fs::read_to_string(fixture.join(name)).unwrap();
+            std::fs::write(
+                directory.path().join(name),
+                source.replace("name_regex = n", &format!("name_regex = {replacement}")),
+            )
+            .unwrap();
+        }
+        let path = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+        let parsed = crate::config_loader::parse_directory(&path, catalog)
+            .unwrap()
+            .into_parsed();
+        let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+        assert_eq!(tree.resources().count(), 1);
+        assert_eq!(tree.project_resources().count(), 0);
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, catalog);
+        let configuration =
+            crate::config_loader::load_buffer_configuration(&parsed, &schemas, catalog);
+        validate_resource_admissions(
+            configuration.judged(),
+            &bindings,
+            &HashSet::from(["mock".into()]),
+            &mut Vec::new(),
+        )
+        .unwrap();
+    }
+}
+
 fn expression_validation_directory(
     source: &str,
     sibling: &str,

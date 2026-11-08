@@ -27,6 +27,8 @@ use carina_core::resource::{
 };
 use carina_core::schema::{SchemaRegistry, TypeError};
 use carina_core::validation::DeferredAccessTypeError;
+#[cfg(test)]
+use carina_core::validation::admission::attributes::uses_resource_attribute_admission;
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
@@ -336,7 +338,7 @@ impl ExpandedDiagnosticValidationInputs<'_> {
         resource_id: &carina_core::resource::ResourceId,
         session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Option<carina_core::schema::ResourceValueValidation> {
-        use carina_core::validation::admission::{attributes::resource_attribute_admissions, kind};
+        use carina_core::validation::admission::attributes::resource_attribute_admissions;
         let resource = self
             .tree
             .resources()
@@ -363,37 +365,17 @@ impl ExpandedDiagnosticValidationInputs<'_> {
             |_, _| {},
         ));
         let report = self.configuration.report().for_resource(resource_id).ok()?;
-        Some(match resource.kind() {
-            carina_core::parser::AnalysisItemKind::DataSource => {
-                resource_attribute_admissions::<kind::DataSourceAttribute, _, _, _>(
-                    resource,
-                    self.configuration.file(),
-                    schema,
-                    &classified,
-                    resource.quoted_string_attrs(),
-                    report,
-                    &self.binding_index,
-                    session,
-                    schemas,
-                )
-            }
-            carina_core::parser::AnalysisItemKind::Resource
-            | carina_core::parser::AnalysisItemKind::DeferredResource
-            | carina_core::parser::AnalysisItemKind::Composition
-            | carina_core::parser::AnalysisItemKind::Wait => {
-                resource_attribute_admissions::<kind::ResourceAttribute, _, _, _>(
-                    resource,
-                    self.configuration.file(),
-                    schema,
-                    &classified,
-                    resource.quoted_string_attrs(),
-                    report,
-                    &self.binding_index,
-                    session,
-                    schemas,
-                )
-            }
-        })
+        Some(resource_attribute_admissions(
+            resource,
+            self.configuration.file(),
+            schema,
+            &classified,
+            resource.quoted_string_attrs(),
+            report,
+            &self.binding_index,
+            session,
+            schemas,
+        ))
     }
 }
 
@@ -1613,15 +1595,9 @@ impl DiagnosticRun<'_> {
                     let mut value_validation = expanded_validation_inputs.as_ref()
                         .filter(|_| uses_composition_output)
                         .and_then(|inputs| inputs.resource_admissions(resource_id, self.provider_context))
-                        .unwrap_or_else(|| match rref.kind() {
-                        carina_core::parser::AnalysisItemKind::DataSource => carina_core::validation::admission::attributes::resource_attribute_admissions::<carina_core::validation::admission::kind::DataSourceAttribute, _, _, _>(
+                        .unwrap_or_else(|| carina_core::validation::admission::attributes::resource_attribute_admissions(
                             rref, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, expression_report, &binding_index, self.provider_context, &self.schemas,
-                        ),
-                        kind if uses_resource_attribute_admission(kind) => carina_core::validation::admission::attributes::resource_attribute_admissions::<carina_core::validation::admission::kind::ResourceAttribute, _, _, _>(
-                            rref, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, expression_report, &binding_index, self.provider_context, &self.schemas,
-                        ),
-                        _ => Default::default(),
-                    });
+                        ));
                     let mut reported_attribute_diagnostics = HashSet::new();
                     let retained_failures = resource_attributes
                         .keys()
@@ -2537,15 +2513,6 @@ fn build_enum_diagnostic(
         doc,
         &finding,
         resource.replaceable_attribute_value(attr_name),
-    )
-}
-
-fn uses_resource_attribute_admission(kind: carina_core::parser::AnalysisItemKind) -> bool {
-    matches!(
-        kind,
-        carina_core::parser::AnalysisItemKind::Resource
-            | carina_core::parser::AnalysisItemKind::DeferredResource
-            | carina_core::parser::AnalysisItemKind::Wait
     )
 }
 

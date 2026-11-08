@@ -180,6 +180,56 @@ fn wider_same_identity_length_records_destination_obligation() {
 }
 
 #[test]
+fn needs_local_without_pending_sites_remains_pending() {
+    fixture(
+        AttributeType::string(),
+        string_type("GroupId", Some(36)),
+        |catalog, _, _, destination| {
+            with_session_for_test(catalog, |session| {
+                let value = text("fits");
+                let (candidate, mut context) = Candidate::validation_classified(
+                    value
+                        .knowledge(&KnowledgeContext::validation())
+                        .unwrap()
+                        .into_classification(),
+                    None,
+                    session,
+                );
+                let local_check = |_: &CompiledAttributeType, _: &Value, path: &LeafPath| {
+                    Ok(crate::schema::value_validation::AssignmentFindings {
+                        local: vec![path.clone()],
+                        ..Default::default()
+                    })
+                };
+                context.assignment = Some(&local_check);
+                assert!(context.sites().is_empty());
+                assert!(matches!(
+                    assignment::judge_with_findings(destination, &candidate, &context)
+                        .unwrap()
+                        .verdict,
+                    AssignmentVerdict::NeedsLocal(_)
+                ));
+                let pending = admit(destination, candidate, &context)
+                    .unwrap()
+                    .ready()
+                    .expect_err("NeedsLocal must retain its obligation even without pending sites");
+                assert!(pending.sites().is_empty());
+                assert!(pending.local_obligation().is_some());
+                assert_eq!(
+                    pending
+                        .discharge(&ResolvedBindings::default(), session)
+                        .unwrap()
+                        .ready()
+                        .unwrap()
+                        .value(),
+                    &value
+                );
+            });
+        },
+    );
+}
+
+#[test]
 fn resource_callers_admit_wider_same_identity_references() {
     fixture(
         string_type("GroupId", Some(64)),
@@ -1126,6 +1176,106 @@ fn unavailable_reference_authority_cannot_be_erased_by_resolution() {
             BindingValueSource::Local,
         );
         assert!(pending.discharge(&resolved, session).is_err());
+    });
+}
+
+fn partial_catalog_admission_fixture(
+    f: impl FnOnce(
+        &BindingIndex<'_, AbsoluteBindingAddress>,
+        &Destination<kind::ResourceAttribute>,
+        &dyn ProviderTypeCheckContext,
+    ),
+) {
+    let mut catalog = crate::parser::LoadedProviderContext::empty_for_test()
+        .as_provider_context()
+        .clone();
+    catalog.custom_types = catalog
+        .custom_types
+        .with_failed_providers(std::collections::BTreeSet::from(["test".into()]));
+    assert!(catalog.custom_types.is_partial());
+    fixture_in(
+        &catalog,
+        string_type("TargetId", None),
+        string_type("TargetId", None),
+        |_, _, bindings, destination| {
+            with_session_for_test(&catalog, |session| f(bindings, destination, session));
+        },
+    );
+}
+
+fn assert_provider_catalog_error(error: AdmissionErrors) {
+    let ResolutionError::AdmissionConstraints(findings) = error.resolution_error() else {
+        panic!("expected provider custom-type error, got {error:?}");
+    };
+    assert_eq!(findings.findings().len(), 1);
+    let finding = &findings.findings()[0];
+    assert_eq!(finding.path.to_string(), "target");
+    assert_eq!(finding.error.attribute_name(), Some("target"));
+    assert!(matches!(
+        &finding.error,
+        TypeError::CustomTypeValidation { error, .. }
+            if matches!(error.as_ref(), crate::parser::CustomTypeValidationError::ProvidersNotLoaded)
+    ));
+    assert!(
+        finding
+            .error
+            .to_string()
+            .contains("provider custom types are not loaded")
+    );
+}
+
+#[test]
+fn partial_catalog_custom_type_error_at_validation() {
+    partial_catalog_admission_fixture(|bindings, destination, session| {
+        assert_provider_catalog_error(
+            validate(destination, &text("fits"), bindings, session).unwrap_err(),
+        );
+    });
+}
+
+#[test]
+fn partial_catalog_custom_type_error_at_plan() {
+    partial_catalog_admission_fixture(|_, destination, session| {
+        let value = text("fits");
+        let resolved = ResolvedBindings::default();
+        let proof =
+            PlanResolved::try_from(value.knowledge(&KnowledgeContext::plan(&resolved)).unwrap())
+                .unwrap();
+        let (candidate, context) = Candidate::plan(proof, session);
+        assert_provider_catalog_error(admit(destination, candidate, &context).unwrap_err());
+    });
+}
+
+#[test]
+fn partial_catalog_custom_type_error_at_apply() {
+    partial_catalog_admission_fixture(|_, destination, session| {
+        let value = text("fits");
+        let resolved = ResolvedBindings::default();
+        let (candidate, context) = Candidate::apply(
+            value
+                .knowledge(&KnowledgeContext::apply(&resolved))
+                .unwrap(),
+            session,
+        )
+        .unwrap();
+        assert_provider_catalog_error(admit(destination, candidate, &context).unwrap_err());
+    });
+}
+
+#[test]
+fn partial_catalog_custom_type_error_on_discharge() {
+    partial_catalog_admission_fixture(|bindings, destination, session| {
+        let pending = validate(destination, &reference(), bindings, session)
+            .unwrap()
+            .ready()
+            .unwrap_err();
+        let mut resolved = ResolvedBindings::default();
+        resolved.set(
+            "producer",
+            HashMap::from([("output".into(), text("fits"))]),
+            BindingValueSource::Local,
+        );
+        assert_provider_catalog_error(pending.discharge(&resolved, session).unwrap_err());
     });
 }
 
