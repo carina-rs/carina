@@ -1260,6 +1260,7 @@ fn computed_access_rejects_heterogeneous_collection_in_validation() {
             .judged(),
             &HashSet::new(),
             &bindings,
+            &mut Vec::new(),
         );
         match expected_error {
             Some(expected) => {
@@ -1562,6 +1563,7 @@ fn resource_reference_is_pending_while_strict_boundaries_retain_both_names() {
         .judged(),
         &HashSet::new(),
         &bindings,
+        &mut Vec::new(),
     )
     .expect("same-identity resource reference defers its local constraints");
     let messages = [
@@ -1606,11 +1608,12 @@ fn wider_name_resource_reference_discharge_matches_the_destination_literal_error
         .unwrap();
     deferred_types::with_session_for_test(snapshot.provider_context(), |session| {
         let reference = crate::resource::Value::root_resource_ref("source", "value0", vec![]);
-        let (candidate, boundary) = Candidate::validation(
+        let (candidate, boundary) = Candidate::validation_classified(
             reference
                 .knowledge(&KnowledgeContext::validation())
-                .unwrap(),
-            &bindings,
+                .unwrap()
+                .into_classification(),
+            Some(&bindings),
             session,
         );
         let pending = admit(&destination, candidate, &boundary)
@@ -1620,9 +1623,12 @@ fn wider_name_resource_reference_discharge_matches_the_destination_literal_error
         let literal = crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
             "A".repeat(65).into(),
         ));
-        let (candidate, boundary) = Candidate::validation(
-            literal.knowledge(&KnowledgeContext::validation()).unwrap(),
-            &bindings,
+        let (candidate, boundary) = Candidate::validation_classified(
+            literal
+                .knowledge(&KnowledgeContext::validation())
+                .unwrap()
+                .into_classification(),
+            Some(&bindings),
             session,
         );
         let literal_error = admit(&destination, candidate, &boundary).unwrap_err();
@@ -1761,6 +1767,7 @@ fn integer_result_mismatches_share_names_in_value_and_resource_checkers() {
         .judged(),
         &HashSet::new(),
         &bindings,
+        &mut Vec::new(),
     )
     .unwrap_err();
     assert!(error.to_string().contains(expected), "{error}");
@@ -1837,6 +1844,7 @@ fn integer_operand_mismatches_do_not_hide_a_named_strings_constraints() {
         .judged(),
         &HashSet::new(),
         &bindings,
+        &mut Vec::new(),
     )
     .unwrap_err();
     assert!(

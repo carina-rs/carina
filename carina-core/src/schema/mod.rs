@@ -201,7 +201,7 @@ pub use carina_provider_protocol::types::{
 pub use pattern_display::{DiagnosticPatternSpec, PatternSpecDisplay};
 pub(crate) mod length_interval;
 use crate::resource::knowledge::{
-    Classification, ClassifiedRef, KnownValue, PendingFit, PlanResolved, StructuralPending,
+    Classification, ClassifiedRef, KnownValue, PendingFit, StructuralPending,
 };
 use length_interval::length_contains;
 mod input_rules;
@@ -9882,66 +9882,6 @@ impl ValidatedResourceSchema {
         self.schema
             .validate_values_with_origins_and_lookup(attributes, is_string_literal, lookup)
     }
-
-    pub(crate) fn validate_known_values_with_origins_and_lookup<
-        'v,
-        T: StructuralPending<
-                'v,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-            >,
-    >(
-        &self,
-        attributes: &HashMap<
-            String,
-            Classification<
-                'v,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-                T,
-            >,
-        >,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-    ) -> Result<(), Vec<TypeError>> {
-        self.schema.validate_known_values_with_origins_and_lookup(
-            attributes,
-            is_string_literal,
-            lookup,
-        )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn validate_selected_known_values_with_origins_and_lookup<
-        'v,
-        T: StructuralPending<
-                'v,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-            >,
-    >(
-        &self,
-        attributes: &HashMap<
-            String,
-            Classification<
-                'v,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-                T,
-            >,
-        >,
-        selected: &HashSet<String>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-    ) -> Result<(), Vec<TypeError>> {
-        self.schema
-            .validate_selected_known_values_with_origins_and_lookup(
-                attributes,
-                selected,
-                is_string_literal,
-                lookup,
-            )
-    }
 }
 
 fn config_definition_issues(
@@ -14678,52 +14618,6 @@ impl<'a> OwnerBoundResourceSchema<'a> {
             .schema
             .validate_report(attributes, is_string_literal, &lookup)
     }
-
-    /// Validate every concrete value known at the provider boundary, routing
-    /// identified declarations through this schema's registered owner.
-    ///
-    /// ```compile_fail,E0308
-    /// use std::collections::HashMap;
-    /// use carina_core::{parser::CustomTypeResolver, resource::Value, schema::OwnerBoundResourceSchema};
-    /// fn bypass(schema: OwnerBoundResourceSchema<'_>, raw: &HashMap<String, Value>, resolver: &dyn CustomTypeResolver) {
-    ///     let _ = schema.validate_known_values_with_resolver(raw, &|_| false, resolver);
-    /// }
-    /// ```
-    pub fn validate_known_values_with_resolver(
-        self,
-        attributes: &HashMap<String, KnownValue<'_>>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        resolver: &dyn crate::parser::CustomTypeResolver,
-    ) -> Result<(), Vec<TypeError>> {
-        let attributes: HashMap<String, Classification<'_>> = attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), Classification::Known(value.clone())))
-            .collect();
-        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
-        self.schema.validate_known_values_with_origins_and_lookup(
-            &attributes,
-            is_string_literal,
-            &lookup,
-        )
-    }
-
-    pub fn validate_plan_value_constraints_with_resolver(
-        self,
-        attributes: &HashMap<String, PlanResolved<'_>>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        resolver: &dyn crate::parser::CustomTypeResolver,
-    ) -> Result<(), Vec<TypeError>> {
-        let attributes = attributes
-            .iter()
-            .map(|(key, value)| (key.clone(), value.knowledge().clone()))
-            .collect();
-        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
-        self.schema.validate_known_values_with_origins_and_lookup(
-            &attributes,
-            is_string_literal,
-            &lookup,
-        )
-    }
 }
 
 impl std::ops::Deref for OwnerBoundResourceSchema<'_> {
@@ -14743,7 +14637,6 @@ impl std::ops::Deref for OwnerBoundResourceSchema<'_> {
 /// See `notes/specs/2026-05-02-resource-vs-data-source-design.md` (Decision 1-2).
 #[derive(Debug, Clone, Default)]
 pub struct SchemaRegistry {
-    pub(crate) unavailable_admission_identity: crate::validation::admission::DeclarationId,
     managed: HashMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
     data_sources: HashMap<(SchemaTypeOwner, String), ValidatedResourceSchema>,
     reference_forms: BTreeMap<String, ReferenceForms>,
@@ -14876,7 +14769,6 @@ impl SchemaRegistry {
     /// be identical; fixture-only insertions carry no competing declarations.
     pub fn extend(&mut self, other: SchemaRegistry) -> Result<(), SchemaRegistryError> {
         let SchemaRegistry {
-            unavailable_admission_identity: _,
             managed,
             data_sources,
             reference_forms,
@@ -15458,141 +15350,6 @@ impl PatternResourceSchema<Compiled> {
         self.validate_inner(attributes, is_string_literal, lookup)
     }
 
-    /// Validate constraints on values that are currently known.
-    ///
-    /// Unlike the full validation entry point, this method
-    /// deliberately omits shape-of-resource checks that were already made
-    /// when the source was expanded: required attributes, unknown
-    /// attributes, provider-populated attributes, and field groups. It is
-    /// intended for a later resolution boundary, where a value
-    /// that was deferred during expansion may have become concrete.
-    ///
-    /// Deferred leaves are ignored while concrete siblings in the same
-    /// collection are still checked. The resource validator is re-run because
-    /// it may express cross-attribute value constraints.
-    fn validate_known_values_with_origins_and_lookup<
-        'v,
-        T: StructuralPending<
-                'v,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-            >,
-    >(
-        &self,
-        attributes: &HashMap<
-            String,
-            Classification<
-                'v,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-                T,
-            >,
-        >,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-    ) -> Result<(), Vec<TypeError>> {
-        let mut errors = self
-            .validate_value_entries(
-                attributes,
-                is_string_literal,
-                lookup,
-                ValueEntryValidation::KnownWritableOnly,
-                None,
-                None,
-            )
-            .into_errors();
-
-        if let Some(validator) = self.validator()
-            && let Err(mut validation_errors) = run_resource_validator(
-                validator,
-                &attributes
-                    .iter()
-                    .map(|(key, value)| {
-                        (
-                            key.clone(),
-                            ClassifiedRef::from(value).diagnostic_value().clone(),
-                        )
-                    })
-                    .collect(),
-            )
-        {
-            errors.append(&mut validation_errors);
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
-    /// Validate only the attributes whose values became known at the current
-    /// resolution boundary.
-    ///
-    /// `attributes` is still the complete authored-value view so a resource
-    /// validator can evaluate cross-attribute rules. Per-attribute schema and
-    /// provider custom-type checks are restricted to `selected`; every other
-    /// value was checked at an earlier boundary and may now be in a normalized
-    /// representation that intentionally differs from the authored form.
-    #[cfg(test)]
-    fn validate_selected_known_values_with_origins_and_lookup<
-        'v,
-        T: StructuralPending<
-                'v,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-            >,
-    >(
-        &self,
-        attributes: &HashMap<
-            String,
-            Classification<
-                'v,
-                crate::resource::NoPlaceholder,
-                crate::resource::AbsoluteBindingAddress,
-                T,
-            >,
-        >,
-        selected: &HashSet<String>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-    ) -> Result<(), Vec<TypeError>> {
-        let mut errors = self
-            .validate_value_entries(
-                attributes,
-                is_string_literal,
-                lookup,
-                ValueEntryValidation::KnownWritableOnly,
-                Some(selected),
-                None,
-            )
-            .into_errors();
-
-        if !selected.is_empty()
-            && let Some(validator) = self.validator()
-            && let Err(mut validation_errors) = run_resource_validator(
-                validator,
-                &attributes
-                    .iter()
-                    .map(|(key, value)| {
-                        (
-                            key.clone(),
-                            ClassifiedRef::from(value).diagnostic_value().clone(),
-                        )
-                    })
-                    .collect(),
-            )
-        {
-            errors.append(&mut validation_errors);
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors)
-        }
-    }
-
     fn validate_inner<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
         &self,
         attributes: &HashMap<String, Classification<'v, P, B, T>>,
@@ -15648,8 +15405,7 @@ impl PatternResourceSchema<Compiled> {
             None,
             admission,
         );
-        report.errors.extend(values.errors);
-        report.attributes = values.attributes;
+        report.append_values(values);
 
         for group in &self.field_groups {
             let present = group
@@ -15803,7 +15559,7 @@ impl PatternResourceSchema<Compiled> {
                         lookup,
                     ),
                 };
-                for error in findings.local_errors() {
+                for (index, error) in findings.local_errors().enumerate() {
                     let tagged = error.clone().with_attribute(name);
                     let reshaped = if is_string_literal(name.as_str())
                         && matches!(effective_attribute.value_type().shape(), Shape::Enum { .. })
@@ -15812,14 +15568,19 @@ impl PatternResourceSchema<Compiled> {
                     } else {
                         tagged
                     };
+                    if let Some((path, _)) = findings.located.get(index) {
+                        report
+                            .error_paths
+                            .insert(report.errors.len(), (name.clone(), path.clone()));
+                    }
                     report.errors.push(reshaped);
                 }
-                report.errors.extend(
-                    findings
-                        .provider
-                        .iter()
-                        .map(|(_, error)| error.clone().with_attribute(name)),
-                );
+                for (path, error) in &findings.provider {
+                    report
+                        .error_paths
+                        .insert(report.errors.len(), (name.clone(), path.canonical()));
+                    report.errors.push(error.clone().with_attribute(name));
+                }
                 report.attributes.insert(name.clone(), findings);
             } else if mode == ValueEntryValidation::FullInput {
                 if let Some(admit) = admission {
@@ -15843,7 +15604,7 @@ impl PatternResourceSchema<Compiled> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 pub(crate) fn assignment_catalog_without_edges_for_test()

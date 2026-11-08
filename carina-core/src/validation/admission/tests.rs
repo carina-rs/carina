@@ -83,9 +83,12 @@ fn validate<K: DestinationKind>(
     bindings: &BindingIndex<'_, AbsoluteBindingAddress>,
     session: &dyn ProviderTypeCheckContext,
 ) -> Result<Admission<K>, AdmissionErrors> {
-    let (candidate, context) = Candidate::validation(
-        value.knowledge(&KnowledgeContext::validation()).unwrap(),
-        bindings,
+    let (candidate, context) = Candidate::validation_classified(
+        value
+            .knowledge(&KnowledgeContext::validation())
+            .unwrap()
+            .into_classification(),
+        Some(bindings),
         session,
     );
     admit(destination, candidate, &context)
@@ -99,9 +102,12 @@ fn replacing_candidate_value_carries_all_original_obligations() {
         |catalog, _, bindings, _| {
             with_session_for_test(catalog, |session| {
                 let value = reference();
-                let (candidate, _) = Candidate::validation(
-                    value.knowledge(&KnowledgeContext::validation()).unwrap(),
-                    bindings,
+                let (candidate, _) = Candidate::validation_classified(
+                    value
+                        .knowledge(&KnowledgeContext::validation())
+                        .unwrap()
+                        .into_classification(),
+                    Some(bindings),
                     session,
                 );
                 let original = candidate.clone();
@@ -194,12 +200,14 @@ fn resource_callers_admit_wider_same_identity_references() {
                 schemas,
                 &std::collections::HashSet::from(["test".into()]),
                 catalog,
+                &mut Vec::new(),
             )
             .unwrap();
             crate::validation::validate_resource_ref_types(
                 configuration.judged(),
                 &std::collections::HashSet::new(),
                 &bindings,
+                &mut Vec::new(),
             )
             .expect("same-identity resource reference is pending until resolution");
         },
@@ -236,9 +244,12 @@ fn declared_reference_defers_same_identity_local_constraints_at_resource_sink() 
                 let declared = source
                     .with_value_declaration(&declaration, bindings)
                     .unwrap();
-                let (candidate, mut context) = Candidate::validation(
-                    value.knowledge(&KnowledgeContext::validation()).unwrap(),
-                    bindings,
+                let (candidate, mut context) = Candidate::validation_classified(
+                    value
+                        .knowledge(&KnowledgeContext::validation())
+                        .unwrap()
+                        .into_classification(),
+                    Some(bindings),
                     session,
                 );
                 context.declaration = Some(("argument", &declared));
@@ -809,14 +820,20 @@ fn candidate_cannot_use_another_candidates_boundary_proof() {
             with_session_for_test(catalog, |session| {
                 let first = text("first");
                 let second = text("second");
-                let (candidate, _) = Candidate::validation(
-                    first.knowledge(&KnowledgeContext::validation()).unwrap(),
-                    bindings,
+                let (candidate, _) = Candidate::validation_classified(
+                    first
+                        .knowledge(&KnowledgeContext::validation())
+                        .unwrap()
+                        .into_classification(),
+                    Some(bindings),
                     session,
                 );
-                let (_, context) = Candidate::validation(
-                    second.knowledge(&KnowledgeContext::validation()).unwrap(),
-                    bindings,
+                let (_, context) = Candidate::validation_classified(
+                    second
+                        .knowledge(&KnowledgeContext::validation())
+                        .unwrap()
+                        .into_classification(),
+                    Some(bindings),
                     session,
                 );
                 assert!(admit(destination, candidate, &context).is_err());
@@ -877,31 +894,35 @@ fn pending_is_holdable_and_discharged_for_every_unmigrated_kind() {
 
 #[test]
 fn missing_schema_never_becomes_placement_at_apply() {
-    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    let registry = SchemaRegistry::new();
-    let id = crate::resource::ResourceId::with_provider_identity("test", "Sink", "sink", None);
-    let destination = registry.resource_destination(&id, &catalog);
-    with_session_for_test(&catalog, |session| {
-        let value = text("known");
-        let proof = PlanResolved::try_from(
-            value
-                .knowledge(&KnowledgeContext::plan(&ResolvedBindings::default()))
-                .unwrap(),
-        )
-        .unwrap();
-        let (candidate, context) = Candidate::plan(proof, session);
-        let pending = admit(&destination, candidate, &context)
-            .unwrap()
-            .ready()
-            .unwrap_err();
-        assert!(matches!(
-            pending
-                .discharge(&ResolvedBindings::default(), session)
-                .unwrap_err()
-                .resolution_error(),
-            ResolutionError::Knowledge(_)
-        ));
-    });
+    fixture(
+        AttributeType::string(),
+        AttributeType::string(),
+        |catalog, _, _, destination| {
+            let mut destination = destination.clone();
+            destination.contract = None;
+            with_session_for_test(catalog, |session| {
+                let value = text("known");
+                let proof = PlanResolved::try_from(
+                    value
+                        .knowledge(&KnowledgeContext::plan(&ResolvedBindings::default()))
+                        .unwrap(),
+                )
+                .unwrap();
+                let (candidate, context) = Candidate::plan(proof, session);
+                let pending = admit(&destination, candidate, &context)
+                    .unwrap()
+                    .ready()
+                    .unwrap_err();
+                assert!(matches!(
+                    pending
+                        .discharge(&ResolvedBindings::default(), session)
+                        .unwrap_err()
+                        .resolution_error(),
+                    ResolutionError::Knowledge(_)
+                ));
+            });
+        },
+    );
 }
 
 #[test]
@@ -1294,7 +1315,7 @@ fn conversion_error_display_label_remains_available_for_4260() {
     let error = AdmissionErrors::conversion(source.clone());
     assert_eq!(error.to_string(), "conversion admission failed");
     assert_eq!(error.resolution_error(), &source);
-    assert_eq!(error.into_resolution_error(), source);
+    assert_eq!(ResolutionError::from(error), source);
     assert_eq!(
         AdmissionErrors::from(source).to_string(),
         "value admission failed"

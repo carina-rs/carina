@@ -4,77 +4,65 @@ use super::*;
 use crate::resource::ResourceId;
 use crate::schema::{LeafPathSegment, SchemaKind, SchemaRegistry};
 
-fn owner(catalog: &ProviderContext, provider: &str) -> DeclarationOwner {
-    let mut owners = std::collections::BTreeSet::new();
-    owners.extend(
-        catalog
-            .resource_types
-            .iter()
-            .map(|(owner, _)| owner.as_str()),
-    );
-    owners.extend(
-        catalog
-            .known_custom_types()
-            .iter()
-            .flat_map(|identity| identity.provider_names()),
-    );
-    owners
-        .iter()
-        .position(|owner| *owner == provider)
-        .map(DeclarationOwner::Catalog)
-        .unwrap_or(DeclarationOwner::Builtin)
+/// A catalog descriptor requires a registered schema owner.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DestinationError {
+    #[error("unknown schema owner '{provider}'")]
+    UnknownOwner { provider: String },
+    #[error("schema unavailable for {resource}")]
+    SchemaUnavailable { resource: Box<ResourceId> },
+    #[error("unknown attribute '{attribute}' on {resource}")]
+    UnknownAttribute {
+        resource: Box<ResourceId>,
+        attribute: String,
+    },
+}
+
+fn identity(
+    schema: crate::schema::OwnerBoundResourceSchema<'_>,
+    id: &ResourceId,
+    catalog: &ProviderContext,
+) -> DestinationIdentity {
+    DestinationIdentity {
+        declaration: DeclarationIdentity {
+            owner: schema.schema_type_owner().clone(),
+            schema: schema.schema().admission_identity,
+        },
+        instance: InstanceIdentity::Resource(id.clone()),
+        path: vec![],
+        revision: CatalogRevision(catalog.custom_types.clone()),
+    }
 }
 
 impl SchemaRegistry {
-    fn admission_destination<K: DestinationKind>(
-        &self,
-        id: &ResourceId,
-        kind: SchemaKind,
-        catalog: &ProviderContext,
-    ) -> Destination<K> {
-        let schema = self
-            .get(&id.provider, &id.resource_type, kind)
-            .map(|schema| schema.schema().admission_identity)
-            .unwrap_or(self.unavailable_admission_identity);
-        Destination::catalogued(
-            DestinationIdentity {
-                declaration: DeclarationIdentity {
-                    owner: owner(catalog, &id.provider),
-                    schema,
-                },
-                instance: InstanceIdentity::Resource(id.clone()),
-                path: vec![],
-                revision: CatalogRevision(catalog.custom_types.clone()),
-            },
-            format!("{id}"),
-        )
-    }
-
-    pub fn resource_destination(
-        &self,
-        id: &ResourceId,
-        catalog: &ProviderContext,
-    ) -> Destination<kind::ResourceAttribute> {
-        self.admission_destination(id, SchemaKind::Resource, catalog)
-    }
-
-    pub fn data_source_destination(
-        &self,
-        id: &ResourceId,
-        catalog: &ProviderContext,
-    ) -> Destination<kind::DataSourceAttribute> {
-        self.admission_destination(id, SchemaKind::DataSource, catalog)
-    }
-
     fn admission_attribute<K: DestinationKind>(
         &self,
         id: &ResourceId,
         attribute: &str,
         kind: SchemaKind,
         catalog: &ProviderContext,
-    ) -> Option<Destination<K>> {
-        self.get(&id.provider, &id.resource_type, kind)?
+    ) -> Result<Destination<K>, DestinationError> {
+        let schema = self
+            .get(&id.provider, &id.resource_type, kind)
+            .ok_or_else(|| {
+                if self.assignability_closures().contains_key(
+                    &crate::parser::SchemaTypeOwner::Provider(id.provider.clone()),
+                ) {
+                    DestinationError::SchemaUnavailable {
+                        resource: Box::new(id.clone()),
+                    }
+                } else {
+                    DestinationError::UnknownOwner {
+                        provider: id.provider.clone(),
+                    }
+                }
+            })?;
+        schema
             .admission_attribute(id, attribute, catalog)
+            .ok_or_else(|| DestinationError::UnknownAttribute {
+                resource: Box::new(id.clone()),
+                attribute: attribute.into(),
+            })
     }
 
     pub fn resource_attribute_destination(
@@ -82,7 +70,7 @@ impl SchemaRegistry {
         id: &ResourceId,
         attribute: &str,
         catalog: &ProviderContext,
-    ) -> Option<Destination<kind::ResourceAttribute>> {
+    ) -> Result<Destination<kind::ResourceAttribute>, DestinationError> {
         self.admission_attribute(id, attribute, SchemaKind::Resource, catalog)
     }
 
@@ -91,7 +79,7 @@ impl SchemaRegistry {
         id: &ResourceId,
         attribute: &str,
         catalog: &ProviderContext,
-    ) -> Option<Destination<kind::DataSourceAttribute>> {
+    ) -> Result<Destination<kind::DataSourceAttribute>, DestinationError> {
         self.admission_attribute(id, attribute, SchemaKind::DataSource, catalog)
     }
 }
@@ -103,18 +91,7 @@ impl crate::schema::OwnerBoundResourceSchema<'_> {
         name: &str,
         catalog: &ProviderContext,
     ) -> Destination<K> {
-        Destination::catalogued(
-            DestinationIdentity {
-                declaration: DeclarationIdentity {
-                    owner: owner(catalog, &id.provider),
-                    schema: self.schema().admission_identity,
-                },
-                instance: InstanceIdentity::Resource(id.clone()),
-                path: vec![],
-                revision: CatalogRevision(catalog.custom_types.clone()),
-            },
-            name.into(),
-        )
+        Destination::catalogued(identity(self, id, catalog), name.into())
     }
 
     pub(crate) fn admission_attribute<K: DestinationKind>(
@@ -130,20 +107,9 @@ impl crate::schema::OwnerBoundResourceSchema<'_> {
             .attributes()
             .keys()
             .position(|name| name == effective.name())?;
-        let mut destination = Destination::catalogued(
-            DestinationIdentity {
-                declaration: DeclarationIdentity {
-                    owner: owner(catalog, &id.provider),
-                    schema: self.schema().admission_identity,
-                },
-                instance: InstanceIdentity::Resource(id.clone()),
-                path: vec![],
-                revision: CatalogRevision(catalog.custom_types.clone()),
-            },
-            attribute.into(),
-        );
+        let mut destination =
+            Destination::catalogued(identity(self, id, catalog), attribute.into());
         destination.identity.path.push(ordinal);
-        destination.label = attribute.into();
         destination.contract = Some(Box::new(DestinationContract {
             attr: effective.field_type().clone(),
             defs: self.schema().as_schema().defs.clone(),
@@ -155,7 +121,7 @@ impl crate::schema::OwnerBoundResourceSchema<'_> {
     }
 }
 
-fn findings<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
+fn admission_findings<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
     result: &mut Result<Admission<K, P, B>, AdmissionErrors>,
 ) -> crate::schema::ValueValidationFindings {
     match result {
@@ -207,14 +173,15 @@ pub fn admit_plan_attributes<K: RechecksResolved>(
                     .admission_attribute::<K>(id, name, session.catalog())
                     .expect("schema selected attribute");
                 let (candidate, boundary) = Candidate::plan(attributes[name].clone(), session);
-                findings(&mut admit(&destination, candidate, &boundary))
+                admission_findings(&mut admit(&destination, candidate, &boundary))
             },
         )
 }
 
-/// Every selected slot is filled only with a placement from this gate.
+/// Minted only after every selected attribute has produced a placement.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AdmittedAttributes<K: RechecksResolved> {
-    _slots: std::collections::HashMap<String, PlacedValue<K>>,
+    kind: PhantomData<K>,
 }
 
 pub(crate) enum ApplyAdmissionErrors {
@@ -294,58 +261,97 @@ fn admit_apply_attributes<K: RechecksResolved>(
     resolver: &dyn crate::parser::CustomTypeResolver,
 ) -> Result<AdmittedAttributes<K>, ApplyAdmissionErrors> {
     use std::cell::RefCell;
-    let projected = resource_attributes
-        .iter()
-        .map(|(name, value)| {
-            let value = authored
-                .and_then(|(attributes, _)| attributes.get(name))
-                .unwrap_or(value);
-            value
-                .knowledge(&KnowledgeContext::apply(bindings))
-                .map(|proof| (name.clone(), proof))
-        })
-        .collect::<Result<std::collections::HashMap<_, _>, _>>()?;
+    let mut projected = std::collections::HashMap::new();
+    let mut projection_errors = Vec::new();
+    for (name, value) in resource_attributes {
+        let value = authored
+            .and_then(|(attributes, _)| attributes.get(name))
+            .unwrap_or(value);
+        match value.knowledge(&KnowledgeContext::apply(bindings)) {
+            Ok(proof) => {
+                projected.insert(name.clone(), proof);
+            }
+            Err(error) => projection_errors.push((name, AdmissionErrors::from(error))),
+        }
+    }
     let classified = projected
         .iter()
         .map(|(name, proof)| (name.clone(), (**proof).clone()))
         .collect();
-    let slots = RefCell::new(std::collections::HashMap::new());
-    let failure = RefCell::new(None);
+    let failures = RefCell::new(Vec::new());
     let lookup = crate::parser::custom_type_lookup_for_schema(resolver, schema);
-    let report = schema.schema().as_schema().validate_resolved_admission_report(
-        &classified, authored.map(|(_, names)| names), &|name| quoted.contains(name), &lookup, &|name, _| {
-            let destination = schema.admission_attribute::<K>(id, name, session.catalog()).expect("schema selected attribute");
-            let result = Candidate::apply(projected[name].clone(), session).and_then(|(candidate, mut boundary)| {
-                boundary.lookup = Some(&lookup);
-                admit(&destination, candidate, &boundary)
-            });
-            match result {
-                Ok(mut admission) => {
-                    let findings = admission.take_findings();
-                    match admission {
-                        Admission::Ready(placed) => { slots.borrow_mut().insert(name.into(), placed); }
-                        Admission::Pending(pending) => { *failure.borrow_mut() = Some(KnowledgeError::<AbsoluteBindingAddress>::UnresolvedAtBoundary { sites: pending.sites().to_vec() }.into()); }
+    let mut report = schema
+        .schema()
+        .as_schema()
+        .validate_resolved_admission_report(
+            &classified,
+            authored.map(|(_, names)| names),
+            &|name| quoted.contains(name),
+            &lookup,
+            &|name, _| {
+                let destination = schema
+                    .admission_attribute::<K>(id, name, session.catalog())
+                    .expect("schema selected attribute");
+                let result = Candidate::apply(projected[name].clone(), session).and_then(
+                    |(candidate, mut boundary)| {
+                        boundary.lookup = Some(&lookup);
+                        admit(&destination, candidate, &boundary)
+                    },
+                );
+                match result {
+                    Ok(mut admission) => {
+                        let findings = admission.take_findings();
+                        match admission {
+                            Admission::Ready(_placed) => {}
+                            Admission::Pending(pending) => {
+                                let error = AdmissionErrors::from(KnowledgeError::<
+                                    AbsoluteBindingAddress,
+                                >::UnresolvedAtBoundary {
+                                    sites: pending.sites().to_vec(),
+                                });
+                                let findings =
+                                    admission_findings::<K, NoPlaceholder, AbsoluteBindingAddress>(
+                                        &mut Err(error.clone()),
+                                    );
+                                failures.borrow_mut().push(error);
+                                return findings;
+                            }
+                        }
+                        findings
                     }
-                    findings
-                }
-                Err(mut error) => {
-                    match error.take_findings() {
+                    Err(mut error) => match error.take_findings() {
                         Some(findings) => findings,
-                        None => { *failure.borrow_mut() = Some(error); Default::default() }
-                    }
+                        None => {
+                            let findings =
+                                admission_findings::<K, NoPlaceholder, AbsoluteBindingAddress>(
+                                    &mut Err(error.clone()),
+                                );
+                            failures.borrow_mut().push(error);
+                            findings
+                        }
+                    },
                 }
-            }
-        },
-    );
-    if let Some(error) = failure.into_inner() {
-        return Err(ApplyAdmissionErrors::Admission(error));
+            },
+        );
+    let mut failures = failures.into_inner();
+    for (name, error) in projection_errors {
+        for finding in
+            admission_findings::<K, NoPlaceholder, AbsoluteBindingAddress>(&mut Err(error.clone()))
+                .local_errors()
+        {
+            report.push_attribute_error(name, finding.clone());
+        }
+        failures.push(error);
+    }
+    // Preserve the established single unresolved-input boundary error. Mixed
+    // or multiple failures are returned with the complete attribute report.
+    if failures.len() == 1 && report.errors().count() == 1 {
+        return Err(ApplyAdmissionErrors::Admission(failures.pop().unwrap()));
     }
     if report.errors().next().is_some() {
         return Err(ApplyAdmissionErrors::Constraints(report));
     }
-    Ok(AdmittedAttributes {
-        _slots: slots.into_inner(),
-    })
+    Ok(AdmittedAttributes { kind: PhantomData })
 }
 
 /// The retained expression check used by the authored attribute walk.
@@ -436,13 +442,13 @@ pub(crate) fn admit_validation_attributes<
             };
             boundary.assignment = Some(&assignment);
             boundary.untyped = Some(&untyped);
-            // The collector reports classification errors and retains Failed
-            // inputs for presence checks. At validation, an admission failure
-            // without schema/assignment findings must not manufacture another
-            // diagnostic from that retained Knowledge evidence.
-            match admit(&destination, candidate, &boundary) {
-                Ok(mut admission) => admission.take_findings(),
-                Err(mut error) => error.take_findings().unwrap_or_default(),
+            let findings = admission_findings(&mut admit(&destination, candidate, &boundary));
+            if proof.failure().is_some() {
+                // Keep attempted failure evidence and attribute presence. The
+                // expression/collector pass owns its validation diagnostic.
+                findings.retained_failure()
+            } else {
+                findings
             }
         }),
     )
@@ -622,11 +628,6 @@ pub fn resource_attribute_admissions<
                     ));
                 },
             );
-            if let Some(finding) = errors.into_iter().next() {
-                return Err(assignment::reference_error(
-                    AdmissionReferenceError::Authored(Box::new(finding)),
-                ));
-            }
             let computed = crate::validation::visit_computed_accesses_with_sink(
                 value,
                 None,
@@ -661,10 +662,26 @@ pub fn resource_attribute_admissions<
                     .collect()
                 },
             );
-            if let Some(error) = computed.into_iter().next() {
-                return Err(assignment::reference_error(
-                    AdmissionReferenceError::Computed(error),
-                ));
+            let errors = errors
+                .into_iter()
+                .map(|finding| {
+                    assignment::reference_error(AdmissionReferenceError::Authored(Box::new(
+                        finding,
+                    )))
+                })
+                .chain(computed.into_iter().map(|error| {
+                    assignment::reference_error(AdmissionReferenceError::Computed(error))
+                }))
+                .collect::<Vec<_>>();
+            if !errors.is_empty() {
+                let path = LeafPath::from_segments(_path.segments().iter().skip(1).cloned());
+                return Ok(crate::schema::value_validation::AssignmentFindings {
+                    errors: errors
+                        .into_iter()
+                        .map(|error| (path.clone(), error))
+                        .collect(),
+                    ..Default::default()
+                });
             }
             if let Some(judged) = judge_argument(expression.assignment_value(value)) {
                 return judged;
@@ -763,4 +780,125 @@ pub fn resource_attribute_admissions<
         Some(&check),
         Some(&declarations),
     )
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn review_r2_validation_and_plan_keep_resolution_failures_without_findings() {
+        let failure = || {
+            Err::<Admission<kind::ResourceAttribute>, _>(AdmissionErrors::from(
+                ResolutionError::Message("reference resolution failed".into()),
+            ))
+        };
+        let validated = admission_findings(&mut failure());
+        let planned = admission_findings(&mut failure());
+        assert_eq!(validated, planned);
+        assert!(matches!(
+            validated.local_error(),
+            Some(TypeError::Reference { .. })
+        ));
+    }
+
+    #[test]
+    fn review_r6_apply_reports_unresolved_and_constraint_failures_together() {
+        let catalog = crate::parser::LoadedProviderContext::empty_for_test();
+        let mut schemas = SchemaRegistry::new();
+        let mut schema = crate::schema::ResourceSchema::new("Sink");
+        for name in ["first", "second", "third", "fourth"] {
+            schema = schema.attribute(
+                crate::schema::AttributeSchema::optional(
+                    name,
+                    crate::schema::AttributeType::string(),
+                )
+                .build(),
+            );
+        }
+        schemas.insert("test", schema.validate().unwrap());
+        let resource = crate::resource::Resource::with_provider("test", "Sink", "sink", None)
+            .with_attribute("first", Value::root_resource_ref("a", "output", vec![]))
+            .with_attribute(
+                "second",
+                Value::Concrete(crate::resource::ConcreteValue::Int(1)),
+            )
+            .with_attribute("third", Value::root_resource_ref("b", "output", vec![]))
+            .with_attribute(
+                "fourth",
+                Value::Concrete(crate::resource::ConcreteValue::Int(2)),
+            );
+        crate::validation::deferred_types::with_session_for_test(
+            catalog.as_provider_context(),
+            |session| {
+                let result = admit_apply_resource(
+                    &resource,
+                    None,
+                    schemas.get_for(&resource).unwrap(),
+                    &ResolvedBindings::default(),
+                    session,
+                    catalog.as_provider_context().custom_type_resolver(),
+                );
+                let errors = match result {
+                    Err(ApplyAdmissionErrors::Constraints(report)) => report
+                        .errors_with_paths()
+                        .map(|(error, key)| format!("{}: {error}", key.unwrap().0))
+                        .collect::<Vec<_>>(),
+                    Err(ApplyAdmissionErrors::Admission(error)) => {
+                        vec![error.resolution_error().to_string()]
+                    }
+                    Ok(_) => panic!("invalid attributes were admitted"),
+                };
+                assert_eq!(errors.len(), 4, "{errors:#?}");
+                for name in ["first", "second", "third", "fourth"] {
+                    assert!(
+                        errors.iter().any(|error| error.contains(name)),
+                        "missing {name}: {errors:#?}"
+                    );
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn review_r8_owner_identity_is_independent_of_other_loaded_providers() {
+        let mut catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            crate::schema::ResourceSchema::new("Sink")
+                .validate()
+                .unwrap(),
+        );
+        let id = ResourceId::with_provider_identity("test", "Sink", "sink", None);
+        let before = identity(
+            schemas.get("test", "Sink", SchemaKind::Resource).unwrap(),
+            &id,
+            &catalog,
+        )
+        .declaration
+        .owner;
+        catalog
+            .resource_types
+            .insert(("aaa".into(), "Other".into()));
+        schemas.insert(
+            "aaa",
+            crate::schema::ResourceSchema::new("Other")
+                .validate()
+                .unwrap(),
+        );
+        let after = identity(
+            schemas.get("test", "Sink", SchemaKind::Resource).unwrap(),
+            &id,
+            &catalog,
+        )
+        .declaration
+        .owner;
+        assert_eq!(before, after);
+        let unknown = ResourceId::with_provider_identity("unknown", "Sink", "sink", None);
+        assert!(matches!(
+            schemas.resource_attribute_destination(&unknown, "value", &catalog),
+            Err(DestinationError::UnknownOwner { .. })
+        ));
+    }
 }

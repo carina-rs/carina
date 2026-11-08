@@ -5006,7 +5006,10 @@ pub(super) mod tests {
                 let wit_id = wasm_convert::core_to_wit_resource_id(&id);
                 let bindings = carina_core::binding_index::ResolvedBindings::default();
                 let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-                let schemas = carina_core::schema::SchemaRegistry::new();
+                let schemas = carina_core::test_utils::preparation_schemas(
+                    &resource.id,
+                    carina_core::schema::SchemaKind::Resource,
+                );
                 let context = carina_core::executor::ProviderPreparationContext::new(
                     &bindings,
                     &gate,
@@ -5263,7 +5266,10 @@ pub(super) mod tests {
 
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = carina_core::schema::SchemaRegistry::new();
+        let schemas = carina_core::test_utils::preparation_schemas(
+            &id,
+            carina_core::schema::SchemaKind::Resource,
+        );
         let provider = std::sync::Arc::new(PendingFixtureProvider {
             captured_attempt: Some(std::sync::Mutex::new(None)),
         });
@@ -5324,7 +5330,10 @@ pub(super) mod tests {
         resource.set_attr("name", test_string_value("example"));
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = carina_core::schema::SchemaRegistry::new();
+        let schemas = carina_core::test_utils::preparation_schemas(
+            &resource.id,
+            carina_core::schema::SchemaKind::Resource,
+        );
         let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(Vec::new()),
             schemas.clone(),
@@ -5459,7 +5468,10 @@ pub(super) mod tests {
         let provider_configs = [];
         let normalizer = carina_core::provider::NoopNormalizer;
         let factories = [];
-        let schemas = carina_core::schema::SchemaRegistry::new();
+        let schemas = carina_core::test_utils::preparation_schemas(
+            &resource.id,
+            carina_core::schema::SchemaKind::Resource,
+        );
         let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
             Arc::new(Vec::new()),
             schemas.clone(),

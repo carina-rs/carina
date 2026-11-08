@@ -36,6 +36,7 @@ use crate::schema::{
     CompiledResourceSchema as ResourceSchema, SchemaKind, SchemaRegistry, TypeError,
     ValidatedConfigSchema,
 };
+use crate::validation::admission::{RechecksResolved, attributes::AdmittedAttributes, kind};
 use crate::value::SerializationError;
 
 /// An immutable value that passed the provider-boundary constraint gate.
@@ -68,21 +69,23 @@ use crate::value::SerializationError;
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq)]
-pub struct ProviderReady<T: ResourceWirePayload> {
+pub struct ProviderReady<T: ResourceWirePayload, K: RechecksResolved = kind::ResourceAttribute> {
     value: WireReady<T>,
     directives: ProviderDirectives,
+    admission: AdmittedAttributes<K>,
     // The same sent values before dispatch removes secret annotations. Keep
     // scalar/container provenance available only to the ingestion boundary.
     diagnostic_attributes: IndexMap<String, Value>,
 }
 
-impl<T: ResourceWirePayload> ProviderReady<T> {
+impl<T: ResourceWirePayload, K: RechecksResolved> ProviderReady<T, K> {
     fn settled(
         pending: crate::validation::deferred_types::PendingProviderTypeChecks<
             '_,
             (T, ProviderDirectives),
         >,
         diagnostic_attributes: IndexMap<String, Value>,
+        admission: AdmittedAttributes<K>,
     ) -> Result<Self, ProviderPreparationError> {
         let mut diagnostics = Vec::new();
         let (value, directives) = pending.publish(&mut diagnostics)?;
@@ -100,6 +103,7 @@ impl<T: ResourceWirePayload> ProviderReady<T> {
             value: WireReady::try_new(value, target)?,
             directives,
             diagnostic_attributes,
+            admission,
         })
     }
 
@@ -166,7 +170,7 @@ impl<T: ResourceWirePayload> ProviderReady<T> {
     }
 }
 
-impl<T: ResourceWirePayload> Deref for ProviderReady<T> {
+impl<T: ResourceWirePayload, K: RechecksResolved> Deref for ProviderReady<T, K> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -178,7 +182,8 @@ impl<T: ResourceWirePayload> Deref for ProviderReady<T> {
 pub type ProviderReadyResource = ProviderReady<ResolvedResource<ProviderModuleSource>>;
 
 /// A fully resolved data source whose known input constraints have run.
-pub type ProviderReadyDataSource = ProviderReady<ResolvedDataSource<ProviderModuleSource>>;
+pub type ProviderReadyDataSource =
+    ProviderReady<ResolvedDataSource<ProviderModuleSource>, kind::DataSourceAttribute>;
 
 /// Provider configuration attributes whose schema-known enum leaves are in
 /// host-resolved API spelling.
@@ -594,6 +599,8 @@ pub enum ProviderPreparationError {
     /// The managed resource has no schema to classify write-only attributes.
     #[error("{resource}: no managed schema is registered")]
     MissingManagedSchema { resource: ResourceId },
+    #[error("{resource}: no data-source schema is registered")]
+    MissingDataSourceSchema { resource: ResourceId },
     /// An ignored write-only value would have to be resent even though its
     /// current provider value is unobservable.
     #[error(transparent)]
@@ -896,41 +903,52 @@ fn validate_provider_config_attributes<P: PlaceholderKind, B: BindingAddress>(
 /// a chain renderer repeat it while still omitting the remaining items. All
 /// structured errors remain available through [`Self::errors`].
 #[derive(Debug)]
-pub struct ProviderValueConstraintErrors(Vec<TypeError>, Vec<TypeError>);
+pub struct ProviderValueConstraintErrors(Box<crate::schema::ResourceValueValidation>);
 
 impl ProviderValueConstraintErrors {
     pub fn errors(&self) -> &[TypeError] {
-        &self.0
+        self.0.error_slice()
     }
 
     fn from_admission(report: crate::schema::ResourceValueValidation) -> Self {
-        let diagnostics = report
-            .errors()
-            .map(|error| report.diagnostic_error(error))
-            .collect();
-        Self(report.into_errors(), diagnostics)
+        Self(Box::new(report))
     }
 }
 
 impl From<Vec<TypeError>> for ProviderValueConstraintErrors {
     fn from(errors: Vec<TypeError>) -> Self {
-        Self(errors.clone(), errors)
+        Self(Box::new(
+            crate::schema::ResourceValueValidation::from_errors(errors),
+        ))
     }
 }
 
 impl fmt::Display for ProviderValueConstraintErrors {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for (index, error) in self.1.iter().enumerate() {
+        for (index, error) in self.0.errors().enumerate() {
             if index > 0 {
                 f.write_str("; ")?;
             }
-            error.fmt(f)?;
+            self.0.diagnostic_error(error).fmt(f)?;
         }
         Ok(())
     }
 }
 
 impl std::error::Error for ProviderValueConstraintErrors {}
+
+#[cfg(test)]
+#[test]
+fn review_r10_constraint_display_uses_the_structured_errors() {
+    let mut errors = ProviderValueConstraintErrors::from(vec![TypeError::MissingRequired {
+        name: "old".into(),
+    }]);
+    *errors.0 =
+        crate::schema::ResourceValueValidation::from_errors(vec![TypeError::MissingRequired {
+            name: "current".into(),
+        }]);
+    assert_eq!(errors.to_string(), errors.errors()[0].to_string());
+}
 
 /// Validate and prepare a resource for provider dispatch.
 ///
@@ -1001,12 +1019,24 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
     context
         .module_gate
         .check(context.bindings, context.type_checks)?;
-    let _admitted = if let Some(schema) = context.schemas.get_for(resource) {
+    let schema = context.schemas.get_for(resource).ok_or_else(|| {
+        ProviderPreparationError::MissingManagedSchema {
+            resource: resource.id.clone(),
+        }
+    });
+    if schema.is_err() {
+        crate::resource::assert_resource_known_for_apply(
+            resource,
+            &crate::resource::knowledge::KnowledgeContext::apply(context.bindings),
+        )?;
+    }
+    let schema = schema?;
+    let admitted = {
         let authored = match &value_check {
             ResourceValueCheck::All => None,
             ResourceValueCheck::ApplyResolved { attributes, names } => Some((attributes, names)),
         };
-        let admitted = validate_known_provider_values(
+        validate_known_provider_values(
             &resource.id,
             crate::validation::admission::attributes::admit_apply_resource(
                 resource,
@@ -1016,11 +1046,9 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
                 context.type_checks,
                 context.custom_type_resolver(),
             ),
-        )?;
-        Some(admitted)
-    } else {
-        None
+        )?
     };
+
     let (normalized, restored) = apply_dispatch_desired_normalization(
         value,
         context.provider_configs,
@@ -1053,6 +1081,7 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
     ProviderReady::settled(
         context.type_checks.pending((resource, directives)),
         diagnostic_attributes,
+        admitted,
     )
 }
 
@@ -1092,12 +1121,29 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
     context
         .module_gate
         .check(context.bindings, context.type_checks)?;
-    let _admitted = if let Some(schema) = context.schemas.get_for_data_source(resource) {
+    let schema = context
+        .schemas
+        .get_for_data_source(resource)
+        .ok_or_else(|| ProviderPreparationError::MissingDataSourceSchema {
+            resource: resource.id.clone(),
+        });
+    if schema.is_err() {
+        for value in resource.attributes.values() {
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::apply(
+                    context.bindings,
+                ))
+                .map_err(crate::resource::knowledge_serialization_error)
+                .and_then(crate::resource::require_known_for_apply)?;
+        }
+    }
+    let schema = schema?;
+    let admitted = {
         let authored = match &value_check {
             ResourceValueCheck::All => None,
             ResourceValueCheck::ApplyResolved { attributes, names } => Some((attributes, names)),
         };
-        let admitted = validate_known_provider_values(
+        validate_known_provider_values(
             &resource.id,
             crate::validation::admission::attributes::admit_apply_data_source(
                 resource,
@@ -1107,11 +1153,9 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
                 context.type_checks,
                 context.custom_type_resolver(),
             ),
-        )?;
-        Some(admitted)
-    } else {
-        None
+        )?
     };
+
     crate::value::canonicalize_data_sources_with_schemas(
         std::slice::from_mut(&mut value),
         context.schemas,
@@ -1140,6 +1184,7 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
     ProviderReady::settled(
         context.type_checks.pending((value, directives)),
         diagnostic_attributes,
+        admitted,
     )
 }
 
@@ -1767,7 +1812,11 @@ mod provider_config_tests {
                     panic!("expected authored value constraint, got {error:?}")
                 };
                 assert_eq!(
-                    errors.0.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    errors
+                        .errors()
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
                     vec!["owner rejected `VpcId`: owner accepts `vpc-good`, not `bad`"]
                 );
                 assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -2507,23 +2556,20 @@ mod provider_config_tests {
                 &|_| false,
                 &resolver,
             ),
-            schema.validate_known_values_with_resolver(
-                &crate::schema::classified_attributes(&attributes)
-                    .unwrap()
-                    .into_iter()
-                    .map(|(name, value)| (name, value.into_known().unwrap()))
-                    .collect(),
+            crate::schema::tests::resolved_admission_for_test(
+                schema.schema().as_schema(),
+                &crate::schema::classified_attributes(&attributes).unwrap(),
+                None,
                 &|_| false,
-                &resolver,
+                &crate::parser::custom_type_lookup_for_schema(&resolver, schema),
             ),
-            schema
-                .schema()
-                .validate_selected_known_values_with_origins_and_lookup(
-                    &crate::schema::classified_attributes(&attributes).unwrap(),
-                    &HashSet::from(["value".to_string()]),
-                    &|_| false,
-                    &crate::parser::custom_type_lookup_for_schema(&resolver, schema),
-                ),
+            crate::schema::tests::resolved_admission_for_test(
+                schema.schema().as_schema(),
+                &crate::schema::classified_attributes(&attributes).unwrap(),
+                Some(&HashSet::from(["value".to_string()])),
+                &|_| false,
+                &crate::parser::custom_type_lookup_for_schema(&resolver, schema),
+            ),
         ] {
             assert_eq!(
                 errors.unwrap_err(),

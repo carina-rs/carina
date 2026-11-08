@@ -65,7 +65,7 @@
 //! ```
 //! use carina_core::{parser::ProviderContext, resource::ResourceId, schema::SchemaRegistry};
 //! fn descriptor(registry: &SchemaRegistry, id: &ResourceId, catalog: &ProviderContext) {
-//!     let _ = registry.resource_destination(id, catalog);
+//!     let _ = registry.resource_attribute_destination(id, "value", catalog);
 //! }
 //! ```
 //! ```compile_fail,E0451
@@ -127,7 +127,6 @@ use crate::parser::ProviderContext;
 use crate::resolver::ResolutionError;
 use crate::resource::knowledge::{
     Apply, Knowledge, KnowledgeContext, KnowledgeError, KnownValue, PendingSite, PlanResolved,
-    Validation,
 };
 use crate::resource::{
     AbsoluteBindingAddress, BindingAddress, NoPlaceholder, PlaceholderKind, Value,
@@ -139,9 +138,7 @@ pub mod attributes;
 #[cfg(test)]
 mod tests;
 
-pub use assignment::{
-    AssignmentProof, AssignmentVerdict, ReferenceCandidate, SchemaObligation, judge_assignment,
-};
+pub use assignment::{AssignmentProof, AssignmentVerdict, ReferenceCandidate, SchemaObligation};
 
 mod sealed {
     pub trait Sealed: Sized {
@@ -287,13 +284,8 @@ impl std::fmt::Debug for CatalogRevision {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum DeclarationOwner {
-    Catalog(usize),
-    Builtin,
-}
-#[derive(Debug, Clone, PartialEq, Eq)]
 struct DeclarationIdentity {
-    owner: DeclarationOwner,
+    owner: crate::parser::SchemaTypeOwner,
     schema: DeclarationId,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,20 +391,7 @@ pub struct AdmissionContext<
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
-    pub fn validation<'a>(
-        proof: Knowledge<'a, P, B, Validation>,
-        bindings: &'a BindingIndex<'a, B>,
-        provider: &'a dyn ProviderTypeCheckContext,
-    ) -> (Self, AdmissionContext<'a, P, B>) {
-        Self::paired(
-            proof.to_value(),
-            AdmissionProof::Validation(proof.into_classification()),
-            Some(bindings),
-            provider,
-        )
-    }
-
-    pub(crate) fn validation_classified<'a>(
+    pub fn validation_classified<'a>(
         proof: crate::resource::knowledge::Classification<'a, P, B>,
         bindings: Option<&'a BindingIndex<'a, B>>,
         provider: &'a dyn ProviderTypeCheckContext,
@@ -742,7 +721,7 @@ impl<B: BindingAddress> From<KnowledgeError<B>> for AdmissionErrors {
 }
 impl From<AdmissionErrors> for ResolutionError {
     fn from(error: AdmissionErrors) -> Self {
-        error.into_resolution_error()
+        error.source
     }
 }
 impl crate::resource::InsideSecret for AdmissionErrors {
@@ -778,9 +757,6 @@ impl AdmissionErrors {
     }
     pub fn resolution_error(&self) -> &ResolutionError {
         &self.source
-    }
-    pub(crate) fn into_resolution_error(self) -> ResolutionError {
-        self.source
     }
 }
 

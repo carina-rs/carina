@@ -915,7 +915,10 @@ fn aws_credential_probe_data_source() -> carina_core::provider::ProviderReadyDat
     let resource = DataSource::with_provider("aws", "test.aws_credentials", "credentials", None);
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::schema::SchemaRegistry::new();
+    let schemas = carina_core::test_utils::preparation_schemas(
+        &resource.id,
+        carina_core::schema::SchemaKind::DataSource,
+    );
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
         schemas.clone(),
@@ -7190,7 +7193,10 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     ]);
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::schema::SchemaRegistry::new();
+    let schemas = carina_core::test_utils::preparation_schemas(
+        &resource.id,
+        carina_core::schema::SchemaKind::DataSource,
+    );
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
         schemas.clone(),
@@ -7433,7 +7439,10 @@ async fn raw_data_source_floats_retain_resource_operation_and_constructor_source
         let resource = DataSource::with_provider("mock", "test.data_source", selector, None);
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = carina_core::schema::SchemaRegistry::new();
+        let schemas = carina_core::test_utils::preparation_schemas(
+            &resource.id,
+            carina_core::schema::SchemaKind::DataSource,
+        );
         carina_core::validation::deferred_types::with_session_for_test_async(
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             async |type_checks| {

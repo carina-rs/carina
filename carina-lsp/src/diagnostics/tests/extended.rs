@@ -3088,6 +3088,7 @@ mock.test.Thing {
         &schemas,
         &std::collections::HashSet::from(["mock".to_string()]),
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        &mut Vec::new(),
     )
     .expect_err("core validation rejects Count");
     assert!(
@@ -10265,11 +10266,12 @@ fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once()
                         .resolve_root_for_test(),
                 },
             );
-            let (candidate, boundary) = Candidate::validation(
+            let (candidate, boundary) = Candidate::validation_classified(
                 reference
                     .knowledge(&KnowledgeContext::validation())
-                    .unwrap(),
-                &bindings,
+                    .unwrap()
+                    .into_classification(),
+                Some(&bindings),
                 session,
             );
             let pending = admit(&destination, candidate, &boundary)
@@ -10277,9 +10279,12 @@ fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once()
                 .ready()
                 .expect_err("the reference must be pending");
             let literal = Value::Concrete(ConcreteValue::String("A".repeat(65).into()));
-            let (candidate, boundary) = Candidate::validation(
-                literal.knowledge(&KnowledgeContext::validation()).unwrap(),
-                &bindings,
+            let (candidate, boundary) = Candidate::validation_classified(
+                literal
+                    .knowledge(&KnowledgeContext::validation())
+                    .unwrap()
+                    .into_classification(),
+                Some(&bindings),
                 session,
             );
             let literal_error = admit(&destination, candidate, &boundary).unwrap_err();
@@ -17835,5 +17840,67 @@ fn secret_origin_4275_lsp_reference_errors_are_redacted() {
             .unwrap()
             .contains("private_field"),
         "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn review_r4_wait_admission_matches_validation_across_files() {
+    assert!(uses_resource_attribute_admission(
+        carina_core::parser::AnalysisItemKind::Wait
+    ));
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("providers.crn"), "provider aws {}\n").unwrap();
+    std::fs::write(
+        fixture.path().join("resources.crn"),
+        "let cert = aws.acm.Certificate { domain_name = 'example.com' }\n",
+    )
+    .unwrap();
+    let source = "let ready = wait cert { until = cert.status == 'ISSUED' }\nlet sink = aws.acm.Certificate { domain_name = [ready.status] }\n";
+    std::fs::write(fixture.path().join("main.crn"), source).unwrap();
+    let engine = test_engine_with_wait_target();
+    let diagnostics = analyze_with_buffer(&engine, fixture.path(), "main.crn", source);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected String, got List")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn review_r7_skipped_lookup_does_not_suppress_a_list_constraint() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "values",
+                    AttributeType::refined_list(
+                        AttributeType::string(),
+                        true,
+                        Some((Some(2), Some(4))),
+                        ListElements::AllowDuplicates,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let diagnostics = engine.analyze(
+        &create_document("let sink = mock.Sink { values = [missing.value] }\n"),
+        None,
+    );
+    assert!(
+        diagnostics.iter().any(
+            |diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+                && diagnostic
+                    .message
+                    .contains("length 1 is outside allowed range [2, 4]")
+        ),
+        "{diagnostics:#?}"
     );
 }

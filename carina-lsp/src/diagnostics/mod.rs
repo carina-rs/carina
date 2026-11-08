@@ -1617,12 +1617,17 @@ impl DiagnosticRun<'_> {
                         carina_core::parser::AnalysisItemKind::DataSource => carina_core::validation::admission::attributes::resource_attribute_admissions::<carina_core::validation::admission::kind::DataSourceAttribute, _, _, _>(
                             rref, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, expression_report, &binding_index, self.provider_context, &self.schemas,
                         ),
-                        carina_core::parser::AnalysisItemKind::Resource | carina_core::parser::AnalysisItemKind::DeferredResource => carina_core::validation::admission::attributes::resource_attribute_admissions::<carina_core::validation::admission::kind::ResourceAttribute, _, _, _>(
+                        kind if uses_resource_attribute_admission(kind) => carina_core::validation::admission::attributes::resource_attribute_admissions::<carina_core::validation::admission::kind::ResourceAttribute, _, _, _>(
                             rref, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, expression_report, &binding_index, self.provider_context, &self.schemas,
                         ),
-                        carina_core::parser::AnalysisItemKind::Composition | carina_core::parser::AnalysisItemKind::Wait => Default::default(),
+                        _ => Default::default(),
                     });
                     let mut reported_attribute_diagnostics = HashSet::new();
+                    let retained_failures = resource_attributes
+                        .keys()
+                        .filter(|name| value_validation.is_retained_failure(name))
+                        .map(String::as_str)
+                        .collect::<HashSet<_>>();
                     for (attr_name, authored_attr_value) in resource_attributes.iter() {
                         let location = rref.attribute_value_location(
                             attr_name,
@@ -1794,19 +1799,20 @@ impl DiagnosticRun<'_> {
                                         .clone(),
                                         tagged,
                                     );
-                                    diagnostics.extend(render_schema_diagnostic(
+                                    if let Some(diagnostic) = render_schema_diagnostic(
                                         doc,
                                         &finding,
                                         rref.replaceable_attribute_value(attr_name),
-                                    ));
-                                    reported_attribute_diagnostics
-                                        .insert(canonical_name.to_string());
+                                    ) {
+                                        diagnostics.push(diagnostic);
+                                        reported_attribute_diagnostics
+                                            .insert(canonical_name.to_string());
+                                    }
                                     continue;
                                 }
                             }
                             let symbolic = attr_findings.symbolic_errors().to_vec();
                             for (_path, error) in &symbolic {
-                                reported_attribute_diagnostics.insert(canonical_name.to_string());
                                 use carina_core::resource::SecretDiagnosticError;
                                 use carina_core::validation::admission::AdmissionReferenceError;
                                 let (location, severity, message) = match error {
@@ -1892,14 +1898,18 @@ impl DiagnosticRun<'_> {
                                     carina_core::parser::Located::new(location.clone(), message);
                                 if let Some(diagnostic) =
                                     render_merged(doc, &finding, severity, finding.detail().clone())
-                                    && !diagnostics.iter().any(|existing| {
+                                {
+                                    if !diagnostics.iter().any(|existing| {
                                         existing.range == diagnostic.range
                                             && existing.message == diagnostic.message
-                                    })
-                                {
-                                    diagnostics.push(diagnostic);
+                                    }) {
+                                        diagnostics.push(diagnostic);
+                                    }
+                                    // This diagnostic is now present, including
+                                    // when the expression pass emitted it first.
+                                    reported_attribute_diagnostics
+                                        .insert(canonical_name.to_string());
                                 }
-                                reported_attribute_diagnostics.insert(canonical_name.to_string());
                             }
 
                             let container_findings = attr_findings
@@ -1986,18 +1996,20 @@ impl DiagnosticRun<'_> {
                                     _ => None,
                                 };
                                 if let Some(message) = message {
-                                    reported_attribute_diagnostics
-                                        .insert(canonical_name.to_string());
                                     let finding = carina_core::parser::Located::new(
                                         rref.attribute_key_location(attr_name).clone(),
                                         message,
                                     );
-                                    diagnostics.extend(render_merged(
+                                    if let Some(diagnostic) = render_merged(
                                         doc,
                                         &finding,
                                         DiagnosticSeverity::WARNING,
                                         finding.detail().clone(),
-                                    ));
+                                    ) {
+                                        diagnostics.push(diagnostic);
+                                        reported_attribute_diagnostics
+                                            .insert(canonical_name.to_string());
+                                    }
                                 }
                             }
                         }
@@ -2006,6 +2018,27 @@ impl DiagnosticRun<'_> {
                     // Render the report produced by the single owner-bound walk.
                     {
                         for error in value_validation.errors() {
+                            if error
+                                .attribute_name()
+                                .is_some_and(|name| retained_failures.contains(name))
+                            {
+                                continue;
+                            }
+                            // Existence checks render lookup failures at their
+                            // reference tokens, even when admission emits none.
+                            if let TypeError::Reference { error, .. } = error
+                                && let carina_core::resource::SecretDiagnosticError::Public(error) = error.as_ref()
+                                && match error {
+                                    carina_core::validation::admission::AdmissionReferenceError::UnknownBinding { .. }
+                                    | carina_core::validation::admission::AdmissionReferenceError::Path(_)
+                                    | carina_core::validation::admission::AdmissionReferenceError::ProtectedBinding
+                                    | carina_core::validation::admission::AdmissionReferenceError::ProtectedAttribute => true,
+                                    carina_core::validation::admission::AdmissionReferenceError::Authored(finding) => finding.is_lookup_error(),
+                                    _ => false,
+                                }
+                            {
+                                continue;
+                            }
                             let error = error.clone();
                             if let carina_core::schema::TypeError::MissingRequired { name } = &error
                                 && pending_resource_sinks.iter().any(
@@ -2504,6 +2537,15 @@ fn build_enum_diagnostic(
         doc,
         &finding,
         resource.replaceable_attribute_value(attr_name),
+    )
+}
+
+fn uses_resource_attribute_admission(kind: carina_core::parser::AnalysisItemKind) -> bool {
+    matches!(
+        kind,
+        carina_core::parser::AnalysisItemKind::Resource
+            | carina_core::parser::AnalysisItemKind::DeferredResource
+            | carina_core::parser::AnalysisItemKind::Wait
     )
 }
 

@@ -269,6 +269,35 @@ fn custom_type_provider_rejection_keeps_masking_and_walkable_cause() {
     }
 }
 
+pub(crate) fn resolved_admission_for_test(
+    schema: &CompiledResourceSchema,
+    attributes: &HashMap<String, Classification<'_>>,
+    selected: Option<&HashSet<String>>,
+    is_string_literal: &dyn Fn(&str) -> bool,
+    lookup: CustomTypeLookup<'_>,
+) -> Result<(), Vec<TypeError>> {
+    let aliases = schema.block_name_map();
+    schema
+        .validate_resolved_admission_report(
+            attributes,
+            selected,
+            is_string_literal,
+            lookup,
+            &|name, proof| {
+                let canonical = aliases.get(name).map(String::as_str).unwrap_or(name);
+                let attribute = &schema.attributes[canonical];
+                value_validation::validate_value_with_lookup(
+                    attribute.attr_type(),
+                    proof,
+                    &schema.defs,
+                    FieldAncestry::from_input_mode(attribute.input_mode()),
+                    lookup,
+                )
+            },
+        )
+        .into_result()
+}
+
 static TEST_OWNER: std::sync::LazyLock<crate::parser::SchemaTypeOwner> =
     std::sync::LazyLock::new(|| crate::parser::SchemaTypeOwner::Provider("test".into()));
 
@@ -334,17 +363,20 @@ fn issue_4276_known_provider_populated_ancestry_keeps_required_fields_inert() {
     )]);
     // main enters through EffectiveAttribute::validate with ProviderPopulated ancestry.
     assert_eq!(
-        schema.validate_known_values_with_origins_and_lookup(
+        resolved_admission_for_test(
+            schema.as_schema(),
             &crate::schema::classified_attributes(&attributes).unwrap(),
+            None,
             &|_| false,
             no_lookup()
         ),
         Ok(())
     );
     assert_eq!(
-        schema.validate_selected_known_values_with_origins_and_lookup(
+        resolved_admission_for_test(
+            schema.as_schema(),
             &crate::schema::classified_attributes(&attributes).unwrap(),
-            &HashSet::from(["output".into()]),
+            Some(&HashSet::from(["output".into()])),
             &|_| false,
             no_lookup(),
         ),
@@ -384,8 +416,10 @@ fn issue_4276_known_provider_populated_ancestry_rejects_nested_assignment() {
         .unwrap_err()
         .with_attribute("output");
     assert_eq!(
-        schema.validate_known_values_with_origins_and_lookup(
+        resolved_admission_for_test(
+            schema.as_schema(),
             &crate::schema::classified_attributes(&attributes).unwrap(),
+            None,
             &|_| false,
             no_lookup()
         ),
@@ -4974,13 +5008,14 @@ fn enum_custom_lookup_receives_resolved_api_spelling() {
         Ok(())
     };
 
-    schema
-        .validate_known_values_with_origins_and_lookup(
-            &crate::schema::classified_attributes(&attributes).unwrap(),
-            &|_| false,
-            &lookup,
-        )
-        .unwrap();
+    resolved_admission_for_test(
+        &schema,
+        &crate::schema::classified_attributes(&attributes).unwrap(),
+        None,
+        &|_| false,
+        &lookup,
+    )
+    .unwrap();
 
     let seen = seen.into_inner().unwrap();
     assert!(matches!(
@@ -7089,8 +7124,10 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
     };
 
     assert_eq!(
-        schema.validate_known_values_with_origins_and_lookup(
+        resolved_admission_for_test(
+            schema.as_schema(),
             &crate::schema::classified_attributes(&attributes).unwrap(),
+            None,
             &|_| false,
             &lookup,
         ),
@@ -7111,13 +7148,14 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
         Value::Concrete(ConcreteValue::String("invalid".into())),
     );
 
-    let errors = schema
-        .validate_known_values_with_origins_and_lookup(
-            &crate::schema::classified_attributes(&attributes).unwrap(),
-            &|_| false,
-            &lookup,
-        )
-        .expect_err("concrete invalid values must be rejected");
+    let errors = resolved_admission_for_test(
+        schema.as_schema(),
+        &crate::schema::classified_attributes(&attributes).unwrap(),
+        None,
+        &|_| false,
+        &lookup,
+    )
+    .expect_err("concrete invalid values must be rejected");
     assert!(
         errors
             .iter()
@@ -7184,13 +7222,14 @@ fn validate_known_values_checks_concrete_siblings_beside_deferred_leaves() {
         ])),
     )]);
 
-    let errors = schema
-        .validate_known_values_with_origins_and_lookup(
-            &crate::schema::classified_attributes(&attributes).unwrap(),
-            &|_| false,
-            no_lookup(),
-        )
-        .expect_err("the concrete sibling must still be checked");
+    let errors = resolved_admission_for_test(
+        &schema,
+        &crate::schema::classified_attributes(&attributes).unwrap(),
+        None,
+        &|_| false,
+        no_lookup(),
+    )
+    .expect_err("the concrete sibling must still be checked");
     assert!(
         errors.iter().any(|error| matches!(
             error,
@@ -7325,13 +7364,14 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
         _ => Ok(()),
     };
 
-    let errors = schema
-        .validate_known_values_with_origins_and_lookup(
-            &crate::schema::classified_attributes(&attributes).unwrap(),
-            &|_| false,
-            &lookup,
-        )
-        .expect_err("secret values must be checked once their inner values are known");
+    let errors = resolved_admission_for_test(
+        schema.as_schema(),
+        &crate::schema::classified_attributes(&attributes).unwrap(),
+        None,
+        &|_| false,
+        &lookup,
+    )
+    .expect_err("secret values must be checked once their inner values are known");
     let rendered = errors
         .iter()
         .map(ToString::to_string)
@@ -7756,8 +7796,10 @@ fn validate_known_values_runs_declared_validator_without_structural_errors() {
     ]);
 
     assert_eq!(
-        schema.validate_known_values_with_origins_and_lookup(
+        resolved_admission_for_test(
+            schema.as_schema(),
             &crate::schema::classified_attributes(&structurally_invalid).unwrap(),
+            None,
             &|_| false,
             no_lookup(),
         ),
@@ -7778,13 +7820,14 @@ fn validate_known_values_runs_declared_validator_without_structural_errors() {
             ),
         ]))),
     )]);
-    let errors = schema
-        .validate_known_values_with_origins_and_lookup(
-            &crate::schema::classified_attributes(&malformed_tags).unwrap(),
-            &|_| false,
-            no_lookup(),
-        )
-        .expect_err("resource validators must run at the known-value gate");
+    let errors = resolved_admission_for_test(
+        schema.as_schema(),
+        &crate::schema::classified_attributes(&malformed_tags).unwrap(),
+        None,
+        &|_| false,
+        no_lookup(),
+    )
+    .expect_err("resource validators must run at the known-value gate");
     assert!(matches!(
         errors.as_slice(),
         [TypeError::ResourceValidationFailed { attribute: Some(attribute), .. }]

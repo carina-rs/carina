@@ -455,7 +455,13 @@ fn dispatch_fixture_create(
     }
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::schema::SchemaRegistry::new();
+    let mut schemas = carina_core::schema::SchemaRegistry::new();
+    schemas.insert(
+        &id.provider,
+        carina_core::schema::PatternResourceSchema::new(&id.resource_type)
+            .validate()
+            .unwrap(),
+    );
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
         |type_checks| {
@@ -542,7 +548,13 @@ pub(crate) fn fixture_repend_in_flight_create(
     let id = pending.id().clone();
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::schema::SchemaRegistry::new();
+    let mut schemas = carina_core::schema::SchemaRegistry::new();
+    schemas.insert(
+        &id.provider,
+        carina_core::schema::PatternResourceSchema::new(&id.resource_type)
+            .validate()
+            .unwrap(),
+    );
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
         |type_checks| {

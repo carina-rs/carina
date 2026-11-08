@@ -385,7 +385,9 @@ fn secret_origin_4275_reference_validation_drops_inner_paths() {
     let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config());
     let provider = LoadedProviderContext::empty_for_test();
     let index = BindingIndex::from_parsed(&parsed, &schemas, &provider);
-    let error = validate_resource_ref_types(loaded.judged(), &HashSet::new(), &index).unwrap_err();
+    let error =
+        validate_resource_ref_types(loaded.judged(), &HashSet::new(), &index, &mut Vec::new())
+            .unwrap_err();
     assert_safe(&error, "private_field");
 }
 
@@ -513,9 +515,10 @@ fn assert_secret_reference_context(reference: &str, expected: &str) {
     let loaded = crate::config_loader::load_buffer_configuration(&parsed, &schemas, &config());
     let provider = LoadedProviderContext::empty_for_test();
     let index = BindingIndex::from_parsed(&parsed, &schemas, &provider);
-    let error = validate_resource_ref_types(loaded.judged(), &HashSet::new(), &index)
-        .unwrap_err()
-        .to_string();
+    let error =
+        validate_resource_ref_types(loaded.judged(), &HashSet::new(), &index, &mut Vec::new())
+            .unwrap_err()
+            .to_string();
     assert!(
         error.contains("mock.test.Secret") && error.contains("params") && error.contains(expected),
         "{reference}: {error}"

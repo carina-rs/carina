@@ -2180,7 +2180,10 @@ mod tests {
             async |type_checks| {
                 let bindings = carina_core::binding_index::ResolvedBindings::default();
                 let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-                let schemas = CoreSchemaRegistry::new();
+                let schemas = carina_core::test_utils::preparation_schemas(
+                    &resource.id,
+                    carina_core::schema::SchemaKind::Resource,
+                );
                 let context = carina_core::executor::ProviderPreparationContext::new(
                     &bindings,
                     &gate,
@@ -5030,7 +5033,7 @@ mod tests {
                 .with_attribute("map", secret(CoreValue::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([("key".into(), CoreValue::Concrete(ConcreteValue::String("value".into())))])))));
             let bindings = carina_core::binding_index::ResolvedBindings::default();
             let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-            let schemas = CoreSchemaRegistry::new();
+            let schemas = carina_core::test_utils::preparation_schemas(&resource.id, carina_core::schema::SchemaKind::Resource);
             let context = carina_core::executor::ProviderPreparationContext::new(&bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &[], &schemas, type_checks);
             let request = carina_core::executor::prepare_create_request(resource, &context).await.unwrap();
             let wire = core_to_wit_create_request(&request).res;

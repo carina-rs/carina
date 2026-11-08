@@ -592,7 +592,12 @@ fn ref_validation_rejects_missing_provenance_without_panicking() {
                     &schemas,
                     session.as_provider_context(),
                 );
-                validate_resource_ref_types(configuration.judged(), &HashSet::new(), &bindings)
+                validate_resource_ref_types(
+                    configuration.judged(),
+                    &HashSet::new(),
+                    &bindings,
+                    &mut Vec::new(),
+                )
             },
         )
     }));
@@ -816,6 +821,7 @@ for item in upstream.items {
         &SchemaRegistry::new(),
         &HashSet::new(),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &mut Vec::new(),
     )
     .expect_err("an unloaded provider cannot derive anonymous identities");
 
@@ -938,8 +944,13 @@ fn validate_resource_ref_types_for_test<
                 schemas,
                 session.as_provider_context(),
             );
-            super::validate_resource_ref_types(configuration.judged(), &argument_names, &bindings)
-                .map_err(|error| error.to_string())
+            super::validate_resource_ref_types(
+                configuration.judged(),
+                &argument_names,
+                &bindings,
+                &mut Vec::new(),
+            )
+            .map_err(|error| error.to_string())
         },
     )
 }
@@ -8751,6 +8762,7 @@ fn validate_resources_accepts_resource_ref_in_list_position() {
         &schemas,
         &known,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &mut Vec::new(),
     );
     assert!(
         result.is_ok(),
@@ -8807,6 +8819,7 @@ fn validate_resources_accepts_resource_ref_in_struct_field_position() {
         &schemas,
         &known,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &mut Vec::new(),
     );
     assert!(
         result.is_ok(),
@@ -8851,6 +8864,7 @@ fn validate_resources_accepts_resource_ref_in_map_position() {
         &schemas,
         &known,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &mut Vec::new(),
     );
     assert!(
         result.is_ok(),
@@ -8886,6 +8900,7 @@ fn validate_resources_checks_secret_literals_without_revealing_them() {
         &schemas,
         &known,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &mut Vec::new(),
     )
     .expect_err("the known value inside secret() must be length-checked");
 
@@ -8930,6 +8945,7 @@ fn validate_resources_rejects_missing_exactly_one_field_group() {
         &schemas,
         &known,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &mut Vec::new(),
     )
     .unwrap_err();
     assert!(
@@ -8988,6 +9004,7 @@ fn enum_membership_violation_in_for_body_is_flagged() {
         &schemas,
         &known,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &mut Vec::new(),
     );
     assert!(result.is_err(), "expected enum-mismatch error in for body");
     let err = result.unwrap_err();
@@ -9066,6 +9083,7 @@ fn quoted_literal_enum_value_yields_string_literal_diagnostic() {
         &mode_schema(),
         &mode_known(),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &mut Vec::new(),
     )
     .unwrap_err();
     assert!(
@@ -9099,6 +9117,7 @@ fn bare_invalid_enum_value_keeps_invalid_variant_diagnostic() {
         &mode_schema(),
         &mode_known(),
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &mut Vec::new(),
     )
     .unwrap_err();
     assert!(
@@ -9124,7 +9143,14 @@ fn bare_valid_enum_value_passes() {
     );
     let context = mode_context();
     assert!(
-        validate_resources(&parsed, &mode_schema(), &mode_known(), &context).is_ok(),
+        validate_resources(
+            &parsed,
+            &mode_schema(),
+            &mode_known(),
+            &context,
+            &mut Vec::new()
+        )
+        .is_ok(),
         "bare valid identifier must pass"
     );
 }
@@ -9142,7 +9168,14 @@ fn fully_qualified_enum_value_passes() {
     );
     let context = mode_context();
     assert!(
-        validate_resources(&parsed, &mode_schema(), &mode_known(), &context).is_ok(),
+        validate_resources(
+            &parsed,
+            &mode_schema(),
+            &mode_known(),
+            &context,
+            &mut Vec::new()
+        )
+        .is_ok(),
         "fully-qualified identifier must pass"
     );
 }
@@ -9184,6 +9217,7 @@ fn read_against_managed_only_type_is_rejected() {
         &schemas,
         &known,
         &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        &mut Vec::new(),
     )
     .unwrap_err();
     assert!(
@@ -10603,6 +10637,120 @@ fn expression_validation_config() -> ProviderContext {
     ProviderContext::new(crate::EnvironmentSnapshot::empty())
 }
 
+#[test]
+fn review_r3_interpolation_reports_every_reference_error() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Source")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "first",
+                    PatternAttributeType::list(PatternAttributeType::string()),
+                )
+                .build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "second",
+                    PatternAttributeType::list(PatternAttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Sink")
+            .attribute(
+                PatternAttributeSchema::optional("value", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let parsed = crate::parser::parse("let src = mock.test.Source {}\nlet sink = mock.test.Sink { value = \"${src.first}-${src.second}\" }\n", &expression_validation_config()).unwrap();
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
+    assert!(
+        error.contains("src.first") && error.contains("src.second"),
+        "{error}"
+    );
+}
+
+#[test]
+fn review_r5_nested_mismatch_uses_the_failing_reference_origin() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Source")
+            .attribute(
+                PatternAttributeSchema::optional("good", PatternAttributeType::string()).build(),
+            )
+            .attribute(PatternAttributeSchema::optional("bad", PatternAttributeType::int()).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Sink")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "values",
+                    PatternAttributeType::list(PatternAttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let parsed = crate::parser::parse("let src = mock.test.Source {}\nlet sink = mock.test.Sink { values = [src.good, src.bad] }\n", &expression_validation_config()).unwrap();
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
+    assert!(error.contains("(from src.bad)"), "{error}");
+    assert!(!error.contains("(from src.good)"), "{error}");
+}
+
+#[test]
+fn review_r9_nested_symbolic_findings_are_rendered_once_per_path() {
+    let catalog = LoadedProviderContext::empty_for_test();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Source")
+            .attribute(PatternAttributeSchema::optional("bad", PatternAttributeType::int()).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Sink")
+            .attribute(
+                PatternAttributeSchema::optional(
+                    "values",
+                    PatternAttributeType::list(PatternAttributeType::string()),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let parsed = crate::parser::parse("let src = mock.test.Source {}\nlet sink = mock.test.Sink { values = [src.bad, src.bad] }\n", catalog.as_provider_context()).unwrap();
+    let bindings = BindingIndex::from_parsed(&parsed, &schemas, catalog.as_provider_context());
+    let loaded = crate::config_loader::load_buffer_configuration(
+        &parsed,
+        &schemas,
+        catalog.as_provider_context(),
+    );
+    let error = validate_resource_admissions(
+        loaded.judged(),
+        &bindings,
+        &HashSet::from(["mock".into()]),
+        &mut Vec::new(),
+    )
+    .unwrap_err()
+    .to_string();
+    assert_eq!(error.lines().count(), 2, "{error}");
+}
+
 fn expression_validation_directory(
     source: &str,
     sibling: &str,
@@ -11135,4 +11283,62 @@ fn issue_4282_deferred_builtin_results_use_existing_resolved_value_checks() {
             Ok(crate::resource::knowledge::Classification::Known(_))
         ));
     }
+}
+
+#[test]
+fn review_r1_admission_publication_keeps_warnings_and_internal_errors() {
+    for loaded in [false, true] {
+        let catalog = if loaded {
+            LoadedProviderContext::empty_for_test()
+                .as_provider_context()
+                .clone()
+        } else {
+            expression_validation_config()
+        };
+        let terminal = deferred_types::TypeCheckSession::run(&catalog, |session| {
+            session.record_type(&TypeExpr::String, "admission regression");
+        });
+        let mut sink = Vec::new();
+        publish_admission_diagnostics(terminal, &mut sink);
+        assert_eq!(sink.len(), 1, "loaded={loaded}: {sink:?}");
+        assert!(matches!(
+            (&sink[0], loaded),
+            (
+                deferred_types::ProviderTypeCheckDiagnostic::Deferred(_),
+                false
+            ) | (
+                deferred_types::ProviderTypeCheckDiagnostic::UnsettledLoadedCheck(_),
+                true
+            )
+        ));
+    }
+}
+
+#[test]
+fn review_r3_interpolation_reports_every_computed_access_error() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Source")
+            .attribute(
+                PatternAttributeSchema::optional("first", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("second", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Sink")
+            .attribute(
+                PatternAttributeSchema::optional("value", PatternAttributeType::string()).build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let parsed = crate::parser::parse("let src = mock.test.Source {}\nlet sink = mock.test.Sink { value = \"${[src.first][0][0]}-${[src.second][0][0]}\" }\n", &expression_validation_config()).unwrap();
+    let error = validate_resource_ref_types_for_test(&parsed, &schemas).unwrap_err();
+    assert_eq!(error.lines().count(), 2, "{error}");
 }

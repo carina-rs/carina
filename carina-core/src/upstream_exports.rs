@@ -2660,6 +2660,7 @@ mod tests {
                     configuration.judged(),
                     &std::collections::HashSet::new(),
                     &bindings,
+                    &mut Vec::new(),
                 )
                 .err()
                 .map(|joined| joined.to_string().lines().map(str::to_string).collect())
@@ -3060,6 +3061,7 @@ mod tests {
             configuration.judged(),
             &std::collections::HashSet::new(),
             &bindings,
+            &mut Vec::new(),
         )
         .err()
         .map(|error| {

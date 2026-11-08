@@ -3057,12 +3057,16 @@ pub fn validate_resources_with_ctx<
     parsed: &carina_core::parser::File<E, P, T, D, B>,
     provider_context: &carina_core::parser::ProviderContext,
 ) -> Vec<AppError> {
-    lift_validation_result(validation::validate_resources(
+    let mut sink = CliTypeCheckSink { errors: Vec::new() };
+    let mut errors = lift_validation_result(validation::validate_resources(
         parsed,
         ctx.schemas(),
         ctx.known_providers(),
         provider_context,
-    ))
+        &mut sink,
+    ));
+    errors.extend(sink.errors.into_iter().map(AppError::Validation));
+    errors
 }
 
 /// Shared authored admission pass; callers supply their enriched binding index.
@@ -3075,7 +3079,13 @@ pub fn validate_resource_admissions_with_ctx<
     judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &carina_core::binding_index::BindingIndex<'_, B>,
 ) -> Vec<AppError> {
-    match validation::validate_resource_admissions(judged, bindings, ctx.known_providers()) {
+    let mut sink = CliTypeCheckSink { errors: Vec::new() };
+    let mut errors = match validation::validate_resource_admissions(
+        judged,
+        bindings,
+        ctx.known_providers(),
+        &mut sink,
+    ) {
         Ok(()) => Vec::new(),
         Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
             split_validation_message(&message)
@@ -3083,7 +3093,9 @@ pub fn validate_resource_admissions_with_ctx<
         Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
             vec![AppError::AnalysisInvariant(error)]
         }
-    }
+    };
+    errors.extend(sink.errors.into_iter().map(AppError::Validation));
+    errors
 }
 
 /// Surface `directives.depends_on` analysis-pass error diagnostics as
@@ -3160,15 +3172,20 @@ pub fn validate_resource_ref_types_with_ctx<
         ctx.schemas(),
         ctx.provider_context().as_provider_context(),
     );
-    match validation::validate_resource_ref_types(judged, argument_names, &bindings) {
-        Ok(()) => Vec::new(),
-        Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
-            split_validation_message(&message)
-        }
-        Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
-            vec![AppError::AnalysisInvariant(error)]
-        }
-    }
+    let mut sink = CliTypeCheckSink { errors: Vec::new() };
+    let mut errors =
+        match validation::validate_resource_ref_types(judged, argument_names, &bindings, &mut sink)
+        {
+            Ok(()) => Vec::new(),
+            Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
+                split_validation_message(&message)
+            }
+            Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
+                vec![AppError::AnalysisInvariant(error)]
+            }
+        };
+    errors.extend(sink.errors.into_iter().map(AppError::Validation));
+    errors
 }
 
 pub fn validate_composition_ref_types_with_ctx<
@@ -4698,10 +4715,12 @@ pub(crate) fn validate_module_internal_ref_types(
             ctx.schemas(),
             config.catalog(),
         );
+        let mut sink = CliTypeCheckSink { errors: Vec::new() };
         if let Err(joined) = validation::validate_resource_ref_types(
             configuration.judged(),
             &HashSet::new(),
             &bindings,
+            &mut sink,
         ) {
             match joined {
                 validation::ResourceRefTypeValidationError::Validation(message) => {
@@ -4711,6 +4730,9 @@ pub(crate) fn validate_module_internal_ref_types(
                     errors.push(AppError::AnalysisInvariant(error))
                 }
             }
+        }
+        for diagnostic in sink.errors {
+            errors.extend(prefixed_validation_messages(&diagnostic, &prefix));
         }
         for parameter in &configuration.judged().file().attribute_params {
             let parameters = std::slice::from_ref(parameter);

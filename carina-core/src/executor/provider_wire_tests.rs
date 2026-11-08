@@ -81,7 +81,10 @@ async fn wire_error_renders_a_top_level_attribute_once() {
                 .with_attribute("unread", duration(u64::MAX));
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
-            let schemas = SchemaRegistry::new();
+            let schemas = crate::test_utils::preparation_schemas(
+                &resource.id,
+                crate::schema::SchemaKind::Resource,
+            );
             let context = ProviderPreparationContext::new(
                 &bindings,
                 &gate,
@@ -123,7 +126,10 @@ async fn wire_error_paths_quote_non_identifier_map_keys() {
                     );
                 let bindings = ResolvedBindings::default();
                 let gate = ModuleConstraintGate::from_live_compositions(&[]);
-                let schemas = SchemaRegistry::new();
+                let schemas = crate::test_utils::preparation_schemas(
+                    &resource.id,
+                    crate::schema::SchemaKind::Resource,
+                );
                 let context = ProviderPreparationContext::new(
                     &bindings,
                     &gate,
@@ -368,7 +374,10 @@ fn native_data_source_checks_even_unschematized_attributes() {
                 .insert("unread".into(), tags(duration(u64::MAX)));
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
-            let schemas = SchemaRegistry::new();
+            let schemas = crate::test_utils::preparation_schemas(
+                &data.id,
+                crate::schema::SchemaKind::DataSource,
+            );
             let context = ProviderPreparationContext::new(
                 &bindings,
                 &gate,
@@ -646,7 +655,10 @@ async fn review2_f4_dispatch_and_native_normalizer_receive_main_plaintext_shapes
                 );
             let bindings = ResolvedBindings::default();
             let gate = ModuleConstraintGate::from_live_compositions(&[]);
-            let schemas = SchemaRegistry::new();
+            let schemas = crate::test_utils::preparation_schemas(
+                &resource.id,
+                crate::schema::SchemaKind::Resource,
+            );
             let normalizer_boundary = crate::provider::ConfiguredNormalizer::fixture(&MainShapes);
             let context = ProviderPreparationContext::new(
                 &bindings,

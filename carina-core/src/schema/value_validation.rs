@@ -101,13 +101,18 @@ pub struct ValueValidationFindings {
     local_error: Option<TypeError>,
     additional_local_errors: Vec<TypeError>,
     local: Vec<(FieldPath, TypeError)>,
-    located: Vec<(LeafPath, TypeError)>,
+    pub(super) located: Vec<(LeafPath, TypeError)>,
     assignment: AssignmentFindings,
     pub(crate) symbolic: Vec<(LeafPath, TypeError)>,
     pub(super) provider: Vec<(FieldPath, TypeError)>,
 }
 
 impl ValueValidationFindings {
+    pub(crate) fn retained_failure(mut self) -> Self {
+        self.structure = ValueStructure::Failed;
+        self
+    }
+
     pub(crate) fn take_assignment(&mut self) -> AssignmentFindings {
         std::mem::take(&mut self.assignment)
     }
@@ -184,13 +189,58 @@ impl InsideSecret for ValueValidationFindings {
 }
 
 /// One validation report, usable by both CLI and LSP without revalidation.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ResourceValueValidation {
     pub(super) errors: Vec<TypeError>,
+    pub(super) error_paths: HashMap<usize, (String, LeafPath)>,
     pub(super) attributes: HashMap<String, ValueValidationFindings>,
 }
 
 impl ResourceValueValidation {
+    pub(crate) fn from_errors(errors: Vec<TypeError>) -> Self {
+        Self {
+            errors,
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn error_slice(&self) -> &[TypeError] {
+        &self.errors
+    }
+
+    pub(crate) fn errors_with_paths(
+        &self,
+    ) -> impl Iterator<Item = (&TypeError, Option<(&str, &LeafPath)>)> {
+        self.errors.iter().enumerate().map(|(index, error)| {
+            (
+                error,
+                self.error_paths
+                    .get(&index)
+                    .map(|(name, path)| (name.as_str(), path)),
+            )
+        })
+    }
+
+    pub(crate) fn push_attribute_error(&mut self, name: &str, error: TypeError) {
+        self.error_paths.insert(
+            self.errors.len(),
+            (name.into(), LeafPath::from_segments([])),
+        );
+        self.errors.push(error.with_attribute(name));
+    }
+
+    pub(super) fn append_values(&mut self, values: Self) {
+        let offset = self.errors.len();
+        self.error_paths.extend(
+            values
+                .error_paths
+                .into_iter()
+                .map(|(index, path)| (offset + index, path)),
+        );
+        self.errors.extend(values.errors);
+        self.attributes.extend(values.attributes);
+    }
+
     /// Render a destination once, using the location retained by the shared
     /// walk. The original TypeError remains available through errors().
     pub fn diagnostic_error(&self, error: &TypeError) -> TypeError {
@@ -231,6 +281,12 @@ impl ResourceValueValidation {
             }
             Some(_) | None => error.clone(),
         }
+    }
+
+    pub fn is_retained_failure(&self, name: &str) -> bool {
+        self.attributes
+            .get(name)
+            .is_some_and(|findings| findings.structure() == ValueStructure::Failed)
     }
 
     pub fn take_attribute(&mut self, name: &str) -> Option<ValueValidationFindings> {
@@ -306,7 +362,7 @@ impl<F> LocalOutcome<F> {
 #[derive(Default)]
 struct CheckedFindings {
     local: Vec<(FieldPath, TypeError)>,
-    located: Vec<(LeafPath, TypeError)>,
+    pub(super) located: Vec<(LeafPath, TypeError)>,
     assignment: AssignmentFindings,
     // Other undecided branches have independent primary local errors. Ordinary
     // containers still retain their established first-error CLI precedence.
@@ -915,6 +971,22 @@ impl<'a> ValueValidator<'a> {
     ) -> CheckedValue<'a> {
         let findings = match assignment {
             Some(check) => match check(attr, value.diagnostic_value(), &path.canonical()) {
+                Ok(findings) if !findings.errors.is_empty() => {
+                    let mut checked = CheckedValue::rejected(path, findings.errors[0].1.clone());
+                    checked.findings.additional_local_errors.extend(
+                        findings
+                            .errors
+                            .iter()
+                            .skip(1)
+                            .map(|(_, error)| error.clone()),
+                    );
+                    checked
+                        .findings
+                        .located
+                        .extend(findings.errors.iter().cloned());
+                    checked.findings.assignment = findings;
+                    return checked;
+                }
                 Ok(findings) => findings,
                 Err(error) => {
                     let mut checked = CheckedValue::rejected(path, error.clone());

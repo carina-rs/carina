@@ -23,9 +23,12 @@ fn reference_judgement_uses_the_contract_already_found() {
         |catalog, _, bindings, destination| {
             crate::validation::deferred_types::with_session_for_test(catalog, |session| {
                 let value = Value::root_resource_ref("producer", "output", vec![]);
-                let (_, context) = Candidate::validation(
-                    value.knowledge(&KnowledgeContext::validation()).unwrap(),
-                    bindings,
+                let (_, context) = Candidate::validation_classified(
+                    value
+                        .knowledge(&KnowledgeContext::validation())
+                        .unwrap()
+                        .into_classification(),
+                    Some(bindings),
                     session,
                 );
                 let CandidateOrigin::Reference(reference) = CandidateOrigin::of(&value) else {
@@ -332,14 +335,6 @@ fn verdict<K: DestinationKind>(
     } else {
         AssignmentVerdict::NeedsSchema(schema)
     }
-}
-
-pub fn judge_assignment<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
-    destination: &Destination<K>,
-    candidate: &Candidate<P, B>,
-    context: &AdmissionContext<'_, P, B>,
-) -> Result<AssignmentVerdict<K>, AdmissionErrors> {
-    judge_with_findings(destination, candidate, context).map(|judged| judged.verdict)
 }
 
 pub(super) struct AssignmentJudgement<K: DestinationKind> {
