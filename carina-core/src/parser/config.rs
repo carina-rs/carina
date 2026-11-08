@@ -804,6 +804,58 @@ impl PartialEq for CustomTypeValidationError {
 }
 
 impl CustomTypeValidationError {
+    pub(crate) fn diagnostic_shape(&self) -> crate::schema::ValidationDiagnostic<'_> {
+        use crate::provider_text::DiagnosticText;
+        use crate::schema::ValidationDiagnostic;
+        match self {
+            Self::ProviderRejected {
+                owner,
+                identity,
+                error,
+                masked,
+            } => {
+                let prefix = format!(
+                    "{} rejected `{}`: ",
+                    DiagnosticText::new(owner),
+                    DiagnosticText::new(identity.to_string())
+                );
+                if *masked {
+                    ValidationDiagnostic::HiddenChild {
+                        message: format!(
+                            "{prefix}{} failed validation",
+                            crate::schema::SECRET_VALUE_MASK
+                        ),
+                        child: error.as_ref(),
+                    }
+                } else {
+                    ValidationDiagnostic::Child {
+                        prefix,
+                        child: error.as_ref(),
+                    }
+                }
+            }
+            Self::InvalidDeclarationValue {
+                owner,
+                identity,
+                error,
+            } => ValidationDiagnostic::Child {
+                prefix: format!(
+                    "{} rejected `{}`: ",
+                    DiagnosticText::new(owner),
+                    DiagnosticText::new(identity.to_string())
+                ),
+                child: error.as_ref(),
+            },
+            Self::ProvidersNotLoaded
+            | Self::Rejected { .. }
+            | Self::MissingDeclaration { .. }
+            | Self::ConflictingEnumDefinitions { .. }
+            | Self::ConflictingEnumSpelling { .. } => ValidationDiagnostic::Plain(self),
+        }
+    }
+}
+
+impl CustomTypeValidationError {
     pub fn provider_error(&self) -> Option<&crate::provider::HostError> {
         match self {
             Self::ProviderRejected { error, .. } => Some(error),

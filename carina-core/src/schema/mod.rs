@@ -7003,6 +7003,81 @@ pub enum TypeError {
     BlockSyntaxNotAllowed { attribute: String },
 }
 
+/// The complete causal shape of a validation category. Rendering and logical
+/// sources consume this same value; neither guesses from a second variant map.
+pub(crate) enum ValidationDiagnostic<'a> {
+    Reason {
+        prefix: String,
+        reason: &'a ProviderValidation,
+    },
+    Child {
+        prefix: String,
+        child: &'a (dyn std::error::Error + 'static),
+    },
+    Alternatives(&'a UnionArmFailures),
+    // The category retains this cause but deliberately omits its rendered text.
+    HiddenChild {
+        message: String,
+        child: &'a (dyn std::error::Error + 'static),
+    },
+    Plain(&'a (dyn std::error::Error + 'static)),
+}
+
+impl ValidationDiagnostic<'_> {
+    pub(crate) fn capture_text<S: crate::provider_text::TextState>(
+        &self,
+    ) -> crate::provider_text::ErrorText<S> {
+        use crate::provider_text::{Diagnostic, ErrorText};
+        let text = match self {
+            Self::Reason { prefix, reason } => {
+                let mut text = ErrorText::new(prefix);
+                text.append(&reason.capture_text());
+                text
+            }
+            Self::Child { prefix, child } => {
+                let mut text = ErrorText::new(prefix);
+                text.append(&Diagnostic::<S>::capture(*child));
+                text
+            }
+            Self::Alternatives(failures) => {
+                let mut text = ErrorText::new("No union alternative accepts this value: ");
+                for (index, arm) in failures.iter().enumerate() {
+                    if index != 0 {
+                        text.append_host("; or ");
+                    }
+                    let nested = contains_union_alternatives_mismatch(arm);
+                    if nested {
+                        text.append_host("(");
+                    }
+                    text.append(&Diagnostic::<S>::capture(arm));
+                    if nested {
+                        text.append_host(")");
+                    }
+                }
+                text
+            }
+            Self::HiddenChild { message, child } => {
+                let inventory = Diagnostic::<S>::capture(*child).redaction_context();
+                ErrorText::new(message).with_redaction_context(&inventory)
+            }
+            Self::Plain(error) => ErrorText::new(error.to_string()),
+        };
+        // Every alternative's inventory protects the complete diagnostic,
+        // including sibling text, before any boundary chooses how to bind it.
+        let inventory = text.redaction_context();
+        text.with_redaction_context(&inventory)
+    }
+}
+
+// Raw Error walkers stop at the opaque alternatives node. ProviderCause uses
+// its typed arms and carries the complete union's redaction inventory.
+impl fmt::Display for UnionArmFailures {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<union alternatives>")
+    }
+}
+impl std::error::Error for UnionArmFailures {}
+
 impl From<crate::parser::CustomTypeValidationError> for TypeError {
     fn from(error: crate::parser::CustomTypeValidationError) -> Self {
         Self::CustomTypeValidation {
@@ -7078,80 +7153,85 @@ impl TypeError {
         }
     }
 
-    pub(crate) fn provider_validation_reason(&self) -> Option<&ProviderValidation> {
+    /// Classify every category once for capture, rendering, and traversal.
+    /// New TypeError variants must choose a shape here before they compile.
+    pub(crate) fn diagnostic_shape(&self) -> ValidationDiagnostic<'_> {
         match self {
-            Self::ValidationFailed { message } | Self::ResourceValidationFailed { message, .. } => {
-                Some(message)
-            }
-            Self::StringLiteralExpectedEnum { extra_message, .. } => extra_message.as_ref(),
-            _ => None,
-        }
-    }
-    pub(crate) fn provider_validation_child(&self) -> Option<&TypeError> {
-        match self {
-            Self::ListItemError { inner, .. }
-            | Self::MapKeyError { inner, .. }
-            | Self::MapValueError { inner, .. }
-            | Self::StructFieldError { inner, .. } => Some(inner),
-            _ => None,
-        }
-    }
-    pub(crate) fn provider_diagnostic_text<S: crate::provider_text::TextState>(
-        &self,
-    ) -> crate::provider_text::ErrorText<S> {
-        use crate::provider_text::ErrorText;
-        if let Some(child) = self.provider_validation_child() {
-            let prefix = match self {
-                Self::ListItemError { index, .. } => format!("List item at index {index}: "),
-                Self::MapKeyError { key, .. } => {
-                    format!("Map key '{}': ", DiagnosticText::new(key))
-                }
-                Self::MapValueError { key, .. } => {
-                    format!("Map value for key '{}': ", DiagnosticText::new(key))
-                }
-                Self::StructFieldError { field, .. } => {
-                    format!("Struct field '{}': ", DiagnosticText::new(field))
-                }
-                _ => unreachable!("only single-parent validation containers have a child"),
-            };
-            let mut text = ErrorText::<S>::new(prefix);
-            text.append(&crate::provider_text::Diagnostic::<S>::capture(child));
-            return text;
-        }
-
-        let (mut text, reason) = match self {
-            Self::ValidationFailed { message } => {
-                (ErrorText::new("Validation failed: "), Some(message))
-            }
-            Self::ResourceValidationFailed { message, .. } => (
-                ErrorText::new("Resource validation failed: "),
-                Some(message),
-            ),
+            Self::ValidationFailed { message } => ValidationDiagnostic::Reason {
+                prefix: "Validation failed: ".into(),
+                reason: message,
+            },
+            Self::ResourceValidationFailed { message, .. } => ValidationDiagnostic::Reason {
+                prefix: "Resource validation failed: ".into(),
+                reason: message,
+            },
             Self::StringLiteralExpectedEnum {
                 user_typed,
                 attribute,
                 type_name,
                 expected,
                 extra_message,
-            } => (
-                ErrorText::new(format_string_literal_expected_enum(
-                    user_typed,
-                    attribute.as_deref(),
-                    type_name,
-                    expected,
-                    None,
-                )),
-                expected
-                    .is_empty()
-                    .then_some(extra_message.as_ref())
-                    .flatten(),
-            ),
-            _ => unreachable!("only diagnostic-bearing categories are opaque frames"),
-        };
-        if let Some(reason) = reason {
-            text.append(&reason.capture_text());
+            } => {
+                if let Some(reason) = extra_message {
+                    let message = format_string_literal_expected_enum(
+                        user_typed,
+                        attribute.as_deref(),
+                        type_name,
+                        expected,
+                        None,
+                    );
+                    if expected.is_empty() {
+                        ValidationDiagnostic::Reason {
+                            prefix: message,
+                            reason,
+                        }
+                    } else {
+                        ValidationDiagnostic::HiddenChild {
+                            message,
+                            child: reason,
+                        }
+                    }
+                } else {
+                    ValidationDiagnostic::Plain(self)
+                }
+            }
+            Self::ListItemError { index, inner } => ValidationDiagnostic::Child {
+                prefix: format!("List item at index {index}: "),
+                child: inner.as_ref(),
+            },
+            Self::MapKeyError { key, inner } => ValidationDiagnostic::Child {
+                prefix: format!("Map key '{}': ", DiagnosticText::new(key)),
+                child: inner.as_ref(),
+            },
+            Self::MapValueError { key, inner } => ValidationDiagnostic::Child {
+                prefix: format!("Map value for key '{}': ", DiagnosticText::new(key)),
+                child: inner.as_ref(),
+            },
+            Self::StructFieldError { field, inner } => ValidationDiagnostic::Child {
+                prefix: format!("Struct field '{}': ", DiagnosticText::new(field)),
+                child: inner.as_ref(),
+            },
+            Self::CustomTypeValidation { error, .. } => ValidationDiagnostic::Child {
+                prefix: String::new(),
+                child: error.as_ref(),
+            },
+            Self::UnionAlternativesMismatch { failures } => {
+                ValidationDiagnostic::Alternatives(failures)
+            }
+            Self::TypeMismatch { .. }
+            | Self::BindingShadowsEnumMember(_)
+            | Self::InvalidEnumVariant { .. }
+            | Self::PatternMismatch { .. }
+            | Self::LengthOutOfRange { .. }
+            | Self::DuplicateListElement { .. }
+            | Self::MissingRequired { .. }
+            | Self::FieldGroupViolation { .. }
+            | Self::ReadOnlyAttribute { .. }
+            | Self::UnknownAttribute { .. }
+            | Self::UnknownStructField { .. }
+            | Self::UnionStructMismatch { .. }
+            | Self::BlockSyntaxNotAllowed { .. } => ValidationDiagnostic::Plain(self),
         }
-        text
     }
 
     /// Return the authored top-level attribute carried by this diagnostic.

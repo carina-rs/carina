@@ -1620,7 +1620,8 @@ enum OpaqueFrame<'a> {
     Host(&'a crate::provider::HostError),
     Diagnostic(&'a HostDiagnostic),
     Validation(&'a crate::schema::ProviderValidation),
-    ValidationCategory(&'a crate::schema::TypeError),
+    ValidationCategory(crate::schema::ValidationDiagnostic<'a>),
+    Alternatives(&'a crate::schema::UnionArmFailures),
     Dispatch(&'a crate::provider::CustomTypeDispatchError),
 }
 fn opaque_frame<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<OpaqueFrame<'a>> {
@@ -1637,16 +1638,30 @@ fn opaque_frame<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<Opaq
     if let Some(error) = frame_downcast::<crate::schema::ProviderValidation>(error) {
         return Some(OpaqueFrame::Validation(error));
     }
-    if let Some(error) = frame_downcast::<crate::schema::TypeError>(error)
-        && (error.provider_validation_reason().is_some()
-            || error.provider_validation_child().is_some())
-    {
-        return Some(OpaqueFrame::ValidationCategory(error));
+    if let Some(error) = frame_downcast::<crate::schema::TypeError>(error) {
+        return validation_frame(error.diagnostic_shape());
+    }
+    if let Some(error) = frame_downcast::<crate::parser::CustomTypeValidationError>(error) {
+        return validation_frame(error.diagnostic_shape());
+    }
+    if let Some(error) = frame_downcast::<crate::schema::UnionArmFailures>(error) {
+        return Some(OpaqueFrame::Alternatives(error));
     }
     if let Some(error) = frame_downcast::<crate::provider::CustomTypeDispatchError>(error) {
         return Some(OpaqueFrame::Dispatch(error));
     }
     frame_downcast::<HostDiagnostic>(error).map(OpaqueFrame::Diagnostic)
+}
+
+fn validation_frame(shape: crate::schema::ValidationDiagnostic<'_>) -> Option<OpaqueFrame<'_>> {
+    use crate::schema::ValidationDiagnostic;
+    match shape {
+        ValidationDiagnostic::Plain(_) => None,
+        shape @ (ValidationDiagnostic::Reason { .. }
+        | ValidationDiagnostic::Child { .. }
+        | ValidationDiagnostic::Alternatives(_)
+        | ValidationDiagnostic::HiddenChild { .. }) => Some(OpaqueFrame::ValidationCategory(shape)),
+    }
 }
 impl<'a> OpaqueFrame<'a> {
     fn text<S: TextState>(&self) -> ErrorText<S> {
@@ -1657,7 +1672,10 @@ impl<'a> OpaqueFrame<'a> {
             Self::Host(error) => error.segmented_text().host_for_state(),
             Self::Diagnostic(error) => error.text.host_for_state(),
             Self::Validation(error) => error.capture_text(),
-            Self::ValidationCategory(error) => error.provider_diagnostic_text(),
+            Self::ValidationCategory(shape) => shape.capture_text(),
+            Self::Alternatives(arms) => {
+                crate::schema::ValidationDiagnostic::Alternatives(arms).capture_text()
+            }
             Self::Dispatch(error) => {
                 if let crate::provider::CustomTypeDispatchError::Validation(category) = error {
                     if let crate::schema::TypeError::ValidationFailed { message } =
@@ -1679,19 +1697,14 @@ impl<'a> OpaqueFrame<'a> {
             Self::Host(error) => error.retryability(),
             Self::Diagnostic(error) => error.retryability(),
             Self::Validation(error) => error.retryability(),
-            Self::ValidationCategory(error) => {
-                if let Some(reason) = error.provider_validation_reason() {
-                    reason.retryability()
-                } else {
-                    ProviderDiagnostic::new(
-                        error
-                            .provider_validation_child()
-                            .expect("single-parent validation frame has a child")
-                            .clone(),
-                    )
-                    .retryability()
-                }
-            }
+            Self::ValidationCategory(shape) => match shape {
+                crate::schema::ValidationDiagnostic::Reason { reason, .. } => reason.retryability(),
+                crate::schema::ValidationDiagnostic::Child { .. }
+                | crate::schema::ValidationDiagnostic::Alternatives(_)
+                | crate::schema::ValidationDiagnostic::HiddenChild { .. }
+                | crate::schema::ValidationDiagnostic::Plain(_) => Retryability::Unclassified,
+            },
+            Self::Alternatives(_) => Retryability::Unclassified,
             Self::Dispatch(error) => match error {
                 crate::provider::CustomTypeDispatchError::Validation(category) => {
                     ProviderDiagnostic::new(category.as_ref().clone()).retryability()
@@ -1701,12 +1714,9 @@ impl<'a> OpaqueFrame<'a> {
             },
         }
     }
-    fn source(self) -> Option<ProviderCause<'a>> {
-        let plain = |error| ProviderCause {
-            error,
-            secrets: RedactionContext::default(),
-        };
-        match self {
+    fn sources(self) -> CauseChildren<'a> {
+        let plain = |error| ProviderCause::new(error, RedactionContext::default());
+        let source = match self {
             #[cfg(feature = "guest-runtime")]
             Self::RenderedGuest(error) => Some(error.0.as_cause()),
             Self::Provider(error) => error.detail().cause().map(Diagnostic::as_cause),
@@ -1717,18 +1727,24 @@ impl<'a> OpaqueFrame<'a> {
                     .category()
                     .map(|category| plain(category as &(dyn std::error::Error + 'static)))
             }),
-            Self::ValidationCategory(error) => error
-                .provider_validation_reason()
-                .map(|reason| plain(reason as &(dyn std::error::Error + 'static)))
-                .or_else(|| {
-                    error
-                        .provider_validation_child()
-                        .map(|child| plain(child as &(dyn std::error::Error + 'static)))
-                }),
+            Self::ValidationCategory(shape) => match shape {
+                crate::schema::ValidationDiagnostic::Reason { reason, .. } => Some(plain(reason)),
+                crate::schema::ValidationDiagnostic::Child { child, .. }
+                | crate::schema::ValidationDiagnostic::HiddenChild { child, .. } => {
+                    Some(plain(child))
+                }
+                crate::schema::ValidationDiagnostic::Alternatives(arms) => Some(plain(arms)),
+                crate::schema::ValidationDiagnostic::Plain(error) => error.source().map(plain),
+            },
+            Self::Alternatives(arms) => return CauseChildren::Alternatives(arms),
             Self::Dispatch(error) => {
                 use std::error::Error as _;
                 error.source().map(plain)
             }
+        };
+        match source {
+            Some(cause) => CauseChildren::One(cause),
+            None => CauseChildren::None,
         }
     }
 }
@@ -1822,10 +1838,7 @@ impl<S: TextState> Diagnostic<S> {
     pub(crate) fn capture_host_or_provider(
         error: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
-        let mut node = Some(ProviderCause {
-            error: &error,
-            secrets: RedactionContext::default(),
-        });
+        let mut node = Some(ProviderCause::new(&error, RedactionContext::default()));
         let mut retryability = Retryability::Unclassified;
         while let Some(cause) = node {
             if let Some(frame) = opaque_frame(cause.error) {
@@ -1906,10 +1919,7 @@ impl<S: TextState> Diagnostic<S> {
         self.error.is::<T>()
     }
     pub fn as_cause(&self) -> ProviderCause<'_> {
-        ProviderCause {
-            error: self.error.as_ref(),
-            secrets: self.text.redaction_context(),
-        }
+        ProviderCause::new(self.error.as_ref(), self.text.redaction_context())
     }
     #[cfg(test)]
     pub fn error(&self) -> ProviderCause<'_> {
@@ -1919,10 +1929,7 @@ impl<S: TextState> Diagnostic<S> {
         self.as_cause().source_is::<T>()
     }
     pub fn downcast_ref<T: std::error::Error + 'static>(&self) -> Option<ProviderCause<'_>> {
-        self.is::<T>().then(|| ProviderCause {
-            error: self.error.as_ref(),
-            secrets: self.text.redaction_context(),
-        })
+        self.is::<T>().then(|| self.as_cause())
     }
     pub fn source(&self) -> Option<ProviderCause<'_>> {
         self.as_cause().source()
@@ -1931,10 +1938,10 @@ impl<S: TextState> Diagnostic<S> {
         &self,
         secrets: &RedactionSet,
     ) -> Option<RedactedNormalizationCause<'_>> {
-        ProviderCause {
-            error: self.error.as_ref(),
-            secrets: self.text.redaction_context().with(secrets),
-        }
+        ProviderCause::new(
+            self.error.as_ref(),
+            self.text.redaction_context().with(secrets),
+        )
         .normalization()
     }
     #[cfg(test)]
@@ -1943,10 +1950,10 @@ impl<S: TextState> Diagnostic<S> {
         secrets: &RedactionSet,
         project: impl FnOnce(&T) -> String,
     ) -> Option<RedactedProviderText> {
-        ProviderCause {
-            error: self.error.as_ref(),
-            secrets: self.text.redaction_context().with(secrets),
-        }
+        ProviderCause::new(
+            self.error.as_ref(),
+            self.text.redaction_context().with(secrets),
+        )
         .project_redacted(project)
     }
 
@@ -2098,6 +2105,21 @@ impl<'de> Deserialize<'de> for Diagnostic<Unbound> {
 pub struct ProviderCause<'a> {
     error: &'a (dyn std::error::Error + 'static),
     secrets: RedactionContext,
+    pending: Option<std::rc::Rc<PendingCause<'a>>>,
+}
+
+// Persistent continuations keep each branch's inventory without flattening
+// alternatives or cloning the remainder of the tree on every source step.
+struct PendingCause<'a> {
+    error: &'a (dyn std::error::Error + 'static),
+    secrets: RedactionContext,
+    next: Option<std::rc::Rc<PendingCause<'a>>>,
+}
+
+enum CauseChildren<'a> {
+    None,
+    One(ProviderCause<'a>),
+    Alternatives(&'a crate::schema::UnionArmFailures),
 }
 impl fmt::Debug for ProviderCause<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -2105,14 +2127,21 @@ impl fmt::Debug for ProviderCause<'_> {
     }
 }
 impl<'a> ProviderCause<'a> {
+    fn new(error: &'a (dyn std::error::Error + 'static), secrets: RedactionContext) -> Self {
+        Self {
+            error,
+            secrets,
+            pending: None,
+        }
+    }
     pub fn is<T: std::error::Error + 'static>(&self) -> bool {
         self.error.is::<T>()
     }
     pub fn downcast_ref<T: std::error::Error + 'static>(&self) -> Option<Self> {
         self.is::<T>().then(|| self.clone())
     }
-    /// Check a typed cause with a non-capturing test predicate, returning only a bool.
-    /// Returns false without calling the predicate when the type does not match.
+    /// Check typed nodes in this logical source walk with a non-capturing
+    /// predicate, returning only a bool. Only matching types call the predicate.
     ///
     /// ```
     /// use carina_core::provider_text::ProviderDiagnostic;
@@ -2147,7 +2176,8 @@ impl<'a> ProviderCause<'a> {
         }
         false
     }
-    /// Search all descendants while leaving `is` and `downcast_ref` current-node only.
+    /// Search subsequent logical sources, including remaining union alternatives.
+    /// `is` and `downcast_ref` inspect only the current node.
     pub fn source_is<T: std::error::Error + 'static>(&self) -> bool {
         let mut current = self.source();
         while let Some(cause) = current {
@@ -2158,13 +2188,42 @@ impl<'a> ProviderCause<'a> {
         }
         false
     }
+    /// Advance one logical node. After a union arm ends, resume its remaining
+    /// alternatives in declaration order, retaining the union's inventory.
     pub fn source(&self) -> Option<Self> {
-        let mut cause = if let Some(frame) = opaque_frame(self.error) {
-            frame.source()?
+        let children = if let Some(frame) = opaque_frame(self.error) {
+            frame.sources()
         } else {
-            Self {
-                error: self.error.source()?,
-                secrets: RedactionContext::default(),
+            match self.error.source() {
+                Some(error) => CauseChildren::One(Self::new(error, RedactionContext::default())),
+                None => CauseChildren::None,
+            }
+        };
+        let mut cause = match children {
+            CauseChildren::One(mut cause) => {
+                cause.pending = self.pending.clone();
+                cause
+            }
+            CauseChildren::Alternatives(arms) => {
+                let mut arms = arms.iter();
+                let first = arms.next()?;
+                let mut pending = self.pending.clone();
+                for arm in arms.collect::<Vec<_>>().into_iter().rev() {
+                    pending = Some(std::rc::Rc::new(PendingCause {
+                        error: arm,
+                        secrets: self.secrets.clone(),
+                        next: pending,
+                    }));
+                }
+                let mut cause = Self::new(first, RedactionContext::default());
+                cause.pending = pending;
+                cause
+            }
+            CauseChildren::None => {
+                let pending = self.pending.as_ref()?;
+                let mut cause = Self::new(pending.error, pending.secrets.clone());
+                cause.pending = pending.next.clone();
+                cause
             }
         };
         cause.secrets.extend(&self.secrets);

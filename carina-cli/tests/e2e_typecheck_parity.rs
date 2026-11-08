@@ -37,6 +37,9 @@ use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
 #[path = "e2e_typecheck_parity/round4.rs"]
 mod round4;
 
+#[path = "e2e_typecheck_parity/error_composition.rs"]
+mod error_composition;
+
 // ============================================================================
 // Fixture + helpers (mirror carina-lsp/tests/e2e_typecheck.rs)
 // ============================================================================
