@@ -1572,7 +1572,7 @@ mod tests {
             TypeIdentity::bare("VpcId"),
             None,
             None,
-            legacy_validator(noop),
+            legacy_validator(move |value| noop(value).map_err(Into::into)),
             None,
         )
     }

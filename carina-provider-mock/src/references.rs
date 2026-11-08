@@ -2,7 +2,7 @@
 use carina_core::schema::{
     AttributeSchema, AttributeType, ResourceSchema, TypeIdentity, ValidatedResourceSchema,
 };
-use carina_plugin_sdk::types::{
+use carina_provider_protocol::types::{
     ProviderError, ProviderErrorKind, ReferenceError, ReferenceOutcome, ReferenceRequest,
 };
 use std::collections::BTreeMap;
@@ -82,6 +82,30 @@ pub fn resolve(
                     "reference {value:?} not found"
                 ))))
             })
+        })
+        .collect()
+}
+
+/// Decode the textual mock configuration at the provider input boundary.
+pub fn resolve_authoring(
+    table: &ReferenceTable,
+    requests: Vec<ReferenceRequest>,
+) -> Vec<Result<carina_plugin_sdk::types::ReferenceOutcome, carina_plugin_sdk::types::ReferenceError>>
+{
+    use carina_plugin_sdk::types::{ReferenceError as Error, ReferenceOutcome as Outcome};
+    let decode = |error: Box<ProviderError>| {
+        Box::new(carina_core::provider::ProviderError::from_wire(*error))
+    };
+    resolve(table, requests)
+        .into_iter()
+        .map(|result| match result {
+            Ok(ReferenceOutcome::Resolved(value)) => Ok(Outcome::Resolved(value)),
+            Ok(ReferenceOutcome::NotFound(error)) => Ok(Outcome::NotFound(decode(error))),
+            Err(ReferenceError::AccessDenied(error)) => Err(Error::AccessDenied(decode(error))),
+            Err(ReferenceError::Transient(error)) => Err(Error::Transient(decode(error))),
+            Err(ReferenceError::InvalidReference(error)) => {
+                Err(Error::InvalidReference(decode(error)))
+            }
         })
         .collect()
 }

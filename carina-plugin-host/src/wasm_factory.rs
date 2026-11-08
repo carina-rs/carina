@@ -48,9 +48,9 @@ use carina_core::provider::{
     CreateFailureKind, CreateObservation, InFlightCreate, InFlightPersistence, ResumeFailureKind,
     UnobservedReason,
 };
-use carina_core::provider_text::{
-    DiagnosticText, ProviderDiagnostic, ProviderKey, ProviderText, RedactionSet,
-};
+#[cfg(test)]
+use carina_core::provider_text::ProviderDiagnostic;
+use carina_core::provider_text::{DiagnosticText, ProviderKey, ProviderText, RedactionSet};
 #[cfg(test)]
 use carina_core::resource::Resource;
 #[cfg(test)]
@@ -207,24 +207,6 @@ where
     }
 }
 
-#[derive(Debug)]
-struct InvalidWasmCreateResult {
-    detail: &'static str,
-    _source: ProviderError,
-}
-
-impl fmt::Display for InvalidWasmCreateResult {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.detail)
-    }
-}
-
-impl std::error::Error for InvalidWasmCreateResult {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        None
-    }
-}
-
 fn wasm_value_decode_provider_error<E>(operation: &'static str, error: E) -> ProviderError
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -280,7 +262,7 @@ impl std::error::Error for WasmDiagnostic {}
 #[derive(Debug)]
 struct WasmGuestCallError {
     context: Option<WasmGuestCallContext>,
-    source: WasmDiagnostic,
+    source: wasmtime::Error,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -299,13 +281,15 @@ impl fmt::Display for WasmGuestCallError {
             Some(WasmGuestCallContext::ComputeBudgetExceeded { operation }) => {
                 write!(f, "{operation} exceeded the guest compute budget")
             }
-        }?;
-        f.write_str(": ")?;
-        self.source.fmt(f)
+        }
     }
 }
 
-impl std::error::Error for WasmGuestCallError {}
+impl std::error::Error for WasmGuestCallError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
 
 #[cfg(test)]
 fn wasm_trap_provider_error_for_test(
@@ -812,14 +796,6 @@ impl std::error::Error for WasmProviderLoadError {
 }
 
 impl WasmProviderLoadError {
-    fn opaque_text(&self) -> ProviderText {
-        match self {
-            Self::Metadata { context, source } => source.opaque().with_context(context.as_str()),
-            Self::EgressDeclaration(source) => source.opaque().clone(),
-            _ => ProviderText::new(self.to_string()),
-        }
-    }
-
     fn metadata(
         context: impl Into<String>,
         source: impl std::error::Error + Send + Sync + 'static,
@@ -2569,7 +2545,7 @@ fn info_call_load_error(error: wasmtime::Error) -> WasmProviderLoadError {
         "Failed to call info()",
         WasmGuestCallError {
             context: None,
-            source: WasmDiagnostic::new(error, true),
+            source: error,
         },
     )
 }
@@ -2716,7 +2692,7 @@ fn hash_validation_bytes(hasher: &mut ValidationFingerprintHasher, bytes: &[u8])
 /// The originating operation and typed Wasmtime trap classification are kept
 /// separately from the rejected follow-up operation, so fail-fast diagnostics
 /// never misattribute an earlier failure to a later guest call.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum PoisonReason {
     /// A guest future was cancelled before Wasmtime returned a result.
     Cancelled,
@@ -2726,11 +2702,57 @@ enum PoisonReason {
     Trap {
         operation: &'static str,
         trap: Option<wasmtime::Trap>,
-        root_cause: ProviderText,
+        root_cause: String,
         secrets: Option<RedactionSet>,
         before_request_root: Option<DiagnosticText>,
         root_is_trap: bool,
     },
+}
+
+impl fmt::Debug for PoisonReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => f.write_str("Cancelled"),
+            Self::WallClockTimeout { operation } => f
+                .debug_struct("WallClockTimeout")
+                .field("operation", operation)
+                .finish(),
+            Self::Trap {
+                operation, trap, ..
+            } => f
+                .debug_struct("Trap")
+                .field("operation", operation)
+                .field("trap", trap)
+                .field("root_cause", &"<provider text>")
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl PoisonReason {
+    fn capture_text(&self) -> String {
+        match self {
+            Self::Trap {
+                operation,
+                trap,
+                root_cause,
+                root_is_trap,
+                secrets,
+                ..
+            } => {
+                let context = format!("WASM provider instance unusable after trap in {operation}");
+                if secrets.is_none() {
+                    return format!("{context}: {root_cause}");
+                }
+                match trap {
+                    Some(trap) if *root_is_trap => format!("{context}: {trap}"),
+                    Some(trap) => format!("{context}: {trap}: {root_cause}"),
+                    None => format!("{context}: {root_cause}"),
+                }
+            }
+            _ => self.to_string(),
+        }
+    }
 }
 
 impl fmt::Display for PoisonReason {
@@ -3383,7 +3405,11 @@ struct WasmProviderRebuildError {
 
 impl fmt::Display for WasmProviderRebuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "previous poison reason: {}", self.previous_poison)
+        write!(
+            f,
+            "previous poison reason: {}",
+            self.previous_poison.capture_text()
+        )
     }
 }
 
@@ -3400,24 +3426,21 @@ fn rebuild_provider_error(
     #[cfg(test)]
     tests::record_rebuild_load_probe(&load_error);
     let timed_out = load_error.is_wall_budget_timeout();
-    let mut text = previous_poison
-        .opaque_text()
-        .with_context("previous poison reason");
-    text.append_host(": ");
-    text.append(&load_error.opaque_text());
     let error = WasmProviderRebuildError {
         previous_poison,
         load_error,
     };
-    ProviderError::from_diagnostic(
-        if timed_out {
-            carina_core::provider::ProviderErrorKind::Timeout
-        } else {
-            carina_core::provider::ProviderErrorKind::Internal
-        },
-        "Failed to rebuild WASM provider validation instance",
-        ProviderDiagnostic::from_text(error, text),
-    )
+    if timed_out {
+        ProviderError::timeout_caused_by(
+            "Failed to rebuild WASM provider validation instance",
+            error,
+        )
+    } else {
+        ProviderError::internal_caused_by(
+            "Failed to rebuild WASM provider validation instance",
+            error,
+        )
+    }
 }
 
 /// Factory-validation instance that rebuilds after poisoning and independently

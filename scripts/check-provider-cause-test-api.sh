@@ -69,15 +69,19 @@ with tempfile.TemporaryDirectory(prefix="carina-provider-cause-api-") as tempora
             if diagnostic["level"] == "error":
                 errors.append(diagnostic)
 
+    expected_methods = {"matches_for_test", "to_wire"}
+    missing_methods = {
+        name for error in errors for name in expected_methods if name in error["message"]
+    }
     if result.returncode == 0:
-        sys.exit("ERROR: matches_for_test is exposed without test-utils")
-    if result.returncode != 101 or not errors or any(
+        sys.exit("ERROR: provider test predicates or native encoding are exposed")
+    if result.returncode != 101 or missing_methods != expected_methods or any(
         (error.get("code") or {}).get("code") != "E0599"
-        or "matches_for_test" not in error["message"]
+        or not any(name in error["message"] for name in ("matches_for_test", "to_wire"))
         for error in errors
     ):
         print(result.stdout, file=sys.stderr)
         print(result.stderr, file=sys.stderr)
-        sys.exit("ERROR: expected only E0599 for the unavailable matches_for_test method")
-    print("OK: downstream matches_for_test is unavailable without test-utils (E0599).")
+        sys.exit("ERROR: expected E0599 for both unavailable predicates and native partial encoding")
+    print("OK: downstream predicates and native partial plaintext encoding are unavailable (E0599).")
 PY

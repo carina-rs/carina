@@ -7,6 +7,103 @@
 use carina_provider_protocol::PERSISTED_SECRET_KEY;
 use carina_provider_protocol::types as proto;
 
+/// Flatten an authored error at the SDK transport boundary.
+#[doc(hidden)]
+pub fn encode_provider_error(error: crate::types::ProviderError) -> proto::ProviderError {
+    #[cfg(target_arch = "wasm32")]
+    {
+        error.to_wire()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        carina_core::test_utils::provider_text::NativeWireFixture::to_wire(&error)
+    }
+}
+#[doc(hidden)]
+pub fn encode_partial(
+    diagnostic: &crate::types::PartialReadDiagnostic,
+) -> proto::PartialReadDiagnostic {
+    #[cfg(target_arch = "wasm32")]
+    {
+        diagnostic.to_wire()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        carina_core::test_utils::provider_text::NativeWireFixture::to_wire(diagnostic)
+    }
+}
+#[doc(hidden)]
+pub fn encode_create_step<T>(
+    step: crate::ProtocolCreateStep<T>,
+) -> proto::CreateStep<
+    std::collections::BTreeMap<String, proto::Value>,
+    proto::PartialReadDiagnostic,
+    T,
+> {
+    match step {
+        proto::CreateStep::Success {
+            identifier,
+            attributes,
+        } => proto::CreateStep::Success {
+            identifier,
+            attributes,
+        },
+        proto::CreateStep::PartialSuccess {
+            identifier,
+            attributes,
+            diagnostic,
+        } => proto::CreateStep::PartialSuccess {
+            identifier,
+            attributes,
+            diagnostic: encode_partial(&diagnostic),
+        },
+        proto::CreateStep::Pending(pending) => proto::CreateStep::Pending(pending),
+    }
+}
+#[doc(hidden)]
+pub fn encode_resume_step<T>(
+    step: crate::ProtocolResumeStep<T>,
+) -> proto::ResumeStep<
+    std::collections::BTreeMap<String, proto::Value>,
+    proto::PartialReadDiagnostic,
+    T,
+> {
+    match step {
+        proto::ResumeStep::Completed {
+            identifier,
+            attributes,
+        } => proto::ResumeStep::Completed {
+            identifier,
+            attributes,
+        },
+        proto::ResumeStep::PartialSuccess {
+            identifier,
+            attributes,
+            diagnostic,
+        } => proto::ResumeStep::PartialSuccess {
+            identifier,
+            attributes,
+            diagnostic: encode_partial(&diagnostic),
+        },
+        proto::ResumeStep::Pending(pending) => proto::ResumeStep::Pending(pending),
+        proto::ResumeStep::Resent(step) => proto::ResumeStep::Resent(encode_create_step(step)),
+    }
+}
+#[doc(hidden)]
+pub fn encode_update_result(outcome: &crate::types::UpdateOutcome) -> proto::UpdateOutcome {
+    match outcome {
+        crate::types::UpdateOutcome::Success { state } => proto::UpdateOutcome::Success {
+            state: state.clone(),
+        },
+        crate::types::UpdateOutcome::PartialSuccess { state, diagnostic } => {
+            proto::UpdateOutcome::PartialSuccess {
+                state: state.clone(),
+                diagnostic: encode_partial(diagnostic),
+            }
+        }
+    }
+}
+
 /// Decode and validate a host-owned update continuation before dispatch.
 #[doc(hidden)]
 pub fn decode_pending_update<T: serde::de::DeserializeOwned + crate::PhasedToken>(
@@ -751,7 +848,7 @@ macro_rules! export_provider {
             $($world_items)*
 
             use super::*;
-            use $crate::types as proto;
+            use $crate::protocol::types as proto;
             use $crate::wasm_guest as helpers;
             use std::collections::{BTreeMap, HashMap};
 
@@ -1061,9 +1158,10 @@ macro_rules! export_provider {
             }
 
             fn proto_to_wit_update_outcome(
-                outcome: &proto::UpdateOutcome,
+                outcome: &$crate::types::UpdateOutcome,
             ) -> wit_types::UpdateOutcome {
-                match outcome {
+                let outcome = $crate::wasm_guest::encode_update_result(outcome);
+                match &outcome {
                     proto::UpdateOutcome::Success { state } => {
                         wit_types::UpdateOutcome::Success(proto_to_wit_applied_persisted_state(
                             state,
@@ -1429,7 +1527,7 @@ macro_rules! export_provider {
                 step: $crate::ProtocolCreateStep<T>,
                 operation: &'static str,
             ) -> Result<wit_types::CreateStep, CreateStepEncodeFailure> {
-                sdk_to_wit_protocol_create_step(step, operation)
+                sdk_to_wit_protocol_create_step($crate::wasm_guest::encode_create_step(step), operation)
             }
 
             fn sdk_to_wit_protocol_create_step<T: serde::Serialize>(
@@ -1461,7 +1559,7 @@ macro_rules! export_provider {
             }
 
             fn proto_to_wit_observation(
-                observation: proto::Observation<proto::ReadOutcome, proto::ProviderError>,
+                observation: proto::Observation<proto::ReadOutcome, $crate::types::ProviderError>,
             ) -> wit_types::Observation {
                 match observation {
                     proto::Observation::Read(read) => {
@@ -1474,7 +1572,7 @@ macro_rules! export_provider {
             }
 
             fn sdk_to_wit_create_identified(
-                identified: proto::CreateIdentified<proto::ReadOutcome, proto::ProviderError>,
+                identified: proto::CreateIdentified<proto::ReadOutcome, $crate::types::ProviderError>,
             ) -> wit_types::CreateIdentified {
                 let (identifier, observation, sent, error) = identified.into_parts();
                 wit_types::CreateIdentified {
@@ -1486,7 +1584,7 @@ macro_rules! export_provider {
             }
 
             fn sdk_to_wit_resume_identified(
-                identified: proto::ResumeIdentified<proto::ReadOutcome, proto::ProviderError>,
+                identified: proto::ResumeIdentified<proto::ReadOutcome, $crate::types::ProviderError>,
             ) -> wit_types::ResumeIdentified {
                 let (identifier, observation, error) = identified.into_parts();
                 wit_types::ResumeIdentified {
@@ -1497,7 +1595,7 @@ macro_rules! export_provider {
             }
 
             fn sdk_to_wit_create_verdict<T: serde::Serialize>(
-                verdict: proto::CreateVerdict<proto::ReadOutcome, T, proto::ProviderError>,
+                verdict: proto::CreateVerdict<proto::ReadOutcome, T, $crate::types::ProviderError>,
                 operation: &'static str,
             ) -> Result<wit_types::CreateVerdict, CreateStepEncodeFailure> {
                 match verdict {
@@ -1563,7 +1661,7 @@ macro_rules! export_provider {
                 step: $crate::ProtocolResumeStep<T>,
                 operation: &'static str,
             ) -> Result<wit_types::ResumeStep, ResumeStepEncodeFailure> {
-                match step {
+                match $crate::wasm_guest::encode_resume_step(step) {
                     proto::ResumeStep::Completed {
                         identifier,
                         attributes,
@@ -1807,7 +1905,10 @@ macro_rules! export_provider {
                 })
             }
 
-            fn proto_to_wit_provider_error(err: proto::ProviderError) -> wit_types::ProviderError {
+            fn proto_to_wit_provider_error(err: $crate::types::ProviderError) -> wit_types::ProviderError {
+                wire_to_wit_provider_error($crate::wasm_guest::encode_provider_error(err))
+            }
+            fn wire_to_wit_provider_error(err: proto::ProviderError) -> wit_types::ProviderError {
                 let detail = wit_types::ErrorDetail {
                     message: err.message,
                     resource_id: err.resource_id.as_ref().map(proto_to_wit_resource_id),
@@ -1881,7 +1982,7 @@ macro_rules! export_provider {
             fn desired_resource_boundary_to_provider_error(direction: &str, error: $crate::DesiredNormalizationError) -> wit_types::ProviderError {
                 let mut error: proto::ProviderError = error.into();
                 error.message = format!("WASM boundary {direction} error in normalize_desired: {}", error.message);
-                proto_to_wit_provider_error(error)
+                wire_to_wit_provider_error(error)
             }
 
             fn boundary_applied_identifier_decode_to_provider_error(
@@ -1946,10 +2047,10 @@ macro_rules! export_provider {
 
             fn provider_export_or_trap<T>(
                 operation: &'static str,
-                result: Result<T, proto::ProviderError>,
+                result: Result<T, $crate::types::ProviderError>,
             ) -> T {
                 result.unwrap_or_else(|error| {
-                    panic!("Provider export error in {operation}: {}", error.message)
+                    panic!("Provider export error in {operation}: {}", $crate::wasm_guest::encode_provider_error(error).message)
                 })
             }
 
@@ -2451,9 +2552,7 @@ macro_rules! export_provider {
                         &wit_to_proto_type_identity(&ty),
                         &value,
                     )
-                    .map_err(|error| {
-                        validate_string_to_provider_error(helpers::render_error_chain(&error))
-                    })
+                    .map_err(|error| proto_to_wit_provider_error(error.into_provider_error()))
                 }
 
                 fn resolve_references(
@@ -2468,11 +2567,11 @@ macro_rules! export_provider {
                         $crate::CarinaProvider::resolve_references(&*provider, requests)
                     }.map_err(proto_to_wit_provider_error)?;
                     Ok(results.into_iter().map(|result| match result {
-                        Ok(proto::ReferenceOutcome::Resolved(value)) => Ok(wit_types::ReferenceOutcome::Resolved(value)),
-                        Ok(proto::ReferenceOutcome::NotFound(error)) => Ok(wit_types::ReferenceOutcome::NotFound(proto_to_wit_provider_error(*error))),
-                        Err(proto::ReferenceError::AccessDenied(error)) => Err(wit_types::ReferenceError::AccessDenied(proto_to_wit_provider_error(*error))),
-                        Err(proto::ReferenceError::Transient(error)) => Err(wit_types::ReferenceError::Transient(proto_to_wit_provider_error(*error))),
-                        Err(proto::ReferenceError::InvalidReference(error)) => Err(wit_types::ReferenceError::InvalidReference(proto_to_wit_provider_error(*error))),
+                        Ok($crate::types::ReferenceOutcome::Resolved(value)) => Ok(wit_types::ReferenceOutcome::Resolved(value)),
+                        Ok($crate::types::ReferenceOutcome::NotFound(error)) => Ok(wit_types::ReferenceOutcome::NotFound(proto_to_wit_provider_error(*error))),
+                        Err($crate::types::ReferenceError::AccessDenied(error)) => Err(wit_types::ReferenceError::AccessDenied(proto_to_wit_provider_error(*error))),
+                        Err($crate::types::ReferenceError::Transient(error)) => Err(wit_types::ReferenceError::Transient(proto_to_wit_provider_error(*error))),
+                        Err($crate::types::ReferenceError::InvalidReference(error)) => Err(wit_types::ReferenceError::InvalidReference(proto_to_wit_provider_error(*error))),
                     }).collect())
                 }
 

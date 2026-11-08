@@ -53,7 +53,12 @@ impl Provider for PartialReadProvider {
             )
             .partial(
                 HashMap::new(),
-                PartialReadDiagnostic::new(reason.into(), vec!["password".into()]).unwrap(),
+                PartialReadDiagnostic::new(
+                    carina_core::provider_text::ProviderDiagnostic::new(reason),
+                    (vec!["password".into()])
+                        .try_into()
+                        .expect("nonempty partial attributes"),
+                ),
             );
         Box::pin(async { Ok(outcome) })
     }
@@ -82,8 +87,10 @@ impl Provider for PartialReadProvider {
         let reason = read_back_error(&plaintext);
         let outcome = UpdateOutcome::partial_success(
             AppliedState::from_identifier(id.clone(), identifier.clone(), HashMap::new()),
-            reason.into(),
-            vec!["password".into()],
+            carina_core::provider_text::ProviderDiagnostic::new(reason),
+            (vec!["password".into()])
+                .try_into()
+                .expect("nonempty partial attributes"),
         );
         Box::pin(async { Ok(outcome) })
     }

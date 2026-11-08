@@ -126,8 +126,7 @@ impl crate::resource::InsideSecret for ReferencePlanError {
 
 impl From<Box<ReferencePlanError>> for HostError {
     fn from(error: Box<ReferencePlanError>) -> Self {
-        HostError::from_diagnostic(
-            crate::provider::ProviderErrorKind::InvalidInput,
+        HostError::invalid_input_caused_by(
             "Failed to prepare reference comparison",
             crate::provider_text::HostDiagnostic::capture_host_or_provider(error),
         )
@@ -851,8 +850,7 @@ impl ReferencePreparation {
                     path: "<planning>".into(),
                     raw: "<planning>".into(),
                     source: ReferenceFailure::Call(
-                        HostError::from_diagnostic(
-                            crate::provider::ProviderErrorKind::InvalidInput,
+                        HostError::invalid_input_caused_by(
                             "Failed to verify secret comparison",
                             crate::provider_text::HostDiagnostic::capture_host_or_provider(error),
                         )
@@ -867,8 +865,7 @@ impl ReferencePreparation {
                     path: "<planning>".into(),
                     raw: "<planning>".into(),
                     source: ReferenceFailure::Call(
-                        HostError::from_diagnostic(
-                            crate::provider::ProviderErrorKind::InvalidInput,
+                        HostError::invalid_input_caused_by(
                             "Failed to resolve comparison resource",
                             crate::provider_text::HostDiagnostic::capture_host_or_provider(error),
                         )

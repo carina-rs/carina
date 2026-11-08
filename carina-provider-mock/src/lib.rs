@@ -879,7 +879,7 @@ impl MockProvider {
             })?,
             None => references::ReferenceTable::new(),
         };
-        Ok(references::resolve(&table, requests))
+        Ok(references::resolve_authoring(&table, requests))
     }
 
     fn canonicalize_mock_reference_write<P: StateValueLeaf>(
@@ -1459,11 +1459,20 @@ impl MockProvider {
             ));
         }
         if let Some(config) = partial_create {
-            let outcome = match PartialReadDiagnostic::new(
-                "mock partial create".into(),
+            let outcome = match carina_core::provider::NonEmptyMissingAttributes::try_from(
                 config.missing_attributes.clone(),
-            ) {
-                Some(diagnostic) => issued.partial(state_attrs, diagnostic),
+            )
+            .ok()
+            {
+                Some(missing) => issued.partial(
+                    state_attrs,
+                    PartialReadDiagnostic::new(
+                        carina_core::provider_text::ProviderDiagnostic::message(
+                            "mock partial create".into(),
+                        ),
+                        missing,
+                    ),
+                ),
                 None => issued.succeeded(state_attrs),
             };
             return Ok(outcome);
@@ -1703,16 +1712,23 @@ impl Provider for MockProvider {
                 .resolve_reference_requests(requests)?
                 .into_iter()
                 .map(|result| match result {
-                    Ok(outcome) => ReferenceOutcome::from_guest(outcome),
-                    Err(WireError::AccessDenied(error)) => Err(ReferenceError::AccessDenied(
-                        ProviderError::from_wire(*error).into(),
-                    )),
-                    Err(WireError::Transient(error)) => Err(ReferenceError::Transient(
-                        ProviderError::from_wire(*error).into(),
-                    )),
-                    Err(WireError::InvalidReference(error)) => Err(
-                        ReferenceError::InvalidReference(ProviderError::from_wire(*error).into()),
-                    ),
+                    Ok(carina_plugin_sdk::types::ReferenceOutcome::Resolved(value)) => {
+                        ReferenceOutcome::from_guest(
+                            carina_provider_protocol::types::ReferenceOutcome::Resolved(value),
+                        )
+                    }
+                    Ok(carina_plugin_sdk::types::ReferenceOutcome::NotFound(error)) => {
+                        Ok(ReferenceOutcome::NotFound(*error))
+                    }
+                    Err(WireError::AccessDenied(error)) => {
+                        Err(ReferenceError::AccessDenied((*error).into()))
+                    }
+                    Err(WireError::Transient(error)) => {
+                        Err(ReferenceError::Transient((*error).into()))
+                    }
+                    Err(WireError::InvalidReference(error)) => {
+                        Err(ReferenceError::InvalidReference((*error).into()))
+                    }
                 })
                 .collect())
         })
@@ -1994,8 +2010,12 @@ impl Provider for MockProvider {
             if let Some(config) = partial_update {
                 return Ok(UpdateOutcome::partial_success(
                     state,
-                    "mock partial update".into(),
-                    config.missing_attributes.clone(),
+                    carina_core::provider_text::ProviderDiagnostic::message(
+                        "mock partial update".into(),
+                    ),
+                    (config.missing_attributes.clone())
+                        .try_into()
+                        .expect("nonempty partial attributes"),
                 ));
             }
 

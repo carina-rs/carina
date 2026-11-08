@@ -51,13 +51,12 @@ async fn persisted_read_back_failure(incomplete: bool) -> String {
         panic!("read-back failure must retain the created identifier");
     };
     let identified = if incomplete {
-        identified.with_partial_read_for_test(
-            carina_core::provider::PartialReadDiagnostic::new(
-                detail.into(),
-                vec!["computed".into()],
-            )
-            .unwrap(),
-        )
+        identified.with_partial_read_for_test(carina_core::provider::PartialReadDiagnostic::new(
+            carina_core::provider_text::ProviderDiagnostic::message(detail.into()),
+            (vec!["computed".into()])
+                .try_into()
+                .expect("nonempty partial attributes"),
+        ))
     } else {
         identified
     };

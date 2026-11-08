@@ -85,17 +85,15 @@ use carina_plugin_sdk::{
 struct HelloProvider;
 
 fn error(kind: ProviderErrorKind, message: impl Into<String>) -> ProviderError {
-    ProviderError {
-        kind,
-        message: message.into(),
-        resource_id: None,
-        cause: None,
-        provider_name: Some("hello".to_string()),
-        operation: None,
-        status: None,
-        code: None,
-        request_id: None,
-    }
+    let message = message.into();
+    let error = match kind {
+        ProviderErrorKind::InvalidInput => ProviderError::invalid_input(message),
+        ProviderErrorKind::ApiError => ProviderError::api_error(message),
+        ProviderErrorKind::NotFound => ProviderError::not_found(message),
+        ProviderErrorKind::Timeout => ProviderError::timeout(message),
+        ProviderErrorKind::Internal => ProviderError::internal(message),
+    };
+    error.for_provider("hello")
 }
 
 fn greeting(name: &str) -> BTreeMap<String, Value> {

@@ -15633,3 +15633,24 @@ async fn round2_binding_stability_reuses_normalized_inputs() {
     )
     .await;
 }
+
+#[test]
+fn retry_policy_inherits_transient_causes_and_respects_explicit_overrides() {
+    use carina_core::provider_text::Retryability;
+    let cause = ProviderError::api_error_caused_by(
+        "read failed",
+        std::io::Error::other("transport failure"),
+    )
+    .with_retryability(Retryability::Transient);
+    let error = ProviderError::internal_caused_by("read-back failed", cause).into_host_for_test();
+    assert!(is_throttling_error(&error));
+    assert!(!is_throttling_error(
+        &error.clone().with_retryability(Retryability::Permanent)
+    ));
+    assert!(!is_throttling_error(
+        &error.with_retryability(Retryability::Unclassified)
+    ));
+    assert!(!is_throttling_error(
+        &ProviderError::timeout("deadline").into_host_for_test()
+    ));
+}

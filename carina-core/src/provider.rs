@@ -35,7 +35,8 @@ use crate::parser::{ProviderConfig, StateBlockAddress};
 use crate::provider_text::OpaqueFixtureDisplay as _;
 use crate::provider_text::{
     Bound, Diagnostic, DiagnosticSource, DiagnosticText, ErrorText, ProviderDiagnostic,
-    ProviderErrorText, ProviderKey, ProviderText, RedactionSet, TextState, Unbound,
+    ProviderErrorText, ProviderKey, ProviderText, RedactionContext, RedactionSet, Retryability,
+    TextState, Unbound,
 };
 pub use crate::resource::ProviderDirectiveSchema;
 use crate::resource::{
@@ -127,16 +128,12 @@ pub struct UnknownMissingAttribute;
 /// ```
 #[derive(Default, Clone)]
 pub struct OperationErrorDetail<S: TextState = Unbound> {
-    /// Human-readable message.
-    message: ErrorText<S>,
+    body: FailureBody<S>,
     /// Retry policy captured before diagnostic text is escaped or truncated.
     throttling: ThrottlingClassification,
-    pub transient: bool,
+    retryability: Retryability,
     /// Resource the error pertains to, if known.
     pub resource_id: Option<Box<ErrorResourceId<S>>>,
-    /// Underlying terminal cause. Flattened to a string when the error crosses
-    /// the WIT boundary.
-    cause: Option<Diagnostic<S>>,
     /// Host-side policy marker. This is deliberately not transported over the
     /// provider protocol because guests cannot originate host lifecycle state.
     host_cause: Option<HostErrorCause>,
@@ -169,15 +166,81 @@ pub struct OperationErrorDetail<S: TextState = Unbound> {
     pub request_id: Option<ErrorText<S>>,
 }
 
+// A captured source owns its complete rendering. Only contextual bodies add text.
+#[derive(Clone)]
+enum FailureBody<S: TextState> {
+    Message(ErrorText<S>),
+    Captured(Diagnostic<S>),
+    Context {
+        context: ErrorText<S>,
+        cause: Diagnostic<S>,
+    },
+}
+impl<S: TextState> Default for FailureBody<S> {
+    fn default() -> Self {
+        Self::Message(ErrorText::default())
+    }
+}
+impl<S: TextState> FailureBody<S> {
+    fn message(&self) -> &ErrorText<S> {
+        match self {
+            Self::Message(text) => text,
+            Self::Captured(source) => source.text(),
+            Self::Context { context, .. } => context,
+        }
+    }
+    fn cause(&self) -> Option<&Diagnostic<S>> {
+        match self {
+            Self::Message(_) => None,
+            Self::Captured(source) | Self::Context { cause: source, .. } => Some(source),
+        }
+    }
+    fn rendered_cause(&self) -> Option<&Diagnostic<S>> {
+        match self {
+            Self::Context { cause, .. } => Some(cause),
+            Self::Message(_) | Self::Captured(_) => None,
+        }
+    }
+}
+impl FailureBody<Unbound> {
+    fn bind(self, secrets: &RedactionSet, context: &RedactionContext) -> FailureBody<Bound> {
+        let text =
+            |text: ErrorText<Unbound>| text.into_host(secrets).with_redaction_context(context);
+        let diagnostic = |source: ProviderDiagnostic| {
+            source.with_secrets(secrets).with_redaction_context(context)
+        };
+        match self {
+            Self::Message(message) => FailureBody::Message(text(message)),
+            Self::Captured(source) => FailureBody::Captured(diagnostic(source)),
+            Self::Context { context, cause } => FailureBody::Context {
+                context: text(context),
+                cause: diagnostic(cause),
+            },
+        }
+    }
+}
+impl FailureBody<Bound> {
+    fn host_for_state<S: TextState>(self) -> FailureBody<S> {
+        match self {
+            Self::Message(text) => FailureBody::Message(text.host_for_state()),
+            Self::Captured(source) => FailureBody::Captured(source.host_for_state()),
+            Self::Context { context, cause } => FailureBody::Context {
+                context: context.host_for_state(),
+                cause: cause.host_for_state(),
+            },
+        }
+    }
+}
+
 impl<S: TextState> fmt::Debug for OperationErrorDetail<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if !S::BOUND {
             return f.write_str("ErrorDetail(<provider text>)");
         }
         f.debug_struct("ErrorDetail")
-            .field("message", &self.message)
+            .field("message", self.body.message())
             .field("resource_id", &self.resource_id)
-            .field("cause", &self.cause)
+            .field("cause", &self.body.cause())
             .field("provider_name", &self.provider_name)
             .field("operation", &self.operation)
             .field("status", &self.status)
@@ -362,9 +425,9 @@ impl std::error::Error for ProviderFailure<Bound> {}
 
 impl<S: TextState> From<crate::value::EnumCanonicalizationError> for ProviderFailure<S> {
     fn from(error: crate::value::EnumCanonicalizationError) -> Self {
-        Self::from_diagnostic(
+        Self::with_context_diagnostic(
             ProviderErrorKind::InvalidInput,
-            "Failed to canonicalize enum value",
+            ErrorText::new("Failed to canonicalize enum value"),
             Diagnostic::capture_host_or_provider(error),
         )
     }
@@ -379,7 +442,7 @@ impl<S: TextState> ProviderFailure<S> {
             text.append(&id.text.opaque());
             text.append_host("] ");
         }
-        text.append(&detail.message.opaque());
+        text.append(&detail.body.message().opaque());
         if detail.has_structured_cloud_fields() {
             if let Some(operation) = &detail.operation {
                 text.append_host("\n  operation: ");
@@ -406,15 +469,15 @@ impl<S: TextState> ProviderFailure<S> {
                 text.append_host("\n  request_id: ");
                 text.append(&request_id.opaque());
             }
-            if let Some(cause) = &detail.cause {
+            if let Some(cause) = detail.body.rendered_cause() {
                 text.append_host("\n  cause: ");
                 text.append(&cause.opaque());
             }
-        } else if let Some(cause) = &detail.cause {
+        } else if let Some(cause) = detail.body.rendered_cause() {
             text.append_host(": ");
             text.append(&cause.opaque());
         }
-        text
+        ErrorText::<S>::protect_opaque(text, &self.redaction_context())
     }
     pub(crate) fn segmented_text(&self) -> ErrorText<S> {
         let detail = self.detail();
@@ -424,7 +487,7 @@ impl<S: TextState> ProviderFailure<S> {
             text.append(&id.text);
             text.append_host("] ");
         }
-        text.append(&detail.message);
+        text.append(detail.body.message());
         if detail.has_structured_cloud_fields() {
             if let Some(operation) = &detail.operation {
                 text.append_host("\n  operation: ");
@@ -445,15 +508,15 @@ impl<S: TextState> ProviderFailure<S> {
                 text.append_host("\n  request_id: ");
                 text.append(request_id);
             }
-            if let Some(cause) = &detail.cause {
+            if let Some(cause) = detail.body.rendered_cause() {
                 text.append_host("\n  cause: ");
                 text.append(cause.text());
             }
-        } else if let Some(cause) = &detail.cause {
+        } else if let Some(cause) = detail.body.rendered_cause() {
             text.append_host(": ");
             text.append(cause.text());
         }
-        text
+        text.with_redaction_context(&self.redaction_context())
     }
     fn host_diagnostic_text(&self) -> String {
         let detail = self.detail();
@@ -463,7 +526,7 @@ impl<S: TextState> ProviderFailure<S> {
             text.push_str(id.text.redacted_str());
             text.push_str("] ");
         }
-        text.push_str(detail.message.redacted_str());
+        text.push_str(detail.body.message().redacted_str());
         if detail.has_structured_cloud_fields() {
             if let Some(operation) = &detail.operation {
                 text.push_str("\n  operation: ");
@@ -485,24 +548,48 @@ impl<S: TextState> ProviderFailure<S> {
                 text.push_str("\n  request_id: ");
                 text.push_str(request_id.redacted_str());
             }
-            if let Some(cause) = &detail.cause {
+            if let Some(cause) = detail.body.rendered_cause() {
                 text.push_str("\n  cause: ");
                 text.push_str(cause.redacted_str());
             }
-        } else if let Some(cause) = &detail.cause {
+        } else if let Some(cause) = detail.body.rendered_cause() {
             text.push_str(": ");
             text.push_str(cause.redacted_str());
         }
         text
     }
 
+    fn redaction_context(&self) -> RedactionContext {
+        let detail = self.detail();
+        let mut context = detail.body.message().redaction_context();
+        if let Some(cause) = detail.cause() {
+            context.extend(&cause.text().redaction_context());
+        }
+        for text in [
+            &detail.provider_name,
+            &detail.operation,
+            &detail.code,
+            &detail.request_id,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            context.extend(&text.redaction_context());
+        }
+        if let Some(id) = &detail.resource_id {
+            context.extend(&id.text.redaction_context());
+        }
+        context
+    }
+
     /// Preserve an already captured opaque source instead of formatting it.
-    pub fn from_diagnostic(
-        kind: ProviderErrorKind,
-        context: &'static str,
-        cause: Diagnostic<S>,
-    ) -> Self {
-        let detail = Box::new(OperationErrorDetail::from_diagnostic(context, cause));
+    pub fn from_diagnostic(kind: ProviderErrorKind, source: impl DiagnosticSource<S>) -> Self {
+        let source = source.into_diagnostic();
+        let detail = OperationErrorDetail::captured(source);
+        Self::from_detail(kind, detail)
+    }
+    fn from_detail(kind: ProviderErrorKind, detail: OperationErrorDetail<S>) -> Self {
+        let detail = Box::new(detail);
         match kind {
             ProviderErrorKind::InvalidInput => Self::InvalidInput(detail),
             ProviderErrorKind::ApiError => Self::ApiError(detail),
@@ -510,6 +597,13 @@ impl<S: TextState> ProviderFailure<S> {
             ProviderErrorKind::Timeout => Self::Timeout(detail),
             ProviderErrorKind::Internal => Self::Internal(detail),
         }
+    }
+    fn with_context_diagnostic(
+        kind: ProviderErrorKind,
+        context: ErrorText<S>,
+        source: Diagnostic<S>,
+    ) -> Self {
+        Self::from_detail(kind, OperationErrorDetail::contextual(context, source))
     }
 
     /// Borrow the inner [`ErrorDetail`] regardless of variant.
@@ -556,12 +650,15 @@ impl<S: TextState> ProviderFailure<S> {
         }
     }
 
-    pub fn with_transient(mut self, transient: bool) -> Self {
-        self.detail_mut().transient = transient;
+    pub fn with_retryability(mut self, retryability: Retryability) -> Self {
+        self.detail_mut().retryability = retryability;
         self
     }
+    pub fn retryability(&self) -> Retryability {
+        self.detail().retryability
+    }
     pub fn is_transient(&self) -> bool {
-        self.detail().transient
+        self.retryability() == Retryability::Transient
     }
 
     /// Whether the original message, code or cause identifies throttling.
@@ -576,50 +673,61 @@ impl<S: TextState> ProviderFailure<S> {
     }
 
     /// User-supplied input is invalid.
-    pub fn invalid_input(message: impl Into<String>) -> Self {
+    pub fn invalid_input(message: impl Into<S::Message>) -> Self {
         ProviderFailure::InvalidInput(Box::new(OperationErrorDetail::new(message)))
     }
 
     /// The cloud API rejected the request.
-    pub fn api_error(message: impl Into<String>) -> Self {
+    pub fn api_error(message: impl Into<S::Message>) -> Self {
         ProviderFailure::ApiError(Box::new(OperationErrorDetail::new(message)))
     }
 
     /// Resource was not found at the cloud API.
-    pub fn not_found(message: impl Into<String>) -> Self {
+    pub fn not_found(message: impl Into<S::Message>) -> Self {
         ProviderFailure::NotFound(Box::new(OperationErrorDetail::new(message)))
     }
 
     /// Operation timed out.
-    pub fn timeout(message: impl Into<String>) -> Self {
+    pub fn timeout(message: impl Into<S::Message>) -> Self {
         ProviderFailure::Timeout(Box::new(OperationErrorDetail::new(message)))
     }
 
     /// Provider-internal failure / unexpected state.
-    pub fn internal(message: impl Into<String>) -> Self {
+    pub fn internal(message: impl Into<S::Message>) -> Self {
         ProviderFailure::Internal(Box::new(OperationErrorDetail::new(message)))
     }
 
     /// User-supplied input is invalid because of a typed source error.
     ///
-    /// `context` is deliberately static: dynamic data belongs in a typed
-    /// cause, so its rendered text cannot also be copied into the message.
-    pub fn invalid_input_caused_by(context: &'static str, cause: impl DiagnosticSource<S>) -> Self {
+    /// Runtime contexts must be explicitly opaque provider text.
+    pub fn invalid_input_caused_by(
+        context: impl Into<S::Context>,
+        cause: impl DiagnosticSource<S>,
+    ) -> Self {
         ProviderFailure::InvalidInput(Box::new(OperationErrorDetail::caused_by(context, cause)))
     }
 
     /// The cloud API rejected the request because of a typed source error.
-    pub fn api_error_caused_by(context: &'static str, cause: impl DiagnosticSource<S>) -> Self {
+    pub fn api_error_caused_by(
+        context: impl Into<S::Context>,
+        cause: impl DiagnosticSource<S>,
+    ) -> Self {
         ProviderFailure::ApiError(Box::new(OperationErrorDetail::caused_by(context, cause)))
     }
 
     /// A resource was not found because of a typed source error.
-    pub fn not_found_caused_by(context: &'static str, cause: impl DiagnosticSource<S>) -> Self {
+    pub fn not_found_caused_by(
+        context: impl Into<S::Context>,
+        cause: impl DiagnosticSource<S>,
+    ) -> Self {
         ProviderFailure::NotFound(Box::new(OperationErrorDetail::caused_by(context, cause)))
     }
 
     /// An operation timed out because of a typed source error.
-    pub fn timeout_caused_by(context: &'static str, cause: impl DiagnosticSource<S>) -> Self {
+    pub fn timeout_caused_by(
+        context: impl Into<S::Context>,
+        cause: impl DiagnosticSource<S>,
+    ) -> Self {
         ProviderFailure::Timeout(Box::new(OperationErrorDetail::caused_by(context, cause)))
     }
 
@@ -631,7 +739,10 @@ impl<S: TextState> ProviderFailure<S> {
     /// use carina_core::provider::HostError;
     /// let error = HostError::internal_caused_by("ctx", std::io::Error::other("guest password"));
     /// ```
-    pub fn internal_caused_by(context: &'static str, cause: impl DiagnosticSource<S>) -> Self {
+    pub fn internal_caused_by(
+        context: impl Into<S::Context>,
+        cause: impl DiagnosticSource<S>,
+    ) -> Self {
         ProviderFailure::Internal(Box::new(OperationErrorDetail::caused_by(context, cause)))
     }
 
@@ -641,7 +752,10 @@ impl<S: TextState> ProviderFailure<S> {
     /// wire format cannot carry `dyn Error`. The returned type is the exact
     /// protocol record consumed by guest SDK encoders.
     fn to_wire_inner(&self) -> WireProviderError {
-        let detail = self.detail();
+        let union = self.redaction_context();
+        let mut projection = self.clone();
+        projection.protect_fields(&union);
+        let detail = projection.detail();
         let kind = match self.kind() {
             ProviderErrorKind::InvalidInput => WireProviderErrorKind::InvalidInput,
             ProviderErrorKind::ApiError => WireProviderErrorKind::ApiError,
@@ -677,8 +791,8 @@ impl<S: TextState> ProviderFailure<S> {
             request_id: None,
         };
         crate::provider_text::ErrorWireText {
-            message: &detail.message,
-            cause: detail.cause.as_ref(),
+            message: detail.body.message(),
+            cause: detail.body.rendered_cause(),
             provider_name: detail.provider_name.as_ref(),
             operation: detail.operation.as_ref(),
             code: detail.code.as_ref(),
@@ -755,9 +869,48 @@ impl<S: TextState> ProviderFailure<S> {
     /// Replace only diagnostic text while preserving the error variant,
     /// structured metadata, typed cause, and host lifecycle classification.
     pub(crate) fn with_redacted_message(mut self, message: impl Into<String>) -> Self {
-        self.detail_mut().message = self.new_host_field(message.into());
-
+        let text = self.new_host_field(message.into());
+        self.detail_mut().body = match self.detail().body.clone() {
+            FailureBody::Message(_) => FailureBody::Message(text),
+            FailureBody::Context { cause, .. } | FailureBody::Captured(cause) => {
+                FailureBody::Context {
+                    context: text,
+                    cause,
+                }
+            }
+        };
         self
+    }
+    fn protect_fields(&mut self, context: &RedactionContext) {
+        let detail = self.detail_mut();
+        detail.body = match detail.body.clone() {
+            FailureBody::Message(text) => {
+                FailureBody::Message(text.with_redaction_context(context))
+            }
+            FailureBody::Captured(source) => {
+                FailureBody::Captured(source.with_redaction_context(context))
+            }
+            FailureBody::Context {
+                context: text,
+                cause,
+            } => FailureBody::Context {
+                context: text.with_redaction_context(context),
+                cause: cause.with_redaction_context(context),
+            },
+        };
+        for field in [
+            &mut detail.provider_name,
+            &mut detail.operation,
+            &mut detail.code,
+            &mut detail.request_id,
+        ] {
+            if let Some(text) = field.take() {
+                *field = Some(text.with_redaction_context(context));
+            }
+        }
+        if let Some(id) = &mut detail.resource_id {
+            id.text = id.text.clone().with_redaction_context(context);
+        }
     }
     fn new_host_field(&self, text: String) -> ErrorText<S> {
         ErrorText::<S>::new(text)
@@ -765,35 +918,38 @@ impl<S: TextState> ProviderFailure<S> {
 }
 
 impl<S: TextState> OperationErrorDetail<S> {
-    pub fn new(message: impl Into<String>) -> Self {
-        let message = message.into();
-        Self {
-            throttling: ThrottlingClassification::from_raw(&message, None, None),
-            message: ErrorText::<S>::new(message),
-            ..Self::default()
-        }
+    pub fn new(message: impl Into<S::Message>) -> Self {
+        let text = S::message(message.into());
+        let mut detail = Self::captured(Diagnostic::message_for_state(text.clone()));
+        detail.body = FailureBody::Message(text);
+        detail
     }
-
-    fn caused_by(context: &'static str, cause: impl DiagnosticSource<S>) -> Self {
-        Self::from_diagnostic(context, Diagnostic::<S>::new(cause))
-    }
-
-    fn from_diagnostic(context: &'static str, cause: Diagnostic<S>) -> Self {
-        let mut throttling = ThrottlingClassification::from_raw(context, None, None);
-        throttling.message_or_cause |= cause.has_throttling_marker();
-        throttling.delete_dependency |= cause.has_delete_dependency_marker();
-        let message = ErrorText::<S>::new(context);
+    fn captured(cause: Diagnostic<S>) -> Self {
+        let throttling = ThrottlingClassification {
+            message_or_cause: cause.has_throttling_marker(),
+            delete_dependency: cause.has_delete_dependency_marker(),
+            ..ThrottlingClassification::default()
+        };
         Self {
-            message,
+            retryability: cause.retryability(),
+            body: FailureBody::Captured(cause),
             throttling,
-            cause: Some(cause),
             ..Self::default()
         }
     }
-
-    /// Typed source error, when this detail was built by a cause-bearing path.
+    fn caused_by(context: impl Into<S::Context>, cause: impl DiagnosticSource<S>) -> Self {
+        Self::contextual(S::context(context.into()), cause.into_diagnostic())
+    }
+    fn contextual(context: ErrorText<S>, cause: Diagnostic<S>) -> Self {
+        let mut detail = Self::captured(cause.clone());
+        detail.throttling.message_or_cause |= context.opaque().has_throttling_marker();
+        detail.throttling.delete_dependency |= context.opaque().has_delete_dependency_marker();
+        detail.body = FailureBody::Context { context, cause };
+        detail
+    }
+    /// The complete captured diagnostic, without exposing a raw error reference.
     pub fn cause(&self) -> Option<&Diagnostic<S>> {
-        self.cause.as_ref()
+        self.body.cause()
     }
 
     /// Host-side lifecycle classification, when the host attached one.
@@ -822,10 +978,10 @@ impl<S: TextState> OperationErrorDetail<S> {
 }
 
 impl OperationErrorDetail<Bound> {
-    /// Static context for a caused error, or the complete message for a
+    /// Opaque context for a caused error, or the complete message for a
     /// message-only error.
     pub fn context(&self) -> &str {
-        &self.message
+        self.body.message()
     }
 
     /// Sanitized application-level code for diagnostics. Set it with
@@ -2472,14 +2628,31 @@ pub enum UpdateOutcomeKind<S: TextState = Unbound> {
     },
 }
 
+/// Missing attribute names validated before a partial-read reason is consumed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NonEmptyMissingAttributes(Vec<String>);
+#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[error("a partial read requires at least one missing attribute")]
+pub struct EmptyMissingAttributes;
+impl TryFrom<Vec<String>> for NonEmptyMissingAttributes {
+    type Error = EmptyMissingAttributes;
+    fn try_from(attributes: Vec<String>) -> Result<Self, Self::Error> {
+        if attributes.is_empty() {
+            Err(EmptyMissingAttributes)
+        } else {
+            Ok(Self(attributes))
+        }
+    }
+}
+
 /// Diagnostic details for a partial post-mutation read.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(bound(
-    serialize = "ErrorText<S>: Serialize",
-    deserialize = "ErrorText<S>: Deserialize<'de>"
+    serialize = "Diagnostic<S>: Serialize",
+    deserialize = "Diagnostic<S>: Deserialize<'de>"
 ))]
 pub struct PartialReadDiagnostic<S: TextState = Unbound> {
-    pub(crate) reason: ErrorText<S>,
+    pub(crate) reason: Diagnostic<S>,
     pub(crate) missing_attributes: Vec<ProviderKey>,
 }
 
@@ -5289,14 +5462,10 @@ impl<S: TextState> CreateOutcome<S> {
     pub(crate) fn partial_success(
         state: AppliedState,
         reason: S::PartialReadReason,
-        missing_attributes: Vec<String>,
+        missing_attributes: NonEmptyMissingAttributes,
     ) -> Self {
-        match PartialReadDiagnostic::new(reason, missing_attributes) {
-            Some(diagnostic) => {
-                Self::provider_reported(CreateOutcomeKind::PartialSuccess { state, diagnostic })
-            }
-            None => Self::provider_reported(CreateOutcomeKind::Success { state }),
-        }
+        let diagnostic = PartialReadDiagnostic::new(reason, missing_attributes);
+        Self::provider_reported(CreateOutcomeKind::PartialSuccess { state, diagnostic })
     }
 
     pub fn kind(&self) -> &CreateOutcomeKind<S> {
@@ -5372,14 +5541,10 @@ impl<S: TextState> UpdateOutcome<S> {
     pub fn partial_success(
         state: AppliedState,
         reason: S::PartialReadReason,
-        missing_attributes: Vec<String>,
+        missing_attributes: NonEmptyMissingAttributes,
     ) -> Self {
-        match PartialReadDiagnostic::new(reason, missing_attributes) {
-            Some(diagnostic) => {
-                Self::provider_reported(UpdateOutcomeKind::PartialSuccess { state, diagnostic })
-            }
-            None => Self::success(state),
-        }
+        let diagnostic = PartialReadDiagnostic::new(reason, missing_attributes);
+        Self::provider_reported(UpdateOutcomeKind::PartialSuccess { state, diagnostic })
     }
 
     fn provider_reported(kind: UpdateOutcomeKind<S>) -> Self {
@@ -5429,60 +5594,59 @@ impl UpdateOutcome<Bound> {
 }
 
 impl<S: TextState> PartialReadDiagnostic<S> {
-    pub fn new(reason: S::PartialReadReason, missing_attributes: Vec<String>) -> Option<Self> {
-        Self::from_reason(S::partial_read_reason(reason), missing_attributes)
-    }
-    fn from_reason(reason: ErrorText<S>, missing_attributes: Vec<String>) -> Option<Self> {
-        if missing_attributes.is_empty() {
-            None
-        } else {
-            Some(Self {
-                reason,
-                missing_attributes: missing_attributes
-                    .into_iter()
-                    .map(ProviderKey::from)
-                    .collect(),
-            })
+    pub fn new(
+        reason: S::PartialReadReason,
+        missing_attributes: NonEmptyMissingAttributes,
+    ) -> Self {
+        Self {
+            reason: S::partial_read_reason(reason),
+            missing_attributes: missing_attributes
+                .0
+                .into_iter()
+                .map(ProviderKey::from)
+                .collect(),
         }
     }
-
+    pub fn diagnostic(&self) -> &Diagnostic<S> {
+        &self.reason
+    }
     pub fn missing_attributes(&self) -> &[ProviderKey] {
         &self.missing_attributes
     }
-
-    /// Merge another partial-read diagnostic into this one.
-    ///
-    /// The receiver's reason is kept because it represents the most recent
-    /// operation that wrote the state. Missing attributes are unioned so the
-    /// next plan can surface every unobserved attribute as Unknown.
-    pub fn merge_in(&mut self, other: PartialReadDiagnostic<S>) {
-        for attr in other.missing_attributes {
-            if !self.missing_attributes.contains(&attr) {
-                self.missing_attributes.push(attr);
+    /// Add missing names without consuming or discarding another diagnostic.
+    pub fn union_missing_attributes(&mut self, attributes: &NonEmptyMissingAttributes) {
+        for name in &attributes.0 {
+            if !self
+                .missing_attributes
+                .iter()
+                .any(|known| known.as_str() == name)
+            {
+                self.missing_attributes.push(name.clone().into());
             }
-        }
-    }
-
-    /// Merge two optional diagnostics.
-    ///
-    /// When both are present, `a` keeps its reason because it represents the
-    /// more recent operation, while missing attributes are unioned with `b`.
-    /// Use this wherever two operations on the same resource may each report
-    /// partial; `.or()` silently drops the loser's missing attributes.
-    pub fn merge_options(a: Option<Self>, b: Option<Self>) -> Option<Self> {
-        match (a, b) {
-            (Some(mut a), Some(b)) => {
-                a.merge_in(b);
-                Some(a)
-            }
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
         }
     }
 }
 
+impl<S: TextState> PartialReadDiagnostic<S> {
+    fn to_wire_inner(&self) -> protocol_types::PartialReadDiagnostic {
+        self.reason.text().partial_read_wire(
+            self.missing_attributes
+                .iter()
+                .map(|name| name.as_str().to_owned())
+                .collect(),
+        )
+    }
+}
+impl PartialReadDiagnostic<Unbound> {
+    #[cfg(any(test, target_arch = "wasm32"))]
+    pub fn to_wire(&self) -> protocol_types::PartialReadDiagnostic {
+        self.to_wire_inner()
+    }
+}
 impl PartialReadDiagnostic<Bound> {
+    pub fn to_wire(&self) -> protocol_types::PartialReadDiagnostic {
+        self.to_wire_inner()
+    }
     /// Bounded diagnostic projection; the original reason also feeds identity data.
     pub fn reason(&self) -> DiagnosticText {
         DiagnosticText::new(self.reason.redacted_str())
@@ -5506,34 +5670,12 @@ impl PartialReadDiagnostic<Bound> {
 }
 
 impl ProviderFailure<Unbound> {
-    /// Compose provider-owned opaque text without formatting its placeholder
-    /// or granting authority to render it on the host.
-    pub fn from_text(kind: ProviderErrorKind, text: ProviderText) -> Self {
-        let throttling = ThrottlingClassification {
-            message_or_cause: text.has_throttling_marker(),
-            delete_dependency: text.has_delete_dependency_marker(),
-            ..ThrottlingClassification::default()
-        };
-        let detail = Box::new(OperationErrorDetail {
-            message: ErrorText::from_provider_text(text),
-            throttling,
-            ..OperationErrorDetail::default()
-        });
-        match kind {
-            ProviderErrorKind::InvalidInput => Self::InvalidInput(detail),
-            ProviderErrorKind::ApiError => Self::ApiError(detail),
-            ProviderErrorKind::NotFound => Self::NotFound(detail),
-            ProviderErrorKind::Timeout => Self::Timeout(detail),
-            ProviderErrorKind::Internal => Self::Internal(detail),
-        }
-    }
-
     /// Decode untrusted provider data received through the protocol/WIT boundary.
     ///
     /// This is the only sanctioned entry point for a wire record containing
     /// both a runtime-built message and flattened cause string. It preserves
-    /// sanitized text for diagnostics; it does not provide the static
-    /// context guarantees of the typed `*_caused_by` constructors.
+    /// text for diagnostics. The original typed source and retry policy have
+    /// already been flattened and cannot be recovered by this decoder.
     pub fn from_wire(error: WireProviderError) -> Self {
         let WireProviderError {
             kind,
@@ -5551,11 +5693,16 @@ impl ProviderFailure<Unbound> {
         let throttling =
             ThrottlingClassification::from_raw(&message, code.as_deref(), cause.as_deref());
         let detail = Box::new(OperationErrorDetail {
-            message: message.into(),
+            body: match cause {
+                Some(cause) => FailureBody::Context {
+                    context: message.into(),
+                    cause: ProviderDiagnostic::new(FlattenedWireCause(cause)),
+                },
+                None => FailureBody::Message(message.into()),
+            },
             throttling,
-            transient: false,
+            retryability: Retryability::Unclassified,
             resource_id,
-            cause: cause.map(|cause| ProviderDiagnostic::new(FlattenedWireCause(cause))),
             // Host lifecycle markers are intentionally not part of the wire
             // record and untrusted guest errors cannot acquire one on decode.
             host_cause: None,
@@ -5574,7 +5721,10 @@ impl ProviderFailure<Unbound> {
         }
     }
     pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostError {
-        let convert = |text: ProviderErrorText| text.into_host(secrets);
+        let mut context = self.redaction_context();
+        context.include(secrets);
+        let convert =
+            |text: ProviderErrorText| text.into_host(secrets).with_redaction_context(&context);
         let kind = self.kind();
         let detail = match self {
             Self::InvalidInput(d)
@@ -5584,16 +5734,15 @@ impl ProviderFailure<Unbound> {
             | Self::Internal(d) => *d,
         };
         let detail = Box::new(OperationErrorDetail {
-            message: convert(detail.message),
+            body: detail.body.bind(secrets, &context),
             throttling: detail.throttling,
-            transient: detail.transient,
+            retryability: detail.retryability,
             resource_id: detail.resource_id.map(|id| {
                 Box::new(ErrorResourceId {
                     id: id.id,
                     text: convert(id.text),
                 })
             }),
-            cause: detail.cause.map(|cause| cause.with_secrets(secrets)),
             host_cause: detail.host_cause,
             provider_name: detail.provider_name.map(convert),
             operation: detail.operation.map(convert),
@@ -5626,16 +5775,15 @@ impl ProviderFailure<Bound> {
             | Self::Internal(d) => *d,
         };
         let detail = Box::new(OperationErrorDetail {
-            message: detail.message.host_for_state(),
+            body: detail.body.host_for_state(),
             throttling: detail.throttling,
-            transient: detail.transient,
+            retryability: detail.retryability,
             resource_id: detail.resource_id.map(|id| {
                 Box::new(ErrorResourceId {
                     id: id.id,
                     text: id.text.host_for_state(),
                 })
             }),
-            cause: detail.cause.map(Diagnostic::host_for_state),
             host_cause: detail.host_cause,
             provider_name: detail.provider_name.map(|text| text.host_for_state()),
             operation: detail.operation.map(|text| text.host_for_state()),
@@ -5684,7 +5832,7 @@ impl PartialReadDiagnostic<Unbound> {
 
     pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostPartialReadDiagnostic {
         PartialReadDiagnostic {
-            reason: self.reason.into_host(secrets),
+            reason: self.reason.with_secrets(secrets),
             missing_attributes: self.missing_attributes,
         }
     }
@@ -6735,8 +6883,7 @@ pub fn merge_default_tags<S, D>(
                 | SerializationError::UnavailableSecret(_)
                 | SerializationError::InsideSecret { .. }),
             ) => {
-                return Err(HostError::from_diagnostic(
-                    crate::provider::ProviderErrorKind::InvalidInput,
+                return Err(HostError::invalid_input_caused_by(
                     "failed to encode default tag",
                     crate::provider_text::HostDiagnostic::capture_host_or_provider(
                         DefaultTagEncodingError {
@@ -7296,8 +7443,7 @@ impl std::error::Error for ComparisonResolutionError {}
 
 impl From<ComparisonResolutionError> for HostError {
     fn from(error: ComparisonResolutionError) -> Self {
-        HostError::from_diagnostic(
-            crate::provider::ProviderErrorKind::Internal,
+        HostError::internal_caused_by(
             "Failed to resolve resource comparison",
             crate::provider_text::HostDiagnostic::capture_host_or_provider(error),
         )
@@ -8673,13 +8819,6 @@ fn local_custom_validator(
     }
 }
 
-fn custom_validator_bridge_message(error: crate::schema::TypeError) -> String {
-    match error {
-        crate::schema::TypeError::ValidationFailed { message } => message.to_string(),
-        error => error.to_string(),
-    }
-}
-
 #[derive(Debug)]
 pub enum CustomTypeFactoryValidationError {
     InvalidValue(crate::schema::TypeError),
@@ -8927,9 +9066,8 @@ impl CustomTypeDispatchTable {
             .ok_or_else(|| CustomTypeDispatchError::Undeclared(identity.clone()))?;
         let value = bridge_text_to_typed_value(binding.scalar_kind, canonical_text.into())?;
         for callback in &binding.callbacks {
-            callback(&value).map_err(|error| {
-                CustomTypeDispatchError::Validation(custom_validator_bridge_message(error))
-            })?;
+            callback(&value)
+                .map_err(|error| CustomTypeDispatchError::Validation(Box::new(error)))?;
         }
         Ok(())
     }
@@ -8965,7 +9103,14 @@ impl std::error::Error for CustomTypeBridgeDecodeError {
 pub enum CustomTypeDispatchError {
     Undeclared(TypeIdentity),
     Decode(CustomTypeBridgeDecodeError),
-    Validation(String),
+    Validation(Box<crate::schema::TypeError>),
+}
+
+impl CustomTypeDispatchError {
+    /// Finish provider-side validation with its category and typed cause intact.
+    pub fn into_provider_error(self) -> ProviderError {
+        ProviderError::from_diagnostic(ProviderErrorKind::InvalidInput, self)
+    }
 }
 
 impl fmt::Display for CustomTypeDispatchError {
@@ -8976,7 +9121,10 @@ impl fmt::Display for CustomTypeDispatchError {
                 "custom type `{identity}` is not declared by this provider"
             ),
             Self::Decode(_) => f.write_str("failed to decode custom type bridge value"),
-            Self::Validation(message) => f.write_str(message),
+            Self::Validation(error) => match error.as_ref() {
+                crate::schema::TypeError::ValidationFailed { message } => message.fmt(f),
+                error => error.fmt(f),
+            },
         }
     }
 }
@@ -8984,7 +9132,8 @@ impl fmt::Display for CustomTypeDispatchError {
 impl std::error::Error for CustomTypeDispatchError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Undeclared(_) | Self::Validation(_) => None,
+            Self::Undeclared(_) => None,
+            Self::Validation(source) => Some(source.as_ref()),
             Self::Decode(source) => Some(source),
         }
     }
@@ -10258,8 +10407,8 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
                         legacy_validator(|value| match value {
                             crate::resource::Value::Concrete(
                                 crate::resource::ConcreteValue::Int(5),
-                            ) => Err("schema-derived callback rejected five".to_string()),
-                            _ => Err("Expected integer".to_string()),
+                            ) => Err(("schema-derived callback rejected five".to_string()).into()),
+                            _ => Err(("Expected integer".to_string()).into()),
                         }),
                     ),
                 )
@@ -10370,7 +10519,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
                                 received.lock().unwrap().push(value.get());
                                 Ok(())
                             }
-                            _ => Err("Expected float".to_string()),
+                            _ => Err(("Expected float".to_string()).into()),
                         }),
                     ),
                 )
@@ -10471,7 +10620,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         assert!(matches!(
             error.into_type_error(),
             crate::schema::TypeError::ValidationFailed { message }
-                if message == expected_message
+                if message.to_string() == expected_message
         ));
     }
 
@@ -10578,7 +10727,7 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
                         .expect("callback log mutex poisoned")
                         .push(name);
                     match error {
-                        Some(message) => Err(message.to_string()),
+                        Some(message) => Err((message.to_string()).into()),
                         None => Ok(()),
                     }
                 })
@@ -11251,10 +11400,13 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             PersistedAttributes::default(),
         );
         let diagnostic: PartialReadDiagnostic = PartialReadDiagnostic::new(
-            "read-back remained incomplete".into(),
-            vec!["computed".to_string()],
-        )
-        .expect("fixture has one missing attribute");
+            crate::provider_text::ProviderDiagnostic::message(
+                "read-back remained incomplete".into(),
+            ),
+            (vec!["computed".to_string()])
+                .try_into()
+                .expect("nonempty partial attributes"),
+        );
 
         let outcome = ResumedCreate {
             pending,
@@ -12534,9 +12686,12 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         let state = AppliedState::new(id.clone(), "mock-id", HashMap::new())
             .expect("fixture identifier is non-empty");
         let expected = State::existing(id, HashMap::new()).with_identifier("mock-id");
-        let diagnostic: PartialReadDiagnostic =
-            PartialReadDiagnostic::new("mock partial create".into(), vec!["dns_name".to_string()])
-                .expect("missing attributes are non-empty");
+        let diagnostic: PartialReadDiagnostic = PartialReadDiagnostic::new(
+            crate::provider_text::ProviderDiagnostic::message("mock partial create".into()),
+            (vec!["dns_name".to_string()])
+                .try_into()
+                .expect("nonempty partial attributes"),
+        );
 
         let success: CreateOutcome = CreateOutcome::fixture_success(state.clone());
         let success = success.into_host_for_test();
@@ -12546,8 +12701,10 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
 
         let partial = CreateOutcome::partial_success(
             state.clone(),
-            "mock partial create".into(),
-            vec!["dns_name".to_string()],
+            crate::provider_text::ProviderDiagnostic::message("mock partial create".into()),
+            (vec!["dns_name".to_string()])
+                .try_into()
+                .expect("nonempty partial attributes"),
         );
 
         let diagnostic = diagnostic.into_host_for_test();
@@ -12620,34 +12777,32 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
 
         let created = CreateOutcome::partial_success(
             applied(),
-            "provider returned a partial read".into(),
-            vec!["computed".to_string()],
+            crate::provider_text::ProviderDiagnostic::message(
+                "provider returned a partial read".into(),
+            ),
+            (vec!["computed".to_string()])
+                .try_into()
+                .expect("nonempty partial attributes"),
         )
         .with_secrets(&RedactionSet::for_test(&[]));
         assert_materialized(created.into_state_for_writeback(), &expected);
 
         let updated = UpdateOutcome::partial_success(
             applied(),
-            "provider returned a partial read".into(),
-            vec!["computed".to_string()],
+            crate::provider_text::ProviderDiagnostic::message(
+                "provider returned a partial read".into(),
+            ),
+            (vec!["computed".to_string()])
+                .try_into()
+                .expect("nonempty partial attributes"),
         )
         .with_secrets(&RedactionSet::for_test(&[]));
         assert_materialized(updated.into_state_for_writeback(), &expected);
     }
 
     #[test]
-    fn create_outcome_empty_partial_diagnostic_becomes_success() {
-        let id = ResourceId::with_identity("test", "example");
-        let state = AppliedState::new(id.clone(), "mock-id", HashMap::new())
-            .expect("fixture identifier is non-empty");
-        let expected = State::existing(id, HashMap::new()).with_identifier("mock-id");
-
-        let outcome: CreateOutcome =
-            CreateOutcome::partial_success(state.clone(), "mock partial create".into(), vec![]);
-
-        let outcome = outcome.into_host_for_test();
-        assert_eq!(outcome.diagnostic(), None);
-        assert_eq!(outcome.into_state_for_writeback(), expected);
+    fn native_partial_diagnostic_rejects_empty_missing_attributes() {
+        assert!(NonEmptyMissingAttributes::try_from(Vec::<String>::new()).is_err());
     }
 
     #[test]
@@ -12667,38 +12822,25 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     }
 
     #[test]
-    fn partial_read_diagnostic_merge_options_covers_all_cases() {
-        type PartialReadDiagnostic = crate::provider::HostPartialReadDiagnostic;
-        let a = PartialReadDiagnostic::new(
-            "rename partial".to_string(),
-            vec!["rename_attr".to_string(), "shared".to_string()],
-        )
-        .expect("missing attributes are non-empty");
-        let b = PartialReadDiagnostic::new(
-            "create partial".to_string(),
-            vec!["create_attr".to_string(), "shared".to_string()],
-        )
-        .expect("missing attributes are non-empty");
-
-        assert_eq!(PartialReadDiagnostic::merge_options(None, None), None);
-        assert_eq!(
-            PartialReadDiagnostic::merge_options(Some(a.clone()), None),
-            Some(a.clone())
+    fn partial_read_diagnostic_unions_attributes_without_consuming_a_reason() {
+        let mut diagnostic = HostPartialReadDiagnostic::new(
+            "rename partial".to_owned(),
+            vec!["rename_attr".to_owned(), "shared".to_owned()]
+                .try_into()
+                .unwrap(),
         );
-        assert_eq!(
-            PartialReadDiagnostic::merge_options(None, Some(b.clone())),
-            Some(b.clone())
+        diagnostic.union_missing_attributes(
+            &vec!["create_attr".to_owned(), "shared".to_owned()]
+                .try_into()
+                .unwrap(),
         );
-
-        let merged = PartialReadDiagnostic::merge_options(Some(a), Some(b))
-            .expect("both diagnostics should merge into one");
-        assert_eq!(merged.reason(), "rename partial");
+        assert_eq!(diagnostic.reason(), "rename partial");
         assert_eq!(
-            merged.missing_attributes(),
+            diagnostic.missing_attributes(),
             &[
-                "rename_attr".to_string(),
-                "shared".to_string(),
-                "create_attr".to_string(),
+                "rename_attr".to_owned(),
+                "shared".to_owned(),
+                "create_attr".to_owned()
             ]
         );
     }
@@ -12706,10 +12848,13 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     #[test]
     fn host_deadline_provenance_is_not_provider_diagnostic_identity() {
         let provider_reported = PartialReadDiagnostic::new(
-            "read-back remained incomplete".into(),
-            vec!["computed".to_string()],
+            crate::provider_text::ProviderDiagnostic::message(
+                "read-back remained incomplete".into(),
+            ),
+            (vec!["computed".to_string()])
+                .try_into()
+                .expect("nonempty partial attributes"),
         )
-        .expect("missing attributes are non-empty")
         .with_secrets(&RedactionSet::for_test(&[]));
         let encoded = serde_json::to_value(&provider_reported).unwrap();
         let round_tripped: HostPartialReadDiagnostic =
@@ -12735,8 +12880,12 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             .expect("the fixture identifier is non-empty");
         let mut provider_outcome = Some(UpdateOutcome::partial_success(
             state,
-            "read-back remained incomplete".into(),
-            vec!["computed".to_string()],
+            crate::provider_text::ProviderDiagnostic::message(
+                "read-back remained incomplete".into(),
+            ),
+            (vec!["computed".to_string()])
+                .try_into()
+                .expect("nonempty partial attributes"),
         ));
         let provider_kind = provider_outcome.as_ref().unwrap().kind().clone();
         let driven =
@@ -15516,5 +15665,98 @@ mod provider_text_route_tests {
             2,
             "routing must retain the other binding's state"
         );
+    }
+}
+
+#[cfg(test)]
+mod composition_partial_tests {
+    use super::*;
+    use crate::test_utils::provider_text::{BindProviderText, context, create_attempt_for_test};
+
+    fn id() -> ResourceId {
+        ResourceId::with_provider_identity("text-fixture", "resource", "fixture", None)
+    }
+    fn reason() -> PartialReadDiagnostic {
+        PartialReadDiagnostic::new(
+            ProviderDiagnostic::new(
+                ProviderError::api_error_caused_by(
+                    "read-back failed",
+                    std::io::Error::other("partial-private"),
+                )
+                .with_retryability(Retryability::Transient),
+            ),
+            vec!["name".to_owned()].try_into().unwrap(),
+        )
+    }
+    fn assert_native<S: TextState>(partial: &PartialReadDiagnostic<S>) {
+        assert_eq!(partial.diagnostic().retryability(), Retryability::Transient);
+        assert!(partial.diagnostic().source_is::<std::io::Error>());
+    }
+    #[test]
+    fn native_create_partial_preserves_cause_and_policy_through_boundary_and_persistence() {
+        let outcome = create_attempt_for_test(id())
+            .issued(
+                AppliedIdentifier::new("id").unwrap(),
+                Sent::AllRequestAttributes,
+            )
+            .partial(HashMap::new(), reason());
+        assert_native(outcome.diagnostic().unwrap());
+        let outcome =
+            BindProviderText::with_secrets_for_test(outcome, &context(&["partial-private"]));
+        assert_native(outcome.diagnostic().unwrap());
+        assert_eq!(
+            outcome.diagnostic().unwrap().reason(),
+            "read-back failed: (secret)"
+        );
+        let json = serde_json::to_string(&outcome.into_state_for_writeback()).unwrap();
+        assert!(!json.contains("partial-private"));
+        assert!(json.contains("read-back failed: (secret)"));
+    }
+    #[test]
+    fn native_resume_partial_preserves_cause_and_policy_through_boundary_and_persistence() {
+        let identifier = AppliedIdentifier::new("id").unwrap();
+        let pending = create_attempt_for_test(id())
+            .issued(identifier.clone(), Sent::AllRequestAttributes)
+            .pending(PendingToken::new("read-back"), 0)
+            .persist(Default::default(), Default::default());
+        let outcome = ResumedCreate {
+            pending,
+            identifier,
+        }
+        .partial(HashMap::new(), reason());
+        let ResumeOutcomeKind::PartialSuccess(partial) = outcome.kind() else {
+            panic!("native partial resume")
+        };
+        assert_native(partial.diagnostic());
+        let outcome =
+            BindProviderText::with_secrets_for_test(outcome, &context(&["partial-private"]));
+        let HostResumeOutcomeKind::PartialSuccess(partial) = outcome.into_kind() else {
+            panic!("bound partial resume")
+        };
+        assert_native(partial.diagnostic());
+        assert_eq!(partial.diagnostic().reason(), "read-back failed: (secret)");
+        let (_, state, _, _) = partial.into_parts();
+        let json = serde_json::to_string(&state).unwrap();
+        assert!(!json.contains("partial-private"));
+        assert!(json.contains("read-back failed: (secret)"));
+    }
+    #[test]
+    fn native_update_partial_preserves_cause_and_policy_through_boundary_and_persistence() {
+        let outcome = UpdateOutcome::partial_success(
+            AppliedState::new(id(), "id", HashMap::new()).unwrap(),
+            reason().reason,
+            vec!["name".to_owned()].try_into().unwrap(),
+        );
+        assert_native(outcome.diagnostic().unwrap());
+        let outcome =
+            BindProviderText::with_secrets_for_test(outcome, &context(&["partial-private"]));
+        assert_native(outcome.diagnostic().unwrap());
+        assert_eq!(
+            outcome.diagnostic().unwrap().reason(),
+            "read-back failed: (secret)"
+        );
+        let json = serde_json::to_string(&outcome.into_state_for_writeback()).unwrap();
+        assert!(!json.contains("partial-private"));
+        assert!(json.contains("read-back failed: (secret)"));
     }
 }

@@ -814,7 +814,10 @@ fn round4_transient_classification_survives_boundary_and_executor() {
             .as_error()
             .downcast_ref::<carina_core::provider::HostError>()
             .unwrap();
-        assert!(failure.detail().transient);
+        assert_eq!(
+            failure.retryability(),
+            carina_core::provider_text::Retryability::Transient
+        );
         assert!(failure.is_transient());
         assert!(!failure.to_string().contains(SECRET));
     });

@@ -1,6 +1,9 @@
 //! Text supplied by providers for host diagnostics.
 
 pub mod boundary;
+mod composition_contract;
+#[cfg(test)]
+mod composition_tests;
 mod guest_inputs;
 #[cfg(feature = "guest-runtime")]
 mod guest_store;
@@ -92,7 +95,7 @@ thread_local! { static REDACTION_PASSES: std::cell::Cell<usize> = const { std::c
 /// Partial-read reasons must remain typed.
 ///
 /// ```compile_fail,E0308
-/// let _ = carina_core::provider::PartialReadDiagnostic::<carina_core::provider_text::Unbound>::new(String::from("provider reason"), vec!["name".into()]);
+/// let _ = carina_core::provider::PartialReadDiagnostic::<carina_core::provider_text::Unbound>::new(String::from("provider reason"), vec!["name".into()].try_into().unwrap());
 /// ```
 /// Test features cannot grant an empty-session provider bypass.
 ///
@@ -135,9 +138,13 @@ pub trait TextState:
 {
     #[doc(hidden)]
     const BOUND: bool;
+    type Message: From<String> + for<'a> From<&'a str>;
+    type Context;
     type PartialReadReason;
+    fn message(text: Self::Message) -> ErrorText<Self>;
+    fn context(text: Self::Context) -> ErrorText<Self>;
     type Permission;
-    fn partial_read_reason(reason: Self::PartialReadReason) -> ErrorText<Self>;
+    fn partial_read_reason(reason: Self::PartialReadReason) -> Diagnostic<Self>;
 }
 /// Provider-owned text, with no host display/storage authority.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -149,18 +156,34 @@ impl state_sealed::Sealed for Unbound {}
 impl state_sealed::Sealed for Bound {}
 impl TextState for Unbound {
     const BOUND: bool = false;
-    type PartialReadReason = ProviderText;
+    type Message = ProviderText;
+    type Context = ProviderContext;
+    type PartialReadReason = ProviderDiagnostic;
+    fn message(text: ProviderText) -> ErrorText<Self> {
+        ErrorText::from_provider_text(text)
+    }
+    fn context(text: ProviderContext) -> ErrorText<Self> {
+        Self::message(text.0)
+    }
     type Permission = String;
-    fn partial_read_reason(reason: ProviderText) -> ErrorText<Self> {
-        ErrorText::from_provider_text(reason)
+    fn partial_read_reason(reason: ProviderDiagnostic) -> Diagnostic<Self> {
+        reason
     }
 }
 impl TextState for Bound {
     const BOUND: bool = true;
+    type Message = String;
+    type Context = &'static str;
     type PartialReadReason = String;
+    fn message(text: String) -> ErrorText<Self> {
+        ErrorText::new(text)
+    }
+    fn context(text: &'static str) -> ErrorText<Self> {
+        ErrorText::new(text)
+    }
     type Permission = RequiredPermission;
-    fn partial_read_reason(reason: String) -> ErrorText<Self> {
-        ErrorText::new(reason)
+    fn partial_read_reason(reason: String) -> Diagnostic<Self> {
+        Diagnostic::message_for_state(ErrorText::new(reason))
     }
 }
 
@@ -201,6 +224,56 @@ enum OpaquePart {
         secrets: RedactionSet,
     },
 }
+/// Opaque context for a cause-bearing provider error.
+/// Runtime context must be explicitly wrapped in [`ProviderText`].
+#[derive(Clone, Debug)]
+pub struct ProviderContext(ProviderText);
+impl From<&'static str> for ProviderContext {
+    fn from(text: &'static str) -> Self {
+        Self(ProviderText::new(text))
+    }
+}
+impl From<ProviderText> for ProviderContext {
+    fn from(text: ProviderText) -> Self {
+        Self(text)
+    }
+}
+
+/// Explicit retry policy. Error kinds and rendered text do not infer this policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Retryability {
+    #[default]
+    Unclassified,
+    Permanent,
+    Transient,
+}
+
+/// Attach SDK-supplied retry policy while preserving the complete diagnostic.
+#[derive(Debug)]
+pub struct ClassifiedSource<C> {
+    cause: C,
+    retryability: Retryability,
+}
+impl<C: DiagnosticSource<Unbound>> ClassifiedSource<C> {
+    pub fn new(cause: C, retryability: Retryability) -> Self {
+        Self {
+            cause,
+            retryability,
+        }
+    }
+}
+impl<C: DiagnosticSource<Unbound>> diagnostic_source_sealed::Sealed<Unbound>
+    for ClassifiedSource<C>
+{
+}
+impl<C: DiagnosticSource<Unbound>> DiagnosticSource<Unbound> for ClassifiedSource<C> {
+    fn into_diagnostic(self) -> ProviderDiagnostic {
+        let mut diagnostic = self.cause.into_diagnostic();
+        diagnostic.retryability = self.retryability;
+        diagnostic
+    }
+}
+
 impl ProviderText {
     fn collect_context(&self, context: &mut RedactionContext) {
         for part in &self.0 {
@@ -254,8 +327,9 @@ impl ProviderText {
             OpaquePart::Status(_) => false,
         })
     }
-    pub fn with_context(&self, context: &str) -> Self {
-        let mut text = Self::new([context, ": "].concat());
+    pub fn with_context(&self, context: impl Into<ProviderContext>) -> Self {
+        let mut text = context.into().0;
+        text.append_host(": ");
         text.append(self);
         text
     }
@@ -294,13 +368,13 @@ impl ProviderText {
     }
 }
 
-impl From<crate::provider::ProviderError> for ProviderText {
-    fn from(error: crate::provider::ProviderError) -> Self {
-        error.diagnostic_text()
-    }
-}
 impl From<String> for ProviderText {
     fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+impl From<&String> for ProviderText {
+    fn from(text: &String) -> Self {
         Self::new(text)
     }
 }
@@ -341,9 +415,9 @@ enum TextContent {
 /// Retain live handles for every boundary crossed by a nested diagnostic.
 /// Typed cause views must carry these too, rather than selecting one set.
 #[derive(Clone, Default)]
-struct RedactionContext(Vec<RedactionSet>);
+pub(crate) struct RedactionContext(Vec<RedactionSet>);
 impl RedactionContext {
-    fn include(&mut self, set: &RedactionSet) {
+    pub(crate) fn include(&mut self, set: &RedactionSet) {
         if !self.0.iter().any(|known| known.shares_inventory(set)) {
             self.0.push(set.clone());
         }
@@ -351,6 +425,23 @@ impl RedactionContext {
     fn with(mut self, set: &RedactionSet) -> Self {
         self.include(set);
         self
+    }
+    pub(crate) fn extend(&mut self, other: &Self) {
+        for set in &other.0 {
+            self.include(set);
+        }
+    }
+    fn protect(&self, mut text: ProviderText) -> ProviderText {
+        for secrets in &self.0 {
+            text = ProviderText(vec![OpaquePart::Protected {
+                text,
+                secrets: secrets.clone(),
+            }]);
+        }
+        text
+    }
+    fn generations(&self) -> Vec<u64> {
+        self.0.iter().map(RedactionSet::generation).collect()
     }
     fn snapshot(&self) -> Option<RedactionSet> {
         let first = self.0.first()?;
@@ -369,8 +460,14 @@ impl RedactionContext {
 #[derive(Clone)]
 pub struct ErrorText<S: TextState = Unbound> {
     content: TextContent,
-    projection: std::sync::OnceLock<TextProjection>,
+    projection: std::sync::OnceLock<Box<ProjectionCache>>,
     state: std::marker::PhantomData<S>,
+}
+#[derive(Clone)]
+struct ProjectionCache {
+    generations: Vec<u64>,
+    projection: TextProjection,
+    next: std::sync::OnceLock<Box<ProjectionCache>>,
 }
 #[derive(Clone)]
 struct TextProjection {
@@ -415,26 +512,38 @@ impl<S: TextState> ErrorText<S> {
         }
     }
     fn projection(&self) -> &TextProjection {
-        self.projection.get_or_init(|| {
-            let mut text = String::new();
-            match &self.content {
-                TextContent::Unbound(_) => text.push_str("<provider text>"),
-                TextContent::Bound(segments) => {
-                    for segment in segments {
-                        match segment {
-                            Segment::Host(host) => text.push_str(&host.0),
-                            Segment::Provider { text: raw, secrets } => {
-                                text.push_str(secrets.redact(raw).as_str())
+        let generations = self.redaction_context().generations();
+        let mut slot = &self.projection;
+        loop {
+            let cached = slot.get_or_init(|| {
+                let mut text = String::new();
+                match &self.content {
+                    TextContent::Unbound(_) => text.push_str("<provider text>"),
+                    TextContent::Bound(segments) => {
+                        for segment in segments {
+                            match segment {
+                                Segment::Host(host) => text.push_str(&host.0),
+                                Segment::Provider { text: raw, secrets } => {
+                                    text.push_str(secrets.redact(raw).as_str())
+                                }
                             }
                         }
                     }
                 }
+                Box::new(ProjectionCache {
+                    generations: generations.clone(),
+                    projection: TextProjection {
+                        diagnostic: DiagnosticText::new(&text),
+                        text,
+                    },
+                    next: std::sync::OnceLock::new(),
+                })
+            });
+            if cached.generations == generations {
+                return &cached.projection;
             }
-            TextProjection {
-                diagnostic: DiagnosticText::new(&text),
-                text,
-            }
-        })
+            slot = &cached.next;
+        }
     }
     pub(crate) fn redacted_str(&self) -> &str {
         &self.projection().text
@@ -459,7 +568,7 @@ impl<S: TextState> ErrorText<S> {
             }
         }
     }
-    fn redaction_context(&self) -> RedactionContext {
+    pub(crate) fn redaction_context(&self) -> RedactionContext {
         let mut context = RedactionContext::default();
         match &self.content {
             TextContent::Unbound(text) => text.collect_context(&mut context),
@@ -473,6 +582,26 @@ impl<S: TextState> ErrorText<S> {
             }
         }
         context
+    }
+    pub(crate) fn with_redaction_context(mut self, context: &RedactionContext) -> Self {
+        if context.0.is_empty() {
+            return self;
+        }
+        match &mut self.content {
+            TextContent::Unbound(text) => *text = context.protect(text.clone()),
+            TextContent::Bound(segments) => {
+                for segment in segments {
+                    if let Segment::Provider { text, .. } = segment {
+                        *text = context.protect(text.clone());
+                    }
+                }
+            }
+        }
+        self.projection.take();
+        self
+    }
+    pub(crate) fn protect_opaque(text: ProviderText, context: &RedactionContext) -> ProviderText {
+        context.protect(text)
     }
     pub(crate) fn known_secrets(&self) -> Option<RedactionSet> {
         self.redaction_context().snapshot()
@@ -504,7 +633,7 @@ impl<S: TextState> ErrorText<S> {
     }
 }
 impl<S: TextState> ErrorText<S> {
-    fn from_opaque_for_state(text: ProviderText) -> Self {
+    pub(crate) fn from_opaque_for_state(text: ProviderText) -> Self {
         assert!(
             !S::BOUND,
             "an opaque provider cause requires its boundary session"
@@ -1461,6 +1590,122 @@ impl fmt::Display for DiagnosticText {
     }
 }
 
+fn frame_downcast<'a, T: std::error::Error + 'static>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a T> {
+    error
+        .downcast_ref::<T>()
+        .or_else(|| error.downcast_ref::<std::sync::Arc<T>>().map(AsRef::as_ref))
+        .or_else(|| error.downcast_ref::<Box<T>>().map(AsRef::as_ref))
+}
+enum OpaqueFrame<'a> {
+    Provider(&'a crate::provider::ProviderError),
+    Host(&'a crate::provider::HostError),
+    Diagnostic(&'a HostDiagnostic),
+    Validation(&'a crate::schema::ProviderValidation),
+    ValidationCategory(&'a crate::schema::TypeError),
+    Dispatch(&'a crate::provider::CustomTypeDispatchError),
+}
+fn opaque_frame<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<OpaqueFrame<'a>> {
+    if let Some(error) = frame_downcast::<OpaqueProviderFailure>(error) {
+        return Some(OpaqueFrame::Provider(&error.0));
+    }
+    if let Some(error) = frame_downcast::<crate::provider::HostError>(error) {
+        return Some(OpaqueFrame::Host(error));
+    }
+    if let Some(error) = frame_downcast::<crate::schema::ProviderValidation>(error) {
+        return Some(OpaqueFrame::Validation(error));
+    }
+    if let Some(error) = frame_downcast::<crate::schema::TypeError>(error)
+        && (error.provider_validation_reason().is_some()
+            || error.provider_validation_child().is_some())
+    {
+        return Some(OpaqueFrame::ValidationCategory(error));
+    }
+    if let Some(error) = frame_downcast::<crate::provider::CustomTypeDispatchError>(error) {
+        return Some(OpaqueFrame::Dispatch(error));
+    }
+    frame_downcast::<HostDiagnostic>(error).map(OpaqueFrame::Diagnostic)
+}
+impl<'a> OpaqueFrame<'a> {
+    fn text<S: TextState>(&self) -> ErrorText<S> {
+        match self {
+            Self::Provider(error) => ErrorText::from_opaque_for_state(error.diagnostic_text()),
+            Self::Host(error) => error.segmented_text().host_for_state(),
+            Self::Diagnostic(error) => error.text.host_for_state(),
+            Self::Validation(error) => error.capture_text(),
+            Self::ValidationCategory(error) => error.provider_diagnostic_text(),
+            Self::Dispatch(error) => {
+                if let crate::provider::CustomTypeDispatchError::Validation(category) = error {
+                    if let crate::schema::TypeError::ValidationFailed { message } =
+                        category.as_ref()
+                    {
+                        return message.capture_text();
+                    }
+                    return Diagnostic::capture(category.as_ref());
+                }
+                Diagnostic::capture_foreign(*error)
+            }
+        }
+    }
+    fn retryability(&self) -> Retryability {
+        match self {
+            Self::Provider(error) => error.retryability(),
+            Self::Host(error) => error.retryability(),
+            Self::Diagnostic(error) => error.retryability(),
+            Self::Validation(error) => error.retryability(),
+            Self::ValidationCategory(error) => {
+                if let Some(reason) = error.provider_validation_reason() {
+                    reason.retryability()
+                } else {
+                    ProviderDiagnostic::new(
+                        error
+                            .provider_validation_child()
+                            .expect("single-parent validation frame has a child")
+                            .clone(),
+                    )
+                    .retryability()
+                }
+            }
+            Self::Dispatch(error) => match error {
+                crate::provider::CustomTypeDispatchError::Validation(category) => {
+                    ProviderDiagnostic::new(category.as_ref().clone()).retryability()
+                }
+                crate::provider::CustomTypeDispatchError::Undeclared(_)
+                | crate::provider::CustomTypeDispatchError::Decode(_) => Retryability::Unclassified,
+            },
+        }
+    }
+    fn source(self) -> Option<ProviderCause<'a>> {
+        let plain = |error| ProviderCause {
+            error,
+            secrets: RedactionContext::default(),
+        };
+        match self {
+            Self::Provider(error) => error.detail().cause().map(Diagnostic::as_cause),
+            Self::Host(error) => error.detail().cause().map(Diagnostic::as_cause),
+            Self::Diagnostic(error) => Some(error.as_cause()),
+            Self::Validation(error) => error.diagnostic().map(Diagnostic::as_cause).or_else(|| {
+                error
+                    .category()
+                    .map(|category| plain(category as &(dyn std::error::Error + 'static)))
+            }),
+            Self::ValidationCategory(error) => error
+                .provider_validation_reason()
+                .map(|reason| plain(reason as &(dyn std::error::Error + 'static)))
+                .or_else(|| {
+                    error
+                        .provider_validation_child()
+                        .map(|child| plain(child as &(dyn std::error::Error + 'static)))
+                }),
+            Self::Dispatch(error) => {
+                use std::error::Error as _;
+                error.source().map(plain)
+            }
+        }
+    }
+}
+
 mod diagnostic_source_sealed {
     pub trait Sealed<S> {}
 }
@@ -1493,7 +1738,12 @@ impl diagnostic_source_sealed::Sealed<Unbound> for crate::provider::ProviderErro
 impl DiagnosticSource<Unbound> for crate::provider::ProviderError {
     fn into_diagnostic(self) -> ProviderDiagnostic {
         let text = self.diagnostic_text();
-        ProviderDiagnostic::from_text(OpaqueProviderFailure(self), text)
+        let retryability = self.retryability();
+        ProviderDiagnostic::captured(
+            OpaqueProviderFailure(self),
+            ErrorText::from_provider_text(text),
+            retryability,
+        )
     }
 }
 impl diagnostic_source_sealed::Sealed<Unbound> for ProviderDiagnostic {}
@@ -1508,11 +1758,13 @@ macro_rules! host_sources {
         impl DiagnosticSource<Bound> for $ty { fn into_diagnostic(self) -> HostDiagnostic { HostDiagnostic::capture_host_or_provider(self) } }
     )* };
 }
-host_sources!(
-    crate::provider::HostError,
-    HostDiagnostic,
-    InvalidRequiredPermission
-);
+host_sources!(crate::provider::HostError, InvalidRequiredPermission);
+impl diagnostic_source_sealed::Sealed<Bound> for HostDiagnostic {}
+impl DiagnosticSource<Bound> for HostDiagnostic {
+    fn into_diagnostic(self) -> HostDiagnostic {
+        self
+    }
+}
 
 /// A provider's typed error and its opaque diagnostic.
 ///
@@ -1522,6 +1774,7 @@ host_sources!(
 pub struct Diagnostic<S: TextState = Unbound> {
     error: std::sync::Arc<dyn std::error::Error + Send + Sync>,
     text: Box<ErrorText<S>>,
+    retryability: Retryability,
 }
 
 impl<S: TextState> fmt::Debug for Diagnostic<S> {
@@ -1542,36 +1795,46 @@ impl<S: TextState> Diagnostic<S> {
     pub(crate) fn capture_host_or_provider(
         error: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
+        let retryability =
+            opaque_frame(&error).map_or(Retryability::Unclassified, |frame| frame.retryability());
         let text = Self::capture(&error);
+        Self::captured(error, text, retryability)
+    }
+    fn captured(
+        error: impl std::error::Error + Send + Sync + 'static,
+        text: ErrorText<S>,
+        retryability: Retryability,
+    ) -> Self {
         Self {
             error: std::sync::Arc::new(error),
             text: Box::new(text),
+            retryability,
         }
     }
-    fn capture(error: &(dyn std::error::Error + 'static)) -> ErrorText<S> {
-        fn downcast<'a, T: std::error::Error + 'static>(
-            error: &'a (dyn std::error::Error + 'static),
-        ) -> Option<&'a T> {
-            error
-                .downcast_ref::<T>()
-                .or_else(|| error.downcast_ref::<std::sync::Arc<T>>().map(AsRef::as_ref))
-                .or_else(|| error.downcast_ref::<Box<T>>().map(AsRef::as_ref))
+    pub(crate) fn message_for_state(text: ErrorText<S>) -> Self {
+        Self::captured(OpaqueMessage, text, Retryability::Unclassified)
+    }
+    pub fn retryability(&self) -> Retryability {
+        self.retryability
+    }
+    pub(crate) fn capture(error: &(dyn std::error::Error + 'static)) -> ErrorText<S> {
+        if let Some(frame) = opaque_frame(error) {
+            return frame.text();
         }
-        if let Some(provider) = downcast::<OpaqueProviderFailure>(error) {
-            return ErrorText::from_opaque_for_state(provider.0.diagnostic_text());
-        }
-        if let Some(host) = downcast::<crate::provider::HostError>(error) {
-            return host.segmented_text().host_for_state();
-        }
-        if let Some(host) = downcast::<HostDiagnostic>(error) {
-            return host.text.host_for_state();
-        }
+        Self::capture_foreign(error)
+    }
+    fn capture_foreign(error: &(dyn std::error::Error + 'static)) -> ErrorText<S> {
         let mut text = ErrorText::<S>::new(error.to_string());
         if let Some(source) = error.source() {
             text.append_host(": ");
             text.append(&Self::capture(source));
         }
-        text
+        let context = text.redaction_context();
+        text.with_redaction_context(&context)
+    }
+    pub(crate) fn with_redaction_context(mut self, context: &RedactionContext) -> Self {
+        self.text = Box::new(self.text.with_redaction_context(context));
+        self
     }
     pub(crate) fn known_secrets(&self) -> Option<RedactionSet> {
         self.text.known_secrets()
@@ -1598,7 +1861,7 @@ impl<S: TextState> Diagnostic<S> {
         self.as_cause()
     }
     pub fn source_is<T: std::error::Error + 'static>(&self) -> bool {
-        self.source().is_some_and(|source| source.is::<T>())
+        self.as_cause().source_is::<T>()
     }
     pub fn downcast_ref<T: std::error::Error + 'static>(&self) -> Option<ProviderCause<'_>> {
         self.is::<T>().then(|| ProviderCause {
@@ -1641,19 +1904,14 @@ impl<S: TextState> Diagnostic<S> {
 }
 
 impl Diagnostic<Unbound> {
-    pub fn from_text(
-        error: impl std::error::Error + Send + Sync + 'static,
-        text: ProviderText,
-    ) -> Self {
-        Self {
-            error: std::sync::Arc::new(error),
-            text: Box::new(ErrorText::from_provider_text(text)),
-        }
+    pub fn message(text: ProviderText) -> Self {
+        Self::message_for_state(ErrorText::from_provider_text(text))
     }
     pub(crate) fn with_secrets(self, secrets: &RedactionSet) -> HostDiagnostic {
         Diagnostic {
             error: self.error,
             text: Box::new(self.text.into_host(secrets)),
+            retryability: self.retryability,
         }
     }
 }
@@ -1675,6 +1933,7 @@ impl Diagnostic<Bound> {
         Diagnostic {
             error: self.error,
             text: Box::new(self.text.host_for_state()),
+            retryability: self.retryability,
         }
     }
 
@@ -1728,6 +1987,25 @@ impl Diagnostic<Bound> {
         project: impl FnOnce(&T) -> String,
     ) -> Option<RedactedProviderText> {
         self.project_redacted_with_context(&RedactionSet::before_request(), project)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("<provider message>")]
+struct OpaqueMessage;
+impl<S: TextState> PartialEq for Diagnostic<S> {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+impl<S: TextState> Serialize for Diagnostic<S> {
+    fn serialize<Ser: serde::Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
+        self.text.serialize(serializer)
+    }
+}
+impl<'de> Deserialize<'de> for Diagnostic<Unbound> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|text| Self::message(text.into()))
     }
 }
 
@@ -1805,20 +2083,42 @@ impl<'a> ProviderCause<'a> {
         &self,
         predicate: fn(&T) -> bool,
     ) -> bool {
-        self.error.downcast_ref::<T>().is_some_and(predicate)
+        let mut current = Some(self.clone());
+        while let Some(cause) = current {
+            if cause.error.downcast_ref::<T>().is_some_and(predicate) {
+                return true;
+            }
+            current = cause.source();
+        }
+        false
+    }
+    /// Search all descendants while leaving `is` and `downcast_ref` current-node only.
+    pub fn source_is<T: std::error::Error + 'static>(&self) -> bool {
+        let mut current = self.source();
+        while let Some(cause) = current {
+            if cause.is::<T>() {
+                return true;
+            }
+            current = cause.source();
+        }
+        false
     }
     pub fn source(&self) -> Option<Self> {
-        if let Some(provider) = self.error.downcast_ref::<OpaqueProviderFailure>() {
-            let mut cause = provider.0.detail().cause()?.as_cause();
-            for secrets in &self.secrets.0 {
-                cause.secrets.include(secrets);
+        let mut cause = if let Some(frame) = opaque_frame(self.error) {
+            frame.source()?
+        } else {
+            Self {
+                error: self.error.source()?,
+                secrets: RedactionContext::default(),
             }
-            return Some(cause);
+        };
+        cause.secrets.extend(&self.secrets);
+        if let Some(frame) = opaque_frame(cause.error) {
+            cause
+                .secrets
+                .extend(&frame.text::<Unbound>().redaction_context());
         }
-        self.error.source().map(|error| Self {
-            error,
-            secrets: self.secrets.clone(),
-        })
+        Some(cause)
     }
     #[cfg(test)]
     pub fn redact(&self, _fixture_inventory: &RedactionSet) -> RedactedProviderText {
@@ -2033,10 +2333,11 @@ mod tests {
     fn round4_missing_attribute_names_are_structural() {
         let secrets = provider_secrets(&["1", "true"]);
         let diagnostic = crate::provider::PartialReadDiagnostic::new(
-            "public reason".into(),
-            vec!["subnet_1_id".into()],
+            crate::provider_text::ProviderDiagnostic::message("public reason".into()),
+            (vec!["subnet_1_id".into()])
+                .try_into()
+                .expect("nonempty partial attributes"),
         )
-        .unwrap()
         .with_secrets(&secrets);
         assert_eq!(diagnostic.missing_attributes()[0].as_str(), "subnet_1_id");
     }
@@ -2591,8 +2892,12 @@ mod tests {
         use crate::resource::{ResourceId, State};
 
         for raw in ["computed\x1b[2J".to_string(), "x".repeat(9000)] {
-            let diagnostic =
-                PartialReadDiagnostic::new("incomplete".into(), vec![raw.clone()]).unwrap();
+            let diagnostic = PartialReadDiagnostic::new(
+                "incomplete".into(),
+                (vec![raw.clone()])
+                    .try_into()
+                    .expect("nonempty partial attributes"),
+            );
             let read_back = PartialReadBack::from_diagnostic(
                 AppliedOperation::Create,
                 &diagnostic,
@@ -2813,7 +3118,7 @@ mod tests {
         .unwrap();
         assert_eq!(completion.value, "data");
         assert!(!completion.description.contains(['\x1b', '\x07']));
-        let validator = legacy_validator(move |_| Err(raw.clone()));
+        let validator = legacy_validator(move |_| Err((raw.clone()).into()));
         let error = validator(&crate::resource::Value::Concrete(
             crate::resource::ConcreteValue::Bool(true),
         ))
@@ -2821,7 +3126,7 @@ mod tests {
         let TypeError::ValidationFailed { message } = error else {
             panic!("expected a validation failure");
         };
-        assert!(!message.contains(['\x1b', '\x07']));
-        assert!(message.len() <= MAX_PROVIDER_TEXT_BYTES);
+        assert!(!message.to_string().contains(['\x1b', '\x07']));
+        assert!(message.to_string().len() <= MAX_PROVIDER_TEXT_BYTES);
     }
 }

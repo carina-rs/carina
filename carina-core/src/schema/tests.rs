@@ -5370,7 +5370,7 @@ fn with_attribute_tags_leaf_validator_failures_for_diagnostics() {
         TypeError::ResourceValidationFailed {
             message,
             attribute: Some(attribute),
-        } if message == "invalid CIDR" && attribute == "cidr_block"
+        } if message.to_string() == "invalid CIDR" && attribute == "cidr_block"
     ));
 }
 
@@ -5651,7 +5651,9 @@ fn schema_validate_with_origins_reshapes_custom_namespaced_type() {
                     PatternAttributeType::string(),
                     None,
                     vec![],
-                    Some(legacy_validator(validate_mode)),
+                    Some(legacy_validator(move |value| {
+                        validate_mode(value).map_err(Into::into)
+                    })),
                     None,
                 ),
             )
@@ -6823,7 +6825,7 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
             TypeError::ResourceValidationFailed {
                 message,
                 attribute: Some(name),
-            } if message.contains("outside allowed range") && name == "range"
+            } if message.to_string().contains("outside allowed range") && name == "range"
         )),
         "missing range error: {errors:?}"
     );
@@ -6833,7 +6835,7 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
             TypeError::ResourceValidationFailed {
                 message,
                 attribute: Some(name),
-            } if message == "custom value rejected" && name == "custom"
+            } if message.to_string() == "custom value rejected" && name == "custom"
         )),
         "missing custom lookup error: {errors:?}"
     );
@@ -6904,9 +6906,9 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
         None,
         None,
         legacy_validator(|value| match value {
-            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(value)) => Err(
-                format!("schema validator rejected {}", value.expose_plaintext()),
-            ),
+            crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(value)) => {
+                Err((format!("schema validator rejected {}", value.expose_plaintext())).into())
+            }
             _ => Ok(()),
         }),
         None,
@@ -7083,8 +7085,10 @@ fn secret_enum_literal_masks_typed_value_and_validator_message() {
                     Some(legacy_validator(|value| match value {
                         crate::resource::Value::Concrete(
                             crate::resource::ConcreteValue::String(value),
-                        ) => Err(format!("provider rejected {}", value.expose_plaintext())),
-                        _ => Err("expected a string".to_string()),
+                        ) => {
+                            Err((format!("provider rejected {}", value.expose_plaintext())).into())
+                        }
+                        _ => Err(("expected a string".to_string()).into()),
                     })),
                     None,
                 ),
@@ -7152,7 +7156,7 @@ fn secret_enum_literal_masks_typed_value_and_validator_message() {
     };
     assert!(matches!(user_typed, DiagnosticValue::Masked));
     assert_eq!(
-        extra_message.as_deref(),
+        extra_message.as_ref().map(ToString::to_string).as_deref(),
         Some("(secret) failed validation"),
         "StringLiteralExpectedEnum.extra_message leaked {validator_plaintext}"
     );
@@ -7566,13 +7570,10 @@ fn validate_union_type() {
                 if s.expose_plaintext().starts_with("a-") {
                     Ok(())
                 } else {
-                    Err(format!(
-                        "Expected 'a-' prefix, got '{}'",
-                        s.expose_plaintext()
-                    ))
+                    Err((format!("Expected 'a-' prefix, got '{}'", s.expose_plaintext())).into())
                 }
             } else {
-                Err("Expected string".to_string())
+                Err(("Expected string".to_string()).into())
             }
         }),
         None,
@@ -7586,13 +7587,10 @@ fn validate_union_type() {
                 if s.expose_plaintext().starts_with("b-") {
                     Ok(())
                 } else {
-                    Err(format!(
-                        "Expected 'b-' prefix, got '{}'",
-                        s.expose_plaintext()
-                    ))
+                    Err((format!("Expected 'b-' prefix, got '{}'", s.expose_plaintext())).into())
                 }
             } else {
-                Err("Expected string".to_string())
+                Err(("Expected string".to_string()).into())
             }
         }),
         None,
@@ -13191,7 +13189,7 @@ mod validate_collect_tests {
                     && matches!(
                         inner.as_ref(),
                         TypeError::ValidationFailed { message }
-                            if message == "rejected while collecting diagnostics"
+                            if message.to_string() == "rejected while collecting diagnostics"
                     )
         ));
     }
@@ -13583,7 +13581,9 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
                     PatternAttributeType::string(),
                     None,
                     vec![],
-                    Some(legacy_validator(validate_mode)),
+                    Some(legacy_validator(move |value| {
+                        validate_mode(value).map_err(Into::into)
+                    })),
                     None,
                 ),
             )
@@ -13616,15 +13616,16 @@ fn custom_namespaced_string_literal_routes_validator_text_to_extra_message() {
         "Custom-namespaced reshape leaves structured variants empty"
     );
     let msg = extra_message
-        .as_deref()
-        .expect("validator text must be carried on extra_message");
+        .as_ref()
+        .expect("validator text must be carried on extra_message")
+        .to_string();
     assert!(
         msg.contains("invalid Mode") && msg.contains("expected fast"),
         "extra_message must carry validator text, got: {msg}"
     );
     let rendered = reshaped.to_string();
     assert!(
-        rendered.contains(msg),
+        rendered.contains(&msg),
         "Display must surface extra_message text in tail, got: {rendered}"
     );
     assert!(
@@ -14654,14 +14655,14 @@ fn tied_scalar_union_reports_every_distinct_failure_in_declaration_order() {
             TypeIdentity::bare("FirstScalar"),
             None,
             None,
-            legacy_validator(reject_first),
+            legacy_validator(move |value| reject_first(value).map_err(Into::into)),
             None,
         ),
         AttributeType::refined_string_with_validator(
             TypeIdentity::bare("SecondScalar"),
             None,
             None,
-            legacy_validator(reject_second),
+            legacy_validator(move |value| reject_second(value).map_err(Into::into)),
             None,
         ),
     ]);
@@ -15394,7 +15395,7 @@ fn union_string_vs_custom_picks_custom_error_for_string_input() {
             TypeIdentity::bare("Arn"),
             None,
             None,
-            legacy_validator(must_be_arn),
+            legacy_validator(move |value| must_be_arn(value).map_err(Into::into)),
             None,
         ),
     ]);
@@ -15404,7 +15405,7 @@ fn union_string_vs_custom_picks_custom_error_for_string_input() {
     match err {
         TypeError::ValidationFailed { ref message } => {
             assert!(
-                message.contains("must start with 'arn:'"),
+                message.to_string().contains("must start with 'arn:'"),
                 "expected the Custom validator's actual message, got: {message}"
             );
         }
@@ -15459,7 +15460,7 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
         AttributeType::refined_int_with_validator(
             TypeIdentity::bare("PositiveInt"),
             None,
-            legacy_validator(must_be_positive),
+            legacy_validator(move |value| must_be_positive(value).map_err(Into::into)),
         ),
         AttributeType::bool(),
     ]);
@@ -15469,7 +15470,7 @@ fn union_custom_with_int_base_picks_custom_error_for_int_input() {
     match err {
         TypeError::ValidationFailed { ref message } => {
             assert!(
-                message.contains("must be positive"),
+                message.to_string().contains("must be positive"),
                 "expected the Custom validator's actual message, got: {message}"
             );
         }
@@ -15553,7 +15554,10 @@ fn custom_validator_can_capture_external_state() {
         .unwrap_err();
     match err {
         TypeError::ValidationFailed { message } => {
-            assert!(message.contains("ap-northeast-1") && message.contains("us-east-1"));
+            assert!(
+                message.to_string().contains("ap-northeast-1")
+                    && message.to_string().contains("us-east-1")
+            );
         }
         other => panic!("expected ValidationFailed, got: {other:?}"),
     }
@@ -17974,4 +17978,124 @@ fn pattern_reason_controls_are_escaped_in_every_diagnostic() {
         };
         assert_eq!(stored.as_str(), reason);
     }
+}
+
+#[test]
+fn enum_validation_tail_retains_diagnostic_source_and_quick_fix_category() {
+    let reason = TypeError::ValidationFailed {
+        message: crate::provider_text::ProviderDiagnostic::new(
+            crate::provider::ProviderError::api_error_caused_by(
+                "invalid reference",
+                std::io::Error::other("validation-private"),
+            )
+            .with_retryability(crate::provider_text::Retryability::Transient),
+        )
+        .into(),
+    };
+    let error = TypeError::StringLiteralExpectedEnum {
+        user_typed: "literal".into(),
+        attribute: Some("reference".into()),
+        type_name: "Reference".into(),
+        expected: Vec::new(),
+        extra_message: Some(validation_error_message(reason)),
+    };
+    let error = crate::provider::ProviderError::from_diagnostic(
+        crate::provider::ProviderErrorKind::InvalidInput,
+        error,
+    );
+    assert!(
+        error
+            .detail()
+            .cause()
+            .unwrap()
+            .source_is::<std::io::Error>()
+    );
+    assert_eq!(
+        error.retryability(),
+        crate::provider_text::Retryability::Transient
+    );
+    let error = error.with_secrets(&crate::provider_text::RedactionSet::for_test(&[
+        "validation-private",
+    ]));
+    assert!(error.to_string().contains("invalid reference: (secret)"));
+    assert!(!error.to_string().contains("validation-private"));
+    assert!(error.detail().cause().unwrap().as_cause().matches_for_test(|category: &TypeError| {
+        matches!(category, TypeError::StringLiteralExpectedEnum { attribute: Some(attribute), type_name, .. } if attribute == "reference" && type_name == "Reference")
+    }));
+}
+
+fn diagnostic_validation_reason() -> TypeError {
+    TypeError::ValidationFailed {
+        message: crate::provider_text::ProviderDiagnostic::new(
+            crate::provider::ProviderError::api_error_caused_by(
+                "invalid reference",
+                std::io::Error::other("validation-private"),
+            )
+            .with_retryability(crate::provider_text::Retryability::Transient),
+        )
+        .into(),
+    }
+}
+
+#[test]
+fn validation_containers_preserve_one_diagnostic_parent() {
+    for kind in 0..4 {
+        let inner = Box::new(diagnostic_validation_reason());
+        let category = match kind {
+            0 => TypeError::ListItemError { index: 3, inner },
+            1 => TypeError::MapKeyError {
+                key: "entry".into(),
+                inner,
+            },
+            2 => TypeError::MapValueError {
+                key: "entry".into(),
+                inner,
+            },
+            _ => TypeError::StructFieldError {
+                field: "reference".into(),
+                inner,
+            },
+        };
+        let error = crate::provider::CustomTypeDispatchError::Validation(Box::new(category))
+            .into_provider_error();
+        assert!(
+            error
+                .detail()
+                .cause()
+                .unwrap()
+                .source_is::<std::io::Error>()
+        );
+        assert_eq!(
+            error.retryability(),
+            crate::provider_text::Retryability::Transient
+        );
+        let error = error.with_secrets(&crate::provider_text::RedactionSet::for_test(&[
+            "validation-private",
+        ]));
+        assert!(error.to_string().contains("invalid reference: (secret)"));
+        assert_eq!(error.to_string().matches("invalid reference").count(), 1);
+    }
+}
+
+#[test]
+fn secret_validation_keeps_opaque_causes_until_the_provider_boundary() {
+    use crate::resource::InsideSecret as _;
+    let category = diagnostic_validation_reason().inside_secret();
+    let error = crate::provider::CustomTypeDispatchError::Validation(Box::new(category))
+        .into_provider_error();
+    assert!(
+        error
+            .detail()
+            .cause()
+            .unwrap()
+            .source_is::<std::io::Error>()
+    );
+    assert_eq!(
+        error.retryability(),
+        crate::provider_text::Retryability::Transient
+    );
+    let error = error.with_secrets(&crate::provider_text::RedactionSet::for_test(&[
+        "validation-private",
+    ]));
+    assert_eq!(error.to_string(), "invalid reference: (secret)");
 }

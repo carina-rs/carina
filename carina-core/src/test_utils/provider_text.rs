@@ -280,6 +280,16 @@ fn fixture(payload: Payload, context: &Context) -> InitializedProvider {
                 .unwrap_or_default(),
             _ => Vec::new(),
         },
+        Payload::Resume(Ok(outcome)) => match outcome.kind() {
+            ResumeOutcomeKind::PartialSuccess(partial) => {
+                partial.diagnostic().missing_attributes().to_vec()
+            }
+            ResumeOutcomeKind::Resent(outcome) => outcome
+                .diagnostic()
+                .map(|d| d.missing_attributes().to_vec())
+                .unwrap_or_default(),
+            ResumeOutcomeKind::Resumed(_) => Vec::new(),
+        },
         Payload::Update(outcome) => outcome
             .diagnostic()
             .map(|d| d.missing_attributes().to_vec())
@@ -383,7 +393,7 @@ impl BindProviderText for ProviderDiagnostic {
     type Host = HostDiagnostic;
     fn with_secrets_for_test(self, context: &Context) -> HostDiagnostic {
         BindProviderText::with_secrets_for_test(
-            ProviderError::from_diagnostic(ProviderErrorKind::Internal, "fixture", self),
+            ProviderError::from_diagnostic(ProviderErrorKind::Internal, self),
             context,
         )
         .detail()
@@ -501,10 +511,18 @@ impl BindProviderText for UpdateOutcome {
 }
 /// Encode a native test error after ingestion by the real provider boundary.
 pub trait NativeWireFixture {
-    fn to_wire(&self) -> crate::provider::WireProviderError;
+    type Wire;
+    fn to_wire(&self) -> Self::Wire;
 }
 impl NativeWireFixture for ProviderError {
+    type Wire = crate::provider::WireProviderError;
     fn to_wire(&self) -> crate::provider::WireProviderError {
+        BindProviderText::into_host_for_test(self.clone()).to_wire()
+    }
+}
+impl NativeWireFixture for PartialReadDiagnostic {
+    type Wire = carina_provider_protocol::types::PartialReadDiagnostic;
+    fn to_wire(&self) -> Self::Wire {
         BindProviderText::into_host_for_test(self.clone()).to_wire()
     }
 }

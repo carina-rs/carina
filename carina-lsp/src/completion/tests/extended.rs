@@ -3627,7 +3627,7 @@ fn exports_map_value_offers_matching_resource_refs() {
         carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
-        legacy_validator(validate_noop),
+        legacy_validator(move |value| validate_noop(value).map_err(Into::into)),
         None,
     );
     let schema = PatternResourceSchema::new("organizations.account")
@@ -3713,7 +3713,7 @@ fn exports_map_value_multiple_entries_returns_refs() {
         carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
-        legacy_validator(validate_noop),
+        legacy_validator(move |value| validate_noop(value).map_err(Into::into)),
         None,
     );
     let schema = PatternResourceSchema::new("organizations.account")
@@ -3772,7 +3772,7 @@ fn exports_map_value_includes_bindings_from_sibling_files() {
         carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
-        legacy_validator(validate_noop),
+        legacy_validator(move |value| validate_noop(value).map_err(Into::into)),
         None,
     );
     let schema = PatternResourceSchema::new("organizations.account")
@@ -3943,7 +3943,7 @@ fn custom_type_value_ref_includes_sibling_file_bindings() {
         carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
-        legacy_validator(validate_noop),
+        legacy_validator(move |value| validate_noop(value).map_err(Into::into)),
         None,
     );
     let account_schema = PatternResourceSchema::new("organizations.account")
@@ -4054,7 +4054,7 @@ fn binding_dot_completion_resolves_sibling_file_binding() {
         carina_core::schema::TypeIdentity::bare("AwsAccountId"),
         None,
         None,
-        legacy_validator(validate_noop),
+        legacy_validator(move |value| validate_noop(value).map_err(Into::into)),
         None,
     );
     let account_schema = PatternResourceSchema::new("organizations.account")
@@ -4304,7 +4304,7 @@ fn upstream_state_string_export_not_offered_to_specific_custom_receiver() {
         carina_core::schema::TypeIdentity::bare("VpcId"),
         None,
         None,
-        legacy_validator(noop),
+        legacy_validator(move |value| noop(value).map_err(Into::into)),
         None,
     );
     let schema = PatternResourceSchema::new("ec2.SecurityGroup")

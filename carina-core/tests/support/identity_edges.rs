@@ -60,10 +60,7 @@ impl ProviderFactory for EdgeFactory {
                 {
                     Ok(())
                 } else {
-                    Err(format!(
-                        "Name must start with good- (got {})",
-                        value.type_name()
-                    ))
+                    Err((format!("Name must start with good- (got {})", value.type_name())).into())
                 }
             }),
             None,

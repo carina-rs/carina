@@ -1310,13 +1310,20 @@ pub(crate) fn wit_to_core_create_step(
             decode_created_attributes(state, id, Some(proto::Sent::AllRequestAttributes), None).map(
                 |decoded| {
                     decoded.map(|(identifier, attributes)| {
-                        match CorePartialReadDiagnostic::new(reason.into(), missing_attributes) {
-                            Some(diagnostic) => proto::CreateStep::PartialSuccess {
+                        match carina_core::provider::NonEmptyMissingAttributes::try_from(
+                            missing_attributes,
+                        ) {
+                            Ok(missing) => proto::CreateStep::PartialSuccess {
                                 identifier,
                                 attributes,
-                                diagnostic,
+                                diagnostic: CorePartialReadDiagnostic::new(
+                                    carina_core::provider_text::ProviderDiagnostic::message(
+                                        reason.into(),
+                                    ),
+                                    missing,
+                                ),
                             },
-                            None => proto::CreateStep::Success {
+                            Err(_) => proto::CreateStep::Success {
                                 identifier,
                                 attributes,
                             },
@@ -1445,13 +1452,20 @@ pub(crate) fn wit_to_core_resume_step(
             } = diagnostic;
             decode_created_attributes(state, id, None, None).map(|decoded| {
                 decoded.map(|(identifier, attributes)| {
-                    match CorePartialReadDiagnostic::new(reason.into(), missing_attributes) {
-                        Some(diagnostic) => proto::ResumeStep::PartialSuccess {
+                    match carina_core::provider::NonEmptyMissingAttributes::try_from(
+                        missing_attributes,
+                    ) {
+                        Ok(missing) => proto::ResumeStep::PartialSuccess {
                             identifier,
                             attributes,
-                            diagnostic,
+                            diagnostic: CorePartialReadDiagnostic::new(
+                                carina_core::provider_text::ProviderDiagnostic::message(
+                                    reason.into(),
+                                ),
+                                missing,
+                            ),
                         },
-                        None => proto::ResumeStep::Completed {
+                        Err(_) => proto::ResumeStep::Completed {
                             identifier,
                             attributes,
                         },
@@ -1546,13 +1560,18 @@ pub(crate) fn wit_to_core_update_outcome(
                 reason,
                 missing_attributes,
             } = diagnostic;
-            Ok(WasmUpdateOutcome::Done(Box::new(
-                CoreUpdateOutcome::partial_success(
-                    wit_to_core_applied_persisted_state(state, id)?,
-                    reason.into(),
-                    missing_attributes,
+            let state = wit_to_core_applied_persisted_state(state, id)?;
+            let outcome = match carina_core::provider::NonEmptyMissingAttributes::try_from(
+                missing_attributes,
+            ) {
+                Ok(missing) => CoreUpdateOutcome::partial_success(
+                    state,
+                    carina_core::provider_text::ProviderDiagnostic::message(reason.into()),
+                    missing,
                 ),
-            )))
+                Err(_) => CoreUpdateOutcome::success(state),
+            };
+            Ok(WasmUpdateOutcome::Done(Box::new(outcome)))
         }
         wit::UpdateOutcome::Pending(pending) => Ok(WasmUpdateOutcome::Pending(
             UpdatePendingOperation(PendingOperation::from_wit(pending)),
@@ -2809,7 +2828,7 @@ mod tests {
                         None,
                         legacy_validator(|value| match value {
                             CoreValue::Concrete(ConcreteValue::Int(value)) if *value > 0 => Ok(()),
-                            _other => Err("count must be positive".to_string()),
+                            _other => Err(("count must be positive".to_string()).into()),
                         }),
                     ),
                 )

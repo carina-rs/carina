@@ -109,7 +109,7 @@ impl ProviderFactory for AwsccTestFactory {
                 TypeIdentity::bare("TestToken"),
                 None,
                 None,
-                legacy_validator(|_| Err("bare token rejected by its owner".to_string())),
+                legacy_validator(|_| Err(("bare token rejected by its owner".to_string()).into())),
                 None,
             );
 

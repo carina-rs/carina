@@ -10659,7 +10659,7 @@ mod tests {
                 let call = calls_from_validator.fetch_add(1, Ordering::SeqCst);
                 (call == 0)
                     .then_some(())
-                    .ok_or_else(|| "validator was called twice".to_string())
+                    .ok_or_else(|| "validator was called twice".into())
             })),
             None,
         );

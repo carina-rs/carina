@@ -26,17 +26,19 @@ impl MockHttpAwsProvider {
         kind: ProviderErrorKind,
         message: impl Into<String>,
     ) -> ProviderError {
-        ProviderError {
-            kind,
-            message: message.into(),
-            resource_id: Some(id.clone()),
-            cause: None,
-            provider_name: Some("aws".to_string()),
-            operation: Some("current_credentials".to_string()),
-            status: None,
-            code: None,
-            request_id: None,
-        }
+        let message: String = message.into();
+        (match kind {
+            ProviderErrorKind::InvalidInput => ProviderError::invalid_input(message),
+            ProviderErrorKind::ApiError => ProviderError::api_error(message),
+            ProviderErrorKind::NotFound => ProviderError::not_found(message),
+            ProviderErrorKind::Timeout => ProviderError::timeout(message),
+            ProviderErrorKind::Internal => ProviderError::internal(message),
+        })
+        .for_resource(
+            carina_plugin_sdk::core::protocol_convert::protocol_to_resource_id(&(id.clone())),
+        )
+        .for_provider("aws".to_string())
+        .with_operation("current_credentials".to_string())
     }
 }
 

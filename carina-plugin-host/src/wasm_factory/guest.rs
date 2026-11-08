@@ -997,12 +997,6 @@ impl WasmDiagnostic {
             redacted: Some(redacted),
         }
     }
-    pub(super) fn from_guest(error: wasmtime::Error, inline: bool) -> Self {
-        Self {
-            text: Self::capture_chain(&error, inline),
-            redacted: None,
-        }
-    }
     fn capture_chain(error: &wasmtime::Error, inline: bool) -> ProviderText {
         let mut text = ProviderText::default();
         for (index, cause) in error.chain().enumerate() {
@@ -1029,7 +1023,7 @@ impl PoisonReason {
         Self::Trap {
             operation,
             trap,
-            root_cause: ProviderText::new(root_cause),
+            root_cause: root_cause.to_owned(),
             secrets: secrets.cloned(),
             before_request_root: secrets.is_none().then(|| DiagnosticText::new(root_cause)),
             root_is_trap,
@@ -1037,36 +1031,12 @@ impl PoisonReason {
     }
 
     pub(super) fn opaque_text(&self) -> ProviderText {
-        match self {
-            Self::Trap {
-                operation,
-                trap,
-                root_cause,
-                root_is_trap,
-                secrets,
-                ..
-            } => {
-                let context =
-                    ["WASM provider instance unusable after trap in ", operation].concat();
-                if secrets.is_none() {
-                    return root_cause.with_context(&context);
-                }
-                match trap {
-                    Some(trap) if *root_is_trap => {
-                        ProviderText::new(trap.to_string()).with_context(&context)
-                    }
-                    Some(trap) => root_cause
-                        .with_context(&[context.as_str(), ": ", &trap.to_string()].concat()),
-                    None => root_cause.with_context(&context),
-                }
-            }
-            _ => ProviderText::new(self.to_string()),
-        }
+        ProviderText::new(self.capture_text())
     }
     pub(super) fn fail_fast_error(&self, operation: &'static str) -> ProviderError {
         let mut text = self.opaque_text();
         text.append_host([" (operation '", operation, "'); re-run the command"].concat());
-        ProviderError::from_text(carina_core::provider::ProviderErrorKind::Internal, text)
+        ProviderError::internal(text)
     }
 }
 
@@ -1084,27 +1054,26 @@ pub(super) fn wasm_trap_provider_error(
         Err(error) => error,
     };
     let timed_out = error.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt);
-    let (kind, context, call_context, text_context) = if timed_out {
+    let (context, call_context) = if timed_out {
         (
-            carina_core::provider::ProviderErrorKind::Timeout,
             "WASM plugin timed out",
             WasmGuestCallContext::ComputeBudgetExceeded { operation },
-            [operation, " exceeded the guest compute budget"].concat(),
         )
     } else {
         (
-            carina_core::provider::ProviderErrorKind::Internal,
             "WASM guest trapped",
             WasmGuestCallContext::Trap { operation },
-            [operation, " call failed"].concat(),
         )
     };
     let cause = WasmGuestCallError {
         context: Some(call_context),
-        source: WasmDiagnostic::from_guest(error, true),
+        source: error,
     };
-    let text = cause.source.text.with_context(&text_context);
-    ProviderError::from_diagnostic(kind, context, ProviderDiagnostic::from_text(cause, text))
+    if timed_out {
+        ProviderError::timeout_caused_by(context, cause)
+    } else {
+        ProviderError::internal_caused_by(context, cause)
+    }
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -1966,19 +1935,9 @@ impl WasmProvider {
         detail: &'static str,
         source: ProviderError,
     ) -> ProviderError {
-        let mut text = ProviderText::new(detail);
-        text.append_host(": ");
-        text.append(&source.clone().into());
-        ProviderError::from_diagnostic(
-            carina_core::provider::ProviderErrorKind::Internal,
+        ProviderError::internal_caused_by(
             "invalid WASM create result",
-            ProviderDiagnostic::from_text(
-                InvalidWasmCreateResult {
-                    detail,
-                    _source: source,
-                },
-                text,
-            ),
+            ProviderError::internal_caused_by(detail, source),
         )
         .for_resource(id.clone())
     }
@@ -9235,7 +9194,8 @@ pub(super) mod tests {
             1,
             "{rendered}"
         );
-        assert!(cause.source().is_none());
+        assert!(cause.source().is_some());
+        assert!(cause.source_is::<wasmtime::Trap>());
     }
 
     #[tokio::test]

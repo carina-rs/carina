@@ -8,7 +8,7 @@ pub trait InspectProviderCause {
 }
 impl InspectProviderCause for ProviderText {
     fn redact(&self, context: &Context) -> String {
-        ProviderError::from_text(ProviderErrorKind::Internal, self.clone())
+        ProviderError::internal(self.clone())
             .with_secrets_for_test(context)
             .to_string()
     }

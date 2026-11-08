@@ -4,7 +4,15 @@
 
 pub use carina_core as core;
 pub use carina_provider_protocol as protocol;
-pub use carina_provider_protocol::types;
+mod authoring;
+/// Provider authoring values. Errors and partial reasons remain opaque until encoding.
+pub mod types {
+    pub use crate::authoring::{ReferenceError, ReferenceOutcome, UpdateResult as UpdateOutcome};
+    pub use carina_core::provider::{
+        NonEmptyMissingAttributes, PartialReadDiagnostic, ProviderError, ProviderErrorKind,
+    };
+    pub use carina_provider_protocol::types::*;
+}
 pub use carina_provider_protocol::{FiniteF64, NonFiniteFloatError};
 
 #[cfg(test)]
@@ -81,14 +89,15 @@ pub fn parse_resource_id_string(key: &str) -> carina_provider_protocol::types::R
     }
 }
 
+use carina_core::provider::ProviderError;
 use carina_core::schema::{
     AssignabilityEdge, ReferenceForms, ValidatedConfigSchema, ValidatedProviderSchemaWitness,
     ValidatedResourceSchema,
 };
 use carina_provider_protocol::types::{
     AppliedIdentifier, AppliedState, CompletionValue, CreateRequest, DeleteRequest, PersistedState,
-    PersistedValue, ProviderError, ProviderInfo, ReadOutcome, ReadRequest, ReferenceScope,
-    Resource, ResourceId, State, TypeIdentity, UpdateRequest, Value,
+    PersistedValue, ProviderInfo, ReadOutcome, ReadRequest, ReferenceScope, Resource, ResourceId,
+    State, TypeIdentity, UpdateRequest, Value,
 };
 use std::collections::{BTreeMap, HashMap};
 
@@ -624,7 +633,7 @@ impl IssuedCreate {
     pub fn partial<T>(
         self,
         attributes: BTreeMap<String, Value>,
-        diagnostic: carina_provider_protocol::types::PartialReadDiagnostic,
+        diagnostic: carina_core::provider::PartialReadDiagnostic,
     ) -> CreateStep<T> {
         CreateStep(
             carina_provider_protocol::types::CreateStep::PartialSuccess {
@@ -679,7 +688,7 @@ impl FinishingCreate {
     pub fn partial<T>(
         self,
         attributes: BTreeMap<String, Value>,
-        diagnostic: carina_provider_protocol::types::PartialReadDiagnostic,
+        diagnostic: carina_core::provider::PartialReadDiagnostic,
     ) -> CreateStep<T> {
         CreateStep(
             carina_provider_protocol::types::CreateStep::PartialSuccess {
@@ -881,7 +890,7 @@ impl ResumedCreate {
     pub fn partial<T>(
         self,
         attributes: BTreeMap<String, Value>,
-        diagnostic: carina_provider_protocol::types::PartialReadDiagnostic,
+        diagnostic: carina_core::provider::PartialReadDiagnostic,
     ) -> ResumeStep<T> {
         ResumeStep(
             carina_provider_protocol::types::ResumeStep::PartialSuccess {
@@ -933,7 +942,7 @@ impl FinishingResume {
     pub fn partial<T>(
         self,
         attributes: BTreeMap<String, Value>,
-        diagnostic: carina_provider_protocol::types::PartialReadDiagnostic,
+        diagnostic: carina_core::provider::PartialReadDiagnostic,
     ) -> ResumeStep<T> {
         ResumeStep(
             carina_provider_protocol::types::ResumeStep::PartialSuccess {
@@ -984,7 +993,7 @@ pub enum Resume<T: PhasedToken> {
 
 pub type ProtocolCreateStep<T> = carina_provider_protocol::types::CreateStep<
     BTreeMap<String, Value>,
-    carina_provider_protocol::types::PartialReadDiagnostic,
+    carina_core::provider::PartialReadDiagnostic,
     T,
 >;
 
@@ -1086,7 +1095,7 @@ impl<T> From<CreateVerdict<T>> for PollVerdict<T> {
 
 pub type ProtocolResumeStep<T> = carina_provider_protocol::types::ResumeStep<
     BTreeMap<String, Value>,
-    carina_provider_protocol::types::PartialReadDiagnostic,
+    carina_core::provider::PartialReadDiagnostic,
     T,
 >;
 
@@ -1141,7 +1150,7 @@ impl<T> From<CreateVerdict<T>> for ResumeVerdict<T> {
 /// SDK result of one update step.
 #[derive(Debug)]
 pub enum UpdateOutcome<T> {
-    Done(carina_provider_protocol::UpdateOutcome),
+    Done(types::UpdateOutcome),
     Pending(Pending<T>),
 }
 
@@ -1242,17 +1251,10 @@ pub trait CarinaProvider {
                     .collect::<Vec<_>>()
                     .join(".");
                 Err(types::ReferenceError::InvalidReference(Box::new(
-                    ProviderError {
-                        kind: types::ProviderErrorKind::InvalidInput,
-                        message: format!("unsupported reference identity {identity}"),
-                        resource_id: None,
-                        cause: None,
-                        provider_name: None,
-                        operation: Some("resolve_references".into()),
-                        status: None,
-                        code: None,
-                        request_id: None,
-                    },
+                    ProviderError::invalid_input(format!(
+                        "unsupported reference identity {identity}"
+                    ))
+                    .with_operation("resolve_references"),
                 )))
             })
             .collect())
@@ -1617,31 +1619,19 @@ pub fn dispatch_resume_create<P: CarinaProvider + ?Sized>(
 }
 
 fn create_phase_mismatch(id: &ResourceId) -> ProviderError {
-    ProviderError {
-        kind: types::ProviderErrorKind::Internal,
-        message: "create continuation phase does not match its token".to_string(),
-        resource_id: Some(id.clone()),
-        cause: None,
-        provider_name: None,
-        operation: None,
-        status: None,
-        code: Some("CREATE_CONTINUATION_PHASE_MISMATCH".to_string()),
-        request_id: None,
-    }
+    ProviderError::internal("create continuation phase does not match its token".to_string())
+        .for_resource(carina_core::protocol_convert::protocol_to_resource_id(
+            &(id.clone()),
+        ))
+        .with_code("CREATE_CONTINUATION_PHASE_MISMATCH".to_string())
 }
 
 fn read_back_without_identifier(id: &ResourceId) -> ProviderError {
-    ProviderError {
-        kind: types::ProviderErrorKind::InvalidInput,
-        message: "read-back continuation requires an identifier".to_string(),
-        resource_id: Some(id.clone()),
-        cause: None,
-        provider_name: None,
-        operation: None,
-        status: None,
-        code: Some("READ_BACK_WITHOUT_IDENTIFIER".to_string()),
-        request_id: None,
-    }
+    ProviderError::invalid_input("read-back continuation requires an identifier".to_string())
+        .for_resource(carina_core::protocol_convert::protocol_to_resource_id(
+            &(id.clone()),
+        ))
+        .with_code("READ_BACK_WITHOUT_IDENTIFIER".to_string())
 }
 
 #[cfg(test)]
@@ -1652,6 +1642,7 @@ pub(crate) fn finite(value: f64) -> carina_provider_protocol::FiniteF64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use carina_core::test_utils::provider_text::NativeWireFixture;
     use std::cell::Cell;
 
     #[test]
@@ -1662,25 +1653,30 @@ mod tests {
             provider.initialize(&BTreeMap::new());
         assert!(validation.is_ok());
         assert!(initialization.is_ok());
-        let error = ProviderError {
-            kind: types::ProviderErrorKind::ApiError,
-            message: "configuration request failed".into(),
-            cause: Some("provider cause".into()),
-            operation: Some("initialize".into()),
-            status: Some(403),
-            code: Some("AccessDenied".into()),
-            request_id: Some("request-id".into()),
-            provider_name: Some("test".into()),
-            resource_id: None,
-        };
+        let error = ProviderError::api_error_caused_by(
+            carina_core::provider_text::ProviderText::new("configuration request failed"),
+            std::io::Error::other("provider cause"),
+        )
+        .for_provider("test")
+        .with_operation("initialize")
+        .with_status(403)
+        .with_code("AccessDenied")
+        .with_request_id("request-id");
         provider.config_failure = Some(error.clone());
-        let expected = serde_json::to_value(error).unwrap();
+        let expected = serde_json::to_value(error.to_wire()).unwrap();
         assert_eq!(
-            serde_json::to_value(provider.validate_config(&BTreeMap::new()).unwrap_err()).unwrap(),
+            serde_json::to_value(
+                provider
+                    .validate_config(&BTreeMap::new())
+                    .unwrap_err()
+                    .to_wire()
+            )
+            .unwrap(),
             expected
         );
         assert_eq!(
-            serde_json::to_value(provider.initialize(&BTreeMap::new()).unwrap_err()).unwrap(),
+            serde_json::to_value(provider.initialize(&BTreeMap::new()).unwrap_err().to_wire())
+                .unwrap(),
             expected
         );
     }
@@ -1708,7 +1704,7 @@ mod tests {
         assert_eq!(results.len(), 2);
         for (result, name) in results.into_iter().zip(["First", "Second"]) {
             assert!(
-                matches!(result, Err(types::ReferenceError::InvalidReference(error)) if error.message.contains(&format!("test.keys.{name}")))
+                matches!(result, Err(types::ReferenceError::InvalidReference(error)) if error.to_wire().message.contains(&format!("test.keys.{name}")))
             );
         }
     }
@@ -2194,17 +2190,7 @@ mod tests {
     }
 
     fn continuation_error() -> ProviderError {
-        ProviderError {
-            kind: types::ProviderErrorKind::Internal,
-            message: "transient continuation error".to_string(),
-            resource_id: None,
-            cause: None,
-            provider_name: None,
-            operation: None,
-            status: None,
-            code: None,
-            request_id: None,
-        }
+        ProviderError::internal("transient continuation error".to_string())
     }
 
     #[test]
@@ -2226,8 +2212,8 @@ mod tests {
         assert_eq!(in_flight.pending.sent, Sent::only(["name"]));
         assert_eq!(in_flight.pending.poll_after_secs, 7);
         assert_eq!(
-            serde_json::to_value(in_flight.error).unwrap(),
-            serde_json::to_value(error).unwrap()
+            serde_json::to_value(in_flight.error.to_wire()).unwrap(),
+            serde_json::to_value(error.to_wire()).unwrap()
         );
     }
 
@@ -2270,8 +2256,8 @@ mod tests {
         assert_eq!(in_flight.pending.token, TestToken::ReadBack);
         assert_eq!(in_flight.pending.poll_after_secs, 9);
         assert_eq!(
-            serde_json::to_value(in_flight.error).unwrap(),
-            serde_json::to_value(error).unwrap()
+            serde_json::to_value(in_flight.error.to_wire()).unwrap(),
+            serde_json::to_value(error.to_wire()).unwrap()
         );
     }
 
@@ -2372,10 +2358,13 @@ mod tests {
         let types::PollVerdict::NotCreated(error) = *verdict else {
             panic!("invalid read-back must end polling, got {verdict:?}");
         };
-        assert!(error.message.contains("requires an identifier"));
-        assert_eq!(error.code.as_deref(), Some("READ_BACK_WITHOUT_IDENTIFIER"));
-        assert_eq!(error.kind, types::ProviderErrorKind::InvalidInput);
-        assert_eq!(error.resource_id, Some(id.clone()));
+        assert!(error.to_wire().message.contains("requires an identifier"));
+        assert_eq!(
+            error.to_wire().code.as_deref(),
+            Some("READ_BACK_WITHOUT_IDENTIFIER")
+        );
+        assert_eq!(error.kind(), types::ProviderErrorKind::InvalidInput);
+        assert_eq!(error.to_wire().resource_id, Some(id.clone()));
 
         let verdict = dispatch_resume_create(
             &provider,
@@ -2389,10 +2378,13 @@ mod tests {
         let types::ResumeVerdict::NotCreated(error) = *verdict else {
             panic!("invalid resumed read-back must end polling, got {verdict:?}");
         };
-        assert!(error.message.contains("requires an identifier"));
-        assert_eq!(error.code.as_deref(), Some("READ_BACK_WITHOUT_IDENTIFIER"));
-        assert_eq!(error.kind, types::ProviderErrorKind::InvalidInput);
-        assert_eq!(error.resource_id, Some(id));
+        assert!(error.to_wire().message.contains("requires an identifier"));
+        assert_eq!(
+            error.to_wire().code.as_deref(),
+            Some("READ_BACK_WITHOUT_IDENTIFIER")
+        );
+        assert_eq!(error.kind(), types::ProviderErrorKind::InvalidInput);
+        assert_eq!(error.to_wire().resource_id, Some(id));
     }
 
     #[test]
@@ -2424,12 +2416,17 @@ mod tests {
         let types::PollVerdict::Unchanged(error) = *verdict else {
             panic!("a regression must keep the previous continuation, got {verdict:?}");
         };
-        assert!(error.message.contains("phase does not match its token"));
+        assert!(
+            error
+                .to_wire()
+                .message
+                .contains("phase does not match its token")
+        );
         assert_eq!(
-            error.code.as_deref(),
+            error.to_wire().code.as_deref(),
             Some("CREATE_CONTINUATION_PHASE_MISMATCH")
         );
-        assert_eq!(error.resource_id, Some(id.clone()));
+        assert_eq!(error.to_wire().resource_id, Some(id.clone()));
     }
 
     #[test]
@@ -2460,12 +2457,17 @@ mod tests {
         let types::ResumeVerdict::Unchanged(error) = *verdict else {
             panic!("a regression must keep the previous continuation, got {verdict:?}");
         };
-        assert!(error.message.contains("phase does not match its token"));
+        assert!(
+            error
+                .to_wire()
+                .message
+                .contains("phase does not match its token")
+        );
         assert_eq!(
-            error.code.as_deref(),
+            error.to_wire().code.as_deref(),
             Some("CREATE_CONTINUATION_PHASE_MISMATCH")
         );
-        assert_eq!(error.resource_id, Some(id.clone()));
+        assert_eq!(error.to_wire().resource_id, Some(id.clone()));
     }
 
     #[test]
@@ -2504,7 +2506,10 @@ mod tests {
         assert_eq!(in_flight.pending.token, TestToken::ReadBack);
         assert_eq!(in_flight.pending.sent, sent);
         assert_eq!(in_flight.pending.poll_after_secs, 7);
-        assert_eq!(in_flight.error.message, continuation_error().message);
+        assert_eq!(
+            in_flight.error.to_wire().message,
+            continuation_error().to_wire().message
+        );
     }
 
     #[test]
@@ -2540,7 +2545,10 @@ mod tests {
         );
         assert_eq!(in_flight.pending.token, TestToken::ReadBack);
         assert_eq!(in_flight.pending.poll_after_secs, 9);
-        assert_eq!(in_flight.error.message, continuation_error().message);
+        assert_eq!(
+            in_flight.error.to_wire().message,
+            continuation_error().to_wire().message
+        );
     }
 
     #[test]
@@ -2628,7 +2636,10 @@ mod tests {
             assert_eq!(in_flight.pending.token, token);
             assert_eq!(in_flight.pending.sent, sent);
             assert_eq!(in_flight.pending.poll_after_secs, 7);
-            assert_eq!(in_flight.error.message, continuation_error().message);
+            assert_eq!(
+                in_flight.error.to_wire().message,
+                continuation_error().to_wire().message
+            );
         }
     }
 
@@ -2662,7 +2673,10 @@ mod tests {
             assert_eq!(in_flight.pending.progress, progress);
             assert_eq!(in_flight.pending.token, token);
             assert_eq!(in_flight.pending.poll_after_secs, 9);
-            assert_eq!(in_flight.error.message, continuation_error().message);
+            assert_eq!(
+                in_flight.error.to_wire().message,
+                continuation_error().to_wire().message
+            );
         }
     }
 
@@ -2785,5 +2799,145 @@ mod explicit_pattern_mode_tests {
                 attrs[name]["attr_type"]["pattern"]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod error_composition_tests {
+    use super::*;
+    use carina_core::provider_text::{ProviderDiagnostic, Retryability};
+
+    fn reason() -> types::PartialReadDiagnostic {
+        types::PartialReadDiagnostic::new(
+            ProviderDiagnostic::new(
+                carina_core::provider::ProviderError::api_error_caused_by(
+                    "read-back failed",
+                    std::io::Error::other("typed leaf"),
+                )
+                .with_retryability(Retryability::Transient),
+            ),
+            vec!["name".into()].try_into().unwrap(),
+        )
+    }
+
+    #[test]
+    fn create_partial_retains_native_reason_until_sdk_encoding() {
+        let step: CreateStep<Never> = IssuedCreate::from_parts(
+            AppliedIdentifier::new("id").unwrap(),
+            Sent::AllRequestAttributes,
+        )
+        .partial(BTreeMap::new(), reason());
+        let carina_provider_protocol::types::CreateStep::PartialSuccess { diagnostic, .. } =
+            &step.0
+        else {
+            panic!("partial create")
+        };
+        assert_eq!(
+            diagnostic.diagnostic().retryability(),
+            Retryability::Transient
+        );
+        assert!(diagnostic.diagnostic().source_is::<std::io::Error>());
+        let wire = wasm_guest::encode_create_step(step.into_protocol());
+        let carina_provider_protocol::types::CreateStep::PartialSuccess { diagnostic, .. } = wire
+        else {
+            panic!("wire partial create")
+        };
+        assert_eq!(diagnostic.reason, "read-back failed: typed leaf");
+    }
+
+    #[test]
+    fn resume_partial_retains_native_reason_until_sdk_encoding() {
+        let step: ResumeStep<Never> = ResumedCreate::new(AppliedIdentifier::new("id").unwrap())
+            .partial(BTreeMap::new(), reason());
+        let carina_provider_protocol::types::ResumeStep::PartialSuccess { diagnostic, .. } =
+            &step.0
+        else {
+            panic!("partial resume")
+        };
+        assert_eq!(
+            diagnostic.diagnostic().retryability(),
+            Retryability::Transient
+        );
+        assert!(diagnostic.diagnostic().source_is::<std::io::Error>());
+        let wire = wasm_guest::encode_resume_step(step.into_protocol());
+        let carina_provider_protocol::types::ResumeStep::PartialSuccess { diagnostic, .. } = wire
+        else {
+            panic!("wire partial resume")
+        };
+        assert_eq!(diagnostic.reason, "read-back failed: typed leaf");
+    }
+
+    #[test]
+    fn update_partial_retains_native_reason_until_sdk_encoding() {
+        let outcome = types::UpdateOutcome::PartialSuccess {
+            state: types::AppliedPersistedState {
+                id: types::ResourceId {
+                    provider: "text-fixture".into(),
+                    resource_type: "resource".into(),
+                    identity: "fixture".into(),
+                },
+                identifier: AppliedIdentifier::new("id").unwrap(),
+                attributes: BTreeMap::new(),
+            },
+            diagnostic: reason(),
+        };
+        let types::UpdateOutcome::PartialSuccess { diagnostic, .. } = &outcome else {
+            panic!("partial update")
+        };
+        assert_eq!(
+            diagnostic.diagnostic().retryability(),
+            Retryability::Transient
+        );
+        assert!(diagnostic.diagnostic().source_is::<std::io::Error>());
+        let wire = wasm_guest::encode_update_result(&outcome);
+        let decoded =
+            carina_core::protocol_convert::protocol_update_outcome_to_core(&wire).unwrap();
+        let diagnostic = decoded.diagnostic().unwrap();
+        assert_eq!(
+            diagnostic.diagnostic().retryability(),
+            Retryability::Unclassified
+        );
+        assert!(
+            !diagnostic
+                .diagnostic()
+                .as_cause()
+                .matches_for_test::<std::io::Error>(|_| true)
+        );
+        use carina_core::test_utils::provider_text::BindProviderText;
+        assert_eq!(
+            diagnostic.clone().into_host_for_test().reason(),
+            "read-back failed: typed leaf"
+        );
+    }
+
+    #[test]
+    fn sdk_error_authoring_retains_cause_until_encoding() {
+        let error = types::ProviderError::api_error_caused_by(
+            "outer",
+            carina_core::provider::ProviderError::timeout_caused_by(
+                "inner",
+                std::io::Error::other("typed leaf"),
+            )
+            .with_retryability(Retryability::Transient),
+        );
+        assert!(error.is_transient());
+        assert!(
+            error
+                .detail()
+                .cause()
+                .unwrap()
+                .source_is::<std::io::Error>()
+        );
+        let wire = wasm_guest::encode_provider_error(error);
+        let decoded = carina_core::provider::ProviderError::from_wire(wire);
+        assert_eq!(decoded.retryability(), Retryability::Unclassified);
+        assert!(
+            !decoded
+                .detail()
+                .cause()
+                .unwrap()
+                .as_cause()
+                .matches_for_test::<std::io::Error>(|_| true)
+        );
     }
 }

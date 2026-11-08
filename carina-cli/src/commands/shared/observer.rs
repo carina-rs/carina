@@ -744,11 +744,14 @@ mod tests {
             "demo",
         ));
         let diagnostic = carina_core::provider::PartialReadDiagnostic::new(
-            "provider read was incomplete".into(),
-            vec!["arn".to_string(), "versioning".to_string()],
+            carina_core::provider_text::ProviderDiagnostic::message(
+                "provider read was incomplete".into(),
+            ),
+            (vec!["arn".to_string(), "versioning".to_string()])
+                .try_into()
+                .expect("nonempty partial attributes"),
         )
-        .map(|diagnostic| diagnostic.into_host_for_test())
-        .expect("fixture has missing attributes");
+        .into_host_for_test();
 
         let output = plain_output(
             color_mode,

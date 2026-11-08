@@ -18,17 +18,12 @@ struct MockHttpAwsUnusedProvider;
 
 impl MockHttpAwsUnusedProvider {
     fn error(id: &ResourceId, message: impl Into<String>) -> ProviderError {
-        ProviderError {
-            kind: ProviderErrorKind::InvalidInput,
-            message: message.into(),
-            resource_id: Some(id.clone()),
-            cause: None,
-            provider_name: Some("mock_http_aws_unused".to_string()),
-            operation: None,
-            status: None,
-            code: None,
-            request_id: None,
-        }
+        let message: String = message.into();
+        ProviderError::invalid_input(message)
+            .for_resource(
+                carina_plugin_sdk::core::protocol_convert::protocol_to_resource_id(&(id.clone())),
+            )
+            .for_provider("mock_http_aws_unused".to_string())
     }
 }
 
