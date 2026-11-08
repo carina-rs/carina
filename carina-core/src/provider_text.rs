@@ -1866,18 +1866,24 @@ impl<S: TextState> Diagnostic<S> {
         Self::capture_foreign(error)
     }
     fn capture_foreign(error: &(dyn std::error::Error + 'static)) -> ErrorText<S> {
+        let source = error.source();
         #[cfg(feature = "guest-runtime")]
-        if let Some(source) = error
-            .source()
+        let complete = source
             .and_then(frame_downcast::<RenderedGuestDiagnostic>)
-        {
-            return ErrorText::from_opaque_for_state(source.0.text.opaque());
-        }
-        let mut text = ErrorText::<S>::new(error.to_string());
-        if let Some(source) = error.source() {
-            text.append_host(": ");
-            text.append(&Self::capture(source));
-        }
+            .map(|source| source.0.text.opaque());
+        #[cfg(not(feature = "guest-runtime"))]
+        let complete: Option<ProviderText> = None;
+        let text = match complete {
+            Some(text) => ErrorText::from_opaque_for_state(text),
+            None => {
+                let mut text = ErrorText::<S>::new(error.to_string());
+                if let Some(source) = source {
+                    text.append_host(": ");
+                    text.append(&Self::capture(source));
+                }
+                text
+            }
+        };
         let context = text.redaction_context();
         text.with_redaction_context(&context)
     }

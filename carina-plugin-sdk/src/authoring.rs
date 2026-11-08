@@ -1,4 +1,4 @@
-//! Native authoring carriers; only SDK encoders produce protocol diagnostics.
+//! Native authoring carriers; transport encoding flattens their diagnostics.
 use crate::types::{AppliedPersistedState, PartialReadDiagnostic, ProviderError};
 
 #[derive(Debug, Clone)]

@@ -7,26 +7,10 @@
 use carina_provider_protocol::PERSISTED_SECRET_KEY;
 use carina_provider_protocol::types as proto;
 
-#[cfg(target_arch = "wasm32")]
-pub type EncodedProviderError = carina_core::provider::SdkWire<proto::ProviderError>;
-#[cfg(not(target_arch = "wasm32"))]
+/// Flattened transport projections. These records retain text and metadata,
+/// while native typed causes and retry policy remain in the authored values.
 pub type EncodedProviderError = proto::ProviderError;
-#[cfg(target_arch = "wasm32")]
-pub type EncodedPartial = carina_core::provider::SdkWire<proto::PartialReadDiagnostic>;
-#[cfg(not(target_arch = "wasm32"))]
 pub type EncodedPartial = proto::PartialReadDiagnostic;
-
-#[cfg(target_arch = "wasm32")]
-pub enum EncodedUpdateOutcome {
-    Success {
-        state: proto::AppliedPersistedState,
-    },
-    PartialSuccess {
-        state: proto::AppliedPersistedState,
-        diagnostic: EncodedPartial,
-    },
-}
-#[cfg(not(target_arch = "wasm32"))]
 pub type EncodedUpdateOutcome = proto::UpdateOutcome;
 
 /// Flatten an authored error at the SDK transport boundary.
@@ -1276,12 +1260,6 @@ macro_rules! export_provider {
             fn proto_to_wit_partial_read_diagnostic(
                 diagnostic: helpers::EncodedPartial,
             ) -> wit_types::PartialReadDiagnostic {
-                // SAFETY: SdkWire<T> is repr(transparent) over exactly T. This
-                // private export helper immediately lowers it to WIT; no safe
-                // provider API returns the underlying record or its strings.
-                let diagnostic: proto::PartialReadDiagnostic = unsafe {
-                    ::core::mem::transmute(diagnostic)
-                };
                 let proto::PartialReadDiagnostic {
                     reason,
                     missing_attributes,
@@ -1918,12 +1896,7 @@ macro_rules! export_provider {
             }
 
             fn proto_to_wit_provider_error(err: $crate::types::ProviderError) -> wit_types::ProviderError {
-                wire_to_wit_provider_error(encoded_provider_error_to_wire($crate::wasm_guest::encode_provider_error(err)))
-            }
-            fn encoded_provider_error_to_wire(err: helpers::EncodedProviderError) -> proto::ProviderError {
-                // SAFETY: SdkWire<T> guarantees T's transparent representation.
-                // The conversion stays inside the private WIT export adapter.
-                unsafe { ::core::mem::transmute(err) }
+                wire_to_wit_provider_error($crate::wasm_guest::encode_provider_error(err))
             }
             fn wire_to_wit_provider_error(err: proto::ProviderError) -> wit_types::ProviderError {
                 let detail = wit_types::ErrorDetail {
@@ -2067,7 +2040,7 @@ macro_rules! export_provider {
                 result: Result<T, $crate::types::ProviderError>,
             ) -> T {
                 result.unwrap_or_else(|error| {
-                    panic!("Provider export error in {operation}: {}", encoded_provider_error_to_wire($crate::wasm_guest::encode_provider_error(error)).message)
+                    panic!("Provider export error in {operation}: {}", $crate::wasm_guest::encode_provider_error(error).message)
                 })
             }
 

@@ -208,7 +208,7 @@ let verdict = ProviderError::internal_caused_by("read-back failed", source);
 
 A cause-bearing error inherits retryability automatically. Foreign errors start as `Unclassified`; attach SDK or provider policy to the composed error with `with_retryability(Retryability::Transient)`. `with_retryability(Retryability::Unclassified)` explicitly clears inherited retryability. A foreign wrapper inherits the nearest `Transient` classification in its source chain. `is_transient()` is true only for `Transient`; the `Timeout` kind alone does not imply it.
 
-Diagnostics share immutable causal storage when cloned. Each handle has its own text view, so binding one handle does not change another. There is one causal parent; combining independent typed causes is unsupported. SDK encoding flattens native causes and partial reasons to the existing version-24 wire records. In wasm provider code, encoding returns opaque carriers with no safe access to message or reason fields; the SDK export adapter consumes them when lowering to WIT. Typed sources and retryability remain native properties.
+Diagnostics share immutable causal storage when cloned. Each handle has its own text view, so binding one handle does not change another. There is one causal parent; combining independent typed causes is unsupported. SDK encoding flattens native causes and partial reasons to the existing version-24 wire records. In wasm provider code, encoding returns plain wire records containing flattened text and metadata. These records retain neither typed sources nor retryability, and the wire decoder is private to the host. Keep the authored error or diagnostic when composing another failure; use the encoded record for transport.
 
 ## read
 

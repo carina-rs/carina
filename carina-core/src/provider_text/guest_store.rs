@@ -5,12 +5,14 @@ use std::ops::{Deref, DerefMut};
 use super::{GuestCredentialHandoff, GuestInputInventory};
 use crate::resource::{AbsoluteBindingAddress, NoPlaceholder, SecretPayload};
 
-/// An opaque causal source for a guest load error whose standalone display
-/// already renders the complete diagnostic. Capture adopts this complete frame
-/// instead of appending it to the enclosing error's display a second time.
-/// Raw `Error` walkers cannot expose its provider text or underlying source.
-/// The native host installs the transparent carrier in its private loader;
-/// there is no safe authoring constructor for this adapter.
+/// Delegate an enclosing error's captured rendering to an existing diagnostic.
+///
+/// The diagnostic already owns its complete text, typed cause, retry policy,
+/// and redaction inventories. This identity wrapper accepts no replacement
+/// text and grants no binding or plaintext access. Core applies its ordinary
+/// redaction rules when capturing it, including when a foreign error returns
+/// it from `Error::source()` to avoid rendering its own inline cause twice.
+/// Raw `Error` walkers cannot expose the stored text or underlying source.
 ///
 /// ```compile_fail,E0423
 /// use carina_core::provider_text::{ProviderDiagnostic, RenderedGuestDiagnostic};
@@ -21,11 +23,16 @@ use crate::resource::{AbsoluteBindingAddress, NoPlaceholder, SecretPayload};
 /// ```
 /// use carina_core::provider_text::{ProviderDiagnostic, RenderedGuestDiagnostic};
 /// let source = ProviderDiagnostic::new(std::io::Error::other("typed leaf"));
-/// let _ = source;
+/// let _ = RenderedGuestDiagnostic::from(source);
 /// ```
-#[repr(transparent)]
 #[derive(Clone, Debug)]
 pub struct RenderedGuestDiagnostic(pub(super) super::ProviderDiagnostic);
+
+impl From<super::ProviderDiagnostic> for RenderedGuestDiagnostic {
+    fn from(source: super::ProviderDiagnostic) -> Self {
+        Self(source)
+    }
+}
 
 impl std::fmt::Display for RenderedGuestDiagnostic {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

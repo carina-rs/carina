@@ -86,15 +86,28 @@ with tempfile.TemporaryDirectory(prefix="carina-provider-cause-api-") as tempora
     print("OK: downstream predicates and native encoding/round-trip fixtures are unavailable (E0599).")
 
     # Compile as an actual guest provider depending on the SDK. Repeat with
-    # unified test features: a dependency feature must not grant wire readers.
+    # unified test features: a dependency feature must not grant wire decoders.
     manifest_path = fixture / "Cargo.toml"
     manifest_path.write_text(manifest_path.read_text().replace(
         '[patch.crates-io]',
         'carina-plugin-sdk = { path = ' + json.dumps(str(repo / "carina-plugin-sdk")) + ' }\n'
+        'serde = { version = "1", features = ["derive"] }\n'
         'serde_json = "1"\n\n'
-        '[features]\nunified-test-utils = ["carina-core/test-utils", "carina-plugin-sdk/test-utils"]\n\n'
+        '[features]\nunified-test-utils = ["carina-core/test-utils", "carina-plugin-sdk/test-utils"]\n'
+        'export-http = []\nexport-aws = []\n\n'
         '[patch.crates-io]',
     ))
+    for world in ([], ["--features", "export-http"], ["--features", "export-aws"]):
+        shutil.copyfile(repo / "scripts/tests/provider-cause-test-api/wasm_export_forbid_unsafe.rs", fixture / "src/lib.rs")
+        result = subprocess.run([
+            "cargo", "check", "--offline", "--lib", "--target", "wasm32-wasip2", *world,
+            "--manifest-path", str(manifest_path), "--target-dir", str(repo / "target"),
+        ], env=environment, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            print(result.stdout, file=sys.stderr)
+            print(result.stderr, file=sys.stderr)
+            sys.exit(f"ERROR: export_provider! must compile under forbid(unsafe_code): world={world}")
+        print(f"OK: export_provider! compiles under forbid(unsafe_code); world={world}.")
     for target in ([], ["--target", "wasm32-wasip2"]):
         for features in ([], ["--features", "unified-test-utils"]):
             for filename, should_compile in (("wire_decode.rs", False), ("direct_authoring.rs", True)):
@@ -120,7 +133,7 @@ with tempfile.TemporaryDirectory(prefix="carina-provider-cause-api-") as tempora
                     sys.exit(f"ERROR: provider wire decode check failed: {filename}, target={target}, features={features}")
             print(f"OK: provider wire decoders are unavailable and direct authoring compiles; target={target}, features={features}.")
     for features in ([], ["--features", "unified-test-utils"]):
-        for filename, should_compile in (("wasm_lossy_rewrap.rs", False), ("wasm_sdk_encoding.rs", True)):
+        for filename, should_compile in (("wasm_native_fixtures.rs", False), ("wasm_sdk_encoding.rs", True)):
             shutil.copyfile(repo / "scripts/tests/provider-cause-test-api" / filename, fixture / "src/lib.rs")
             result = subprocess.run([
                 "cargo", "check", "--offline", "--lib", "--message-format=json",
@@ -136,10 +149,7 @@ with tempfile.TemporaryDirectory(prefix="carina-provider-cause-api-") as tempora
                 if message.get("reason") == "compiler-message" and message["message"]["level"] == "error":
                     errors.append(message["message"])
             expected_codes = {
-                "error_message": "E0609", "partial_reason": "E0609",
-                "sdk_error_message": "E0609", "sdk_partial_reason": "E0609",
-                "serialize_error": "E0277", "serialize_partial": "E0277",
-                "private_wire_field": "E0616", "native_fixture": "E0433",
+                "native_fixture": "E0433",
                 "native_round_trip_fixture": "E0433",
             }
             lines = (fixture / "src/lib.rs").read_text().splitlines()
@@ -160,6 +170,6 @@ with tempfile.TemporaryDirectory(prefix="carina-provider-cause-api-") as tempora
             if (should_compile and result.returncode != 0) or (not should_compile and not valid_failure):
                 print(result.stdout, file=sys.stderr)
                 print(result.stderr, file=sys.stderr)
-                sys.exit(f"ERROR: wasm SDK opacity check failed: {filename}, features={features}")
-        print(f"OK: wasm SDK encoding compiles and all nine lossy routes are rejected; features={features}.")
+                sys.exit(f"ERROR: flattened SDK encoding or native fixture check failed: {filename}, features={features}")
+        print(f"OK: flattened wire encoding compiles and native fixtures remain unavailable; features={features}.")
 PY

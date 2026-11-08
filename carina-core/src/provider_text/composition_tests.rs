@@ -100,6 +100,92 @@ fn capturing_an_existing_bound_diagnostic_preserves_the_current_node() {
     assert!(adopted.is::<std::io::Error>());
 }
 
+#[cfg(feature = "guest-runtime")]
+#[derive(Debug)]
+struct CompleteGuestDisplay {
+    source: RenderedGuestDiagnostic,
+}
+
+#[cfg(feature = "guest-runtime")]
+impl std::fmt::Display for CompleteGuestDisplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("guest-secret public reason")
+    }
+}
+
+#[cfg(feature = "guest-runtime")]
+impl std::error::Error for CompleteGuestDisplay {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+#[cfg(feature = "guest-runtime")]
+#[test]
+fn safe_rendered_guest_frame_preserves_redactions_and_typed_cause() {
+    let carried = RedactionSet::for_test(&["guest-secret"]);
+    let source: ProviderError = ProviderError::api_error_caused_by(
+        ProviderText::new("metadata guest-secret").with_redaction(&carried),
+        std::io::Error::other("guest-secret public reason"),
+    )
+    .with_request_id("guest-secret")
+    .with_retryability(Retryability::Transient)
+    .with_secrets(&carried)
+    .into();
+    let frame = RenderedGuestDiagnostic::from(ProviderDiagnostic::new(source));
+    assert!(!format!("{frame} {frame:?}").contains("guest-secret"));
+    let error =
+        ProviderError::internal_caused_by("load failed", CompleteGuestDisplay { source: frame });
+    assert!(error.is_transient());
+    assert!(
+        error
+            .detail()
+            .cause()
+            .unwrap()
+            .source_is::<std::io::Error>()
+    );
+    let boundary = RedactionSet::for_test(&[]);
+    let host = error.with_secrets(&boundary);
+    let wire = host.to_wire();
+    let text = format!("{host} {host:?} {wire:?}");
+    assert!(!text.contains("guest-secret"), "{text}");
+    assert!(text.contains("(secret)"), "{text}");
+    assert_eq!(
+        wire.cause
+            .as_ref()
+            .unwrap()
+            .matches("public reason")
+            .count(),
+        1
+    );
+    let mut node = host.detail().cause().unwrap().as_cause();
+    loop {
+        assert!(!node.redact(&boundary).as_str().contains("guest-secret"));
+        if node.is::<std::io::Error>() {
+            break;
+        }
+        node = node
+            .source()
+            .expect("the typed guest cause remains traversable");
+    }
+}
+
+#[cfg(feature = "guest-runtime")]
+#[test]
+fn safe_rendered_guest_frame_renders_the_captured_text_once() {
+    let source = ProviderDiagnostic::new(std::io::Error::other("guest-secret public reason"));
+    let frame = RenderedGuestDiagnostic::from(source.clone());
+    assert!(std::sync::Arc::ptr_eq(&frame.0.error, &source.error));
+    let error = ProviderError::from_diagnostic(
+        ProviderErrorKind::Internal,
+        CompleteGuestDisplay { source: frame },
+    );
+    let host = error.with_secrets(&RedactionSet::for_test(&["guest-secret"]));
+    assert_eq!(host.to_string(), "(secret) public reason");
+    assert_eq!(host.to_wire().message, "(secret) public reason");
+    assert!(host.detail().cause().unwrap().source_is::<std::io::Error>());
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("foreign validation wrapper")] // error-chain: caller-renders-sources
 struct ForeignValidation(#[source] crate::schema::ProviderValidation);

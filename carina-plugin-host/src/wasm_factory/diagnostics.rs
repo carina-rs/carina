@@ -453,15 +453,7 @@ impl MetadataLoadDiagnostic {
                 ProviderText::new(context.clone()),
                 source.source.clone(),
             ));
-        // SAFETY: core declares this opaque carrier repr(transparent) over
-        // ProviderDiagnostic. Keep installation inside the metadata loader;
-        // safe provider authoring cannot mint a pre-rendered source adapter.
-        let captured = unsafe {
-            std::mem::transmute::<
-                ProviderDiagnostic,
-                carina_core::provider_text::RenderedGuestDiagnostic,
-            >(captured)
-        };
+        let captured = captured.into();
         Self {
             context: DiagnosticText::new(context),
             source,

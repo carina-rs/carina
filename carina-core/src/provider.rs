@@ -5639,9 +5639,11 @@ impl PartialReadDiagnostic<Unbound> {
     pub fn to_wire(&self) -> protocol_types::PartialReadDiagnostic {
         self.to_wire_inner()
     }
+    /// Flatten this reason for transport. Typed causes and retry policy do not
+    /// survive this projection; retain the diagnostic for further composition.
     #[cfg(target_arch = "wasm32")]
-    pub fn to_wire(&self) -> SdkWire<protocol_types::PartialReadDiagnostic> {
-        SdkWire(self.to_wire_inner())
+    pub fn to_wire(&self) -> protocol_types::PartialReadDiagnostic {
+        self.to_wire_inner()
     }
 }
 impl PartialReadDiagnostic<Bound> {
@@ -5808,29 +5810,15 @@ impl ProviderFailure<Unbound> {
     pub fn to_wire(&self) -> WireProviderError {
         self.to_wire_inner()
     }
+    /// Flatten this error for transport. Typed causes and retry policy do not
+    /// survive this projection; retain the error for further composition.
+    /// Wire decoding is private to the host, not a provider authoring route.
     #[cfg(target_arch = "wasm32")]
-    pub fn to_wire(&self) -> SdkWire<WireProviderError> {
-        SdkWire(self.to_wire_inner())
+    pub fn to_wire(&self) -> WireProviderError {
+        self.to_wire_inner()
     }
 }
 
-/// A transport record with no safe access to its provider-authored fields.
-///
-/// No safe projection, serialization or formatting operation exposes `T`.
-/// The SDK's generated lowering helpers live in a private module and unwrap
-/// this transparent representation with unsafe conversions. Provider code can
-/// also unwrap it using unsafe code; this is a safe-API boundary.
-#[cfg(target_arch = "wasm32")]
-#[repr(transparent)]
-#[derive(Clone)]
-pub struct SdkWire<T>(T);
-
-#[cfg(target_arch = "wasm32")]
-impl<T> fmt::Debug for SdkWire<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SdkWire(<provider text>)")
-    }
-}
 impl PartialReadDiagnostic<Unbound> {
     pub(crate) fn validate(&self, id: &ResourceId, schemas: &SchemaRegistry) -> ProviderResult<()> {
         let schema = schemas.get(
