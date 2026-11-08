@@ -896,6 +896,13 @@ impl CarinaProvider for MockProcessProvider {
     }
 
     fn validate_config(&self, attrs: &BTreeMap<String, Value>) -> Result<(), ProviderError> {
+        if let Some(Value::String(cause)) = attrs.get("__mock_validate_config_captured_cause__") {
+            return Err(ProviderError::from_diagnostic(
+                carina_plugin_sdk::types::ProviderErrorKind::ApiError,
+                std::io::Error::other(format!("original validation failure: {cause}")),
+            )
+            .with_status(403));
+        }
         if let Some(Value::String(cause)) = attrs.get("__mock_validate_config_cause__") {
             return Err(ProviderError::api_error_caused_by(
                 "mock configuration request failed",

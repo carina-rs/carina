@@ -866,19 +866,22 @@ impl<S: TextState> ProviderFailure<S> {
         self
     }
 
-    /// Replace only diagnostic text while preserving the error variant,
-    /// structured metadata, typed cause, and host lifecycle classification.
+    /// Replace the message, retaining independently contextualized causes.
+    /// A captured diagnostic is the message itself, so it is suppressed in full.
+    /// Preserve the error variant, retry policy, metadata, and redaction inventories.
     pub(crate) fn with_redacted_message(mut self, message: impl Into<String>) -> Self {
-        let text = self.new_host_field(message.into());
+        let redactions = self.redaction_context();
+        let text = self
+            .new_host_field(message.into())
+            .with_redaction_context(&redactions);
         self.detail_mut().body = match self.detail().body.clone() {
-            FailureBody::Message(_) => FailureBody::Message(text),
-            FailureBody::Context { cause, .. } | FailureBody::Captured(cause) => {
-                FailureBody::Context {
-                    context: text,
-                    cause,
-                }
-            }
+            FailureBody::Message(_) | FailureBody::Captured(_) => FailureBody::Message(text),
+            FailureBody::Context { context: _, cause } => FailureBody::Context {
+                context: text,
+                cause,
+            },
         };
+        self.protect_fields(&redactions);
         self
     }
     fn protect_fields(&mut self, context: &RedactionContext) {
@@ -919,7 +922,7 @@ impl<S: TextState> ProviderFailure<S> {
 
 impl<S: TextState> OperationErrorDetail<S> {
     pub fn new(message: impl Into<S::Message>) -> Self {
-        let text = S::message(message.into());
+        let text = S::operations().message(message.into());
         let mut detail = Self::captured(Diagnostic::message_for_state(text.clone()));
         detail.body = FailureBody::Message(text);
         detail
@@ -938,7 +941,10 @@ impl<S: TextState> OperationErrorDetail<S> {
         }
     }
     fn caused_by(context: impl Into<S::Context>, cause: impl DiagnosticSource<S>) -> Self {
-        Self::contextual(S::context(context.into()), cause.into_diagnostic())
+        Self::contextual(
+            S::operations().context(context.into()),
+            cause.into_diagnostic(),
+        )
     }
     fn contextual(context: ErrorText<S>, cause: Diagnostic<S>) -> Self {
         let mut detail = Self::captured(cause.clone());
@@ -5599,7 +5605,7 @@ impl<S: TextState> PartialReadDiagnostic<S> {
         missing_attributes: NonEmptyMissingAttributes,
     ) -> Self {
         Self {
-            reason: S::partial_read_reason(reason),
+            reason: S::operations().partial_read_reason(reason),
             missing_attributes: missing_attributes
                 .0
                 .into_iter()
@@ -5819,11 +5825,12 @@ impl ProviderFailure<Unbound> {
     }
 }
 
-/// A transport record whose provider-authored fields remain unreadable.
+/// A transport record with no safe access to its provider-authored fields.
 ///
 /// No safe projection, serialization or formatting operation exposes `T`.
-/// The transparent representation is consumed only by the SDK export macro's
-/// private WIT lowering functions, alongside the generated canonical ABI code.
+/// The SDK's generated lowering helpers live in a private module and unwrap
+/// this transparent representation with unsafe conversions. Provider code can
+/// also unwrap it using unsafe code; this is a safe-API boundary.
 #[cfg(target_arch = "wasm32")]
 #[repr(transparent)]
 #[derive(Clone)]

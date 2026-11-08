@@ -129,7 +129,32 @@ use serde::{Deserialize, Deserializer, Serialize};
 pub const MAX_PROVIDER_TEXT_BYTES: usize = 8 * 1024;
 
 mod state_sealed {
-    pub trait Sealed {}
+    use super::{Diagnostic, ErrorText, TextState};
+
+    pub trait Sealed: Sized {
+        fn operations() -> Operations<Self>
+        where
+            Self: TextState;
+    }
+
+    // The public sealed supertrait can reveal this opaque helper, including
+    // through generic TextState bounds, but only core can call its operations.
+    pub struct Operations<S: TextState> {
+        pub(super) message: fn(S::Message) -> ErrorText<S>,
+        pub(super) context: fn(S::Context) -> ErrorText<S>,
+        pub(super) partial_read_reason: fn(S::PartialReadReason) -> Diagnostic<S>,
+    }
+    impl<S: TextState> Operations<S> {
+        pub(crate) fn message(&self, text: S::Message) -> ErrorText<S> {
+            (self.message)(text)
+        }
+        pub(crate) fn context(&self, text: S::Context) -> ErrorText<S> {
+            (self.context)(text)
+        }
+        pub(crate) fn partial_read_reason(&self, reason: S::PartialReadReason) -> Diagnostic<S> {
+            (self.partial_read_reason)(reason)
+        }
+    }
 }
 
 /// Whether diagnostic text has crossed the host ingestion boundary.
@@ -141,10 +166,7 @@ pub trait TextState:
     type Message: From<String> + for<'a> From<&'a str>;
     type Context;
     type PartialReadReason;
-    fn message(text: Self::Message) -> ErrorText<Self>;
-    fn context(text: Self::Context) -> ErrorText<Self>;
     type Permission;
-    fn partial_read_reason(reason: Self::PartialReadReason) -> Diagnostic<Self>;
 }
 /// Provider-owned text, with no host display/storage authority.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -152,39 +174,37 @@ pub struct Unbound;
 /// Text authored by the host or redacted at its provider boundary.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bound;
-impl state_sealed::Sealed for Unbound {}
-impl state_sealed::Sealed for Bound {}
+impl state_sealed::Sealed for Unbound {
+    fn operations() -> state_sealed::Operations<Self> {
+        state_sealed::Operations {
+            message: ErrorText::from_provider_text,
+            context: |text| ErrorText::from_provider_text(text.0),
+            partial_read_reason: |reason| reason,
+        }
+    }
+}
+impl state_sealed::Sealed for Bound {
+    fn operations() -> state_sealed::Operations<Self> {
+        state_sealed::Operations {
+            message: ErrorText::new,
+            context: ErrorText::new,
+            partial_read_reason: |reason| Diagnostic::message_for_state(ErrorText::new(reason)),
+        }
+    }
+}
 impl TextState for Unbound {
     const BOUND: bool = false;
     type Message = ProviderText;
     type Context = ProviderContext;
     type PartialReadReason = ProviderDiagnostic;
-    fn message(text: ProviderText) -> ErrorText<Self> {
-        ErrorText::from_provider_text(text)
-    }
-    fn context(text: ProviderContext) -> ErrorText<Self> {
-        Self::message(text.0)
-    }
     type Permission = String;
-    fn partial_read_reason(reason: ProviderDiagnostic) -> Diagnostic<Self> {
-        reason
-    }
 }
 impl TextState for Bound {
     const BOUND: bool = true;
     type Message = String;
     type Context = &'static str;
     type PartialReadReason = String;
-    fn message(text: String) -> ErrorText<Self> {
-        ErrorText::new(text)
-    }
-    fn context(text: &'static str) -> ErrorText<Self> {
-        ErrorText::new(text)
-    }
     type Permission = RequiredPermission;
-    fn partial_read_reason(reason: String) -> Diagnostic<Self> {
-        Diagnostic::message_for_state(ErrorText::new(reason))
-    }
 }
 
 pub type ProviderErrorText = ErrorText<Unbound>;
@@ -249,7 +269,6 @@ pub enum Retryability {
 }
 
 /// Attach SDK-supplied retry policy while preserving the complete diagnostic.
-#[derive(Debug)]
 pub struct ClassifiedSource<C> {
     cause: C,
     retryability: Retryability,
