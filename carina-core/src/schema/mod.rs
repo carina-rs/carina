@@ -1914,6 +1914,10 @@ pub struct RootlessType {
 }
 
 impl RootlessType {
+    pub(crate) fn effective_type(&self) -> EffectiveType<'_> {
+        EffectiveType::for_value_walk(&self.schema.root, &self.schema.defs)
+    }
+
     #[cfg(test)]
     pub(crate) fn new(root: CompiledAttributeType) -> Self {
         Self::with_defs(root, BTreeMap::new())
