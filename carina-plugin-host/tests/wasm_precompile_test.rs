@@ -33,6 +33,37 @@ fn non_instantiable_component() -> Vec<u8> {
     wat::parse_str(NON_INSTANTIABLE_COMPONENT_WAT).expect("fixture WAT must compile")
 }
 
+#[test]
+fn concurrent_precompile_writers_publish_complete_artifacts() {
+    let cache = tempfile::tempdir().unwrap();
+    let path = cache.path().join("concurrent.cwasm");
+    let bytes = non_instantiable_component();
+    let barrier = std::sync::Barrier::new(16);
+    std::thread::scope(|scope| {
+        let writers: Vec<_> = (0..16)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    for _ in 0..8 {
+                        WasmProviderFactory::precompile(&bytes, &path)
+                            .expect("every concurrent writer must publish atomically");
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+    });
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model(true).epoch_interruption(true);
+    let engine = wasmtime::Engine::new(&config).unwrap();
+    // SAFETY: the fixture was produced only by our precompile calls above.
+    unsafe { wasmtime::component::Component::deserialize_file(&engine, &path) }
+        .expect("the last publication must be a complete compiled component");
+    assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 1);
+}
+
 struct CacheArtifactSnapshot {
     contents: Vec<u8>,
     modified: std::time::SystemTime,

@@ -251,9 +251,9 @@ jobs:
       - run: bash scripts/check-example-warnings.sh
 
   test:
-    # Keep the job id: rust-cache includes github.job in its default cache key.
-    # Main warms the same cache restored by PR/merge-queue Test jobs.
-    name: ${{ github.event_name == 'push' && 'Warm Test Cache' || 'Test' }}
+    # Keep the main cache writer's job id and existing cache key. Auxiliary
+    # checks restore this namespace; push still only builds, without testing.
+    name: Build Test Archive
     needs: changes
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
@@ -265,43 +265,145 @@ jobs:
         with:
           targets: wasm32-wasip2
       - uses: ./.github/actions/rust-cache
-      - name: Restore cargo-nextest
-        id: nextest
-        uses: actions/cache@v4
-        with:
-          path: ~/.cargo/bin/cargo-nextest
-          key: cargo-nextest-${{ runner.os }}-${{ runner.arch }}-${{ env.NEXTEST_VERSION }}
-      # A cold-cache GitHub release outage must fail promptly, not retry for 20m.
-      - name: Install cargo-nextest
-        if: steps.nextest.outputs.cache-hit != 'true'
+      - uses: ./.github/actions/setup-nextest
         timeout-minutes: 3
-        uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
-      # Build the WASM fixture so carina-plugin-host's integration tests run
-      # instead of silently skipping. Without this step a stale or missing
-      # fixture leaves the wasm_integration_test suite as a no-op in CI.
+          version: ${{ env.NEXTEST_VERSION }}
       - run: >-
           cargo build
           -p carina-provider-mock
           -p carina-provider-mock-http
           --target wasm32-wasip2
-      # Separate compilation from execution so future runs expose both timings.
-      # On push, compilation alone populates main's cache without rerunning tests.
-      - name: Compile workspace tests
-        run: cargo nextest run --workspace --all-features --no-run
-      - name: Run workspace tests
+      - name: Archive workspace tests
+        run: cargo nextest archive --workspace --all-features --archive-file nextest-archive.tar.zst
+      - uses: actions/upload-artifact@v4
         if: github.event_name != 'push'
-        run: cargo nextest run --workspace --all-features
-      - if: github.event_name != 'push'
-        run: scripts/test-in-process-isolation.sh
-      - if: github.event_name != 'push'
-        run: bash scripts/check-provider-cause-test-api.sh
-      # nextest does not run doctests; cover them with cargo test --doc.
-      # Stable Cargo rejects --doc --no-run. The nextest build warms their
-      # dependencies; avoid executing doctests again on the same main commit.
-      - if: github.event_name != 'push'
-        run: cargo test --workspace --doc --all-features
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'push'
+        with:
+          name: wasm-fixtures
+          path: target/wasm32-wasip2/debug/*.wasm
+          if-no-files-found: error
+          retention-days: 1
+
+  test-partition:
+    name: Workspace tests (${{ matrix.partition }}/6)
+    needs: [changes, test]
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-nextest
+        timeout-minutes: 3
+        with:
+          version: ${{ env.NEXTEST_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-fixtures
+          path: target/wasm32-wasip2/debug
+      - run: bash scripts/require-wasm-fixtures.sh
+      # Extract into the checkout: integration tests use Cargo's compile-time
+      # binary paths under target/debug, as well as the WASM fixtures above.
+      - run: >-
+          cargo nextest run --archive-file nextest-archive.tar.zst
+          --workspace-remap . --extract-to . --extract-overwrite
+          --partition count:${{ matrix.partition }}/6 --no-fail-fast
+
+  test-isolation:
+    name: In-process isolation
+    needs: [changes, test]
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-nextest
+        timeout-minutes: 3
+        with:
+          version: ${{ env.NEXTEST_VERSION }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: nextest-archive
+      - uses: actions/download-artifact@v4
+        with:
+          name: wasm-fixtures
+          path: target/wasm32-wasip2/debug
+      - run: bash scripts/require-wasm-fixtures.sh
+      - run: scripts/test-in-process-isolation.sh nextest-archive.tar.zst
+
+  test-provider-cause:
+    name: Provider cause API
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - uses: ./.github/actions/rust-cache
+        with:
+          cache-job: test
+      - run: bash scripts/check-provider-cause-test-api.sh
+
+  test-doctests:
+    name: Doctests
+    needs: changes
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/rust-cache
+        with:
+          cache-job: test
+      # nextest archives do not contain doctests.
+      - run: cargo test --workspace --doc --all-features
+
+  test-result:
+    name: Test
+    needs: [changes, test, test-partition, test-isolation, test-provider-cause, test-doctests]
+    # Preserve the required check's legitimate docs/version-only skip. An
+    # unsuccessful change detector must instead run this job and fail closed.
+    if: always() && github.event_name != 'push' && (needs.changes.result != 'success' || (needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every test job to succeed
+        env:
+          NEEDS_RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python3 - <<'PYTHON'
+          import json
+          import os
+          import sys
+          results = json.loads(os.environ["NEEDS_RESULTS"])
+          failed = {job: value["result"] for job, value in results.items() if value["result"] != "success"}
+          if failed:
+              sys.exit(f"Test dependencies did not succeed: {failed}")
+          print("Every test partition and auxiliary check succeeded.")
+          PYTHON
 
   binary-build:
     name: Binary Build (linux-x86_64)

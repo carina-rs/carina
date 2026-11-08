@@ -1,0 +1,21 @@
+name: Set up nextest
+description: Restore or install the pinned cargo-nextest release
+inputs:
+  version:
+    description: cargo-nextest version
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Restore cargo-nextest
+      id: nextest
+      uses: actions/cache@v4
+      with:
+        path: ~/.cargo/bin/cargo-nextest
+        key: cargo-nextest-${{ runner.os }}-${{ runner.arch }}-${{ inputs.version }}
+    # A cold-cache GitHub release outage must fail promptly.
+    - name: Install cargo-nextest
+      if: steps.nextest.outputs.cache-hit != 'true'
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-nextest@${{ inputs.version }}

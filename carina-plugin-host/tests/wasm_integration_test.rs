@@ -792,13 +792,15 @@ fn default_aws_provisioner() -> FixedAwsCredentialProvisioner {
     )))))
 }
 
-/// Build a `WasmProviderFactory` using a per-test temporary cache directory.
-///
-/// Tests in this binary run in parallel; if they all shared
-/// `WasmProviderFactory::from_bytes()`'s configured compiled-WASM cache, concurrent
-/// precompile runs race on the same `.cwasm` path and one test can observe
-/// a partially-written file (`"failed to load code for …"`). Each test gets
-/// its own cache dir via this helper to eliminate that race.
+// The setup script owns this directory for one nextest run. Only immutable
+// compiled code is shared; egress locks and all other mutable state stay private.
+fn compiled_cache_dir(private: &std::path::Path) -> PathBuf {
+    std::env::var_os("CARINA_TEST_WASM_CACHE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| private.join("compiled"))
+}
+
+/// Load using the run's compiled cache while retaining a private egress lock.
 async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile::TempDir) {
     let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
     let wasm_bytes = std::fs::read(wasm).expect("Failed to read WASM provider");
@@ -807,7 +809,7 @@ async fn load_factory(wasm: &std::path::Path) -> (WasmProviderFactory, tempfile:
     let aws = default_aws_provisioner();
     let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
         load,
-        cache.path(),
+        &compiled_cache_dir(cache.path()),
         locked_egress.as_ref(),
         &aws,
     )
@@ -827,7 +829,7 @@ async fn load_aws_http_factory(
     let aws = FixedAwsCredentialProvisioner(Ok(credentials));
     let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
         load,
-        cache.path(),
+        &compiled_cache_dir(cache.path()),
         locked_egress.as_ref(),
         &aws,
     )
@@ -859,7 +861,7 @@ async fn load_http_factory_with_name_and_class(
     let aws = default_aws_provisioner();
     let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
         load,
-        cache.path(),
+        &compiled_cache_dir(cache.path()),
         locked_egress.as_ref(),
         &aws,
     )
@@ -908,10 +910,12 @@ async fn load_schema_http_factory(
 ) -> (WasmProviderFactory, tempfile::TempDir) {
     let cache = tempfile::tempdir().expect("Failed to create cache tempdir");
     let wasm_bytes = std::fs::read(wasm).expect("Failed to read HTTP probe WASM provider");
-    let factory =
-        WasmProviderFactory::from_bytes_with_cache_dir(mock_http_load(&wasm_bytes), cache.path())
-            .await
-            .expect("Failed to load HTTP probe WASM provider");
+    let factory = WasmProviderFactory::from_bytes_with_cache_dir(
+        mock_http_load(&wasm_bytes),
+        &compiled_cache_dir(cache.path()),
+    )
+    .await
+    .expect("Failed to load HTTP probe WASM provider");
     (factory, cache)
 }
 
@@ -1479,7 +1483,7 @@ async fn schema_only_loads_an_aws_world_without_a_credential_source() {
 
     let factory = WasmProviderFactory::from_bytes_with_cache_dir(
         mock_http_aws_load_with_class(&wasm_bytes, ProviderTrustClass::Aws),
-        cache.path(),
+        &compiled_cache_dir(cache.path()),
     )
     .await
     .expect("schema-only loading must link the failing credential import");
@@ -1533,7 +1537,7 @@ async fn aws_kind_runtime_rejects_an_http_world_before_provisioning_credentials(
 
     let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
         load,
-        cache.path(),
+        &compiled_cache_dir(cache.path()),
         locked_egress.as_ref(),
         &aws,
     )
@@ -1568,7 +1572,7 @@ async fn aws_world_without_credential_calls_loads_as_aws_kind_at_runtime() {
 
     let factory = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
         load,
-        cache.path(),
+        &compiled_cache_dir(cache.path()),
         locked_egress.as_ref(),
         &aws,
     )
@@ -1591,7 +1595,7 @@ async fn aws_world_provision_failure_remains_a_typed_load_error() {
 
     let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
         load,
-        cache.path(),
+        &compiled_cache_dir(cache.path()),
         locked_egress.as_ref(),
         &aws,
     )
@@ -1620,7 +1624,7 @@ async fn non_aws_kinds_never_provision_and_cannot_instantiate_an_aws_world() {
         let locked_egress = explicit_test_egress(&load, cache.path());
         let result = WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
             load,
-            cache.path(),
+            &compiled_cache_dir(cache.path()),
             locked_egress.as_ref(),
             &aws,
         )

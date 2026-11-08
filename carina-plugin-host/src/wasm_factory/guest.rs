@@ -4885,10 +4885,18 @@ pub(super) mod tests {
             return None;
         };
         let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
+        let private = tempfile::tempdir().expect("create fallback compiled cache");
+        let cache = std::env::var_os("CARINA_TEST_WASM_CACHE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| private.path().to_path_buf());
+        let load = VerifiedLoad::for_test(&wasm_bytes, test_load_identity("mock"));
+        let declaration = VerifiedEgressDeclaration::read(&load).unwrap();
+        let locked = test_explicit_egress(&declaration);
         Some(
-            WasmProviderFactory::new_uncached(
-                &wasm_bytes,
-                test_load_identity("mock"),
+            WasmProviderFactory::from_bytes_with_cache_dir_and_egress(
+                load,
+                &cache,
+                Some(&locked),
                 &UnusedAwsCredentialProvisioner,
             )
             .await
@@ -8696,8 +8704,9 @@ pub(super) mod tests {
 
     #[test]
     fn test_cache_key_changes_when_content_changes() {
-        let key1 = WasmProviderFactory::cache_key(b"content_v1");
-        let key2 = WasmProviderFactory::cache_key(b"content_v2");
+        let engine = WasmProviderFactory::create_engine().unwrap();
+        let key1 = WasmProviderFactory::cache_key(b"content_v1", &engine);
+        let key2 = WasmProviderFactory::cache_key(b"content_v2", &engine);
 
         assert_ne!(
             key1, key2,
@@ -8707,10 +8716,46 @@ pub(super) mod tests {
 
     #[test]
     fn test_cache_key_stable_for_same_content() {
-        let key1 = WasmProviderFactory::cache_key(b"same_content");
-        let key2 = WasmProviderFactory::cache_key(b"same_content");
+        let engine = WasmProviderFactory::create_engine().unwrap();
+        let key1 = WasmProviderFactory::cache_key(b"same_content", &engine);
+        let key2 = WasmProviderFactory::cache_key(b"same_content", &engine);
 
         assert_eq!(key1, key2, "cache key should be stable for same content");
+    }
+
+    #[test]
+    fn cache_key_covers_engine_configuration() {
+        let standard = WasmProviderFactory::create_engine().unwrap();
+        let equivalent = WasmProviderFactory::create_engine().unwrap();
+        let mut config = build_engine_config();
+        config.epoch_interruption(false);
+        let different = Engine::new(&config).unwrap();
+        assert_eq!(
+            WasmProviderFactory::cache_key(b"component", &standard),
+            WasmProviderFactory::cache_key(b"component", &equivalent),
+        );
+        assert_ne!(
+            WasmProviderFactory::cache_key(b"component", &standard),
+            WasmProviderFactory::cache_key(b"component", &different),
+            "incompatible engines must not overwrite each other's compiled artifacts",
+        );
+    }
+
+    #[test]
+    fn cache_key_covers_wasmtime_serialization_version() {
+        let standard = WasmProviderFactory::create_engine().unwrap();
+        let mut config = build_engine_config();
+        config
+            .module_version(wasmtime::ModuleVersionStrategy::Custom(
+                "other-version".into(),
+            ))
+            .unwrap();
+        let different = Engine::new(&config).unwrap();
+        assert_ne!(
+            WasmProviderFactory::cache_key(b"component", &standard),
+            WasmProviderFactory::cache_key(b"component", &different),
+            "serialization version changes must select a different cache artifact",
+        );
     }
 
     #[test]
