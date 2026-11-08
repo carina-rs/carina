@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use carina_core::config_loader::load_configuration_with_config;
+use carina_core::config_loader::load_configuration_for_plan as load_configuration_with_config;
 use carina_core::data_source_value::{DataSourceValue, DataSourceValues};
 use carina_core::differ::Orphans;
 use carina_core::executor::UnresolvedResource;

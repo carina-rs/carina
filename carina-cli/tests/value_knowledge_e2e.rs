@@ -32,6 +32,23 @@ fn success(output: &Output) {
     );
 }
 
+fn assert_masked_strict_resolution_failure(output: &Output, location: &str, missing: &str) {
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+    let text = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        text,
+        format!(
+            "Error: {location}: {}\n",
+            carina_core::resource::INSIDE_SECRET_MESSAGE
+        ),
+    );
+    assert_eq!(text.lines().count(), 1, "{text}");
+    assert!(text.contains(carina_core::resource::INSIDE_SECRET_MESSAGE));
+    assert!(!text.contains(missing), "{text}");
+    assert!(!text.contains("secret(env("), "{text}");
+}
+
 fn fixture_files(name: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -675,14 +692,16 @@ mod selection_diagnostics {
         );
     }
     #[test]
-    fn missing_schema_keeps_its_main_cause() {
+    fn failed_secret_input_precedes_unknown_schema_during_strict_plan_loading() {
         let dir = fixture("missing_schema");
         let output = run(dir.path(), &["plan", "."]);
-        assert!(!output.status.success());
-        assert!(
-            String::from_utf8_lossy(&output.stderr)
-                .contains("Unknown resource type: mock.test.NoSuchResource")
+        super::assert_masked_strict_resolution_failure(
+            &output,
+            "./main.crn:1:1: Invalid expression at line 1",
+            "CARINA_KNOWLEDGE_MISSING_INPUT",
         );
+        // Input-free unknown-schema coverage: anonymous_resource_plan_e2e's
+        // unknown_anonymous_mock_type_is_rejected_before_plan_and_creates_nothing.
     }
 
     #[test]
@@ -784,21 +803,14 @@ mod reference_resolution {
         assert_plans("unselected_env");
     }
     #[test]
-    fn unavailable_required_attribute_keeps_main_sibling_validation() {
+    fn failed_secret_required_attribute_stops_strict_validation_before_siblings() {
         let dir = fixture("required_failure");
         let output = run(dir.path(), &["validate", "."]);
         let text = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success());
-        // Unavailable is classified as Failed, rather than a classifier Err. Main
-        // defers that failure until plan; validation still checks the sibling.
-        assert!(!text.contains("invalid value inside secret(...)"), "{text}");
-        assert!(text.contains("expected Map"), "{text}");
-        assert_eq!(
-            text.lines()
-                .filter(|line| line.starts_with("Error:"))
-                .count(),
-            1,
-            "{text}"
+        super::assert_masked_strict_resolution_failure(
+            &output,
+            "./main.crn:1:1: Invalid expression at line 1",
+            "CARINA_4316_UNUSED_MISSING",
         );
         assert!(!text.contains("Missing required"), "{text}");
     }
@@ -826,15 +838,20 @@ mod reference_resolution {
         }
     }
     #[test]
-    fn failed_module_value_keeps_the_main_parse_diagnostic() {
+    fn failed_secret_root_input_precedes_module_parsing_during_strict_plan_loading() {
         let dir = tempfile::tempdir().unwrap();
         let source = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/saved_plan_deferred_for_secrets");
         copy_fixture(&source, dir.path());
         let output = run(dir.path(), &["plan", "."]);
-        assert!(!output.status.success());
-        let text = String::from_utf8_lossy(&output.stderr);
-        assert!(text.starts_with("Error: Module resolution error: Parse error: nested-loops/main.crn:14:3: Invalid expression at line 16: invalid value inside secret(...)"), "{text}");
+        super::assert_masked_strict_resolution_failure(
+            &output,
+            "./resources.crn:10:3: Invalid expression at line 12",
+            "SAVED_PLAN_DEFERRED_FOR_SECRET_3990",
+        );
+        // Input-free module parse locations: bare_handle_compat_e2e's
+        // imported_module_bare_handle_errors_name_the_owning_file and
+        // imported_module_errors_use_one_normalized_located_path_form.
     }
 
     #[test]

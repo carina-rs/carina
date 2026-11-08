@@ -8,7 +8,7 @@ use crate::output_style::Colorize;
 use similar::{ChangeTag, TextDiff};
 
 use carina_core::config_loader::{
-    find_crn_files_in_dir, find_crn_files_recursive, load_configuration_with_config,
+    find_crn_files_in_dir, find_crn_files_recursive, load_configuration_for_bootstrap,
 };
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::parser::{ProviderConfig as GenericProviderConfig, UseStatement};
@@ -117,7 +117,7 @@ fn load_formatting_directory_config(
     directory: &ResolvedPath,
     environment: &carina_core::EnvironmentSnapshot,
 ) -> FormattingDirectoryConfig {
-    let Some(loaded) = load_configuration_with_config(
+    let Some(loaded) = load_configuration_for_bootstrap(
         directory,
         &carina_core::parser::ProviderContext::new(environment.clone()),
         &carina_core::schema::SchemaRegistry::new(),

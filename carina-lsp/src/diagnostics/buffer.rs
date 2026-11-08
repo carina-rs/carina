@@ -242,8 +242,14 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
                 format!("{}", pest_error),
             )
         }
-        error @ (ParseError::InsideSecret { line, .. }
-        | ParseError::SecretInConstraint { line }) => carina_diagnostic(
+        ParseError::InsideSecret { line } => carina_diagnostic(
+            line.saturating_sub(1) as u32,
+            0,
+            100,
+            DiagnosticSeverity::ERROR,
+            carina_core::resource::INSIDE_SECRET_MESSAGE.to_string(),
+        ),
+        error @ ParseError::SecretInConstraint { line } => carina_diagnostic(
             line.saturating_sub(1) as u32,
             0,
             100,

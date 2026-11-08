@@ -6,14 +6,14 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use indexmap::IndexMap;
 
-use crate::binding_index::{BindingIndex, RefType, RefTypeError};
+use crate::binding_index::BindingIndex;
 use crate::eval_value::{BareStructuralHandle, UnexpandedStructuralHandleKind};
 use crate::identifier::SimHash;
 use crate::parser::{
     ArgumentOrigin, BareBindingSource, DeferredForBody, DeferredIfBody, DeferredIfCondition,
-    DeferredStructuralIf, DeferredValueIf, ModuleArgument, ModuleCall, ParseError,
-    ParsedBindingUses, ParsedDeferredForExpression, ParsedDeferredForIterableState, ParsedFile,
-    RelativeBindingName, WaitBinding,
+    DeferredStructuralIf, ModuleArgument, ModuleCall, ParseError, ParsedBindingUses,
+    ParsedDeferredForExpression, ParsedDeferredForIterableState, ParsedFile, RelativeBindingName,
+    WaitBinding,
 };
 use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, ApplyTimeUnknown, AuthoredDataSource as DataSource,
@@ -1742,7 +1742,7 @@ fn authored_argument_reference_path(
     }
 }
 
-fn append_reference_path(
+pub(crate) fn append_reference_path(
     reference: crate::resource::AuthoredReferencePath,
     postfix: &[PathSegment],
 ) -> crate::resource::AuthoredReferencePath {
@@ -1769,7 +1769,7 @@ fn append_reference_path(
     }
 }
 
-fn module_parameter_postfix<B: BindingAddress>(
+pub(crate) fn module_parameter_postfix<B: BindingAddress>(
     value: &crate::resource::Value<ParserPlaceholder, B>,
     arguments: &HashMap<String, ResolvedArgument<B>>,
 ) -> Option<(String, Vec<PathSegment>)> {
@@ -1869,10 +1869,10 @@ fn module_parameter_postfix<B: BindingAddress>(
 }
 
 #[derive(Clone)]
-struct ResolvedArgument<B: BindingAddress = AbsoluteBindingAddress> {
+pub(crate) struct ResolvedArgument<B: BindingAddress = AbsoluteBindingAddress> {
     argument: ModuleArgument<ParserPlaceholder, B>,
     origin: ArgumentOrigin,
-    caller_reference: Option<crate::resource::AuthoredReferencePath>,
+    pub(crate) caller_reference: Option<crate::resource::AuthoredReferencePath>,
     forwarded_from_enclosing_parameter: bool,
 }
 
@@ -1885,7 +1885,7 @@ impl<B: BindingAddress> std::ops::Deref for ResolvedArgument<B> {
 }
 
 impl<B: BindingAddress> ResolvedArgument<B> {
-    fn source_line(&self, default_line: usize) -> usize {
+    pub(crate) fn source_line(&self, default_line: usize) -> usize {
         match self.origin {
             ArgumentOrigin::Authored {
                 key_span: _,
@@ -1895,7 +1895,7 @@ impl<B: BindingAddress> ResolvedArgument<B> {
         }
     }
 
-    fn substitution(
+    pub(crate) fn substitution(
         &self,
         name: &str,
         position: ArgumentSubstitutionPosition,
@@ -1943,11 +1943,11 @@ impl<B: BindingAddress> ResolvedArgument<B> {
     }
 }
 
-struct ArgumentSubstitutions<'a, B: BindingAddress = AbsoluteBindingAddress> {
-    arguments: &'a HashMap<String, ResolvedArgument<B>>,
-    default_line: usize,
+pub(crate) struct ArgumentSubstitutions<'a, B: BindingAddress = AbsoluteBindingAddress> {
+    pub(crate) arguments: &'a HashMap<String, ResolvedArgument<B>>,
+    pub(crate) default_line: usize,
     caller_source_file: &'a std::path::Path,
-    binding_index: Option<&'a BindingIndex<'a>>,
+    pub(crate) binding_index: Option<&'a BindingIndex<'a>>,
     config: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 }
 
@@ -2594,11 +2594,7 @@ fn resolve_module_binding_uses<P: TypeResolutionPolicy>(
     Ok(resolved)
 }
 
-#[derive(Clone, Copy)]
-enum ArgumentSubstitutionPosition {
-    Value,
-    AccessBase,
-}
+type ArgumentSubstitutionPosition = crate::value_walk::RewritePosition;
 
 fn bind_module_constraints(
     module: &ParsedFile,
@@ -2912,7 +2908,7 @@ fn expanded_if_dependency(
         })
 }
 
-fn decide_expanded_if_condition(
+pub(crate) fn decide_expanded_if_condition(
     value: &ModuleResolvedValue,
 ) -> Result<Option<bool>, crate::resolver::ResolutionError> {
     let mut value = value.clone();
@@ -2941,342 +2937,17 @@ fn decide_expanded_if_condition(
 fn select_expanded_module_ifs(
     value: &ModuleResolvedValue,
 ) -> Result<ModuleResolvedValue, ArgumentSubstitutionError> {
-    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
-
-    Ok(match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            let condition = select_expanded_module_ifs(deferred.condition().value())?;
-            match decide_expanded_if_condition(&condition).map_err(|message| {
-                ArgumentSubstitutionError::Evaluation {
-                    source_file: Some(deferred.condition().source_file().to_path_buf()),
-                    line: deferred.condition().source_line(),
-                    message,
-                    parse_error: None,
-                }
-            })? {
-                Some(true) => select_expanded_module_ifs(deferred.then_value())?,
-                Some(false) => select_expanded_module_ifs(deferred.else_value())?,
-                None => Value::Deferred(DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
-                    DeferredIfCondition::new_with_source_expression(
-                        condition,
-                        deferred.condition().source_file().to_path_buf(),
-                        deferred.condition().source_line(),
-                        deferred.condition().source_expression.clone(),
-                    ),
-                    select_expanded_module_ifs(deferred.then_value())?,
-                    select_expanded_module_ifs(deferred.else_value())?,
-                )))),
-            }
-        }
-        Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
-            values
-                .iter()
-                .map(select_expanded_module_ifs)
-                .collect::<Result<_, _>>()?,
-        )),
-        Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
-            values
-                .iter()
-                .map(|(name, value)| Ok((name.clone(), select_expanded_module_ifs(value)?)))
-                .collect::<Result<_, ArgumentSubstitutionError>>()?,
-        )),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(select_expanded_module_ifs(value)?),
-                default: Box::new(select_expanded_module_ifs(default)?),
-            })
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            let lhs = select_expanded_module_ifs(expression.lhs())?;
-            let rhs = select_expanded_module_ifs(expression.rhs())?;
-            expression
-                .evaluate_with_operands(lhs, rhs)
-                .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                    source_file: None,
-                    line: expression.operator_span().line().unwrap_or(0),
-                    message: error.to_string().into(),
-                    parse_error: None,
-                })?
-        }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            let mut selected = Value::Deferred(DeferredValue::Interpolation(
-                parts
-                    .iter()
-                    .map(|part| match part {
-                        InterpolationPart::Literal(literal) => {
-                            Ok(InterpolationPart::Literal(literal.clone()))
-                        }
-                        InterpolationPart::Expr(value) => {
-                            Ok(InterpolationPart::Expr(select_expanded_module_ifs(value)?))
-                        }
-                    })
-                    .collect::<Result<_, ArgumentSubstitutionError>>()?,
-            ));
-            selected.canonicalize_in_place();
-            selected
-        }
-        Value::Deferred(DeferredValue::FunctionCall {
-            name,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::FunctionCall {
-            name: *name,
-            args: args
-                .iter()
-                .map(|argument| argument.try_map_value(select_expanded_module_ifs))
-                .collect::<Result<_, _>>()?,
-            source_line: *source_line,
-        }),
-        Value::Deferred(DeferredValue::Unavailable {
-            name,
-            args,
-            reason,
-            source_line,
-        }) => Value::Deferred(DeferredValue::Unavailable {
-            name: *name,
-            args: args
-                .iter()
-                .map(|argument| argument.try_map_value(select_expanded_module_ifs))
-                .collect::<Result<_, _>>()?,
-            reason: reason.clone(),
-            source_line: *source_line,
-        }),
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function: function.clone(),
-            functions: functions.clone(),
-            args: args
-                .iter()
-                .map(|argument| argument.try_map_value(select_expanded_module_ifs))
-                .collect::<Result<_, _>>()?,
-            source_line: *source_line,
-        }),
-        Value::Deferred(DeferredValue::Access(access)) => access
-            .rebuild_with_base(
-                select_expanded_module_ifs(access.base())?,
-                AccessMissPolicy::Error,
-            )
-            .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                source_file: None,
-                line: access.source_line(),
-                message: error.to_string().into(),
-                parse_error: None,
-            })?,
-        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            inner.try_map(select_expanded_module_ifs)?,
-        )),
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(
-            DeferredValue::ResourceRef { path: _ } | DeferredValue::BindingRef { binding: _ },
-        ) => value.clone(),
-        Value::Deferred(DeferredValue::Unknown(_)) => value.clone(),
-        Value::Deferred(DeferredValue::Placeholder(_)) => value.clone(),
-    })
+    crate::value_walk::select_expanded_module_ifs(value)
 }
 
 fn evaluate_expanded_module_functions(
     value: &ModuleResolvedValue,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<ModuleResolvedValue, ArgumentSubstitutionError> {
-    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
-
-    Ok(match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            Value::Deferred(DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
-                DeferredIfCondition::new_with_source_expression(
-                    evaluate_expanded_module_functions(deferred.condition().value(), config)?,
-                    deferred.condition().source_file().to_path_buf(),
-                    deferred.condition().source_line(),
-                    deferred.condition().source_expression.clone(),
-                ),
-                evaluate_expanded_module_functions(deferred.then_value(), config)?,
-                evaluate_expanded_module_functions(deferred.else_value(), config)?,
-            ))))
-        }
-        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
-            items
-                .iter()
-                .map(|item| evaluate_expanded_module_functions(item, config))
-                .collect::<Result<_, _>>()?,
-        )),
-        Value::Concrete(ConcreteValue::Map(entries)) => Value::Concrete(ConcreteValue::Map(
-            entries
-                .iter()
-                .map(|(name, item)| {
-                    Ok((
-                        name.clone(),
-                        evaluate_expanded_module_functions(item, config)?,
-                    ))
-                })
-                .collect::<Result<_, ArgumentSubstitutionError>>()?,
-        )),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(evaluate_expanded_module_functions(value, config)?),
-                default: Box::new(evaluate_expanded_module_functions(default, config)?),
-            })
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            let lhs = evaluate_expanded_module_functions(expression.lhs(), config)?;
-            let rhs = evaluate_expanded_module_functions(expression.rhs(), config)?;
-            expression
-                .evaluate_with_operands(lhs, rhs)
-                .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                    source_file: None,
-                    line: expression.operator_span().line().unwrap_or(0),
-                    message: error.to_string().into(),
-                    parse_error: None,
-                })?
-        }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            Value::Deferred(DeferredValue::Interpolation(
-                parts
-                    .iter()
-                    .map(|part| match part {
-                        InterpolationPart::Literal(literal) => {
-                            Ok(InterpolationPart::Literal(literal.clone()))
-                        }
-                        InterpolationPart::Expr(expression) => Ok(InterpolationPart::Expr(
-                            evaluate_expanded_module_functions(expression, config)?,
-                        )),
-                    })
-                    .collect::<Result<_, ArgumentSubstitutionError>>()?,
-            ))
-        }
-        Value::Deferred(DeferredValue::FunctionCall {
-            name,
-            args,
-            source_line,
-        }) => {
-            let args = args
-                .iter()
-                .map(|argument| {
-                    argument
-                        .try_map_value(|value| evaluate_expanded_module_functions(value, config))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            if args.iter().all(|argument| {
-                argument.handle().is_none()
-                    && argument
-                        .walker_value()
-                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-                        .map(|proof| proof.into_classification())
-                        .is_ok_and(|value| value.into_known().is_ok())
-            }) {
-                let eval_args = args
-                    .iter()
-                    .map(crate::parser::function_argument_as_eval)
-                    .collect::<Vec<_>>();
-                crate::builtins::evaluate_builtin_with_config(
-                    name.as_str(),
-                    &eval_args,
-                    config.catalog(),
-                    *source_line,
-                )
-                .map_err(|error| {
-                    let line = source_line.get().unwrap_or(0);
-                    ArgumentSubstitutionError::Evaluation {
-                        source_file: None,
-                        line,
-                        message: error,
-                        parse_error: None,
-                    }
-                })?
-                .into_value()
-                .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                    source_file: None,
-                    line: source_line.get().unwrap_or(0),
-                    message: error.to_string().into(),
-                    parse_error: None,
-                })?
-            } else {
-                Value::Deferred(DeferredValue::FunctionCall {
-                    name: *name,
-                    args,
-                    source_line: *source_line,
-                })
-            }
-        }
-        Value::Deferred(DeferredValue::Unavailable {
-            name,
-            args,
-            reason,
-            source_line,
-        }) => Value::Deferred(DeferredValue::Unavailable {
-            name: *name,
-            args: args
-                .iter()
-                .map(|argument| {
-                    argument
-                        .try_map_value(|value| evaluate_expanded_module_functions(value, config))
-                })
-                .collect::<Result<_, _>>()?,
-            reason: reason.clone(),
-            source_line: *source_line,
-        }),
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions: _,
-            args,
-            source_line,
-        }) => {
-            let args = args
-                .iter()
-                .map(|argument| {
-                    argument
-                        .try_map_value(|value| evaluate_expanded_module_functions(value, config))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let line = source_line.get().unwrap_or(function.body.source_line);
-            crate::resolver::evaluate_module_resolved_user_function(function, &args, config, line)
-                .map_err(|error| function_substitution_error(error, line))?
-        }
-        Value::Deferred(DeferredValue::Access(access)) => access
-            .rebuild_with_base(
-                evaluate_expanded_module_functions(access.base(), config)?,
-                crate::resource::AccessMissPolicy::Error,
-            )
-            .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                source_file: None,
-                line: access.source_line(),
-                message: error.to_string().into(),
-                parse_error: None,
-            })?,
-        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            inner.try_map(|value| evaluate_expanded_module_functions(value, config))?,
-        )),
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(
-            DeferredValue::ResourceRef { path: _ } | DeferredValue::BindingRef { binding: _ },
-        ) => value.clone(),
-        Value::Deferred(DeferredValue::Unknown(_)) => value.clone(),
-        Value::Deferred(DeferredValue::Placeholder(_)) => value.clone(),
-    })
+    crate::value_walk::evaluate_expanded_module_functions(value, config)
 }
 
-fn function_substitution_error(
+pub(crate) fn function_substitution_error(
     error: crate::parser::ParseError,
     fallback_line: usize,
 ) -> ArgumentSubstitutionError {
@@ -4112,7 +3783,7 @@ fn expand_parsed_deferred_for_expression(
 }
 
 #[derive(Debug)]
-pub(super) enum ArgumentSubstitutionError {
+pub(crate) enum ArgumentSubstitutionError {
     InsideSecret {
         source_file: Option<std::path::PathBuf>,
         line: usize,
@@ -4226,7 +3897,7 @@ impl ArgumentSubstitutionError {
         }
     }
 
-    fn with_source_file(self, file: &std::path::Path) -> Self {
+    pub(crate) fn with_source_file(self, file: &std::path::Path) -> Self {
         match self {
             Self::InsideSecret { source_file, line } => Self::InsideSecret {
                 source_file: source_file.or_else(|| Some(file.to_path_buf())),
@@ -4310,135 +3981,7 @@ fn select_authored_module_ifs_for_test(
     value: &Value,
     config: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Value, ArgumentSubstitutionError> {
-    use crate::resource::{ConcreteValue, DeferredValue, Value};
-
-    Ok(match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            match crate::parser::decide_if_condition(deferred.condition().value(), config.catalog())
-                .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                    source_file: Some(deferred.condition().source_file().to_path_buf()),
-                    line: deferred.condition().source_line(),
-                    message: error.to_string().into(),
-                    parse_error: None,
-                })? {
-                Some(true) => select_authored_module_ifs_for_test(deferred.then_value(), config)?,
-                Some(false) => select_authored_module_ifs_for_test(deferred.else_value(), config)?,
-                None => value.clone(),
-            }
-        }
-        Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
-            values
-                .iter()
-                .map(|value| select_authored_module_ifs_for_test(value, config))
-                .collect::<Result<_, _>>()?,
-        )),
-        Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
-            values
-                .iter()
-                .map(|(name, value)| {
-                    Ok((
-                        name.clone(),
-                        select_authored_module_ifs_for_test(value, config)?,
-                    ))
-                })
-                .collect::<Result<_, ArgumentSubstitutionError>>()?,
-        )),
-        Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
-            inner.try_map(|value| select_authored_module_ifs_for_test(value, config))?,
-        )),
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        )
-        | Value::Deferred(
-            DeferredValue::ResourceRef { path: _ }
-            | DeferredValue::BindingRef { binding: _ }
-            | DeferredValue::Coalesce {
-                value: _,
-                default: _,
-            }
-            | DeferredValue::IntegerArithmetic(_)
-            | DeferredValue::Interpolation(_)
-            | DeferredValue::FunctionCall {
-                name: _,
-                args: _,
-                source_line: _,
-            }
-            | DeferredValue::Unavailable {
-                name: _,
-                args: _,
-                reason: _,
-                source_line: _,
-            }
-            | DeferredValue::ResolvedFunctionCall {
-                function: _,
-                functions: _,
-                args: _,
-                source_line: _,
-            }
-            | DeferredValue::Access(_),
-        ) => value.clone(),
-        Value::Deferred(DeferredValue::Unknown(_)) => value.clone(),
-        Value::Deferred(DeferredValue::Placeholder(_)) => value.clone(),
-    })
-}
-
-fn substitute_function_argument<B: BindingAddress>(
-    argument: &crate::resource::FunctionArgument<ParserPlaceholder, B>,
-    arguments: ArgumentSubstitutions<'_, B>,
-) -> Result<crate::resource::FunctionArgument<ParserPlaceholder, B>, ArgumentSubstitutionError> {
-    if let Some(name) = argument.pending_parameter()
-        && let Some(substitution) = arguments.arguments.get(name)
-    {
-        return match substitution.value_ref() {
-            StructuralOperandRef::Handle {
-                handle,
-                access_base: _,
-            } => Ok(crate::resource::FunctionArgument::from_handle(
-                handle.clone(),
-            )),
-            StructuralOperandRef::Value(value) => {
-                Ok(crate::resource::FunctionArgument::from_value(value.clone()))
-            }
-            StructuralOperandRef::Parameter {
-                name: _,
-                access_base: _,
-            } => substitute_arguments_with_position(
-                argument.walker_value(),
-                arguments,
-                ArgumentSubstitutionPosition::Value,
-            )
-            .map(crate::resource::FunctionArgument::from_value),
-        };
-    }
-
-    if let Some(handle) = argument.handle()
-        && let Some(substitution) = arguments.arguments.get(handle.root_binding().as_str())
-    {
-        return Ok(match substitution.value_ref() {
-            StructuralOperandRef::Handle {
-                handle,
-                access_base: _,
-            } => crate::resource::FunctionArgument::from_handle(handle.clone()),
-            StructuralOperandRef::Value(value) => {
-                crate::resource::FunctionArgument::from_value(value.clone())
-            }
-            StructuralOperandRef::Parameter {
-                name: _,
-                access_base,
-            } => crate::resource::FunctionArgument::from_value(access_base.clone()),
-        });
-    }
-
-    argument.try_map_value(|value| {
-        substitute_arguments_with_position(value, arguments, ArgumentSubstitutionPosition::Value)
-    })
+    crate::value_walk::select_authored_module_ifs(value, config)
 }
 
 fn substitute_arguments_with_position<B: BindingAddress>(
@@ -4446,402 +3989,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
     arguments: ArgumentSubstitutions<'_, B>,
     position: ArgumentSubstitutionPosition,
 ) -> Result<crate::resource::Value<ParserPlaceholder, B>, ArgumentSubstitutionError> {
-    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
-
-    let substituted = match value {
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            let condition = substitute_arguments_with_position(
-                deferred.condition().value(),
-                arguments,
-                ArgumentSubstitutionPosition::Value,
-            )
-            .map_err(|error| error.with_source_file(deferred.condition().source_file()))?;
-            Value::Deferred(DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
-                DeferredIfCondition::new_with_source_expression(
-                    condition,
-                    deferred.condition().source_file().to_path_buf(),
-                    deferred.condition().source_line(),
-                    deferred.condition().source_expression.clone(),
-                ),
-                substitute_arguments_with_position(deferred.then_value(), arguments, position)?,
-                substitute_arguments_with_position(deferred.else_value(), arguments, position)?,
-            ))))
-        }
-        Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
-            name,
-            diagnostic,
-        })) => {
-            let Some(argument) = arguments.arguments.get(name) else {
-                return Ok(value.clone());
-            };
-            let line = diagnostic
-                .source_line()
-                .unwrap_or_else(|| argument.source_line(arguments.default_line));
-            let source_file = diagnostic
-                .authored_location()
-                .map(|(source_file, _)| source_file.to_path_buf());
-            match argument.value_ref() {
-                StructuralOperandRef::Value(value) => value.clone(),
-                StructuralOperandRef::Handle { .. }
-                    if matches!(position, ArgumentSubstitutionPosition::Value) =>
-                {
-                    return Err(ArgumentSubstitutionError::Evaluation {
-                        source_file,
-                        line,
-                        message: BareStructuralHandle {
-                            binding: diagnostic.diagnostic_name().unwrap_or(name).to_string(),
-                            kind: UnexpandedStructuralHandleKind::ModuleParameter,
-                        }
-                        .to_string()
-                        .into(),
-                        parse_error: None,
-                    });
-                }
-                StructuralOperandRef::Handle { access_base, .. } => access_base.clone(),
-                StructuralOperandRef::Parameter {
-                    name: _,
-                    access_base,
-                } => {
-                    let mut forwarded_value = access_base.clone();
-                    if let Value::Deferred(DeferredValue::Placeholder(
-                        ParserPlaceholder::ModuleArgument {
-                            diagnostic: forwarded_diagnostic,
-                            ..
-                        },
-                    )) = &mut forwarded_value
-                    {
-                        forwarded_diagnostic.forward_from(diagnostic, name);
-                    }
-                    forwarded_value
-                }
-            }
-        }
-        Value::Deferred(DeferredValue::Placeholder(
-            ParserPlaceholder::FnParam { name: _ }
-            | ParserPlaceholder::FnLocal { name: _ }
-            | ParserPlaceholder::Loop(LoopSlot::Key)
-            | ParserPlaceholder::Loop(LoopSlot::Index)
-            | ParserPlaceholder::Loop(LoopSlot::Value)
-            | ParserPlaceholder::EmptyInterpolation { source: _ },
-        )) => value.clone(),
-        Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            let Some(argument) = arguments.arguments.get(binding.as_str()) else {
-                return Ok(value.clone());
-            };
-            let source_line = argument.source_line(arguments.default_line);
-            argument
-                .substitution(binding.as_str(), ArgumentSubstitutionPosition::Value)
-                .map_err(|message| ArgumentSubstitutionError::Evaluation {
-                    source_file: None,
-                    line: source_line,
-                    message: message.into(),
-                    parse_error: None,
-                })?
-                .value()
-                .clone()
-        }
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            let Some(argument) = arguments.arguments.get(path.binding()) else {
-                return Ok(value.clone());
-            };
-            let source_line = argument.source_line(arguments.default_line);
-            let substitution = argument
-                .substitution(path.binding(), ArgumentSubstitutionPosition::AccessBase)
-                .map_err(|message| ArgumentSubstitutionError::Evaluation {
-                    source_file: None,
-                    line: source_line,
-                    message: message.into(),
-                    parse_error: None,
-                })?;
-            let mut substituted = apply_value_path_segment(
-                substitution.value().clone(),
-                PathSegment::Field {
-                    name: path.attribute().to_string(),
-                },
-                source_line,
-                AccessMissPolicy::Error,
-            )
-            .and_then(ValuePathSegmentResult::into_value)
-            .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                source_file: None,
-                line: source_line,
-                message: error.to_string().into(),
-                parse_error: None,
-            })?;
-            for segment in path.segments() {
-                substituted = apply_value_path_segment(
-                    substituted,
-                    segment.clone(),
-                    source_line,
-                    AccessMissPolicy::Error,
-                )
-                .and_then(ValuePathSegmentResult::into_value)
-                .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                    source_file: None,
-                    line: source_line,
-                    message: error.to_string().into(),
-                    parse_error: None,
-                })?;
-            }
-            if let Some(locations) = path.reference_locations() {
-                substituted = substituted.with_reference_locations(locations);
-            }
-            substituted
-        }
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            let value = substitute_arguments_with_position(
-                value,
-                arguments,
-                ArgumentSubstitutionPosition::Value,
-            )?;
-            if matches!(value, Value::Concrete(_)) {
-                value
-            } else {
-                Value::Deferred(DeferredValue::Coalesce {
-                    value: Box::new(value),
-                    default: Box::new(substitute_arguments_with_position(
-                        default,
-                        arguments,
-                        ArgumentSubstitutionPosition::Value,
-                    )?),
-                })
-            }
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            let lhs = substitute_arguments_with_position(
-                expression.lhs(),
-                arguments,
-                ArgumentSubstitutionPosition::Value,
-            )?;
-            let rhs = substitute_arguments_with_position(
-                expression.rhs(),
-                arguments,
-                ArgumentSubstitutionPosition::Value,
-            )?;
-            expression
-                .evaluate_with_operands(lhs, rhs)
-                .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                    source_file: None,
-                    line: expression
-                        .operator_span()
-                        .line()
-                        .unwrap_or(arguments.default_line),
-                    message: error.to_string().into(),
-                    parse_error: None,
-                })?
-        }
-        Value::Concrete(ConcreteValue::List(items)) => Value::Concrete(ConcreteValue::List(
-            items
-                .iter()
-                .map(|v| {
-                    substitute_arguments_with_position(
-                        v,
-                        arguments,
-                        ArgumentSubstitutionPosition::Value,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            let mut substituted = IndexMap::with_capacity(map.len());
-            for (key, value) in map {
-                substituted.insert(
-                    key.clone(),
-                    substitute_arguments_with_position(
-                        value,
-                        arguments,
-                        ArgumentSubstitutionPosition::Value,
-                    )?,
-                );
-            }
-            Value::Concrete(ConcreteValue::Map(substituted))
-        }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            let substituted_parts: Vec<_> = parts
-                .iter()
-                .map(|p| match p {
-                    InterpolationPart::Expr(v) => substitute_arguments_with_position(
-                        v,
-                        arguments,
-                        ArgumentSubstitutionPosition::Value,
-                    )
-                    .map(InterpolationPart::Expr),
-                    InterpolationPart::Literal(literal) => {
-                        Ok(InterpolationPart::Literal(literal.clone()))
-                    }
-                })
-                .collect::<Result<_, _>>()?;
-            Value::Deferred(DeferredValue::Interpolation(substituted_parts))
-        }
-        Value::Deferred(DeferredValue::FunctionCall {
-            name,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::FunctionCall {
-            name: *name,
-            args: args
-                .iter()
-                .map(|argument| substitute_function_argument(argument, arguments))
-                .collect::<Result<_, _>>()?,
-            source_line: *source_line,
-        }),
-        Value::Deferred(DeferredValue::Unavailable {
-            name,
-            args,
-            reason,
-            source_line,
-        }) => Value::Deferred(DeferredValue::Unavailable {
-            name: *name,
-            args: args
-                .iter()
-                .map(|argument| substitute_function_argument(argument, arguments))
-                .collect::<Result<_, _>>()?,
-            reason: reason.clone(),
-            source_line: *source_line,
-        }),
-        Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }) => {
-            let args = args
-                .iter()
-                .map(|argument| substitute_function_argument(argument, arguments))
-                .collect::<Result<Vec<_>, _>>()?;
-            Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                function: function.clone(),
-                functions: functions.clone(),
-                args,
-                source_line: *source_line,
-            })
-        }
-        Value::Deferred(DeferredValue::Access(access)) => {
-            let substituted_base = substitute_arguments_with_position(
-                access.base(),
-                arguments,
-                ArgumentSubstitutionPosition::AccessBase,
-            )?;
-            access
-                .rebuild_with_base(substituted_base, crate::resource::AccessMissPolicy::Error)
-                .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                    source_file: None,
-                    line: access.source_line(),
-                    message: error.to_string().into(),
-                    parse_error: None,
-                })?
-        }
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        ) => value.clone(),
-        Value::Deferred(DeferredValue::Unknown(_)) => value.clone(),
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            Value::Deferred(DeferredValue::Secret(inner.try_map(|value| {
-                substitute_arguments_with_position(
-                    value,
-                    arguments,
-                    ArgumentSubstitutionPosition::Value,
-                )
-            })?))
-        }
-    };
-
-    if let Some(binding_index) = arguments.binding_index
-        && let Some((argument, postfix)) = module_parameter_postfix(value, arguments.arguments)
-        && let Some(reference) = arguments
-            .arguments
-            .get(&argument)
-            .and_then(|resolved| resolved.caller_reference.clone())
-        && let RefType::UnknownAttribute(
-            error @ RefTypeError::InvalidAccess {
-                path: _,
-                step: _,
-                actual: _,
-            },
-        ) = binding_index.postfix_ref_type(append_reference_path(reference, &postfix).as_ref())
-    {
-        let (source_file, line) = match value {
-            Value::Deferred(DeferredValue::Access(access)) => (None, access.source_line()),
-            Value::Deferred(DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument {
-                name: _,
-                diagnostic,
-            })) => (
-                diagnostic
-                    .authored_location()
-                    .map(|(source_file, _)| source_file.to_path_buf()),
-                diagnostic.source_line().unwrap_or(arguments.default_line),
-            ),
-            Value::Concrete(
-                ConcreteValue::String(_)
-                | ConcreteValue::EnumIdentifier(_)
-                | ConcreteValue::CanonicalEnum(_)
-                | ConcreteValue::Int(_)
-                | ConcreteValue::Float(_)
-                | ConcreteValue::Bool(_)
-                | ConcreteValue::Duration(_)
-                | ConcreteValue::List(_)
-                | ConcreteValue::StringList(_)
-                | ConcreteValue::Map(_),
-            )
-            | Value::Deferred(
-                DeferredValue::ModuleIf(_)
-                | DeferredValue::ResourceRef { path: _ }
-                | DeferredValue::BindingRef { binding: _ }
-                | DeferredValue::Coalesce {
-                    value: _,
-                    default: _,
-                }
-                | DeferredValue::IntegerArithmetic(_)
-                | DeferredValue::Interpolation(_)
-                | DeferredValue::FunctionCall {
-                    name: _,
-                    args: _,
-                    source_line: _,
-                }
-                | DeferredValue::Unavailable {
-                    name: _,
-                    args: _,
-                    reason: _,
-                    source_line: _,
-                }
-                | DeferredValue::ResolvedFunctionCall {
-                    function: _,
-                    functions: _,
-                    args: _,
-                    source_line: _,
-                }
-                | DeferredValue::Secret(_)
-                | DeferredValue::Unknown(
-                    ApplyTimeUnknown::UpstreamExport { path: _ }
-                    | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
-                    | ApplyTimeUnknown::PendingReRead(_),
-                )
-                | DeferredValue::Placeholder(
-                    ParserPlaceholder::FnParam { name: _ }
-                    | ParserPlaceholder::FnLocal { name: _ }
-                    | ParserPlaceholder::Loop(LoopSlot::Key)
-                    | ParserPlaceholder::Loop(LoopSlot::Index)
-                    | ParserPlaceholder::Loop(LoopSlot::Value)
-                    | ParserPlaceholder::EmptyInterpolation { source: _ },
-                ),
-            ) => (None, arguments.default_line),
-        };
-        return Err(ArgumentSubstitutionError::Evaluation {
-            source_file,
-            line,
-            message: error.to_string().into(),
-            parse_error: None,
-        });
-    }
-
-    Ok(substituted)
+    crate::value_walk::substitute_module_arguments(value, arguments, position)
 }
 
 /// Compute the instance prefix for a module call. Named calls use the

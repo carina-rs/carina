@@ -13,11 +13,11 @@ use crate::parser::{display_double_quoted_literal_part, display_string_literal};
 use crate::resource::{
     ApplyTimeUnknown, BindingAddress, CanonicalEnumValue, ConcreteValue, DeferredValue,
     InterpolationPart, LoopSlot, PlaceholderKind, RedactedSecretHash, SnapshotLeaf, SnapshotValue,
-    UnavailableCoalescePolicy, UnavailableSecretError, UnavailableSecretPolicy, Value, ValueKind,
-    find_unavailable_evaluation,
+    UnavailableSecretError, Value, ValueKind,
 };
 use crate::schema::{AttrTypeKind, CompiledAttributeType as AttributeType, TypeIdentity};
 use crate::utils::is_identifier_safe;
+use crate::value_walk::{UnavailableSearchPolicy, contains_unavailable};
 
 /// Where in the pipeline a `Value` is being serialized. Used so the
 /// caller of a failing serialization (e.g. `--out plan.json`) can
@@ -3570,13 +3570,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                 })?;
                 return Ok(candidate.clone());
             }
-            if find_unavailable_evaluation(
-                candidate,
-                UnavailableCoalescePolicy::IncludeDefault,
-                UnavailableSecretPolicy::Include,
-            )
-            .is_some()
-            {
+            if contains_unavailable(candidate, UnavailableSearchPolicy::SavedCandidate) {
                 return Err(SecretRehydrationError::EvaluationUnavailable);
             }
             if !saved.verify_secret(candidate)? {
@@ -3801,12 +3795,7 @@ pub fn rehydrate_redacted_secrets<P: PlaceholderKind>(
     evaluated: &Value<P>,
 ) -> Result<Value<P>, SecretRehydrationError> {
     if contains_redacted_secret(saved)
-        && find_unavailable_evaluation(
-            evaluated,
-            UnavailableCoalescePolicy::IncludeDefault,
-            UnavailableSecretPolicy::OnlyInside,
-        )
-        .is_some()
+        && contains_unavailable(evaluated, UnavailableSearchPolicy::SavedSecret)
     {
         return Err(SecretRehydrationError::EvaluationUnavailable);
     }

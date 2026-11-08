@@ -18,6 +18,8 @@ use std::time::Instant;
 use crate::output_style::Colorize;
 use futures::stream::{FuturesUnordered, StreamExt};
 
+use carina_core::config_loader::load_configuration_for_apply;
+#[cfg(test)]
 use carina_core::config_loader::load_configuration_with_config;
 use carina_core::effect::Effect;
 #[cfg(test)]
@@ -140,7 +142,7 @@ pub async fn run_destroy(
         .map_err(|error| AppError::Config(error.to_string()))?;
     let base_dir = &project;
     let color_mode = runtime.color_mode();
-    let loaded = load_configuration_with_config(
+    let loaded = load_configuration_for_apply(
         base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
@@ -222,7 +224,7 @@ pub async fn run_destroy_with_factories_for_test(
 ) -> Result<(), AppError> {
     let project = carina_core::paths::ResolvedPath::new(path).unwrap();
     let context = ProviderContext::new(runtime.environment().clone());
-    let loaded = load_configuration_with_config(&project, &context, &Default::default())?;
+    let loaded = load_configuration_for_apply(&project, &context, &Default::default())?;
     let providers =
         ProviderLoad::for_test_with_provider_phase(runtime, factories, &loaded.parsed.providers);
     let validated = providers.validate_evaluated_config(

@@ -165,7 +165,7 @@ pub use resolve::{
 pub(crate) use resolve::{
     collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,
     resolve_resource_refs_defer_unknown_functions, resolve_resource_refs_for_diagnostics,
-    resolve_snapshot_function_calls_with_config,
+    resolve_resource_refs_in_context, resolve_snapshot_function_calls_with_config,
 };
 pub use static_eval::evaluate_static_value_for_validation;
 pub use types::{

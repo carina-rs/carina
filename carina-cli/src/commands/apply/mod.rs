@@ -14,7 +14,10 @@ use futures::stream::{self, StreamExt};
 use carina_core::binding_index::{
     LivePreDataSourceReadInputs, ResolvedBindings, SavedPreApplyInputs, WaitAliasSpec,
 };
-use carina_core::config_loader::load_configuration_with_config;
+use carina_core::config_loader::{
+    load_configuration_for_apply as load_configuration_with_config,
+    load_configuration_for_saved_rehydration,
+};
 use carina_core::data_source_value::{DataSourceValues, ExecutableDataSourceValues};
 use carina_core::differ::Orphans;
 use carina_core::executor::{
@@ -3750,7 +3753,7 @@ async fn run_apply_from_plan_with_observer_factory(
     // validation and provider-config resolution: placeholder-free plans may
     // outlive unrelated validation errors in the source configuration (R5),
     // while a valid backend edit must still require migration or replanning.
-    let loaded_current_config = load_configuration_with_config(
+    let loaded_current_config = load_configuration_for_saved_rehydration(
         base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),

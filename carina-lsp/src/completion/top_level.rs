@@ -375,7 +375,7 @@ impl CompletionProvider {
                     &self.schemas,
                 ),
         };
-        carina_core::config_loader::parse_directory(&module_path, &provider_context)
+        carina_core::config_loader::parse_directory_for_bootstrap(&module_path, &provider_context)
             .ok()
             .map(|directory| directory.into_parsed())
             .filter(|parsed| !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty())

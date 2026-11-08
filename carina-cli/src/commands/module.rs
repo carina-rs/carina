@@ -39,7 +39,7 @@ fn run_module_list(path: &Path, provider_context: &ProviderContext) -> Result<()
     let project = carina_core::paths::ResolvedPath::new(path)
         .map_err(|error| AppError::Config(error.to_string()))?;
     let base_dir = &project;
-    let config = config_loader::load_configuration_with_config(
+    let config = config_loader::load_configuration_for_bootstrap(
         base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),

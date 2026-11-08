@@ -936,6 +936,7 @@ pub(crate) struct ModuleResolver<'cfg, P = StrictTypeResolution> {
     /// therefore the stable base for user-facing source labels.
     configuration_root: PathBuf,
     source_overrides: crate::config_loader::SourceOverrides,
+    resolution: crate::config_loader::ResolutionContext,
     /// Cache of loaded modules: path -> ParsedFile
     pub(super) module_cache: HashMap<crate::paths::CanonicalPath, ParsedFile>,
     /// Currently resolving modules (for cycle detection)
@@ -1050,6 +1051,7 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
             module_locations: HashMap::new(),
             configuration_root: base_dir.clone(),
             source_overrides: Default::default(),
+            resolution: crate::config_loader::strict_resolution_context(),
             base_dir,
             module_cache: HashMap::new(),
             resolving: HashSet::new(),
@@ -1298,8 +1300,12 @@ impl<'cfg, P: TypeResolutionPolicy> ModuleResolver<'cfg, P> {
         // intact. Besides folding module-local values, this records the direct
         // dependency bindings that expansion subsequently instance-prefixes.
         // Argument bindings remain deferred for call-site substitution.
-        crate::parser::resolve_resource_refs_in_session_unsealed(&mut merged, self.session)
-            .map_err(ModuleError::Parse)?;
+        crate::parser::resolve_resource_refs_in_session_unsealed(
+            &mut merged,
+            self.session,
+            self.resolution,
+        )
+        .map_err(ModuleError::Parse)?;
 
         P::resolve_file_type_exprs(&mut merged, self.session)?;
         crate::parser::retained::judge_configuration(
@@ -1997,6 +2003,7 @@ pub fn resolve_modules_with_diagnostics_and_overrides<
 ) -> ModuleResolutionDiagnosticResult<E::Absolute> {
     let mut resolver = ModuleResolver::with_constraint_reports(base_dir, config, schemas);
     resolver.source_overrides = overrides.clone();
+    resolver.resolution = parsed.resolution_context();
     resolve_modules_with_diagnostics_and_resolver(parsed.parsed(), resolver, covered_findings)
 }
 
@@ -2011,7 +2018,9 @@ pub fn resolve_modules_with_providerless_diagnostics<
     schemas: &SchemaRegistry,
     covered_findings: &[crate::validation::ModuleCallFinding],
 ) -> ModuleResolutionDiagnosticResult<E::Absolute> {
-    let resolver = ModuleResolver::with_providerless_constraint_reports(base_dir, config, schemas);
+    let mut resolver =
+        ModuleResolver::with_providerless_constraint_reports(base_dir, config, schemas);
+    resolver.resolution = parsed.resolution_context();
     resolve_modules_with_diagnostics_and_resolver(parsed.parsed(), resolver, covered_findings)
 }
 

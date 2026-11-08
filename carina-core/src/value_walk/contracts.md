@@ -43,9 +43,9 @@ The existing SecretPayload adapter clones for an owned rewrite because main
 has no consuming payload accessor. Arguments, arithmetic operands and access
 bases move through small crate-only owning-type adapters. Arithmetic replacements
 still pass through from_post_validation, preserving the existing operand checks.
-Argument traversal preserves all auxiliary operands and metadata. No existing
-walker is migrated; the prior RootlessType::effective_type addition remains the
-only schema edit, and schema/mod.rs is unchanged in r4. Replacement is tracked
+Argument traversal preserves all auxiliary operands and metadata. Parser/module
+substitution and unavailable searches now adopt the kernel; schema/mod.rs
+remains unchanged by this migration. Replacement is tracked
 explicitly, never by Value equality (which is not reflexive for Unknown and some
 placeholders).
 
@@ -90,6 +90,23 @@ resolved call does not count an entire function as one output.
 
 ## Knowledge remains the classifier
 
+The crate-private parser adapter binds Transform to ParserPlaceholder and its
+binding phase without changing the public Algebra signatures. Its six required
+arms use the same exhaustive dispatcher macro and typed Parts fold. Only the
+SecretChild entry accesses a protected payload, and its owned completion restores
+the wrapper. The callback trait and nonrecursive policies are private to the
+kernel; parser/module owners call concrete operations with their inventories.
+Leaves and call finishing retain typed fields rather than downcasting a raw
+node for dispatch. Policies query the existing knowledge authority; the adapter
+contains no knowledge classifier. Captured definitions are
+walked structurally without applying a caller's lexical substitutions. Selected
+control expressions walk inactive operands structurally without evaluating them.
+
+Unavailable inspection uses Algebra<Inspect> and Evidence handles. Error text
+stays in the inspector's private inventory; the scoped obligation determines
+protection when the owner retrieves the first applicable failure. Resolution
+demand comes from the loader phase and expression edges, independently of Secret.
+
 The kernel has **no** known/unknown classification, is-known predicate, pending
 phase calculation, or expression evaluator. ScalarKind, LeafKind, and
 ExpressionKind describe representation only. In particular, a Concrete List or
@@ -128,8 +145,10 @@ An obligation attached inside Secret retains protected scope and a hidden path.
 ModuleIf schedules Condition, Then, and Else. Coalesce schedules CoalesceValue
 and CoalesceDefault, including an unused fallback. Calls include their argument
 values and access metadata; resolved calls include captured function defaults,
-locals, bodies, and scope definitions. Nothing selects a branch, invokes a
-builtin, substitutes a slot, or materializes a directive. Thus an owner can
+locals, bodies, and scope definitions. The public structural fold selects no
+branch, invokes no builtin, substitutes no slot, and materializes no directive.
+The private parser operations apply their explicit domain rules separately.
+Thus an owner can
 inventory obligations in unselected computations without evaluating them.
 
 ReferenceRef exposes only nonrecursive reference identity through the restricted
