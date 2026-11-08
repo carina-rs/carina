@@ -596,10 +596,11 @@ mod structural_consumers {
                 .unwrap(),
         )]);
         let context = ProviderContext::new(carina_core::EnvironmentSnapshot::new([]));
-        let mut report = schema.validate_values_with_resolver(
+        let mut report = carina_core::test_utils::admit_resource_attribute_report(
+            schema,
             &attributes,
             &|_| false,
-            context.custom_type_resolver(),
+            &context.custom_types,
         );
         assert_eq!(report.errors().count(), 0);
         assert_eq!(

@@ -3645,30 +3645,29 @@ fn suspension_deduplication_does_not_turn_validation_errors_into_success() {
         )
         .expect("suspended-validation schema must be registered");
     let validate = || {
-        schema
-            .validate_with_resolver(
-                &attributes
-                    .iter()
-                    .map(|(name, value)| {
-                        (
-                            name.clone(),
-                            value
-                                .knowledge(
-                                    &carina_core::resource::knowledge::KnowledgeContext::validation(
-                                    ),
-                                )
-                                .map(|proof| proof.into_classification())
-                                .unwrap(),
-                        )
-                    })
-                    .collect(),
-                &|_| false,
-                engine.provider_context.custom_type_resolver(),
-            )
-            .expect_err("validation must remain an error")
-            .into_iter()
-            .find(|error| error.host_cause().is_some())
-            .expect("provider validation error must retain host policy metadata")
+        carina_core::test_utils::admit_resource_attributes(
+            schema,
+            &attributes
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        value
+                            .knowledge(
+                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
+                            )
+                            .map(|proof| proof.into_classification())
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+            &|_| false,
+            &engine.provider_context.custom_types,
+        )
+        .expect_err("validation must remain an error")
+        .into_iter()
+        .find(|error| error.host_cause().is_some())
+        .expect("provider validation error must retain host policy metadata")
     };
 
     let first = validate();
@@ -3972,32 +3971,32 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
         carina_core::provider::provider_custom_types_from_factories(Arc::new(factories));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("test", schema);
-    let core_errors = schemas
-        .get(
-            "test",
-            "route53.Record",
-            carina_core::schema::SchemaKind::Resource,
-        )
-        .expect("test schema must be owner-bound")
-        .validate_with_resolver(
-            &attributes
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.clone(),
-                        value
-                            .knowledge(
-                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                            )
-                            .map(|proof| proof.into_classification())
-                            .unwrap(),
-                    )
-                })
-                .collect(),
-            &|name| name == "hosted_zone_id",
-            &core_resolver,
-        )
-        .expect_err("core validation must reject both union alternatives");
+    let core_errors = carina_core::test_utils::admit_resource_attributes(
+        schemas
+            .get(
+                "test",
+                "route53.Record",
+                carina_core::schema::SchemaKind::Resource,
+            )
+            .expect("test schema must be owner-bound"),
+        &attributes
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    value
+                        .knowledge(
+                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
+                        )
+                        .map(|proof| proof.into_classification())
+                        .unwrap(),
+                )
+            })
+            .collect(),
+        &|name| name == "hosted_zone_id",
+        &core_resolver,
+    )
+    .expect_err("core validation must reject both union alternatives");
     assert_eq!(core_errors.len(), 1, "core errors: {core_errors:#?}");
     let core_message = core_errors[0].to_string();
     assert!(

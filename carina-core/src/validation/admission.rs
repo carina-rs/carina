@@ -76,30 +76,34 @@
 //! ```
 //!
 //! ```
-//! use carina_core::validation::admission::{AssignmentVerdict, DeferredLocal, kind::ResourceAttribute};
-//! fn deferred(value: DeferredLocal<ResourceAttribute>) -> AssignmentVerdict<ResourceAttribute> {
-//!     AssignmentVerdict::NeedsLocal(value)
+//! use carina_core::validation::admission::{PendingAdmission, DeferredLocal, kind::ResourceAttribute};
+//! fn deferred(value: &PendingAdmission<ResourceAttribute>) -> Option<&DeferredLocal<ResourceAttribute>> {
+//!     value.local_obligation()
 //! }
 //! ```
 //! ```compile_fail,E0308
-//! use carina_core::validation::admission::{AssignmentVerdict, DeferredLocal, kind::{ResourceAttribute, ModuleArgument}};
-//! fn bypass(value: DeferredLocal<ResourceAttribute>) -> AssignmentVerdict<ModuleArgument> {
-//!     AssignmentVerdict::<ModuleArgument>::NeedsLocal(value)
+//! use carina_core::validation::admission::{PendingAdmission, DeferredLocal, kind::{ResourceAttribute, ModuleArgument}};
+//! fn bypass(value: &PendingAdmission<ModuleArgument>) -> Option<&DeferredLocal<ResourceAttribute>> {
+//!     value.local_obligation()
 //! }
 //! ```
 //!
-//! Only reference evidence can enter the relaxed assignment path.
+//! A reference judgement cannot hand owned deferred work to external callers.
 //!
-//! ```
+//! ```compile_fail,E0599
 //! use carina_core::validation::admission::{ReferenceCandidate, Destination, AdmissionContext, kind::ResourceAttribute};
-//! fn inspect(reference: &ReferenceCandidate, destination: &Destination<ResourceAttribute>, context: &AdmissionContext<'_>) {
+//! fn bypass(reference: &ReferenceCandidate, destination: &Destination<ResourceAttribute>, context: &AdmissionContext<'_>) {
 //!     let _ = reference.judge_assignment(destination, context);
 //! }
 //! ```
-//! ```compile_fail,E0308
-//! use carina_core::validation::admission::{ReferenceCandidate, Candidate, Destination, AdmissionContext, kind::ResourceAttribute};
-//! fn bypass(value: &Candidate, destination: &Destination<ResourceAttribute>, context: &AdmissionContext<'_>) {
-//!     let _ = ReferenceCandidate::judge_assignment(value, destination, context);
+//!
+//! Assignment verdicts are internal to admission; callers cannot construct
+//! deferred work outside a pending admission.
+//!
+//! ```compile_fail,E0603
+//! use carina_core::validation::admission::{AssignmentVerdict, DeferredLocal, kind::ResourceAttribute};
+//! fn bypass(value: DeferredLocal<ResourceAttribute>) -> AssignmentVerdict<ResourceAttribute> {
+//!     AssignmentVerdict::NeedsLocal(value)
 //! }
 //! ```
 //!
@@ -138,8 +142,9 @@ pub mod attributes;
 #[cfg(test)]
 mod tests;
 
+use assignment::AssignmentVerdict;
 pub(crate) use assignment::LocalPath;
-pub use assignment::{AssignmentProof, AssignmentVerdict, ReferenceCandidate, SchemaObligation};
+pub use assignment::{AssignmentProof, ReferenceCandidate, SchemaObligation};
 
 mod sealed {
     pub trait Sealed: Sized {
@@ -396,14 +401,13 @@ impl<K: DestinationKind> Destination<K> {
 pub struct Candidate<P: PlaceholderKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress>
 {
     value: Value<P, B>,
-    obligations: CandidateObligations<B>,
+    obligations: CandidateObligations,
 }
 
 /// Value replacement moves this whole bundle. Future evidence belongs here.
 #[derive(Debug, Clone, PartialEq)]
-struct CandidateObligations<B: BindingAddress> {
+struct CandidateObligations {
     identity: DeclarationId,
-    origin: assignment::CandidateOrigin<B>,
     schema: SchemaObligation,
 }
 
@@ -524,7 +528,6 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             Self {
                 obligations: CandidateObligations {
                     identity,
-                    origin: assignment::CandidateOrigin::of(&value),
                     schema: SchemaObligation::default(),
                 },
                 value,
@@ -544,12 +547,6 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> AdmissionContext<'_, P, B> {
-    fn validation_proof(&self) -> Option<&crate::resource::knowledge::Classification<'_, P, B>> {
-        match &self.proof {
-            AdmissionProof::Validation(proof) => Some(proof),
-            AdmissionProof::Plan(_) | AdmissionProof::Apply(_) => None,
-        }
-    }
     fn sites(&self) -> Vec<PendingSite<B>> {
         match &self.proof {
             AdmissionProof::Validation(proof) => proof.sites().collect(),
@@ -760,7 +757,7 @@ impl<B: BindingAddress> From<KnowledgeError<B>> for AdmissionErrors {
 }
 impl From<AdmissionErrors> for ResolutionError {
     fn from(error: AdmissionErrors) -> Self {
-        error.source
+        error.into_resolution_error()
     }
 }
 impl crate::resource::InsideSecret for AdmissionErrors {
@@ -782,6 +779,10 @@ fn constraints(findings: Vec<AdmissionFinding>) -> AdmissionErrors {
 }
 
 impl AdmissionErrors {
+    pub(crate) fn into_resolution_error(self) -> ResolutionError {
+        self.source
+    }
+
     pub(crate) fn take_findings(&mut self) -> Option<crate::schema::ValueValidationFindings> {
         self.findings.take().map(|findings| *findings)
     }
@@ -799,6 +800,32 @@ impl AdmissionErrors {
     }
 }
 
+/// Admit a proof-paired candidate. Its actual value determines whether reference
+/// assignment applies; a raw value cannot supply reference-origin evidence.
+///
+/// ```
+/// use carina_core::validation::admission::{admit, Candidate, Destination, AdmissionContext, kind::ResourceAttribute};
+/// fn inspect(value: Candidate, destination: &Destination<ResourceAttribute>, context: &AdmissionContext<'_>) {
+///     let _ = admit(destination, value, context);
+/// }
+/// ```
+/// ```compile_fail,E0308
+/// use carina_core::{resource::Value, validation::admission::{admit, Destination, AdmissionContext, kind::ResourceAttribute}};
+/// fn bypass(value: Value, destination: &Destination<ResourceAttribute>, context: &AdmissionContext<'_>) {
+///     let _ = admit(destination, value, context);
+/// }
+/// ```
+///
+/// An arbitrary candidate also cannot mint the evidence required by the
+/// relaxed reference relation.
+///
+/// ```compile_fail,E0277
+/// use carina_core::validation::admission::{admit, Candidate, ReferenceCandidate, Destination, AdmissionContext, kind::ResourceAttribute};
+/// fn bypass(value: Candidate, destination: &Destination<ResourceAttribute>, context: &AdmissionContext<'_>) {
+///     let _: ReferenceCandidate = value.clone().into();
+///     let _ = admit(destination, value, context);
+/// }
+/// ```
 pub fn admit<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
     destination: &Destination<K>,
     candidate: Candidate<P, B>,

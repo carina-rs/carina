@@ -276,21 +276,18 @@ pub(crate) fn resolved_admission_for_test(
     is_string_literal: &dyn Fn(&str) -> bool,
     lookup: CustomTypeLookup<'_>,
 ) -> Result<(), Vec<TypeError>> {
-    let aliases = schema.block_name_map();
     schema
         .validate_resolved_admission_report(
             attributes,
             selected,
             is_string_literal,
             lookup,
-            &|name, proof| {
-                let canonical = aliases.get(name).map(String::as_str).unwrap_or(name);
-                let attribute = &schema.attributes[canonical];
+            &|_, attribute, proof| {
                 value_validation::validate_value_with_lookup(
-                    attribute.attr_type(),
+                    attribute.effective.field_type(),
                     proof,
                     &schema.defs,
-                    FieldAncestry::from_input_mode(attribute.input_mode()),
+                    FieldAncestry::from_input_mode(attribute.effective.effective_input_mode()),
                     lookup,
                 )
             },

@@ -107,6 +107,22 @@ impl crate::schema::OwnerBoundResourceSchema<'_> {
             .attributes()
             .keys()
             .position(|name| name == effective.name())?;
+        Some(self.admission_selected_attribute(
+            id,
+            attribute,
+            crate::schema::value_validation::SchemaAttribute { ordinal, effective },
+            catalog,
+        ))
+    }
+
+    fn admission_selected_attribute<K: DestinationKind>(
+        self,
+        id: &ResourceId,
+        attribute: &str,
+        selected: crate::schema::value_validation::SchemaAttribute<'_>,
+        catalog: &ProviderContext,
+    ) -> Destination<K> {
+        let crate::schema::value_validation::SchemaAttribute { ordinal, effective } = selected;
         let mut destination =
             Destination::catalogued(identity(self, id, catalog), attribute.into());
         destination.identity.path.push(ordinal);
@@ -119,7 +135,7 @@ impl crate::schema::OwnerBoundResourceSchema<'_> {
             ancestry: FieldAncestry::from_input_mode(effective.effective_input_mode()),
             path: LeafPath::from_segments([LeafPathSegment::StructField(attribute.into())]),
         }));
-        Some(destination)
+        destination
     }
 }
 
@@ -146,7 +162,8 @@ fn admission_findings<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>
     }
 }
 
-/// Plan uses only the plan-stage proof. Apply-pending sites remain in each admission.
+/// Plan uses only the plan-stage proof and retains diagnostic findings. Its
+/// pending admissions are dropped; apply re-admits the resolved resource values.
 pub fn admit_plan_attributes<K: RechecksResolved>(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     id: &ResourceId,
@@ -170,10 +187,9 @@ pub fn admit_plan_attributes<K: RechecksResolved>(
             None,
             &|name| quoted.contains(name),
             &lookup,
-            &|name, _| {
-                let destination = schema
-                    .admission_attribute::<K>(id, name, session.catalog())
-                    .expect("schema selected attribute");
+            &|name, selected, _| {
+                let destination =
+                    schema.admission_selected_attribute::<K>(id, name, selected, session.catalog());
                 let (candidate, boundary) = Candidate::plan(attributes[name].clone(), session);
                 admission_findings(&mut admit(&destination, candidate, &boundary))
             },
@@ -306,10 +322,9 @@ fn admit_apply_attributes<K: RechecksResolved>(
             authored.map(|(_, names)| names),
             &|name| quoted.contains(name),
             &lookup,
-            &|name, _| {
-                let destination = schema
-                    .admission_attribute::<K>(id, name, session.catalog())
-                    .expect("schema selected attribute");
+            &|name, selected, _| {
+                let destination =
+                    schema.admission_selected_attribute::<K>(id, name, selected, session.catalog());
                 let result = Candidate::apply(projected[name].clone(), session).and_then(
                     |(candidate, mut boundary)| {
                         boundary.lookup = Some(&lookup);
@@ -409,81 +424,83 @@ pub(crate) fn admit_validation_attributes<
         session.catalog().custom_type_resolver(),
         schema,
     );
+    let admit_attribute = |name: &str,
+                           proof: &crate::resource::knowledge::Classification<'_, P, B>,
+                           destination: &Destination<K>| {
+        let (candidate, mut boundary) =
+            Candidate::validation_classified(proof.clone(), bindings, session);
+        boundary.declaration = declarations
+            .and_then(|sources| sources.get(name))
+            .map(|(name, source)| (name.as_str(), source));
+        // Retained expressions use the same attribute contract and binding
+        // authority. Their leaf references have no top-level declaration.
+        let reference_context = assignment::ReferenceContext {
+            bindings,
+            provider: session,
+            declaration: None,
+        };
+        let assignment = destination.contract.as_deref().map(|contract| {
+            move |attr: &CompiledAttributeType, value: &Value<P, B>, path: &LeafPath| match check {
+                Some(check) => check(name, attr, value, path, contract, &reference_context),
+                None => Ok(Default::default()),
+            }
+        });
+        let untyped = || {
+            let Some(bindings) = bindings else {
+                return Vec::new();
+            };
+            let interpolation_sink =
+                crate::validation::lift_type_expr(&crate::validation::INTERPOLATION_REF_SINK)
+                    .expect("built-in interpolation sink");
+            let context = crate::validation::ResourceReferenceContext {
+                location: crate::validation::ReferenceFindingLocation::Resource {
+                    location: id.to_string(),
+                    attribute: name.into(),
+                },
+                bindings,
+                declared_source: None,
+                interpolation_sink: &interpolation_sink,
+            };
+            crate::validation::collect_ref_diagnostics_with_sink(
+                crate::resource::knowledge::ClassifiedRef::from(proof).diagnostic_value(),
+                None,
+                &mut |reference, sink, usage, _, errors| {
+                    errors.extend(crate::validation::check_resource_reference(
+                        &context, reference, sink, usage,
+                    ));
+                },
+            )
+            .into_iter()
+            .map(|finding| {
+                assignment::reference_error(AdmissionReferenceError::Authored(Box::new(finding)))
+            })
+            .collect()
+        };
+        boundary.assignment = assignment.as_ref().map(|check| check as &_);
+        boundary.untyped = Some(&untyped);
+        let findings = admission_findings(&mut admit(destination, candidate, &boundary));
+        if proof.failure().is_some() {
+            // Keep attempted failure evidence and attribute presence. The
+            // expression/collector pass owns its validation diagnostic.
+            findings.retained_failure()
+        } else {
+            findings
+        }
+    };
     schema.schema().as_schema().validate_admission_report(
         attributes,
         &|name| quoted.contains(name),
         &lookup,
-        Some(&|name, proof| {
-            let destination = schema
-                .admission_attribute::<K>(id, name, session.catalog())
-                .unwrap_or_else(|| schema.untyped_attribute(id, name, session.catalog()));
-            let (candidate, mut boundary) =
-                Candidate::validation_classified(proof.clone(), bindings, session);
-            boundary.declaration = declarations
-                .and_then(|sources| sources.get(name))
-                .map(|(name, source)| (name.as_str(), source));
-            // Retained expressions use the same attribute contract and binding
-            // authority. Their leaf references have no top-level declaration.
-            let reference_context = assignment::ReferenceContext {
-                bindings,
-                provider: session,
-                declaration: None,
-            };
-            let assignment =
-                |attr: &CompiledAttributeType, value: &Value<P, B>, path: &LeafPath| match check {
-                    Some(check) => check(
-                        name,
-                        attr,
-                        value,
-                        path,
-                        destination.contract.as_deref().expect("typed assignment"),
-                        &reference_context,
-                    ),
-                    None => Ok(Default::default()),
-                };
-            let untyped = || {
-                let Some(bindings) = bindings else {
-                    return Vec::new();
-                };
-                let interpolation_sink =
-                    crate::validation::lift_type_expr(&crate::validation::INTERPOLATION_REF_SINK)
-                        .expect("built-in interpolation sink");
-                let context = crate::validation::ResourceReferenceContext {
-                    location: crate::validation::ReferenceFindingLocation::Resource {
-                        location: id.to_string(),
-                        attribute: name.into(),
-                    },
-                    bindings,
-                    declared_source: None,
-                    interpolation_sink: &interpolation_sink,
-                };
-                crate::validation::collect_ref_diagnostics_with_sink(
-                    crate::resource::knowledge::ClassifiedRef::from(proof).diagnostic_value(),
-                    None,
-                    &mut |reference, sink, usage, _, errors| {
-                        errors.extend(crate::validation::check_resource_reference(
-                            &context, reference, sink, usage,
-                        ));
-                    },
-                )
-                .into_iter()
-                .map(|finding| {
-                    assignment::reference_error(AdmissionReferenceError::Authored(Box::new(
-                        finding,
-                    )))
-                })
-                .collect()
-            };
-            boundary.assignment = Some(&assignment);
-            boundary.untyped = Some(&untyped);
-            let findings = admission_findings(&mut admit(&destination, candidate, &boundary));
-            if proof.failure().is_some() {
-                // Keep attempted failure evidence and attribute presence. The
-                // expression/collector pass owns its validation diagnostic.
-                findings.retained_failure()
-            } else {
-                findings
-            }
+        Some(&crate::schema::value_validation::AttributeAdmission {
+            known: &|name, selected, proof| {
+                let destination =
+                    schema.admission_selected_attribute::<K>(id, name, selected, session.catalog());
+                admit_attribute(name, proof, &destination)
+            },
+            unknown: Some(&|name, proof| {
+                let destination = schema.untyped_attribute::<K>(id, name, session.catalog());
+                admit_attribute(name, proof, &destination)
+            }),
         }),
     )
 }

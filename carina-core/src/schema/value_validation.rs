@@ -306,10 +306,12 @@ impl ResourceValueValidation {
         self.errors.iter()
     }
 
+    #[cfg(test)]
     pub(crate) fn into_errors(self) -> Vec<TypeError> {
         self.errors
     }
 
+    #[cfg(test)]
     pub(crate) fn into_result(self) -> Result<(), Vec<TypeError>> {
         let errors = self.into_errors();
         if errors.is_empty() {
@@ -718,8 +720,22 @@ pub(crate) type AssignmentCheck<'a, P, B> = Option<
     ) -> Result<AssignmentFindings, TypeError>,
 >;
 
-pub(crate) type AttributeAdmission<'a, 'v, P, B, T> =
+/// The declaration selected by the resource schema walk, including its slot.
+pub(crate) struct SchemaAttribute<'s> {
+    pub(crate) ordinal: usize,
+    pub(crate) effective: EffectiveAttribute<'s>,
+}
+
+pub(crate) type KnownAttributeAdmission<'a, 'v, P, B, T> =
+    &'a dyn Fn(&str, SchemaAttribute<'_>, &Classification<'v, P, B, T>) -> ValueValidationFindings;
+
+type UnknownAttributeAdmission<'a, 'v, P, B, T> =
     &'a dyn Fn(&str, &Classification<'v, P, B, T>) -> ValueValidationFindings;
+
+pub(crate) struct AttributeAdmission<'a, 'v, P: PlaceholderKind, B: BindingAddress, T> {
+    pub(crate) known: KnownAttributeAdmission<'a, 'v, P, B, T>,
+    pub(crate) unknown: Option<UnknownAttributeAdmission<'a, 'v, P, B, T>>,
+}
 
 struct AdmittedUnion<'a> {
     selected: UnionFit<'a>,

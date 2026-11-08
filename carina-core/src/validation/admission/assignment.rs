@@ -151,14 +151,14 @@ impl SchemaObligation {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum AssignmentVerdict<K: DestinationKind> {
+pub(super) enum AssignmentVerdict<K: DestinationKind> {
     Proven(AssignmentProof<K>),
     NeedsLocal(K::LocalObligation),
     NeedsSchema(SchemaObligation),
 }
 
-/// Only boundary factories can select this origin. In particular, a future
-/// conversion's judged type cannot manufacture a reference-origin token.
+/// `of` exhaustively classifies the actual value. A judged type alone cannot
+/// select reference origin, including for a future conversion.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum CandidateOrigin<B: BindingAddress> {
     Reference(ReferenceCandidate<B>),
@@ -222,7 +222,8 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> From<&AdmissionContext<'a, P, B>
 impl<B: BindingAddress> ReferenceCandidate<B> {
     /// This entry is available only on reference evidence. Placement still
     /// requires `admit`, which also checks the boundary proof and actual value.
-    pub fn judge_assignment<K: DestinationKind, P: PlaceholderKind>(
+    #[cfg(test)]
+    pub(super) fn judge_assignment<K: DestinationKind, P: PlaceholderKind>(
         &self,
         destination: &Destination<K>,
         context: &AdmissionContext<'_, P, B>,
@@ -493,33 +494,6 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
             findings: Default::default(),
         });
     };
-    let reference_context = ReferenceContext::from(context);
-    let check = |attr: &CompiledAttributeType, value: &Value<P, B>, path: &LeafPath| {
-        let path = join(&contract.path, path);
-        let origin = if std::ptr::eq(
-            value,
-            crate::resource::knowledge::ClassifiedRef::from(
-                context.validation_proof().expect("validation proof"),
-            )
-            .diagnostic_value(),
-        ) {
-            candidate.obligations.origin.clone()
-        } else {
-            CandidateOrigin::of(value)
-        };
-        let mut findings = crate::schema::value_validation::AssignmentFindings::default();
-        match origin {
-            CandidateOrigin::Reference(reference) => {
-                reference.judge_at::<K>(contract, attr, &path, &reference_context, &mut findings)?
-            }
-            CandidateOrigin::Expression => {
-                if let Some(check) = context.assignment {
-                    return check(attr, value, &path);
-                }
-            }
-        }
-        Ok(findings)
-    };
     let lookup = ContractLookup {
         owner: &contract.owner,
         resolver: context.provider.catalog().custom_type_resolver(),
@@ -527,6 +501,26 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
     let lookup = context.lookup.unwrap_or(&lookup);
     let mut checked = match &context.proof {
         AdmissionProof::Validation(proof) => {
+            let reference_context = ReferenceContext::from(context);
+            let check = |attr: &CompiledAttributeType, value: &Value<P, B>, path: &LeafPath| {
+                let path = join(&contract.path, path);
+                let mut findings = crate::schema::value_validation::AssignmentFindings::default();
+                match CandidateOrigin::of(value) {
+                    CandidateOrigin::Reference(reference) => reference.judge_at::<K>(
+                        contract,
+                        attr,
+                        &path,
+                        &reference_context,
+                        &mut findings,
+                    )?,
+                    CandidateOrigin::Expression => {
+                        if let Some(check) = context.assignment {
+                            return check(attr, value, &path);
+                        }
+                    }
+                }
+                Ok(findings)
+            };
             crate::schema::value_validation::validate_value_for_admission(
                 contract.attr(),
                 proof,

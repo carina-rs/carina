@@ -1,6 +1,5 @@
 //! Shared schema catalog and recording provider for the infrastructure regressions.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use carina_core::provider::{
@@ -12,7 +11,7 @@ use carina_core::provider::{BoxFuture, ProviderFactory, ProviderInitialization, 
 use carina_core::resource::{ConcreteValue, ProviderResource, ResourceId, State, Value};
 use carina_core::schema::{
     AttributeSchema, AttributeType, PatternMatch, PatternSpec, ResourceSchema, StructField,
-    TypeIdentity, ValidatedResourceSchema,
+    TypeError, TypeIdentity, ValidatedResourceSchema,
 };
 
 pub struct InfraFactory(pub &'static str);
@@ -243,35 +242,36 @@ pub fn runtime_factories(
         .collect()
 }
 
-/// Compute the literal-equivalent diagnostics independently of the executor.
-pub fn literal_errors(
-    schemas: &carina_core::schema::SchemaRegistry,
-    catalog: &carina_core::parser::ProviderContext,
-    destination: &ResourceId,
-    attribute: &str,
-    value: Value,
-) -> Vec<carina_core::schema::TypeError> {
-    let values = HashMap::from([(attribute.to_owned(), value)]);
-    let classified = values
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.clone(),
-                value
-                    .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
-                    .unwrap()
-                    .into_classification(),
-            )
-        })
-        .collect();
-    schemas
-        .get(
-            &destination.provider,
-            &destination.resource_type,
-            carina_core::schema::SchemaKind::Resource,
-        )
-        .unwrap()
-        .validate_with_resolver(&classified, &|_| false, catalog.custom_type_resolver())
-        .err()
-        .unwrap_or_default()
+/// The exact diagnostics for the fixture outputs, independent of validation.
+pub fn expected_literal_errors(attribute: &str, output: &str) -> Vec<TypeError> {
+    match (attribute, output) {
+        ("principal_id", "12345678-1234-1234-1234-123456789abc")
+        | ("target", "arn:aws:iam::123456789012:role/scheduler") => Vec::new(),
+        ("principal_id", value) if value == "invalid-uuid" || value == "a".repeat(64) => {
+            vec![TypeError::PatternMismatch {
+                value: value.into(),
+                pattern: PatternSpec::new(
+                    "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                    PatternMatch::Full,
+                )
+                .into(),
+                attribute: Some("principal_id".into()),
+                type_name: Some("Id".into()),
+            }]
+        }
+        ("target", value) if value.is_empty() || value == "x".repeat(1601) => {
+            vec![TypeError::StructFieldError {
+                field: "role_arn".into(),
+                inner: Box::new(TypeError::LengthOutOfRange {
+                    value: value.into(),
+                    length: value.len(),
+                    min: Some(1),
+                    max: Some(1600),
+                    attribute: Some("target".into()),
+                    type_name: Some("Arn".into()),
+                }),
+            }]
+        }
+        _ => panic!("unexpected fixture output for {attribute}: {output:?}"),
+    }
 }

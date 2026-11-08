@@ -1762,6 +1762,13 @@ fn active_failure_is_reported_even_when_destination_schema_is_missing() {
 }
 
 #[test]
+fn conversion_error_can_be_consumed_through_the_4260_rebase_surface() {
+    let source = ResolutionError::Message("original conversion failure".into());
+    let error = AdmissionErrors::conversion(source.clone());
+    assert_eq!(error.into_resolution_error(), source);
+}
+
+#[test]
 fn conversion_error_display_label_remains_available_for_4260() {
     let source = ResolutionError::Message("original conversion failure".into());
     let error = AdmissionErrors::conversion(source.clone());

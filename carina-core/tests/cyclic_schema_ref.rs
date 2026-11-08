@@ -358,27 +358,27 @@ fn resource_schema_validate_routes_ref_through_defs() {
         .insert_provider_witness("aws", &witness)
         .expect("cyclic schema provider witness is consistent");
     let resolver = carina_core::parser::ProviderCustomTypes::default();
-    let result = registry
-        .get("aws", "wafv2.WebACL", SchemaKind::Resource)
-        .expect("cyclic schema fixture must be owner-bound")
-        .validate_with_resolver(
-            &attrs
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.clone(),
-                        value
-                            .knowledge(
-                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                            )
-                            .map(|proof| proof.into_classification())
-                            .unwrap(),
-                    )
-                })
-                .collect(),
-            &|_| false,
-            &resolver,
-        );
+    let result = carina_core::test_utils::admit_resource_attributes(
+        registry
+            .get("aws", "wafv2.WebACL", SchemaKind::Resource)
+            .expect("cyclic schema fixture must be owner-bound"),
+        &attrs
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    value
+                        .knowledge(
+                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
+                        )
+                        .map(|proof| proof.into_classification())
+                        .unwrap(),
+                )
+            })
+            .collect(),
+        &|_| false,
+        &resolver,
+    );
     assert!(
         result.is_ok(),
         "owner-bound validation on a Ref-typed attribute with valid value \

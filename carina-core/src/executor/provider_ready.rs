@@ -2555,10 +2555,10 @@ mod provider_config_tests {
         let resolver = test_schema_path_resolver(&factories);
         let attributes = HashMap::from([("value".to_string(), value.clone())]);
         for errors in [
-            schema.validate_with_resolver(
+            schema.schema().validate_with_origins_and_lookup(
                 &crate::schema::classified_attributes(&attributes).unwrap(),
                 &|_| false,
-                &resolver,
+                &crate::parser::custom_type_lookup_for_schema(&resolver, schema),
             ),
             crate::schema::tests::resolved_admission_for_test(
                 schema.schema().as_schema(),

@@ -15,7 +15,7 @@ use carina_core::executor::{
 use carina_core::plan::PlanErrorKind;
 use carina_core::provider::ProviderFactory;
 use carina_core::resource::{ConcreteValue, SavedResource, Value};
-use carina_core::schema::{SchemaKind, SchemaRegistry};
+use carina_core::schema::SchemaRegistry;
 use carina_state::{ResourceState, StateFile};
 use tower_lsp::lsp_types::DiagnosticSeverity;
 
@@ -242,34 +242,7 @@ fn timing_matrix(name: &str) {
     for (output, fits) in case.values() {
         case.seed(&pending, &output);
         let planned = case.plan();
-        let schema = pending
-            .schemas
-            .get("awscc", case.destination, SchemaKind::Resource)
-            .unwrap();
-        let literal: HashMap<String, _> =
-            HashMap::from([(case.attribute.into(), case.literal(&output))]);
-        let literal = literal
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.clone(),
-                    value
-                        .knowledge(
-                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                        )
-                        .unwrap()
-                        .into_classification(),
-                )
-            })
-            .collect();
-        let literal_errors = schema
-            .validate_with_resolver(
-                &literal,
-                &|_| false,
-                loaded.provider_context().custom_type_resolver(),
-            )
-            .err()
-            .unwrap_or_default();
+        let literal_errors = infra::expected_literal_errors(case.attribute, &output);
         if fits {
             assert!(
                 planned.plan.errors().is_empty(),
@@ -468,13 +441,7 @@ fn executor_timing_matrix(name: &str) {
             SchemaRegistry::new(),
             carina_core::EnvironmentSnapshot::empty(),
         );
-        let expected = infra::literal_errors(
-            &fixture.schemas,
-            loaded.provider_context(),
-            &destinations[0],
-            case.attribute,
-            case.literal(&output),
-        );
+        let expected = infra::expected_literal_errors(case.attribute, &output);
         let provider = infra::OutputProvider {
             name: "aws",
             output: output.clone(),

@@ -9877,6 +9877,7 @@ impl ValidatedResourceSchema {
             .validate_values_with_origins(attributes, is_string_literal)
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_with_origins_and_lookup<P: PlaceholderKind, B: BindingAddress>(
         &self,
         attributes: &HashMap<String, Classification<'_, P, B>>,
@@ -14519,6 +14520,25 @@ fn validate_ipv6_group(group: &str, addr: &str) -> Result<(), String> {
 /// let value = Value::Concrete(ConcreteValue::String("ok".into()));
 /// let _ = rootless.validate_with_lookup(&value, &|_, _| Ok(()));
 /// ```
+///
+/// Resource attributes must enter admission with boundary evidence; an
+/// owner-bound schema cannot decide their validity by itself.
+///
+/// ```compile_fail,E0599
+/// use std::collections::HashMap;
+/// use carina_core::{parser::CustomTypeResolver, resource::{AbsoluteBindingAddress, NoPlaceholder}, schema::OwnerBoundResourceSchema};
+/// fn bypass(schema: OwnerBoundResourceSchema<'_>, resolver: &dyn CustomTypeResolver) {
+///     let _ = schema.validate_with_resolver::<NoPlaceholder, AbsoluteBindingAddress>(&HashMap::new(), &|_| false, resolver);
+/// }
+/// ```
+///
+/// ```compile_fail,E0599
+/// use std::collections::HashMap;
+/// use carina_core::{parser::CustomTypeResolver, resource::{AbsoluteBindingAddress, NoPlaceholder}, schema::OwnerBoundResourceSchema};
+/// fn bypass(schema: OwnerBoundResourceSchema<'_>, resolver: &dyn CustomTypeResolver) {
+///     let _ = schema.validate_values_with_resolver::<NoPlaceholder, AbsoluteBindingAddress>(&HashMap::new(), &|_| false, resolver);
+/// }
+/// ```
 #[derive(Debug, Clone, Copy)]
 pub struct OwnerBoundResourceSchema<'a> {
     owner: &'a SchemaTypeOwner,
@@ -14587,40 +14607,6 @@ impl<'a> OwnerBoundResourceSchema<'a> {
     /// Return the explicit edges declared by this schema's provider owner.
     pub fn assignability_edges(self) -> &'a [AssignabilityEdge] {
         self.assignability_edges
-    }
-
-    /// Validate authored resource values with custom-type routing derived from
-    /// this schema's registered owner.
-    ///
-    /// ```compile_fail,E0308
-    /// use std::collections::HashMap;
-    /// use carina_core::{parser::CustomTypeResolver, resource::Value, schema::OwnerBoundResourceSchema};
-    /// fn bypass(schema: OwnerBoundResourceSchema<'_>, raw: &HashMap<String, Value>, resolver: &dyn CustomTypeResolver) {
-    ///     let _ = schema.validate_with_resolver(raw, &|_| false, resolver);
-    /// }
-    /// ```
-    pub fn validate_with_resolver<P: PlaceholderKind, B: BindingAddress>(
-        self,
-        attributes: &HashMap<String, Classification<'_, P, B>>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        resolver: &dyn crate::parser::CustomTypeResolver,
-    ) -> Result<(), Vec<TypeError>> {
-        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
-        self.schema
-            .validate_with_origins_and_lookup(attributes, is_string_literal, &lookup)
-    }
-
-    /// Validate once, retaining source paths for diagnostic renderers.
-    pub fn validate_values_with_resolver<P: PlaceholderKind, B: BindingAddress>(
-        self,
-        attributes: &HashMap<String, Classification<'_, P, B>>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        resolver: &dyn crate::parser::CustomTypeResolver,
-    ) -> ResourceValueValidation {
-        let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
-        self.schema
-            .schema
-            .validate_report(attributes, is_string_literal, &lookup)
     }
 }
 
@@ -15340,6 +15326,7 @@ impl PatternResourceSchema<Compiled> {
     /// refined primitive identity reached during traversal so
     /// provider-supplied validators that the schema itself cannot
     /// carry (WASM plugin path) still get to reject bad values.
+    #[cfg(test)]
     fn validate_values_with_origins_and_lookup<
         'v,
         P: PlaceholderKind,
@@ -15354,6 +15341,7 @@ impl PatternResourceSchema<Compiled> {
         self.validate_inner(attributes, is_string_literal, lookup)
     }
 
+    #[cfg(test)]
     fn validate_inner<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
         &self,
         attributes: &HashMap<String, Classification<'v, P, B, T>>,
@@ -15364,6 +15352,7 @@ impl PatternResourceSchema<Compiled> {
             .into_result()
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_report<
         'v,
         P: PlaceholderKind,
@@ -15388,7 +15377,7 @@ impl PatternResourceSchema<Compiled> {
         attributes: &HashMap<String, Classification<'v, P, B, T>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
-        admission: Option<value_validation::AttributeAdmission<'_, 'v, P, B, T>>,
+        admission: Option<&value_validation::AttributeAdmission<'_, 'v, P, B, T>>,
     ) -> ResourceValueValidation {
         let mut report = ResourceValueValidation::default();
 
@@ -15467,7 +15456,7 @@ impl PatternResourceSchema<Compiled> {
         selected: Option<&HashSet<String>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
-        admission: value_validation::AttributeAdmission<
+        admission: value_validation::KnownAttributeAdmission<
             '_,
             'v,
             crate::resource::NoPlaceholder,
@@ -15481,7 +15470,10 @@ impl PatternResourceSchema<Compiled> {
             lookup,
             ValueEntryValidation::KnownWritableOnly,
             selected,
-            Some(admission),
+            Some(&value_validation::AttributeAdmission {
+                known: admission,
+                unknown: None,
+            }),
         );
         if selected.is_none_or(|names| !names.is_empty())
             && let Some(validator) = self.validator()
@@ -15515,7 +15507,7 @@ impl PatternResourceSchema<Compiled> {
         lookup: CustomTypeLookup<'_>,
         mode: ValueEntryValidation,
         selected: Option<&HashSet<String>>,
-        admission: Option<value_validation::AttributeAdmission<'_, 'v, P, B, T>>,
+        admission: Option<&value_validation::AttributeAdmission<'_, 'v, P, B, T>>,
     ) -> ResourceValueValidation {
         let mut report = ResourceValueValidation::default();
 
@@ -15537,7 +15529,12 @@ impl PatternResourceSchema<Compiled> {
             // Resolve block_name alias to canonical name
             let canonical = bn_map.get(name).map(|s| s.as_str()).unwrap_or(name);
 
-            if let Some(schema) = self.attributes.get(canonical) {
+            if let Some((ordinal, (_, schema))) = self
+                .attributes
+                .iter()
+                .enumerate()
+                .find(|(_, (name, _))| name.as_str() == canonical)
+            {
                 let effective_attribute = EffectiveAttribute {
                     attribute: schema,
                     defs: &self.defs,
@@ -15554,7 +15551,14 @@ impl PatternResourceSchema<Compiled> {
                 }
 
                 let findings = match admission {
-                    Some(admit) => admit(name, value),
+                    Some(admit) => (admit.known)(
+                        name,
+                        value_validation::SchemaAttribute {
+                            ordinal,
+                            effective: effective_attribute.clone(),
+                        },
+                        value,
+                    ),
                     None => value_validation::validate_value_with_lookup(
                         &schema.attr_type,
                         value,
@@ -15587,7 +15591,7 @@ impl PatternResourceSchema<Compiled> {
                 }
                 report.attributes.insert(name.clone(), findings);
             } else if mode == ValueEntryValidation::FullInput {
-                if let Some(admit) = admission {
+                if let Some(admit) = admission.and_then(|admission| admission.unknown) {
                     report.attributes.insert(name.clone(), admit(name, value));
                 }
                 let id_attribute = format!("{name}_id");

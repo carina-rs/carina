@@ -47,30 +47,11 @@ async fn saved_plan_unknown_role_arn_is_checked_before_schedule_dispatch() {
                 .values()
                 .all(|value| matches!(value, carina_core::resource::Current::Absent(_)))
         );
-        let destination = planned
-            .desired_resources
-            .iter()
-            .find(|resource| resource.as_inner().id.resource_type == "scheduler.Schedule")
-            .unwrap()
-            .as_inner()
-            .id
-            .clone();
         let literal = Value::Concrete(ConcreteValue::Map(IndexMap::from([(
             "role_arn".into(),
             string_value(&output),
         )])));
-        let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
-            Arc::new(infra::runtime_factories(&output, &creates)),
-            SchemaRegistry::new(),
-            carina_core::EnvironmentSnapshot::empty(),
-        );
-        let expected = infra::literal_errors(
-            &planned.schemas,
-            loaded.provider_context(),
-            &destination,
-            "target",
-            literal.clone(),
-        );
+        let expected = infra::expected_literal_errors("target", &output);
         let configs: Vec<carina_core::parser::ExpandedProviderConfig> = ["aws", "awscc"]
             .into_iter()
             .map(|name| ProviderConfig {

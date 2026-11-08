@@ -12563,20 +12563,19 @@ fn provider_context_lookup_preserves_typed_custom_validation_errors() {
             crate::schema::SchemaKind::Resource,
         )
         .expect("typed-error fixture schema must be registered");
-    let error = schema
-        .validate_with_resolver(
-            &crate::schema::classified_attributes(&std::collections::HashMap::<
-                String,
-                ExpandedValue,
-            >::from([(
+    let error = crate::test_utils::admit_resource_attributes(
+        schema,
+        &crate::schema::classified_attributes(
+            &std::collections::HashMap::<String, ExpandedValue>::from([(
                 "value".to_string(),
                 ExpandedValue::Concrete(ExpandedConcreteValue::String("value".into())),
-            )]))
-            .unwrap(),
-            &|_| false,
-            config.custom_type_resolver(),
+            )]),
         )
-        .expect_err("the resolver's typed error must cross the schema lookup adapter");
+        .unwrap(),
+        &|_| false,
+        &config.custom_types,
+    )
+    .expect_err("the resolver's typed error must cross the schema lookup adapter");
 
     let [
         crate::schema::TypeError::CustomTypeValidation {
