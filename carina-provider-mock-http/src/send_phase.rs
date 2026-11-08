@@ -235,7 +235,16 @@ pub fn wasi_http_send_phase(url: &str, method: &str, body: &str, kind: ProbeKind
             // host/guest contract test.
             .read_timeout(Duration::from_secs(1))
             .build();
-        let connector = WasiHttpClient::new().http_connector(&settings, &components);
+        let credentials = carina_plugin_sdk::ProviderDiagnostics::guest()
+            .register_aws_session(
+                carina_plugin_sdk::protected_material::AwsSessionMaterial::new(
+                    "http-probe-access-key".into(),
+                    "http-probe-secret-key".into(),
+                    None,
+                ),
+            )
+            .expect("HTTP probe credentials must be registered before transport");
+        let connector = WasiHttpClient::new(credentials).http_connector(&settings, &components);
         let mut request = HttpRequest::get(url).expect(kind.url_expectation());
         request.set_method(method).expect(kind.method_expectation());
         *request.body_mut() = body.as_bytes().to_vec().into();

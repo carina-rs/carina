@@ -11083,13 +11083,13 @@ where
         for resource in self.iter_all_resources() {
             match resource {
                 ResourceRef::Resource(resource) => {
-                    plan.include(&resource.id, resource.attributes.values())
+                    plan.include(&resource.id, resource.attributes.iter())
                 }
                 ResourceRef::DataSource(source) => {
-                    plan.include(&source.id, source.attributes.values())
+                    plan.include(&source.id, source.attributes.iter())
                 }
                 ResourceRef::Deferred { resource, .. } => {
-                    plan.include(resource.id(), resource.attributes().values())
+                    plan.include(resource.id(), resource.attributes().iter())
                 }
                 ResourceRef::LiveComposition(_) => {}
             }

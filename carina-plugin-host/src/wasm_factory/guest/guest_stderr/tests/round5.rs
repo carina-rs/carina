@@ -2,7 +2,7 @@ use super::*;
 use carina_core::provider::*;
 use carina_core::resource::{ConcreteValue, DeferredValue, Resource, Value};
 
-struct LateFactory(GuestStderr);
+struct LateFactory(HostOutput);
 impl ProviderFactory for LateFactory {
     fn name(&self) -> &str {
         "stderr-test"
@@ -37,7 +37,7 @@ impl ProviderFactory for LateFactory {
         )
     }
 }
-struct LateProvider(GuestStderr);
+struct LateProvider(HostOutput);
 impl Provider for LateProvider {
     fn name(&self) -> &str {
         "stderr-test"
@@ -110,7 +110,7 @@ async fn guest_stderr_round5_deferred_ref_grows_during_and_after_create() {
     use carina_core::executor::*;
     const SECRET: &str = "late-guest-private-4305";
     let capture = Capture::default();
-    let stderr = GuestStderr::new(capture.clone());
+    let stderr = HostOutput::new(capture.clone());
     let mut desired = Resource::with_provider("stderr-test", "resource", "probe", None);
     desired.attributes.insert(
         "password".into(),
@@ -144,7 +144,8 @@ async fn guest_stderr_round5_deferred_ref_grows_during_and_after_create() {
     ));
     let schemas = carina_core::schema::SchemaRegistry::new();
     let plan = carina_core::input_rules::finalize_plan_for_test(plan)
-        .check_inputs(&schemas, &Default::default()).unwrap();
+        .check_inputs(&schemas, &Default::default())
+        .unwrap();
     let input = LiveExecutionInput {
         plan: &plan,
         provider_check_inputs: ProviderCheckInputs::Authored,

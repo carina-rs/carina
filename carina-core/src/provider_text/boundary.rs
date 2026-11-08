@@ -22,12 +22,14 @@ use crate::resource::{ResourceId, State};
 #[derive(Clone, Debug)]
 pub struct ProviderPlan {
     routes: std::collections::HashMap<ProviderInstanceKey, RedactionSet>,
+    addresses: super::events::ProtectedAddresses,
 }
 impl ProviderPlan {
     /// No desired configuration exists (for example, state-only cleanup).
     pub fn state_only() -> Self {
         Self {
             routes: Default::default(),
+            addresses: Default::default(),
         }
     }
     #[cfg(test)]
@@ -42,22 +44,33 @@ impl ProviderPlan {
     ) -> Self {
         let mut plan = Self::state_only();
         for resource in desired {
-            plan.include(&resource.id, resource.attributes.values());
+            plan.include(&resource.id, resource.attributes.iter());
         }
         for source in data_sources {
-            plan.include(&source.id, source.attributes.values());
+            plan.include(&source.id, source.attributes.iter());
         }
         plan
     }
     pub(crate) fn include<'a, P: crate::resource::ValueKind + 'a>(
         &mut self,
         id: &ResourceId,
-        values: impl IntoIterator<Item = &'a crate::resource::Value<P>>,
+        values: impl IntoIterator<Item = (&'a String, &'a crate::resource::Value<P>)>,
     ) {
+        let values = values.into_iter().collect::<Vec<_>>();
+        let mut paths = Vec::new();
+        for (name, value) in &values {
+            super::events::protected_paths(value, &mut vec![(*name).clone()], &mut paths);
+        }
+        self.addresses
+            .entry(id.clone())
+            .or_insert(super::events::AddressProtection::Unclassified)
+            .include_checked(paths);
         self.routes
             .entry(ProviderInstanceKey::from(id))
             .or_insert_with(RedactionSet::before_request)
-            .extend(&RedactionSet::collect(values));
+            .extend(&RedactionSet::collect(
+                values.into_iter().map(|(_name, value)| value),
+            ));
     }
     /// Mint one configured or built-in provider session from this whole plan.
     pub fn session(
@@ -77,6 +90,8 @@ pub struct ProviderSession {
     provider: String,
     binding: Option<String>,
     secrets: RedactionSet,
+    diagnostics: super::ProviderDiagnosticChannel,
+    diagnostic_owner: super::DiagnosticOwner,
 }
 impl ProviderSession {
     /// Core-owned call inputs for guest handoff; this does not grant runtime
@@ -84,6 +99,8 @@ impl ProviderSession {
     pub fn guest_inputs(&self) -> ProviderValidationInputs {
         ProviderValidationInputs {
             secrets: self.secrets.clone(),
+            diagnostics: self.diagnostics.clone(),
+            diagnostic_owner: self.diagnostic_owner.clone(),
         }
     }
     pub fn guest_inventory(&self) -> super::GuestInputInventory {
@@ -106,10 +123,22 @@ impl ProviderSession {
         )) {
             secrets.extend(desired);
         }
+        let addresses = plan
+            .addresses
+            .iter()
+            .filter(|(id, _paths)| {
+                id.provider == provider && id.provider_instance.as_deref() == binding
+            })
+            .map(|(id, paths)| (id.clone(), paths.clone()))
+            .collect();
+        let (diagnostics, diagnostic_owner) =
+            super::ProviderDiagnosticChannel::new(secrets.clone(), provider.to_owned(), addresses);
         Self {
             config: config.cloned(),
             provider: provider.to_owned(),
             binding: binding.map(str::to_owned),
+            diagnostics,
+            diagnostic_owner,
             secrets,
         }
     }
@@ -122,6 +151,19 @@ impl ProviderSession {
     pub fn redaction_set(&self) -> &RedactionSet {
         &self.secrets
     }
+    pub fn diagnostics(&self) -> super::ProviderDiagnosticChannel {
+        self.diagnostics.clone()
+    }
+    pub(crate) fn diagnostic_owner(&self) -> super::DiagnosticOwner {
+        self.diagnostic_owner.clone()
+    }
+    pub fn with_diagnostic_sink(
+        self,
+        sink: impl Fn(super::BoundProviderEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.diagnostics.set_sink(sink);
+        self
+    }
 }
 
 /// Inputs for validation before a checked configuration exists. This type
@@ -129,6 +171,8 @@ impl ProviderSession {
 #[derive(Clone, Debug)]
 pub struct ProviderValidationInputs {
     secrets: RedactionSet,
+    diagnostics: super::ProviderDiagnosticChannel,
+    diagnostic_owner: super::DiagnosticOwner,
 }
 impl ProviderValidationInputs {
     pub fn guest_inventory(&self) -> super::GuestInputInventory {
@@ -141,12 +185,26 @@ impl ProviderValidationInputs {
     >(
         values: impl IntoIterator<Item = &'a crate::resource::Value<P, B>>,
     ) -> Self {
+        let secrets = RedactionSet::collect(values);
+        let (diagnostics, diagnostic_owner) = super::ProviderDiagnosticChannel::new(
+            secrets.clone(),
+            String::new(),
+            Default::default(),
+        );
         Self {
-            secrets: RedactionSet::collect(values),
+            diagnostics,
+            diagnostic_owner,
+            secrets,
         }
     }
     pub fn redaction_set(&self) -> &RedactionSet {
         &self.secrets
+    }
+    pub fn diagnostics(&self) -> super::ProviderDiagnosticChannel {
+        self.diagnostics.clone()
+    }
+    pub(super) fn diagnostic_owner(&self) -> super::DiagnosticOwner {
+        self.diagnostic_owner.clone()
     }
 }
 
@@ -174,6 +232,7 @@ pub struct ProviderBoundary<'a> {
     normalizer: ConfiguredNormalizer,
     secrets: RedactionSet,
     schemas: crate::schema::SchemaRegistry,
+    diagnostics: super::ProviderDiagnosticChannel,
 }
 impl ProviderBoundary<'_> {
     pub(crate) fn owns_desired(&self, id: &ResourceId) -> bool {
@@ -185,6 +244,11 @@ impl ProviderBoundary<'static> {
         factory: &dyn ProviderFactory,
         session: &crate::provider::ProviderSession,
     ) -> HostResult<InitializedProvider> {
+        let mut event_schemas = crate::schema::SchemaRegistry::new();
+        event_schemas
+            .insert_provider_witness(&session.provider, &factory.schema_witness())
+            .map_err(|error| crate::provider::HostError::internal(error.to_string()))?;
+        session.diagnostics.set_schemas(event_schemas);
         let (provider, outcome) = factory
             .create_provider(session, InitializeOutcomeMint::new())
             .await
@@ -197,6 +261,7 @@ impl ProviderBoundary<'static> {
                 schemas: normalizer.schemas.clone(),
                 normalizer,
                 secrets: session.secrets.clone(),
+                diagnostics: session.diagnostics.clone(),
             }),
             reference_scope: outcome.reference_scope,
         })
@@ -205,6 +270,11 @@ impl ProviderBoundary<'static> {
         factory: &dyn ProviderFactory,
         session: &crate::provider::ProviderSession,
     ) -> HostResult<ConfiguredNormalizer> {
+        let mut event_schemas = crate::schema::SchemaRegistry::new();
+        event_schemas
+            .insert_provider_witness(&session.provider, &factory.schema_witness())
+            .map_err(|error| crate::provider::HostError::internal(error.to_string()))?;
+        session.diagnostics.set_schemas(event_schemas);
         let ext = factory
             .create_normalizer(session)
             .await
@@ -220,6 +290,7 @@ impl ProviderBoundary<'static> {
                 .map_err(|error| crate::provider::HostError::internal(error.to_string()))?;
         }
         Ok(ConfiguredNormalizer {
+            _diagnostic_owner: session.diagnostic_owner(),
             route: Some(ProviderInstanceKey::new(
                 session.provider.clone(),
                 session.binding.clone(),
@@ -243,6 +314,7 @@ impl Provider<super::Bound> for ProviderBoundary<'_> {
         identifier: &AppliedIdentifier,
         request: ReadRequest,
     ) -> BoxFuture<'_, HostResult<ReadOutcome>> {
+        self.diagnostics.include_address(id);
         let secrets = self.secrets.clone();
         let call = self.provider.read(id, identifier, request);
         Box::pin(async move { call.await.map_err(|error| error.with_secrets(&secrets)) })
@@ -252,6 +324,7 @@ impl Provider<super::Bound> for ProviderBoundary<'_> {
         &self,
         resource: &ProviderReadyDataSource,
     ) -> BoxFuture<'_, HostResult<State>> {
+        self.diagnostics.include_ready_data_source(resource);
         self.secrets
             .extend(&RedactionSet::collect(resource.diagnostic_values()));
         let secrets = self.secrets.clone();
@@ -265,6 +338,7 @@ impl Provider<super::Bound> for ProviderBoundary<'_> {
         request: CreateRequest,
         attempt: CreateAttempt,
     ) -> BoxFuture<'_, Result<HostCreateOutcome, HostCreateFailure>> {
+        self.diagnostics.include_ready_resource(request.resource());
         self.secrets.extend(&RedactionSet::collect(
             request.resource().diagnostic_values(),
         ));
@@ -283,6 +357,8 @@ impl Provider<super::Bound> for ProviderBoundary<'_> {
         &self,
         request: ResumeCreateRequest,
     ) -> BoxFuture<'_, Result<HostResumeOutcome, HostResumeFailure>> {
+        self.diagnostics
+            .include_ready_resource(request.request().resource());
         self.secrets.extend(&RedactionSet::collect(
             request.request().resource().diagnostic_values(),
         ));
@@ -304,6 +380,7 @@ impl Provider<super::Bound> for ProviderBoundary<'_> {
         request: UpdateRequest,
         attempt: UpdateAttempt,
     ) -> BoxFuture<'_, HostResult<HostUpdateOutcome>> {
+        self.diagnostics.include_address(id);
         self.secrets
             .extend(&RedactionSet::collect(request.diagnostic_values()));
         let secrets = self.secrets.clone();
@@ -448,15 +525,20 @@ impl<'a> ProviderBoundary<'a> {
         schemas: &crate::schema::SchemaRegistry,
     ) {
         self.secrets = session.secrets;
+        self.diagnostics = session.diagnostics;
+        self.diagnostics.set_schemas(schemas.clone());
         self.schemas = schemas.clone();
         self.normalizer.config_secrets = self.secrets.clone();
+        self.normalizer._diagnostic_owner = session.diagnostic_owner;
         self.normalizer.schemas = schemas.clone();
     }
     pub(crate) fn fixture(provider: impl Provider + 'a) -> Self {
-        let secrets = ProviderPlan::state_only().session("", None, None).secrets;
+        let session = ProviderPlan::state_only().session("", None, None);
+        let secrets = session.secrets;
         Self {
             provider: Box::new(provider),
             normalizer: ConfiguredNormalizer {
+                _diagnostic_owner: session.diagnostic_owner,
                 route: None,
                 provider_name: String::new(),
                 ext: Box::new(NoopNormalizer),
@@ -464,6 +546,7 @@ impl<'a> ProviderBoundary<'a> {
                 schemas: crate::schema::SchemaRegistry::new(),
             },
             secrets,
+            diagnostics: session.diagnostics,
             schemas: crate::schema::SchemaRegistry::new(),
         }
     }

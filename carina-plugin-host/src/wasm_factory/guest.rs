@@ -4,9 +4,13 @@ use super::diagnostics::{
 };
 use super::*;
 mod desired_normalization;
+mod diagnostic_imports;
 pub(super) mod guest_stderr;
 pub(super) mod guest_store;
 mod wasm_convert;
+pub(super) use diagnostic_imports::add_diagnostic_imports;
+#[cfg(test)]
+mod diagnostic_tests;
 use version_checked_bindings::wit_types;
 pub(super) use version_checked_bindings::{SchemaOnlyBindings, WasmBindings};
 
@@ -33,6 +37,8 @@ mod version_checked_bindings {
             exports: { default: async },
             with: {
                 "carina:provider/types": super::basic::carina::provider::types,
+                "carina:provider/diagnostics": super::basic::carina::provider::diagnostics,
+                "carina:provider/protected-material": super::basic::carina::provider::protected_material,
                 "carina:provider/provider": super::basic::exports::carina::provider::provider,
                 "wasi:http": wasmtime_wasi_http::p2::bindings::http,
                 "wasi:io": wasmtime_wasi::p2::bindings::io,
@@ -49,6 +55,8 @@ mod version_checked_bindings {
             exports: { default: async },
             with: {
                 "carina:provider/types": super::basic::carina::provider::types,
+                "carina:provider/diagnostics": super::basic::carina::provider::diagnostics,
+                "carina:provider/protected-material": super::basic::carina::provider::protected_material,
                 "carina:provider/provider": super::basic::exports::carina::provider::provider,
                 "wasi:http": wasmtime_wasi_http::p2::bindings::http,
                 "wasi:io": wasmtime_wasi::p2::bindings::io,
@@ -58,6 +66,9 @@ mod version_checked_bindings {
 
     pub(crate) use aws::carina::provider::aws_credentials;
     pub(crate) use basic::carina::provider::types as wit_types;
+    pub(super) use basic::carina::provider::{
+        diagnostics as wit_diagnostics, protected_material as wit_protected_material,
+    };
     pub(crate) use basic::exports::carina::provider::provider::{
         DesiredResource as WitDesiredResource, PlanOp as WitPlanOp,
     };
@@ -65,7 +76,7 @@ mod version_checked_bindings {
     use basic::CarinaProvider;
     use http::CarinaProviderWithHttp;
 
-    const PROVIDER_INTERFACE_EXPORT: &str = "carina:provider/provider@0.1.0";
+    const PROVIDER_INTERFACE_EXPORT: &str = "carina:provider/provider@0.2.0";
 
     // Wasmtime 43 generates types owned by an exported interface separately
     // for each world, even when `with` shares that interface for referenced
@@ -116,6 +127,20 @@ mod version_checked_bindings {
             component: &Component,
             linker: &Linker<HostState>,
         ) -> Result<Self, WasmBindingCreationError> {
+            if component
+                .component_type()
+                .exports(linker.engine())
+                .any(|(name, _item)| {
+                    name.starts_with("carina:provider/provider@")
+                        && name != PROVIDER_INTERFACE_EXPORT
+                })
+            {
+                return Err(WasmBindingCreationError::ProtocolVersion(
+                    DiagnosticText::new(
+                        "Incompatible provider WIT package; host requires carina:provider@0.2.0 (protocol 25)",
+                    ),
+                ));
+            }
             let pre = linker
                 .instantiate_pre(component)
                 .map_err(WasmBindingCreationError::Instantiation)?;
@@ -4010,6 +4035,7 @@ pub(super) mod tests {
     #[cfg(test)]
     mod round6 {
         use super::*;
+        use carina_core::provider_text::{EventLevel, ProviderEvent};
         #[tokio::test]
         async fn validation_failed_capacity_rebuild_does_not_retain_unsent_inputs() {
             let mut factory = rebuildable_state_test_factory()
@@ -4210,6 +4236,12 @@ pub(super) mod tests {
                 assert!(stderr.check_write().unwrap() >= line.len());
                 stderr.write(hyper::body::Bytes::from(line)).unwrap();
                 stderr.flush().unwrap();
+                let diagnostic = ProviderError::api_error(format!("credential={token}; public=visible"));
+                store.data().input_inventory().diagnostics().emit(ProviderEvent::failure(
+                    EventLevel::Warn,
+                    "guest typed credential".into(),
+                    &diagnostic,
+                ));
                 ProviderError::api_error(format!("guest error credential={token}; public=visible"))
             }).await.unwrap();
             let error = error.with_secrets_for_test(&context);
@@ -4248,7 +4280,11 @@ pub(super) mod tests {
                 "host credential leaked through guest store: {stderr}"
             );
             assert!(
-                stderr.contains("guest stderr credential=(secret); public=visible"),
+                !stderr.contains("guest stderr credential="),
+                "raw guest stderr was forwarded: {stderr}"
+            );
+            assert!(
+                stderr.contains("guest typed credential: credential=(secret); public=visible"),
                 "{stderr}"
             );
             assert!(
@@ -4257,11 +4293,11 @@ pub(super) mod tests {
             );
         }
         #[test]
-        fn review_round6_guest_stderr_masks_session_token() {
+        fn review_round6_guest_store_never_leaks_session_token() {
             round6_credential_parent(false);
         }
         #[test]
-        fn review_round6_guest_stderr_masks_github_token() {
+        fn review_round6_guest_store_never_leaks_github_token() {
             round6_credential_parent(true);
         }
 
@@ -4274,7 +4310,7 @@ pub(super) mod tests {
                 "round6%2fpath%2bprivate%3dvalue",
             ] {
                 let capture = tempfile::NamedTempFile::new().unwrap();
-                let stderr = guest_stderr::GuestStderr::new(capture.reopen().unwrap());
+                let stderr = guest_stderr::HostOutput::new(capture.reopen().unwrap());
                 let _call = stderr.begin_call(&context.session().guest_inputs());
                 let uri = format!("https://example.com/{encoded}/public");
                 stderr
@@ -4316,6 +4352,10 @@ pub(super) mod tests {
                     "{text}\n{}",
                     String::from_utf8_lossy(&output.stdout)
                 );
+                assert!(
+                    !text.contains("raw guest stderr: remembered "),
+                    "raw validation stderr was forwarded: {text}"
+                );
                 for secret in [
                     "round6-validation-first",
                     "round6-validation-second",
@@ -4356,10 +4396,23 @@ pub(super) mod tests {
                         let mut cli = store.data_mut().cli();
                         let handle = cli.get_stderr().unwrap();
                         let stderr = cli.table.get_mut(&handle).unwrap();
-                        let line = format!("remembered {message}; public=visible\n");
+                        let line =
+                            format!("raw guest stderr: remembered {message}; public=visible\n");
                         assert!(stderr.check_write().unwrap() >= line.len());
                         stderr.write(hyper::body::Bytes::from(line)).unwrap();
                         stderr.flush().unwrap();
+                        let diagnostic = ProviderError::api_error(format!(
+                            "remembered {message}; public=visible"
+                        ));
+                        store
+                            .data()
+                            .input_inventory()
+                            .diagnostics()
+                            .emit(ProviderEvent::failure(
+                                EventLevel::Warn,
+                                "validation".into(),
+                                &diagnostic,
+                            ));
                         Ok::<_, wasmtime::Error>(result)
                     })
                     .await
@@ -6844,7 +6897,7 @@ pub(super) mod tests {
             let session = crate::provider_text_fixtures::context(&[SECRET])
                 .session()
                 .guest_inputs();
-            let stderr = guest_stderr::GuestStderr::new(std::io::stderr());
+            let stderr = guest_stderr::HostOutput::new(std::io::stderr());
             let _call = stderr.begin_call(&session);
             let mut hooks = AllowListHttpHooks::with_resolver(
                 local_provider_label("mock_http"),
@@ -6899,7 +6952,7 @@ pub(super) mod tests {
             .guest_inputs();
         for phases in [false, true] {
             let capture = tempfile::NamedTempFile::new().unwrap();
-            let stderr = guest_stderr::GuestStderr::new(capture.reopen().unwrap());
+            let stderr = guest_stderr::HostOutput::new(capture.reopen().unwrap());
             let _call = stderr.begin_call(&session);
             let uri = format!("https://example.com/{}/{secret}/public", "x".repeat(8000));
             let line = if phases {

@@ -117,7 +117,31 @@ pub(in crate::wasm_factory) struct HostRuntimeState {
     http_hooks: AllowListHttpHooks,
     limits: StoreLimits,
     guest: GuestStoreState,
-    stderr: super::guest_stderr::GuestStderr,
+    stderr: super::guest_stderr::HostOutput,
+    provider_name: String,
+    diagnostic_imports: usize,
+    protected_bytes: usize,
+    protected_values: usize,
+}
+
+impl HostRuntimeState {
+    pub(super) fn accept_diagnostic_import(&mut self) -> bool {
+        if self.diagnostic_imports >= 256 {
+            return false;
+        }
+        self.diagnostic_imports += 1;
+        true
+    }
+    pub(super) fn accept_protected_material(&mut self, bytes: usize, values: usize) -> bool {
+        if bytes > (256usize * 1024).saturating_sub(self.protected_bytes)
+            || values > 1024usize.saturating_sub(self.protected_values)
+        {
+            return false;
+        }
+        self.protected_bytes += bytes;
+        self.protected_values += values;
+        true
+    }
 }
 
 impl WasiView for HostRuntimeState {
@@ -189,9 +213,10 @@ impl GuestStore {
         budget: GuestCallBudget,
         http_test_route: Option<HttpTestRoute>,
     ) -> Self {
-        let stderr = super::guest_stderr::GuestStderr::new(super::host_stderr());
+        let stderr = super::guest_stderr::HostOutput::new(super::host_stderr());
+        let provider_name = label.name.clone();
         let inputs = ProviderPlan::state_only()
-            .session("", None, None)
+            .session(&provider_name, None, None)
             .guest_inventory();
         let capabilities = network.runtime_capabilities().cloned();
         let mut http_hooks = AllowListHttpHooks::with_test_route(label, network, http_test_route);
@@ -204,14 +229,16 @@ impl GuestStore {
             limits,
             guest: GuestStoreState::new(budget),
             stderr: stderr.clone(),
+            provider_name,
+            diagnostic_imports: 0,
+            protected_bytes: 0,
+            protected_values: 0,
         };
         let mut store = GuestStoreData::new_store(engine, host_state, inputs);
-        let wasi_ctx = super::build_sandboxed_wasi_ctx_with_stderr(
-            store.data(),
-            capabilities.as_ref(),
-            |key| std::env::var(key).ok(),
-            stderr,
-        );
+        let wasi_ctx =
+            super::build_sandboxed_wasi_ctx_for_store(store.data(), capabilities.as_ref(), |key| {
+                std::env::var(key).ok()
+            });
         store.data_mut().wasi_ctx = wasi_ctx;
         store.limiter(|state| &mut state.limits);
         store.call_hook(|mut store, transition| {
@@ -308,12 +335,15 @@ impl GuestStore {
             .next_secrets
             .take()
             .or_else(|| self.config_secrets.clone());
-        let inputs = self.store.data().input_inventory();
         let source = secrets.clone().unwrap_or_else(|| {
             ProviderPlan::state_only()
-                .session("", None, None)
+                .session(&self.store.data().provider_name, None, None)
                 .guest_inputs()
         });
+        self.store
+            .data_mut()
+            .set_input_inventory(source.guest_inventory());
+        let inputs = self.store.data().input_inventory();
         let _input_call = inputs.observe(&source);
         let _stderr_call = (secrets.is_some() || !inputs.is_empty()).then(|| {
             self.store

@@ -850,6 +850,7 @@ macro_rules! export_provider {
             fn get_provider() -> &'static ::std::sync::Mutex<$provider_type> {
                 static PROVIDER: ::std::sync::OnceLock<::std::sync::Mutex<$provider_type>> =
                     ::std::sync::OnceLock::new();
+                $crate::wasm_guest::enter_export();
                 PROVIDER.get_or_init(|| ::std::sync::Mutex::new(<$provider_type>::default()))
             }
 
@@ -2141,6 +2142,7 @@ macro_rules! export_provider {
 
             impl wit_types::Guest for WasmGuest {
                 fn info() -> String {
+                    $crate::wasm_guest::enter_export();
                     let provider = get_provider().lock().unwrap();
                     let info = $crate::CarinaProvider::info(&*provider);
                     let envelope = $crate::protocol::types::ProviderInfoEnvelope {
@@ -2152,6 +2154,7 @@ macro_rules! export_provider {
                 }
 
                 fn schemas() -> String {
+                    $crate::wasm_guest::enter_export();
                     let cache = match get_provider_schema_cache() {
                         Ok(cache) => cache,
                         Err(error) => {
@@ -2171,6 +2174,7 @@ macro_rules! export_provider {
                 }
 
                 fn provider_config_attribute_types() -> String {
+                    $crate::wasm_guest::enter_export();
                     let cache = match get_provider_schema_cache() {
                         Ok(cache) => cache,
                         Err(error) => {
@@ -2192,6 +2196,7 @@ macro_rules! export_provider {
                 fn validate_config(
                     attrs: Vec<(String, wit_types::Value)>,
                 ) -> Result<(), wit_types::ProviderError> {
+                    $crate::wasm_guest::enter_export();
                     let map = wit_to_proto_value_map(&attrs).map_err(|error| {
                         boundary_decode_to_provider_error("validate_config", None, error)
                     })?;
@@ -2203,6 +2208,7 @@ macro_rules! export_provider {
                 fn initialize(
                     attrs: Vec<(String, wit_types::Value)>,
                 ) -> Result<wit_types::InitializeResult, wit_types::ProviderError> {
+                    $crate::wasm_guest::enter_export();
                     let map = wit_to_proto_value_map(&attrs).map_err(|error| {
                         boundary_decode_to_provider_error("initialize", None, error)
                     })?;
@@ -2219,6 +2225,7 @@ macro_rules! export_provider {
                     identifier: String,
                     _request: wit_types::ReadRequest,
                 ) -> Result<wit_types::ReadOutcome, wit_types::ProviderError> {
+                    $crate::wasm_guest::enter_export();
                     let identifier = helpers::wit_to_proto_applied_identifier(identifier).map_err(|error| {
                         boundary_applied_identifier_decode_to_provider_error("read", error)
                     })?;
@@ -2238,6 +2245,7 @@ macro_rules! export_provider {
                 fn read_data_source(
                     res: wit_types::ResourceDef,
                 ) -> Result<wit_types::State, wit_types::ProviderError> {
+                    $crate::wasm_guest::enter_export();
                     let directives = helpers::protocol_20_default_resource_directives();
                     let proto_res = wit_to_proto_resource(&res, directives).map_err(|error| {
                         boundary_decode_to_provider_error("read_data_source", None, error)
@@ -2253,6 +2261,7 @@ macro_rules! export_provider {
                     id: wit_types::ResourceId,
                     request: wit_types::CreateRequest,
                 ) -> Result<wit_types::CreateStep, wit_types::CreateVerdict> {
+                    $crate::wasm_guest::enter_export();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let directives = helpers::protocol_20_default_resource_directives();
                     let proto_request = match wit_to_proto_create_request(request, directives) {
@@ -2284,6 +2293,7 @@ macro_rules! export_provider {
                     pending: wit_types::PendingCreate,
                     poll_request: wit_types::PollRequest,
                 ) -> Result<wit_types::CreateStep, wit_types::PollVerdict> {
+                    $crate::wasm_guest::enter_export();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
                     let directives = helpers::protocol_20_default_resource_directives();
@@ -2332,6 +2342,7 @@ macro_rules! export_provider {
                     pending: wit_types::ResumePending,
                     poll_request: wit_types::PollRequest,
                 ) -> Result<wit_types::ResumeStep, wit_types::ResumeVerdict> {
+                    $crate::wasm_guest::enter_export();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let previous_pending = pending.clone();
                     let directives = helpers::protocol_20_default_resource_directives();
@@ -2378,6 +2389,7 @@ macro_rules! export_provider {
                     identifier: String,
                     request: wit_types::UpdateRequest,
                 ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
+                    $crate::wasm_guest::enter_export();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let identifier = helpers::wit_to_proto_applied_identifier(identifier).map_err(|error| {
                         boundary_applied_identifier_decode_to_provider_error("update", error)
@@ -2405,6 +2417,7 @@ macro_rules! export_provider {
                     pending: wit_types::PendingUpdate,
                     poll_request: wit_types::PollRequest,
                 ) -> Result<wit_types::UpdateOutcome, wit_types::ProviderError> {
+                    $crate::wasm_guest::enter_export();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let identifier = helpers::wit_to_proto_applied_identifier(identifier).map_err(|error| {
                         boundary_applied_identifier_decode_to_provider_error("poll_update", error)
@@ -2439,6 +2452,7 @@ macro_rules! export_provider {
                     identifier: String,
                     request: wit_types::DeleteRequest,
                 ) -> Result<wit_types::DeleteOutcome, wit_types::ProviderError> {
+                    $crate::wasm_guest::enter_export();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let identifier = helpers::wit_to_proto_applied_identifier(identifier).map_err(|error| {
                         boundary_applied_identifier_decode_to_provider_error("delete", error)
@@ -2462,6 +2476,7 @@ macro_rules! export_provider {
                     request: wit_types::DeleteRequest,
                     pending: wit_types::PendingDelete,
                 ) -> Result<wit_types::DeleteOutcome, wit_types::ProviderError> {
+                    $crate::wasm_guest::enter_export();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let identifier = helpers::wit_to_proto_applied_identifier(identifier).map_err(|error| {
                         boundary_applied_identifier_decode_to_provider_error("poll_delete", error)
@@ -2490,6 +2505,7 @@ macro_rules! export_provider {
                     id: wit_types::ResourceId,
                     operation: wit_types::PlanOp,
                 ) -> Vec<String> {
+                    $crate::wasm_guest::enter_export();
                     let proto_id = wit_to_proto_resource_id(&id);
                     let result = {
                         let provider = get_provider().lock().unwrap();
@@ -2506,6 +2522,7 @@ macro_rules! export_provider {
                     target_id: wit_types::ResourceId,
                     attr_path: Vec<String>,
                 ) -> Vec<wit_types::BindingPattern> {
+                    $crate::wasm_guest::enter_export();
                     let proto_id = wit_to_proto_resource_id(&target_id);
                     let result = {
                         let provider = get_provider().lock().unwrap();
@@ -2518,6 +2535,7 @@ macro_rules! export_provider {
                 }
 
                 fn provider_config_completions() -> String {
+                    $crate::wasm_guest::enter_export();
                     let provider = get_provider().lock().unwrap();
                     let completions = $crate::CarinaProvider::config_completions(&*provider);
                     serde_json::to_string(&completions)
@@ -2525,6 +2543,7 @@ macro_rules! export_provider {
                 }
 
                 fn identity_attributes() -> Vec<String> {
+                    $crate::wasm_guest::enter_export();
                     let provider = get_provider().lock().unwrap();
                     $crate::CarinaProvider::identity_attributes(&*provider)
                 }
@@ -2533,6 +2552,7 @@ macro_rules! export_provider {
                     ty: wit_types::TypeIdentity,
                     value: String,
                 ) -> Result<(), wit_types::ProviderError> {
+                    $crate::wasm_guest::enter_export();
                     let cache = get_provider_schema_cache()
                         .map_err(|error| {
                             validate_string_to_provider_error(helpers::render_error_chain(error))
@@ -2548,6 +2568,7 @@ macro_rules! export_provider {
                 fn resolve_references(
                     requests: Vec<wit_types::ReferenceRequest>,
                 ) -> Result<Vec<Result<wit_types::ReferenceOutcome, wit_types::ReferenceError>>, wit_types::ProviderError> {
+                    $crate::wasm_guest::enter_export();
                     let requests = requests.into_iter().map(|request| {
                         let wit_types::ReferenceRequest { ty, value } = request;
                         proto::ReferenceRequest { ty: wit_to_proto_type_identity(&ty), value }
@@ -2568,6 +2589,7 @@ macro_rules! export_provider {
                 fn normalize_desired(
                     resources: Vec<wit_types::DesiredResource>,
                 ) -> Result<Vec<wit_types::DesiredResource>, wit_types::ProviderError> {
+                    $crate::wasm_guest::enter_export();
                     let proto_resources = resources.into_iter().map(|resource| {
                         let id = wit_to_proto_resource_id(&resource.id);
                         let mut attributes = std::collections::BTreeMap::new();
@@ -2597,6 +2619,7 @@ macro_rules! export_provider {
                 fn normalize_state(
                     states: Vec<(String, wit_types::PersistedState)>,
                 ) -> Result<Vec<(String, wit_types::PersistedState)>, wit_types::ProviderError> {
+                    $crate::wasm_guest::enter_export();
                     let proto_states = states
                         .iter()
                         .map(|(key, state)| {
@@ -2623,6 +2646,7 @@ macro_rules! export_provider {
                     states: Vec<(String, wit_types::PersistedState)>,
                     saved_attrs: Vec<(String, Vec<(String, wit_types::PersistedValue)>)>,
                 ) -> Result<Vec<(String, wit_types::PersistedState)>, wit_types::ProviderError> {
+                    $crate::wasm_guest::enter_export();
                     let mut proto_states = states
                         .iter()
                         .map(|(key, state)| {
@@ -2946,4 +2970,11 @@ mod tests {
             assert!(decode_persisted_list_val(&json.to_string()).is_err());
         }
     }
+}
+
+/// Install the SDK hook before any export decoding or provider construction.
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub fn enter_export() {
+    crate::diagnostics::install_panic_hook();
 }

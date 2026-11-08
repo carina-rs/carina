@@ -1,9 +1,17 @@
 //! Text supplied by providers for host diagnostics.
 
 pub mod boundary;
+mod events;
+pub(crate) use events::DiagnosticOwner;
+pub use events::{
+    BoundProviderEvent, EventLevel, ProviderDiagnosticChannel, ProviderEvent,
+    ProviderEventPresentation, ProviderValueDiagnostic, ValueOrigin, present_event,
+};
 mod composition_contract;
 #[cfg(test)]
 mod composition_tests;
+#[cfg(test)]
+mod event_tests;
 mod guest_inputs;
 #[cfg(feature = "guest-runtime")]
 mod guest_store;
@@ -681,14 +689,7 @@ impl ErrorText<Unbound> {
         }
     }
     pub(crate) fn into_host(self, secrets: &RedactionSet) -> ErrorText<Bound> {
-        ErrorText {
-            content: TextContent::Bound(vec![Segment::Provider {
-                text: self.opaque(),
-                secrets: secrets.clone(),
-            }]),
-            projection: Default::default(),
-            state: std::marker::PhantomData,
-        }
+        events::bind_text(self.opaque(), secrets)
     }
 }
 impl<S: TextState> From<&str> for ErrorText<S> {

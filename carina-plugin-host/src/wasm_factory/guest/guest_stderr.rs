@@ -1,23 +1,31 @@
-//! Host-owned stderr for provider guests. Retain a bounded sanitized prefix
+//! Host-owned diagnostic output. This type has no production WASI stream capability. Retain a bounded sanitized prefix
 //! and count the entire discarded tail before emitting one line at its end.
 
 use std::io::{self, Write};
+#[cfg(test)]
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
 use std::task::{Context, Poll};
 
 use carina_core::provider::ProviderValidationInputs;
 use carina_core::provider_text::GuestInputInventory;
+#[cfg(test)]
+use carina_core::provider_text::MAX_PROVIDER_TEXT_BYTES;
+use carina_core::provider_text::RedactingLineWriter;
 use carina_core::provider_text::RedactionSet;
-use carina_core::provider_text::{MAX_PROVIDER_TEXT_BYTES, RedactingLineWriter};
+#[cfg(test)]
 use hyper::body::Bytes;
+#[cfg(test)]
 use tokio::io::AsyncWrite;
+#[cfg(test)]
 use wasmtime_wasi::cli::{IsTerminal, StdoutStream};
+#[cfg(test)]
 use wasmtime_wasi::p2::{OutputStream, Pollable, StreamError, StreamResult};
 
 /// All handles for one guest stderr share a buffer and a host-owned sink.
 #[derive(Clone)]
-pub(in crate::wasm_factory) struct GuestStderr {
+pub(in crate::wasm_factory) struct HostOutput {
     state: Arc<Mutex<LineBuffer>>,
 }
 
@@ -44,7 +52,7 @@ impl Write for SharedSink {
             .flush()
     }
 }
-impl GuestStderr {
+impl HostOutput {
     pub(in crate::wasm_factory) fn new(sink: impl Write + Send + 'static) -> Self {
         let sink = SharedSink(Arc::new(Mutex::new(Box::new(sink))));
         Self {
@@ -61,14 +69,14 @@ impl GuestStderr {
     pub(in crate::wasm_factory) fn begin_call(
         &self,
         session: &ProviderValidationInputs,
-    ) -> GuestStderrCall {
+    ) -> HostOutputCall {
         self.begin_inventory_call(session, &session.guest_inventory())
     }
     pub(in crate::wasm_factory) fn begin_inventory_call(
         &self,
         session: &ProviderValidationInputs,
         inputs: &GuestInputInventory,
-    ) -> GuestStderrCall {
+    ) -> HostOutputCall {
         let mut state = self
             .state
             .lock()
@@ -76,7 +84,7 @@ impl GuestStderr {
         let _ = state.flush_pending();
         state.session = Some(session.redaction_set().clone());
         state.writer = Some(inputs.line_writer(state.sink.clone()));
-        GuestStderrCall(self.clone())
+        HostOutputCall(self.clone())
     }
     pub(in crate::wasm_factory) fn known_secrets(&self) -> Option<RedactionSet> {
         self.state
@@ -96,6 +104,7 @@ impl GuestStderr {
         state.flush_pending()
     }
 
+    #[cfg(test)]
     fn write_bytes(&self, bytes: &[u8]) -> io::Result<()> {
         self.state
             .lock()
@@ -110,6 +119,7 @@ impl GuestStderr {
             .flush_pending()
     }
 
+    #[cfg(test)]
     fn flush_sink(&self) -> io::Result<()> {
         self.state
             .lock()
@@ -118,8 +128,8 @@ impl GuestStderr {
     }
 }
 
-pub(in crate::wasm_factory) struct GuestStderrCall(GuestStderr);
-impl Drop for GuestStderrCall {
+pub(in crate::wasm_factory) struct HostOutputCall(HostOutput);
+impl Drop for HostOutputCall {
     fn drop(&mut self) {
         let _ = self.0.flush_pending();
     }
@@ -218,13 +228,15 @@ impl LineBuffer {
     }
 }
 
-impl IsTerminal for GuestStderr {
+#[cfg(test)]
+impl IsTerminal for HostOutput {
     fn is_terminal(&self) -> bool {
         false
     }
 }
 
-impl StdoutStream for GuestStderr {
+#[cfg(test)]
+impl StdoutStream for HostOutput {
     fn p2_stream(&self) -> Box<dyn OutputStream> {
         Box::new(self.clone())
     }
@@ -234,12 +246,14 @@ impl StdoutStream for GuestStderr {
     }
 }
 
+#[cfg(test)]
 #[wasmtime_wasi::async_trait]
-impl Pollable for GuestStderr {
+impl Pollable for HostOutput {
     async fn ready(&mut self) {}
 }
 
-impl OutputStream for GuestStderr {
+#[cfg(test)]
+impl OutputStream for HostOutput {
     fn write(&mut self, bytes: Bytes) -> StreamResult<()> {
         self.write_bytes(&bytes)
             .map_err(|error| StreamError::LastOperationFailed(wasmtime::Error::new(error)))
@@ -264,7 +278,8 @@ impl OutputStream for GuestStderr {
     }
 }
 
-impl AsyncWrite for GuestStderr {
+#[cfg(test)]
+impl AsyncWrite for HostOutput {
     fn poll_write(
         self: Pin<&mut Self>,
         _cx: &mut Context<'_>,
@@ -377,7 +392,7 @@ mod tests {
         const CHUNK: usize = 4093;
         const SPLIT: &str = "split-private-4305";
         let capture = Capture::default();
-        let stderr = GuestStderr::new(capture.clone());
+        let stderr = HostOutput::new(capture.clone());
         let context = crate::provider_text_fixtures::context(&[
             "volume-private-4305",
             "unicode-秘密-4305",
@@ -424,7 +439,7 @@ mod tests {
     #[test]
     fn guest_stderr_uses_current_call_then_instance_union_without_a_call() {
         let capture = Capture::default();
-        let stderr = GuestStderr::new(capture.clone());
+        let stderr = HostOutput::new(capture.clone());
         let mut stream = stderr.p2_stream();
         {
             let _call = stderr.begin_call(
@@ -448,7 +463,7 @@ mod tests {
             "(secret)\n(secret) (secret)\n(secret) (secret)\n"
         );
         let independent = Capture::default();
-        let other = GuestStderr::new(independent.clone());
+        let other = HostOutput::new(independent.clone());
         write_all(other.p2_stream().as_mut(), b"first-private\n");
         assert_eq!(independent.text(), "first-private\n");
     }
@@ -456,7 +471,7 @@ mod tests {
     #[test]
     fn review_a1_poison_relay_does_not_rescan_inserted_masks() {
         let context = call_secrets("secret");
-        let stderr = GuestStderr::new(Capture::default());
+        let stderr = HostOutput::new(Capture::default());
         drop(stderr.begin_call(&context));
         let reason = super::super::PoisonReason::from_trap(
             "create",
@@ -487,7 +502,7 @@ mod tests {
     #[test]
     fn review_a4_guest_stderr_in_flight_retains_previous_resource_secrets() {
         let capture = Capture::default();
-        let stderr = GuestStderr::new(capture.clone());
+        let stderr = HostOutput::new(capture.clone());
         let mut stream = stderr.p2_stream();
         drop(
             stderr.begin_call(
@@ -517,7 +532,7 @@ mod tests {
 
     #[test]
     fn guest_stderr_known_secrets_protect_poisoned_instance_diagnostics() {
-        let stderr = GuestStderr::new(Capture::default());
+        let stderr = HostOutput::new(Capture::default());
         let call = stderr.begin_call(&call_secrets("previous-call-private"));
         drop(call);
         let reason = super::super::PoisonReason::from_trap(
@@ -536,7 +551,7 @@ mod tests {
     #[test]
     fn guest_stderr_masks_multiline_secrets_before_line_framing() {
         let capture = Capture::default();
-        let stderr = GuestStderr::new(capture.clone());
+        let stderr = HostOutput::new(capture.clone());
         let mut stream = stderr.p2_stream();
         let call = stderr.begin_call(&call_secrets("private\nmultiline"));
         write_all(stream.as_mut(), b"public private\n");
@@ -556,7 +571,7 @@ mod tests {
     #[test]
     fn guest_stderr_call_drop_flushes_partial_secret_and_protects_teardown() {
         let capture = Capture::default();
-        let stderr = GuestStderr::new(capture.clone());
+        let stderr = HostOutput::new(capture.clone());
         let mut stream = stderr.p2_stream();
         let call = stderr.begin_call(&call_secrets("private-tail"));
         write_all(stream.as_mut(), b"private-");
@@ -577,7 +592,7 @@ mod tests {
         const SECRET: &str = "guest-stderr-private-4305";
         const MASK: &str = "(secret)";
         let capture = Capture::default();
-        let stderr = GuestStderr::new(capture.clone());
+        let stderr = HostOutput::new(capture.clone());
         let values = indexmap::IndexMap::from([(
             "password".to_owned(),
             carina_core::resource::Value::Deferred(carina_core::resource::DeferredValue::Secret(
@@ -626,7 +641,7 @@ mod tests {
         use carina_core::provider_text::DiagnosticText as ProviderText;
         for terminate_with_newline in [false, true] {
             let capture = Capture::default();
-            let stderr = GuestStderr::new(capture.clone());
+            let stderr = HostOutput::new(capture.clone());
             let mut stream = stderr.p2_stream();
             let raw = format!(
                 "\x1b[2J{}\x1b]0;tail\x07",
@@ -656,7 +671,7 @@ mod tests {
         use carina_core::provider_text::DiagnosticText as ProviderText;
         for oversized in [false, true] {
             let capture = Capture::default();
-            let stderr = GuestStderr::new(capture.clone());
+            let stderr = HostOutput::new(capture.clone());
             let mut stream = stderr.p2_stream();
             let mut raw = if oversized {
                 vec![b'x'; MAX_PROVIDER_TEXT_BYTES - 1]
@@ -685,7 +700,7 @@ mod tests {
     #[test]
     fn guest_stderr_streams_sanitized_lines_and_caps_long_lines() {
         let capture = Capture::default();
-        let stderr = GuestStderr::new(capture.clone());
+        let stderr = HostOutput::new(capture.clone());
         let mut stream = stderr.p2_stream();
         write_all(stream.as_mut(), b"\x1b[2J");
         assert!(
@@ -725,7 +740,7 @@ mod tests {
     async fn guest_stderr_keeps_one_line_across_flushed_dropped_handles() {
         for use_async in [false, true] {
             let capture = Capture::default();
-            let stderr = GuestStderr::new(capture.clone());
+            let stderr = HostOutput::new(capture.clone());
             for piece in [
                 b"a ".as_slice(),
                 b"\x1b",
@@ -771,7 +786,7 @@ mod tests {
 
         let capture = Capture::default();
         let mut ctx = wasmtime_wasi::WasiCtxBuilder::new()
-            .stderr(GuestStderr::new(capture.clone()))
+            .stderr(HostOutput::new(capture.clone()))
             .build();
         let mut table = ResourceTable::new();
         let stream = WasiCliCtxView {
@@ -801,7 +816,7 @@ mod tests {
     #[tokio::test]
     async fn guest_stderr_shares_utf8_buffer_between_p2_and_async_handles() {
         let capture = Capture::default();
-        let stderr = GuestStderr::new(capture.clone());
+        let stderr = HostOutput::new(capture.clone());
         let mut p2 = stderr.p2_stream();
         let mut async_stream = Pin::from(stderr.async_stream());
         write_all(p2.as_mut(), b"a\xff\xf0\x9f");
@@ -820,7 +835,7 @@ mod tests {
         use carina_core::provider_text::DiagnosticText as ProviderText;
         for suffix in ["あ".as_bytes(), "🦀".as_bytes()] {
             let capture = Capture::default();
-            let stderr = GuestStderr::new(capture.clone());
+            let stderr = HostOutput::new(capture.clone());
             let mut stream = stderr.p2_stream();
             write_all(stream.as_mut(), &vec![b'x'; MAX_PROVIDER_TEXT_BYTES - 1]);
             for byte in suffix {
@@ -834,7 +849,7 @@ mod tests {
         }
 
         let capture = Capture::default();
-        let stderr = GuestStderr::new(capture.clone());
+        let stderr = HostOutput::new(capture.clone());
         let mut stream = stderr.p2_stream();
         write_all(stream.as_mut(), &vec![0xe2; 3 * MAX_PROVIDER_TEXT_BYTES]);
         assert!(stderr.state.lock().unwrap().utf8_tail.len() < char::MAX.len_utf8());
@@ -863,7 +878,7 @@ mod tests {
     #[test]
     fn guest_stderr_preserves_delimiters_after_truncation_and_escapes_other_controls() {
         let capture = Capture::default();
-        let stderr = GuestStderr::new(capture.clone());
+        let stderr = HostOutput::new(capture.clone());
         let mut stream = stderr.p2_stream();
         write_all(stream.as_mut(), &vec![b'x'; MAX_PROVIDER_TEXT_BYTES + 1]);
         assert!(capture.text().is_empty());
@@ -889,7 +904,7 @@ mod tests {
             }
         }
         let attempts = Arc::new(AtomicUsize::new(0));
-        let stderr = GuestStderr::new(FailingSink(Arc::clone(&attempts)));
+        let stderr = HostOutput::new(FailingSink(Arc::clone(&attempts)));
         let mut stream = stderr.p2_stream();
         let error = stream.write(Bytes::from_static(b"failed\n")).unwrap_err();
         let StreamError::LastOperationFailed(error) = error else {

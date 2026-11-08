@@ -7157,6 +7157,7 @@ impl InitializedProvider {
 /// Normalizer-only loading returns this type. It deliberately has no API that
 /// can mint a [`crate::differ::ComparisonSchema`].
 pub struct ConfiguredNormalizer<N = Box<dyn ProviderNormalizer>> {
+    pub(crate) _diagnostic_owner: crate::provider_text::DiagnosticOwner,
     pub(crate) route: Option<ProviderInstanceKey>,
     pub(crate) provider_name: String,
     pub(crate) ext: N,
@@ -7192,6 +7193,9 @@ impl NormalizerRouter {
 impl<N> ConfiguredNormalizer<N> {
     pub(crate) fn fixture(ext: N) -> Self {
         Self {
+            _diagnostic_owner: ProviderPlan::state_only()
+                .session("", None, None)
+                .diagnostic_owner(),
             route: None,
             provider_name: String::new(),
             ext,
@@ -7205,6 +7209,7 @@ impl<N> ConfiguredNormalizer<N> {
         schemas: &SchemaRegistry,
     ) -> Self {
         Self {
+            _diagnostic_owner: session.diagnostic_owner(),
             route: None,
             provider_name: String::new(),
             ext,
@@ -7221,6 +7226,9 @@ impl NormalizerRouter {
         ext: Box<dyn ProviderNormalizer>,
     ) {
         self.add_initialized_normalizer(ConfiguredNormalizer {
+            _diagnostic_owner: ProviderPlan::state_only()
+                .session("", None, None)
+                .diagnostic_owner(),
             route: None,
             provider_name: provider_name.into(),
             ext,

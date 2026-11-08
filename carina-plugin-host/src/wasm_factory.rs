@@ -1567,7 +1567,7 @@ struct AllowListHttpHooks {
     resolver: Arc<dyn DestinationResolver>,
     test_route: Option<HttpTestRoute>,
     call_egress: Option<CallEgressRecorder>,
-    stderr: guest_stderr::GuestStderr,
+    stderr: guest_stderr::HostOutput,
 }
 
 impl AllowListHttpHooks {
@@ -1582,7 +1582,7 @@ impl AllowListHttpHooks {
             resolver,
             test_route: None,
             call_egress: None,
-            stderr: guest_stderr::GuestStderr::new(std::io::stderr()),
+            stderr: guest_stderr::HostOutput::new(std::io::stderr()),
         }
     }
 
@@ -1798,7 +1798,7 @@ async fn send_request_handler(
     mut request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
     config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
     destination: VettedDestination,
-    trace: Option<guest_stderr::GuestStderr>,
+    trace: Option<guest_stderr::HostOutput>,
 ) -> Result<
     wasmtime_wasi_http::p2::types::IncomingResponse,
     wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
@@ -2071,6 +2071,11 @@ fn create_linker(
     add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
         WasmBindingCreationError::Instantiation(error.context("Failed to add WASI to linker"))
     })?;
+    guest::add_diagnostic_imports(&mut linker).map_err(|error| {
+        WasmBindingCreationError::Instantiation(
+            error.context("Failed to add typed provider imports"),
+        )
+    })?;
     match world {
         InstantiationWorld::Basic => {}
         InstantiationWorld::HttpEnabled => {
@@ -2322,12 +2327,7 @@ fn build_sandboxed_wasi_ctx_with(
         .session("", None, None)
         .guest_inventory();
     let store = carina_core::provider_text::GuestStoreData::new_store(&engine, (), inputs);
-    build_sandboxed_wasi_ctx_with_stderr(
-        store.data(),
-        capabilities,
-        env_value,
-        guest_stderr::GuestStderr::new(std::io::stderr()),
-    )
+    build_sandboxed_wasi_ctx_for_store(store.data(), capabilities, env_value)
 }
 
 struct GuestEnvironmentPartition {
@@ -2351,14 +2351,14 @@ fn handoff_credential<T>(
         _ => unreachable!("host credentials are constructed as strings"),
     }
 }
-fn build_sandboxed_wasi_ctx_with_stderr<T>(
+fn build_sandboxed_wasi_ctx_for_store<T>(
     store: &carina_core::provider_text::GuestStoreData<T>,
     capabilities: Option<&RuntimeCapabilities>,
     mut env_value: impl FnMut(&str) -> Option<String>,
-    stderr: guest_stderr::GuestStderr,
 ) -> WasiCtx {
     let mut builder = WasiCtxBuilder::new();
-    builder.stderr(stderr);
+    builder.stdout(wasmtime_wasi::p2::pipe::SinkOutputStream);
+    builder.stderr(wasmtime_wasi::p2::pipe::SinkOutputStream);
     let partition = capabilities
         .map(RuntimeCapabilities::environment_partition)
         .unwrap_or(GuestEnvironmentPartition {

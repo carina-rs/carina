@@ -124,10 +124,10 @@ impl SavedProviderConfiguration<NoPlaceholder, SavedInputsResolved> {
     pub fn provider_plan(&self) -> crate::provider::ProviderPlan {
         let mut plan = crate::provider::ProviderPlan::state_only();
         for resource in &self.resources {
-            plan.include(&resource.id, resource.attributes.values());
+            plan.include(&resource.id, resource.attributes.iter());
         }
         for source in &self.data_sources {
-            plan.include(&source.id, source.attributes.values());
+            plan.include(&source.id, source.attributes.iter());
         }
         plan
     }

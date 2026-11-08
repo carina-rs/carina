@@ -1,4 +1,6 @@
 //! Integration tests for the general mock and the isolated wasi:http probe guests.
+#[path = "wasm_integration/provider_diagnostics.rs"]
+mod provider_diagnostics;
 
 #[path = "../../carina-core/tests/support/provider_text.rs"]
 mod provider_text_fixtures;

@@ -5,6 +5,13 @@
 pub use carina_core as core;
 pub use carina_provider_protocol as protocol;
 mod authoring;
+mod diagnostics;
+mod diagnostics_contract;
+pub use carina_core::provider_text::{EventLevel, ProviderValueDiagnostic, ValueOrigin};
+pub use diagnostics::{ProviderDiagnostics, ProviderEvent, expect_diagnostic, panic_diagnostic};
+#[cfg(test)]
+mod diagnostics_tests;
+pub mod protected_material;
 /// Provider authoring values. Errors and partial reasons remain opaque until encoding.
 pub mod types {
     pub use crate::authoring::{ReferenceError, ReferenceOutcome, UpdateResult as UpdateOutcome};

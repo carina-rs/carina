@@ -6,6 +6,7 @@ members = [
     "carina-lsp",
     "carina-plugin-bindings-aws",
     "carina-plugin-bindings-aws-credentials",
+    "carina-plugin-bindings-diagnostics",
     "carina-plugin-bindings-http",
     "carina-plugin-bindings-provider",
     "carina-plugin-host",

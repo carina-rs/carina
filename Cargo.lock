@@ -1169,6 +1169,7 @@ name = "carina-plugin-bindings-aws"
 version = "0.13.1"
 dependencies = [
  "carina-plugin-bindings-aws-credentials",
+ "carina-plugin-bindings-diagnostics",
  "wasi 0.14.7+wasi-0.2.4",
  "wit-bindgen 0.54.0",
 ]
@@ -1181,9 +1182,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "carina-plugin-bindings-diagnostics"
+version = "0.13.1"
+dependencies = [
+ "wit-bindgen 0.54.0",
+]
+
+[[package]]
 name = "carina-plugin-bindings-http"
 version = "0.13.1"
 dependencies = [
+ "carina-plugin-bindings-diagnostics",
  "wasi 0.14.7+wasi-0.2.4",
  "wit-bindgen 0.54.0",
 ]
@@ -1192,6 +1201,7 @@ dependencies = [
 name = "carina-plugin-bindings-provider"
 version = "0.13.1"
 dependencies = [
+ "carina-plugin-bindings-diagnostics",
  "wit-bindgen 0.54.0",
 ]
 
@@ -1239,16 +1249,19 @@ dependencies = [
 name = "carina-plugin-sdk"
 version = "0.13.1"
 dependencies = [
+ "aws-credential-types",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
  "carina-core",
  "carina-plugin-bindings-aws",
  "carina-plugin-bindings-aws-credentials",
+ "carina-plugin-bindings-diagnostics",
  "carina-plugin-bindings-http",
  "carina-plugin-bindings-provider",
  "carina-provider-protocol",
  "http 1.4.0",
  "indexmap 2.13.0",
+ "percent-encoding",
  "serde",
  "serde_json",
  "tokio",
@@ -1268,6 +1281,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "uuid",
+ "wasi 0.14.7+wasi-0.2.4",
 ]
 
 [[package]]

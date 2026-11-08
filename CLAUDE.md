@@ -682,6 +682,28 @@ A struct type represents a nested object with typed fields.
   across or explicitly bound and documented as unavailable on the destination
   side. Never use a catch-all `_` or `..` at this seam; a silently dropped field
   is invisible in production and cost carina#3034 its effect (carina#3772).
+- **Provider diagnostics** (carina#4334): protocol 25 and WIT package 0.2.0
+  require `diagnostics` and `protected-material` imports in every provider
+  world. `ProviderDiagnostics::emit` accepts only typed events borrowing
+  provider errors/diagnostics or carrying structured value candidates. The
+  host binds them through the same private text kernel as returned errors.
+  Only that kernel mints `BoundProviderEvent`; its presenter consumes Bound
+  segments and never constructs `HostText` or uses generic Bound error or
+  partial-reason constructors. Closing those older constructors remains #4301.
+  Value origin is advisory: host-resolved addresses, protected desired-input
+  paths, schema write-only fields and the existing `RedactionSet` decide
+  masking. An unresolved address masks the subtree. Every string leaf and key
+  uses that same redactor; decoded guest values acquire no protection marks.
+  Raw WASI stdout/stderr have discard-only capabilities from metadata through
+  teardown. Host-owned HTTP traces keep the redacting stream. The SDK panic
+  hook precedes construction and exports, preserves string payloads and typed
+  locations, and never invokes the default hook or formats unknown payloads.
+  Credential and signing adoption requires registration acknowledgement before
+  operational wrappers can reach transport. Inventories retain old generations;
+  event/tree/rate and registration budgets fail without a plaintext fallback.
+  Native factories receive the same typed channel through `ProviderSession`;
+  this does not refuse native OS output. Diagnostics are not persisted and do
+  not change the state format.
 - **Desired normalization is per leaf** (carina#4194). The normalization opacity policy,
   `carina_core::resource::is_deferred_desired_leaf`, marks every
   `Value::Deferred` leaf (references, unknowns, secrets, other unresolved

@@ -26,6 +26,9 @@ use std::fmt;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+use crate::protected_material::{
+    RegisteredAwsSession, RegisteredRequest, RegisteredSignedMaterial,
+};
 use aws_smithy_runtime_api::client::http::{
     HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpClient,
     SharedHttpConnector,
@@ -35,6 +38,7 @@ use aws_smithy_runtime_api::client::result::ConnectorError;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
 use aws_smithy_runtime_api::http::Response;
 use aws_smithy_types::body::SdkBody;
+#[cfg(test)]
 use carina_provider_protocol::http_trace::{TraceHeaders, TraceUri};
 
 use wasi::http::outgoing_handler;
@@ -162,24 +166,42 @@ impl ResponseBodyError {
 #[derive(Debug)]
 pub struct TransportFailure {
     phase: SendPhase,
-    code: Option<ErrorCode>,
-    message: String,
+    detail: TransportFailureDetail,
+}
+#[derive(Debug)]
+enum TransportFailureDetail {
+    Transport {
+        code: Option<ErrorCode>,
+        message: String,
+    },
+    Preparation(crate::protected_material::RequestPreparationError),
 }
 
 impl TransportFailure {
     fn maybe_sent(message: impl Into<String>, code: Option<ErrorCode>) -> Self {
         Self {
             phase: SendPhase::MaybeSent,
-            code,
-            message: message.into(),
+            detail: TransportFailureDetail::Transport {
+                code,
+                message: message.into(),
+            },
         }
     }
 
     fn from_code(message: impl Into<String>, code: ErrorCode) -> Self {
         Self {
             phase: send_phase(&code),
-            code: Some(code),
-            message: message.into(),
+            detail: TransportFailureDetail::Transport {
+                code: Some(code),
+                message: message.into(),
+            },
+        }
+    }
+
+    fn preparation(error: crate::protected_material::RequestPreparationError) -> Self {
+        Self {
+            phase: SendPhase::NotSent,
+            detail: TransportFailureDetail::Preparation(error),
         }
     }
 
@@ -190,7 +212,10 @@ impl TransportFailure {
 
     /// Return the wasi:http error code when the failing API supplied one.
     pub fn code(&self) -> Option<&ErrorCode> {
-        self.code.as_ref()
+        match &self.detail {
+            TransportFailureDetail::Transport { code, message: _ } => code.as_ref(),
+            TransportFailureDetail::Preparation(_error) => None,
+        }
     }
 }
 
@@ -198,8 +223,10 @@ impl From<PreSendError> for TransportFailure {
     fn from(error: PreSendError) -> Self {
         Self {
             phase: SendPhase::NotSent,
-            code: None,
-            message: error.message,
+            detail: TransportFailureDetail::Transport {
+                code: None,
+                message: error.message,
+            },
         }
     }
 }
@@ -209,19 +236,36 @@ impl From<ResponseBodyError> for TransportFailure {
         // A response proves the request was sent, regardless of its error code.
         Self {
             phase: SendPhase::MaybeSent,
-            code: error.code,
-            message: error.message,
+            detail: TransportFailureDetail::Transport {
+                code: error.code,
+                message: error.message,
+            },
         }
     }
 }
 
 impl fmt::Display for TransportFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
+        match &self.detail {
+            TransportFailureDetail::Transport { code: _, message } => f.write_str(message),
+            TransportFailureDetail::Preparation(_error) => {
+                f.write_str("HTTP request preparation failed")
+            }
+        }
     }
 }
 
-impl std::error::Error for TransportFailure {}
+impl std::error::Error for TransportFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.detail {
+            TransportFailureDetail::Transport {
+                code: _,
+                message: _,
+            } => None,
+            TransportFailureDetail::Preparation(error) => Some(error),
+        }
+    }
+}
 
 /// Return the send phase carried by a connector error from this transport.
 ///
@@ -251,6 +295,7 @@ fn trace_enabled() -> bool {
     })
 }
 
+#[cfg(test)]
 fn http_trace_headers_line(
     method: &str,
     uri: TraceUri<'_>,
@@ -263,6 +308,7 @@ fn http_trace_headers_line(
     )
 }
 
+#[cfg(test)]
 fn http_trace_timing_line(
     method: &str,
     uri: TraceUri<'_>,
@@ -305,7 +351,9 @@ fn http_trace_timing_line(
 /// inside a WASM component. The host (via wasmtime-wasi-http) provides the
 /// actual HTTP implementation.
 #[derive(Clone)]
-pub struct WasiHttpClient;
+pub struct WasiHttpClient {
+    credentials: RegisteredAwsSession,
+}
 
 impl fmt::Debug for WasiHttpClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -315,19 +363,13 @@ impl fmt::Debug for WasiHttpClient {
 
 impl WasiHttpClient {
     /// Create a new WasiHttpClient.
-    pub fn new() -> Self {
-        Self
+    pub fn new(credentials: RegisteredAwsSession) -> Self {
+        Self { credentials }
     }
 
     /// Create a SharedHttpClient for use with aws-config.
-    pub fn shared() -> SharedHttpClient {
-        SharedHttpClient::new(Self::new())
-    }
-}
-
-impl Default for WasiHttpClient {
-    fn default() -> Self {
-        Self::new()
+    pub fn shared(credentials: RegisteredAwsSession) -> SharedHttpClient {
+        SharedHttpClient::new(Self::new(credentials))
     }
 }
 
@@ -340,6 +382,7 @@ impl HttpClient for WasiHttpClient {
         SharedHttpConnector::new(WasiHttpConnector {
             connect_timeout: settings.connect_timeout(),
             read_timeout: settings.read_timeout(),
+            credentials: self.credentials.clone(),
         })
     }
 }
@@ -347,6 +390,7 @@ impl HttpClient for WasiHttpClient {
 /// An HTTP connector that carries SDK-supplied timeouts into wasi:http requests.
 #[derive(Clone)]
 struct WasiHttpConnector {
+    credentials: RegisteredAwsSession,
     connect_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
 }
@@ -363,7 +407,7 @@ impl fmt::Debug for WasiHttpConnector {
 impl HttpConnector for WasiHttpConnector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         let options = build_request_options(self.connect_timeout, self.read_timeout);
-        HttpConnectorFuture::ready(make_request(request, options))
+        HttpConnectorFuture::ready(make_request(request, options, &self.credentials))
     }
 }
 
@@ -524,10 +568,103 @@ fn prepare_request(request: WasiRequest) -> Result<PreparedRequest, PreSendError
 /// [`send_request`] and the AWS SDK [`WasiHttpClient`] funnel through
 /// here, so the body-framing fixes (carina#3254 / #3320 / #3318) apply
 /// to every caller.
-fn execute(
+struct RegisteredWasiRequest {
     request: WasiRequest,
+    registration: RegisteredSignedMaterial,
+}
+
+fn execute(
+    registered: RegisteredWasiRequest,
     options: Option<RequestOptions>,
 ) -> Result<WasiResponse, TransportFailure> {
+    #[cfg(target_arch = "wasm32")]
+    let error_trace = trace_enabled().then(|| {
+        (
+            registered.registration.diagnostics.clone(),
+            registered.request.method.clone(),
+            registered.request.uri.clone(),
+            registered.request.body.len() as u64,
+        )
+    });
+    let mut phases_ms = [0; 7];
+    let result = execute_registered(registered, options, &mut phases_ms);
+    #[cfg(target_arch = "wasm32")]
+    if let (Some((diagnostics, method, uri, request_body_bytes)), Err(error)) =
+        (error_trace, &result)
+    {
+        diagnostics.http(carina_provider_protocol::diagnostics::HttpDiagnostic {
+            method,
+            uri,
+            headers: Vec::new(),
+            request_body_bytes,
+            response_body_bytes: None,
+            status: None,
+            transport_code: error.code().map(trace_transport_code),
+            phases_ms,
+        });
+    }
+    result
+}
+
+#[cfg(target_arch = "wasm32")]
+fn trace_transport_code(
+    code: &ErrorCode,
+) -> carina_provider_protocol::diagnostics::HttpTransportCode {
+    use carina_provider_protocol::diagnostics::HttpTransportCode as Code;
+    match code {
+        ErrorCode::DnsTimeout => Code::Dns,
+        ErrorCode::DnsError(_payload) => Code::Dns,
+        ErrorCode::DestinationNotFound => Code::Connect,
+        ErrorCode::DestinationUnavailable => Code::Connect,
+        ErrorCode::DestinationIpProhibited => Code::Connect,
+        ErrorCode::DestinationIpUnroutable => Code::Connect,
+        ErrorCode::ConnectionRefused => Code::Connect,
+        ErrorCode::ConnectionTerminated => Code::Connect,
+        ErrorCode::ConnectionLimitReached => Code::Connect,
+        ErrorCode::ConnectionTimeout => Code::Timeout,
+        ErrorCode::ConnectionReadTimeout => Code::Timeout,
+        ErrorCode::ConnectionWriteTimeout => Code::Timeout,
+        ErrorCode::HttpResponseTimeout => Code::Timeout,
+        ErrorCode::TlsProtocolError => Code::Tls,
+        ErrorCode::TlsCertificateError => Code::Tls,
+        ErrorCode::TlsAlertReceived(_payload) => Code::Tls,
+        ErrorCode::HttpRequestBodySize(_size) => Code::Body,
+        ErrorCode::HttpResponseBodySize(_size) => Code::Body,
+        ErrorCode::HttpResponseIncomplete => Code::Body,
+        ErrorCode::HttpRequestDenied => Code::Protocol,
+        ErrorCode::HttpRequestLengthRequired => Code::Protocol,
+        ErrorCode::HttpRequestMethodInvalid => Code::Protocol,
+        ErrorCode::HttpRequestUriInvalid => Code::Protocol,
+        ErrorCode::HttpRequestUriTooLong => Code::Protocol,
+        ErrorCode::HttpRequestHeaderSectionSize(_size) => Code::Protocol,
+        ErrorCode::HttpRequestHeaderSize(_payload) => Code::Protocol,
+        ErrorCode::HttpRequestTrailerSectionSize(_size) => Code::Protocol,
+        ErrorCode::HttpRequestTrailerSize(_payload) => Code::Protocol,
+        ErrorCode::HttpResponseHeaderSectionSize(_size) => Code::Protocol,
+        ErrorCode::HttpResponseHeaderSize(_payload) => Code::Protocol,
+        ErrorCode::HttpResponseTrailerSectionSize(_size) => Code::Protocol,
+        ErrorCode::HttpResponseTrailerSize(_payload) => Code::Protocol,
+        ErrorCode::HttpResponseTransferCoding(_coding) => Code::Protocol,
+        ErrorCode::HttpResponseContentCoding(_coding) => Code::Protocol,
+        ErrorCode::HttpUpgradeFailed => Code::Protocol,
+        ErrorCode::HttpProtocolError => Code::Protocol,
+        ErrorCode::LoopDetected => Code::Protocol,
+        ErrorCode::ConfigurationError => Code::Protocol,
+        ErrorCode::InternalError(_message) => Code::Protocol,
+    }
+}
+
+fn execute_registered(
+    registered: RegisteredWasiRequest,
+    options: Option<RequestOptions>,
+    phases_ms: &mut [u64; 7],
+) -> Result<WasiResponse, TransportFailure> {
+    let RegisteredWasiRequest {
+        request,
+        registration,
+    } = registered;
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = &registration;
     let trace = trace_enabled();
     let req_start = if trace { Some(Instant::now()) } else { None };
     let trace_method = if trace {
@@ -541,20 +678,20 @@ fn execute(
         String::new()
     };
 
+    #[cfg(target_arch = "wasm32")]
     if trace {
-        // Dump request headers before any wasi:http translation. Used to
-        // confirm whether body-less requests carry `content-length: 0` /
-        // `transfer-encoding: chunked` / `expect: 100-continue` (the
-        // body-framing hypotheses narrowed for the ~20 s S3 latency).
-        eprintln!(
-            "{}",
-            http_trace_headers_line(
-                &trace_method,
-                TraceUri::new(&trace_uri),
-                request.body.len(),
-                TraceHeaders::new(&request.headers),
-            )
-        );
+        registration
+            .diagnostics
+            .http(carina_provider_protocol::diagnostics::HttpDiagnostic {
+                method: trace_method.clone(),
+                uri: trace_uri.clone(),
+                headers: request.headers.clone(),
+                request_body_bytes: request.body.len() as u64,
+                response_body_bytes: None,
+                status: None,
+                transport_code: None,
+                phases_ms: [0; 7],
+            });
     }
 
     let PreparedRequest {
@@ -564,6 +701,9 @@ fn execute(
     } = prepare_request(request)?;
     let body_len = body.content_length();
     let t_setup_done = req_start.map(|s| s.elapsed());
+    phases_ms[0] = t_setup_done
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
 
     // Hand the request off to the host *first* so the hyper task that
     // consumes the body channel is spawned before we start writing.
@@ -576,45 +716,64 @@ fn execute(
     let future_response = outgoing_handler::handle(outgoing_request, options)
         .map_err(|e| TransportFailure::from_code(format!("outgoing-handler error: {e:?}"), e))?;
     let t_handle_done = req_start.map(|s| s.elapsed());
+    phases_ms[1] = t_handle_done
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
 
     // Now ship the body. The hyper consumer is live, so each
     // `blocking_write_and_flush` chunk drains as it goes and the
     // channel stays well below its capacity bound.
     let write_error = write_body(&outgoing_body, body.as_bytes()).err();
     let t_write_body_done = req_start.map(|s| s.elapsed());
+    phases_ms[2] = t_write_body_done
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
     // Close the producer even after a failed write, before waiting for the
     // response, so the host cannot remain blocked on an open request body.
     let finish_error = OutgoingBody::finish(outgoing_body, None)
         .err()
         .map(|e| TransportFailure::from_code(format!("Failed to finish body: {e:?}"), e));
     let t_body_finish_done = req_start.map(|s| s.elapsed());
+    phases_ms[3] = t_body_finish_done
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
     // Wait for the response by polling
     let pollable = future_response.subscribe();
     pollable.block();
     let t_pollable_block_done = req_start.map(|s| s.elapsed());
+    phases_ms[4] = t_pollable_block_done
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
 
     let response = resolve_response(future_response.get(), write_error.or(finish_error))?;
     let t_get_response_done = req_start.map(|s| s.elapsed());
+    phases_ms[5] = t_get_response_done
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
 
     let response = read_response(response)?;
     let t_read_body_done = req_start.map(|s| s.elapsed());
+    phases_ms[6] = t_read_body_done
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0);
 
+    #[cfg(target_arch = "wasm32")]
     if trace {
-        // Emit a single-line breakdown so it can be greped from log files.
-        // Cumulative milliseconds since execute() entry, one column per
-        // phase. Phases that should be ~instant on the WASM side
-        // (everything except pollable.block) flag a host-side stall when
-        // they grow.
-        let ms = |d: Option<Duration>| d.map(|x| x.as_millis()).unwrap_or(0);
-        eprintln!(
-            "{}",
-            http_trace_timing_line(
-                &trace_method,
-                TraceUri::new(&trace_uri),
-                response.status,
-                body_len,
-                response.body.len(),
-                [
+        let ms = |d: Option<Duration>| {
+            d.map(|x| u64::try_from(x.as_millis()).unwrap_or(u64::MAX))
+                .unwrap_or(0)
+        };
+        registration
+            .diagnostics
+            .http(carina_provider_protocol::diagnostics::HttpDiagnostic {
+                method: trace_method,
+                uri: trace_uri,
+                headers: Vec::new(),
+                request_body_bytes: body_len as u64,
+                response_body_bytes: Some(response.body.len() as u64),
+                status: Some(response.status),
+                transport_code: None,
+                phases_ms: [
                     ms(t_setup_done),
                     ms(t_handle_done),
                     ms(t_write_body_done),
@@ -623,9 +782,21 @@ fn execute(
                     ms(t_get_response_done),
                     ms(t_read_body_done),
                 ],
-            )
-        );
+            });
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = (
+        trace_method,
+        trace_uri,
+        body_len,
+        t_setup_done,
+        t_handle_done,
+        t_write_body_done,
+        t_body_finish_done,
+        t_pollable_block_done,
+        t_get_response_done,
+        t_read_body_done,
+    );
 
     Ok(response)
 }
@@ -642,8 +813,12 @@ fn execute(
 /// same resend-safety decision as the AWS SDK path. The body-framing fixes in
 /// [`execute`] (carina#3254 / #3320 / #3318) apply to both paths.
 pub fn send_request(
-    request: http::Request<Vec<u8>>,
+    registered: RegisteredRequest,
 ) -> Result<http::Response<Vec<u8>>, TransportFailure> {
+    let RegisteredRequest {
+        request,
+        registration,
+    } = registered;
     let (parts, body) = request.into_parts();
     let headers = parts
         .headers
@@ -657,7 +832,14 @@ pub fn send_request(
         body,
     };
 
-    build_http_response(execute(wasi_req, None)?).map_err(Into::into)
+    build_http_response(execute(
+        RegisteredWasiRequest {
+            request: wasi_req,
+            registration,
+        },
+        None,
+    )?)
+    .map_err(Into::into)
 }
 
 fn build_http_response(
@@ -678,6 +860,7 @@ fn build_http_response(
 fn make_request(
     request: HttpRequest,
     options: Option<RequestOptions>,
+    credentials: &RegisteredAwsSession,
 ) -> Result<Response<SdkBody>, ConnectorError> {
     let headers = request
         .headers()
@@ -691,7 +874,18 @@ fn make_request(
         body: request.body().bytes().unwrap_or(&[]).to_vec(),
     };
 
-    let wasi_resp = execute(wasi_req, options).map_err(connector_error)?;
+    let registration = credentials
+        .diagnostics
+        .register_request_material(&wasi_req.uri, &wasi_req.headers)
+        .map_err(|error| connector_error(TransportFailure::preparation(error)))?;
+    let wasi_resp = execute(
+        RegisteredWasiRequest {
+            request: wasi_req,
+            registration,
+        },
+        options,
+    )
+    .map_err(connector_error)?;
     build_sdk_response(wasi_resp).map_err(|error| connector_error(error.into()))
 }
 
