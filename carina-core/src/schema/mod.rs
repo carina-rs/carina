@@ -7333,11 +7333,17 @@ impl TypeError {
     }
 
     /// Provider name retained from provider-backed validation.
-    pub fn provider_name(&self) -> Option<&str> {
+    pub fn provider_name(&self) -> Option<DiagnosticText> {
         match self {
-            TypeError::CustomTypeValidation { error, .. } => error
-                .provider_error()
-                .and_then(|error| error.detail().provider_name.as_deref()),
+            TypeError::CustomTypeValidation { error, .. } => {
+                error.provider_error().and_then(|error| {
+                    error
+                        .detail()
+                        .provider_name
+                        .as_ref()
+                        .map(|name| name.as_diagnostic())
+                })
+            }
             TypeError::ListItemError { inner, .. }
             | TypeError::MapKeyError { inner, .. }
             | TypeError::MapValueError { inner, .. }

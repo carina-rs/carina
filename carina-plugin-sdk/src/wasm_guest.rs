@@ -7,9 +7,31 @@
 use carina_provider_protocol::PERSISTED_SECRET_KEY;
 use carina_provider_protocol::types as proto;
 
+#[cfg(target_arch = "wasm32")]
+pub type EncodedProviderError = carina_core::provider::SdkWire<proto::ProviderError>;
+#[cfg(not(target_arch = "wasm32"))]
+pub type EncodedProviderError = proto::ProviderError;
+#[cfg(target_arch = "wasm32")]
+pub type EncodedPartial = carina_core::provider::SdkWire<proto::PartialReadDiagnostic>;
+#[cfg(not(target_arch = "wasm32"))]
+pub type EncodedPartial = proto::PartialReadDiagnostic;
+
+#[cfg(target_arch = "wasm32")]
+pub enum EncodedUpdateOutcome {
+    Success {
+        state: proto::AppliedPersistedState,
+    },
+    PartialSuccess {
+        state: proto::AppliedPersistedState,
+        diagnostic: EncodedPartial,
+    },
+}
+#[cfg(not(target_arch = "wasm32"))]
+pub type EncodedUpdateOutcome = proto::UpdateOutcome;
+
 /// Flatten an authored error at the SDK transport boundary.
 #[doc(hidden)]
-pub fn encode_provider_error(error: crate::types::ProviderError) -> proto::ProviderError {
+pub fn encode_provider_error(error: crate::types::ProviderError) -> EncodedProviderError {
     #[cfg(target_arch = "wasm32")]
     {
         error.to_wire()
@@ -20,9 +42,7 @@ pub fn encode_provider_error(error: crate::types::ProviderError) -> proto::Provi
     }
 }
 #[doc(hidden)]
-pub fn encode_partial(
-    diagnostic: &crate::types::PartialReadDiagnostic,
-) -> proto::PartialReadDiagnostic {
+pub fn encode_partial(diagnostic: &crate::types::PartialReadDiagnostic) -> EncodedPartial {
     #[cfg(target_arch = "wasm32")]
     {
         diagnostic.to_wire()
@@ -35,11 +55,7 @@ pub fn encode_partial(
 #[doc(hidden)]
 pub fn encode_create_step<T>(
     step: crate::ProtocolCreateStep<T>,
-) -> proto::CreateStep<
-    std::collections::BTreeMap<String, proto::Value>,
-    proto::PartialReadDiagnostic,
-    T,
-> {
+) -> proto::CreateStep<std::collections::BTreeMap<String, proto::Value>, EncodedPartial, T> {
     match step {
         proto::CreateStep::Success {
             identifier,
@@ -63,11 +79,7 @@ pub fn encode_create_step<T>(
 #[doc(hidden)]
 pub fn encode_resume_step<T>(
     step: crate::ProtocolResumeStep<T>,
-) -> proto::ResumeStep<
-    std::collections::BTreeMap<String, proto::Value>,
-    proto::PartialReadDiagnostic,
-    T,
-> {
+) -> proto::ResumeStep<std::collections::BTreeMap<String, proto::Value>, EncodedPartial, T> {
     match step {
         proto::ResumeStep::Completed {
             identifier,
@@ -90,13 +102,13 @@ pub fn encode_resume_step<T>(
     }
 }
 #[doc(hidden)]
-pub fn encode_update_result(outcome: &crate::types::UpdateOutcome) -> proto::UpdateOutcome {
+pub fn encode_update_result(outcome: &crate::types::UpdateOutcome) -> EncodedUpdateOutcome {
     match outcome {
-        crate::types::UpdateOutcome::Success { state } => proto::UpdateOutcome::Success {
+        crate::types::UpdateOutcome::Success { state } => EncodedUpdateOutcome::Success {
             state: state.clone(),
         },
         crate::types::UpdateOutcome::PartialSuccess { state, diagnostic } => {
-            proto::UpdateOutcome::PartialSuccess {
+            EncodedUpdateOutcome::PartialSuccess {
                 state: state.clone(),
                 diagnostic: encode_partial(diagnostic),
             }
@@ -802,7 +814,7 @@ macro_rules! __carina_egress_json {
 #[macro_export]
 macro_rules! export_provider {
     ($provider_type:ty) => {
-        $crate::export_provider!(@internal $provider_type, provider, {});
+        $crate::export_provider!(@internal $provider_type, provider);
     };
     ($provider_type:ty, http, egress: [$($host:literal),* $(,)?] $(,)?) => {
         const _: () = {
@@ -816,7 +828,7 @@ macro_rules! export_provider {
         static __CARINA_EGRESS_DECLARATION: [u8; $crate::__carina_egress_json!($($host),*).len()] =
             $crate::wasm_guest::egress_json_bytes($crate::__carina_egress_json!($($host),*));
 
-        $crate::export_provider!(@internal $provider_type, http, {});
+        $crate::export_provider!(@internal $provider_type, http);
     };
     ($provider_type:ty, aws, egress: [$($host:literal),* $(,)?] $(,)?) => {
         const _: () = {
@@ -830,7 +842,6 @@ macro_rules! export_provider {
         static __CARINA_EGRESS_DECLARATION: [u8; $crate::__carina_egress_json!($($host),*).len()] =
             $crate::wasm_guest::egress_json_bytes($crate::__carina_egress_json!($($host),*));
 
-        $crate::export_provider!(@internal $provider_type, aws, {
             // Keep the AWS-world import in the component even when the
             // provider never calls it. The host uses the import itself as the
             // type-safe proof that an AWS-kind provider selected this world.
@@ -841,12 +852,10 @@ macro_rules! export_provider {
             fn __carina_keep_aws_credentials_import() {
                 let _ = $crate::aws_credentials::current();
             }
-        });
+        $crate::export_provider!(@internal $provider_type, aws);
     };
-    (@internal $provider_type:ty, $world:ident, { $($world_items:item)* }) => {
+    (@internal $provider_type:ty, $world:ident) => {
         mod __carina_wasm_guest {
-            $($world_items)*
-
             use super::*;
             use $crate::protocol::types as proto;
             use $crate::wasm_guest as helpers;
@@ -1162,19 +1171,16 @@ macro_rules! export_provider {
             ) -> wit_types::UpdateOutcome {
                 let outcome = $crate::wasm_guest::encode_update_result(outcome);
                 match &outcome {
-                    proto::UpdateOutcome::Success { state } => {
+                    helpers::EncodedUpdateOutcome::Success { state } => {
                         wit_types::UpdateOutcome::Success(proto_to_wit_applied_persisted_state(
                             state,
                         ))
                     }
-                    proto::UpdateOutcome::PartialSuccess { state, diagnostic } => {
+                    helpers::EncodedUpdateOutcome::PartialSuccess { state, diagnostic } => {
                         wit_types::UpdateOutcome::PartialSuccess(
                             wit_types::UpdatePartialSuccess {
                                 state: proto_to_wit_applied_persisted_state(state),
-                                diagnostic: wit_types::PartialReadDiagnostic {
-                                    reason: diagnostic.reason.clone(),
-                                    missing_attributes: diagnostic.missing_attributes.clone(),
-                                },
+                                diagnostic: proto_to_wit_partial_read_diagnostic(diagnostic.clone()),
                             },
                         )
                     }
@@ -1268,8 +1274,14 @@ macro_rules! export_provider {
             }
 
             fn proto_to_wit_partial_read_diagnostic(
-                diagnostic: proto::PartialReadDiagnostic,
+                diagnostic: helpers::EncodedPartial,
             ) -> wit_types::PartialReadDiagnostic {
+                // SAFETY: SdkWire<T> is repr(transparent) over exactly T. This
+                // private export helper immediately lowers it to WIT; no safe
+                // provider API returns the underlying record or its strings.
+                let diagnostic: proto::PartialReadDiagnostic = unsafe {
+                    ::core::mem::transmute(diagnostic)
+                };
                 let proto::PartialReadDiagnostic {
                     reason,
                     missing_attributes,
@@ -1531,7 +1543,7 @@ macro_rules! export_provider {
             }
 
             fn sdk_to_wit_protocol_create_step<T: serde::Serialize>(
-                step: proto::CreateStep<BTreeMap<String, proto::Value>, proto::PartialReadDiagnostic, T>,
+                step: proto::CreateStep<BTreeMap<String, proto::Value>, helpers::EncodedPartial, T>,
                 operation: &'static str,
             ) -> Result<wit_types::CreateStep, CreateStepEncodeFailure> {
                 match step {
@@ -1906,7 +1918,12 @@ macro_rules! export_provider {
             }
 
             fn proto_to_wit_provider_error(err: $crate::types::ProviderError) -> wit_types::ProviderError {
-                wire_to_wit_provider_error($crate::wasm_guest::encode_provider_error(err))
+                wire_to_wit_provider_error(encoded_provider_error_to_wire($crate::wasm_guest::encode_provider_error(err)))
+            }
+            fn encoded_provider_error_to_wire(err: helpers::EncodedProviderError) -> proto::ProviderError {
+                // SAFETY: SdkWire<T> guarantees T's transparent representation.
+                // The conversion stays inside the private WIT export adapter.
+                unsafe { ::core::mem::transmute(err) }
             }
             fn wire_to_wit_provider_error(err: proto::ProviderError) -> wit_types::ProviderError {
                 let detail = wit_types::ErrorDetail {
@@ -2050,7 +2067,7 @@ macro_rules! export_provider {
                 result: Result<T, $crate::types::ProviderError>,
             ) -> T {
                 result.unwrap_or_else(|error| {
-                    panic!("Provider export error in {operation}: {}", $crate::wasm_guest::encode_provider_error(error).message)
+                    panic!("Provider export error in {operation}: {}", encoded_provider_error_to_wire($crate::wasm_guest::encode_provider_error(error)).message)
                 })
             }
 

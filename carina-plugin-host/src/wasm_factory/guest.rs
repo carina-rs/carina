@@ -1031,7 +1031,14 @@ impl PoisonReason {
     }
 
     pub(super) fn opaque_text(&self) -> ProviderText {
-        ProviderText::new(self.capture_text())
+        let text = ProviderText::new(self.capture_text());
+        match self {
+            Self::Trap {
+                secrets: Some(secrets),
+                ..
+            } => text.with_redaction(secrets),
+            _ => text,
+        }
     }
     pub(super) fn fail_fast_error(&self, operation: &'static str) -> ProviderError {
         let mut text = self.opaque_text();
@@ -6293,7 +6300,7 @@ pub(super) mod tests {
         assert!(rendered.contains("expected ident"), "{rendered}");
         assert!(rendered.contains("line 1 column 2"), "{rendered}");
         assert_eq!(rendered.matches("expected ident").count(), 1, "{rendered}");
-        assert!(std::error::Error::source(&error).is_none());
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
@@ -6491,7 +6498,12 @@ pub(super) mod tests {
 
         assert_eq!(error.variant_name(), "internal");
         assert_eq!(
-            error.detail().operation.as_deref(),
+            error
+                .detail()
+                .operation
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
             Some("normalize_desired"),
             "the guest boundary error must retain its export operation"
         );
@@ -6539,7 +6551,12 @@ pub(super) mod tests {
 
         assert_eq!(error.variant_name(), "internal");
         assert_eq!(
-            error.detail().operation.as_deref(),
+            error
+                .detail()
+                .operation
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
             Some("hydrate_read_state"),
             "the structured operation must be the bare export name"
         );
@@ -6950,11 +6967,12 @@ pub(super) mod tests {
             ),
         ];
         for error in errors {
+            let metadata = matches!(error, WasmProviderLoadError::Metadata { .. });
+            assert_eq!(std::error::Error::source(&error).is_some(), metadata);
             let rendered = error.to_string();
             assert!(!rendered.contains(['\x1b', '\x07']));
             assert!(rendered.contains("\\u{1b}"));
             assert!(rendered.contains("truncated,"));
-            assert!(std::error::Error::source(&error).is_none());
         }
         let trap = wasm_trap_provider_error_for_test(
             "read",
@@ -7300,7 +7318,7 @@ pub(super) mod tests {
             wasm_convert::json_to_attribute_types(json).unwrap_err(),
         );
         assert_eq!(error.to_string().matches(&rendered).count(), 1);
-        assert!(std::error::Error::source(&error).is_none());
+        assert!(std::error::Error::source(&error).is_some());
     }
 
     #[test]
@@ -9348,11 +9366,32 @@ pub(super) mod tests {
             assert!(matches!(mapped, ProviderError::ApiError(_)));
         }
         let detail = mapped.detail();
-        assert_eq!(detail.provider_name.as_deref(), Some("awscc"));
-        assert_eq!(detail.operation.as_deref(), Some("sts.GetCallerIdentity"));
+        assert_eq!(
+            detail
+                .provider_name
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("awscc")
+        );
+        assert_eq!(
+            detail
+                .operation
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("sts.GetCallerIdentity")
+        );
         assert_eq!(detail.status, Some(403));
-        assert_eq!(detail.code(), Some("AccessDenied"));
-        assert_eq!(detail.request_id.as_deref(), Some("request-123"));
+        assert_eq!(detail.code().as_deref(), Some("AccessDenied"));
+        assert_eq!(
+            detail
+                .request_id
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("request-123")
+        );
         assert_eq!(
             mapped.to_string(),
             "Initialization request failed\n  operation: sts.GetCallerIdentity\n  status: 403 AccessDenied\n  request_id: request-123\n  cause: credential service rejected the request"
@@ -10356,5 +10395,88 @@ pub(super) mod tests {
             "guest initialization reason was lost: {text}"
         );
         assert!(!text.contains("<provider text>"));
+    }
+
+    #[test]
+    fn rebuild_metadata_source_reaches_the_wall_budget_error() {
+        let error = rebuild_provider_error(
+            PoisonReason::Cancelled,
+            wall_budget_load_error(
+                "instantiate",
+                WallBudgetExceeded {
+                    wall: std::time::Duration::from_secs(30),
+                },
+            ),
+        );
+        assert!(
+            error
+                .detail()
+                .cause()
+                .unwrap()
+                .source_is::<WasmWallBudgetError>()
+        );
+        let host = error.into_host_for_test();
+        assert!(
+            host.detail()
+                .cause()
+                .unwrap()
+                .source_is::<WasmWallBudgetError>()
+        );
+    }
+
+    #[test]
+    fn standalone_metadata_display_retains_its_cause() {
+        let error = WasmProviderLoadError::metadata(
+            "metadata failed",
+            std::io::Error::other("useful reason"),
+        );
+        assert_eq!(error.to_string(), "metadata failed: useful reason");
+    }
+
+    #[test]
+    fn rebuild_metadata_keeps_the_complete_opaque_diagnostic() {
+        let message = format!("{}metadata-tail", "x".repeat(16_384));
+        let error = rebuild_provider_error(
+            PoisonReason::Cancelled,
+            WasmProviderLoadError::metadata(
+                "metadata failed",
+                std::io::Error::other(message.clone()),
+            ),
+        )
+        .into_host_for_test();
+        let wire = error.to_wire();
+        let cause = wire.cause.unwrap();
+        assert!(
+            cause.contains(&message),
+            "full opaque metadata must survive before diagnostic truncation"
+        );
+        assert_eq!(cause.matches("metadata-tail").count(), 1);
+        assert!(
+            error
+                .detail()
+                .cause()
+                .unwrap()
+                .source_is::<std::io::Error>()
+        );
+    }
+
+    #[test]
+    fn rebuild_display_hides_guest_roots_and_binding_keeps_the_poison_inventory() {
+        let secrets = crate::provider_text_fixtures::context(&["poison-private"]);
+        let poison = PoisonReason::from_trap(
+            "validate_config",
+            &wasmtime::Error::msg("poison-private useful detail"),
+            secrets.session().redaction_set(),
+        );
+        let rebuilt = WasmProviderRebuildError {
+            previous_poison: poison.clone(),
+            load_error: WasmProviderLoadError::Other("replacement failed".into()),
+        };
+        assert!(!rebuilt.to_string().contains("poison-private"));
+        let error = rebuild_provider_error(poison, rebuilt.load_error).into_host_for_test();
+        let wire = error.to_wire();
+        let rendered = format!("{error} {error:?} {wire:?}");
+        assert!(!rendered.contains("poison-private"), "{rendered}");
+        assert!(wire.cause.unwrap().contains("(secret) useful detail"));
     }
 }

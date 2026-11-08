@@ -2886,7 +2886,10 @@ async fn test_wasm_identifierless_read_back_resume_ends_invalid_continuation() {
         error.to_string().contains("requires an identifier"),
         "{error}"
     );
-    assert_eq!(error.detail().code(), Some("READ_BACK_WITHOUT_IDENTIFIER"));
+    assert_eq!(
+        error.detail().code().as_deref(),
+        Some("READ_BACK_WITHOUT_IDENTIFIER")
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -6751,7 +6754,15 @@ async fn test_wasm_provider_normalizer_errors_are_structured_and_do_not_poison_i
         Some(&desired_id),
         "the guest resource id must survive the WIT conversion"
     );
-    assert_eq!(error.detail().provider_name.as_deref(), Some("mock"));
+    assert_eq!(
+        error
+            .detail()
+            .provider_name
+            .as_ref()
+            .map(|text| text.as_diagnostic())
+            .as_deref(),
+        Some("mock")
+    );
     assert_eq!(
         desired_resources, desired_before,
         "provider normalizer errors must be atomic and restore stripped attributes"

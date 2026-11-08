@@ -371,8 +371,10 @@ impl std::error::Error for WallBudgetExceeded {}
 #[derive(Clone, Debug)]
 pub struct MetadataDiagnostic {
     source: ProviderDiagnostic,
+    opaque_source: carina_core::schema::ProviderValidation,
     projection: DiagnosticText,
     opaque: ProviderText,
+    source_rendered_separately: bool,
 }
 impl MetadataDiagnostic {
     pub(in crate::wasm_factory) fn new(
@@ -385,14 +387,27 @@ impl MetadataDiagnostic {
             text.push_str(&cause.to_string());
             source = cause.source();
         }
+        let source = ProviderDiagnostic::new(error);
         Self {
-            source: ProviderDiagnostic::new(error),
+            opaque_source: source.clone().into(),
+            source,
             opaque: ProviderText::new(text.clone()),
             projection: DiagnosticText::new(text),
+            source_rendered_separately: false,
         }
     }
     pub fn opaque(&self) -> ProviderText {
         self.opaque.clone()
+    }
+    pub(in crate::wasm_factory) fn opaque_source(&self) -> &(dyn std::error::Error + 'static) {
+        &self.opaque_source
+    }
+    pub(in crate::wasm_factory) fn for_causal_capture(mut self) -> Self {
+        self.source_rendered_separately = true;
+        self
+    }
+    pub(in crate::wasm_factory) fn source_rendered_separately(&self) -> bool {
+        self.source_rendered_separately
     }
     pub fn is<T: std::error::Error + 'static>(&self) -> bool {
         self.source.is::<T>()

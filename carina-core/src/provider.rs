@@ -523,38 +523,38 @@ impl<S: TextState> ProviderFailure<S> {
         let mut text = String::new();
         if let Some(id) = &detail.resource_id {
             text.push('[');
-            text.push_str(id.text.redacted_str());
+            text.push_str(&id.text.redacted_str());
             text.push_str("] ");
         }
-        text.push_str(detail.body.message().redacted_str());
+        text.push_str(&detail.body.message().redacted_str());
         if detail.has_structured_cloud_fields() {
             if let Some(operation) = &detail.operation {
                 text.push_str("\n  operation: ");
-                text.push_str(operation.redacted_str());
+                text.push_str(&operation.redacted_str());
             }
             match (detail.status, &detail.code) {
                 (Some(status), Some(code)) => {
                     text.push_str(&format!("\n  status: {} ", status));
-                    text.push_str(code.redacted_str());
+                    text.push_str(&code.redacted_str());
                 }
                 (Some(status), None) => text.push_str(&format!("\n  status: {}", status)),
                 (None, Some(code)) => {
                     text.push_str("\n  code: ");
-                    text.push_str(code.redacted_str());
+                    text.push_str(&code.redacted_str());
                 }
                 _ => {}
             }
             if let Some(request_id) = &detail.request_id {
                 text.push_str("\n  request_id: ");
-                text.push_str(request_id.redacted_str());
+                text.push_str(&request_id.redacted_str());
             }
             if let Some(cause) = detail.body.rendered_cause() {
                 text.push_str("\n  cause: ");
-                text.push_str(cause.redacted_str());
+                text.push_str(&cause.redacted_str());
             }
         } else if let Some(cause) = detail.body.rendered_cause() {
             text.push_str(": ");
-            text.push_str(cause.redacted_str());
+            text.push_str(&cause.redacted_str());
         }
         text
     }
@@ -980,14 +980,14 @@ impl<S: TextState> OperationErrorDetail<S> {
 impl OperationErrorDetail<Bound> {
     /// Opaque context for a caused error, or the complete message for a
     /// message-only error.
-    pub fn context(&self) -> &str {
-        self.body.message()
+    pub fn context(&self) -> crate::provider_text::DiagnosticText {
+        self.body.message().as_diagnostic()
     }
 
     /// Sanitized application-level code for diagnostics. Set it with
     /// [`ProviderError::with_code`] so raw-text retry classification stays valid.
-    pub fn code(&self) -> Option<&str> {
-        self.code.as_deref()
+    pub fn code(&self) -> Option<crate::provider_text::DiagnosticText> {
+        self.code.as_ref().map(ErrorText::as_diagnostic)
     }
 }
 
@@ -5638,9 +5638,13 @@ impl<S: TextState> PartialReadDiagnostic<S> {
     }
 }
 impl PartialReadDiagnostic<Unbound> {
-    #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub fn to_wire(&self) -> protocol_types::PartialReadDiagnostic {
         self.to_wire_inner()
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn to_wire(&self) -> SdkWire<protocol_types::PartialReadDiagnostic> {
+        SdkWire(self.to_wire_inner())
     }
 }
 impl PartialReadDiagnostic<Bound> {
@@ -5653,7 +5657,7 @@ impl PartialReadDiagnostic<Bound> {
     }
 
     /// Original reason for persistence, transport and identity material.
-    pub fn raw_reason(&self) -> &str {
+    pub fn raw_reason(&self) -> String {
         self.reason.redacted_str()
     }
 
@@ -5805,9 +5809,30 @@ impl ProviderFailure<Bound> {
     }
 }
 impl ProviderFailure<Unbound> {
-    #[cfg(any(test, target_arch = "wasm32"))]
+    #[cfg(all(test, not(target_arch = "wasm32")))]
     pub fn to_wire(&self) -> WireProviderError {
         self.to_wire_inner()
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn to_wire(&self) -> SdkWire<WireProviderError> {
+        SdkWire(self.to_wire_inner())
+    }
+}
+
+/// A transport record whose provider-authored fields remain unreadable.
+///
+/// No safe projection, serialization or formatting operation exposes `T`.
+/// The transparent representation is consumed only by the SDK export macro's
+/// private WIT lowering functions, alongside the generated canonical ABI code.
+#[cfg(target_arch = "wasm32")]
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct SdkWire<T>(T);
+
+#[cfg(target_arch = "wasm32")]
+impl<T> fmt::Debug for SdkWire<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SdkWire(<provider text>)")
     }
 }
 impl PartialReadDiagnostic<Unbound> {
@@ -13183,7 +13208,15 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             .await
             .expect_err("normalizer failure must propagate");
 
-        assert_eq!(error.detail().provider_name.as_deref(), Some("awscc"));
+        assert_eq!(
+            error
+                .detail()
+                .provider_name
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("awscc")
+        );
     }
 
     #[tokio::test]

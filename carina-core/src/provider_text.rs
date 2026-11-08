@@ -286,6 +286,14 @@ impl ProviderText {
     pub fn new(text: impl Into<String>) -> Self {
         Self(vec![OpaquePart::Text(text.into())])
     }
+    /// Retain a live inventory with opaque text without granting display or
+    /// binding authority to the caller.
+    pub fn with_redaction(self, secrets: &RedactionSet) -> Self {
+        Self(vec![OpaquePart::Protected {
+            text: self,
+            secrets: secrets.clone(),
+        }])
+    }
     fn redact(&self, secrets: &RedactionSet) -> RedactedProviderText {
         #[cfg(test)]
         REDACTION_PASSES.with(|count| count.set(count.get() + 1));
@@ -457,27 +465,33 @@ impl RedactionContext {
 }
 
 /// Opaque provider input, or host/provider segments bound to their redaction set.
-#[derive(Clone)]
 pub struct ErrorText<S: TextState = Unbound> {
     content: TextContent,
-    projection: std::sync::OnceLock<Box<ProjectionCache>>,
+    projection: std::sync::Mutex<Option<ProjectionCache>>,
     state: std::marker::PhantomData<S>,
 }
-#[derive(Clone)]
 struct ProjectionCache {
     generations: Vec<u64>,
-    projection: TextProjection,
-    next: std::sync::OnceLock<Box<ProjectionCache>>,
+    projection: std::sync::Arc<TextProjection>,
 }
 #[derive(Clone)]
 struct TextProjection {
     text: String,
     diagnostic: DiagnosticText,
 }
+impl<S: TextState> Clone for ErrorText<S> {
+    fn clone(&self) -> Self {
+        Self {
+            content: self.content.clone(),
+            projection: Default::default(),
+            state: std::marker::PhantomData,
+        }
+    }
+}
 impl<S: TextState> fmt::Debug for ErrorText<S> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if S::BOUND {
-            DiagnosticText::new(self.redacted_str()).fmt(f)
+            self.projection().diagnostic.fmt(f)
         } else {
             f.write_str("<provider text>")
         }
@@ -507,46 +521,53 @@ impl<S: TextState> ErrorText<S> {
             } else {
                 TextContent::Unbound(ProviderText::new(text))
             },
-            projection: std::sync::OnceLock::new(),
+            projection: Default::default(),
             state: std::marker::PhantomData,
         }
     }
-    fn projection(&self) -> &TextProjection {
+    fn projection(&self) -> std::sync::Arc<TextProjection> {
         let generations = self.redaction_context().generations();
-        let mut slot = &self.projection;
-        loop {
-            let cached = slot.get_or_init(|| {
-                let mut text = String::new();
-                match &self.content {
-                    TextContent::Unbound(_) => text.push_str("<provider text>"),
-                    TextContent::Bound(segments) => {
-                        for segment in segments {
-                            match segment {
-                                Segment::Host(host) => text.push_str(&host.0),
-                                Segment::Provider { text: raw, secrets } => {
-                                    text.push_str(secrets.redact(raw).as_str())
-                                }
+        let mut slot = self
+            .projection
+            .lock()
+            .expect("projection cache lock poisoned");
+        if slot
+            .as_ref()
+            .is_none_or(|cached| cached.generations != generations)
+        {
+            let mut text = String::new();
+            match &self.content {
+                TextContent::Unbound(_) => text.push_str("<provider text>"),
+                TextContent::Bound(segments) => {
+                    for segment in segments {
+                        match segment {
+                            Segment::Host(host) => text.push_str(&host.0),
+                            Segment::Provider { text: raw, secrets } => {
+                                text.push_str(secrets.redact(raw).as_str())
                             }
                         }
                     }
                 }
-                Box::new(ProjectionCache {
-                    generations: generations.clone(),
-                    projection: TextProjection {
-                        diagnostic: DiagnosticText::new(&text),
-                        text,
-                    },
-                    next: std::sync::OnceLock::new(),
-                })
-            });
-            if cached.generations == generations {
-                return &cached.projection;
             }
-            slot = &cached.next;
+            *slot = Some(ProjectionCache {
+                generations,
+                projection: std::sync::Arc::new(TextProjection {
+                    diagnostic: DiagnosticText::new(&text),
+                    text,
+                }),
+            });
         }
+        slot.as_ref()
+            .expect("projection initialized")
+            .projection
+            .clone()
     }
-    pub(crate) fn redacted_str(&self) -> &str {
-        &self.projection().text
+    #[cfg(test)]
+    fn cached_projection_count(&self) -> usize {
+        usize::from(self.projection.lock().unwrap().is_some())
+    }
+    pub(crate) fn redacted_str(&self) -> String {
+        self.projection().text.clone()
     }
     pub(crate) fn opaque(&self) -> ProviderText {
         match &self.content {
@@ -597,7 +618,7 @@ impl<S: TextState> ErrorText<S> {
                 }
             }
         }
-        self.projection.take();
+        self.projection = Default::default();
         self
     }
     pub(crate) fn protect_opaque(text: ProviderText, context: &RedactionContext) -> ProviderText {
@@ -608,14 +629,14 @@ impl<S: TextState> ErrorText<S> {
     }
     pub(crate) fn append_host(&mut self, text: impl Into<String>) {
         let text = text.into();
-        self.projection.take();
+        self.projection = Default::default();
         match &mut self.content {
             TextContent::Unbound(raw) => raw.append_host(text),
             TextContent::Bound(segments) => segments.push(Segment::Host(HostText(text))),
         }
     }
     pub(crate) fn append(&mut self, other: &Self) {
-        self.projection.take();
+        self.projection = Default::default();
         match (&mut self.content, &other.content) {
             (TextContent::Bound(segments), TextContent::Bound(other)) => {
                 segments.extend(other.clone())
@@ -629,7 +650,7 @@ impl<S: TextState> ErrorText<S> {
         if !S::BOUND {
             return self.opaque().wire_text();
         }
-        self.redacted_str().to_owned()
+        self.redacted_str()
     }
 }
 impl<S: TextState> ErrorText<S> {
@@ -640,7 +661,7 @@ impl<S: TextState> ErrorText<S> {
         );
         Self {
             content: TextContent::Unbound(text),
-            projection: std::sync::OnceLock::new(),
+            projection: Default::default(),
             state: std::marker::PhantomData,
         }
     }
@@ -653,7 +674,7 @@ impl ErrorText<Bound> {
             } else {
                 TextContent::Unbound(self.opaque())
             },
-            projection: std::sync::OnceLock::new(),
+            projection: Default::default(),
             state: std::marker::PhantomData,
         }
     }
@@ -662,7 +683,7 @@ impl ErrorText<Unbound> {
     pub(crate) fn from_provider_text(text: ProviderText) -> Self {
         Self {
             content: TextContent::Unbound(text),
-            projection: std::sync::OnceLock::new(),
+            projection: Default::default(),
             state: std::marker::PhantomData,
         }
     }
@@ -672,7 +693,7 @@ impl ErrorText<Unbound> {
                 text: self.opaque(),
                 secrets: secrets.clone(),
             }]),
-            projection: std::sync::OnceLock::new(),
+            projection: Default::default(),
             state: std::marker::PhantomData,
         }
     }
@@ -687,15 +708,16 @@ impl<S: TextState> From<String> for ErrorText<S> {
         Self::new(text)
     }
 }
-impl Deref for ErrorText<Bound> {
-    type Target = str;
-    fn deref(&self) -> &str {
-        &self.projection().diagnostic
+impl ErrorText<Bound> {
+    /// An owned diagnostic snapshot. Later inventory generations can replace
+    /// this handle's cache without invalidating a previously returned value.
+    pub fn as_diagnostic(&self) -> DiagnosticText {
+        self.projection().diagnostic.clone()
     }
 }
 impl fmt::Display for ErrorText<Bound> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self)
+        self.projection().diagnostic.fmt(f)
     }
 }
 impl<S: TextState> Serialize for ErrorText<S> {
@@ -705,7 +727,7 @@ impl<S: TextState> Serialize for ErrorText<S> {
                 "provider text requires a boundary before serialization",
             ));
         }
-        serializer.serialize_str(self.redacted_str())
+        serializer.serialize_str(&self.redacted_str())
     }
 }
 impl<'de> Deserialize<'de> for ErrorText<Unbound> {
@@ -1795,8 +1817,21 @@ impl<S: TextState> Diagnostic<S> {
     pub(crate) fn capture_host_or_provider(
         error: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
-        let retryability =
-            opaque_frame(&error).map_or(Retryability::Unclassified, |frame| frame.retryability());
+        let mut node = Some(ProviderCause {
+            error: &error,
+            secrets: RedactionContext::default(),
+        });
+        let mut retryability = Retryability::Unclassified;
+        while let Some(cause) = node {
+            if let Some(frame) = opaque_frame(cause.error) {
+                let classification = frame.retryability();
+                if classification != Retryability::Unclassified {
+                    retryability = classification;
+                    break;
+                }
+            }
+            node = cause.source();
+        }
         let text = Self::capture(&error);
         Self::captured(error, text, retryability)
     }
@@ -1898,7 +1933,7 @@ impl<S: TextState> Diagnostic<S> {
     pub(crate) fn opaque(&self) -> ProviderText {
         self.text.opaque()
     }
-    pub(crate) fn redacted_str(&self) -> &str {
+    pub(crate) fn redacted_str(&self) -> String {
         self.text.redacted_str()
     }
 }
@@ -2402,7 +2437,15 @@ mod tests {
             error.to_string(),
             "(secret)\n  operation: create\n  status: 403 public"
         );
-        assert_eq!(error.detail().provider_name.as_deref(), Some("(secret)"));
+        assert_eq!(
+            error
+                .detail()
+                .provider_name
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("(secret)")
+        );
         assert_eq!(error.to_wire().status, Some(403));
     }
 
@@ -2857,7 +2900,12 @@ mod tests {
                 .with_request_id(raw);
             assert!(!error.to_string().contains(['\x1b', '\x07']));
             assert_eq!(
-                error.detail().provider_name.as_deref(),
+                error
+                    .detail()
+                    .provider_name
+                    .as_ref()
+                    .map(|text| text.as_diagnostic())
+                    .as_deref(),
                 Some("\\u{1b}]52;c;ZXZpbA==\\u{7}\\u{1b}[2J")
             );
             if let Some(cause) = error.detail().cause() {

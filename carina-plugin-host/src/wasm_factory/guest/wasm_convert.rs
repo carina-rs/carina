@@ -4736,6 +4736,8 @@ mod tests {
             !decoded
                 .detail()
                 .provider_name
+                .as_ref()
+                .map(|text| text.as_diagnostic())
                 .as_deref()
                 .unwrap()
                 .contains('\x1b')
@@ -4859,11 +4861,32 @@ mod tests {
         assert!(matches!(back, CoreProviderError::ApiError(_)));
         let detail = back.detail();
         assert_eq!(detail.context(), "Failed to read");
-        assert_eq!(detail.provider_name.as_deref(), Some("aws"));
-        assert_eq!(detail.operation.as_deref(), Some("s3.HeadBucket"));
+        assert_eq!(
+            detail
+                .provider_name
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("aws")
+        );
+        assert_eq!(
+            detail
+                .operation
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("s3.HeadBucket")
+        );
         assert_eq!(detail.status, Some(503));
-        assert_eq!(detail.code(), Some("ServiceUnavailable"));
-        assert_eq!(detail.request_id.as_deref(), Some("request-123"));
+        assert_eq!(detail.code().as_deref(), Some("ServiceUnavailable"));
+        assert_eq!(
+            detail
+                .request_id
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("request-123")
+        );
         let rid = detail
             .resource_id
             .as_ref()
@@ -4902,11 +4925,22 @@ mod tests {
         let wit_err = wire_to_wit_provider_error(err.to_wire());
         let back = wit_to_core_provider_error(wit_err).into_host_for_test();
         let detail = back.detail();
-        assert_eq!(detail.operation.as_deref(), Some("iam.ListRoles"));
-        assert_eq!(detail.status, Some(403));
-        assert_eq!(detail.code(), Some("AccessDenied"));
         assert_eq!(
-            detail.request_id.as_deref(),
+            detail
+                .operation
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
+            Some("iam.ListRoles")
+        );
+        assert_eq!(detail.status, Some(403));
+        assert_eq!(detail.code().as_deref(), Some("AccessDenied"));
+        assert_eq!(
+            detail
+                .request_id
+                .as_ref()
+                .map(|text| text.as_diagnostic())
+                .as_deref(),
             Some("997aa923-2aa4-4d2b-8d16-44fd21c81368"),
         );
     }

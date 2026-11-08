@@ -3761,7 +3761,15 @@ async fn instantiate_provider_into_router_propagates_normalizer_creation_failure
         panic!("expected provider error, got {error}");
     };
     assert_eq!(error.to_string(), "normalizer initialization failed");
-    assert_eq!(error.detail().provider_name.as_deref(), Some("failing"));
+    assert_eq!(
+        error
+            .detail()
+            .provider_name
+            .as_ref()
+            .map(|text| text.as_diagnostic())
+            .as_deref(),
+        Some("failing")
+    );
 }
 
 #[test]
@@ -4033,8 +4041,24 @@ async fn sourced_provider_initialization_error_keeps_provider_and_phase() {
     let AppError::Provider(error) = error else {
         panic!("expected provider error")
     };
-    assert_eq!(error.detail().provider_name.as_deref(), Some("aws"));
-    assert_eq!(error.detail().operation.as_deref(), Some("initialize"));
+    assert_eq!(
+        error
+            .detail()
+            .provider_name
+            .as_ref()
+            .map(|text| text.as_diagnostic())
+            .as_deref(),
+        Some("aws")
+    );
+    assert_eq!(
+        error
+            .detail()
+            .operation
+            .as_ref()
+            .map(|text| text.as_diagnostic())
+            .as_deref(),
+        Some("initialize")
+    );
 }
 
 struct ProviderConfigConstraintFactory {

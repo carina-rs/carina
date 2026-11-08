@@ -99,3 +99,67 @@ fn capturing_an_existing_bound_diagnostic_preserves_the_current_node() {
     assert!(std::sync::Arc::ptr_eq(&original.error, &adopted.error));
     assert!(adopted.is::<std::io::Error>());
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("foreign validation wrapper")] // error-chain: caller-renders-sources
+struct ForeignValidation(#[source] crate::schema::ProviderValidation);
+
+#[derive(Debug, thiserror::Error)]
+#[error("foreign diagnostic wrapper")] // error-chain: caller-renders-sources
+struct ForeignDiagnostic(#[source] HostDiagnostic);
+
+#[test]
+fn foreign_wrapper_inherits_the_nearest_classified_diagnostic() {
+    for retryability in [Retryability::Transient, Retryability::Permanent] {
+        let leaf = ProviderError::api_error("leaf").with_retryability(Retryability::Transient);
+        let nearest =
+            ProviderError::internal_caused_by("validation", leaf).with_retryability(retryability);
+        let wrapped = ForeignValidation(ProviderDiagnostic::new(nearest).into());
+        let error = ProviderError::invalid_input_caused_by("outer", wrapped);
+        assert_eq!(error.retryability(), retryability);
+        let host = error.with_secrets(&RedactionSet::for_test(&[]));
+        assert_eq!(host.retryability(), retryability);
+        assert!(
+            host.detail()
+                .cause()
+                .unwrap()
+                .source_is::<crate::schema::ProviderValidation>()
+        );
+        let diagnostic = ProviderDiagnostic::new(
+            ProviderError::api_error("leaf").with_retryability(retryability),
+        )
+        .with_secrets(&RedactionSet::for_test(&[]));
+        let error = ProviderError::api_error_caused_by("outer", ForeignDiagnostic(diagnostic));
+        assert_eq!(error.retryability(), retryability);
+    }
+}
+
+#[test]
+fn changing_redaction_generations_replaces_the_cached_projection() {
+    let secrets = RedactionSet::for_test(&[]);
+    let text = ErrorText::<Unbound>::new("last-secret").into_host(&secrets);
+    let first = text.as_diagnostic();
+    let stale = std::sync::Arc::downgrade(&text.projection());
+    for generation in 0..128 {
+        let secret = if generation == 127 {
+            "last-secret".to_owned()
+        } else {
+            format!("secret-{generation}")
+        };
+        secrets.extend(&RedactionSet::for_test(&[&secret]));
+        let rendered = text.to_string();
+        assert!(
+            stale.upgrade().is_none(),
+            "replacing the cache must release the previous projection"
+        );
+        if generation == 127 {
+            assert_eq!(rendered, "(secret)");
+        }
+        assert_eq!(text.cached_projection_count(), 1);
+    }
+    assert_eq!(
+        first.as_str(),
+        "last-secret",
+        "owned snapshots remain valid after cache replacement"
+    );
+}

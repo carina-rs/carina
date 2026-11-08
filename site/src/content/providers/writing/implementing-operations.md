@@ -210,7 +210,7 @@ let verdict = ProviderError::internal_caused_by("read-back failed", source);
 
 A cause-bearing error inherits retryability automatically. Foreign errors start as `Unclassified`; SDK policy can be attached with `ClassifiedSource::new(source, Retryability::Transient)` or `Permanent`. `with_retryability` explicitly overrides the inherited value. `is_transient()` is true only for `Transient`; the `Timeout` kind alone does not imply it.
 
-Diagnostics share immutable causal storage when cloned. Each handle has its own text view, so binding one handle does not change another. There is one causal parent; combining independent typed causes is unsupported. SDK encoding flattens native causes and partial reasons to the existing version-24 wire records. Typed sources and retryability remain native properties.
+Diagnostics share immutable causal storage when cloned. Each handle has its own text view, so binding one handle does not change another. There is one causal parent; combining independent typed causes is unsupported. SDK encoding flattens native causes and partial reasons to the existing version-24 wire records. In wasm provider code, encoding returns opaque carriers with no readable message or reason fields; the SDK export adapter consumes them when lowering to WIT. Typed sources and retryability remain native properties.
 
 ## read
 

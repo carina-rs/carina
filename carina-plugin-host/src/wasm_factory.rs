@@ -48,7 +48,6 @@ use carina_core::provider::{
     CreateFailureKind, CreateObservation, InFlightCreate, InFlightPersistence, ResumeFailureKind,
     UnobservedReason,
 };
-#[cfg(test)]
 use carina_core::provider_text::ProviderDiagnostic;
 use carina_core::provider_text::{DiagnosticText, ProviderKey, ProviderText, RedactionSet};
 #[cfg(test)]
@@ -770,7 +769,11 @@ impl fmt::Display for WasmProviderLoadError {
                 "this provider requires AWS credentials, which only an AWS-kind provider can receive",
             ),
             WasmProviderLoadError::Metadata { context, source } => {
-                write!(f, "{context}: {source}")
+                if source.source_rendered_separately() {
+                    context.fmt(f)
+                } else {
+                    write!(f, "{context}: {source}")
+                }
             }
             WasmProviderLoadError::Other(message) => f.write_str(message),
         }
@@ -782,6 +785,7 @@ impl std::error::Error for WasmProviderLoadError {
         match self {
             Self::EgressLock(source) => source.source(),
             Self::EgressConsent(source) => source.source(),
+            Self::Metadata { source, .. } => Some(source.opaque_source()),
             Self::EgressDeclaration(_)
             | Self::PrecompiledDeserialization(_)
             | Self::Instantiation(_)
@@ -789,13 +793,25 @@ impl std::error::Error for WasmProviderLoadError {
             | Self::AwsCredentials(_)
             | Self::AwsCredentialsImportMissing
             | Self::AwsCredentialsRequired
-            | Self::Metadata { .. }
             | Self::Other(_) => None,
         }
     }
 }
 
 impl WasmProviderLoadError {
+    // A captured metadata error has a logical opaque source. Its complete
+    // source text is rendered by core, while direct metadata-load Display
+    // retains the existing bounded terminal diagnostic.
+    fn for_causal_capture(self) -> Self {
+        match self {
+            Self::Metadata { context, source } => Self::Metadata {
+                context,
+                source: source.for_causal_capture(),
+            },
+            other => other,
+        }
+    }
+
     fn metadata(
         context: impl Into<String>,
         source: impl std::error::Error + Send + Sync + 'static,
@@ -3405,11 +3421,10 @@ struct WasmProviderRebuildError {
 
 impl fmt::Display for WasmProviderRebuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "previous poison reason: {}",
-            self.previous_poison.capture_text()
-        )
+        if matches!(self.previous_poison, PoisonReason::Trap { .. }) {
+            return f.write_str("replacement instance could not be loaded after a guest trap");
+        }
+        write!(f, "previous poison reason: {}", self.previous_poison)
     }
 }
 
@@ -3425,20 +3440,30 @@ fn rebuild_provider_error(
 ) -> ProviderError {
     #[cfg(test)]
     tests::record_rebuild_load_probe(&load_error);
+    let load_error = load_error.for_causal_capture();
     let timed_out = load_error.is_wall_budget_timeout();
+    let poison_context = matches!(previous_poison, PoisonReason::Trap { .. }).then(|| {
+        previous_poison
+            .opaque_text()
+            .with_context("previous poison reason")
+    });
     let error = WasmProviderRebuildError {
         previous_poison,
         load_error,
     };
+    let source = match poison_context {
+        Some(context) => ProviderDiagnostic::new(ProviderError::internal_caused_by(context, error)),
+        None => ProviderDiagnostic::new(error),
+    };
     if timed_out {
         ProviderError::timeout_caused_by(
             "Failed to rebuild WASM provider validation instance",
-            error,
+            source,
         )
     } else {
         ProviderError::internal_caused_by(
             "Failed to rebuild WASM provider validation instance",
-            error,
+            source,
         )
     }
 }

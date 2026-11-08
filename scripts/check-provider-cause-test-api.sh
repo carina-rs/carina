@@ -84,4 +84,57 @@ with tempfile.TemporaryDirectory(prefix="carina-provider-cause-api-") as tempora
         print(result.stderr, file=sys.stderr)
         sys.exit("ERROR: expected E0599 for both unavailable predicates and native partial encoding")
     print("OK: downstream predicates and native partial plaintext encoding are unavailable (E0599).")
+
+    # Compile as an actual guest provider depending on the SDK. Repeat with
+    # unified test features: a dependency feature must not grant wire readers.
+    manifest_path = fixture / "Cargo.toml"
+    manifest_path.write_text(manifest_path.read_text().replace(
+        '[patch.crates-io]',
+        'carina-plugin-sdk = { path = ' + json.dumps(str(repo / "carina-plugin-sdk")) + ' }\n'
+        'serde_json = "1"\n\n'
+        '[features]\nunified-test-utils = ["carina-core/test-utils", "carina-plugin-sdk/test-utils"]\n\n'
+        '[patch.crates-io]',
+    ))
+    for features in ([], ["--features", "unified-test-utils"]):
+        for filename, should_compile in (("wasm_lossy_rewrap.rs", False), ("wasm_sdk_encoding.rs", True)):
+            shutil.copyfile(repo / "scripts/tests/provider-cause-test-api" / filename, fixture / "src/lib.rs")
+            result = subprocess.run([
+                "cargo", "check", "--offline", "--lib", "--message-format=json",
+                "--target", "wasm32-wasip2", *features,
+                "--manifest-path", str(manifest_path), "--target-dir", str(repo / "target"),
+            ], env=environment, capture_output=True, text=True, timeout=600)
+            errors = []
+            for line in result.stdout.splitlines():
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if message.get("reason") == "compiler-message" and message["message"]["level"] == "error":
+                    errors.append(message["message"])
+            expected_codes = {
+                "error_message": "E0609", "partial_reason": "E0609",
+                "sdk_error_message": "E0609", "sdk_partial_reason": "E0609",
+                "serialize_error": "E0277", "serialize_partial": "E0277",
+                "private_wire_field": "E0616", "native_fixture": "E0433",
+            }
+            lines = (fixture / "src/lib.rs").read_text().splitlines()
+            current_function = None
+            functions = {}
+            for number, line in enumerate(lines, 1):
+                if line.startswith("pub fn "):
+                    current_function = line.split("pub fn ", 1)[1].split("(", 1)[0]
+                functions[number] = current_function
+            rejected = {}
+            for error in errors:
+                primary = next((span for span in error["spans"] if span["is_primary"]), {})
+                function = functions.get(primary.get("line_start"))
+                rejected.setdefault(function, []).append((error.get("code") or {}).get("code"))
+            valid_failure = result.returncode == 101 and rejected == {
+                function: [code] for function, code in expected_codes.items()
+            }
+            if (should_compile and result.returncode != 0) or (not should_compile and not valid_failure):
+                print(result.stdout, file=sys.stderr)
+                print(result.stderr, file=sys.stderr)
+                sys.exit(f"ERROR: wasm SDK opacity check failed: {filename}, features={features}")
+        print(f"OK: wasm SDK encoding compiles and all eight lossy routes are rejected; features={features}.")
 PY
