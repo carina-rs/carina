@@ -859,6 +859,105 @@ fn lexical_call(
 }
 
 #[test]
+fn shared_lexical_body_keeps_each_invocations_operand_timing() {
+    use crate::schema::LeafPathSegment;
+    use std::sync::Arc;
+    type Parsed = Value<ParserPlaceholder, RelativeBindingName>;
+    let mut parsed = crate::parser::parse_file(
+        "fn identity(value: String): String { value }",
+        std::path::Path::new("functions.crn"),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let function = Arc::new(parsed.user_functions.remove("identity").unwrap());
+    let call = |argument: Parsed| {
+        Parsed::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: Arc::clone(&function),
+            functions: Arc::new(HashMap::new()),
+            args: vec![argument.into()],
+            source_line: 1.into(),
+        })
+    };
+    let value = Parsed::Concrete(ConcreteValue::List(vec![
+        call(Parsed::Concrete(ConcreteValue::String("ready".into()))),
+        call(Parsed::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::PendingReRead(PendingReRead::not_found()),
+        ))),
+    ]));
+    let bindings = ResolvedBindings::default();
+    let knowledge = value.knowledge(&KnowledgeContext::plan(&bindings)).unwrap();
+    let sites = knowledge.sites().collect::<Vec<_>>();
+    let known = sites
+        .iter()
+        .filter(|site| site.path.segments() == [LeafPathSegment::ListIndex(0)])
+        .collect::<Vec<_>>();
+    let apply = sites
+        .iter()
+        .filter(|site| site.path.segments() == [LeafPathSegment::ListIndex(1)])
+        .collect::<Vec<_>>();
+    assert!(!known.is_empty() && !apply.is_empty());
+    assert!(known.iter().all(|site| site.phase() == Phase::Plan));
+    assert!(
+        apply.iter().all(|site| site.phase() == Phase::Apply),
+        "{apply:?}"
+    );
+    let Classification::ShapeKnown(shape) = &*knowledge else {
+        panic!("partial list");
+    };
+    let kernel::ShapeNode::List(items) = &shape.node else {
+        panic!("list");
+    };
+    let analysis = |item: &Classification<'_, ParserPlaceholder, RelativeBindingName>| {
+        let Classification::Pending(pending) = item else {
+            panic!("call");
+        };
+        let kernel::PendingNode::Ordinary(inputs) = &pending.node else {
+            panic!("ordinary call");
+        };
+        inputs
+            .iter()
+            .find_map(|input| match &input.value {
+                kernel::InputValue::Lexical(body) => Some(Arc::as_ptr(body) as usize),
+                kernel::InputValue::Value(_) => None,
+            })
+            .unwrap()
+    };
+    assert_eq!(analysis(&items[0]), analysis(&items[1]));
+    let Err(KnowledgeError::UnresolvedAtBoundary { sites }) = PlanResolved::try_from(knowledge)
+    else {
+        panic!("the ready unevaluated call must still be rejected");
+    };
+    assert!(
+        sites
+            .iter()
+            .all(|site| site.path.segments() == [LeafPathSegment::ListIndex(0)])
+    );
+}
+
+#[test]
+fn apply_operation_preserves_independent_plan_operand_work() {
+    let value: V = Value::Deferred(DeferredValue::Interpolation(vec![
+        InterpolationPart::Expr(V::Deferred(DeferredValue::Unknown(
+            ApplyTimeUnknown::PendingReRead(PendingReRead::not_found()),
+        ))),
+        InterpolationPart::Expr(V::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![V::Concrete(ConcreteValue::String("ready".into())).into()],
+            source_line: 1.into(),
+        })),
+    ]));
+    let bindings = ResolvedBindings::default();
+    let knowledge = value.knowledge(&KnowledgeContext::plan(&bindings)).unwrap();
+    let Classification::Pending(operation) = &*knowledge else {
+        panic!("interpolation");
+    };
+    assert_eq!(operation.phase(), Phase::Apply);
+    assert!(
+        matches!(PlanResolved::try_from(knowledge), Err(KnowledgeError::UnresolvedAtBoundary { sites }) if sites.len() == 1)
+    );
+}
+
+#[test]
 fn shared_body_sites_keep_each_call_position_and_protection() {
     let mut function = function_leaf();
     function.body.value = Value::resource_ref("private_source", "identifier", vec![]);

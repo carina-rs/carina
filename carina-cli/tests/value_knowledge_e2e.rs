@@ -37,11 +37,21 @@ fn fixture_files(name: &str) -> tempfile::TempDir {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/value_knowledge")
         .join(name);
+    copy_fixture_directory(&source, dir.path());
+    dir
+}
+
+fn copy_fixture_directory(source: &Path, destination: &Path) {
     for file in fs::read_dir(source).unwrap() {
         let file = file.unwrap();
-        fs::copy(file.path(), dir.path().join(file.file_name())).unwrap();
+        let target = destination.join(file.file_name());
+        if file.file_type().unwrap().is_dir() {
+            fs::create_dir(&target).unwrap();
+            copy_fixture_directory(&file.path(), &target);
+        } else {
+            fs::copy(file.path(), target).unwrap();
+        }
     }
-    dir
 }
 
 fn fixture(name: &str) -> tempfile::TempDir {
@@ -87,6 +97,37 @@ fn lexical_resource_function_iterable_plans_in_a_directory() {
 fn sibling_lexical_function_iterable_plans_in_a_directory() {
     let fixture = fixture("lexical_sibling");
     assert_eq!(names(&plan(fixture.path())), ["pre-a"]);
+}
+
+#[test]
+fn deferred_module_query_keeps_structural_inputs_after_constraint_admission() {
+    let fixture = fixture("deferred_query_input");
+    success(&run(fixture.path(), &["plan", "--out", "plan.json", "."]));
+    let saved: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture.path().join("plan.json")).unwrap()).unwrap();
+    let read = saved["plan"]["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find_map(|effect| effect.get("Read"))
+        .expect("the deferred query must keep its Read effect");
+    assert_eq!(
+        read["resource"]["attributes"]["name_regex"],
+        serde_json::json!({"ResourceRef": {"path": {"binding": "next", "attribute": "name"}}}),
+        "constraint admission must not rewrite the saved query's structural input",
+    );
+    assert_eq!(
+        read["resource"]["value_dependencies"][0]["identity"],
+        "next",
+    );
+    assert_eq!(
+        saved["data_source_values"][0]["value"]["kind"],
+        "deferred_to_apply",
+    );
+    success(&run(
+        fixture.path(),
+        &["apply", "--auto-approve", "--lock=false", "plan.json"],
+    ));
 }
 
 #[test]

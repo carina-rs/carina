@@ -4263,6 +4263,7 @@ fn validate_resolved_value_constraints(
     resource_origins: &[Resource],
     data_sources: &[DataSource],
     data_source_origins: &[DataSource],
+    session: &ValidationProviderCatalog<'_>,
 ) -> Vec<PlanError> {
     assert_eq!(
         resources.len(),
@@ -4301,12 +4302,31 @@ fn validate_resolved_value_constraints(
         let Some(schema) = ctx.schemas().get_for_data_source(resource) else {
             continue;
         };
-        let classified = project_plan_attributes(
-            &resource.id,
-            &resource.attributes,
-            bindings,
-            &mut plan_errors,
-        );
+        // Deferred queries keep authored references for saved-plan dependency
+        // reconstruction. Resolve a separate candidate for constraint admission.
+        let attributes = resource
+            .attributes
+            .iter()
+            .filter_map(
+                |(name, value)| match carina_core::resolver::resolve_ref_value_with_config(
+                    value, bindings, session,
+                ) {
+                    Ok(value) => Some((name.clone(), value)),
+                    Err(error) => {
+                        plan_errors.push(PlanError::new(
+                            resource.id.clone(),
+                            PlanErrorKind::ValueResolution {
+                                attribute: name.clone(),
+                                error: Box::new(error),
+                            },
+                        ));
+                        None
+                    }
+                },
+            )
+            .collect();
+        let classified =
+            project_plan_attributes(&resource.id, &attributes, bindings, &mut plan_errors);
         append_resolved_value_constraint_errors(
             &mut plan_errors,
             &resource.id,
@@ -4418,6 +4438,7 @@ impl<'a> PlanPreprocessor<'a> {
                         resource_origins,
                         data_sources,
                         data_source_origins,
+                        session,
                     );
                     if let Err(error) = module_gate.check(resources.bindings(), session)
                         && let Some(module_errors) = module_constraint_plan_errors(error)?

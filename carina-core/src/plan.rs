@@ -184,6 +184,12 @@ pub enum PlanErrorKind {
         attribute: String,
         error: Box<crate::resource::knowledge::KnowledgeError>,
     },
+    /// Resolving a transient constraint candidate must retain typed failures.
+    #[serde(skip)]
+    ValueResolution {
+        attribute: String,
+        error: Box<crate::resolver::ResolutionError>,
+    },
     /// An update would have to resend an ignored write-only value that the
     /// provider cannot return on read.
     IgnoredWriteOnlyValueUnavailable {
@@ -464,6 +470,7 @@ impl PlanErrorKind {
                 reason,
             } => write!(f, "wait `{wait_binding}`: {reason}"),
             Self::Knowledge { attribute, error } => write!(f, "{attribute}: {error}"),
+            Self::ValueResolution { attribute, error } => write!(f, "{attribute}: {error}"),
             Self::ResolvedValueConstraint {
                 attributes,
                 origins,
@@ -517,6 +524,9 @@ impl PlanError {
             // not a second user-facing resource identity.
             PlanErrorKind::ModuleConstraint(diagnostic) => write!(f, "{diagnostic}"),
             PlanErrorKind::Knowledge { attribute, error } => {
+                write!(f, "{}.{attribute}: {error}", self.resource_id)
+            }
+            PlanErrorKind::ValueResolution { attribute, error } => {
                 write!(f, "{}.{attribute}: {error}", self.resource_id)
             }
             kind @ (PlanErrorKind::PreventDestroy { .. }

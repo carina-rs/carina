@@ -62,14 +62,18 @@ fn plan_boundary_collects_every_resource_and_attribute_failure() {
             ]));
         }
     }
-    let errors = validate_resolved_value_constraints(
-        &ctx,
-        &ResolvedBindings::default(),
-        &parsed.resources,
-        &origins,
-        &[],
-        &[],
-    );
+    let errors =
+        carina_core::validation::deferred_types::with_session_for_test(&config, |session| {
+            validate_resolved_value_constraints(
+                &ctx,
+                &ResolvedBindings::default(),
+                &parsed.resources,
+                &origins,
+                &[],
+                &[],
+                session,
+            )
+        });
     assert_eq!(errors.len(), 4);
     assert!(errors.iter().all(|entry| matches!(
         &entry.kind,

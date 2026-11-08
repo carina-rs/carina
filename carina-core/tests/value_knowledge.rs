@@ -18,6 +18,70 @@ fn secret(value: V) -> V {
     Value::Deferred(DeferredValue::Secret(Box::new(value).into()))
 }
 
+fn assert_apply_operand_timing(binding: &str, attribute: &str) {
+    let directory = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../carina-cli/tests/fixtures/value_knowledge/apply_operand_timing");
+    let parsed = carina_core::config_loader::parse_directory(
+        &carina_core::paths::ResolvedPath::new(directory).unwrap(),
+        &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+    )
+    .unwrap()
+    .into_parsed();
+    let resource = parsed
+        .resources
+        .iter()
+        .find(|resource| {
+            resource
+                .binding
+                .as_ref()
+                .is_some_and(|name| name.as_str() == binding)
+        })
+        .unwrap();
+    let value = resource.get_attr(attribute).unwrap();
+    let bindings = carina_core::binding_index::ResolvedBindings::default();
+    let knowledge = value.knowledge(&KnowledgeContext::plan(&bindings)).unwrap();
+    let Classification::Pending(operation) = &*knowledge else {
+        panic!("retained operation");
+    };
+    assert_eq!(operation.phase(), Phase::Apply);
+    assert!(
+        knowledge.sites().all(|site| site.phase() == Phase::Apply),
+        "{binding} retained a Plan site: {:?}",
+        knowledge.sites().collect::<Vec<_>>()
+    );
+    assert!(PlanResolved::try_from(knowledge).is_ok());
+}
+
+#[test]
+fn apply_operand_user_call_has_no_plan_sites() {
+    assert_apply_operand_timing("direct", "present");
+}
+
+#[test]
+fn apply_operand_builtin_has_no_plan_sites() {
+    assert_apply_operand_timing("builtin", "present");
+}
+
+#[test]
+fn apply_operand_interpolation_has_no_plan_sites() {
+    assert_apply_operand_timing("interpolation", "present");
+}
+
+#[test]
+fn apply_operand_arithmetic_has_no_plan_sites() {
+    assert_apply_operand_timing("arithmetic", "create_read_back_pending_polls");
+}
+
+#[test]
+fn apply_operand_access_has_no_plan_sites() {
+    assert_apply_operand_timing("access", "present");
+}
+
+#[test]
+fn apply_operand_coalesce_has_no_plan_sites() {
+    assert_apply_operand_timing("coalesce", "present");
+}
+
 #[test]
 fn source_free_evaluation_has_a_nonempty_plan_site() {
     let value: V = Value::Deferred(DeferredValue::Interpolation(vec![

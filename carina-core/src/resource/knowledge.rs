@@ -2550,13 +2550,22 @@ fn pending<'a, P: PlaceholderKind, B: BindingAddress>(
 fn expression<'a, P: PlaceholderKind, B: BindingAddress>(
     source: &'a Value<P, B>,
     kind: EvaluationKind,
-    inputs: Vec<kernel::Input<'a, P, B>>,
+    mut inputs: Vec<kernel::Input<'a, P, B>>,
 ) -> Classification<'a, P, B> {
     let phase = if inputs.iter().any(kernel::Input::apply_required) {
         Phase::Apply
     } else {
         Phase::Plan
     };
+    // A shared lexical body is executed within this invocation. Carry the
+    // invocation's timing on its edge without changing the cached analysis.
+    // Ordinary value operands retain their own pending work.
+    for input in &mut inputs {
+        match &input.value {
+            kernel::InputValue::Lexical(_) => input.apply = phase == Phase::Apply,
+            kernel::InputValue::Value(_) => {}
+        }
+    }
     Classification::Pending(Pending {
         source,
         node: kernel::PendingNode::Ordinary(inputs),
