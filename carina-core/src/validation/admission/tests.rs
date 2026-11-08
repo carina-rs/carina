@@ -260,7 +260,7 @@ fn retained_reference_boundaries_are_built_per_attribute_not_per_leaf() {
 }
 
 #[test]
-fn ambiguous_union_keeps_existence_checks_and_defers_value_checks_to_apply() {
+fn ambiguous_union_rejects_reference_fitting_no_member_and_checks_existence() {
     fixture(
         AttributeType::int(),
         AttributeType::union(vec![
@@ -277,11 +277,20 @@ fn ambiguous_union_keeps_existence_checks_and_defers_value_checks_to_apply() {
                         indexmap::IndexMap::from([("count".into(), value)]),
                     ))
                 };
-                let pending = validate(destination, &map(reference()), bindings, session)
-                    .unwrap()
-                    .ready()
-                    .unwrap_err();
-                assert!(pending.local_obligation().is_some());
+                let error =
+                    validate(destination, &map(reference()), bindings, session).unwrap_err();
+                let ResolutionError::AdmissionConstraints(findings) = error.resolution_error()
+                else {
+                    panic!("expected a validation rejection: {error:?}");
+                };
+                assert_eq!(findings.findings().len(), 1, "{error:?}");
+                assert!(
+                    findings.findings()[0]
+                        .error
+                        .to_string()
+                        .contains("expected String, got Int"),
+                    "{error:?}"
+                );
                 assert!(
                     validate(
                         destination,
@@ -291,106 +300,82 @@ fn ambiguous_union_keeps_existence_checks_and_defers_value_checks_to_apply() {
                     )
                     .is_err()
                 );
-                let mut resolved = ResolvedBindings::default();
-                resolved.set(
-                    "producer",
-                    HashMap::from([(
-                        "output".into(),
-                        Value::Concrete(crate::resource::ConcreteValue::Int(1)),
-                    )]),
-                    BindingValueSource::Local,
-                );
-                assert!(pending.discharge(&resolved, session).is_err());
             });
         },
     );
 }
 
 #[test]
-fn ambiguous_union_module_argument_keeps_schema_requirement() {
-    ambiguous_union_strict_kind_keeps_schema_requirement::<kind::ModuleArgument>();
+fn ambiguous_union_checks_no_member_and_all_members_for_every_kind() {
+    ambiguous_union_checks_members::<kind::ResourceAttribute>();
+    ambiguous_union_checks_members::<kind::DataSourceAttribute>();
+    ambiguous_union_checks_members::<kind::ProviderConfigAttribute>();
+    ambiguous_union_checks_members::<kind::BackendAttribute>();
+    ambiguous_union_checks_members::<kind::ModuleArgument>();
+    ambiguous_union_checks_members::<kind::AnnotatedAttribute>();
+    ambiguous_union_checks_members::<kind::Export>();
+    ambiguous_union_checks_members::<kind::UpstreamExport>();
 }
 
-#[test]
-fn ambiguous_union_export_keeps_schema_requirement() {
-    ambiguous_union_strict_kind_keeps_schema_requirement::<kind::Export>();
-}
-
-#[test]
-fn ambiguous_union_other_strict_kinds_keep_schema_requirement() {
-    ambiguous_union_strict_kind_keeps_schema_requirement::<kind::ProviderConfigAttribute>();
-    ambiguous_union_strict_kind_keeps_schema_requirement::<kind::BackendAttribute>();
-    ambiguous_union_strict_kind_keeps_schema_requirement::<kind::AnnotatedAttribute>();
-    ambiguous_union_strict_kind_keeps_schema_requirement::<kind::UpstreamExport>();
-}
-
-fn ambiguous_union_strict_kind_keeps_schema_requirement<K: DestinationKind + std::fmt::Debug>() {
-    fixture(
-        AttributeType::int(),
-        AttributeType::union(vec![
-            AttributeType::map(AttributeType::string()),
-            AttributeType::struct_(
-                "Count",
-                vec![StructField::optional("count", AttributeType::string()).build()],
-            ),
-        ]),
-        |catalog, _, bindings, destination| {
-            let destination: Destination<K> = Destination {
-                identity: destination.identity.clone(),
-                label: destination.label.clone(),
-                contract: destination.contract.clone(),
-                kind: PhantomData,
-            };
-            with_session_for_test(catalog, |session| {
-                let value = Value::Concrete(crate::resource::ConcreteValue::Map(
-                    indexmap::IndexMap::from([("count".into(), reference())]),
-                ));
-                let (candidate, context) = Candidate::validation_classified(
-                    value
-                        .knowledge(&KnowledgeContext::validation())
-                        .unwrap()
-                        .into_classification(),
-                    Some(bindings),
-                    session,
-                );
-                let contract = destination.contract.as_deref().unwrap();
-                let path = join(
-                    &contract.path,
-                    &crate::schema::FieldPath::new()
-                        .push_map_key("count")
-                        .canonical(),
-                );
-                let assignment::CandidateOrigin::Reference(reference) =
-                    assignment::CandidateOrigin::of(&reference())
-                else {
-                    panic!("reference origin")
-                };
-                let mut findings = crate::schema::value_validation::AssignmentFindings::default();
-                reference
-                    .judge_at::<K>(
-                        contract,
-                        contract.attr(),
-                        &path,
-                        &assignment::ReferenceContext::from(&context),
-                        &mut findings,
-                    )
-                    .unwrap();
-                assert!(findings.local.is_empty());
-                assert!(!findings.schema.is_empty());
-                assert!(matches!(
-                    assignment::judge_with_findings(&destination, &candidate, &context)
-                        .unwrap()
-                        .verdict,
-                    AssignmentVerdict::NeedsSchema(schema) if !schema.is_empty()
-                ));
-                let pending = admit(&destination, candidate, &context)
-                    .unwrap()
-                    .ready()
-                    .unwrap_err();
-                assert!(pending.local_obligation().is_none());
-            });
-        },
-    );
+fn ambiguous_union_checks_members<K: DestinationKind + std::fmt::Debug>() {
+    for (source, accepted) in [
+        (AttributeType::int(), false),
+        (AttributeType::string(), true),
+    ] {
+        for reverse in [false, true] {
+            let mut members = vec![
+                AttributeType::map(AttributeType::string()),
+                AttributeType::struct_(
+                    "Count",
+                    vec![StructField::optional("count", AttributeType::string()).build()],
+                ),
+            ];
+            if reverse {
+                members.reverse();
+            }
+            fixture(
+                source.clone(),
+                AttributeType::union(members),
+                |catalog, _, bindings, destination| {
+                    let destination: Destination<K> = Destination {
+                        identity: destination.identity.clone(),
+                        label: destination.label.clone(),
+                        contract: destination.contract.clone(),
+                        kind: PhantomData,
+                    };
+                    with_session_for_test(catalog, |session| {
+                        let value = Value::Concrete(crate::resource::ConcreteValue::Map(
+                            indexmap::IndexMap::from([("count".into(), reference())]),
+                        ));
+                        let (candidate, context) = Candidate::validation_classified(
+                            value
+                                .knowledge(&KnowledgeContext::validation())
+                                .unwrap()
+                                .into_classification(),
+                            Some(bindings),
+                            session,
+                        );
+                        let judgement =
+                            assignment::judge_with_findings(&destination, &candidate, &context);
+                        if accepted {
+                            assert!(matches!(
+                                judgement.unwrap().verdict,
+                                AssignmentVerdict::Proven(_)
+                            ));
+                            let pending = admit(&destination, candidate, &context)
+                                .unwrap()
+                                .ready()
+                                .unwrap_err();
+                            assert!(pending.local_obligation().is_none());
+                        } else {
+                            assert!(judgement.is_err(), "Int fits no candidate member");
+                            assert!(admit(&destination, candidate, &context).is_err());
+                        }
+                    });
+                },
+            );
+        }
+    }
 }
 
 #[test]

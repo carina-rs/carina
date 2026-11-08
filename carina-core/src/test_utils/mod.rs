@@ -41,7 +41,50 @@ pub fn admit_resource_attribute_report<
     })
 }
 
-/// Collect fixture diagnostics from production validation admission.
+/// Validate a resource's authored attributes through production admission.
+///
+/// Available with the `test-utils` feature for provider test dev-dependencies.
+/// The schema walk checks required attributes and field groups; each authored
+/// value enters `admit()`, including local and provider custom-type validation
+/// from `custom_types`. Use the schema and custom types from the same catalog.
+///
+/// A VPC gateway attachment must specify exactly one gateway. Supplying both
+/// is rejected even though each attribute is individually a valid String:
+///
+/// ```
+/// use std::collections::HashMap;
+/// use carina_core::{
+///     parser::ProviderCustomTypes,
+///     resource::{ConcreteValue, Value, knowledge::KnowledgeContext},
+///     schema::{AttributeSchema, AttributeType, FieldGroup, ResourceSchema, SchemaKind, SchemaRegistry},
+///     test_utils::admit_resource_attributes,
+/// };
+///
+/// let schema = ResourceSchema::new("ec2.vpc_gateway_attachment")
+///     .attribute(AttributeSchema::required("vpc_id", AttributeType::string()).build())
+///     .attribute(AttributeSchema::optional("internet_gateway_id", AttributeType::string()).build())
+///     .attribute(AttributeSchema::optional("vpn_gateway_id", AttributeType::string()).build())
+///     .field_group(FieldGroup::exactly_one(["internet_gateway_id", "vpn_gateway_id"]).unwrap())
+///     .validate().unwrap();
+/// let mut schemas = SchemaRegistry::new();
+/// schemas.insert("awscc", schema);
+/// let schema = schemas.get("awscc", "ec2.vpc_gateway_attachment", SchemaKind::Resource).unwrap();
+/// let values: HashMap<String, Value> = HashMap::from([
+///     ("vpc_id".into(), Value::Concrete(ConcreteValue::String("vpc-12345678".into()))),
+///     ("internet_gateway_id".into(), Value::Concrete(ConcreteValue::String("igw-12345678".into()))),
+///     ("vpn_gateway_id".into(), Value::Concrete(ConcreteValue::String("vgw-12345678".into()))),
+/// ]);
+/// let attributes = values.iter().map(|(name, value)| {
+///     (name.clone(), value.knowledge(&KnowledgeContext::validation()).unwrap().into_classification())
+/// }).collect();
+/// let errors = admit_resource_attributes(
+///     schema, &attributes, &|_| true, &ProviderCustomTypes::default(),
+/// ).unwrap_err();
+/// assert_eq!(errors.len(), 1);
+/// assert!(errors[0].to_string().contains(
+///     "exactly one of [internet_gateway_id, vpn_gateway_id] must be set"
+/// ));
+/// ```
 pub fn admit_resource_attributes<
     P: crate::resource::PlaceholderKind,
     B: crate::resource::BindingAddress,

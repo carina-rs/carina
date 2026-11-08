@@ -22,8 +22,8 @@ use carina_core::provider::{
     HostErrorCause, LoadedProviderSnapshot, ProviderFactory, SuspendedValidationId,
 };
 use carina_core::resource::{
-    AbsoluteBindingAddress, BindingAddress, ConcreteValue, DeferredValue, ParserPlaceholder,
-    RelativeBindingName, Value as GenericValue,
+    AbsoluteBindingAddress, BindingAddress, ConcreteValue, ParserPlaceholder, RelativeBindingName,
+    Value as GenericValue,
 };
 use carina_core::schema::{SchemaRegistry, TypeError};
 use carina_core::validation::DeferredAccessTypeError;
@@ -1805,7 +1805,7 @@ impl DiagnosticRun<'_> {
                                 }
                             }
                             let symbolic = attr_findings.symbolic_errors().to_vec();
-                            for (_path, error) in &symbolic {
+                            for (path, error) in &symbolic {
                                 use carina_core::resource::SecretDiagnosticError;
                                 use carina_core::validation::admission::AdmissionReferenceError;
                                 let (location, severity, message) = match error {
@@ -1861,19 +1861,12 @@ impl DiagnosticRun<'_> {
                                             error.to_string(),
                                         ),
                                     },
-                                    TypeError::TypeMismatch { .. } => {
-                                        let origin = match assignment_value {
-                                            Value::Deferred(DeferredValue::ResourceRef {
-                                                path,
-                                            }) => Some(path.to_dot_string()),
-                                            Value::Deferred(DeferredValue::BindingRef {
-                                                binding,
-                                            }) => Some(binding.to_string()),
-                                            _ => None,
-                                        };
-                                        let message = origin.map_or_else(
-                                            || error.to_string(),
-                                            |origin| format!("{error} (from {origin})"),
+                                    TypeError::TypeMismatch { types } => {
+                                        let message = validation::reference_mismatch_message(
+                                            assignment_value,
+                                            path,
+                                            attr_name,
+                                            types,
                                         );
                                         (
                                             rref.attribute_key_location(attr_name),
@@ -1929,11 +1922,8 @@ impl DiagnosticRun<'_> {
                                     .filter(|(path, error)| {
                                         (!path.is_empty()
                                             || !contains_function_call(authored_attr_value))
-                                            && !symbolic.iter().any(
-                                                |(symbolic_path, symbolic_error)| {
-                                                    path.canonical() == *symbolic_path
-                                                        && error == symbolic_error
-                                                },
+                                            && !validation::covered_by_symbolic_findings(
+                                                path, error, &symbolic,
                                             )
                                     })
                                     .collect();

@@ -3,8 +3,96 @@
 use super::{DiagnosticEngine, render_merged, render_schema_diagnostic};
 use crate::document::Document;
 use carina_core::parser::{AnalysisResourceRef, Located};
-use carina_core::schema::{FieldPath, FieldPathStep, TypeError, ValidatedResourceSchema};
+use carina_core::schema::{
+    FieldPath, FieldPathStep, LeafPath, LeafPathSegment, MismatchTypeNames, TypeError,
+    ValidatedResourceSchema,
+};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
+
+pub(super) fn reference_mismatch_message(
+    value: &super::Value,
+    path: &LeafPath,
+    attribute: &str,
+    types: &MismatchTypeNames,
+) -> String {
+    use carina_core::resource::{ConcreteValue, DeferredValue, Value};
+
+    let leaf = path
+        .segments()
+        .iter()
+        .try_fold(value, |value, step| match (value, step) {
+            (Value::Concrete(ConcreteValue::List(values)), LeafPathSegment::ListIndex(index)) => {
+                values.get(*index)
+            }
+            (Value::Concrete(ConcreteValue::Map(values)), LeafPathSegment::StructField(name)) => {
+                values.get(name)
+            }
+            (Value::Concrete(ConcreteValue::Map(values)), LeafPathSegment::MapKey(key)) => {
+                values.get(key.expose_plaintext())
+            }
+            _ => None,
+        });
+    let origin = match leaf {
+        Some(Value::Deferred(DeferredValue::ResourceRef { path })) => Some(path.to_dot_string()),
+        Some(Value::Deferred(DeferredValue::BindingRef { binding })) => Some(binding.to_string()),
+        _ => None,
+    };
+    let message = if path.segments().is_empty() {
+        format!("Type mismatch: {types}")
+    } else {
+        format!("cannot assign {} to '{attribute}': {types}", types.actual())
+    };
+    match origin {
+        Some(origin) => format!("{message} (from {origin})"),
+        None => message,
+    }
+}
+
+/// A container summary is redundant only when every error it describes has
+/// already been rendered from admission at the same authored value path.
+pub(super) fn covered_by_symbolic_findings(
+    path: &FieldPath,
+    error: &TypeError,
+    symbolic: &[(LeafPath, TypeError)],
+) -> bool {
+    if symbolic.iter().any(|(symbolic_path, symbolic_error)| {
+        error == symbolic_error
+            && path.steps().len() == symbolic_path.segments().len()
+            && path
+                .steps()
+                .iter()
+                .zip(symbolic_path.segments())
+                .all(|(step, segment)| match (step, segment) {
+                    (FieldPathStep::Field(field), LeafPathSegment::StructField(name)) => {
+                        field == name
+                    }
+                    (FieldPathStep::Field(field), LeafPathSegment::MapKey(key)) => {
+                        field == key.expose_plaintext()
+                    }
+                    (FieldPathStep::Index(index), LeafPathSegment::ListIndex(other)) => {
+                        index == other
+                    }
+                    _ => false,
+                })
+    }) {
+        return true;
+    }
+    match error {
+        TypeError::ListItemError { index, inner } => {
+            covered_by_symbolic_findings(&path.push_index(*index), inner, symbolic)
+        }
+        TypeError::MapValueError { key, inner } => {
+            covered_by_symbolic_findings(&path.push_field(key), inner, symbolic)
+        }
+        TypeError::StructFieldError { field, inner } => {
+            covered_by_symbolic_findings(&path.push_field(field), inner, symbolic)
+        }
+        TypeError::UnionAlternativesMismatch { failures } => failures
+            .iter()
+            .all(|error| covered_by_symbolic_findings(path, error, symbolic)),
+        _ => false,
+    }
+}
 
 impl DiagnosticEngine {
     /// Attach each cached path-tagged error to the

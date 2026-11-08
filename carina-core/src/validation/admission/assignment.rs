@@ -330,13 +330,9 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
         };
         match source {
             RefType::Typed(source) => {
-                if !contract.has_reference_sink_at(path) {
-                    // A Union supplies a nested sink only when its collection
-                    // shape identifies one member. Existence was checked above;
-                    // only rechecking kinds may defer a local Union check.
-                    defer_reference_check::<K>(path, findings);
-                    return Ok(());
-                }
+                // The value walk supplies each Union member's own sink. Every
+                // kind judges that sink even when several members share a shape:
+                // reject if none fit, admit if all fit, without guessing a sink.
                 if source.resource_handle_type().is_some() {
                     return Err(reference_error(AdmissionReferenceError::ResourceHandle {
                         reference: self.reference.as_ref().to_dot_string(),

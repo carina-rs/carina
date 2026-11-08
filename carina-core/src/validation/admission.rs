@@ -331,26 +331,6 @@ impl DestinationContract {
     fn defs(&self) -> &std::collections::BTreeMap<String, CompiledAttributeType> {
         self.schema.defs()
     }
-
-    fn has_reference_sink_at(&self, path: &LeafPath) -> bool {
-        let root = crate::validation::RefSink::EffectiveType {
-            attr_type: self.attr(),
-            defs: self.defs(),
-            owner: &self.owner,
-            ancestry: self.ancestry,
-        };
-        path.segments()
-            .iter()
-            .skip(self.path.segments().len())
-            .try_fold(root, |sink, step| match step {
-                crate::schema::LeafPathSegment::StructField(name) => sink.map_entry(name),
-                crate::schema::LeafPathSegment::MapKey(key) => {
-                    sink.map_entry(key.expose_plaintext())
-                }
-                crate::schema::LeafPathSegment::ListIndex(_) => sink.list_element(),
-            })
-            .is_some()
-    }
 }
 
 /// Minted only by the owning catalog, binding declaration, instance and snapshot.
