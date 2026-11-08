@@ -2395,6 +2395,23 @@ fn collect_ref_diagnostics_with_sink<'a, P: PlaceholderKind, B: BindingAddress, 
 
 type ReferenceDiagnosticMessage = SecretDiagnosticError<String>;
 
+/// Render a reference mismatch for an attribute or a top-level value.
+/// `origin` includes its label (for example, `from producer.output`).
+pub fn reference_type_mismatch_message(
+    attribute: Option<&str>,
+    types: &MismatchTypeNames,
+    origin: Option<&dyn std::fmt::Display>,
+) -> String {
+    let message = match attribute {
+        Some(attribute) => format!("cannot assign {} to '{attribute}': {types}", types.actual()),
+        None => format!("Type mismatch: {types}"),
+    };
+    match origin {
+        Some(origin) => format!("{message} ({origin})"),
+        None => message,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReferenceFindingLocation {
     Resource { location: String, attribute: String },
@@ -2505,11 +2522,15 @@ impl std::fmt::Display for ReferenceFinding {
                 origin,
             } => {
                 match &self.location {
-                    ReferenceFindingLocation::Resource { attribute, .. } => write!(
-                        f,
-                        "cannot assign {} to '{attribute}': {types}",
-                        types.actual()
-                    )?,
+                    ReferenceFindingLocation::Resource { attribute, .. } => {
+                        return f.write_str(&reference_type_mismatch_message(
+                            Some(attribute),
+                            types,
+                            origin
+                                .as_ref()
+                                .map(|origin| origin as &dyn std::fmt::Display),
+                        ));
+                    }
                     ReferenceFindingLocation::Attribute(_) => write!(f, "type mismatch: {types}")?,
                     ReferenceFindingLocation::Export(_) => {
                         write!(f, "type mismatch for '{path}': {types}")?
@@ -5434,14 +5455,12 @@ fn resource_admission_report<
                                         DeferredAccessTypeError::TypeMismatch { types, origin },
                                     ),
                                 ) => {
-                                    all_errors.push(format!(
-                                        "{}: cannot assign {} to '{}': {} ({})",
-                                        location,
-                                        types.actual(),
-                                        attribute,
+                                    let message = reference_type_mismatch_message(
+                                        Some(attribute),
                                         types,
-                                        origin
-                                    ));
+                                        Some(origin),
+                                    );
+                                    all_errors.push(format!("{location}: {message}"));
                                 }
                                 SecretDiagnosticError::Public(
                                     admission::AdmissionReferenceError::Computed(
@@ -5496,18 +5515,15 @@ fn resource_admission_report<
                                         references.push(binding.diagnostic_path().to_dot_string())
                                     });
                                 }
-                                let origin = references
-                                    .first()
-                                    .map(|path| format!(" (from {path})"))
-                                    .unwrap_or_default();
-                                all_errors.push(format!(
-                                    "{}: cannot assign {} to '{}': {}{}",
-                                    location,
-                                    types.actual(),
-                                    attribute,
+                                let origin = references.first().map(|path| format!("from {path}"));
+                                let message = reference_type_mismatch_message(
+                                    Some(attribute),
                                     types,
                                     origin
-                                ));
+                                        .as_ref()
+                                        .map(|origin| origin as &dyn std::fmt::Display),
+                                );
+                                all_errors.push(format!("{location}: {message}"));
                             }
                             error => all_errors.push(format!("{location}.{attribute}: {error}")),
                         }

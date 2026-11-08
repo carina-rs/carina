@@ -9864,7 +9864,7 @@ impl ValidatedResourceSchema {
         &self,
         attributes: &HashMap<String, Value>,
     ) -> Result<(), Vec<TypeError>> {
-        self.schema.validate_values(attributes)
+        self.validate_with_origins(attributes, &|_| false)
     }
 
     #[cfg(test)]
@@ -9873,8 +9873,11 @@ impl ValidatedResourceSchema {
         attributes: &HashMap<String, Value>,
         is_string_literal: &dyn Fn(&str) -> bool,
     ) -> Result<(), Vec<TypeError>> {
-        self.schema
-            .validate_values_with_origins(attributes, is_string_literal)
+        self.validate_with_origins_and_lookup(
+            &classified_attributes(attributes)?,
+            is_string_literal,
+            no_lookup(),
+        )
     }
 
     #[cfg(test)]
@@ -9884,8 +9887,13 @@ impl ValidatedResourceSchema {
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
-        self.schema
-            .validate_values_with_origins_and_lookup(attributes, is_string_literal, lookup)
+        crate::validation::admission::attributes::admit_resource_attribute_fixture(
+            self,
+            attributes,
+            is_string_literal,
+            lookup,
+        )
+        .into_result()
     }
 }
 
@@ -15282,91 +15290,6 @@ impl PatternResourceSchema<Compiled> {
         )
     }
 
-    /// Validate resource attributes.
-    ///
-    /// This variant does not have origin information for string values, so
-    /// it cannot distinguish a user-typed `target_type = "aaa"` from a
-    /// bare-identifier `target_type = aaa` — both surface as
-    /// `InvalidEnumVariant`. Call `validate_with_origins` when the caller
-    /// knows which attributes were written as quoted string literals
-    /// (see #2094).
-    #[cfg(test)]
-    fn validate_values(&self, attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-        self.validate_inner(
-            &classified_attributes(attributes)?,
-            &|_attr_name| false,
-            no_lookup(),
-        )
-    }
-
-    /// Validate resource attributes, reshaping enum-variant errors into
-    /// `StringLiteralExpectedEnum` for attributes whose value was written
-    /// in the source as a quoted string literal.
-    ///
-    /// `is_string_literal` answers "was this top-level attribute on the
-    /// current resource written as `attr = \"...\"`?". A `true` response
-    /// upgrades any `InvalidEnumVariant` for that attribute into
-    /// `StringLiteralExpectedEnum` so the error message describes the
-    /// form mismatch instead of asking the user to match a list of
-    /// variants. Non-enum errors are passed through unchanged.
-    #[cfg(test)]
-    fn validate_values_with_origins(
-        &self,
-        attributes: &HashMap<String, Value>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-    ) -> Result<(), Vec<TypeError>> {
-        self.validate_inner(
-            &classified_attributes(attributes)?,
-            is_string_literal,
-            no_lookup(),
-        )
-    }
-
-    /// As [`validate_with_origins`], but also runs `lookup` on every
-    /// refined primitive identity reached during traversal so
-    /// provider-supplied validators that the schema itself cannot
-    /// carry (WASM plugin path) still get to reject bad values.
-    #[cfg(test)]
-    fn validate_values_with_origins_and_lookup<
-        'v,
-        P: PlaceholderKind,
-        B: BindingAddress,
-        T: StructuralPending<'v, P, B>,
-    >(
-        &self,
-        attributes: &HashMap<String, Classification<'v, P, B, T>>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-    ) -> Result<(), Vec<TypeError>> {
-        self.validate_inner(attributes, is_string_literal, lookup)
-    }
-
-    #[cfg(test)]
-    fn validate_inner<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
-        &self,
-        attributes: &HashMap<String, Classification<'v, P, B, T>>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-    ) -> Result<(), Vec<TypeError>> {
-        self.validate_report(attributes, is_string_literal, lookup)
-            .into_result()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn validate_report<
-        'v,
-        P: PlaceholderKind,
-        B: BindingAddress,
-        T: StructuralPending<'v, P, B>,
-    >(
-        &self,
-        attributes: &HashMap<String, Classification<'v, P, B, T>>,
-        is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-    ) -> ResourceValueValidation {
-        self.validate_admission_report(attributes, is_string_literal, lookup, None)
-    }
-
     pub(crate) fn validate_admission_report<
         'v,
         P: PlaceholderKind,
@@ -15376,8 +15299,7 @@ impl PatternResourceSchema<Compiled> {
         &self,
         attributes: &HashMap<String, Classification<'v, P, B, T>>,
         is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
-        admission: Option<&value_validation::AttributeAdmission<'_, 'v, P, B, T>>,
+        admission: &value_validation::AttributeAdmission<'_, 'v, P, B, T>,
     ) -> ResourceValueValidation {
         let mut report = ResourceValueValidation::default();
 
@@ -15393,7 +15315,6 @@ impl PatternResourceSchema<Compiled> {
         let values = self.validate_value_entries(
             attributes,
             is_string_literal,
-            lookup,
             ValueEntryValidation::FullInput,
             None,
             admission,
@@ -15455,7 +15376,6 @@ impl PatternResourceSchema<Compiled> {
         >,
         selected: Option<&HashSet<String>>,
         is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
         admission: value_validation::KnownAttributeAdmission<
             '_,
             'v,
@@ -15467,13 +15387,12 @@ impl PatternResourceSchema<Compiled> {
         let mut report = self.validate_value_entries(
             attributes,
             is_string_literal,
-            lookup,
             ValueEntryValidation::KnownWritableOnly,
             selected,
-            Some(&value_validation::AttributeAdmission {
+            &value_validation::AttributeAdmission {
                 known: admission,
                 unknown: None,
-            }),
+            },
         );
         if selected.is_none_or(|names| !names.is_empty())
             && let Some(validator) = self.validator()
@@ -15504,10 +15423,9 @@ impl PatternResourceSchema<Compiled> {
         &self,
         attributes: &HashMap<String, Classification<'v, P, B, T>>,
         is_string_literal: &dyn Fn(&str) -> bool,
-        lookup: CustomTypeLookup<'_>,
         mode: ValueEntryValidation,
         selected: Option<&HashSet<String>>,
-        admission: Option<&value_validation::AttributeAdmission<'_, 'v, P, B, T>>,
+        admission: &value_validation::AttributeAdmission<'_, 'v, P, B, T>,
     ) -> ResourceValueValidation {
         let mut report = ResourceValueValidation::default();
 
@@ -15550,23 +15468,14 @@ impl PatternResourceSchema<Compiled> {
                     continue;
                 }
 
-                let findings = match admission {
-                    Some(admit) => (admit.known)(
-                        name,
-                        value_validation::SchemaAttribute {
-                            ordinal,
-                            effective: effective_attribute.clone(),
-                        },
-                        value,
-                    ),
-                    None => value_validation::validate_value_with_lookup(
-                        &schema.attr_type,
-                        value,
-                        &self.defs,
-                        FieldAncestry::from_input_mode(effective_attribute.effective_input_mode()),
-                        lookup,
-                    ),
-                };
+                let findings = (admission.known)(
+                    name,
+                    value_validation::SchemaAttribute {
+                        ordinal,
+                        effective: effective_attribute.clone(),
+                    },
+                    value,
+                );
                 for (index, error) in findings.local_errors().enumerate() {
                     let tagged = error.clone().with_attribute(name);
                     let reshaped = if is_string_literal(name.as_str())
@@ -15591,7 +15500,7 @@ impl PatternResourceSchema<Compiled> {
                 }
                 report.attributes.insert(name.clone(), findings);
             } else if mode == ValueEntryValidation::FullInput {
-                if let Some(admit) = admission.and_then(|admission| admission.unknown) {
+                if let Some(admit) = admission.unknown {
                     report.attributes.insert(name.clone(), admit(name, value));
                 }
                 let id_attribute = format!("{name}_id");

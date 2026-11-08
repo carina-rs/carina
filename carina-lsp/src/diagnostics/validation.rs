@@ -33,19 +33,21 @@ pub(super) fn reference_mismatch_message(
             _ => None,
         });
     let origin = match leaf {
-        Some(Value::Deferred(DeferredValue::ResourceRef { path })) => Some(path.to_dot_string()),
-        Some(Value::Deferred(DeferredValue::BindingRef { binding })) => Some(binding.to_string()),
+        Some(Value::Deferred(DeferredValue::ResourceRef { path })) => {
+            Some(format!("from {}", path.to_dot_string()))
+        }
+        Some(Value::Deferred(DeferredValue::BindingRef { binding })) => {
+            Some(format!("from {binding}"))
+        }
         _ => None,
     };
-    let message = if path.segments().is_empty() {
-        format!("Type mismatch: {types}")
-    } else {
-        format!("cannot assign {} to '{attribute}': {types}", types.actual())
-    };
-    match origin {
-        Some(origin) => format!("{message} (from {origin})"),
-        None => message,
-    }
+    carina_core::validation::reference_type_mismatch_message(
+        (!path.segments().is_empty()).then_some(attribute),
+        types,
+        origin
+            .as_ref()
+            .map(|origin| origin as &dyn std::fmt::Display),
+    )
 }
 
 /// A container summary is redundant only when every error it describes has

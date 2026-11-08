@@ -175,10 +175,6 @@ pub fn admit_plan_attributes<K: RechecksResolved>(
         .iter()
         .map(|(name, proof)| (name.clone(), proof.knowledge().clone()))
         .collect();
-    let lookup = crate::parser::custom_type_lookup_for_schema(
-        session.catalog().custom_type_resolver(),
-        schema,
-    );
     schema
         .schema()
         .as_schema()
@@ -186,7 +182,6 @@ pub fn admit_plan_attributes<K: RechecksResolved>(
             &projected,
             None,
             &|name| quoted.contains(name),
-            &lookup,
             &|name, selected, _| {
                 let destination =
                     schema.admission_selected_attribute::<K>(id, name, selected, session.catalog());
@@ -321,7 +316,6 @@ fn admit_apply_attributes<K: RechecksResolved>(
             &classified,
             authored.map(|(_, names)| names),
             &|name| quoted.contains(name),
-            &lookup,
             &|name, selected, _| {
                 let destination =
                     schema.admission_selected_attribute::<K>(id, name, selected, session.catalog());
@@ -420,10 +414,6 @@ pub(crate) fn admit_validation_attributes<
         &std::collections::HashMap<String, (String, crate::binding_index::DeclaredValueSource)>,
     >,
 ) -> crate::schema::ResourceValueValidation {
-    let lookup = crate::parser::custom_type_lookup_for_schema(
-        session.catalog().custom_type_resolver(),
-        schema,
-    );
     let admit_attribute = |name: &str,
                            proof: &crate::resource::knowledge::Classification<'_, P, B>,
                            destination: &Destination<K>| {
@@ -490,8 +480,7 @@ pub(crate) fn admit_validation_attributes<
     schema.schema().as_schema().validate_admission_report(
         attributes,
         &|name| quoted.contains(name),
-        &lookup,
-        Some(&crate::schema::value_validation::AttributeAdmission {
+        &crate::schema::value_validation::AttributeAdmission {
             known: &|name, selected, proof| {
                 let destination =
                     schema.admission_selected_attribute::<K>(id, name, selected, session.catalog());
@@ -501,8 +490,53 @@ pub(crate) fn admit_validation_attributes<
                 let destination = schema.untyped_attribute::<K>(id, name, session.catalog());
                 admit_attribute(name, proof, &destination)
             }),
-        }),
+        },
     )
+}
+
+/// Keep schema unit-test lookups inside the production admission boundary.
+#[cfg(test)]
+pub(crate) fn admit_resource_attribute_fixture<P: PlaceholderKind, B: BindingAddress>(
+    schema: &crate::schema::ValidatedResourceSchema,
+    attributes: &std::collections::HashMap<
+        String,
+        crate::resource::knowledge::Classification<'_, P, B>,
+    >,
+    is_string_literal: &dyn Fn(&str) -> bool,
+    lookup: crate::schema::CustomTypeLookup<'_>,
+) -> crate::schema::ResourceValueValidation {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert("test", schema.clone());
+    let schema = schemas
+        .get("test", schema.parts().resource_type, schema.parts().kind)
+        .expect("fixture schema must be registered");
+    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let id = ResourceId::pending_with_provider("test", schema.schema().parts().resource_type, None);
+    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
+        let admit_attribute =
+            |proof: &crate::resource::knowledge::Classification<'_, P, B>,
+             destination: &Destination<kind::ResourceAttribute>| {
+                let (candidate, mut boundary) =
+                    Candidate::validation_classified(proof.clone(), None, session);
+                boundary.lookup = Some(lookup);
+                admission_findings(&mut admit(destination, candidate, &boundary))
+            };
+        schema.schema().as_schema().validate_admission_report(
+            attributes,
+            is_string_literal,
+            &crate::schema::value_validation::AttributeAdmission {
+                known: &|name, selected, proof| {
+                    let destination =
+                        schema.admission_selected_attribute(&id, name, selected, session.catalog());
+                    admit_attribute(proof, &destination)
+                },
+                unknown: Some(&|name, proof| {
+                    let destination = schema.untyped_attribute(&id, name, session.catalog());
+                    admit_attribute(proof, &destination)
+                }),
+            },
+        )
+    })
 }
 
 /// Exhaustive resource/data-source policy shared by all analysis adapters.

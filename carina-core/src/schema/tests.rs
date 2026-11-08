@@ -281,7 +281,6 @@ pub(crate) fn resolved_admission_for_test(
             attributes,
             selected,
             is_string_literal,
-            lookup,
             &|_, attribute, proof| {
                 value_validation::validate_value_with_lookup(
                     attribute.effective.field_type(),
