@@ -86,7 +86,12 @@ fn failed_user_call_modes_match_head() {
         resolve_resource_refs_defer_unknown_functions(&mut failed_user_call(), &context()).is_err()
     );
     assert!(
-        resolve_snapshot_function_calls_with_config(&mut failed_user_call(), &context()).is_err()
+        resolve_snapshot_function_calls_in_context(
+            &mut failed_user_call(),
+            &context(),
+            analysis_resolution_context()
+        )
+        .is_err()
     );
     assert!(resolve_resource_refs_for_diagnostics(&mut failed_user_call(), &context()).is_ok());
 }
@@ -108,8 +113,12 @@ fn strict_entry_points_and_diagnostics_still_reject_builtin_failures() {
             .is_ok()
     );
     assert!(
-        resolve_snapshot_function_calls_with_config(&mut parsed("length(true)"), &context())
-            .is_ok()
+        resolve_snapshot_function_calls_in_context(
+            &mut parsed("length(true)"),
+            &context(),
+            analysis_resolution_context()
+        )
+        .is_ok()
     );
 }
 
@@ -196,4 +205,19 @@ fn strict_coalesce_default_preserves_failures_and_folds_successes() {
         panic!("retained coalesce")
     };
     assert_eq!(default.as_ref(), &Value::Concrete(ConcreteValue::Int(2)));
+}
+
+#[test]
+fn retained_snapshot_does_not_require_failed_user_calls() {
+    let mut file = failed_user_call();
+    resolve_snapshot_function_calls_in_context(
+        &mut file,
+        &context(),
+        analysis_resolution_context().retained(),
+    )
+    .unwrap();
+    assert!(matches!(
+        file.resources[0].get_attr("comment"),
+        Some(Value::Deferred(DeferredValue::ResolvedFunctionCall { .. }))
+    ));
 }

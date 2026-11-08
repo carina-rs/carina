@@ -755,6 +755,20 @@ impl<O: WalkOutput> TransformFold<O> {
         Ok(nested.changed.then_some(candidate))
     }
 }
+/// Transform one typed argument through the same fold used by call operands.
+/// Whole-argument replacement still inventories every original Secret operand.
+pub(super) fn transform_argument_bound<
+    P: ValueKind,
+    B: BindingAddress,
+    A: BoundTransform<P, B> + BoundTransform<crate::resource::ParserPlaceholder, B>,
+>(
+    argument: FunctionArgument<P, B>,
+    at: At<'_>,
+    algebra: &mut A,
+) -> Result<FunctionArgument<P, B>, WalkError> {
+    TransformFold::<A::Output>::new().argument(argument, at, algebra)
+}
+
 impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
     pub(super) fn transform<
         A: BoundTransform<P, B> + BoundTransform<crate::resource::ParserPlaceholder, B>,

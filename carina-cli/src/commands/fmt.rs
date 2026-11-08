@@ -150,6 +150,41 @@ fn formatting_discovery_uses_environment_snapshot() {
     assert_eq!(config.providers[0].name, "mock");
 }
 
+#[cfg(test)]
+#[test]
+fn formatting_discovery_retains_directory_config_with_unavailable_lets() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("main.crn"),
+        "let item = mock.test.resource { name = 'item' }\n",
+    )
+    .unwrap();
+    fs::write(directory.path().join("providers.crn"),
+        "provider mock { version = '1.2.3' }\nlet named = provider mock {}\nlet token = secret(env('UNSET_X'))\nlet unused = env('UNSET_Y')\n").unwrap();
+    fs::write(
+        directory.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    let config = load_formatting_directory_config(
+        &ResolvedPath::new(directory.path()).unwrap(),
+        &carina_core::EnvironmentSnapshot::empty(),
+    );
+    assert_eq!(
+        config.providers.len(),
+        2,
+        "directory config must not fall back to defaults"
+    );
+    assert_eq!(
+        config.providers[0]
+            .version
+            .as_ref()
+            .map(ToString::to_string),
+        Some("1.2.3".to_string())
+    );
+    assert_eq!(config.providers[1].binding.as_deref(), Some("named"));
+}
+
 fn block_names_from_config<F>(
     directory: &ResolvedPath,
     config: &FormattingDirectoryConfig,

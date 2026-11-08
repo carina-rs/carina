@@ -7,9 +7,9 @@ use crate::output_style::Colorize;
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use futures::stream::{FuturesUnordered, StreamExt};
 
-#[cfg(test)]
-use carina_core::config_loader::load_configuration_with_config;
-use carina_core::config_loader::{load_configuration_for_apply, load_configuration_for_bootstrap};
+use carina_core::config_loader::{
+    load_configuration_for_bootstrap, load_configuration_with_config,
+};
 use carina_core::data_source_value::DataSourceValue;
 #[cfg(test)]
 use carina_core::deps::sort_resources_by_dependencies;
@@ -1503,7 +1503,7 @@ async fn run_state_bucket_delete(
         .map_err(|error| AppError::Config(error.to_string()))?;
     let base_dir = &project;
     let color_mode = runtime.color_mode();
-    let loaded = load_configuration_for_apply(
+    let loaded = load_configuration_with_config(
         base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
@@ -1715,7 +1715,7 @@ pub async fn run_state_refresh(
         .map_err(|error| AppError::Config(error.to_string()))?;
     let base_dir = &project;
     let color_mode = runtime.color_mode();
-    let loaded = load_configuration_for_apply(
+    let loaded = load_configuration_with_config(
         base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),

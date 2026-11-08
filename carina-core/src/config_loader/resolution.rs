@@ -6,10 +6,11 @@ use crate::value_walk::ExpressionEdge;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ResolutionPhase {
     Analysis(AnalysisMode),
+    /// Discovery retains values until a later validation consumer demands them.
     Bootstrap,
-    ValidateStrict,
-    Plan,
-    Apply,
+    /// Validation, planning and live apply demand the same current values.
+    Strict,
+    /// Candidate failures stay retained across rechecks until hash verification.
     SavedRehydration,
 }
 
@@ -38,28 +39,37 @@ impl ResolutionContext {
     pub(super) const fn issue(phase: ResolutionPhase) -> Self {
         Self {
             phase,
-            demand: Demand::Active,
+            demand: match phase {
+                ResolutionPhase::Bootstrap | ResolutionPhase::SavedRehydration => Demand::Retained,
+                ResolutionPhase::Analysis(_) | ResolutionPhase::Strict => Demand::Active,
+            },
         }
     }
 
     /// A later semantic recheck was strict even when its input came from an
     /// editor parse. Only the owning loader can issue that phase transition.
     pub(super) fn strict_recheck(self) -> Self {
-        if matches!(self.phase, ResolutionPhase::Analysis(_)) {
-            Self::issue(ResolutionPhase::ValidateStrict)
-        } else {
-            self
+        match self.phase {
+            ResolutionPhase::Analysis(_) => Self::issue(ResolutionPhase::Strict),
+            // Discovery can enter full validation when a later consumer needs it.
+            ResolutionPhase::Bootstrap => self.demanded(),
+            // Saved candidates retain attempted failures until hash verification.
+            ResolutionPhase::SavedRehydration | ResolutionPhase::Strict => self,
         }
     }
 
-    /// Bootstrap defers resource attribute values only. Backend settings,
-    /// directives and other declarations still have their strict contract.
-    /// The loader owns this choice of phase for a declaration root.
-    pub(super) fn declarations(self) -> Self {
-        if self.phase == ResolutionPhase::Bootstrap {
-            Self::issue(ResolutionPhase::ValidateStrict)
-        } else {
-            self
+    /// Only the loader raises demand for a root consumed as current metadata.
+    pub(super) fn demanded(self) -> Self {
+        Self {
+            demand: Demand::Active,
+            ..self
+        }
+    }
+
+    pub(super) fn snapshot(self) -> Self {
+        Self {
+            phase: ResolutionPhase::Analysis(AnalysisMode::DeferBuiltins),
+            ..self
         }
     }
 
@@ -82,8 +92,6 @@ impl ResolutionContext {
             && !matches!(
                 self.phase,
                 ResolutionPhase::Analysis(AnalysisMode::DeferBuiltins)
-                    | ResolutionPhase::Bootstrap
-                    | ResolutionPhase::SavedRehydration
             )
     }
 

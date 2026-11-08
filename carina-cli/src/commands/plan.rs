@@ -9,7 +9,7 @@ use crate::output_style::Colorize;
 use serde::{Deserialize, Serialize};
 
 use carina_core::config_loader::{
-    load_configuration_for_bootstrap, load_configuration_for_plan as load_configuration_with_config,
+    load_configuration_for_bootstrap, load_configuration_with_config,
 };
 use carina_core::data_source_value::DataSourceValue;
 use carina_core::detail_rows::HistoricalDisplayAttributes;

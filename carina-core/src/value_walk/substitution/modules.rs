@@ -70,15 +70,11 @@ impl ParserRewrite<AbsoluteBindingAddress> for ExpandedModuleRewrite<'_> {
     fn call(
         &mut self,
         name: crate::builtins::BuiltinFunction,
-        args: Vec<FunctionArgument<ParserPlaceholder, AbsoluteBindingAddress>>,
+        args: &[FunctionArgument<ParserPlaceholder, AbsoluteBindingAddress>],
         source_line: DiagnosticSourceLine,
-    ) -> Result<ModuleResolvedValue, Self::Error> {
+    ) -> Result<Option<ModuleResolvedValue>, Self::Error> {
         let Some(config) = self.config else {
-            return Ok(Value::Deferred(DeferredValue::FunctionCall {
-                name,
-                args,
-                source_line,
-            }));
+            return Ok(None);
         };
         if !args.iter().all(|argument| {
             argument.handle().is_none()
@@ -88,11 +84,7 @@ impl ParserRewrite<AbsoluteBindingAddress> for ExpandedModuleRewrite<'_> {
                     .map(|proof| proof.into_classification())
                     .is_ok_and(|value| value.into_known().is_ok())
         }) {
-            return Ok(Value::Deferred(DeferredValue::FunctionCall {
-                name,
-                args,
-                source_line,
-            }));
+            return Ok(None);
         }
         let eval_args = args
             .iter()
@@ -111,6 +103,7 @@ impl ParserRewrite<AbsoluteBindingAddress> for ExpandedModuleRewrite<'_> {
             parse_error: None,
         })?
         .into_value()
+        .map(Some)
         .map_err(|error| ArgumentSubstitutionError::Evaluation {
             source_file: None,
             line: source_line.get().unwrap_or(0),
@@ -120,21 +113,17 @@ impl ParserRewrite<AbsoluteBindingAddress> for ExpandedModuleRewrite<'_> {
     }
     fn resolved_call(
         &mut self,
-        function: Arc<crate::parser::UserFunction<AbsoluteBindingAddress>>,
-        functions: Arc<HashMap<String, crate::parser::UserFunction<AbsoluteBindingAddress>>>,
-        args: Vec<FunctionArgument<ParserPlaceholder, AbsoluteBindingAddress>>,
+        function: &Arc<crate::parser::UserFunction<AbsoluteBindingAddress>>,
+        _functions: &Arc<HashMap<String, crate::parser::UserFunction<AbsoluteBindingAddress>>>,
+        args: &[FunctionArgument<ParserPlaceholder, AbsoluteBindingAddress>],
         source_line: DiagnosticSourceLine,
-    ) -> Result<ModuleResolvedValue, Self::Error> {
+    ) -> Result<Option<ModuleResolvedValue>, Self::Error> {
         let Some(config) = self.config else {
-            return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                function,
-                functions,
-                args,
-                source_line,
-            }));
+            return Ok(None);
         };
         let line = source_line.get().unwrap_or(function.body.source_line);
-        crate::resolver::evaluate_module_resolved_user_function(&function, &args, config, line)
+        crate::resolver::evaluate_module_resolved_user_function(function, args, config, line)
+            .map(Some)
             .map_err(|error| function_substitution_error(error, line))
     }
 

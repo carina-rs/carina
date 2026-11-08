@@ -480,6 +480,7 @@ impl ResidualModuleResolutionError {
                 | ParseError::CyclicLetBinding { chain: _ }
                 | ParseError::InsideSecret { .. }
                 | ParseError::SecretInConstraint { .. }
+                | ParseError::ValueWalk(_)
                 | ParseError::UserFunctionError(_) => false,
             },
             ModuleError::ParseInFile { path, error } => {

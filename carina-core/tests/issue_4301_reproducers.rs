@@ -325,3 +325,93 @@ fn issue_3979_retained_coalesce_does_not_execute_during_strict_resolution() {
         Some(Value::Deferred(DeferredValue::Coalesce { .. }))
     ));
 }
+
+#[test]
+fn bootstrap_and_saved_loading_only_demand_consumed_backend_values() {
+    let directory = fixture(&[
+        (
+            "main.crn",
+            "let item = mock.test.resource { name = 'item' }\n",
+        ),
+        (
+            "providers.crn",
+            "provider mock {}\nlet token = secret(env('UNSET_X'))\nlet unused = env('UNSET_Y')\n",
+        ),
+        ("backend.crn", "backend local { path = 'state.json' }\n"),
+    ]);
+    let path = ResolvedPath::new(directory.path()).unwrap();
+    let context = ProviderContext::new(EnvironmentSnapshot::empty());
+    for loader in [
+        carina_core::config_loader::load_configuration_for_bootstrap,
+        carina_core::config_loader::load_configuration_for_saved_rehydration,
+    ] {
+        let loaded = loader(&path, &context, &SchemaRegistry::new()).unwrap();
+        assert!(matches!(
+            loaded.parsed.variables.get("token"),
+            Some(Value::Deferred(DeferredValue::Secret(_)))
+        ));
+        assert!(matches!(
+            loaded.parsed.variables.get("unused"),
+            Some(Value::Deferred(DeferredValue::Unavailable { .. }))
+        ));
+    }
+}
+
+#[test]
+fn saved_loading_rejects_unavailable_backend_values_with_location() {
+    let directory = fixture(&[
+        (
+            "main.crn",
+            "let item = mock.test.resource { name = 'item' }\n",
+        ),
+        ("providers.crn", "provider mock {}\n"),
+        ("backend.crn", "backend s3 { bucket = env('MISSING') }\n"),
+    ]);
+    let context = ProviderContext::new(EnvironmentSnapshot::empty());
+    let error = carina_core::config_loader::load_configuration_for_saved_rehydration(
+        &ResolvedPath::new(directory.path()).unwrap(),
+        &context,
+        &SchemaRegistry::new(),
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("backend.crn:1:"), "{error}");
+    assert!(
+        error.contains("environment variable 'MISSING' is not set"),
+        "{error}"
+    );
+}
+
+#[test]
+fn metadata_backend_demands_its_let_dependency_but_not_unrelated_lets() {
+    let directory = fixture(&[
+        (
+            "main.crn",
+            "let item = mock.test.resource { name = 'item' }\n",
+        ),
+        (
+            "providers.crn",
+            "provider mock {}\nlet token = env('UNSET_X')\nlet unrelated = secret(env('UNSET_Y'))\n",
+        ),
+        ("backend.crn", "backend local { path = token }\n"),
+    ]);
+    let context = ProviderContext::new(EnvironmentSnapshot::empty());
+    for loader in [
+        carina_core::config_loader::load_configuration_for_bootstrap,
+        carina_core::config_loader::load_configuration_for_saved_rehydration,
+    ] {
+        let error = loader(
+            &ResolvedPath::new(directory.path()).unwrap(),
+            &context,
+            &SchemaRegistry::new(),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("backend.crn:1:"), "{error}");
+        assert!(
+            error.contains("environment variable 'UNSET_X' is not set"),
+            "{error}"
+        );
+        assert!(!error.contains("UNSET_Y"), "{error}");
+    }
+}

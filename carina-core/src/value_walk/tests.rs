@@ -2556,12 +2556,9 @@ fn unavailable_search_preserves_saved_scope_and_coalesce_policies() {
         (fallback(unavailable.clone()), false),
         (fallback(unavailable.clone().into_secret()), true),
     ] {
-        assert!(contains_unavailable(
-            &candidate,
-            UnavailableSearchPolicy::SavedCandidate
-        ));
+        assert!(contains_unavailable(&candidate, UnavailableSearchPolicy::SavedCandidate).unwrap());
         assert_eq!(
-            contains_unavailable(&candidate, UnavailableSearchPolicy::SavedSecret),
+            contains_unavailable(&candidate, UnavailableSearchPolicy::SavedSecret).unwrap(),
             inside
         );
     }
@@ -2570,6 +2567,7 @@ fn unavailable_search_preserves_saved_scope_and_coalesce_policies() {
             &fallback(unavailable),
             crate::config_loader::strict_resolution_context()
         )
+        .unwrap()
         .is_none()
     );
     // OnlyInside ignored an outer public failure but still searched its args.
@@ -2581,10 +2579,7 @@ fn unavailable_search_preserves_saved_scope_and_coalesce_policies() {
         reason: crate::resource::UnavailableReason::from_builtin_error("outer".into()),
         source_line: 1.into(),
     });
-    assert!(contains_unavailable(
-        &outer,
-        UnavailableSearchPolicy::SavedSecret
-    ));
+    assert!(contains_unavailable(&outer, UnavailableSearchPolicy::SavedSecret).unwrap());
 }
 
 #[test]
@@ -2612,6 +2607,7 @@ fn unavailable_search_checks_both_module_if_branches() {
         )));
         assert!(
             find_required_unavailable(&value, crate::config_loader::strict_resolution_context())
+                .unwrap()
                 .is_some()
         );
     }
@@ -2635,16 +2631,11 @@ fn unavailable_search_ignores_captured_code_and_checks_call_arguments() {
         args: vec![],
         source_line: 1.into(),
     });
-    assert!(!contains_unavailable(
-        &value,
-        UnavailableSearchPolicy::SavedCandidate
-    ));
-    assert!(!contains_unavailable(
-        &value,
-        UnavailableSearchPolicy::SavedSecret
-    ));
+    assert!(!contains_unavailable(&value, UnavailableSearchPolicy::SavedCandidate).unwrap());
+    assert!(!contains_unavailable(&value, UnavailableSearchPolicy::SavedSecret).unwrap());
     assert!(
         find_required_unavailable(&value, crate::config_loader::strict_resolution_context())
+            .unwrap()
             .is_none()
     );
     if let Value::Deferred(DeferredValue::ResolvedFunctionCall { args, .. }) = &mut value {
@@ -2656,16 +2647,11 @@ fn unavailable_search_ignores_captured_code_and_checks_call_arguments() {
         value,
         Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
     ));
-    assert!(contains_unavailable(
-        &value,
-        UnavailableSearchPolicy::SavedCandidate
-    ));
-    assert!(contains_unavailable(
-        &value,
-        UnavailableSearchPolicy::SavedSecret
-    ));
+    assert!(contains_unavailable(&value, UnavailableSearchPolicy::SavedCandidate).unwrap());
+    assert!(contains_unavailable(&value, UnavailableSearchPolicy::SavedSecret).unwrap());
     assert!(
         find_required_unavailable(&value, crate::config_loader::strict_resolution_context())
+            .unwrap()
             .is_some()
     );
 }
@@ -2676,6 +2662,7 @@ fn unavailable_search_protects_secret_diagnostics() {
         &unavailable_candidate().into_secret(),
         crate::config_loader::strict_resolution_context(),
     )
+    .unwrap()
     .unwrap();
     assert!(
         error
@@ -2716,13 +2703,24 @@ fn parser_substitution_keeps_nested_call_error_location_and_protection() {
             ResourceTypePath::new("mock", "test.resource"),
         )),
     )]);
-    let error = crate::parser::substitute_fn_params(&value, &substitutions, 1).unwrap_err();
+    let error = crate::value_walk::substitute_function_parameters(
+        &value,
+        &substitutions,
+        1,
+        crate::value_walk::RewritePosition::Value,
+    )
+    .unwrap_err();
     assert!(
         matches!(error, ParseError::InvalidExpression { line: 29, .. }),
         "{error}"
     );
-    let error =
-        crate::parser::substitute_fn_params(&value.into_secret(), &substitutions, 1).unwrap_err();
+    let error = crate::value_walk::substitute_function_parameters(
+        &value.into_secret(),
+        &substitutions,
+        1,
+        crate::value_walk::RewritePosition::Value,
+    )
+    .unwrap_err();
     assert!(
         error
             .to_string()
@@ -2760,7 +2758,13 @@ fn parser_substitution_preserves_captured_lexical_scopes_and_arc_identity() {
         "input".into(),
         FunctionArgument::from_value(replacement.clone()),
     )]);
-    let rewritten = crate::parser::substitute_fn_params(&call, &substitutions, 1).unwrap();
+    let rewritten = crate::value_walk::substitute_function_parameters(
+        &call,
+        &substitutions,
+        1,
+        crate::value_walk::RewritePosition::Value,
+    )
+    .unwrap();
     assert!(!format!("{rewritten:?}").contains("private-lexical-input"));
     assert!(matches!(
         &rewritten,
@@ -2869,4 +2873,63 @@ fn parser_policy_callbacks_are_confined_to_the_kernel() {
             "{owner} can supply raw-node callbacks"
         );
     }
+}
+
+#[test]
+fn substitution_if_branches_inside_access_bases_remain_value_positions() {
+    use crate::eval_value::UnexpandedStructuralHandle;
+    use crate::parser::{DeferredIfCondition, DeferredValueIf, ResourceTypePath};
+    use crate::resource::{AuthoredValue, FunctionArgument, ParserPlaceholder, PathSegment};
+    let parameter = |name: &str| {
+        AuthoredValue::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnParam {
+            name: name.into(),
+        }))
+    };
+    let conditional =
+        AuthoredValue::Deferred(DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
+            DeferredIfCondition::new(parameter("c"), "branches.crn".into(), 7),
+            parameter("p"),
+            parameter("q"),
+        ))));
+    let body = crate::resource::apply_postfix_access(
+        conditional,
+        PathSegment::Field {
+            name: "field".into(),
+        },
+        7,
+        crate::resource::AccessMissPolicy::Error,
+    )
+    .unwrap();
+    let substitutions = HashMap::from([
+        (
+            "c".into(),
+            FunctionArgument::from_value(AuthoredValue::Concrete(ConcreteValue::Bool(true))),
+        ),
+        (
+            "p".into(),
+            FunctionArgument::from_handle(UnexpandedStructuralHandle::module_parameter(
+                "resource",
+                ResourceTypePath::new("mock", "test.resource"),
+            )),
+        ),
+        (
+            "q".into(),
+            FunctionArgument::from_value(AuthoredValue::Concrete(ConcreteValue::Map(
+                indexmap::indexmap! {
+                    "field".into() => AuthoredValue::Concrete(ConcreteValue::String("value".into())),
+                },
+            ))),
+        ),
+    ]);
+    let error = crate::value_walk::substitute_function_parameters(
+        &body,
+        &substitutions,
+        7,
+        crate::value_walk::RewritePosition::Value,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Invalid expression at line 7: 'p' is a resource handle, not a value; reference one of its attributes, e.g. 'p.<attribute>'"
+    );
 }

@@ -516,6 +516,11 @@ fn parse_error_to_diagnostic(error: &ParseError) -> Diagnostic {
             DiagnosticSeverity::ERROR,
             error.to_string(),
         ),
+        error @ ParseError::ValueWalk(_) => carina_diagnostic_range(
+            Range::default(),
+            DiagnosticSeverity::ERROR,
+            carina_core::executor::render_error_chain(error),
+        ),
     }
 }
 

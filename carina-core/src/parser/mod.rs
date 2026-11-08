@@ -152,7 +152,7 @@ pub use functions::{
 };
 pub(crate) use functions::{
     contains_module_argument_matching, custom_type_lookup_for_schema, function_argument_as_eval,
-    substitute_fn_params, validate_builtin_custom_type, validate_schema_custom_type_with_context,
+    validate_builtin_custom_type, validate_schema_custom_type_with_context,
 };
 pub use resolve::{
     ProviderConfigInvariantError, ProviderConfigResolutionError, ResolvedProviderConfig,
@@ -165,7 +165,7 @@ pub use resolve::{
 pub(crate) use resolve::{
     collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,
     resolve_resource_refs_defer_unknown_functions, resolve_resource_refs_for_diagnostics,
-    resolve_resource_refs_in_context, resolve_snapshot_function_calls_with_config,
+    resolve_resource_refs_in_context, resolve_snapshot_function_calls_in_context,
 };
 pub use static_eval::evaluate_static_value_for_validation;
 pub use types::{

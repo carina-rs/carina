@@ -10,7 +10,7 @@ use crate::{
     parser::ParseError,
     resource::{DiagnosticSourceLine, InsideSecret, ParserPlaceholder},
 };
-pub(crate) use functions::substitute_function_parameters;
+pub(crate) use functions::{substitute_function_call_argument, substitute_function_parameters};
 #[cfg(test)]
 pub(crate) use modules::select_authored_module_ifs;
 pub(crate) use modules::{
@@ -60,29 +60,20 @@ pub(super) trait ParserRewrite<B: BindingAddress> {
     }
     fn call(
         &mut self,
-        name: crate::builtins::BuiltinFunction,
-        args: Vec<FunctionArgument<ParserPlaceholder, B>>,
-        source_line: DiagnosticSourceLine,
-    ) -> Result<Value<ParserPlaceholder, B>, Self::Error> {
-        Ok(Value::Deferred(DeferredValue::FunctionCall {
-            name,
-            args,
-            source_line,
-        }))
+        _name: crate::builtins::BuiltinFunction,
+        _args: &[FunctionArgument<ParserPlaceholder, B>],
+        _source_line: DiagnosticSourceLine,
+    ) -> Result<Option<Value<ParserPlaceholder, B>>, Self::Error> {
+        Ok(None)
     }
     fn resolved_call(
         &mut self,
-        function: Arc<crate::parser::UserFunction<B>>,
-        functions: Arc<HashMap<String, crate::parser::UserFunction<B>>>,
-        args: Vec<FunctionArgument<ParserPlaceholder, B>>,
-        source_line: DiagnosticSourceLine,
-    ) -> Result<Value<ParserPlaceholder, B>, Self::Error> {
-        Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions,
-            args,
-            source_line,
-        }))
+        _function: &Arc<crate::parser::UserFunction<B>>,
+        _functions: &Arc<HashMap<String, crate::parser::UserFunction<B>>>,
+        _args: &[FunctionArgument<ParserPlaceholder, B>],
+        _source_line: DiagnosticSourceLine,
+    ) -> Result<Option<Value<ParserPlaceholder, B>>, Self::Error> {
+        Ok(None)
     }
     fn select(
         &mut self,
@@ -132,25 +123,10 @@ pub(super) fn rewrite_parser_value<B: BindingAddress, R: ParserRewrite<B>>(
     position: RewritePosition,
     policy: &mut R,
 ) -> Result<Value<ParserPlaceholder, B>, R::Error> {
-    let mut algebra = ParserTransform {
-        policy,
-        error: None,
-        position,
-        position_start: 0,
-        structural_only: 0,
-        argument_line: DiagnosticSourceLine::synthetic(),
-        binding: PhantomData,
-    };
+    let mut algebra = ParserTransform::new(policy, position);
     engine::dispatch_bound(value.clone(), WalkRoot::syntactic().at(), &mut algebra)
         .map(|product| product.value)
-        .map_err(|error| {
-            algebra.error.unwrap_or_else(|| {
-                algebra.policy.error(ParseError::InvalidExpression {
-                    line: algebra.policy.source_line(),
-                    message: error.to_string(),
-                })
-            })
-        })
+        .map_err(|error| algebra.take_error(error))
 }
 
 struct ParserTransform<'a, R, E, B: BindingAddress> {
@@ -161,6 +137,7 @@ struct ParserTransform<'a, R, E, B: BindingAddress> {
     position_start: usize,
     structural_only: usize,
     argument_line: DiagnosticSourceLine,
+    replacements: usize,
 }
 
 impl<R, E, B: BindingAddress> TransformOutput for ParserTransform<'_, R, E, B> {
@@ -186,11 +163,7 @@ impl<R, E: InsideSecret, B: BindingAddress> ParserTransform<'_, R, E, B> {
     }
 
     fn position(&self, at: &At<'_>) -> RewritePosition {
-        match at.expression_edges()[self.position_start..]
-            .iter()
-            .rev()
-            .find(|edge| !matches!(edge, ExpressionEdge::Then | ExpressionEdge::Else))
-        {
+        match at.expression_edges()[self.position_start..].last() {
             Some(ExpressionEdge::AccessBase) => RewritePosition::AccessBase,
             Some(_) => RewritePosition::Value,
             None => self.position,
@@ -207,13 +180,32 @@ impl<R, E: InsideSecret, B: BindingAddress> ParserTransform<'_, R, E, B> {
     }
 }
 
-impl<B: BindingAddress, R: ParserRewrite<B>> ParserTransform<'_, R, R::Error, B> {
+impl<'a, B: BindingAddress, R: ParserRewrite<B>> ParserTransform<'a, R, R::Error, B> {
+    fn new(policy: &'a mut R, position: RewritePosition) -> Self {
+        Self {
+            policy,
+            error: None,
+            position,
+            position_start: 0,
+            structural_only: 0,
+            argument_line: DiagnosticSourceLine::synthetic(),
+            replacements: 0,
+            binding: PhantomData,
+        }
+    }
+
+    fn take_error(&mut self, error: WalkError) -> R::Error {
+        self.error
+            .take()
+            .unwrap_or_else(|| self.policy.error(ParseError::ValueWalk(error)))
+    }
+
     fn operand(
         &mut self,
         value: Value<ParserPlaceholder, B>,
         at: At<'_>,
-    ) -> Result<Value<ParserPlaceholder, B>, WalkError> {
-        engine::dispatch_bound(value, at, self).map(|product| product.value)
+    ) -> Result<RewriteProduct<(), ParserPlaceholder, B>, WalkError> {
+        engine::dispatch_bound(value, at, self)
     }
 
     fn retained(
@@ -232,142 +224,154 @@ impl<B: BindingAddress, R: ParserRewrite<B>> ParserTransform<'_, R, R::Error, B>
         parts: Parts<'v, Transform, ParserPlaceholder, B>,
         at: At<'v>,
     ) -> Result<RewriteProduct<(), ParserPlaceholder, B>, WalkError> {
-        let value = match parts {
-            Parts::Access(access) => {
-                let base = self.operand(
-                    access.base().clone(),
-                    at.operand(ExpressionEdge::AccessBase),
-                )?;
-                let result = self.policy.access(access, base);
-                self.record(result)?
-            }
-            Parts::Arithmetic(expression) => {
-                let lhs = self.operand(
-                    expression.lhs().clone(),
-                    at.operand(ExpressionEdge::ArithmeticLeft),
-                )?;
-                let rhs = self.operand(
-                    expression.rhs().clone(),
-                    at.operand(ExpressionEdge::ArithmeticRight),
-                )?;
-                let result = self.policy.arithmetic(expression, lhs, rhs);
-                self.record(result)?
-            }
-            Parts::Coalesce { value, default } => {
-                let first = self.operand(*value, at.operand(ExpressionEdge::CoalesceValue))?;
-                let selection = self.policy.select(ExpressionKind::Coalesce, &first, None);
-                match self.record(selection)? {
-                    Some(0) => {
-                        self.retained(*default, at.operand(ExpressionEdge::CoalesceDefault))?;
-                        return Ok(RewriteProduct {
-                            value: first,
-                            output: (),
-                            changed: true,
-                        });
+        let (value, changed) =
+            match parts {
+                Parts::Access(access) => {
+                    let base = self.operand(
+                        access.base().clone(),
+                        at.operand(ExpressionEdge::AccessBase),
+                    )?;
+                    if base.changed {
+                        let result = self.policy.access(access, base.value);
+                        (self.record(result)?, true)
+                    } else {
+                        (Value::Deferred(DeferredValue::Access(access)), false)
                     }
-                    Some(1) => {
-                        let value =
-                            self.operand(*default, at.operand(ExpressionEdge::CoalesceDefault))?;
-                        return Ok(RewriteProduct {
-                            value,
-                            output: (),
-                            changed: true,
-                        });
-                    }
-                    Some(_) => return Err(WalkError::Rejected),
-                    None => Value::Deferred(DeferredValue::Coalesce {
-                        value: Box::new(first),
-                        default: Box::new(
-                            self.operand(*default, at.operand(ExpressionEdge::CoalesceDefault))?,
-                        ),
-                    }),
                 }
-            }
-            Parts::ModuleIf(conditional) => {
-                let crate::parser::DeferredValueIf {
-                    condition,
-                    then_value,
-                    else_value,
-                } = *conditional;
-                let crate::parser::DeferredIfCondition {
-                    value,
-                    source_file,
-                    source_line,
-                    source_expression,
-                } = condition;
-                let first = self
-                    .operand(value, at.operand(ExpressionEdge::Condition))
-                    .inspect_err(|_| {
-                        self.error = self
-                            .error
-                            .take()
-                            .map(|error| self.policy.condition_error(error, &source_file));
-                    })?;
-                let selection = self.policy.select(
-                    ExpressionKind::ModuleIf,
-                    &first,
-                    Some((&source_file, source_line)),
-                );
-                match self.record(selection)? {
-                    Some(1) => {
-                        let value = self.operand(then_value, at.operand(ExpressionEdge::Then))?;
-                        self.retained(else_value, at.operand(ExpressionEdge::Else))?;
-                        return Ok(RewriteProduct {
-                            value,
-                            output: (),
-                            changed: true,
-                        });
+                Parts::Arithmetic(expression) => {
+                    let lhs = self.operand(
+                        expression.lhs().clone(),
+                        at.operand(ExpressionEdge::ArithmeticLeft),
+                    )?;
+                    let rhs = self.operand(
+                        expression.rhs().clone(),
+                        at.operand(ExpressionEdge::ArithmeticRight),
+                    )?;
+                    if lhs.changed || rhs.changed {
+                        let result = self.policy.arithmetic(expression, lhs.value, rhs.value);
+                        (self.record(result)?, true)
+                    } else {
+                        (
+                            Value::Deferred(DeferredValue::IntegerArithmetic(expression)),
+                            false,
+                        )
                     }
-                    Some(2) => {
-                        self.retained(then_value, at.operand(ExpressionEdge::Then))?;
-                        let value = self.operand(else_value, at.operand(ExpressionEdge::Else))?;
-                        return Ok(RewriteProduct {
-                            value,
-                            output: (),
-                            changed: true,
-                        });
+                }
+                Parts::Coalesce { value, default } => {
+                    let first = self.operand(*value, at.operand(ExpressionEdge::CoalesceValue))?;
+                    let selection =
+                        self.policy
+                            .select(ExpressionKind::Coalesce, &first.value, None);
+                    match self.record(selection)? {
+                        Some(0) => {
+                            self.retained(*default, at.operand(ExpressionEdge::CoalesceDefault))?;
+                            (first.value, true)
+                        }
+                        Some(1) => {
+                            let value = self
+                                .operand(*default, at.operand(ExpressionEdge::CoalesceDefault))?;
+                            (value.value, true)
+                        }
+                        Some(_) => return Err(WalkError::Rejected),
+                        None => {
+                            let fallback = self
+                                .operand(*default, at.operand(ExpressionEdge::CoalesceDefault))?;
+                            (
+                                Value::Deferred(DeferredValue::Coalesce {
+                                    value: Box::new(first.value),
+                                    default: Box::new(fallback.value),
+                                }),
+                                first.changed || fallback.changed,
+                            )
+                        }
                     }
-                    Some(_) => return Err(WalkError::Rejected),
-                    None => Value::Deferred(DeferredValue::ModuleIf(Box::new(
-                        crate::parser::DeferredValueIf::new(
-                            crate::parser::DeferredIfCondition::new_with_source_expression(
-                                first,
-                                source_file,
-                                source_line,
-                                source_expression,
+                }
+                Parts::ModuleIf(conditional) => {
+                    let crate::parser::DeferredValueIf {
+                        condition,
+                        then_value,
+                        else_value,
+                    } = *conditional;
+                    let crate::parser::DeferredIfCondition {
+                        value,
+                        source_file,
+                        source_line,
+                        source_expression,
+                    } = condition;
+                    let first = self
+                        .operand(value, at.operand(ExpressionEdge::Condition))
+                        .inspect_err(|_| {
+                            self.error = self
+                                .error
+                                .take()
+                                .map(|error| self.policy.condition_error(error, &source_file));
+                        })?;
+                    let selection = self.policy.select(
+                        ExpressionKind::ModuleIf,
+                        &first.value,
+                        Some((&source_file, source_line)),
+                    );
+                    match self.record(selection)? {
+                        Some(1) => {
+                            let value =
+                                self.operand(then_value, at.operand(ExpressionEdge::Then))?;
+                            self.retained(else_value, at.operand(ExpressionEdge::Else))?;
+                            (value.value, true)
+                        }
+                        Some(2) => {
+                            self.retained(then_value, at.operand(ExpressionEdge::Then))?;
+                            let value =
+                                self.operand(else_value, at.operand(ExpressionEdge::Else))?;
+                            (value.value, true)
+                        }
+                        Some(_) => return Err(WalkError::Rejected),
+                        None => {
+                            let then_value =
+                                self.operand(then_value, at.operand(ExpressionEdge::Then))?;
+                            let else_value =
+                                self.operand(else_value, at.operand(ExpressionEdge::Else))?;
+                            let changed = first.changed || then_value.changed || else_value.changed;
+                            (Value::Deferred(DeferredValue::ModuleIf(Box::new(
+                            crate::parser::DeferredValueIf::new(
+                                crate::parser::DeferredIfCondition::new_with_source_expression(
+                                    first.value, source_file, source_line, source_expression,
+                                ), then_value.value, else_value.value,
                             ),
-                            self.operand(then_value, at.operand(ExpressionEdge::Then))?,
-                            self.operand(else_value, at.operand(ExpressionEdge::Else))?,
-                        ),
-                    ))),
+                        ))), changed)
+                        }
+                    }
                 }
-            }
-            parts @ (Parts::List(_)
-            | Parts::Map(_)
-            | Parts::Interpolation(_)
-            | Parts::Call {
-                name: _,
-                args: _,
-                source_line: _,
-            }
-            | Parts::Unavailable {
-                name: _,
-                args: _,
-                reason: _,
-                source_line: _,
-            }
-            | Parts::ResolvedCall {
-                function: _,
-                functions: _,
-                args: _,
-                source_line: _,
-            }
-            | Parts::Evidence { value: _, edge: _ }) => parts.transform(at, self, |_| ())?.value,
-        };
+                parts @ (Parts::List(_)
+                | Parts::Map(_)
+                | Parts::Interpolation(_)
+                | Parts::Call {
+                    name: _,
+                    args: _,
+                    source_line: _,
+                }
+                | Parts::Unavailable {
+                    name: _,
+                    args: _,
+                    reason: _,
+                    source_line: _,
+                }
+                | Parts::ResolvedCall {
+                    function: _,
+                    functions: _,
+                    args: _,
+                    source_line: _,
+                }
+                | Parts::Evidence { value: _, edge: _ }) => {
+                    let replacements = self.replacements;
+                    let mut product = parts.transform(at, self, |_| ())?;
+                    product.changed |= self.replacements != replacements;
+                    return Ok(product);
+                }
+            };
         Ok(RewriteProduct {
             value,
             output: (),
-            changed: true,
+            changed,
         })
     }
 }
@@ -501,8 +505,18 @@ impl<B: BindingAddress, R: ParserRewrite<B>> BoundTransform<ParserPlaceholder, B
                 source_line,
             }));
         }
-        let result = self.policy.call(name, args, source_line);
-        self.record(result)
+        let result = self.policy.call(name, &args, source_line);
+        match self.record(result)? {
+            Some(value) => {
+                self.replacements += 1;
+                Ok(value)
+            }
+            None => Ok(Value::Deferred(DeferredValue::FunctionCall {
+                name,
+                args,
+                source_line,
+            })),
+        }
     }
     fn resolved_call(
         &mut self,
@@ -522,8 +536,19 @@ impl<B: BindingAddress, R: ParserRewrite<B>> BoundTransform<ParserPlaceholder, B
         }
         let result = self
             .policy
-            .resolved_call(function, functions, args, source_line);
-        self.record(result)
+            .resolved_call(&function, &functions, &args, source_line);
+        match self.record(result)? {
+            Some(value) => {
+                self.replacements += 1;
+                Ok(value)
+            }
+            None => Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                function,
+                functions,
+                args,
+                source_line,
+            })),
+        }
     }
 
     fn argument(
@@ -576,15 +601,8 @@ mod argument_tests {
         });
         let at = WalkRoot::syntactic().at();
         let encountered = at.encountered_secret.clone();
-        let mut algebra = ParserTransform {
-            policy: &mut ReplaceArgument,
-            error: None,
-            position: RewritePosition::Value,
-            position_start: 0,
-            structural_only: 0,
-            argument_line: DiagnosticSourceLine::synthetic(),
-            binding: PhantomData,
-        };
+        let mut policy = ReplaceArgument;
+        let mut algebra = ParserTransform::new(&mut policy, RewritePosition::Value);
         assert!(engine::dispatch_bound(value, at, &mut algebra).is_ok());
         assert!(encountered.get());
     }

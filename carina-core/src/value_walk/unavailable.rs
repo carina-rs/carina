@@ -8,9 +8,9 @@ use crate::{config_loader::ResolutionContext, parser::ParseError, resource::Insi
 pub(crate) fn find_required_unavailable<P: ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
     context: ResolutionContext,
-) -> Option<ParseError> {
+) -> Result<Option<ParseError>, WalkError> {
     if !context.requires_available() {
-        return None;
+        return Ok(None);
     }
     find_unavailable(value, UnavailableSearchPolicy::Required(context))
 }
@@ -50,29 +50,40 @@ impl UnavailableSearchPolicy {
 pub(crate) fn contains_unavailable<P: ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
     policy: UnavailableSearchPolicy,
-) -> bool {
-    find_unavailable(value, policy).is_some()
+) -> Result<bool, WalkError> {
+    find_unavailable(value, policy).map(|error| error.is_some())
 }
 
 fn find_unavailable<P: ValueKind, B: BindingAddress>(
     value: &Value<P, B>,
     policy: UnavailableSearchPolicy,
-) -> Option<ParseError> {
+) -> Result<Option<ParseError>, WalkError> {
     let mut search = UnavailableSearch {
         policy,
         errors: Vec::new(),
     };
-    let evidence = match inspect(WalkRoot::syntactic(), value, &mut search) {
-        Ok(located) => located.into_output(),
-        Err(error) => return Some(ParseError::UserFunctionError(error.to_string())),
+    let result =
+        inspect(WalkRoot::syntactic(), value, &mut search).map(|located| located.into_output());
+    finish_unavailable_search(result, search.errors)
+}
+
+fn finish_unavailable_search(
+    result: Result<Evidence<usize, ()>, WalkError>,
+    errors: Vec<ParseError>,
+) -> Result<Option<ParseError>, WalkError> {
+    let evidence = result?;
+    let Some(site) = evidence.obligations().first() else {
+        return Ok(None);
     };
-    let site = evidence.obligations().first()?;
-    let error = search.errors.into_iter().nth(*site.output())?;
-    Some(if site.is_secret() {
+    let error = errors
+        .into_iter()
+        .nth(*site.output())
+        .ok_or(WalkError::ReceiptOrigin)?;
+    Ok(Some(if site.is_secret() {
         error.inside_secret()
     } else {
         error
-    })
+    }))
 }
 
 struct UnavailableSearch {
@@ -172,5 +183,43 @@ impl Algebra<Inspect> for UnavailableSearch {
         child: SecretChild<'_, Inspect, P, B>,
     ) -> SecretStep<Inspect, Self::Output, P, B> {
         child.inspect(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn walk_failure_sources_survive_parser_and_secret_error_boundaries() {
+        let parser = ParseError::from(WalkError::Rejected).inside_secret();
+        let secret =
+            crate::value::SecretRehydrationError::from(WalkError::Rejected).inside_secret();
+        for error in [
+            &parser as &dyn std::error::Error,
+            &secret as &dyn std::error::Error,
+        ] {
+            assert!(
+                error
+                    .source()
+                    .is_some_and(|source| source.is::<WalkError>())
+            );
+        }
+        assert!(matches!(parser, ParseError::ValueWalk(WalkError::Rejected)));
+        assert!(matches!(
+            secret,
+            crate::value::SecretRehydrationError::ValueWalk(WalkError::Rejected)
+        ));
+    }
+
+    #[test]
+    fn unavailable_search_preserves_an_injected_walk_failure_type() {
+        let failure = finish_unavailable_search(Err(WalkError::Rejected), Vec::new()).unwrap_err();
+        let error: &dyn std::error::Error = &failure;
+        assert_eq!(
+            error.downcast_ref::<WalkError>(),
+            Some(&WalkError::Rejected),
+            "kernel failure lost its type: {failure:?}"
+        );
     }
 }

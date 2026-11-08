@@ -1248,6 +1248,18 @@ pub enum AppError {
     #[error("Invalid provider config in saved plan: {0}")]
     SavedProviderConfig(Box<carina_core::parser::ProviderConfigInvariantError>),
 
+    /// An invariant failure while traversing a secret candidate retains its cause.
+    #[error(
+        // error-chain: caller-renders-sources
+        "Value traversal failed while verifying {location}",
+        location = carina_core::provider_text::DiagnosticText::new(location)
+    )]
+    ValueWalk {
+        location: String,
+        #[source]
+        error: carina_core::value_walk::WalkError,
+    },
+
     /// A typed saved-plan secret verification failure with actionable cause.
     #[error(transparent)]
     SavedPlanSecretVerification(Box<SavedPlanSecretVerificationError>),

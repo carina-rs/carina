@@ -756,9 +756,10 @@ pub(crate) fn resolve_resource_refs_in_session_unsealed<E: ExportParamLike>(
 /// identity and dependency provenance, while leaving ordinary references in
 /// expression form. Sibling functions require the directory-merged function
 /// table, so this runs after file merge rather than during each file's parse.
-pub(crate) fn resolve_snapshot_function_calls_with_config(
+pub(crate) fn resolve_snapshot_function_calls_in_context(
     parsed: &mut ParsedFile,
     config: &ProviderContext,
+    resolution: ResolutionContext,
 ) -> Result<(), ParseError> {
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in parsed.iter_top_level_resources() {
@@ -785,13 +786,8 @@ pub(crate) fn resolve_snapshot_function_calls_with_config(
     }
     for resource in iter_pre_apply_resources_mut(parsed) {
         for value in resource.attributes_mut().values_mut() {
-            *value = resolve_function_calls_only(
-                value,
-                &binding_map,
-                fn_ctx.config,
-                None,
-                analysis_resolution_context(),
-            )?;
+            *value =
+                resolve_function_calls_only(value, &binding_map, fn_ctx.config, None, resolution)?;
         }
     }
     Ok(())
@@ -828,7 +824,6 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     resolution: ResolutionContext,
 ) -> Result<(), ParseError> {
-    let declaration_resolution = crate::config_loader::declaration_resolution_context(resolution);
     let syntax = parsed.parser_binding_metadata.syntax().clone();
     let locate_named = |kind, name: &str, error: ParseError| match syntax
         .declarations()
@@ -953,7 +948,7 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
                 &binding_map,
                 fn_ctx.config,
                 session,
-                declaration_resolution,
+                crate::config_loader::backend_resolution_context(resolution),
             )
             .map_err(|error| {
                 match syntax
@@ -1025,7 +1020,7 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
             &binding_map,
             fn_ctx.config,
             session,
-            declaration_resolution,
+            resolution,
         )?;
     }
 
@@ -1054,14 +1049,14 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
                 &binding_map,
                 fn_ctx.config,
                 session,
-                declaration_resolution,
+                resolution,
             )?,
             crate::parser::DeferredForBody::Read(source) => resolve_directive_function_calls(
                 &mut source.directives,
                 &binding_map,
                 fn_ctx.config,
                 session,
-                declaration_resolution,
+                resolution,
             )?,
             crate::parser::DeferredForBody::ModuleCall(_) => {}
         }
@@ -1092,7 +1087,7 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
                         &binding_map,
                         fn_ctx.config,
                         session,
-                        declaration_resolution,
+                        resolution,
                     )?
                 }
                 crate::parser::DeferredIfBody::DataSource(source) => {
@@ -1101,7 +1096,7 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
                         &binding_map,
                         fn_ctx.config,
                         session,
-                        declaration_resolution,
+                        resolution,
                     )?
                 }
                 crate::parser::DeferredIfBody::ModuleCall(_) => {}
@@ -1120,16 +1115,11 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
     let var_keys: Vec<String> = parsed.variables.keys().cloned().collect();
     for key in var_keys {
         let expr = parsed.variables[&key].clone();
-        let resolved = resolve_function_calls_only(
-            &expr,
-            &binding_map,
-            fn_ctx.config,
-            session,
-            declaration_resolution,
-        )
-        .map_err(|error| {
-            locate_named(crate::config_loader::DeclarationKind::Binding, &key, error)
-        })?;
+        let resolved =
+            resolve_function_calls_only(&expr, &binding_map, fn_ctx.config, session, resolution)
+                .map_err(|error| {
+                    locate_named(crate::config_loader::DeclarationKind::Binding, &key, error)
+                })?;
         parsed.variables[&key] = resolved;
     }
 
@@ -1142,14 +1132,8 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
         let location = call.id().declaration_location().clone();
         for argument in call.arguments_mut() {
             argument.try_rewrite(|value| {
-                resolve_function_calls_only(
-                    value,
-                    &binding_map,
-                    fn_ctx.config,
-                    session,
-                    declaration_resolution,
-                )
-                .map_err(|error| error.at(&location))
+                resolve_function_calls_only(value, &binding_map, fn_ctx.config, session, resolution)
+                    .map_err(|error| error.at(&location))
             })?;
         }
     }
@@ -1160,7 +1144,7 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
                 &binding_map,
                 fn_ctx.config,
                 session,
-                declaration_resolution,
+                resolution,
             )
             .map_err(|error| {
                 locate_named(
@@ -1184,7 +1168,7 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
                 &binding_map,
                 fn_ctx.config,
                 session,
-                declaration_resolution,
+                resolution,
             )
             .map_err(|error| {
                 locate_named(
@@ -1206,7 +1190,7 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
                 &binding_map,
                 fn_ctx.config,
                 session,
-                declaration_resolution,
+                resolution,
             )
             .map_err(|error| {
                 locate_named(
@@ -2010,9 +1994,8 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
     }
 }
 
-// Failure-retention policy, shared by an already-attempted input and the
-// first evaluation of its call. Validation retains protected external inputs;
-// plan/apply value admission still rejects their typed failure evidence.
+// Demanded roots reject attempted builtin failures; retained roots preserve
+// their evidence. Protection controls masking independently of demand.
 fn unavailable_builtin_error(
     name: crate::builtins::BuiltinFunction,
     reason: &UnavailableReason,
@@ -2032,13 +2015,12 @@ fn reject_required_interpolation_unavailable<B: BindingAddress>(
     if !resolution.requires_available() {
         return Ok(());
     }
-    if let Some(error) = parts.iter().find_map(|part| match part {
-        InterpolationPart::Expr(value) => {
-            crate::value_walk::find_required_unavailable(value, resolution)
+    for part in parts {
+        if let InterpolationPart::Expr(value) = part
+            && let Some(error) = crate::value_walk::find_required_unavailable(value, resolution)?
+        {
+            return Err(error);
         }
-        InterpolationPart::Literal(_) => None,
-    }) {
-        return Err(error);
     }
     Ok(())
 }

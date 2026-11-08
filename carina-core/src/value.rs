@@ -211,6 +211,16 @@ pub enum SecretRehydrationError {
     #[error(transparent)]
     UnavailableSecret(#[from] UnavailableSecretError),
 
+    #[error(
+        // error-chain: caller-renders-sources
+        "value traversal failed during secret verification"
+    )]
+    ValueWalk(
+        #[from]
+        #[source]
+        crate::value_walk::WalkError,
+    ),
+
     /// The current configuration no longer evaluates to a secret at the
     /// position recorded by the saved plan.
     #[error("the current value is no longer a secret")]
@@ -3570,7 +3580,7 @@ fn rehydrate_redacted_secrets_impl<P: PlaceholderKind>(
                 })?;
                 return Ok(candidate.clone());
             }
-            if contains_unavailable(candidate, UnavailableSearchPolicy::SavedCandidate) {
+            if contains_unavailable(candidate, UnavailableSearchPolicy::SavedCandidate)? {
                 return Err(SecretRehydrationError::EvaluationUnavailable);
             }
             if !saved.verify_secret(candidate)? {
@@ -3795,7 +3805,7 @@ pub fn rehydrate_redacted_secrets<P: PlaceholderKind>(
     evaluated: &Value<P>,
 ) -> Result<Value<P>, SecretRehydrationError> {
     if contains_redacted_secret(saved)
-        && contains_unavailable(evaluated, UnavailableSearchPolicy::SavedSecret)
+        && contains_unavailable(evaluated, UnavailableSearchPolicy::SavedSecret)?
     {
         return Err(SecretRehydrationError::EvaluationUnavailable);
     }

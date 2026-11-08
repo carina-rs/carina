@@ -23,6 +23,21 @@ pub(crate) fn substitute_function_parameters<B: BindingAddress>(
         },
     )
 }
+pub(crate) fn substitute_function_call_argument<B: BindingAddress>(
+    argument: &ParserStageFunctionArgument<B>,
+    substitutions: &HashMap<String, ParserStageFunctionArgument<B>>,
+    source_line: usize,
+) -> Result<ParserStageFunctionArgument<B>, ParseError> {
+    let mut policy = FunctionParameterRewrite {
+        substitutions,
+        source_line,
+    };
+    let mut algebra = ParserTransform::new(&mut policy, RewritePosition::Value);
+    algebra.argument_line = source_line.into();
+    engine::transform_argument_bound(argument.clone(), WalkRoot::syntactic().at(), &mut algebra)
+        .map_err(|error| algebra.take_error(error))
+}
+
 fn substituted_function_argument<B: BindingAddress>(
     name: &str,
     argument: &ParserStageFunctionArgument<B>,
@@ -139,5 +154,99 @@ impl<B: BindingAddress> ParserRewrite<B> for FunctionParameterRewrite<'_, B> {
             return Ok(Some(substitution.clone()));
         }
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::{AuthoredValue, RelativeBindingName};
+
+    #[test]
+    fn substitution_without_placeholders_keeps_arcs_and_reports_unchanged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut file = crate::parser::parse(
+            "fn keep(input: String): String { 'constant' }",
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )?;
+        let unchanged_expression = AuthoredValue::Deferred(DeferredValue::FunctionCall {
+            name: crate::builtins::BuiltinFunction::upper,
+            args: vec![FunctionArgument::from_value(AuthoredValue::Concrete(
+                ConcreteValue::String("literal".into()),
+            ))],
+            source_line: 3.into(),
+        });
+        for definition in file.user_functions.values_mut() {
+            definition.body.value = unchanged_expression.clone();
+        }
+        let function = Arc::new(file.user_functions["keep"].clone());
+        let functions = Arc::new(file.user_functions);
+        let value = AuthoredValue::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: function.clone(),
+            functions: functions.clone(),
+            args: vec![FunctionArgument::from_value(unchanged_expression)],
+            source_line: 3.into(),
+        });
+        let substitutions = HashMap::new();
+        let rewritten =
+            substitute_function_parameters(&value, &substitutions, 3, RewritePosition::Value)?;
+        assert!(matches!(
+            &rewritten,
+            AuthoredValue::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+        ));
+        if let AuthoredValue::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: new_function,
+            functions: new_functions,
+            ..
+        }) = rewritten
+        {
+            assert!(Arc::ptr_eq(&function, &new_function));
+            assert!(Arc::ptr_eq(&functions, &new_functions));
+        }
+        let mut policy = FunctionParameterRewrite::<RelativeBindingName> {
+            substitutions: &substitutions,
+            source_line: 3,
+        };
+        let mut algebra = ParserTransform::new(&mut policy, RewritePosition::Value);
+        let product = engine::dispatch_bound(value, WalkRoot::syntactic().at(), &mut algebra)?;
+        assert!(
+            !product.changed,
+            "an unchanged expression must not invalidate parent sharing"
+        );
+        Ok(())
+    }
+    #[test]
+    fn root_argument_substitution_preserves_handles_and_secret_boundaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let parameter =
+            AuthoredValue::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnLocal {
+                name: "local".into(),
+            }));
+        let handle = FunctionArgument::from_handle(
+            crate::eval_value::UnexpandedStructuralHandle::module_parameter(
+                "private-handle",
+                crate::parser::ResourceTypePath::new("mock", "test.resource"),
+            ),
+        );
+        let substitutions = HashMap::from([("local".into(), handle)]);
+        let plain = substitute_function_call_argument(
+            &FunctionArgument::from_value(parameter.clone()),
+            &substitutions,
+            7,
+        )?;
+        assert!(plain.handle().is_some());
+        let protected = substitute_function_call_argument(
+            &FunctionArgument::from_value(parameter.into_secret()),
+            &substitutions,
+            7,
+        )
+        .unwrap_err();
+        assert!(
+            protected
+                .to_string()
+                .contains(crate::resource::INSIDE_SECRET_MESSAGE)
+        );
+        assert!(!format!("{protected:?} {protected}").contains("private-handle"));
+        Ok(())
     }
 }

@@ -17,7 +17,7 @@ pub(crate) use resolution::ResolutionContext;
 use resolution::{AnalysisMode, ResolutionPhase};
 
 pub(crate) const fn strict_resolution_context() -> ResolutionContext {
-    ResolutionContext::issue(ResolutionPhase::ValidateStrict)
+    ResolutionContext::issue(ResolutionPhase::Strict)
 }
 
 pub(crate) const fn analysis_resolution_context() -> ResolutionContext {
@@ -28,8 +28,12 @@ pub(crate) const fn diagnostics_resolution_context() -> ResolutionContext {
     ResolutionContext::issue(ResolutionPhase::Analysis(AnalysisMode::Diagnostics))
 }
 
-pub(crate) fn declaration_resolution_context(context: ResolutionContext) -> ResolutionContext {
-    context.declarations()
+pub(crate) fn backend_resolution_context(context: ResolutionContext) -> ResolutionContext {
+    context.demanded()
+}
+
+pub(crate) fn snapshot_resolution_context(context: ResolutionContext) -> ResolutionContext {
+    context.snapshot()
 }
 
 /// The syntactic kind of one named declaration.
@@ -762,7 +766,7 @@ pub fn load_configuration(
     load_configuration_with_config(path, config, &SchemaRegistry::new())
 }
 
-/// Load configuration from a directory containing .crn files.
+/// Strict value loading shared by validate, plan and live apply.
 ///
 /// File paths are rejected — pass a directory instead.
 pub fn load_configuration_with_config(
@@ -773,8 +777,9 @@ pub fn load_configuration_with_config(
     load_configuration_in_context(path, config, schemas, strict_resolution_context())
 }
 
-/// Load installation/discovery metadata without requiring resource attribute
-/// values. Backend settings and the remaining declarations stay strict.
+/// Load installation/discovery metadata, deferring unconsumed value roots.
+/// Current backend settings are demanded; installation and source paths remain
+/// parser-validated metadata.
 pub fn load_configuration_for_bootstrap(
     path: &ResolvedPath,
     config: &ProviderContext,
@@ -785,34 +790,6 @@ pub fn load_configuration_for_bootstrap(
         config,
         schemas,
         ResolutionContext::issue(ResolutionPhase::Bootstrap),
-    )
-}
-
-/// Load the active inputs to a new plan.
-pub fn load_configuration_for_plan(
-    path: &ResolvedPath,
-    config: &ProviderContext,
-    schemas: &SchemaRegistry,
-) -> Result<LoadedConfig, String> {
-    load_configuration_in_context(
-        path,
-        config,
-        schemas,
-        ResolutionContext::issue(ResolutionPhase::Plan),
-    )
-}
-
-/// Load the active inputs to a live apply.
-pub fn load_configuration_for_apply(
-    path: &ResolvedPath,
-    config: &ProviderContext,
-    schemas: &SchemaRegistry,
-) -> Result<LoadedConfig, String> {
-    load_configuration_in_context(
-        path,
-        config,
-        schemas,
-        ResolutionContext::issue(ResolutionPhase::Apply),
     )
 }
 
@@ -926,9 +903,11 @@ fn load_configuration_in_context(
         {
             return Err(e.to_string());
         }
-        if let Err(e) =
-            parser::resolve_snapshot_function_calls_with_config(&mut unresolved_merged, config)
-        {
+        if let Err(e) = parser::resolve_snapshot_function_calls_in_context(
+            &mut unresolved_merged,
+            config,
+            snapshot_resolution_context(resolution),
+        ) {
             return Err(e.to_string());
         }
 
@@ -969,8 +948,8 @@ pub fn parse_directory(
     parse_directory_with_overrides(dir, config, &HashMap::new())
 }
 
-/// Inspect declarations for completion/discovery without demanding resource
-/// attribute values. Other declaration roots keep their strict checks.
+/// Inspect declarations for completion/discovery without demanding their values.
+/// Current backend settings and parser-owned installation/path metadata remain required.
 pub fn parse_directory_for_bootstrap(
     dir: &ResolvedPath,
     config: &ProviderContext,

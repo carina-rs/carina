@@ -329,7 +329,7 @@ fn prepare_user_function_call<'cfg, Source: Clone>(
 
     // Evaluate local lets, substituting and resolving each one
     for (let_name, let_expr, source_line) in &func.local_lets {
-        let local = substitute_function_call_argument(
+        let local = crate::value_walk::substitute_function_call_argument(
             &FunctionArgument::from_value(let_expr.clone()),
             &substitutions,
             *source_line,
@@ -1316,9 +1316,13 @@ pub(crate) fn evaluate_user_function<Source: Clone>(
         }
     };
 
-    let substituted_body =
-        substitute_fn_params(&func.body.value, &substitutions, func.body.source_line)
-            .map_err(|error| locate_function_body_error(func, error))?;
+    let substituted_body = crate::value_walk::substitute_function_parameters(
+        &func.body.value,
+        &substitutions,
+        func.body.source_line,
+        crate::value_walk::RewritePosition::Value,
+    )
+    .map_err(|error| locate_function_body_error(func, error))?;
     let result = try_evaluate_fn_value(substituted_body, &child_ctx, func.body.source_line)
         .map_err(|error| locate_function_body_error(func, error))?
         .canonicalize();
@@ -1426,61 +1430,6 @@ pub fn contains_function_call(value: &Value) -> bool {
         }
         _ => false,
     }
-}
-
-type FunctionSubstitutionPosition = crate::value_walk::RewritePosition;
-
-type ParserStageValue<B> = GenericValue<ParserPlaceholder, B>;
-type ParserStageFunctionArgument<B> = crate::resource::FunctionArgument<ParserPlaceholder, B>;
-
-fn substitute_function_call_argument<B: BindingAddress>(
-    argument: &ParserStageFunctionArgument<B>,
-    substitutions: &HashMap<String, ParserStageFunctionArgument<B>>,
-    source_line: usize,
-) -> Result<ParserStageFunctionArgument<B>, ParseError> {
-    let Some(value) = argument.value() else {
-        return Ok(argument.clone());
-    };
-    if let GenericValue::Deferred(DeferredValue::Placeholder(
-        ParserPlaceholder::FnParam { name } | ParserPlaceholder::FnLocal { name },
-    )) = value
-        && let Some(substitution) = substitutions.get(name)
-    {
-        return Ok(substitution.clone());
-    }
-    argument.try_map_value(|value| {
-        substitute_fn_params_with_position(
-            value,
-            substitutions,
-            source_line,
-            FunctionSubstitutionPosition::Value,
-        )
-    })
-}
-
-/// Recursively substitute function parameter placeholders with actual values.
-/// A handle is legal only while it is the access base of `param.field` or a
-/// typed argument to another deferred function call.
-pub(crate) fn substitute_fn_params<B: BindingAddress>(
-    value: &ParserStageValue<B>,
-    substitutions: &HashMap<String, ParserStageFunctionArgument<B>>,
-    source_line: usize,
-) -> Result<ParserStageValue<B>, ParseError> {
-    substitute_fn_params_with_position(
-        value,
-        substitutions,
-        source_line,
-        FunctionSubstitutionPosition::Value,
-    )
-}
-
-fn substitute_fn_params_with_position<B: BindingAddress>(
-    value: &ParserStageValue<B>,
-    substitutions: &HashMap<String, ParserStageFunctionArgument<B>>,
-    source_line: usize,
-    position: FunctionSubstitutionPosition,
-) -> Result<ParserStageValue<B>, ParseError> {
-    crate::value_walk::substitute_function_parameters(value, substitutions, source_line, position)
 }
 
 /// Try to evaluate a value (resolve function calls including user-defined ones).
