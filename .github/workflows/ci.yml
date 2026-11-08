@@ -10,6 +10,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  NEXTEST_VERSION: 0.9.151
 
 jobs:
   changes:
@@ -17,21 +18,31 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.filter.outputs.code }}
+      version_only: ${{ steps.filter.outputs.version_only }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
       - id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          # Outside pull_request (main push, merge queue), always run.
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
+          # The merge queue always runs the full suite, including releases.
+          if [ "$EVENT_NAME" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "version_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          base="${{ github.event.pull_request.base.sha }}"
-          head="${{ github.event.pull_request.head.sha }}"
-          changed=$(git diff --name-only "$base" "$head")
-          if echo "$changed" | grep -qE '^(.*\.rs$|.*Cargo\.toml$|Cargo\.lock$|\.cargo/.*|\.config/.*|scripts/.*|site/src/content/providers/writing/(schemas|getting-started)\.md$|\.github/(workflows|actions)/.*)'; then
+          if [ "$(bash scripts/classify-ci-diff.sh "$BASE_SHA" "$HEAD_SHA")" = "version-only" ]; then
+            echo "version_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "version_only=false" >> "$GITHUB_OUTPUT"
+          fi
+          if ! changed=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA"); then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          elif echo "$changed" | grep -qE '^(.*\.rs$|.*Cargo\.toml$|Cargo\.lock$|\.cargo/.*|\.config/.*|scripts/.*|site/src/content/providers/writing/(schemas|getting-started)\.md$|\.github/(workflows|actions)/.*)'; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           else
             echo "code=false" >> "$GITHUB_OUTPUT"
@@ -40,7 +51,8 @@ jobs:
   check:
     name: Check
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # Push builds refresh this job's main-branch cache for PR/queue restores.
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,7 +65,7 @@ jobs:
   feature-isolation:
     name: Feature Isolation
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -67,7 +79,7 @@ jobs:
   fmt:
     name: Format
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: github.event_name != 'push' && needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -79,7 +91,7 @@ jobs:
   clippy:
     name: Clippy
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -93,6 +105,7 @@ jobs:
 
   provider-boundaries:
     name: Provider Boundary Check
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -101,6 +114,7 @@ jobs:
 
   error-source-display:
     name: Error Source Display Check
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -109,6 +123,7 @@ jobs:
 
   no-wall-clock-test-assertions:
     name: Check Wall Clock Test Assertions
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -117,6 +132,7 @@ jobs:
 
   docs-spellings:
     name: Docs Spelling Check
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -125,6 +141,7 @@ jobs:
 
   check-resources-access:
     name: Check Direct parsed.resources Access
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -132,6 +149,7 @@ jobs:
 
   check-cli-hints:
     name: Check CLI Project Hint Rendering
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -139,6 +157,7 @@ jobs:
 
   check-no-home-env-reads:
     name: Check Home Environment Reads
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -146,6 +165,7 @@ jobs:
 
   check-crates-not-publishable:
     name: Check Crates Not Publishable
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -153,6 +173,7 @@ jobs:
 
   check-wit-bindgen-workspace:
     name: Check wit-bindgen Workspace Dependency
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -165,6 +186,7 @@ jobs:
 
   check-plan-fixtures:
     name: Check Plan Fixtures
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -172,13 +194,17 @@ jobs:
 
   check-rust-cache-via-local-action:
     name: Check Rust Cache Usage
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - run: bash scripts/check-rust-cache-via-local-action.sh
+      - run: bash scripts/test-classify-ci-diff.sh
+      - run: bash scripts/test-rust-cache-key.sh
 
   check-vendored-patches-used:
     name: Check Vendored Patches Used
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -190,7 +216,7 @@ jobs:
   check-examples:
     name: Check Example Files
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -201,7 +227,7 @@ jobs:
   validate-crn:
     name: Validate .crn Files
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -214,7 +240,7 @@ jobs:
   check-example-warnings:
     name: Check Example Warnings
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -225,9 +251,11 @@ jobs:
       - run: bash scripts/check-example-warnings.sh
 
   test:
-    name: Test
+    # Keep the job id: rust-cache includes github.job in its default cache key.
+    # Main warms the same cache restored by PR/merge-queue Test jobs.
+    name: ${{ github.event_name == 'push' && 'Warm Test Cache' || 'Test' }}
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    if: needs.changes.outputs.code == 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.version_only != 'true')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -237,7 +265,19 @@ jobs:
         with:
           targets: wasm32-wasip2
       - uses: ./.github/actions/rust-cache
-      - uses: taiki-e/install-action@nextest
+      - name: Restore cargo-nextest
+        id: nextest
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-nextest
+          key: cargo-nextest-${{ runner.os }}-${{ runner.arch }}-${{ env.NEXTEST_VERSION }}
+      # A cold-cache GitHub release outage must fail promptly, not retry for 20m.
+      - name: Install cargo-nextest
+        if: steps.nextest.outputs.cache-hit != 'true'
+        timeout-minutes: 3
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@${{ env.NEXTEST_VERSION }}
       # Build the WASM fixture so carina-plugin-host's integration tests run
       # instead of silently skipping. Without this step a stale or missing
       # fixture leaves the wasm_integration_test suite as a no-op in CI.
@@ -246,11 +286,22 @@ jobs:
           -p carina-provider-mock
           -p carina-provider-mock-http
           --target wasm32-wasip2
-      - run: cargo nextest run --workspace --all-features
-      - run: scripts/test-in-process-isolation.sh
-      - run: bash scripts/check-provider-cause-test-api.sh
+      # Separate compilation from execution so future runs expose both timings.
+      # On push, compilation alone populates main's cache without rerunning tests.
+      - name: Compile workspace tests
+        run: cargo nextest run --workspace --all-features --no-run
+      - name: Run workspace tests
+        if: github.event_name != 'push'
+        run: cargo nextest run --workspace --all-features
+      - if: github.event_name != 'push'
+        run: scripts/test-in-process-isolation.sh
+      - if: github.event_name != 'push'
+        run: bash scripts/check-provider-cause-test-api.sh
       # nextest does not run doctests; cover them with cargo test --doc.
-      - run: cargo test --workspace --doc --all-features
+      # Stable Cargo rejects --doc --no-run. The nextest build warms their
+      # dependencies; avoid executing doctests again on the same main commit.
+      - if: github.event_name != 'push'
+        run: cargo test --workspace --doc --all-features
 
   binary-build:
     name: Binary Build (linux-x86_64)
