@@ -1,11 +1,9 @@
 //! Provider-shaped examples of every supported composition in #4325.
 use carina_core::provider::{
     NonEmptyMissingAttributes, PartialReadDiagnostic, ProviderError, ProviderErrorKind,
-    WireProviderError, WireProviderErrorKind,
 };
 use carina_core::provider_text::{
-    ClassifiedSource, Diagnostic, ProviderCause, ProviderDiagnostic, ProviderText, Retryability,
-    TextState,
+    Diagnostic, ProviderCause, ProviderDiagnostic, ProviderText, Retryability, TextState,
 };
 use carina_core::test_utils::provider_text::{BindProviderText, NativeWireFixture, context};
 use std::io::{Error, ErrorKind};
@@ -92,14 +90,12 @@ fn static_context_foreign_source() {
 
 #[test]
 fn static_context_sdk_source_with_policy_and_metadata() {
-    let error = ProviderError::api_error_caused_by(
-        "service read",
-        ClassifiedSource::new(SdkFailure(leaf()), Retryability::Transient),
-    )
-    .with_operation("service.Get context-secret")
-    .with_status(503)
-    .with_code("Unavailable")
-    .with_request_id("cause-secret");
+    let error = ProviderError::api_error_caused_by("service read", SdkFailure(leaf()))
+        .with_retryability(Retryability::Transient)
+        .with_operation("service.Get context-secret")
+        .with_status(503)
+        .with_code("Unavailable")
+        .with_request_id("cause-secret");
     assert!(error.detail().cause().unwrap().source_is::<Error>());
     check(
         error,
@@ -224,17 +220,14 @@ fn runtime_message_as_partial_reason() {
 
 #[test]
 fn flattened_wire_source() {
-    let error = ProviderError::from_wire(WireProviderError {
-        kind: WireProviderErrorKind::ApiError,
-        message: "read context-secret".into(),
-        cause: Some("cause-secret".into()),
-        resource_id: None,
-        provider_name: Some("service".into()),
-        operation: Some("Get".into()),
-        status: Some(503),
-        code: None,
-        request_id: None,
-    });
+    let error = ProviderError::api_error_caused_by(
+        ProviderText::new("read context-secret"),
+        std::io::Error::other("cause-secret"),
+    )
+    .for_provider("service")
+    .with_operation("Get")
+    .with_status(503)
+    .round_trip();
     assert!(
         !error
             .detail()
@@ -318,14 +311,13 @@ fn outer_error_inherits_transient_cause() {
 
 #[test]
 fn explicit_retryability_overrides_inheritance() {
-    for retry in [Retryability::Unclassified, Retryability::Permanent] {
-        check(
-            ProviderError::timeout_caused_by("outer", read_error()).with_retryability(retry),
-            ProviderErrorKind::Timeout,
-            retry,
-            true,
-        );
-    }
+    check(
+        ProviderError::timeout_caused_by("outer", read_error())
+            .with_retryability(Retryability::Unclassified),
+        ProviderErrorKind::Timeout,
+        Retryability::Unclassified,
+        true,
+    );
     assert!(!ProviderError::timeout("budget exhausted").is_transient());
 }
 

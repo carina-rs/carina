@@ -110,28 +110,45 @@ struct ForeignDiagnostic(#[source] HostDiagnostic);
 
 #[test]
 fn foreign_wrapper_inherits_the_nearest_classified_diagnostic() {
-    for retryability in [Retryability::Transient, Retryability::Permanent] {
-        let leaf = ProviderError::api_error("leaf").with_retryability(Retryability::Transient);
-        let nearest =
-            ProviderError::internal_caused_by("validation", leaf).with_retryability(retryability);
-        let wrapped = ForeignValidation(ProviderDiagnostic::new(nearest).into());
-        let error = ProviderError::invalid_input_caused_by("outer", wrapped);
-        assert_eq!(error.retryability(), retryability);
-        let host = error.with_secrets(&RedactionSet::for_test(&[]));
-        assert_eq!(host.retryability(), retryability);
-        assert!(
-            host.detail()
-                .cause()
-                .unwrap()
-                .source_is::<crate::schema::ProviderValidation>()
-        );
-        let diagnostic = ProviderDiagnostic::new(
-            ProviderError::api_error("leaf").with_retryability(retryability),
-        )
-        .with_secrets(&RedactionSet::for_test(&[]));
-        let error = ProviderError::api_error_caused_by("outer", ForeignDiagnostic(diagnostic));
-        assert_eq!(error.retryability(), retryability);
-    }
+    let retryability = Retryability::Transient;
+    let leaf = ProviderError::api_error("leaf").with_retryability(Retryability::Transient);
+    let nearest =
+        ProviderError::internal_caused_by("validation", leaf).with_retryability(retryability);
+    let wrapped = ForeignValidation(ProviderDiagnostic::new(nearest).into());
+    let error = ProviderError::invalid_input_caused_by("outer", wrapped);
+    assert_eq!(error.retryability(), retryability);
+    let host = error.with_secrets(&RedactionSet::for_test(&[]));
+    assert_eq!(host.retryability(), retryability);
+    assert!(
+        host.detail()
+            .cause()
+            .unwrap()
+            .source_is::<crate::schema::ProviderValidation>()
+    );
+    let diagnostic =
+        ProviderDiagnostic::new(ProviderError::api_error("leaf").with_retryability(retryability))
+            .with_secrets(&RedactionSet::for_test(&[]));
+    let error = ProviderError::api_error_caused_by("outer", ForeignDiagnostic(diagnostic));
+    assert_eq!(error.retryability(), retryability);
+}
+
+#[test]
+fn unclassified_foreign_frame_does_not_hide_a_transient_descendant() {
+    let leaf = ProviderError::api_error("leaf").with_retryability(Retryability::Transient);
+    let nearest = ProviderError::internal_caused_by("validation", leaf)
+        .with_retryability(Retryability::Unclassified);
+    assert!(
+        !nearest.is_transient(),
+        "an explicit override applies to this error"
+    );
+    let wrapped = ForeignValidation(ProviderDiagnostic::new(nearest).into());
+    let error = ProviderError::invalid_input_caused_by("outer", wrapped);
+    assert!(error.is_transient());
+    assert!(
+        error
+            .with_secrets(&RedactionSet::for_test(&[]))
+            .is_transient()
+    );
 }
 
 #[test]

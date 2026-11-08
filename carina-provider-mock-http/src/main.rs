@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 
+use carina_plugin_sdk::core::provider_text::{ProviderDiagnostic, ProviderText};
 use carina_plugin_sdk::core::schema::{
     AttributeType as CoreAttributeType, ValidatedConfigSchema as CoreValidatedConfigSchema,
     ValidatedResourceSchema as CoreValidatedResourceSchema,
@@ -62,13 +63,10 @@ impl MockHttpProvider {
         message: impl Into<String>,
     ) -> ProviderError {
         let message: String = message.into();
-        (match kind {
-            ProviderErrorKind::InvalidInput => ProviderError::invalid_input(message),
-            ProviderErrorKind::ApiError => ProviderError::api_error(message),
-            ProviderErrorKind::NotFound => ProviderError::not_found(message),
-            ProviderErrorKind::Timeout => ProviderError::timeout(message),
-            ProviderErrorKind::Internal => ProviderError::internal(message),
-        })
+        ProviderError::from_diagnostic(
+            kind,
+            ProviderDiagnostic::message(ProviderText::new(message)),
+        )
         .for_resource(
             carina_plugin_sdk::core::protocol_convert::protocol_to_resource_id(&(id.clone())),
         )

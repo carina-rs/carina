@@ -513,17 +513,31 @@ impl BindProviderText for UpdateOutcome {
 pub trait NativeWireFixture {
     type Wire;
     fn to_wire(&self) -> Self::Wire;
+    /// Round-trip an already authored value; wire strings cannot be supplied.
+    fn round_trip(&self) -> Self;
 }
 impl NativeWireFixture for ProviderError {
     type Wire = crate::provider::WireProviderError;
     fn to_wire(&self) -> crate::provider::WireProviderError {
         BindProviderText::into_host_for_test(self.clone()).to_wire()
     }
+    fn round_trip(&self) -> Self {
+        ProviderError::from_wire(self.to_wire())
+    }
 }
 impl NativeWireFixture for PartialReadDiagnostic {
     type Wire = carina_provider_protocol::types::PartialReadDiagnostic;
     fn to_wire(&self) -> Self::Wire {
         BindProviderText::into_host_for_test(self.clone()).to_wire()
+    }
+    fn round_trip(&self) -> Self {
+        let wire = self.to_wire();
+        Self::new(
+            crate::provider_text::ProviderDiagnostic::message(wire.reason.into()),
+            wire.missing_attributes
+                .try_into()
+                .expect("authored partials are nonempty"),
+        )
     }
 }
 pub fn boundary(provider: Box<dyn Provider>) -> ProviderBoundary<'static> {

@@ -64,9 +64,9 @@ fn review3_resolved_constraint_origins_mask_secret_paths() {
 #[test]
 fn throttling_error_uses_wire_message_before_display_truncation() {
     for marker in ["ThrottlingException", "Rate exceeded"] {
-        let mut wire = ProviderError::api_error("request failed").to_wire();
-        wire.message = format!("{} {marker}", "x".repeat(9 * 1024));
-        let error = ProviderError::from_wire(wire).into_host_for_test();
+        let error = ProviderError::api_error(format!("{} {marker}", "x".repeat(9 * 1024)))
+            .round_trip()
+            .into_host_for_test();
 
         assert!(!error.to_string().contains(marker));
         assert!(is_throttling_error(&error), "missing raw marker {marker}");
@@ -15668,9 +15668,6 @@ fn retry_policy_inherits_transient_causes_and_respects_explicit_overrides() {
     .with_retryability(Retryability::Transient);
     let error = ProviderError::internal_caused_by("read-back failed", cause).into_host_for_test();
     assert!(is_throttling_error(&error));
-    assert!(!is_throttling_error(
-        &error.clone().with_retryability(Retryability::Permanent)
-    ));
     assert!(!is_throttling_error(
         &error.with_retryability(Retryability::Unclassified)
     ));

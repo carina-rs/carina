@@ -18056,8 +18056,10 @@ fn validation_containers_preserve_one_diagnostic_parent() {
                 inner,
             },
         };
-        let error = crate::provider::CustomTypeDispatchError::Validation(Box::new(category))
-            .into_provider_error();
+        let error = crate::provider::ProviderError::from_diagnostic(
+            crate::provider::ProviderErrorKind::InvalidInput,
+            crate::provider::CustomTypeDispatchError::Validation(Box::new(category)),
+        );
         assert!(
             error
                 .detail()
@@ -18081,8 +18083,10 @@ fn validation_containers_preserve_one_diagnostic_parent() {
 fn secret_validation_keeps_opaque_causes_until_the_provider_boundary() {
     use crate::resource::InsideSecret as _;
     let category = diagnostic_validation_reason().inside_secret();
-    let error = crate::provider::CustomTypeDispatchError::Validation(Box::new(category))
-        .into_provider_error();
+    let error = crate::provider::ProviderError::from_diagnostic(
+        crate::provider::ProviderErrorKind::InvalidInput,
+        crate::provider::CustomTypeDispatchError::Validation(Box::new(category)),
+    );
     assert!(
         error
             .detail()

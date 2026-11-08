@@ -14,7 +14,7 @@ pub use permissions::{InvalidRequiredPermission, RequiredPermission};
 mod saved_configuration;
 pub use guest_inputs::{GuestCredentialHandoff, GuestInputCall, GuestInputInventory};
 #[cfg(feature = "guest-runtime")]
-pub use guest_store::{GuestInputStore, GuestStoreData};
+pub use guest_store::{GuestInputStore, GuestStoreData, RenderedGuestDiagnostic};
 pub use saved_configuration::{
     SavedInputsPending, SavedInputsResolved, SavedProviderConfiguration,
 };
@@ -264,33 +264,7 @@ impl From<ProviderText> for ProviderContext {
 pub enum Retryability {
     #[default]
     Unclassified,
-    Permanent,
     Transient,
-}
-
-/// Attach SDK-supplied retry policy while preserving the complete diagnostic.
-pub struct ClassifiedSource<C> {
-    cause: C,
-    retryability: Retryability,
-}
-impl<C: DiagnosticSource<Unbound>> ClassifiedSource<C> {
-    pub fn new(cause: C, retryability: Retryability) -> Self {
-        Self {
-            cause,
-            retryability,
-        }
-    }
-}
-impl<C: DiagnosticSource<Unbound>> diagnostic_source_sealed::Sealed<Unbound>
-    for ClassifiedSource<C>
-{
-}
-impl<C: DiagnosticSource<Unbound>> DiagnosticSource<Unbound> for ClassifiedSource<C> {
-    fn into_diagnostic(self) -> ProviderDiagnostic {
-        let mut diagnostic = self.cause.into_diagnostic();
-        diagnostic.retryability = self.retryability;
-        diagnostic
-    }
 }
 
 impl ProviderText {
@@ -1640,6 +1614,8 @@ fn frame_downcast<'a, T: std::error::Error + 'static>(
         .or_else(|| error.downcast_ref::<Box<T>>().map(AsRef::as_ref))
 }
 enum OpaqueFrame<'a> {
+    #[cfg(feature = "guest-runtime")]
+    RenderedGuest(&'a RenderedGuestDiagnostic),
     Provider(&'a crate::provider::ProviderError),
     Host(&'a crate::provider::HostError),
     Diagnostic(&'a HostDiagnostic),
@@ -1648,6 +1624,10 @@ enum OpaqueFrame<'a> {
     Dispatch(&'a crate::provider::CustomTypeDispatchError),
 }
 fn opaque_frame<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<OpaqueFrame<'a>> {
+    #[cfg(feature = "guest-runtime")]
+    if let Some(error) = frame_downcast::<RenderedGuestDiagnostic>(error) {
+        return Some(OpaqueFrame::RenderedGuest(error));
+    }
     if let Some(error) = frame_downcast::<OpaqueProviderFailure>(error) {
         return Some(OpaqueFrame::Provider(&error.0));
     }
@@ -1671,6 +1651,8 @@ fn opaque_frame<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<Opaq
 impl<'a> OpaqueFrame<'a> {
     fn text<S: TextState>(&self) -> ErrorText<S> {
         match self {
+            #[cfg(feature = "guest-runtime")]
+            Self::RenderedGuest(error) => ErrorText::from_opaque_for_state(error.0.text.opaque()),
             Self::Provider(error) => ErrorText::from_opaque_for_state(error.diagnostic_text()),
             Self::Host(error) => error.segmented_text().host_for_state(),
             Self::Diagnostic(error) => error.text.host_for_state(),
@@ -1691,6 +1673,8 @@ impl<'a> OpaqueFrame<'a> {
     }
     fn retryability(&self) -> Retryability {
         match self {
+            #[cfg(feature = "guest-runtime")]
+            Self::RenderedGuest(error) => error.0.retryability(),
             Self::Provider(error) => error.retryability(),
             Self::Host(error) => error.retryability(),
             Self::Diagnostic(error) => error.retryability(),
@@ -1723,6 +1707,8 @@ impl<'a> OpaqueFrame<'a> {
             secrets: RedactionContext::default(),
         };
         match self {
+            #[cfg(feature = "guest-runtime")]
+            Self::RenderedGuest(error) => Some(error.0.as_cause()),
             Self::Provider(error) => error.detail().cause().map(Diagnostic::as_cause),
             Self::Host(error) => error.detail().cause().map(Diagnostic::as_cause),
             Self::Diagnostic(error) => Some(error.as_cause()),
@@ -1843,10 +1829,12 @@ impl<S: TextState> Diagnostic<S> {
         let mut retryability = Retryability::Unclassified;
         while let Some(cause) = node {
             if let Some(frame) = opaque_frame(cause.error) {
-                let classification = frame.retryability();
-                if classification != Retryability::Unclassified {
-                    retryability = classification;
-                    break;
+                match frame.retryability() {
+                    Retryability::Unclassified => {}
+                    Retryability::Transient => {
+                        retryability = Retryability::Transient;
+                        break;
+                    }
                 }
             }
             node = cause.source();
@@ -1878,6 +1866,13 @@ impl<S: TextState> Diagnostic<S> {
         Self::capture_foreign(error)
     }
     fn capture_foreign(error: &(dyn std::error::Error + 'static)) -> ErrorText<S> {
+        #[cfg(feature = "guest-runtime")]
+        if let Some(source) = error
+            .source()
+            .and_then(frame_downcast::<RenderedGuestDiagnostic>)
+        {
+            return ErrorText::from_opaque_for_state(source.0.text.opaque());
+        }
         let mut text = ErrorText::<S>::new(error.to_string());
         if let Some(source) = error.source() {
             text.append_host(": ");

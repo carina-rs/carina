@@ -4393,11 +4393,8 @@ pub(super) mod tests {
             WasmProviderLoadError::Instantiation(source) => {
                 Some(WasmProviderLoadError::Instantiation(source.clone()))
             }
-            WasmProviderLoadError::Metadata { context, source } => {
-                Some(WasmProviderLoadError::Metadata {
-                    context: context.clone(),
-                    source: source.clone(),
-                })
+            WasmProviderLoadError::Metadata(source) => {
+                Some(WasmProviderLoadError::Metadata(source.clone()))
             }
             _ => None,
         };
@@ -6967,7 +6964,7 @@ pub(super) mod tests {
             ),
         ];
         for error in errors {
-            let metadata = matches!(error, WasmProviderLoadError::Metadata { .. });
+            let metadata = matches!(error, WasmProviderLoadError::Metadata(..));
             assert_eq!(std::error::Error::source(&error).is_some(), metadata);
             let rendered = error.to_string();
             assert!(!rendered.contains(['\x1b', '\x07']));
@@ -10431,6 +10428,76 @@ pub(super) mod tests {
             std::io::Error::other("useful reason"),
         );
         assert_eq!(error.to_string(), "metadata failed: useful reason");
+    }
+
+    #[test]
+    fn load_metadata_renders_each_source_once_standalone_and_captured() {
+        let error = WasmProviderLoadError::metadata(
+            "metadata failed",
+            std::io::Error::other("useful metadata reason"),
+        );
+        // This is the standalone text on main, including the metadata context.
+        assert_eq!(error.to_string(), "metadata failed: useful metadata reason");
+        assert!(std::error::Error::source(&error).is_some());
+        let error = ProviderError::internal_caused_by(
+            "Failed to create WASM provider validation instance",
+            error,
+        );
+        assert!(
+            error
+                .detail()
+                .cause()
+                .unwrap()
+                .source_is::<std::io::Error>()
+        );
+        let host = error.into_host_for_test();
+        let wire = host.to_wire();
+        assert_eq!(
+            wire.cause.as_deref(),
+            Some("metadata failed: useful metadata reason"),
+        );
+        assert_eq!(
+            host.to_string().matches("useful metadata reason").count(),
+            1
+        );
+        assert!(host.detail().cause().unwrap().source_is::<std::io::Error>());
+    }
+
+    #[test]
+    fn load_egress_lock_renders_each_source_once_standalone_and_captured() {
+        let error = WasmProviderLoadError::EgressLock(
+            carina_provider_resolver::LockedEgressLoadError::LockFile(
+                carina_provider_resolver::LockFileError::Read {
+                    path: "carina-providers.lock".into(),
+                    source: std::io::Error::other("lock read reason"),
+                },
+            ),
+        );
+        let expected = "Failed to read carina-providers.lock: lock read reason";
+        assert_eq!(error.to_string(), expected);
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "resolver errors render their sources inline"
+        );
+        let host = ProviderError::internal_caused_by("load failed", error).into_host_for_test();
+        assert_eq!(host.to_wire().cause.as_deref(), Some(expected));
+        assert_eq!(host.to_string().matches("lock read reason").count(), 1);
+    }
+
+    #[test]
+    fn load_egress_consent_renders_once_standalone_and_captured() {
+        let error = WasmProviderLoadError::EgressConsent(
+            carina_provider_resolver::EgressConsentError::SourceMismatch {
+                locked: "locked-source".into(),
+                loaded: "loaded-source".into(),
+            },
+        );
+        let expected = "locked egress source locked-source does not match loaded provider source loaded-source";
+        assert_eq!(error.to_string(), expected);
+        assert!(std::error::Error::source(&error).is_none());
+        let host = ProviderError::internal_caused_by("load failed", error).into_host_for_test();
+        assert_eq!(host.to_wire().cause.as_deref(), Some(expected));
+        assert_eq!(host.to_string().matches("locked egress source").count(), 1);
     }
 
     #[test]

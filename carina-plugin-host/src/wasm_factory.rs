@@ -1,8 +1,8 @@
 //! WasmProviderFactory loads a WASM component and implements ProviderFactory.
 
 mod diagnostics;
-pub use diagnostics::MetadataDiagnostic;
 pub use diagnostics::SchemaDecodeError;
+pub use diagnostics::{MetadataDiagnostic, MetadataLoadDiagnostic};
 use guest::{guest_stderr, guest_store};
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -738,10 +738,7 @@ pub enum WasmProviderLoadError {
     /// A non-AWS runtime component imported the AWS credential interface.
     AwsCredentialsRequired,
     /// A provider metadata export trapped or returned malformed data.
-    Metadata {
-        context: DiagnosticText,
-        source: MetadataDiagnostic,
-    },
+    Metadata(Box<MetadataLoadDiagnostic>),
     /// Any other engine, component-load, or provider bring-up failure.
     Other(DiagnosticText),
 }
@@ -768,13 +765,7 @@ impl fmt::Display for WasmProviderLoadError {
             WasmProviderLoadError::AwsCredentialsRequired => f.write_str(
                 "this provider requires AWS credentials, which only an AWS-kind provider can receive",
             ),
-            WasmProviderLoadError::Metadata { context, source } => {
-                if source.source_rendered_separately() {
-                    context.fmt(f)
-                } else {
-                    write!(f, "{context}: {source}")
-                }
-            }
+            WasmProviderLoadError::Metadata(source) => source.fmt(f),
             WasmProviderLoadError::Other(message) => f.write_str(message),
         }
     }
@@ -785,7 +776,7 @@ impl std::error::Error for WasmProviderLoadError {
         match self {
             Self::EgressLock(source) => source.source(),
             Self::EgressConsent(source) => source.source(),
-            Self::Metadata { source, .. } => Some(source.opaque_source()),
+            Self::Metadata(source) => Some(source.captured()),
             Self::EgressDeclaration(_)
             | Self::PrecompiledDeserialization(_)
             | Self::Instantiation(_)
@@ -799,27 +790,11 @@ impl std::error::Error for WasmProviderLoadError {
 }
 
 impl WasmProviderLoadError {
-    // A captured metadata error has a logical opaque source. Its complete
-    // source text is rendered by core, while direct metadata-load Display
-    // retains the existing bounded terminal diagnostic.
-    fn for_causal_capture(self) -> Self {
-        match self {
-            Self::Metadata { context, source } => Self::Metadata {
-                context,
-                source: source.for_causal_capture(),
-            },
-            other => other,
-        }
-    }
-
     fn metadata(
         context: impl Into<String>,
         source: impl std::error::Error + Send + Sync + 'static,
     ) -> Self {
-        Self::Metadata {
-            context: DiagnosticText::new(context),
-            source: MetadataDiagnostic::new(source),
-        }
+        Self::Metadata(Box::new(MetadataLoadDiagnostic::new(context, source)))
     }
 
     /// Whether this load failure came from the wall-clock budget enforced by
@@ -829,7 +804,7 @@ impl WasmProviderLoadError {
     fn is_wall_budget_timeout(&self) -> bool {
         matches!(
             self,
-            Self::Metadata { source, .. }
+            Self::Metadata(source)
                 if source.is::<WasmWallBudgetError>()
         )
     }
@@ -3440,7 +3415,6 @@ fn rebuild_provider_error(
 ) -> ProviderError {
     #[cfg(test)]
     tests::record_rebuild_load_probe(&load_error);
-    let load_error = load_error.for_causal_capture();
     let timed_out = load_error.is_wall_budget_timeout();
     let poison_context = matches!(previous_poison, PoisonReason::Trap { .. }).then(|| {
         previous_poison

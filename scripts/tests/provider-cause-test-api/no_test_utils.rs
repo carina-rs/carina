@@ -11,3 +11,7 @@ pub fn partial_wire(partial: carina_core::provider::PartialReadDiagnostic) {
 pub fn partial_matches(partial: carina_core::provider::PartialReadDiagnostic) -> bool {
     partial.diagnostic().as_cause().matches_for_test::<std::io::Error>(|_| true)
 }
+
+pub fn error_round_trip(error: carina_core::provider::ProviderError) {
+    let _ = error.round_trip();
+}

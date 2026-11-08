@@ -1713,9 +1713,7 @@ impl Provider for MockProvider {
                 .into_iter()
                 .map(|result| match result {
                     Ok(carina_plugin_sdk::types::ReferenceOutcome::Resolved(value)) => {
-                        ReferenceOutcome::from_guest(
-                            carina_provider_protocol::types::ReferenceOutcome::Resolved(value),
-                        )
+                        ReferenceOutcome::from_guest(value)
                     }
                     Ok(carina_plugin_sdk::types::ReferenceOutcome::NotFound(error)) => {
                         Ok(ReferenceOutcome::NotFound(*error))

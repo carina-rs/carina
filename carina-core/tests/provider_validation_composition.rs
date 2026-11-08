@@ -19,7 +19,10 @@ fn legacy_validator_retains_a_typed_provider_diagnostic() {
         carina_core::resource::ConcreteValue::String("value".into()),
     ))
     .unwrap_err();
-    let error = CustomTypeDispatchError::Validation(Box::new(category)).into_provider_error();
+    let error = carina_core::provider::ProviderError::from_diagnostic(
+        carina_core::provider::ProviderErrorKind::InvalidInput,
+        CustomTypeDispatchError::Validation(Box::new(category)),
+    );
     assert_eq!(error.kind(), ProviderErrorKind::InvalidInput);
     assert_eq!(error.retryability(), Retryability::Transient);
     assert!(
@@ -47,7 +50,10 @@ fn dispatch_retains_structured_validation_category() {
         name: "region".into(),
     };
     let expected = category.to_string();
-    let error = CustomTypeDispatchError::Validation(Box::new(category)).into_provider_error();
+    let error = carina_core::provider::ProviderError::from_diagnostic(
+        carina_core::provider::ProviderErrorKind::InvalidInput,
+        CustomTypeDispatchError::Validation(Box::new(category)),
+    );
     assert!(error.detail().cause().unwrap().source_is::<TypeError>());
     let error = error.into_host_for_test();
     assert_eq!(error.to_string(), expected);

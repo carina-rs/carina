@@ -51,8 +51,8 @@ use super::version_checked_bindings::{WitPlanOp, wit_types as wit};
 pub use super::super::diagnostics::SchemaDecodeError;
 pub(super) use super::super::diagnostics::WasmAppliedStateDecodeError;
 use super::super::diagnostics::{
-    AppliedStateOperation, PendingToken, WasmValueDecodeError, WasmValueDecodeErrorKind,
-    WitValueVariant,
+    AppliedStateOperation, FlattenedWireCause, PendingToken, WasmValueDecodeError,
+    WasmValueDecodeErrorKind, WitValueVariant,
 };
 
 fn decode_float(value: f64) -> Result<carina_provider_protocol::FiniteF64, WasmValueDecodeError> {
@@ -1714,12 +1714,63 @@ pub(crate) fn wit_to_wire_provider_error(err: wit::ProviderError) -> proto::Prov
     }
 }
 
+/// Rehydrate untrusted wire text only inside the native host decoder.
+/// Provider authoring has no entry point accepting this record.
+fn decode_provider_error(error: proto::ProviderError) -> CoreProviderError {
+    use carina_core::provider::ProviderErrorKind;
+    use carina_core::provider_text::{ProviderDiagnostic, ProviderErrorText, ProviderText};
+    let kind = match error.kind {
+        proto::ProviderErrorKind::InvalidInput => ProviderErrorKind::InvalidInput,
+        proto::ProviderErrorKind::ApiError => ProviderErrorKind::ApiError,
+        proto::ProviderErrorKind::NotFound => ProviderErrorKind::NotFound,
+        proto::ProviderErrorKind::Timeout => ProviderErrorKind::Timeout,
+        proto::ProviderErrorKind::Internal => ProviderErrorKind::Internal,
+    };
+    let mut decoded = match error.cause {
+        Some(cause) => {
+            let context = ProviderText::new(error.message);
+            let cause = FlattenedWireCause::new(cause);
+            match kind {
+                ProviderErrorKind::InvalidInput => {
+                    CoreProviderError::invalid_input_caused_by(context, cause)
+                }
+                ProviderErrorKind::ApiError => {
+                    CoreProviderError::api_error_caused_by(context, cause)
+                }
+                ProviderErrorKind::NotFound => {
+                    CoreProviderError::not_found_caused_by(context, cause)
+                }
+                ProviderErrorKind::Timeout => CoreProviderError::timeout_caused_by(context, cause),
+                ProviderErrorKind::Internal => {
+                    CoreProviderError::internal_caused_by(context, cause)
+                }
+            }
+        }
+        None => CoreProviderError::from_diagnostic(
+            kind,
+            ProviderDiagnostic::message(error.message.into()),
+        ),
+    };
+    if let Some(id) = error.resource_id {
+        decoded = decoded.for_resource(carina_core::protocol_convert::protocol_to_resource_id(&id));
+    }
+    if let Some(code) = error.code {
+        decoded = decoded.with_code(code);
+    }
+    let detail = decoded.detail_mut();
+    detail.provider_name = error.provider_name.map(ProviderErrorText::new);
+    detail.operation = error.operation.map(ProviderErrorText::new);
+    detail.status = error.status;
+    detail.request_id = error.request_id.map(ProviderErrorText::new);
+    decoded
+}
+
 /// Convert a WIT [`wit::ProviderError`] into the host-side core
 /// [`CoreProviderError`]. The variant is preserved exactly; the
 /// flattened `cause` string is rehydrated as a typed `FlattenedWireCause` inside
-/// [`CoreProviderError::from_wire`].
+/// the host-private wire decoder.
 pub(crate) fn wit_to_core_provider_error(err: wit::ProviderError) -> CoreProviderError {
-    CoreProviderError::from_wire(wit_to_wire_provider_error(err))
+    decode_provider_error(wit_to_wire_provider_error(err))
 }
 
 pub(crate) fn decode_reference_results(
@@ -1731,9 +1782,7 @@ pub(crate) fn decode_reference_results(
     results
         .into_iter()
         .map(|result| match result {
-            Ok(wit::ReferenceOutcome::Resolved(value)) => {
-                ReferenceOutcome::from_guest(proto::ReferenceOutcome::Resolved(value))
-            }
+            Ok(wit::ReferenceOutcome::Resolved(value)) => ReferenceOutcome::from_guest(value),
             Ok(wit::ReferenceOutcome::NotFound(error)) => Ok(ReferenceOutcome::NotFound(
                 wit_to_core_provider_error(error),
             )),
@@ -1843,8 +1892,10 @@ mod reference_tests {
 /// configured name in both built-in and source-loaded paths. Keeping the
 /// decoded [`CoreProviderError`] intact preserves its kind, source text,
 /// resource id, and structured cloud fields.
-pub fn decode_provider_initialization_error(error: proto::ProviderError) -> CoreProviderError {
-    let mut error = CoreProviderError::from_wire(error);
+pub(crate) fn decode_provider_initialization_error(
+    error: proto::ProviderError,
+) -> CoreProviderError {
+    let mut error = decode_provider_error(error);
     if error.detail().operation.is_none() {
         error.detail_mut().operation = Some("initialize".into());
     }

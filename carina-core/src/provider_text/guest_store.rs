@@ -5,6 +5,36 @@ use std::ops::{Deref, DerefMut};
 use super::{GuestCredentialHandoff, GuestInputInventory};
 use crate::resource::{AbsoluteBindingAddress, NoPlaceholder, SecretPayload};
 
+/// An opaque causal source for a guest load error whose standalone display
+/// already renders the complete diagnostic. Capture adopts this complete frame
+/// instead of appending it to the enclosing error's display a second time.
+/// Raw `Error` walkers cannot expose its provider text or underlying source.
+/// The native host installs the transparent carrier in its private loader;
+/// there is no safe authoring constructor for this adapter.
+///
+/// ```compile_fail,E0423
+/// use carina_core::provider_text::{ProviderDiagnostic, RenderedGuestDiagnostic};
+/// let source = ProviderDiagnostic::new(std::io::Error::other("typed leaf"));
+/// let _ = RenderedGuestDiagnostic(source);
+/// ```
+///
+/// ```
+/// use carina_core::provider_text::{ProviderDiagnostic, RenderedGuestDiagnostic};
+/// let source = ProviderDiagnostic::new(std::io::Error::other("typed leaf"));
+/// let _ = source;
+/// ```
+#[repr(transparent)]
+#[derive(Clone, Debug)]
+pub struct RenderedGuestDiagnostic(pub(super) super::ProviderDiagnostic);
+
+impl std::fmt::Display for RenderedGuestDiagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<provider cause>")
+    }
+}
+
+impl std::error::Error for RenderedGuestDiagnostic {}
+
 /// Guest data whose append-only inventory is installed together with its host
 /// state. There is no standalone constructor or conversion from an inventory.
 /// Calls observe this same inventory before ingesting the guest's diagnostics.

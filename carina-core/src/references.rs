@@ -46,20 +46,16 @@ pub enum ReferenceError<S: TextState = Unbound> {
 }
 
 impl ReferenceOutcome {
-    pub fn from_guest(
-        outcome: carina_provider_protocol::types::ReferenceOutcome,
-    ) -> Result<Self, ReferenceError> {
-        use carina_provider_protocol::types::ReferenceOutcome as Guest;
-        match outcome {
-            Guest::Resolved(value) if value.is_empty() => Err(ReferenceError::InvalidReference(
+    pub fn from_guest(value: String) -> Result<Self, ReferenceError> {
+        if value.is_empty() {
+            return Err(ReferenceError::InvalidReference(
                 ProviderError::invalid_input("guest returned an empty canonical reference").into(),
-            )),
-            // The guest owns canonical format validation (for example, ARN
-            // shape). Core/host validate only non-emptiness and batch length;
-            // interpreting an AWS ARN here would make this seam provider-specific.
-            Guest::Resolved(value) => Ok(Self::Resolved(CanonicalReference(value))),
-            Guest::NotFound(error) => Ok(Self::NotFound(ProviderError::from_wire(*error))),
+            ));
         }
+        // The guest owns canonical format validation (for example, ARN shape).
+        // Only successful keys cross this public comparison-only decoder;
+        // provider error records are decoded privately by the host.
+        Ok(Self::Resolved(CanonicalReference(value)))
     }
 }
 

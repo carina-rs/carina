@@ -67,7 +67,7 @@ pub fn password(attributes: &WireAttributes) -> String {
 }
 
 pub fn round_trip(error: ProviderError) -> ProviderError {
-    ProviderError::from_wire(error.to_wire())
+    error.round_trip()
 }
 
 pub struct EchoMock {

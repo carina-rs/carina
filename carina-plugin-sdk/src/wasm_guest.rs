@@ -2569,7 +2569,7 @@ macro_rules! export_provider {
                         &wit_to_proto_type_identity(&ty),
                         &value,
                     )
-                    .map_err(|error| proto_to_wit_provider_error(error.into_provider_error()))
+                    .map_err(|error| proto_to_wit_provider_error($crate::types::ProviderError::from_diagnostic($crate::types::ProviderErrorKind::InvalidInput, error)))
                 }
 
                 fn resolve_references(

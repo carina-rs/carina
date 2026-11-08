@@ -71,6 +71,7 @@ use std::collections::BTreeMap;
 
 use carina_plugin_sdk::core::schema::ReferenceForms;
 use carina_plugin_sdk::types::*;
+use carina_plugin_sdk::core::provider_text::{ProviderDiagnostic, ProviderText};
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never,
     Pending, PhasedToken, Poll, PollFinality, PollRequest, PollVerdict, Resume,
@@ -130,13 +131,10 @@ The component exports one concrete type, for example `export_provider!(WidgetPro
 
 fn error(kind: ProviderErrorKind, message: impl Into<String>) -> ProviderError {
     let message = message.into();
-    let error = match kind {
-        ProviderErrorKind::InvalidInput => ProviderError::invalid_input(message),
-        ProviderErrorKind::ApiError => ProviderError::api_error(message),
-        ProviderErrorKind::NotFound => ProviderError::not_found(message),
-        ProviderErrorKind::Timeout => ProviderError::timeout(message),
-        ProviderErrorKind::Internal => ProviderError::internal(message),
-    };
+    let error = ProviderError::from_diagnostic(
+        kind,
+        ProviderDiagnostic::message(ProviderText::new(message)),
+    );
     error.for_provider("widget")
 }
 
@@ -208,7 +206,7 @@ let verdict = ProviderError::internal_caused_by("read-back failed", source);
 
 `from_diagnostic(kind, source)` adopts the complete diagnostic without adding context. Its text is rendered once. `ProviderDiagnostic::message(ProviderText)` creates an explicitly message-only reason. Errors and diagnostics do not convert to `ProviderText`; there is no `from_text` replacement-text API.
 
-A cause-bearing error inherits retryability automatically. Foreign errors start as `Unclassified`; SDK policy can be attached with `ClassifiedSource::new(source, Retryability::Transient)` or `Permanent`. `with_retryability` explicitly overrides the inherited value. `is_transient()` is true only for `Transient`; the `Timeout` kind alone does not imply it.
+A cause-bearing error inherits retryability automatically. Foreign errors start as `Unclassified`; attach SDK or provider policy to the composed error with `with_retryability(Retryability::Transient)`. `with_retryability(Retryability::Unclassified)` explicitly clears inherited retryability. A foreign wrapper inherits the nearest `Transient` classification in its source chain. `is_transient()` is true only for `Transient`; the `Timeout` kind alone does not imply it.
 
 Diagnostics share immutable causal storage when cloned. Each handle has its own text view, so binding one handle does not change another. There is one causal parent; combining independent typed causes is unsupported. SDK encoding flattens native causes and partial reasons to the existing version-24 wire records. In wasm provider code, encoding returns opaque carriers with no safe access to message or reason fields; the SDK export adapter consumes them when lowering to WIT. Typed sources and retryability remain native properties.
 

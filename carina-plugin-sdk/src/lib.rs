@@ -2928,8 +2928,11 @@ mod error_composition_tests {
                 .unwrap()
                 .source_is::<std::io::Error>()
         );
+        use carina_core::test_utils::provider_text::NativeWireFixture;
+        let decoded = error.round_trip();
         let wire = wasm_guest::encode_provider_error(error);
-        let decoded = carina_core::provider::ProviderError::from_wire(wire);
+        assert_eq!(wire.message, "outer");
+        assert_eq!(wire.cause.as_deref(), Some("inner: typed leaf"));
         assert_eq!(decoded.retryability(), Retryability::Unclassified);
         assert!(
             !decoded

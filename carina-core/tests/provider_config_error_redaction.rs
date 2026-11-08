@@ -118,10 +118,12 @@ fn secret_configuration_totally_redacts_host_built_captures() {
 fn secret_configuration_totally_redacts_dispatch_captures() {
     let reason = ProviderDiagnostic::new(std::io::Error::other(ORIGINAL));
     assert_config_redaction(
-        CustomTypeDispatchError::Validation(Box::new(TypeError::ValidationFailed {
-            message: reason.into(),
-        }))
-        .into_provider_error(),
+        ProviderError::from_diagnostic(
+            ProviderErrorKind::InvalidInput,
+            CustomTypeDispatchError::Validation(Box::new(TypeError::ValidationFailed {
+                message: reason.into(),
+            })),
+        ),
         None,
     );
 }

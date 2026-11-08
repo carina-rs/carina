@@ -74,6 +74,7 @@ use carina_plugin_sdk::core::schema::{
     ValidatedResourceSchema,
 };
 use carina_plugin_sdk::types::*;
+use carina_plugin_sdk::core::provider_text::{ProviderDiagnostic, ProviderText};
 use carina_plugin_sdk::{
     CarinaProvider, CreateAttempt, CreateStep, CreateVerdict, DeleteOutcome, Never, Pending,
     PendingDelete, Poll, PollVerdict, Resume, ResumeStep, ResumeVerdict, Sent, UpdateOutcome,
@@ -86,13 +87,10 @@ struct HelloProvider;
 
 fn error(kind: ProviderErrorKind, message: impl Into<String>) -> ProviderError {
     let message = message.into();
-    let error = match kind {
-        ProviderErrorKind::InvalidInput => ProviderError::invalid_input(message),
-        ProviderErrorKind::ApiError => ProviderError::api_error(message),
-        ProviderErrorKind::NotFound => ProviderError::not_found(message),
-        ProviderErrorKind::Timeout => ProviderError::timeout(message),
-        ProviderErrorKind::Internal => ProviderError::internal(message),
-    };
+    let error = ProviderError::from_diagnostic(
+        kind,
+        ProviderDiagnostic::message(ProviderText::new(message)),
+    );
     error.for_provider("hello")
 }
 

@@ -112,21 +112,14 @@ pub struct UnknownMissingAttribute;
 /// host-side (boxed `dyn Error`) and is flattened to a string when the
 /// error crosses the WIT boundary.
 ///
-/// Message and cause cannot be supplied together through a struct literal.
-/// Cause-bearing errors must use one of the typed `*_caused_by` constructors
-/// on [`ProviderError`].
+/// Construct errors through [`ProviderError`]; details expose metadata on an
+/// existing error, rather than a second authoring route.
 ///
-/// ```compile_fail,E0451
+/// ```compile_fail,E0624
 /// use carina_core::provider::ErrorDetail;
-/// use carina_core::provider_text::ProviderDiagnostic;
-///
-/// let _ = ErrorDetail {
-///     message: "x".into(),
-///     cause: Some(ProviderDiagnostic::new(std::io::Error::other("x"))),
-///     ..ErrorDetail::default()
-/// };
+/// let _ = ErrorDetail::new("message");
 /// ```
-#[derive(Default, Clone)]
+#[derive(Clone)]
 pub struct OperationErrorDetail<S: TextState = Unbound> {
     body: FailureBody<S>,
     /// Retry policy captured before diagnostic text is escaped or truncated.
@@ -259,6 +252,7 @@ struct ThrottlingClassification {
 }
 
 impl ThrottlingClassification {
+    #[cfg(any(test, all(feature = "test-utils", not(target_arch = "wasm32"))))]
     fn from_raw(message: &str, code: Option<&str>, cause: Option<&str>) -> Self {
         Self {
             message_or_cause: has_throttling_marker(message)
@@ -921,7 +915,7 @@ impl<S: TextState> ProviderFailure<S> {
 }
 
 impl<S: TextState> OperationErrorDetail<S> {
-    pub fn new(message: impl Into<S::Message>) -> Self {
+    pub(crate) fn new(message: impl Into<S::Message>) -> Self {
         let text = S::operations().message(message.into());
         let mut detail = Self::captured(Diagnostic::message_for_state(text.clone()));
         detail.body = FailureBody::Message(text);
@@ -937,7 +931,13 @@ impl<S: TextState> OperationErrorDetail<S> {
             retryability: cause.retryability(),
             body: FailureBody::Captured(cause),
             throttling,
-            ..Self::default()
+            resource_id: None,
+            host_cause: None,
+            provider_name: None,
+            operation: None,
+            status: None,
+            code: None,
+            request_id: None,
         }
     }
     fn caused_by(context: impl Into<S::Context>, cause: impl DiagnosticSource<S>) -> Self {
@@ -997,16 +997,19 @@ impl OperationErrorDetail<Bound> {
     }
 }
 
-/// Synthetic typed source for a flattened cause received over WIT.
+/// Synthetic typed source for a flattened cause in native wire fixtures.
+#[cfg(any(test, all(feature = "test-utils", not(target_arch = "wasm32"))))]
 #[derive(Debug)]
 struct FlattenedWireCause(String);
 
+#[cfg(any(test, all(feature = "test-utils", not(target_arch = "wasm32"))))]
 impl std::fmt::Display for FlattenedWireCause {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
 }
 
+#[cfg(any(test, all(feature = "test-utils", not(target_arch = "wasm32"))))]
 impl std::error::Error for FlattenedWireCause {}
 
 pub type ProviderResult<T, S = Unbound> = Result<T, ProviderFailure<S>>;
@@ -5619,18 +5622,6 @@ impl<S: TextState> PartialReadDiagnostic<S> {
     pub fn missing_attributes(&self) -> &[ProviderKey] {
         &self.missing_attributes
     }
-    /// Add missing names without consuming or discarding another diagnostic.
-    pub fn union_missing_attributes(&mut self, attributes: &NonEmptyMissingAttributes) {
-        for name in &attributes.0 {
-            if !self
-                .missing_attributes
-                .iter()
-                .any(|known| known.as_str() == name)
-            {
-                self.missing_attributes.push(name.clone().into());
-            }
-        }
-    }
 }
 
 impl<S: TextState> PartialReadDiagnostic<S> {
@@ -5680,13 +5671,11 @@ impl PartialReadDiagnostic<Bound> {
 }
 
 impl ProviderFailure<Unbound> {
-    /// Decode untrusted provider data received through the protocol/WIT boundary.
-    ///
-    /// This is the only sanctioned entry point for a wire record containing
-    /// both a runtime-built message and flattened cause string. It preserves
-    /// text for diagnostics. The original typed source and retry policy have
-    /// already been flattened and cannot be recovered by this decoder.
-    pub fn from_wire(error: WireProviderError) -> Self {
+    /// Decode a native boundary fixture. Production wire decoding lives in the
+    /// host's private WIT conversion module. Neither test-feature unification
+    /// nor a guest target makes this constructor public.
+    #[cfg(any(test, all(feature = "test-utils", not(target_arch = "wasm32"))))]
+    pub(crate) fn from_wire(error: WireProviderError) -> Self {
         let WireProviderError {
             kind,
             message,
@@ -9136,13 +9125,6 @@ pub enum CustomTypeDispatchError {
     Undeclared(TypeIdentity),
     Decode(CustomTypeBridgeDecodeError),
     Validation(Box<crate::schema::TypeError>),
-}
-
-impl CustomTypeDispatchError {
-    /// Finish provider-side validation with its category and typed cause intact.
-    pub fn into_provider_error(self) -> ProviderError {
-        ProviderError::from_diagnostic(ProviderErrorKind::InvalidInput, self)
-    }
 }
 
 impl fmt::Display for CustomTypeDispatchError {
@@ -12851,30 +12833,6 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         let error = serde_json::from_str::<AppliedIdentifier>("\"\"")
             .expect_err("deserialization must preserve the non-empty invariant");
         assert!(error.to_string().contains("must not be empty"), "{error}");
-    }
-
-    #[test]
-    fn partial_read_diagnostic_unions_attributes_without_consuming_a_reason() {
-        let mut diagnostic = HostPartialReadDiagnostic::new(
-            "rename partial".to_owned(),
-            vec!["rename_attr".to_owned(), "shared".to_owned()]
-                .try_into()
-                .unwrap(),
-        );
-        diagnostic.union_missing_attributes(
-            &vec!["create_attr".to_owned(), "shared".to_owned()]
-                .try_into()
-                .unwrap(),
-        );
-        assert_eq!(diagnostic.reason(), "rename partial");
-        assert_eq!(
-            diagnostic.missing_attributes(),
-            &[
-                "rename_attr".to_owned(),
-                "shared".to_owned(),
-                "create_attr".to_owned()
-            ]
-        );
     }
 
     #[test]

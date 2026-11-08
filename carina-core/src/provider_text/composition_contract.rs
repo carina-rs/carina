@@ -392,16 +392,30 @@
 //! assert!(cause.as_cause().matches_for_test::<std::io::Error>(|_| true));
 //! ```
 //!
-//! Classified adapters can only be built by their constructor.
+//! Runtime-selected kinds use diagnostic adoption, rather than detail construction.
 //!
-//! ```compile_fail,E0451
-//! use carina_core::provider_text::{ClassifiedSource, Retryability};
-//! let _ = ClassifiedSource { cause: std::io::Error::other("leaf"), retryability: Retryability::Transient };
+//! ```compile_fail,E0624
+//! use carina_core::provider::{ErrorDetail, ProviderError, ProviderErrorKind};
+//! use carina_core::provider_text::ProviderDiagnostic;
+//! let message = String::from("runtime message");
+//! let _ = ErrorDetail::new(message);
 //! ```
 //!
 //! ```
-//! use carina_core::provider_text::{ClassifiedSource, Retryability};
-//! let _ = ClassifiedSource::new(std::io::Error::other("leaf"), Retryability::Transient);
+//! use carina_core::provider::{ErrorDetail, ProviderError, ProviderErrorKind};
+//! use carina_core::provider_text::ProviderDiagnostic;
+//! let message = String::from("runtime message");
+//! let _ = ProviderError::from_diagnostic(ProviderErrorKind::ApiError, ProviderDiagnostic::message(message.into()));
+//! ```
+//!
+//! ```compile_fail,E0277
+//! use carina_core::provider::{ErrorDetail, ProviderError};
+//! let _: ErrorDetail = Default::default();
+//! ```
+//!
+//! ```
+//! use carina_core::provider::{ErrorDetail, ProviderError};
+//! let _: &ErrorDetail = ProviderError::api_error("message").detail();
 //! ```
 //!
 //! Boolean retry setters have been replaced by explicit policy.
@@ -500,20 +514,6 @@
 //! fn promote<S: TextState>(reason: S::PartialReadReason, admitted: Diagnostic<S>) -> Diagnostic<S> {
 //!     admitted
 //! }
-//! ```
-//!
-//! ClassifiedSource does not format an arbitrary foreign cause.
-//!
-//! ```compile_fail,E0277
-//! use carina_core::provider_text::{ClassifiedSource, ProviderDiagnostic, Retryability};
-//! let source = ClassifiedSource::new(std::io::Error::other("leaf"), Retryability::Transient);
-//! let _ = format!("{source:?}");
-//! ```
-//!
-//! ```
-//! use carina_core::provider_text::{ClassifiedSource, ProviderDiagnostic, Retryability};
-//! let source = ProviderDiagnostic::new(ClassifiedSource::new(std::io::Error::other("leaf"), Retryability::Transient));
-//! let _ = format!("{source:?}");
 //! ```
 //!
 //! Generic callers cannot invoke the sealed helper's construction methods.
