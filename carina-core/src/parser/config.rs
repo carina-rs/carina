@@ -960,7 +960,7 @@ pub trait CustomTypeResolver: Send + Sync {
 pub fn validate_custom_type_value(
     resolver: &dyn CustomTypeResolver,
     target: CustomTypeValidationTarget<'_>,
-    value: &Value,
+    value: &crate::resource::knowledge::KnownValue<'_>,
 ) -> Result<(), CustomTypeValidationError> {
     match target {
         CustomTypeValidationTarget::Declaration { owner, declaration } => {

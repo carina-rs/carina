@@ -283,11 +283,26 @@ fn module_directives_resolve_before_deferred_loop_is_saved() {
         |session| {
             crate::parser::expand_deferred_children(
                 &restored,
-                &crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(vec![
-                    crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
-                        "child".into(),
-                    )),
-                ])),
+                match (crate::resource::Value::Concrete(crate::resource::ConcreteValue::List(
+                    vec![crate::resource::Value::Concrete(
+                        crate::resource::ConcreteValue::String("child".into()),
+                    )],
+                )))
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap()
+                {
+                    crate::resource::knowledge::Classification::Known(value) => {
+                        crate::resource::knowledge::PlanIterable::from_known(value).unwrap()
+                    }
+                    crate::resource::knowledge::Classification::ShapeKnown(value) => {
+                        crate::resource::knowledge::PlanIterable::from_shape(value).unwrap()
+                    }
+                    crate::resource::knowledge::Classification::Pending(_)
+                    | crate::resource::knowledge::Classification::Failed(_) => {
+                        panic!("fixture collection has exact shape")
+                    }
+                },
                 crate::resource::AccessMissPolicy::Error,
                 session,
             )
@@ -341,9 +356,24 @@ fn module_loop_directives_are_strictly_resolved_for_each_child() {
             |session| {
                 crate::parser::expand_deferred_children(
                     deferred,
-                    &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    match (Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                         ConcreteValue::Bool(flag),
-                    )])),
+                    )])))
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                    {
+                        crate::resource::knowledge::Classification::Known(value) => {
+                            crate::resource::knowledge::PlanIterable::from_known(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::ShapeKnown(value) => {
+                            crate::resource::knowledge::PlanIterable::from_shape(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::Pending(_)
+                        | crate::resource::knowledge::Classification::Failed(_) => {
+                            panic!("fixture collection has exact shape")
+                        }
+                    },
                     crate::resource::AccessMissPolicy::Error,
                     session,
                 )
@@ -382,7 +412,22 @@ fn module_loop_directives_are_strictly_resolved_for_each_child() {
             |session| {
                 crate::parser::expand_deferred_children(
                     deferred,
-                    &Value::Concrete(ConcreteValue::List(vec![value])),
+                    match (Value::Concrete(ConcreteValue::List(vec![value])))
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .unwrap()
+                    {
+                        crate::resource::knowledge::Classification::Known(value) => {
+                            crate::resource::knowledge::PlanIterable::from_known(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::ShapeKnown(value) => {
+                            crate::resource::knowledge::PlanIterable::from_shape(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::Pending(_)
+                        | crate::resource::knowledge::Classification::Failed(_) => {
+                            panic!("fixture collection has exact shape")
+                        }
+                    },
                     crate::resource::AccessMissPolicy::Error,
                     session,
                 )

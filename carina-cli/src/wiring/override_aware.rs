@@ -7,7 +7,7 @@ use carina_core::binding_index::{LivePreApplyInputs, ManagedBindingStability, Re
 use carina_core::config_loader::UnresolvedConfigSnapshot;
 use carina_core::data_source_value::DataSourceValues;
 use carina_core::deps::sort_resources_by_dependencies;
-use carina_core::differ::{DeferredCreateTargets, DeferredForExpansionChoice};
+use carina_core::differ::DeferredCreateTargets;
 use carina_core::effect::deps::UnresolvedResource;
 use carina_core::name_override::{
     ApplyDecision, NameOverride, NameOverrideSource, should_apply_override,
@@ -328,24 +328,21 @@ impl<E> CanonicalResourcePair<E> {
     /// atomic update of the owned evaluated file. Generated children and
     /// retained templates both inherit canonical attribute names from the
     /// already-resolved file.
-    pub fn expand_deferred_for_expressions<F>(
+    pub fn expand_deferred_for_expressions(
         &mut self,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
         type_checks: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-        classify: F,
     ) -> Result<
         (
             carina_core::parser::ResolvedDeferredForExpressions,
             DeferredCreateTargets,
         ),
         carina_core::parser::DeferredForExpansionError,
-    >
-    where
-        F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice,
-    {
+    > {
         let (selected, retained) = DeferredCreateTargets::partition_for_expansion(
             self.parsed.take_deferred_for_expressions(),
-            classify,
+            bindings,
+            type_checks.catalog(),
         );
         self.parsed.warnings.retain(|warning| {
             warning.kind != carina_core::parser::WarningKind::DeferredFor

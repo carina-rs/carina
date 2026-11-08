@@ -1,0 +1,5 @@
+fn example(source: map(String)): String {
+ let unused = cidr_subnet(source.value0, 8, 1)
+ "kept"
+}
+mock.test.resource { name = example({ value0 = "invalid" }) }

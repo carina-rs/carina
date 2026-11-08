@@ -350,8 +350,11 @@ fn snapshot_state_typecheck_uses_checked_conversion() {
 fn snapshot_state_unresolved_filter_uses_checked_conversion() {
     let state = historical_siblings();
     let ordinary = resolve_historical_field("name").unwrap();
-    assert!(!carina_core::validation::value_contains_unresolved_ref(
-        &ordinary
+    assert!(matches!(
+        ordinary
+            .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification()),
+        Ok(carina_core::resource::knowledge::Classification::Known(_))
     ));
     assert!(
         state
@@ -391,7 +394,29 @@ fn snapshot_saved_plan_loop_expansion_uses_checked_conversion() {
     let items = resolve_historical_field("items").unwrap();
     let children = carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::LoadedProviderContext::empty_for_test(),
-        |session| expand_deferred_children(&deferred, &items, AccessMissPolicy::Error, session),
+        |session| {
+            expand_deferred_children(
+                &deferred,
+                match items
+                    .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                {
+                    carina_core::resource::knowledge::Classification::Known(value) => {
+                        carina_core::resource::knowledge::PlanIterable::from_known(value).unwrap()
+                    }
+                    carina_core::resource::knowledge::Classification::ShapeKnown(value) => {
+                        carina_core::resource::knowledge::PlanIterable::from_shape(value).unwrap()
+                    }
+                    carina_core::resource::knowledge::Classification::Pending(_)
+                    | carina_core::resource::knowledge::Classification::Failed(_) => {
+                        panic!("fixture collection has exact shape")
+                    }
+                },
+                AccessMissPolicy::Error,
+                session,
+            )
+        },
     )
     .unwrap();
     assert_eq!(children.len(), 1);

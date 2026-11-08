@@ -1,0 +1,2 @@
+let unused = env("CARINA_4316_UNUSED_MISSING")
+mock.test.resource { name = "kept" }

@@ -118,7 +118,7 @@ pub enum ModuleError {
         module: String,
         source_path: String,
         line: usize,
-        diagnostic: Box<crate::parser::Located<String>>,
+        diagnostic: Box<crate::parser::Located<crate::resolver::ResolutionError>>,
     },
 
     #[error(
@@ -598,6 +598,7 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         | ParseError::UnavailableSecret(_)
         | ParseError::InvalidFloatLiteral { .. }
         | ParseError::InvalidExpression { .. }
+        | ParseError::Evaluation { .. }
         | ParseError::IntegerArithmetic { .. }
         | ParseError::UnboundLoopRead { .. }
         | ParseError::UnresolvedDeclarationType { .. }

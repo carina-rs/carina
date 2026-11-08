@@ -26,6 +26,37 @@ pub enum ResolutionError {
     UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
     #[error("{0}")]
     Message(String),
+    #[error(transparent)]
+    Knowledge(Box<crate::resource::knowledge::KnowledgeDiagnostic>),
+    #[error("{context}{error}")]
+    Context {
+        context: String,
+        error: Box<ResolutionError>,
+    },
+}
+
+impl ResolutionError {
+    pub(crate) fn with_context(self, context: impl Into<String>) -> Self {
+        let context = context.into();
+        match self {
+            Self::Message(message) => Self::Message(format!("{context}{message}")),
+            error => Self::Context {
+                context,
+                error: Box::new(error),
+            },
+        }
+    }
+}
+
+impl<B: BindingAddress> From<crate::resource::knowledge::KnowledgeError<B>> for ResolutionError {
+    fn from(error: crate::resource::knowledge::KnowledgeError<B>) -> Self {
+        match error {
+            crate::resource::knowledge::KnowledgeError::UnavailableHistoricalSecret(error) => {
+                Self::UnavailableSecret(error)
+            }
+            error => Self::Knowledge(Box::new(error.into())),
+        }
+    }
 }
 
 impl crate::resource::InsideSecret for ResolutionError {
@@ -37,9 +68,24 @@ impl crate::resource::InsideSecret for ResolutionError {
     }
 }
 
+impl From<&str> for ResolutionError {
+    fn from(message: &str) -> Self {
+        Self::Message(message.to_owned())
+    }
+}
+
 impl From<String> for ResolutionError {
     fn from(message: String) -> Self {
         Self::Message(message)
+    }
+}
+
+impl From<ValueAccessError> for ResolutionError {
+    fn from(error: ValueAccessError) -> Self {
+        match error {
+            ValueAccessError::Classification { error } => *error,
+            error => Self::Message(error.to_string()),
+        }
     }
 }
 
@@ -48,8 +94,14 @@ impl From<crate::parser::ParseError> for ResolutionError {
         match error {
             crate::parser::ParseError::UnavailableSecret(error) => Self::UnavailableSecret(error),
             crate::parser::ParseError::InsideSecret { .. } => Self::InsideSecret {},
+            crate::parser::ParseError::Evaluation { line, error } => {
+                error.with_context(format!("Invalid expression at line {line}: "))
+            }
             crate::parser::ParseError::Located { path, error } => match Self::from(*error) {
                 Self::Message(message) => Self::Message(format!("{}: {message}", path.display())),
+                error @ (Self::Knowledge(_) | Self::Context { .. }) => {
+                    error.with_context(format!("{}: ", path.display()))
+                }
                 unavailable @ (Self::UnavailableSecret(_) | Self::InsideSecret { .. }) => {
                     unavailable
                 }
@@ -59,6 +111,9 @@ impl From<crate::parser::ParseError> for ResolutionError {
                 match Self::from(error) {
                     Self::Message(message) => {
                         Self::Message(crate::parser::Located::new(location, message).to_string())
+                    }
+                    error @ (Self::Knowledge(_) | Self::Context { .. }) => {
+                        error.with_context(crate::parser::Located::new(location, "").to_string())
                     }
                     unavailable @ (Self::UnavailableSecret(_) | Self::InsideSecret { .. }) => {
                         unavailable
@@ -75,9 +130,7 @@ impl From<crate::resource::SnapshotSelectionError> for ResolutionError {
         match error {
             crate::resource::SnapshotSelectionError::UnavailableSecret(error) => error.into(),
             crate::resource::SnapshotSelectionError::Access(error)
-            | crate::resource::SnapshotSelectionError::DeferredMiss(error) => {
-                Self::Message(error.to_string())
-            }
+            | crate::resource::SnapshotSelectionError::DeferredMiss(error) => error.into(),
         }
     }
 }
@@ -553,7 +606,12 @@ pub fn resolve_value_for_plan(
     let resolved = match resolve_ref_value(value, bindings, config) {
         Ok(value) => value,
         Err(error @ ResolutionError::UnavailableSecret(_)) => return Err(error),
-        Err(ResolutionError::Message(_) | ResolutionError::InsideSecret { .. }) => value.clone(),
+        Err(
+            ResolutionError::Message(_)
+            | ResolutionError::InsideSecret { .. }
+            | ResolutionError::Knowledge(_)
+            | ResolutionError::Context { .. },
+        ) => value.clone(),
     };
     Ok(if unresolved_upstream_bindings.is_empty() {
         resolved
@@ -608,8 +666,122 @@ pub enum ValueResolution<
     B: BindingAddress = AbsoluteBindingAddress,
 > {
     Present(Value<P, B>),
-    Absent,
+    Absent(crate::resource::knowledge::AbsenceWitness<B>),
     Unknown(Value<P, B>),
+}
+
+/// The single plan-time reference decision. Consumers supply expression
+/// evaluation, but binding definitiveness and selection are decided here.
+pub(crate) enum PlanReferenceResolution<P: PlaceholderKind, B: BindingAddress> {
+    Present(Value<P, B>),
+    Pending(crate::resource::knowledge::Phase),
+    Absent(crate::resource::knowledge::AbsenceWitness<B>),
+    SelectionError {
+        error: ValueAccessError,
+        absence_is_definitive: bool,
+    },
+}
+pub(crate) enum ReferenceEvaluation<P: PlaceholderKind, B: BindingAddress> {
+    Known(Value<P, B>),
+    Pending(crate::resource::knowledge::Phase),
+}
+pub(crate) enum ReferenceError<E> {
+    Evaluation(E),
+    Historical(crate::resource::UnavailableSecretError),
+}
+
+pub(crate) fn plan_reference_status<P: PlaceholderKind, B: BindingAddress, E>(
+    binding: &B,
+    selection: Option<&crate::resource::AccessPath<B>>,
+    bindings: &ResolvedBindings<P, B>,
+    mut evaluate: impl FnMut(Value<P, B>, bool) -> Result<ReferenceEvaluation<P, B>, E>,
+) -> Result<PlanReferenceResolution<P, B>, ReferenceError<E>> {
+    use crate::resource::knowledge::{AbsenceWitness, Phase};
+    let pending = || PlanReferenceResolution::Pending(Phase::Apply);
+    let Some(attributes) = bindings.get(binding.as_str()) else {
+        return Ok(pending());
+    };
+    let Some(path) = selection else {
+        if !bindings.binding_is_fully_definitive(binding.as_str()) {
+            return Ok(pending());
+        }
+        let mut keys = attributes.keys().collect::<Vec<_>>();
+        keys.sort();
+        let values = keys
+            .into_iter()
+            .map(|key| {
+                attributes[key]
+                    .to_value_at(format!("{binding}.{key}"))
+                    .map(|value| (key.clone(), value))
+            })
+            .collect::<Result<_, _>>()
+            .map_err(ReferenceError::Historical)?;
+        return evaluate(Value::Concrete(ConcreteValue::Map(values)), false)
+            .map(|read| match read {
+                ReferenceEvaluation::Known(value) => PlanReferenceResolution::Present(value),
+                ReferenceEvaluation::Pending(phase) => PlanReferenceResolution::Pending(phase),
+            })
+            .map_err(ReferenceError::Evaluation);
+    };
+    let Some(attribute) = attributes.get(path.attribute()) else {
+        return Ok(match AbsenceWitness::binding_miss(path, bindings) {
+            Some(witness) => PlanReferenceResolution::Absent(witness),
+            None => pending(),
+        });
+    };
+    if !bindings.attribute_value_is_definitive(binding.as_str(), path.attribute()) {
+        return Ok(pending());
+    }
+    let absence_is_definitive =
+        bindings.attribute_absence_is_definitive(binding.as_str(), path.attribute());
+    let selection_error = |error| PlanReferenceResolution::SelectionError {
+        error,
+        absence_is_definitive,
+    };
+    let root_path = format!("{}.{}", path.binding(), path.attribute());
+    let mut selected_segments = 0;
+    let selected = loop {
+        match attribute.select_path(
+            &path.segments()[..selected_segments],
+            &root_path,
+            AccessMissPolicy::Error,
+        ) {
+            Ok(value) => break value,
+            Err(crate::resource::SnapshotSelectionError::UnavailableSecret(_))
+                if selected_segments < path.segments().len() =>
+            {
+                selected_segments += 1
+            }
+            Err(crate::resource::SnapshotSelectionError::UnavailableSecret(error)) => {
+                return Err(ReferenceError::Historical(error));
+            }
+            Err(crate::resource::SnapshotSelectionError::Access(error)) => {
+                return Ok(selection_error(error));
+            }
+            Err(crate::resource::SnapshotSelectionError::DeferredMiss(_)) => return Ok(pending()),
+        }
+    };
+    let mut selected = match evaluate(selected, true).map_err(ReferenceError::Evaluation)? {
+        ReferenceEvaluation::Known(value) => value,
+        ReferenceEvaluation::Pending(phase) => return Ok(PlanReferenceResolution::Pending(phase)),
+    };
+    // The root was admitted once. Selecting its children only needs the shallow
+    // access operation; it cannot introduce an unevaluated sibling.
+    for segment in &path.segments()[selected_segments..] {
+        selected = match crate::resource::apply_value_path_segment(
+            selected,
+            segment.clone(),
+            0,
+            AccessMissPolicy::Error,
+        ) {
+            Ok(ValuePathSegmentResult::Resolved(value)) => value,
+            Ok(ValuePathSegmentResult::Deferred(_) | ValuePathSegmentResult::DeferredMiss(_)) => {
+                return Ok(pending());
+            }
+            Err(error) => return Ok(selection_error(error)),
+        };
+    }
+    Ok(PlanReferenceResolution::Present(selected))
 }
 
 /// Resolve a value while preserving the distinction required by `??`.
@@ -650,13 +822,6 @@ fn binding_access_miss_policy<P: PlaceholderKind, B: BindingAddress>(
     }
 }
 
-fn missing_access(error: &ValueAccessError) -> bool {
-    matches!(
-        error,
-        ValueAccessError::MissingField { .. } | ValueAccessError::MissingKey { .. }
-    )
-}
-
 enum HistoricalSelectionError {
     Access(ValueAccessError),
     Resolution(ResolutionError),
@@ -671,7 +836,6 @@ fn resolve_historical_selection<P: PlaceholderKind, B: BindingAddress>(
     bindings: &ResolvedBindings<P, B>,
     config: RuntimeContext<'_>,
     policy: AccessMissPolicy,
-    require_fully_resolved: bool,
 ) -> Result<Option<Value<P, B>>, HistoricalSelectionError> {
     let root_path = format!("{}.{}", path.binding(), path.attribute());
     // Find the first selectable subtree that can cross the checked conversion.
@@ -698,9 +862,6 @@ fn resolve_historical_selection<P: PlaceholderKind, B: BindingAddress>(
     };
     let mut resolved = resolve_ref_value_inner(&selected, bindings, config)
         .map_err(HistoricalSelectionError::Resolution)?;
-    if require_fully_resolved && !resolved.is_fully_resolved() {
-        return Ok(None);
-    }
     for segment in &path.segments()[selected_segments..] {
         resolved =
             match crate::resource::apply_value_path_segment(resolved, segment.clone(), 0, policy) {
@@ -715,11 +876,65 @@ fn resolve_historical_selection<P: PlaceholderKind, B: BindingAddress>(
                 }
                 Err(error) => return Err(HistoricalSelectionError::Access(error)),
             };
-        if require_fully_resolved && !resolved.is_fully_resolved() {
-            return Ok(None);
-        }
     }
     Ok(Some(resolved))
+}
+
+fn resolve_plan_reference<P: PlaceholderKind, B: BindingAddress>(
+    original: &Value<P, B>,
+    binding: &B,
+    selection: Option<&crate::resource::AccessPath<B>>,
+    bindings: &ResolvedBindings<P, B>,
+    config: RuntimeContext<'_>,
+) -> Result<ValueResolution<P, B>, ResolutionError> {
+    use crate::resource::knowledge::{Classification, KnowledgeContext, Phase};
+    let status = plan_reference_status(binding, selection, bindings, |value, resolve| {
+        let value = if resolve {
+            resolve_ref_value_inner(&value, bindings, config)?
+        } else {
+            value
+        };
+        let classification = value
+            .knowledge(&KnowledgeContext::plan(bindings))
+            .map(|proof| proof.into_classification())?;
+        let phase = if classification.apply_required() {
+            Phase::Apply
+        } else {
+            Phase::Plan
+        };
+        let known = matches!(classification, Classification::Known(_));
+        if let Some(error) = classification.failure() {
+            return Err(ResolutionError::from(error));
+        }
+        Ok(if known {
+            ReferenceEvaluation::Known(value)
+        } else {
+            ReferenceEvaluation::Pending(phase)
+        })
+    })
+    .map_err(|error| match error {
+        ReferenceError::Evaluation(error) => error,
+        ReferenceError::Historical(error) => error.into(),
+    })?;
+    match status {
+        PlanReferenceResolution::Present(value) => Ok(ValueResolution::Present(value)),
+        PlanReferenceResolution::Pending(_) => Ok(ValueResolution::Unknown(original.clone())),
+        PlanReferenceResolution::Absent(witness) => Ok(ValueResolution::Absent(witness)),
+        PlanReferenceResolution::SelectionError {
+            error,
+            absence_is_definitive,
+        } => match crate::resource::knowledge::AbsenceWitness::selection_miss(&error) {
+            Some(witness) if absence_is_definitive => Ok(ValueResolution::Absent(witness)),
+            Some(_) => Ok(ValueResolution::Unknown(original.clone())),
+            None => Err(error
+                .format_for_path(
+                    &selection
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| binding.to_string()),
+                )
+                .into()),
+        },
+    }
 }
 
 fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
@@ -738,91 +953,135 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
             value: left,
             default,
         }) => {
-            let left_resolution = if left.is_coalesce_optional_operand() {
-                resolve_ref_value_status_inner(left, bindings, config, true)?
+            let left_resolution = if let Some(operand) = left.optional_operand() {
+                resolve_ref_value_status_inner(operand.value(), bindings, config, true)?
             } else {
                 resolve_required_value_status(left, bindings, config)?
             };
             match left_resolution {
-                ValueResolution::Present(value) => Ok(ValueResolution::Present(value)),
-                ValueResolution::Absent
-                    if allow_absent_default && default.is_coalesce_optional_operand() =>
+                ValueResolution::Present(selected) => {
+                    match selected
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::plan(
+                            bindings,
+                        ))
+                        .map(|proof| proof.into_classification())
+                        .map_err(ResolutionError::from)?
+                    {
+                        crate::resource::knowledge::Classification::Known(proof) => {
+                            Ok(ValueResolution::Present(
+                                crate::resource::knowledge::take_present(proof),
+                            ))
+                        }
+                        crate::resource::knowledge::Classification::Failed(value) => {
+                            Err(value.error().into())
+                        }
+                        crate::resource::knowledge::Classification::ShapeKnown(_)
+                        | crate::resource::knowledge::Classification::Pending(_) => Ok(
+                            ValueResolution::Unknown(Value::Deferred(DeferredValue::Coalesce {
+                                value: Box::new(selected),
+                                default: default.clone(),
+                            })),
+                        ),
+                    }
+                }
+                ValueResolution::Absent(_witness)
+                    if allow_absent_default && default.optional_operand().is_some() =>
                 {
                     resolve_ref_value_status_inner(default, bindings, config, true)
                 }
-                ValueResolution::Absent => resolve_required_value_status(default, bindings, config),
-                ValueResolution::Unknown(_) => Ok(ValueResolution::Unknown(value.clone())),
+                ValueResolution::Absent(witness) => {
+                    crate::resource::knowledge::take_fallback(witness, || {
+                        match resolve_required_value_status(default, bindings, config)? {
+                            ValueResolution::Present(value) | ValueResolution::Unknown(value) => {
+                                Ok(value)
+                            }
+                            ValueResolution::Absent(_) => {
+                                unreachable!("required resolution cannot produce absence")
+                            }
+                        }
+                    })
+                    .and_then(|selected| {
+                        match selected
+                            .knowledge(&crate::resource::knowledge::KnowledgeContext::plan(
+                                bindings,
+                            ))
+                            .map(|proof| proof.into_classification())
+                        {
+                            Ok(crate::resource::knowledge::Classification::Known(_)) => {
+                                Ok(ValueResolution::Present(selected))
+                            }
+                            Ok(
+                                crate::resource::knowledge::Classification::ShapeKnown(_)
+                                | crate::resource::knowledge::Classification::Pending(_),
+                            ) => Ok(ValueResolution::Unknown(selected)),
+                            Ok(crate::resource::knowledge::Classification::Failed(value)) => {
+                                Err(value.error().into())
+                            }
+                            Err(error) => Err(error.into()),
+                        }
+                    })
+                }
+                ValueResolution::Unknown(_) => {
+                    // Value presence still requires Known. A definitive
+                    // reference can nevertheless expose collection membership:
+                    // retain that classified shape inside the unresolved
+                    // coalesce for the PlanIterable consumer, without selecting
+                    // either operand or granting a known-value proof.
+                    let shape = match left.as_ref() {
+                        Value::Deferred(DeferredValue::ResourceRef { path })
+                            if bindings.attribute_value_is_definitive(
+                                path.binding(),
+                                path.attribute(),
+                            ) =>
+                        {
+                            let selected = resolve_ref_value_inner(left, bindings, config)?;
+                            match selected
+                                .knowledge(&crate::resource::knowledge::KnowledgeContext::plan(
+                                    bindings,
+                                ))
+                                .map(|proof| proof.into_classification())
+                                .map_err(ResolutionError::from)?
+                            {
+                                crate::resource::knowledge::Classification::ShapeKnown(shape) => {
+                                    Some(shape.to_value())
+                                }
+                                crate::resource::knowledge::Classification::Known(_)
+                                | crate::resource::knowledge::Classification::Pending(_)
+                                | crate::resource::knowledge::Classification::Failed(_) => None,
+                            }
+                        }
+                        Value::Deferred(DeferredValue::Secret(_)) => None,
+                        Value::Concrete(_)
+                        | Value::Deferred(
+                            DeferredValue::ModuleIf(_)
+                            | DeferredValue::Interpolation(_)
+                            | DeferredValue::IntegerArithmetic(_)
+                            | DeferredValue::FunctionCall { .. }
+                            | DeferredValue::ResolvedFunctionCall { .. }
+                            | DeferredValue::BindingRef { .. }
+                            | DeferredValue::Access(_)
+                            | DeferredValue::Unknown(_)
+                            | DeferredValue::Placeholder(_)
+                            | DeferredValue::Unavailable { .. }
+                            | DeferredValue::Coalesce { .. }
+                            | DeferredValue::ResourceRef { .. },
+                        ) => None,
+                    };
+                    Ok(ValueResolution::Unknown(match shape {
+                        Some(shape) => Value::Deferred(DeferredValue::Coalesce {
+                            value: Box::new(shape),
+                            default: default.clone(),
+                        }),
+                        None => value.clone(),
+                    }))
+                }
             }
         }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            let binding = path.binding();
-            let Some(attributes) = bindings.get(binding) else {
-                return Ok(ValueResolution::Unknown(value.clone()));
-            };
-            let value_is_definitive =
-                bindings.attribute_value_is_definitive(binding, path.attribute());
-            let absence_is_definitive =
-                bindings.attribute_absence_is_definitive(binding, path.attribute());
-            let Some(attribute) = attributes.get(path.attribute()) else {
-                return if absence_is_definitive {
-                    Ok(ValueResolution::Absent)
-                } else {
-                    Ok(ValueResolution::Unknown(value.clone()))
-                };
-            };
-            if !value_is_definitive {
-                return Ok(ValueResolution::Unknown(value.clone()));
-            }
-
-            let selected = resolve_historical_selection(
-                attribute,
-                path,
-                bindings,
-                config,
-                AccessMissPolicy::Error,
-                true,
-            );
-            let selected = match selected {
-                Ok(Some(value)) => value,
-                Ok(None) => return Ok(ValueResolution::Unknown(value.clone())),
-                Err(HistoricalSelectionError::Access(error))
-                    if missing_access(&error) && absence_is_definitive =>
-                {
-                    return Ok(ValueResolution::Absent);
-                }
-                Err(HistoricalSelectionError::Access(error)) if missing_access(&error) => {
-                    return Ok(ValueResolution::Unknown(value.clone()));
-                }
-                Err(HistoricalSelectionError::Access(error)) => {
-                    return Err(error.format_for_path(&path.to_string()).into());
-                }
-                Err(HistoricalSelectionError::Resolution(error)) => return Err(error),
-            };
-            Ok(ValueResolution::Present(selected))
+            resolve_plan_reference(value, path.binding_address(), Some(path), bindings, config)
         }
         Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            let Some(attributes) = bindings.get(binding.as_str()) else {
-                return Ok(ValueResolution::Unknown(value.clone()));
-            };
-            if !bindings.binding_is_fully_definitive(binding.as_str()) {
-                return Ok(ValueResolution::Unknown(value.clone()));
-            }
-            let mut keys = attributes.keys().collect::<Vec<_>>();
-            keys.sort();
-            let values = keys
-                .into_iter()
-                .map(|key| {
-                    attributes[key]
-                        .to_value_at(format!("{binding}.{key}"))
-                        .map(|value| (key.clone(), value))
-                })
-                .collect::<Result<_, _>>()?;
-            let resolved = Value::Concrete(ConcreteValue::Map(values));
-            if resolved.is_fully_resolved() {
-                Ok(ValueResolution::Present(resolved))
-            } else {
-                Ok(ValueResolution::Unknown(value.clone()))
-            }
+            resolve_plan_reference(value, binding, None, bindings, config)
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let resolved_base = match resolve_ref_value_status_inner(
@@ -832,7 +1091,7 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
                 allow_absent_default,
             )? {
                 ValueResolution::Present(value) => value,
-                ValueResolution::Absent => return Ok(ValueResolution::Absent),
+                ValueResolution::Absent(witness) => return Ok(ValueResolution::Absent(witness)),
                 ValueResolution::Unknown(_) => {
                     return Ok(ValueResolution::Unknown(value.clone()));
                 }
@@ -848,10 +1107,14 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
                 Ok(
                     ValuePathSegmentResult::Deferred(_) | ValuePathSegmentResult::DeferredMiss(_),
                 ) => Ok(ValueResolution::Unknown(value.clone())),
-                Err(error) if missing_access(&error) => Ok(ValueResolution::Absent),
-                Err(error) => Err(error
-                    .format_for_path(&crate::value::format_value(value))
-                    .into()),
+                Err(error) => {
+                    match crate::resource::knowledge::AbsenceWitness::selection_miss(&error) {
+                        Some(witness) => Ok(ValueResolution::Absent(witness)),
+                        None => Err(error
+                            .format_for_path(&crate::value::format_value(value))
+                            .into()),
+                    }
+                }
             }
         }
         Value::Deferred(DeferredValue::Unknown(_)) => Ok(ValueResolution::Unknown(value.clone())),
@@ -867,7 +1130,11 @@ fn resolve_ref_value_status_inner<P: PlaceholderKind, B: BindingAddress>(
             | DeferredValue::Secret(_),
         ) => {
             let resolved = resolve_ref_value_inner(value, bindings, config)?;
-            if !resolved.is_fully_resolved() {
+            if !resolved
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .is_ok_and(|value| value.into_known().is_ok())
+            {
                 Ok(ValueResolution::Unknown(resolved))
             } else {
                 Ok(ValueResolution::Present(resolved))
@@ -887,7 +1154,11 @@ fn resolve_required_value_status<P: PlaceholderKind, B: BindingAddress>(
     config: RuntimeContext<'_>,
 ) -> Result<ValueResolution<P, B>, ResolutionError> {
     let resolved = resolve_ref_value_inner(value, bindings, config)?;
-    if resolved.is_fully_resolved() {
+    if resolved
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        .is_ok_and(|value| value.into_known().is_ok())
+    {
         Ok(ValueResolution::Present(resolved))
     } else {
         Ok(ValueResolution::Unknown(resolved))
@@ -908,15 +1179,7 @@ fn user_function_runtime_error(
     line: usize,
     error: impl Into<ResolutionError>,
 ) -> crate::parser::ParseError {
-    match error.into() {
-        ResolutionError::UnavailableSecret(error) => {
-            crate::parser::ParseError::UnavailableSecret(error)
-        }
-        ResolutionError::Message(message) => {
-            crate::parser::ParseError::InvalidExpression { line, message }
-        }
-        ResolutionError::InsideSecret { .. } => crate::parser::ParseError::InsideSecret { line },
-    }
+    crate::parser::ParseError::from_resolution(error.into(), line)
 }
 
 fn function_annotation_site<B: BindingAddress>(
@@ -1011,8 +1274,11 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
                 )?;
             } else if argument.pending_parameter().is_none()
                 && let Some(value) = argument.value()
-                && let Some(resolved_constraints) =
-                    crate::validation::typecheck::ResolvedConstraintValue::new(value)
+                && let Some(resolved_constraints) = (value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .ok()
+                    .and_then(|value| value.into_known().ok())
             {
                 crate::validation::typecheck::TypecheckProviderContext::for_session(
                     provider_config,
@@ -1069,8 +1335,11 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
         .map_err(|message| user_function_runtime_error(function.body.source_line, message))
         .map_err(|error| locate_user_function_error(function, error))?;
     if let Some(expected) = &function.return_type
-        && let Some(resolved_constraints) =
-            crate::validation::typecheck::ResolvedConstraintValue::new(&result)
+        && let Some(resolved_constraints) = result
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .ok()
+            .and_then(|value| value.into_known().ok())
     {
         crate::validation::typecheck::TypecheckProviderContext::for_session(provider_config)
             .check_resolved_constraints_at(
@@ -1133,30 +1402,16 @@ fn parser_stage_function_arguments<P: PlaceholderKind, B: BindingAddress>(
     )
 }
 
-enum FunctionArgumentResolution<P: PlaceholderKind, B: BindingAddress> {
-    Deferred(Vec<crate::resource::FunctionArgument<P, B>>),
-    FullyResolved(Vec<crate::resource::FunctionArgument<P, B>>),
-}
-
 fn resolve_function_arguments<P: PlaceholderKind, B: BindingAddress>(
     args: &[crate::resource::FunctionArgument<P, B>],
     bindings: &ResolvedBindings<P, B>,
     config: RuntimeContext<'_>,
-) -> Result<FunctionArgumentResolution<P, B>, ResolutionError> {
-    let args = args
-        .iter()
+) -> Result<Vec<crate::resource::FunctionArgument<P, B>>, ResolutionError> {
+    args.iter()
         .map(|argument| {
             argument.try_map_value(|value| resolve_ref_value_inner(value, bindings, config))
         })
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if args.iter().all(|argument| {
-        argument.handle().is_some() || argument.value().is_some_and(Value::is_fully_resolved)
-    }) {
-        Ok(FunctionArgumentResolution::FullyResolved(args))
-    } else {
-        Ok(FunctionArgumentResolution::Deferred(args))
-    }
+        .collect()
 }
 
 fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
@@ -1177,7 +1432,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 // absent default form. Residual coalesces are rejected at
                 // provider/state boundaries, so this cannot silently cross a
                 // concrete-value boundary.
-                ValueResolution::Absent => Ok(value.clone()),
+                ValueResolution::Absent(_) => Ok(value.clone()),
             }
         }
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
@@ -1193,7 +1448,6 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                     bindings,
                     config,
                     miss_policy,
-                    false,
                 ) {
                     Ok(Some(selected)) => Ok(selected),
                     Ok(None) => Ok(value.clone()),
@@ -1253,16 +1507,21 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
             args,
             source_line,
         }) => {
-            let resolved_args = match resolve_function_arguments(args, bindings, config)? {
-                FunctionArgumentResolution::FullyResolved(args) => args,
-                FunctionArgumentResolution::Deferred(args) => {
-                    return Ok(Value::Deferred(DeferredValue::FunctionCall {
-                        name: *name,
-                        args,
-                        source_line: *source_line,
-                    }));
-                }
-            };
+            let resolved_args = resolve_function_arguments(args, bindings, config)?;
+            let candidate = Value::Deferred(DeferredValue::FunctionCall {
+                name: *name,
+                args: resolved_args.clone(),
+                source_line: *source_line,
+            });
+            let knowledge = candidate
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::plan(
+                    bindings,
+                ))
+                .map(|proof| proof.into_classification())
+                .map_err(ResolutionError::from)?;
+            if !knowledge.permits_static_evaluation() {
+                return Ok(candidate);
+            }
 
             // Evaluate the built-in function; propagate errors since args are resolved.
             // The evaluator boundary is `EvalValue::into_value` — a closure
@@ -1283,8 +1542,12 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 .iter()
                 .map(crate::parser::function_argument_as_eval)
                 .collect();
-            let evaluated =
-                crate::builtins::evaluate_builtin_with_config(name, &eval_args, config.catalog());
+            let evaluated = crate::builtins::evaluate_builtin_with_config(
+                name,
+                &eval_args,
+                config.catalog(),
+                *source_line,
+            );
             match evaluated {
                 Ok(result) => result
                     .into_value()
@@ -1292,7 +1555,7 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                     .into_expanded()
                     .map(|value| value.into_placeholder_type())
                     .map_err(|error| ResolutionError::from(format!("{name}(): {error}"))),
-                Err(e) => Err(format!("{}(): {}", name, e).into()),
+                Err(error) => Err(error.with_context(format!("{name}(): "))),
             }
         }
         Value::Deferred(DeferredValue::Unavailable { name, reason, .. }) => {
@@ -1315,17 +1578,25 @@ fn resolve_ref_value_inner<P: PlaceholderKind, B: BindingAddress>(
                 return Ok(value.clone());
             }
 
-            let resolved_args = match resolve_function_arguments(args, bindings, config)? {
-                FunctionArgumentResolution::FullyResolved(args) => args,
-                FunctionArgumentResolution::Deferred(args) => {
-                    return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                        function: function.clone(),
-                        functions: functions.clone(),
-                        args,
-                        source_line: *source_line,
-                    }));
-                }
-            };
+            let resolved_args = resolve_function_arguments(args, bindings, config)?;
+            if !resolved_args.iter().all(|argument| {
+                argument.handle().is_some()
+                    || argument.value().is_some_and(|value| {
+                        value
+                            .knowledge(&crate::resource::knowledge::KnowledgeContext::plan(
+                                bindings,
+                            ))
+                            .map(|proof| proof.into_classification())
+                            .is_ok_and(|knowledge| knowledge.into_known().is_ok())
+                    })
+            }) {
+                return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
+                    function: function.clone(),
+                    functions: functions.clone(),
+                    args: resolved_args,
+                    source_line: *source_line,
+                }));
+            }
 
             let Some(parser_args) = parser_stage_function_arguments(&resolved_args) else {
                 return Ok(Value::Deferred(DeferredValue::ResolvedFunctionCall {
@@ -1431,6 +1702,70 @@ mod tests {
             remote_bindings: &HashMap::new(),
             wait_aliases: &[],
         })
+    }
+
+    #[test]
+    fn historical_status_requires_the_whole_selected_tree_to_be_known() {
+        let bindings = bindings_from(vec![(
+            "source",
+            vec![(
+                "items",
+                Value::Concrete(ConcreteValue::List(vec![
+                    Value::Concrete(ConcreteValue::String("known".into())),
+                    Value::root_resource_ref("future", "identifier", vec![]),
+                ])),
+            )],
+        )]);
+        let value = Value::root_resource_ref("source", "items", vec![]);
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                assert!(matches!(
+                    resolve_ref_value_status(&value, &bindings, session).unwrap(),
+                    ValueResolution::Unknown(_)
+                ));
+                let element = Value::Deferred(DeferredValue::ResourceRef {
+                    path: crate::resource::AccessPath::root_with_fields_and_subscripts(
+                        "source",
+                        "items",
+                        vec![],
+                        vec![crate::resource::Subscript::Int { index: 0 }],
+                    ),
+                });
+                assert!(matches!(
+                    resolve_ref_value_status(&element, &bindings, session).unwrap(),
+                    ValueResolution::Unknown(_)
+                ));
+            },
+        );
+    }
+
+    #[test]
+    fn historical_access_classifies_its_root_once() {
+        let mut nested = Value::Concrete(ConcreteValue::Int(7));
+        for _ in 0..20 {
+            nested = Value::Concrete(ConcreteValue::List(vec![nested]));
+        }
+        let bindings = bindings_from(vec![("source", vec![("items", nested)])]);
+        let reference = Value::Deferred(DeferredValue::ResourceRef {
+            path: crate::resource::AccessPath::root_with_fields_and_subscripts(
+                "source",
+                "items",
+                vec![],
+                vec![crate::resource::Subscript::Int { index: 0 }; 20],
+            ),
+        });
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| {
+                crate::resource::knowledge::with_classification_budget(32, || {
+                    assert_eq!(
+                        resolve_ref_value_status(&reference, &bindings, session).unwrap(),
+                        ValueResolution::Present(Value::Concrete(ConcreteValue::Int(7)))
+                    );
+                });
+            },
+        );
     }
 
     fn coalesce(value: Value, default: Value) -> Value {
@@ -1743,6 +2078,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pending_secret_attribute_keeps_coalesce_undecided() {
+        let pending = Value::Deferred(DeferredValue::Secret(
+            Box::new(Value::Deferred(DeferredValue::Unknown(
+                crate::resource::ApplyTimeUnknown::PendingReRead(
+                    crate::resource::PendingReRead::not_found(),
+                ),
+            )))
+            .into(),
+        ));
+        let mut bindings = ResolvedBindings::default();
+        bindings.set_with_completeness(
+            "holder",
+            HashMap::from([("comment".into(), pending)]),
+            BindingValueSource::Local,
+            BindingCompleteness::Complete,
+        );
+        let expression = coalesce(
+            Value::root_resource_ref("holder", "comment", vec![]),
+            Value::Concrete(ConcreteValue::String("fallback".into())),
+        );
+        let result = crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |session| resolve_ref_value_status(&expression, &bindings, session),
+        )
+        .unwrap();
+        assert!(matches!(
+            result,
+            ValueResolution::Unknown(Value::Deferred(DeferredValue::Coalesce { .. }))
+        ));
     }
 
     #[test]

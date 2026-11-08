@@ -107,7 +107,16 @@ impl NormalizationBatch {
                 Ok(Wire::Map(result))
             }
             _ => {
-                let value = try_core_to_protocol_value(value)
+                let knowledge = value
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(|source| {
+                        error(Kind::Conversion)
+                            .with_source(crate::protocol_convert::protocol_knowledge_error(source))
+                    })?;
+                let known = crate::protocol_convert::require_known_for_protocol(knowledge)
+                    .map_err(|source| error(Kind::Conversion).with_source(source))?;
+                let value = try_core_to_protocol_value(&known)
                     .map_err(|source| error(Kind::Conversion).with_source(source))?;
                 Ok(match value {
                     carina_provider_protocol::types::Value::Bool(value) => Wire::Bool(value),

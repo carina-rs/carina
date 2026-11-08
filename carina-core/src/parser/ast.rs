@@ -1078,6 +1078,14 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                 Value::Deferred(_) => DeferredForIterableResolution::StillDeferred,
             }
         };
+        let phase_detail = iterable
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .ok()
+            .and_then(|knowledge| {
+                crate::validation::validate_module_iteration_shape(&knowledge).err()
+            })
+            .map(|error| error.to_string());
         let template_resource = match body {
             DeferredForBody::Resource(resource) => *resource,
             DeferredForBody::Read(data_source) => {
@@ -1100,6 +1108,7 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                                 },
                                 span,
                                 iterable_resolution,
+                                phase_detail,
                             },
                         )),
                     )),
@@ -1125,6 +1134,7 @@ impl<B: BindingAddress> ParsedDeferredForExpression<ParserPlaceholder, B> {
                                 },
                                 span,
                                 iterable_resolution,
+                                phase_detail,
                             },
                         )),
                     )),
@@ -1765,6 +1775,18 @@ pub enum DeferredForExpansionError {
         expression: String,
         message: String,
     },
+    #[error("deferred-for iterable `{expression}` at line {line}: {error}")]
+    Knowledge {
+        line: usize,
+        expression: String,
+        error: Box<crate::resource::knowledge::KnowledgeDiagnostic>,
+    },
+    #[error("deferred-for iterable `{expression}` at line {line}: {error}")]
+    Evaluation {
+        line: usize,
+        expression: String,
+        error: Box<crate::resolver::ResolutionError>,
+    },
 }
 
 impl DeferredForExpansionError {
@@ -1781,6 +1803,16 @@ impl DeferredForExpansionError {
                 line,
                 expression,
                 message,
+            },
+            crate::resolver::ResolutionError::Knowledge(error) => Self::Knowledge {
+                line,
+                expression,
+                error,
+            },
+            error @ crate::resolver::ResolutionError::Context { .. } => Self::Evaluation {
+                line,
+                expression,
+                error: Box::new(error),
             },
             error @ crate::resolver::ResolutionError::InsideSecret { .. } => Self::Resolution {
                 line,
@@ -1799,7 +1831,7 @@ pub(crate) struct PlaceholderAccessError {
     /// surrounding coalesce may consume this as `Absent`; errors nested in a
     /// collection, interpolation, or function argument are not the absence of
     /// that enclosing expression.
-    coalesce_absence: bool,
+    absence: Option<crate::resource::knowledge::AbsenceWitness>,
 }
 
 impl std::fmt::Display for PlaceholderAccessError {
@@ -1809,7 +1841,7 @@ impl std::fmt::Display for PlaceholderAccessError {
 }
 
 fn nested_placeholder_error(mut error: PlaceholderAccessError) -> PlaceholderAccessError {
-    error.coalesce_absence = false;
+    error.absence = None;
     error
 }
 
@@ -8650,42 +8682,61 @@ impl<E> ExpandedFile<E> {
                         error,
                     )
                 })? {
-                crate::resolver::ValueResolution::Present(value) => value,
-                crate::resolver::ValueResolution::Absent
-                | crate::resolver::ValueResolution::Unknown(_) => continue,
+                crate::resolver::ValueResolution::Present(value)
+                | crate::resolver::ValueResolution::Unknown(value) => value,
+                crate::resolver::ValueResolution::Absent(_) => continue,
             };
             let miss_policy = bindings.access_miss_policy(&deferred.iterable);
+            use crate::resource::knowledge::{Classification, PlanIterable};
+            let iterable = match iterable_value
+                .knowledge(&bindings.knowledge_context())
+                .map(|proof| proof.into_classification())
+                .map_err(|error| {
+                    DeferredForExpansionError::resolution(
+                        deferred.line(),
+                        crate::value::format_value(&deferred.iterable),
+                        error.into(),
+                    )
+                })? {
+                Classification::Known(value) => PlanIterable::from_known(value),
+                Classification::ShapeKnown(value) => {
+                    Some(PlanIterable::from_shape(value).map_err(|error| {
+                        DeferredForExpansionError::resolution(
+                            deferred.line(),
+                            crate::value::format_value(&deferred.iterable),
+                            error.into(),
+                        )
+                    })?)
+                }
+                Classification::Failed(failure) => {
+                    return Err(DeferredForExpansionError::resolution(
+                        deferred.line(),
+                        crate::value::format_value(&deferred.iterable),
+                        failure.error().into(),
+                    ));
+                }
+                Classification::Pending(_) => continue,
+            };
+            let iterable_value = iterable
+                .as_ref()
+                .map(PlanIterable::for_expansion)
+                .unwrap_or_else(|| iterable_value.clone());
 
             match (&deferred.binding, &iterable_value) {
-                // Simple binding: only the value var is bound
-                (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(_))) => {
-                    expanded_resources.extend(expand_deferred_children(
-                        deferred,
-                        &iterable_value,
-                        miss_policy,
-                        type_checks,
-                    )?);
-                    resolved_indices.push(idx);
-                }
-                // Indexed binding: both index and value vars are bound
-                (ForBinding::Indexed(_, _), Value::Concrete(ConcreteValue::List(_))) => {
-                    expanded_resources.extend(expand_deferred_children(
-                        deferred,
-                        &iterable_value,
-                        miss_policy,
-                        type_checks,
-                    )?);
-                    resolved_indices.push(idx);
-                }
-                // Map binding expands over maps, substituting both key and value vars
-                (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(_))) => {
-                    expanded_resources.extend(expand_deferred_children(
-                        deferred,
-                        &iterable_value,
-                        miss_policy,
-                        type_checks,
-                    )?);
-                    resolved_indices.push(idx);
+                (
+                    ForBinding::Simple(_) | ForBinding::Indexed(_, _),
+                    Value::Concrete(ConcreteValue::List(_)),
+                )
+                | (ForBinding::Map(_, _), Value::Concrete(ConcreteValue::Map(_))) => {
+                    if let Some(iterable) = iterable {
+                        expanded_resources.extend(expand_deferred_children(
+                            deferred,
+                            iterable,
+                            miss_policy,
+                            type_checks,
+                        )?);
+                        resolved_indices.push(idx);
+                    }
                 }
                 // Shape mismatch: replace the original "not yet available" warning
                 // with a specific shape-mismatch warning, leave entry deferred.
@@ -8762,16 +8813,25 @@ fn retain_non_matching_deferred_for_warnings(
     warnings.retain(|warning| !deferred.location().matches_deferred_warning(warning));
 }
 
+/// Expand an exact collection shape, whose leaves may still await apply.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{parser::{expand_deferred_children, DeferredForExpression}, resource::{Value, AccessMissPolicy}, validation::deferred_types::ProviderTypeCheckContext};
+/// fn bypass(template:&DeferredForExpression, raw:&Value, context:&dyn ProviderTypeCheckContext) {
+///     let _=expand_deferred_children(template, raw, AccessMissPolicy::Error, context);
+/// }
+/// ```
 pub fn expand_deferred_children<
     S: Clone,
     D: crate::resource::DeferredDependencyPhase<AbsoluteBindingAddress>,
 >(
     deferred: &DeferredForExpression<S, NoPlaceholder, LoopSlot, AbsoluteBindingAddress, D>,
-    iterable_value: &Value,
+    iterable: crate::resource::knowledge::PlanIterable<'_>,
     miss_policy: crate::resource::AccessMissPolicy,
     type_checks: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<Vec<Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>>, DeferredForExpansionError> {
-    match (&deferred.binding, iterable_value) {
+    let iterable_value = iterable.for_expansion();
+    match (&deferred.binding, &iterable_value) {
         (ForBinding::Simple(_), Value::Concrete(ConcreteValue::List(items))) => items
             .iter()
             .enumerate()
@@ -9030,7 +9090,7 @@ pub(crate) fn resolve_loop_directive_value<B: BindingAddress>(
                 |value| match value {
                     crate::resolver::ValueResolution::Present(value)
                     | crate::resolver::ValueResolution::Unknown(value) => value,
-                    crate::resolver::ValueResolution::Absent => expression,
+                    crate::resolver::ValueResolution::Absent(_) => expression,
                 },
             )
         }
@@ -9038,7 +9098,7 @@ pub(crate) fn resolve_loop_directive_value<B: BindingAddress>(
     .map_err(|message| PlaceholderAccessError {
         line: 0,
         message: message.to_string(),
-        coalesce_absence: false,
+        absence: None,
     })
 }
 
@@ -9084,14 +9144,14 @@ fn substitute_placeholder_with_policy<B: BindingAddress>(
             .ok_or_else(|| PlaceholderAccessError {
                 line: 0,
                 message: "for-loop key slot used outside a map binding".to_string(),
-                coalesce_absence: false,
+                absence: None,
             }),
         LoopSlot::Index => index
             .map(|index| Value::Concrete(ConcreteValue::Int(index)))
             .ok_or_else(|| PlaceholderAccessError {
                 line: 0,
                 message: "for-loop index slot used outside an indexed binding".to_string(),
-                coalesce_absence: false,
+                absence: None,
             }),
     })?;
     normalize_substituted_value(&mut expanded, miss_policy)?;
@@ -9136,22 +9196,35 @@ fn normalize_substituted_value<B: BindingAddress>(
         }) => {
             let mut resolved_left = left.as_ref().clone();
             match normalize_substituted_value(&mut resolved_left, miss_policy) {
-                Ok(()) if resolved_left.is_fully_resolved() => {
-                    // A present left operand wins without touching the fallback.
-                    *v = resolved_left;
-                }
                 Ok(()) => {
-                    let mut resolved_default = default.as_ref().clone();
-                    normalize_substituted_lazily(&mut resolved_default)?;
-                    *v = Value::Deferred(DeferredValue::Coalesce {
-                        value: Box::new(resolved_left),
-                        default: Box::new(resolved_default),
-                    });
+                    let known = resolved_left
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .ok()
+                        .and_then(|value| value.into_known().ok());
+                    if let Some(known) = known {
+                        *v = crate::resource::knowledge::take_present(known);
+                    } else {
+                        let mut resolved_default = default.as_ref().clone();
+                        normalize_substituted_lazily(&mut resolved_default)?;
+                        *v = Value::Deferred(DeferredValue::Coalesce {
+                            value: Box::new(resolved_left),
+                            default: Box::new(resolved_default),
+                        });
+                    }
                 }
-                Err(error) if error.coalesce_absence => {
-                    let mut resolved_default = default.as_ref().clone();
-                    normalize_substituted_value(&mut resolved_default, miss_policy)?;
-                    *v = resolved_default;
+                Err(PlaceholderAccessError {
+                    absence: Some(absence),
+                    ..
+                }) => {
+                    *v = crate::resource::knowledge::take_fallback(
+                        absence.in_domain::<B>(),
+                        || {
+                            let mut resolved_default = default.as_ref().clone();
+                            normalize_substituted_value(&mut resolved_default, miss_policy)?;
+                            Ok(resolved_default)
+                        },
+                    )?;
                 }
                 Err(error) => return Err(error),
             }
@@ -9171,15 +9244,12 @@ fn normalize_substituted_value<B: BindingAddress>(
                     *v = original.retain_deferred_miss_display_root();
                 }
                 Err(error) => {
-                    let coalesce_absence = matches!(
-                        error,
-                        crate::resource::ValueAccessError::MissingField { .. }
-                            | crate::resource::ValueAccessError::MissingKey { .. }
-                    );
+                    let absence =
+                        crate::resource::knowledge::AbsenceWitness::selection_miss(&error);
                     return Err(PlaceholderAccessError {
                         line: access.source_line(),
                         message: error.to_string(),
-                        coalesce_absence,
+                        absence,
                     });
                 }
             }
@@ -9203,7 +9273,7 @@ fn normalize_substituted_value<B: BindingAddress>(
                 .map_err(|error| PlaceholderAccessError {
                     line: expression.operator_span().line().unwrap_or(0),
                     message: error.to_string(),
-                    coalesce_absence: false,
+                    absence: None,
                 })?;
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
@@ -9308,7 +9378,7 @@ fn normalize_substituted_lazily<B: BindingAddress>(
                 .map_err(|error| PlaceholderAccessError {
                     line: expression.operator_span().line().unwrap_or(0),
                     message: error.to_string(),
-                    coalesce_absence: false,
+                    absence: None,
                 })?;
         }
         Value::Deferred(DeferredValue::Secret(inner)) => {
@@ -9609,7 +9679,22 @@ mod substitute_placeholder_tests {
             |session| {
                 expand_deferred_children(
                     &deferred,
-                    &Value::Concrete(ConcreteValue::Map(IndexMap::new())),
+                    match (Value::Concrete(ConcreteValue::Map(IndexMap::new())))
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .unwrap()
+                    {
+                        crate::resource::knowledge::Classification::Known(value) => {
+                            crate::resource::knowledge::PlanIterable::from_known(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::ShapeKnown(value) => {
+                            crate::resource::knowledge::PlanIterable::from_shape(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::Pending(_)
+                        | crate::resource::knowledge::Classification::Failed(_) => {
+                            panic!("fixture collection has exact shape")
+                        }
+                    },
                     crate::resource::AccessMissPolicy::Error,
                     session,
                 )
@@ -9649,9 +9734,24 @@ mod substitute_placeholder_tests {
             |session| {
                 expand_deferred_children(
                     &deferred,
-                    &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    match (Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                         ConcreteValue::String("alpha".into()),
-                    )])),
+                    )])))
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                    {
+                        crate::resource::knowledge::Classification::Known(value) => {
+                            crate::resource::knowledge::PlanIterable::from_known(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::ShapeKnown(value) => {
+                            crate::resource::knowledge::PlanIterable::from_shape(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::Pending(_)
+                        | crate::resource::knowledge::Classification::Failed(_) => {
+                            panic!("fixture collection has exact shape")
+                        }
+                    },
                     crate::resource::AccessMissPolicy::Error,
                     session,
                 )
@@ -9715,9 +9815,24 @@ mod substitute_placeholder_tests {
             |session| {
                 expand_deferred_children(
                     &restored,
-                    &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                    match (Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                         ConcreteValue::String("bad".into()),
-                    )])),
+                    )])))
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                    {
+                        crate::resource::knowledge::Classification::Known(value) => {
+                            crate::resource::knowledge::PlanIterable::from_known(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::ShapeKnown(value) => {
+                            crate::resource::knowledge::PlanIterable::from_shape(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::Pending(_)
+                        | crate::resource::knowledge::Classification::Failed(_) => {
+                            panic!("fixture collection has exact shape")
+                        }
+                    },
                     crate::resource::AccessMissPolicy::Error,
                     session,
                 )
@@ -9760,10 +9875,25 @@ mod substitute_placeholder_tests {
             |session| {
                 expand_deferred_children(
                     &list_deferred,
-                    &Value::Concrete(ConcreteValue::List(vec![
+                    match (Value::Concrete(ConcreteValue::List(vec![
                         Value::Concrete(ConcreteValue::String("alpha".into())),
                         Value::Concrete(ConcreteValue::String("beta".into())),
-                    ])),
+                    ])))
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                    {
+                        crate::resource::knowledge::Classification::Known(value) => {
+                            crate::resource::knowledge::PlanIterable::from_known(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::ShapeKnown(value) => {
+                            crate::resource::knowledge::PlanIterable::from_shape(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::Pending(_)
+                        | crate::resource::knowledge::Classification::Failed(_) => {
+                            panic!("fixture collection has exact shape")
+                        }
+                    },
                     crate::resource::AccessMissPolicy::Error,
                     session,
                 )
@@ -9784,7 +9914,7 @@ mod substitute_placeholder_tests {
             |session| {
                 expand_deferred_children(
                     &map_deferred,
-                    &Value::Concrete(ConcreteValue::Map(IndexMap::from([
+                    match (Value::Concrete(ConcreteValue::Map(IndexMap::from([
                         (
                             "alpha".to_string(),
                             Value::Concrete(ConcreteValue::String("one".into())),
@@ -9793,7 +9923,22 @@ mod substitute_placeholder_tests {
                             "beta".to_string(),
                             Value::Concrete(ConcreteValue::String("two".into())),
                         ),
-                    ]))),
+                    ]))))
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                    {
+                        crate::resource::knowledge::Classification::Known(value) => {
+                            crate::resource::knowledge::PlanIterable::from_known(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::ShapeKnown(value) => {
+                            crate::resource::knowledge::PlanIterable::from_shape(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::Pending(_)
+                        | crate::resource::knowledge::Classification::Failed(_) => {
+                            panic!("fixture collection has exact shape")
+                        }
+                    },
                     crate::resource::AccessMissPolicy::Error,
                     session,
                 )
@@ -9841,10 +9986,25 @@ mod substitute_placeholder_tests {
             |session| {
                 expand_deferred_children(
                     deferred,
-                    &Value::Concrete(ConcreteValue::List(vec![
+                    match (Value::Concrete(ConcreteValue::List(vec![
                         Value::Concrete(ConcreteValue::String("alpha".into())),
                         Value::Concrete(ConcreteValue::String("beta".into())),
-                    ])),
+                    ])))
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                    {
+                        crate::resource::knowledge::Classification::Known(value) => {
+                            crate::resource::knowledge::PlanIterable::from_known(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::ShapeKnown(value) => {
+                            crate::resource::knowledge::PlanIterable::from_shape(value).unwrap()
+                        }
+                        crate::resource::knowledge::Classification::Pending(_)
+                        | crate::resource::knowledge::Classification::Failed(_) => {
+                            panic!("fixture collection has exact shape")
+                        }
+                    },
                     crate::resource::AccessMissPolicy::Error,
                     session,
                 )

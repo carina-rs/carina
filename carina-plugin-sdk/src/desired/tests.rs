@@ -1020,7 +1020,12 @@ async fn provider_ready_inputs_preserve_env_string_diagnostic_sensitivity() {
             carina_core::EnvironmentSnapshot::new([("PATH".to_string(), "/captured/path".into())]);
         let sensitive = carina_core::builtins::evaluate_builtin_to_value(
             "env",
-            &[string("PATH")],
+            &[string("PATH")
+                .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap()
+                .into_known()
+                .unwrap()],
             &carina_core::parser::ProviderContext::new(environment),
         )
         .unwrap();

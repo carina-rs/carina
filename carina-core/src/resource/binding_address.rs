@@ -20,6 +20,12 @@ mod private {
         fn with_map_key(&self, key: &ValueString, authority: Derivation) -> Self;
 
         fn module_argument_placeholder(name: String, authority: Derivation) -> Option<Self>;
+
+        fn knowledge_diagnostic(
+            error: super::super::knowledge::KnowledgeError<Self>,
+        ) -> super::super::knowledge::KnowledgeDiagnostic
+        where
+            Self: super::BindingAddress;
     }
 }
 
@@ -252,6 +258,11 @@ pub trait BindingAddress:
 }
 
 impl private::Sealed for RelativeBindingName {
+    fn knowledge_diagnostic(
+        error: super::knowledge::KnowledgeError<Self>,
+    ) -> super::knowledge::KnowledgeDiagnostic {
+        super::knowledge::KnowledgeDiagnostic::Relative(error)
+    }
     fn selected_attribute(&self, attribute: &str, _authority: private::Derivation) -> Self {
         Self(ValueString::derived_from(
             format!("{}.{attribute}", self.as_str()),
@@ -302,6 +313,11 @@ impl BindingAddress for RelativeBindingName {
 }
 
 impl private::Sealed for AbsoluteBindingAddress {
+    fn knowledge_diagnostic(
+        error: super::knowledge::KnowledgeError<Self>,
+    ) -> super::knowledge::KnowledgeDiagnostic {
+        super::knowledge::KnowledgeDiagnostic::Absolute(error)
+    }
     fn selected_attribute(&self, attribute: &str, _authority: private::Derivation) -> Self {
         Self(ValueString::derived_from(
             format!("{}.{attribute}", self.as_str()),
@@ -347,6 +363,12 @@ impl BindingAddress for AbsoluteBindingAddress {
 
 pub(crate) fn binding_with_index<B: BindingAddress>(binding: &B, index: i64) -> B {
     <B as private::Sealed>::with_index(binding, index, private::Derivation)
+}
+
+pub(crate) fn knowledge_diagnostic<B: BindingAddress>(
+    error: super::knowledge::KnowledgeError<B>,
+) -> super::knowledge::KnowledgeDiagnostic {
+    <B as private::Sealed>::knowledge_diagnostic(error)
 }
 
 pub(crate) fn deferred_template_binding<B: BindingAddress>(binding: &B) -> B {

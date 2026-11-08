@@ -96,11 +96,16 @@ pub(crate) fn apply_pipe_step(
         && eval_args.len() < arity
         && eval_args.iter().all(is_static_eval)
     {
-        return crate::builtins::evaluate_builtin_with_config(&func_name, &eval_args, ctx.config)
-            .map_err(|message| ParseError::InvalidExpression {
-                line,
-                message: format!("{func_name}(): {message}"),
-            });
+        return crate::builtins::evaluate_builtin_with_config(
+            &func_name,
+            &eval_args,
+            ctx.config,
+            line.into(),
+        )
+        .map_err(|message| ParseError::InvalidExpression {
+            line,
+            message: format!("{func_name}(): {message}"),
+        });
     }
     crate::parser::functions::construct_builtin_call(builtin, eval_args, ctx, line)
 }
@@ -150,8 +155,22 @@ pub(crate) fn combine_coalesce_operands(
         // A concrete user value is present by construction. Do not fold a
         // computed structural value merely because its payload currently
         // looks concrete: doing so would discard its parser metadata.
-        concrete @ EvalValue::User(Value::Concrete(_)) => Ok(concrete),
         EvalValue::User(value) => {
+            let present = match value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+            {
+                Ok(crate::resource::knowledge::Classification::Known(known)) => !known.is_secret(),
+                Ok(crate::resource::knowledge::Classification::ShapeKnown(_)) => true,
+                Ok(
+                    crate::resource::knowledge::Classification::Pending(_)
+                    | crate::resource::knowledge::Classification::Failed(_),
+                )
+                | Err(_) => false,
+            };
+            if present {
+                return Ok(EvalValue::User(value));
+            }
             let default = default
                 .into_value()
                 .map_err(|error| ParseError::from_eval_value(error, line))?;

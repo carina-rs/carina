@@ -78,22 +78,73 @@ pub(crate) fn parse_duration_literal(src: &str, line: usize) -> Result<Value, Pa
 /// than at validate time because the DSL has no `[-1]` "from end"
 /// semantic — accepting them would let the validator pass and the
 /// resolver silently fall back to the unresolved ref.
-pub(crate) fn subscript_from_value(value: Value, line: usize) -> Result<Subscript, ParseError> {
-    match value {
-        Value::Concrete(ConcreteValue::Int(n)) if n < 0 => Err(ParseError::InvalidExpression {
-            line,
-            message: format!("index access key must be non-negative, got {}", n),
-        }),
-        Value::Concrete(ConcreteValue::Int(n)) => Ok(Subscript::Int { index: n }),
-        Value::Concrete(ConcreteValue::String(s)) => Ok(Subscript::Str { key: s }),
-        other => Err(ParseError::InvalidExpression {
-            line,
-            message: format!(
-                "index access key must be an integer or string, got {}",
-                crate::ValueDescription::of(&other)
-            ),
-        }),
+pub(crate) fn subscript_from_value(
+    value: &crate::resource::knowledge::KnownValue<
+        '_,
+        crate::resource::ParserPlaceholder,
+        RelativeBindingName,
+    >,
+    line: usize,
+) -> Result<Subscript, ParseError> {
+    let invalid = || ParseError::InvalidExpression {
+        line,
+        message: format!(
+            "index access key must be an integer or string, got {}",
+            crate::ValueDescription::of(
+                crate::resource::knowledge::ClassifiedRef::<
+                    crate::resource::ParserPlaceholder,
+                    RelativeBindingName,
+                >::Known(value)
+                .diagnostic_value()
+            )
+        ),
+    };
+    value.visit(
+        |view| match view {
+            crate::resource::knowledge::KnownView::Int(n) if n < 0 => {
+                Err(ParseError::InvalidExpression {
+                    line,
+                    message: format!("index access key must be non-negative, got {n}"),
+                })
+            }
+            crate::resource::knowledge::KnownView::Int(n) => Ok(Subscript::Int { index: n }),
+            crate::resource::knowledge::KnownView::String(s) => {
+                Ok(Subscript::Str { key: s.clone() })
+            }
+            _ => Err(invalid()),
+        },
+        |_| Err(invalid()),
+    )
+}
+
+fn parse_index_subscript(
+    pair: pest::iterators::Pair<Rule>,
+    ctx: &ParseContext,
+) -> Result<Subscript, ParseError> {
+    let line = pair.line_col().0;
+    let expression = first_inner(pair, "index expression", "index access")?;
+    let evaluated = parse_expression(expression, ctx)?;
+    let value = evaluated
+        .projection()
+        .expect("materialized parser expression");
+    // Subscript grammar admits only these scalar roots; reject other shapes
+    // before classification so an invalid container is never walked or cloned.
+    if matches!(
+        value,
+        Value::Concrete(ConcreteValue::Int(_) | ConcreteValue::String(_))
+    ) && let Ok(crate::resource::knowledge::Classification::Known(known)) = value
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+    {
+        return subscript_from_value(&known, line);
     }
+    Err(ParseError::InvalidExpression {
+        line,
+        message: format!(
+            "index access key must be an integer or string, got {}",
+            crate::ValueDescription::of(value)
+        ),
+    })
 }
 
 pub(crate) fn parse_postfix_path_segment(
@@ -102,13 +153,7 @@ pub(crate) fn parse_postfix_path_segment(
 ) -> Result<PathSegment, ParseError> {
     match pair.as_rule() {
         Rule::index_access => {
-            let line = pair.line_col().0;
-            let index_expr_pair = first_inner(pair, "index expression", "index access")?;
-            let index_value = parse_expression(index_expr_pair, ctx)?
-                .projection()
-                .expect("materialized parser expression")
-                .clone();
-            subscript_from_value(index_value, line).map(|index| PathSegment::Subscript { index })
+            parse_index_subscript(pair, ctx).map(|index| PathSegment::Subscript { index })
         }
         Rule::field_access => {
             let ident = first_inner(pair, "identifier", "field access")?;
@@ -631,15 +676,8 @@ fn parse_primary_eval_with_mode_inner(
             for pair in parts {
                 match pair.as_rule() {
                     Rule::index_access => {
-                        let line = pair.line_col().0;
-                        let index_expr_pair =
-                            first_inner(pair, "index expression", "index access")?;
-                        let index_value = parse_expression(index_expr_pair, ctx)?
-                            .projection()
-                            .expect("materialized parser expression")
-                            .clone();
                         segments.push(PathSegment::Subscript {
-                            index: subscript_from_value(index_value, line)?,
+                            index: parse_index_subscript(pair, ctx)?,
                         });
                     }
                     Rule::field_access => {
@@ -779,7 +817,10 @@ fn parse_primary_eval_with_mode_inner(
                 && eval_args.iter().all(is_static_eval)
             {
                 return crate::builtins::evaluate_builtin_with_config(
-                    &func_name, &eval_args, ctx.config,
+                    &func_name,
+                    &eval_args,
+                    ctx.config,
+                    line.into(),
                 )
                 .map_err(|e| ParseError::InvalidExpression {
                     line,
@@ -883,14 +924,7 @@ fn parse_primary_eval_with_mode_inner(
                 for step in access_steps {
                     match step.as_rule() {
                         Rule::index_access => {
-                            let step_line = step.line_col().0;
-                            let index_expr_pair =
-                                first_inner(step, "index expression", "index access")?;
-                            let index_value = parse_expression(index_expr_pair, ctx)?
-                                .projection()
-                                .expect("materialized parser expression")
-                                .clone();
-                            let subscript = subscript_from_value(index_value, step_line)?;
+                            let subscript = parse_index_subscript(step, ctx)?;
                             if in_field_phase {
                                 subscripts.push(subscript);
                             } else {

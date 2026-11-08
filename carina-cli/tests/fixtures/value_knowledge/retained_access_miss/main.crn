@@ -1,0 +1,3 @@
+for item in [{}] {
+  mock.test.resource { name = "consumer" comment = item.absent }
+}

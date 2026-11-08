@@ -100,7 +100,6 @@ use carina_core::deps::{
     get_composition_dependencies, get_data_source_dependencies, get_resource_dependencies,
     sort_resources_by_dependencies,
 };
-pub use carina_core::differ::DeferredForExpansionChoice;
 use carina_core::differ::{CascadeDependents, DeferredCreateTargets};
 use carina_core::differ::{
     Orphan, Orphans, PlanPriorStates, into_all_prior_states, lift_prior_state_enum_leaves,
@@ -109,8 +108,7 @@ use carina_core::differ::{
 };
 use carina_core::effect::{Effect, MoveAuthority, OutcomeUnknownImportReplacement, ResolvedMove};
 use carina_core::executor::normalized::{
-    apply_host_desired_normalization_slice, is_value_fully_concrete_for_expansion,
-    states_contain_unknown,
+    apply_host_desired_normalization_slice, states_contain_unknown,
 };
 use carina_core::executor::{
     ProviderReadyConfig, UnresolvedDataSourceInput, UnresolvedResource,
@@ -4176,6 +4174,12 @@ pub enum PlanPreparationError {
     Plan(NonEmptyPlanErrors),
     #[error(transparent)]
     Provider(#[from] HostError),
+    #[error("{resource}.{attribute}: {error}")]
+    Knowledge {
+        resource: Box<ResourceId>,
+        attribute: String,
+        error: carina_core::resource::knowledge::KnowledgeError,
+    },
 }
 
 fn resolved_constraint_context(
@@ -4224,8 +4228,37 @@ fn resolved_constraint_context(
     (attributes, origins.into_iter().collect())
 }
 
+fn project_plan_attributes<'a>(
+    id: &ResourceId,
+    attributes: &'a IndexMap<String, Value>,
+    bindings: &ResolvedBindings,
+    errors: &mut Vec<PlanError>,
+) -> HashMap<String, carina_core::resource::knowledge::PlanResolved<'a>> {
+    use carina_core::resource::knowledge::{KnowledgeContext, PlanResolved};
+    let cx = KnowledgeContext::plan(bindings);
+    attributes
+        .iter()
+        .filter_map(
+            |(name, value)| match value.knowledge(&cx).and_then(PlanResolved::try_from) {
+                Ok(value) => Some((name.clone(), value)),
+                Err(error) => {
+                    errors.push(PlanError {
+                        resource_id: id.clone(),
+                        kind: carina_core::plan::PlanErrorKind::Knowledge {
+                            attribute: name.clone(),
+                            error: Box::new(error),
+                        },
+                    });
+                    None
+                }
+            },
+        )
+        .collect()
+}
+
 fn validate_resolved_value_constraints(
     ctx: &WiringContext,
+    bindings: &ResolvedBindings,
     resources: &[Resource],
     resource_origins: &[Resource],
     data_sources: &[DataSource],
@@ -4247,11 +4280,17 @@ fn validate_resolved_value_constraints(
         let Some(schema) = ctx.schemas().get_for(resource) else {
             continue;
         };
+        let classified = project_plan_attributes(
+            &resource.id,
+            &resource.attributes,
+            bindings,
+            &mut plan_errors,
+        );
         append_resolved_value_constraint_errors(
             &mut plan_errors,
             &resource.id,
             schema,
-            &resource.resolved_attributes(),
+            &classified,
             &resource.quoted_string_attrs,
             &origin.attributes,
             ctx.custom_type_resolver(),
@@ -4262,11 +4301,17 @@ fn validate_resolved_value_constraints(
         let Some(schema) = ctx.schemas().get_for_data_source(resource) else {
             continue;
         };
+        let classified = project_plan_attributes(
+            &resource.id,
+            &resource.attributes,
+            bindings,
+            &mut plan_errors,
+        );
         append_resolved_value_constraint_errors(
             &mut plan_errors,
             &resource.id,
             schema,
-            &carina_core::resource::attrs_to_hashmap(&resource.attributes),
+            &classified,
             &resource.quoted_string_attrs,
             &origin.attributes,
             ctx.custom_type_resolver(),
@@ -4280,15 +4325,17 @@ fn append_resolved_value_constraint_errors(
     plan_errors: &mut Vec<PlanError>,
     id: &ResourceId,
     schema: OwnerBoundResourceSchema<'_>,
-    attributes: &HashMap<String, Value>,
+    attributes: &HashMap<String, carina_core::resource::knowledge::PlanResolved<'_>>,
     quoted_string_attrs: &HashSet<String>,
     origin_attributes: &IndexMap<String, Value>,
     resolver: &dyn carina_core::parser::CustomTypeResolver,
 ) {
     let is_string_literal = |attribute: &str| quoted_string_attrs.contains(attribute);
-    let Err(errors) =
-        schema.validate_known_values_with_resolver(attributes, &is_string_literal, resolver)
-    else {
+    let Err(errors) = schema.validate_plan_value_constraints_with_resolver(
+        attributes,
+        &is_string_literal,
+        resolver,
+    ) else {
         return;
     };
 
@@ -4366,6 +4413,7 @@ impl<'a> PlanPreprocessor<'a> {
                 async |session| {
                     let mut errors = validate_resolved_value_constraints(
                         self.ctx,
+                        resources.bindings(),
                         resources.resources(),
                         resource_origins,
                         data_sources,
@@ -6914,6 +6962,9 @@ pub(crate) async fn build_post_expansion_plan<M: PostExpansionMode, E>(
                         PlanPreparationError::ModuleConstraint(error) => {
                             return Err(AppError::ModuleConstraint(error));
                         }
+                        error @ PlanPreparationError::Knowledge {..} => {
+                            return Err(error.into());
+                        }
                     };
                     let mut plan = Plan::new();
                     for error in errors.as_slice().iter().cloned() {
@@ -7222,26 +7273,11 @@ impl<E> ValidatedConfig<PostExpansionPlanView<E, ChildrenPending>> {
         managed_bindings: &HashSet<AbsoluteBindingAddress>,
         non_managed: carina_core::parser::ResolvedDeferredForExpressions,
     ) {
-        let (_, retained) = DeferredCreateTargets::partition_for_expansion(
-            self.resources
-                .inner
-                .data
-                .deferred_create_targets
-                .templates()
-                .clone(),
-            |template| {
-                if template
-                    .root_bindings()
-                    .iter()
-                    .any(|binding| managed_bindings.contains(binding))
-                {
-                    DeferredForExpansionChoice::Retain
-                } else {
-                    DeferredForExpansionChoice::Expand
-                }
-            },
-        );
-        self.resources.inner.data.deferred_create_targets = retained;
+        self.resources
+            .inner
+            .data
+            .deferred_create_targets
+            .restrict_to_bindings(managed_bindings);
         self.resources
             .inner
             .data
@@ -7525,20 +7561,17 @@ pub(crate) trait DeferredExpansionTarget<E> {
         providers: &[ExpandedProviderConfig],
     ) -> Result<(), AppError>;
 
-    fn expand_partitioned<F>(
+    fn expand_partitioned(
         &mut self,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
         type_checks: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-        classify: F,
     ) -> Result<
         (
             carina_core::parser::ResolvedDeferredForExpressions,
             DeferredCreateTargets,
         ),
         carina_core::parser::DeferredForExpansionError,
-    >
-    where
-        F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice;
+    >;
 }
 
 impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
@@ -7559,22 +7592,18 @@ impl<E> DeferredExpansionTarget<E> for CanonicalResourcePair<E> {
         )
     }
 
-    fn expand_partitioned<F>(
+    fn expand_partitioned(
         &mut self,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
         type_checks: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-        classify: F,
     ) -> Result<
         (
             carina_core::parser::ResolvedDeferredForExpressions,
             DeferredCreateTargets,
         ),
         carina_core::parser::DeferredForExpansionError,
-    >
-    where
-        F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice,
-    {
-        self.expand_deferred_for_expressions(bindings, type_checks, classify)
+    > {
+        self.expand_deferred_for_expressions(bindings, type_checks)
     }
 }
 
@@ -7600,24 +7629,21 @@ impl<E> DeferredExpansionTarget<E> for ExpandedFile<E> {
         )
     }
 
-    fn expand_partitioned<F>(
+    fn expand_partitioned(
         &mut self,
         bindings: &carina_core::binding_index::IterableBindings<'_>,
         type_checks: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
-        classify: F,
     ) -> Result<
         (
             carina_core::parser::ResolvedDeferredForExpressions,
             DeferredCreateTargets,
         ),
         carina_core::parser::DeferredForExpansionError,
-    >
-    where
-        F: FnMut(&carina_core::parser::DeferredForExpression) -> DeferredForExpansionChoice,
-    {
+    > {
         let (selected, retained) = DeferredCreateTargets::partition_for_expansion(
             self.take_deferred_for_expressions(),
-            classify,
+            bindings,
+            type_checks.catalog(),
         );
         self.warnings.retain(|warning| {
             warning.kind != WarningKind::DeferredFor
@@ -7677,7 +7703,12 @@ async fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTa
                         post_expansion_deferred_for: parsed.deferred_for_expressions().clone(),
                         deferred_create_targets: DeferredCreateTargets::partition_for_expansion(
                             parsed.deferred_for_expressions().clone(),
-                            |_| DeferredForExpansionChoice::Retain,
+                            &carina_core::binding_index::IterableBindings::from_upstream_only(
+                                Default::default(),
+                            ),
+                            &carina_core::parser::ProviderContext::new(
+                                carina_core::EnvironmentSnapshot::new([]),
+                            ),
                         )
                         .1,
                         new_child_ids: HashSet::new(),
@@ -7725,23 +7756,7 @@ async fn expand_same_config_deferred_for_target<E: Clone, T: DeferredExpansionTa
                 let iterable_bindings = resolved_bindings.project_iterable_bindings();
 
                 let (residual_deferred_for, deferred_create_targets) = target
-                    .expand_partitioned(&iterable_bindings, session, |deferred| {
-                        match iterable_bindings.resolve_value(&deferred.iterable, session.catalog())
-                        {
-                            Ok(carina_core::resolver::ValueResolution::Present(value))
-                                if is_value_fully_concrete_for_expansion(&value) =>
-                            {
-                                DeferredForExpansionChoice::Expand
-                            }
-                            Ok(
-                                carina_core::resolver::ValueResolution::Present(_)
-                                | carina_core::resolver::ValueResolution::Absent
-                                | carina_core::resolver::ValueResolution::Unknown(_),
-                            ) => DeferredForExpansionChoice::Retain,
-                            // Let the shared expansion path render the path-aware error.
-                            Err(_) => DeferredForExpansionChoice::Expand,
-                        }
-                    })
+                    .expand_partitioned(&iterable_bindings, session)
                     .map_err(AppError::DeferredForExpansion)?;
                 let providers = target.parsed().providers.clone();
                 target.compute_anonymous_identifiers(identity_context, &providers)?;
@@ -9245,8 +9260,18 @@ pub fn add_state_block_effects<D>(
                     unreachable!("state_block_import always returns an Import effect")
                 };
                 suppress_create.insert(target_id.clone());
-                if carina_core::effect::resolve_import_identifier(resolved_id)
-                    .is_ok_and(|identifier| AppliedIdentifier::new(identifier).is_err())
+                if resolved_id
+                    .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .ok()
+                    .and_then(|value| carina_core::effect::require_import_value(value).ok())
+                    .and_then(|value| carina_core::effect::resolve_import_identifier(&value).ok())
+                    .is_some_and(|value| {
+                        matches!(
+                            carina_core::effect::applied_import_identifier(&value),
+                            Err(carina_core::effect::ImportDispatchError::Empty(_))
+                        )
+                    })
                 {
                     plan.add_error(carina_core::plan::PlanError::new(
                         target_id,

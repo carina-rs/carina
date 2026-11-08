@@ -28,6 +28,70 @@ fn absolute_binding(name: &str) -> carina_core::resource::AbsoluteBindingAddress
 }
 
 #[test]
+fn plan_boundary_collects_every_resource_and_attribute_failure() {
+    let runtime = crate::test_support::TestCommandRuntime::new();
+    let schema = PatternResourceSchema::new("example.consumer")
+        .attribute(PatternAttributeSchema::required("name", PatternAttributeType::string()).build())
+        .attribute(
+            PatternAttributeSchema::optional("plain", PatternAttributeType::string()).build(),
+        )
+        .validate()
+        .unwrap();
+    let ctx = WiringContext::new_for_test_with_additional_schemas::<
+        carina_core::resource::NoPlaceholder,
+        carina_core::resource::AbsoluteBindingAddress,
+    >(&runtime, vec![], &[], [("mock".into(), schema)]);
+    let fixture_path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/value_knowledge/plan_boundary");
+    let directory = ResolvedPath::new(&fixture_path).unwrap();
+    let config =
+        carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+    let parsed = carina_core::config_loader::parse_directory(&directory, &config).unwrap();
+    let mut parsed = parsed
+        .into_parsed()
+        .into_expanded(ctx.schemas(), &config)
+        .unwrap();
+    let origins = parsed.resources.clone(); // allow: direct — fixture test inspection
+    // Model the invariant violation at the end of resolution: a ready
+    // expression was returned without evaluation. Each candidate must be
+    // reported, including siblings on the same resource.
+    for resource in &mut parsed.resources {
+        for value in resource.attributes.values_mut() {
+            *value = Value::Deferred(carina_core::resource::DeferredValue::Interpolation(vec![
+                carina_core::resource::InterpolationPart::Expr(value.clone()),
+            ]));
+        }
+    }
+    let errors = validate_resolved_value_constraints(
+        &ctx,
+        &ResolvedBindings::default(),
+        &parsed.resources,
+        &origins,
+        &[],
+        &[],
+    );
+    assert_eq!(errors.len(), 4);
+    assert!(errors.iter().all(|entry| matches!(
+        &entry.kind,
+        carina_core::plan::PlanErrorKind::Knowledge { error, .. }
+            if matches!(error.as_ref(), carina_core::resource::knowledge::KnowledgeError::UnresolvedAtBoundary { sites } if !sites.is_empty())
+    )));
+    assert!(
+        errors
+            .iter()
+            .all(|error| serde_json::to_value(error).is_err())
+    );
+    let rendered = errors
+        .iter()
+        .map(|error| error.display_with_project_dir(&fixture_path).to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for path in ["first.name", "first.plain", "second.name", "second.plain"] {
+        assert!(rendered.contains(path), "missing {path}: {rendered}");
+    }
+}
+
+#[test]
 fn review3_resolved_constraint_origins_mask_secret_paths() {
     let schema = PatternResourceSchema::new("test.Resource")
         .attribute(PatternAttributeSchema::optional("attr", PatternAttributeType::string()).build())
@@ -353,18 +417,12 @@ fn retained_deferred_warnings_match_source_location_for_both_file_owners() {
     let mut pair = CanonicalResourcePair::for_test(parsed.clone(), Vec::new());
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-        |session| {
-            parsed.expand_partitioned(&bindings, session, |_| DeferredForExpansionChoice::Retain)
-        },
+        |session| parsed.expand_partitioned(&bindings, session),
     )
     .unwrap();
     carina_core::validation::deferred_types::with_session_for_test(
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
-        |session| {
-            pair.expand_deferred_for_expressions(&bindings, session, |_| {
-                DeferredForExpansionChoice::Retain
-            })
-        },
+        |session| pair.expand_deferred_for_expressions(&bindings, session),
     )
     .unwrap();
     for warnings in [&parsed.warnings, &pair.parsed().warnings] {
@@ -554,7 +612,12 @@ async fn post_expansion_seam_carries_non_empty_preparation_diagnostics() {
             residual_deferred_for,
             deferred_create_targets: DeferredCreateTargets::partition_for_expansion(
                 carina_core::parser::ExpandedFile::<()>::default().into_deferred_for_expressions(),
-                |_| DeferredForExpansionChoice::Retain,
+                &carina_core::binding_index::IterableBindings::from_upstream_only(
+                    Default::default(),
+                ),
+                &carina_core::parser::ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                ),
             )
             .1,
         },
@@ -3287,6 +3350,9 @@ async fn plan_preprocessor_propagates_normalizer_failure() {
             assert_eq!(error.to_string(), "plan normalization failed");
         }
         PlanPreparationError::Plan(errors) => panic!("unexpected plan errors: {errors:#?}"),
+        error @ PlanPreparationError::Knowledge { .. } => {
+            panic!("unexpected knowledge error: {error}")
+        }
         PlanPreparationError::ModuleConstraint(error) => {
             panic!("unexpected constraint resolution error: {error:?}")
         }
@@ -8089,9 +8155,24 @@ async fn late_multifile_plan_migrates_legacy_and_renames_named_orphan() {
         |session| {
             carina_core::parser::expand_deferred_children(
                 anonymous_loop,
-                &Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
+                match (Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                     ConcreteValue::String("route".into()),
-                )])),
+                )])))
+                .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap()
+                {
+                    carina_core::resource::knowledge::Classification::Known(value) => {
+                        carina_core::resource::knowledge::PlanIterable::from_known(value).unwrap()
+                    }
+                    carina_core::resource::knowledge::Classification::ShapeKnown(value) => {
+                        carina_core::resource::knowledge::PlanIterable::from_shape(value).unwrap()
+                    }
+                    carina_core::resource::knowledge::Classification::Pending(_)
+                    | carina_core::resource::knowledge::Classification::Failed(_) => {
+                        panic!("fixture collection has exact shape")
+                    }
+                },
                 carina_core::resource::AccessMissPolicy::Error,
                 session,
             )
@@ -11464,10 +11545,25 @@ fn late_anonymous_identity_reconciliation_moves_deferred_legacy_row() {
         |session| {
             carina_core::parser::expand_deferred_children(
                 &parsed.deferred_for_expressions()[0],
-                &Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                match (Value::Concrete(ConcreteValue::Map(IndexMap::from([(
                     "alpha".to_string(),
                     Value::Concrete(ConcreteValue::String("subnet-a".into())),
-                )]))),
+                )]))))
+                .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap()
+                {
+                    carina_core::resource::knowledge::Classification::Known(value) => {
+                        carina_core::resource::knowledge::PlanIterable::from_known(value).unwrap()
+                    }
+                    carina_core::resource::knowledge::Classification::ShapeKnown(value) => {
+                        carina_core::resource::knowledge::PlanIterable::from_shape(value).unwrap()
+                    }
+                    carina_core::resource::knowledge::Classification::Pending(_)
+                    | carina_core::resource::knowledge::Classification::Failed(_) => {
+                        panic!("fixture collection has exact shape")
+                    }
+                },
                 carina_core::resource::AccessMissPolicy::Error,
                 session,
             )
@@ -14472,6 +14568,9 @@ mod resolved_value_constraint_gate {
     fn into_plan_errors(error: PlanPreparationError) -> Vec<carina_core::plan::PlanError> {
         match error {
             PlanPreparationError::Plan(errors) => errors.into_vec(),
+            error @ PlanPreparationError::Knowledge { .. } => {
+                panic!("unexpected knowledge error: {error}")
+            }
             PlanPreparationError::ModuleConstraint(error) => {
                 panic!("unexpected constraint resolution error: {error:?}")
             }
@@ -15632,4 +15731,34 @@ async fn round2_binding_stability_reuses_normalized_inputs() {
         },
     )
     .await;
+}
+
+#[test]
+fn plan_knowledge_error_is_terminal_and_renders_its_attribute_once() {
+    let resource: Resource = Resource::with_provider("mock", "test.resource", "pending", None);
+    let values = IndexMap::from([(
+        "value".to_owned(),
+        Value::Deferred(DeferredValue::Interpolation(vec![])),
+    )]);
+    let mut errors = Vec::new();
+    project_plan_attributes(
+        &resource.id,
+        &values,
+        &ResolvedBindings::default(),
+        &mut errors,
+    );
+    let PlanError {
+        resource_id,
+        kind: carina_core::plan::PlanErrorKind::Knowledge { attribute, error },
+    } = errors.pop().expect("one classified attribute error")
+    else {
+        panic!("typed knowledge failure");
+    };
+    let error = PlanPreparationError::Knowledge {
+        resource: Box::new(resource_id),
+        attribute,
+        error: *error,
+    };
+    assert!(std::error::Error::source(&error).is_none());
+    assert_eq!(error.to_string().matches(".value:").count(), 1);
 }

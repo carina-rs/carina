@@ -1035,7 +1035,14 @@ pub fn attribute_schema_to_protocol(
     let _v18_omits_host_completions = completions;
     let (required, read_only) = input_mode_to_protocol(declared_input_mode);
     let default = default
-        .map(try_core_to_protocol_value)
+        .map(|value| {
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(protocol_knowledge_error)
+                .and_then(require_known_for_protocol)
+                .and_then(|known| try_core_to_protocol_value(&known))
+        })
         .transpose()
         .map_err(|error| error.context(format!("default for `{name}`")))?;
     Ok(protocol::AttributeSchema {
@@ -2164,57 +2171,139 @@ fn input_mode_name(mode: InputMode) -> &'static str {
     }
 }
 
-/// Convert an ordinary concrete core value to the protocol value domain.
-pub fn try_core_to_protocol_value(value: &Value) -> Result<protocol::Value, ProtocolConvertError> {
-    match value {
-        Value::Concrete(ConcreteValue::String(value)) => Ok(protocol::Value::String(
-            value.expose_plaintext().to_string(),
-        )),
-        Value::Concrete(ConcreteValue::EnumIdentifier(_identifier)) => {
-            Err(ProtocolConvertError::NonWireValue {
+/// Convert a recursively-known ordinary value to the protocol domain.
+/// Classification alone does not grant Secret transport permission.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{protocol_convert::try_core_to_protocol_value, resource::Value};
+/// fn bypass(raw:Value) { let _=try_core_to_protocol_value(&raw); }
+/// ```
+/// ```compile_fail,E0308
+/// use carina_core::{protocol_convert::try_core_to_protocol_value,resource::{Value,ConcreteValue,DeferredValue,AccessPath}};
+/// fn bypass(path:AccessPath){
+///     let raw=Value::Concrete(ConcreteValue::List(vec![Value::Deferred(DeferredValue::ResourceRef{path})]));
+///     let _=try_core_to_protocol_value(&raw);
+/// }
+/// ```
+pub fn try_core_to_protocol_value(
+    value: &crate::resource::knowledge::KnownValue<'_>,
+) -> Result<protocol::Value, ProtocolConvertError> {
+    use crate::resource::knowledge::KnownView;
+    value.visit(
+        |view| match view {
+            KnownView::String(value) => {
+                Ok(protocol::Value::String(value.expose_plaintext().to_owned()))
+            }
+            KnownView::EnumIdentifier(_) => Err(ProtocolConvertError::NonWireValue {
                 variant: "EnumIdentifier",
-            })
-        }
-        Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
-            Ok(protocol::Value::String(value.api_value().to_string()))
-        }
-        Value::Concrete(ConcreteValue::Int(value)) => Ok(protocol::Value::Int(*value)),
-        Value::Concrete(ConcreteValue::Float(value)) => Ok(protocol::Value::Float(*value)),
-        Value::Concrete(ConcreteValue::Bool(value)) => Ok(protocol::Value::Bool(*value)),
-        Value::Concrete(ConcreteValue::Duration(value)) => i64::try_from(value.as_secs())
-            .map(protocol::Value::Int)
-            .map_err(|_error| ProtocolConvertError::DurationOutOfRange),
-        Value::Concrete(ConcreteValue::List(values)) => Ok(protocol::Value::List(
-            values
+            }),
+            KnownView::CanonicalEnum(value) => {
+                Ok(protocol::Value::String(value.api_value().to_owned()))
+            }
+            KnownView::Int(value) => Ok(protocol::Value::Int(value)),
+            KnownView::Float(value) => Ok(protocol::Value::Float(value)),
+            KnownView::Bool(value) => Ok(protocol::Value::Bool(value)),
+            KnownView::Duration(value) => i64::try_from(value.as_secs())
+                .map(protocol::Value::Int)
+                .map_err(|_| ProtocolConvertError::DurationOutOfRange),
+            KnownView::List(values) => values
                 .iter()
                 .enumerate()
                 .map(|(index, value)| {
                     try_core_to_protocol_value(value)
                         .map_err(|error| error.at_value_path(WirePathSegment::Index(index)))
                 })
-                .collect::<Result<_, _>>()?,
-        )),
-        Value::Concrete(ConcreteValue::StringList(values)) => Ok(protocol::Value::StringList(
-            values
-                .iter()
-                .map(|value| value.expose_plaintext().to_string())
-                .collect(),
-        )),
-        Value::Concrete(ConcreteValue::Map(values)) => Ok(protocol::Value::Map(
-            values
+                .collect::<Result<_, _>>()
+                .map(protocol::Value::List),
+            KnownView::StringList(values) => Ok(protocol::Value::StringList(
+                values
+                    .iter()
+                    .map(|value| value.expose_plaintext().to_owned())
+                    .collect(),
+            )),
+            KnownView::Map(values) => values
                 .iter()
                 .map(|(key, value)| {
                     try_core_to_protocol_value(value)
-                        .map(|converted| (key.clone(), converted))
+                        .map(|value| (key.to_owned(), value))
                         .map_err(|error| {
-                            error.at_value_path(WirePathSegment::Key(key.clone().into()))
+                            error.at_value_path(WirePathSegment::Key(key.to_owned().into()))
                         })
                 })
-                .collect::<Result<_, _>>()?,
-        )),
-        Value::Deferred(deferred) => Err(ProtocolConvertError::NonWireValue {
-            variant: deferred_value_variant(deferred),
-        }),
+                .collect::<Result<_, _>>()
+                .map(protocol::Value::Map),
+        },
+        |_| Err(ProtocolConvertError::NonWireValue { variant: "Secret" }),
+    )
+}
+
+/// The existing transport owner narrows classifier evidence before ordinary
+/// conversion. It preserves the first wire failure and its nested path.
+pub(crate) fn require_known_for_protocol<'a>(
+    knowledge: crate::resource::knowledge::Classification<'a>,
+) -> Result<crate::resource::knowledge::KnownValue<'a>, ProtocolConvertError> {
+    use crate::resource::knowledge::{Classification, ShapeView};
+    fn failure(knowledge: &Classification<'_>) -> Option<ProtocolConvertError> {
+        match knowledge {
+            Classification::Known(value) => try_core_to_protocol_value(value).err(),
+            Classification::Failed(value) => Some(protocol_knowledge_error(value.error())),
+            Classification::Pending(value) => value.visit(
+                |_, _, _| match value.to_value() {
+                    Value::Deferred(value) => Some(ProtocolConvertError::NonWireValue {
+                        variant: deferred_value_variant(&value),
+                    }),
+                    Value::Concrete(_) => None,
+                },
+                |_| Some(ProtocolConvertError::NonWireValue { variant: "Secret" }),
+            ),
+            Classification::ShapeKnown(value) => {
+                if let Value::Deferred(deferred) = value.to_value() {
+                    return Some(ProtocolConvertError::NonWireValue {
+                        variant: deferred_value_variant(&deferred),
+                    });
+                }
+                value.visit(
+                    |view| match view {
+                        ShapeView::List(items) => {
+                            items.iter().enumerate().find_map(|(index, item)| {
+                                failure(item)
+                                    .map(|error| error.at_value_path(WirePathSegment::Index(index)))
+                            })
+                        }
+                        ShapeView::Map(items) => items.iter().find_map(|(key, item)| {
+                            failure(item).map(|error| {
+                                error.at_value_path(WirePathSegment::Key((*key).to_owned().into()))
+                            })
+                        }),
+                    },
+                    |_| Some(ProtocolConvertError::NonWireValue { variant: "Secret" }),
+                )
+            }
+        }
+    }
+    knowledge.project_known(|value| {
+        failure(value).unwrap_or(ProtocolConvertError::NonWireValue {
+            variant: "Deferred",
+        })
+    })
+}
+
+pub(crate) fn protocol_knowledge_error(
+    error: crate::resource::knowledge::KnowledgeError,
+) -> ProtocolConvertError {
+    use crate::resource::knowledge::KnowledgeError;
+    match error {
+        KnowledgeError::Unavailable { .. } => ProtocolConvertError::NonWireValue {
+            variant: "Unavailable",
+        },
+        KnowledgeError::UnavailableHistoricalSecret(error) => {
+            ProtocolConvertError::UnavailableSecret(error)
+        }
+        KnowledgeError::InvalidStage { .. }
+        | KnowledgeError::Cycle { .. }
+        | KnowledgeError::UnresolvedAtBoundary { .. } => ProtocolConvertError::NonWireValue {
+            variant: "Deferred",
+        },
     }
 }
 
@@ -2337,7 +2426,7 @@ pub fn protocol_schema_default_to_core(
 
 /// Convert an ordinary core value map to the provider protocol domain.
 pub fn try_core_to_protocol_value_map(
-    values: &HashMap<String, Value>,
+    values: &HashMap<String, crate::resource::knowledge::KnownValue<'_>>,
 ) -> Result<BTreeMap<String, protocol::Value>, ProtocolConvertError> {
     values
         .iter()
@@ -2598,9 +2687,14 @@ pub fn try_resource_to_protocol<S, D>(
     let attributes = attributes
         .iter()
         .map(|(key, value)| {
-            try_core_to_protocol_value(value)
-                .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.context(format!("attribute `{key}`")))
+            try_core_to_protocol_value(&require_known_for_protocol(
+                (value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)?,
+            )?)
+            .map(|converted| (key.clone(), converted))
+            .map_err(|error| error.context(format!("attribute `{key}`")))
         })
         .collect::<Result<_, _>>()?;
     Ok(protocol::Resource {
@@ -2633,9 +2727,14 @@ pub fn try_data_source_to_protocol<S, D>(
     let attributes = attributes
         .iter()
         .map(|(key, value)| {
-            try_core_to_protocol_value(value)
-                .map(|converted| (key.clone(), converted))
-                .map_err(|error| error.context(format!("attribute `{key}`")))
+            try_core_to_protocol_value(&require_known_for_protocol(
+                (value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)?,
+            )?)
+            .map(|converted| (key.clone(), converted))
+            .map_err(|error| error.context(format!("attribute `{key}`")))
         })
         .collect::<Result<_, _>>()?;
     Ok(protocol::Resource {
@@ -2734,7 +2833,19 @@ pub fn try_state_to_protocol(state: &State) -> Result<protocol::State, ProtocolC
     Ok(protocol::State {
         id: resource_id_to_protocol(id),
         identifier: identifier.clone(),
-        attributes: try_core_to_protocol_value_map(attributes)?,
+        attributes: attributes
+            .iter()
+            .map(|(key, value)| {
+                value
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)
+                    .and_then(require_known_for_protocol)
+                    .and_then(|known| try_core_to_protocol_value(&known))
+                    .map(|value| (key.clone(), value))
+                    .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
+            })
+            .collect::<Result<_, _>>()?,
         exists: *exists,
     })
 }
@@ -2823,9 +2934,14 @@ pub fn try_applied_state_to_protocol(
                 let value = value
                     .to_value_at(format!("{id}.{key}"))
                     .map_err(ProtocolConvertError::UnavailableSecret)?;
-                try_core_to_protocol_value(&value)
-                    .map(|value| (key.clone(), value))
-                    .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
+                try_core_to_protocol_value(&require_known_for_protocol(
+                    (value)
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .map_err(protocol_knowledge_error)?,
+                )?)
+                .map(|value| (key.clone(), value))
+                .map_err(|error| error.at_value_path(WirePathSegment::Key(key.clone().into())))
             })
             .collect::<Result<_, _>>()?,
     })
@@ -2974,18 +3090,33 @@ pub fn try_patch_op_to_protocol(
     match operation {
         PatchOp::Add { key, value } => Ok(protocol::PatchOp::Add {
             key: key.clone(),
-            value: try_core_to_protocol_value(value)
-                .map_err(|error| error.context(format!("patch add `{key}`")))?,
+            value: try_core_to_protocol_value(&require_known_for_protocol(
+                (value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)?,
+            )?)
+            .map_err(|error| error.context(format!("patch add `{key}`")))?,
         }),
         PatchOp::Replace { key, value } => Ok(protocol::PatchOp::Replace {
             key: key.clone(),
-            value: try_core_to_protocol_value(value)
-                .map_err(|error| error.context(format!("patch replace `{key}`")))?,
+            value: try_core_to_protocol_value(&require_known_for_protocol(
+                (value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)?,
+            )?)
+            .map_err(|error| error.context(format!("patch replace `{key}`")))?,
         }),
         PatchOp::Reassert { key, value } => Ok(protocol::PatchOp::Reassert {
             key: key.clone(),
-            value: try_core_to_protocol_value(value)
-                .map_err(|error| error.context(format!("patch reassert `{key}`")))?,
+            value: try_core_to_protocol_value(&require_known_for_protocol(
+                (value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)?,
+            )?)
+            .map_err(|error| error.context(format!("patch reassert `{key}`")))?,
         }),
         PatchOp::Remove { key } => Ok(protocol::PatchOp::Remove { key: key.clone() }),
     }
@@ -3847,7 +3978,16 @@ mod tests {
             protocol::Value::List(vec![protocol::Value::Float(crate::finite(-0.0))]),
         )]));
         let decoded = protocol_schema_default_to_core(&nested).unwrap();
-        assert_eq!(try_core_to_protocol_value(&decoded).unwrap(), nested);
+        assert_eq!(
+            decoded
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(protocol_knowledge_error)
+                .and_then(require_known_for_protocol)
+                .and_then(|known| try_core_to_protocol_value(&known))
+                .unwrap(),
+            nested
+        );
     }
 
     #[test]
@@ -3902,7 +4042,7 @@ mod tests {
 
     #[test]
     fn ordinary_value_converters_keep_complete_structured_paths() {
-        let core = HashMap::from([(
+        let core: HashMap<String, Value> = HashMap::from([(
             "root".into(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(IndexMap::from([(
@@ -3913,18 +4053,41 @@ mod tests {
                 )])),
             )])),
         )]);
-        assert_complete_value_path(try_core_to_protocol_value_map(&core).unwrap_err());
         assert_complete_value_path(
-            try_core_to_protocol_value(&Value::Concrete(ConcreteValue::Map(
-                core.into_iter().collect(),
-            )))
+            try_core_to_protocol_value_map(
+                &(core)
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            value
+                                .knowledge(
+                                    &crate::resource::knowledge::KnowledgeContext::validation(),
+                                )
+                                .map(|proof| proof.into_classification())
+                                .unwrap()
+                                .into_known()
+                                .unwrap(),
+                        )
+                    })
+                    .collect(),
+            )
             .unwrap_err(),
+        );
+        assert_complete_value_path(
+            (Value::Concrete(ConcreteValue::Map(core.into_iter().collect())))
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(protocol_knowledge_error)
+                .and_then(require_known_for_protocol)
+                .and_then(|known| try_core_to_protocol_value(&known))
+                .unwrap_err(),
         );
     }
 
     #[test]
     fn persisted_value_converters_keep_complete_structured_paths() {
-        let core = HashMap::from([(
+        let core: HashMap<String, SnapshotValue> = HashMap::from([(
             "root".into(),
             Value::Concrete(ConcreteValue::List(vec![Value::Concrete(
                 ConcreteValue::Map(IndexMap::from([(
@@ -3974,9 +4137,14 @@ mod tests {
     #[test]
     fn schema_default_projection_rejects_non_wire_values() {
         assert!(matches!(
-            try_core_to_protocol_value(&Value::Concrete(ConcreteValue::Duration(
-                std::time::Duration::from_secs(u64::MAX),
-            ))),
+            (Value::Concrete(ConcreteValue::Duration(std::time::Duration::from_secs(
+                u64::MAX
+            ),)))
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .map_err(protocol_knowledge_error)
+            .and_then(require_known_for_protocol)
+            .and_then(|known| try_core_to_protocol_value(&known)),
             Err(ProtocolConvertError::DurationOutOfRange)
         ));
 
@@ -4062,7 +4230,12 @@ mod tests {
 
         for value in non_wire {
             assert!(matches!(
-                try_core_to_protocol_value(&value),
+                value
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(protocol_knowledge_error)
+                    .and_then(require_known_for_protocol)
+                    .and_then(|known| try_core_to_protocol_value(&known)),
                 Err(ProtocolConvertError::NonWireValue { variant: _variant })
             ));
         }

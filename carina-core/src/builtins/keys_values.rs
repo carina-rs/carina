@@ -1,73 +1,42 @@
-//! `keys(map)` and `values(map)` built-in functions
-
-use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
-
+//! Map membership is sufficient for keys and values.
 use super::value_type_name;
-
-/// `keys(map)` - Return the keys of a map as a sorted list of strings.
-///
-/// - Single argument: a Map
-/// - Returns: List of String (sorted alphabetically)
-///
-/// Examples:
-/// ```text
-/// keys({b: 2, a: 1})  // => ["a", "b"]
-/// keys({})             // => []
-/// ```
-pub(crate) fn builtin_keys<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
+use crate::resource::knowledge::PlanIterable;
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
+pub fn builtin_keys<B: BindingAddress>(
+    value: &PlanIterable<'_, NoPlaceholder, B>,
 ) -> Result<Value<NoPlaceholder, B>, String> {
-    if args.len() != 1 {
-        return Err(format!("keys() expects 1 argument, got {}", args.len()));
-    }
-
-    match &args[0] {
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            let mut keys: Vec<String> = map.keys().cloned().collect();
-            keys.sort();
-            Ok(Value::Concrete(ConcreteValue::List(
-                keys.into_iter()
-                    .map(|s| Value::Concrete(ConcreteValue::String(s.into())))
-                    .collect(),
-            )))
-        }
-        other => Err(format!(
+    let data = value.for_expansion();
+    let Value::Concrete(ConcreteValue::Map(map)) = data else {
+        return Err(format!(
             "keys() argument must be a Map, got {}",
-            value_type_name(other)
-        )),
-    }
+            value_type_name(&data)
+        ));
+    };
+    let mut keys = map.into_keys().collect::<Vec<_>>();
+    keys.sort();
+    Ok(Value::Concrete(ConcreteValue::List(
+        keys.into_iter()
+            .map(|key| Value::Concrete(ConcreteValue::String(key.into())))
+            .collect(),
+    )))
 }
-
-/// `values(map)` - Return the values of a map as a list, ordered by sorted keys.
-///
-/// - Single argument: a Map
-/// - Returns: List of values (ordered by alphabetically sorted keys)
-///
-/// Examples:
-/// ```text
-/// values({b: 2, a: 1})  // => [1, 2]
-/// values({})             // => []
-/// ```
-pub(crate) fn builtin_values<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
+pub fn builtin_values<B: BindingAddress>(
+    value: &PlanIterable<'_, NoPlaceholder, B>,
 ) -> Result<Value<NoPlaceholder, B>, String> {
-    if args.len() != 1 {
-        return Err(format!("values() expects 1 argument, got {}", args.len()));
-    }
-
-    match &args[0] {
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            let mut keys: Vec<String> = map.keys().cloned().collect();
-            keys.sort();
-            Ok(Value::Concrete(ConcreteValue::List(
-                keys.into_iter().map(|k| map[&k].clone()).collect(),
-            )))
-        }
-        other => Err(format!(
+    let data = value.for_expansion();
+    let Value::Concrete(ConcreteValue::Map(mut map)) = data else {
+        return Err(format!(
             "values() argument must be a Map, got {}",
-            value_type_name(other)
-        )),
-    }
+            value_type_name(&data)
+        ));
+    };
+    let mut keys = map.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    Ok(Value::Concrete(ConcreteValue::List(
+        keys.into_iter()
+            .map(|key| map.swap_remove(&key).expect("proven map member"))
+            .collect(),
+    )))
 }
 
 #[cfg(test)]

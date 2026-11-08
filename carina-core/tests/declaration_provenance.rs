@@ -341,7 +341,22 @@ let selected_read = if enabled { read mock.test.Lookup { name = 'then read' } } 
         let children = TypeCheckSession::run(&config, |session| {
             carina_core::parser::expand_deferred_children(
                 deferred,
-                &concrete,
+                match concrete
+                    .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                {
+                    carina_core::resource::knowledge::Classification::Known(value) => {
+                        carina_core::resource::knowledge::PlanIterable::from_known(value).unwrap()
+                    }
+                    carina_core::resource::knowledge::Classification::ShapeKnown(value) => {
+                        carina_core::resource::knowledge::PlanIterable::from_shape(value).unwrap()
+                    }
+                    carina_core::resource::knowledge::Classification::Pending(_)
+                    | carina_core::resource::knowledge::Classification::Failed(_) => {
+                        panic!("fixture collection has exact shape")
+                    }
+                },
                 carina_core::resource::AccessMissPolicy::Error,
                 session,
             )

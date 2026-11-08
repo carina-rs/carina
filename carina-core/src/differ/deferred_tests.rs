@@ -92,7 +92,8 @@ fn review5_4283_deferred_absorption_uses_the_recorded_generation_snapshot() {
                 crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
                     deferred_replace_test_target(),
                 ]),
-                |_| DeferredForExpansionChoice::Retain,
+                &crate::binding_index::IterableBindings::from_upstream_only(Default::default()),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .1,
         ),
@@ -123,7 +124,8 @@ fn deferred_create_targets_absorb_matching_orphan_deletes_into_deferred_replace(
                 crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
                     target.clone()
                 ]),
-                |_| DeferredForExpansionChoice::Retain,
+                &crate::binding_index::IterableBindings::from_upstream_only(Default::default()),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .1,
         ),
@@ -236,7 +238,8 @@ fn unbound_deferred_create_absorbs_exact_legacy_current_delete() {
         crate::test_support::resolved_targets(
             DeferredCreateTargets::partition_for_expansion(
                 crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([target]),
-                |_| DeferredForExpansionChoice::Retain,
+                &crate::binding_index::IterableBindings::from_upstream_only(Default::default()),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .1,
         ),
@@ -285,7 +288,8 @@ fn unbound_deferred_create_keeps_unrelated_anonymous_delete_plain() {
         crate::test_support::resolved_targets(
             DeferredCreateTargets::partition_for_expansion(
                 crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([target]),
-                |_| DeferredForExpansionChoice::Retain,
+                &crate::binding_index::IterableBindings::from_upstream_only(Default::default()),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .1,
         ),
@@ -329,7 +333,8 @@ fn deferred_create_targets_absorb_matching_map_key_orphan_deletes() {
                 crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
                     target.clone()
                 ]),
-                |_| DeferredForExpansionChoice::Retain,
+                &crate::binding_index::IterableBindings::from_upstream_only(Default::default()),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .1,
         ),
@@ -463,7 +468,8 @@ fn deferred_create_targets_do_not_absorb_deposed_deletes() {
                 crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
                     target.clone()
                 ]),
-                |_| DeferredForExpansionChoice::Retain,
+                &crate::binding_index::IterableBindings::from_upstream_only(Default::default()),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .1,
         ),
@@ -510,7 +516,8 @@ fn deferred_create_targets_do_not_absorb_unrelated_orphan_deletes() {
                 crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
                     target.clone()
                 ]),
-                |_| DeferredForExpansionChoice::Retain,
+                &crate::binding_index::IterableBindings::from_upstream_only(Default::default()),
+                &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             )
             .1,
         ),

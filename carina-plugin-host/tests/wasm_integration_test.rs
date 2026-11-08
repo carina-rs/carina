@@ -1845,7 +1845,24 @@ async fn sdk_schema_validator_dispatches_through_the_wasm_host_without_an_overri
     )]);
 
     let errors = schema
-        .validate_with_resolver(&attributes, &|_| false, &custom_types)
+        .validate_with_resolver(
+            &attributes
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        value
+                            .knowledge(
+                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
+                            )
+                            .map(|proof| proof.into_classification())
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+            &|_| false,
+            &custom_types,
+        )
         .expect_err("the SDK schema callback must reject through the guest bridge");
     assert!(
         errors.iter().any(|error| error
@@ -4866,7 +4883,20 @@ async fn test_wasm_validate_custom_type_rebuilds_after_validate_config_timeout()
             &HashMap::<String, Value>::from([(
                 "value".to_string(),
                 Value::Concrete(ConcreteValue::String("clean".into())),
-            )]),
+            )])
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    value
+                        .knowledge(
+                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
+                        )
+                        .map(|proof| proof.into_classification())
+                        .unwrap(),
+                )
+            })
+            .collect(),
             &|_| false,
             &custom_types,
         )
@@ -4898,7 +4928,20 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
             &HashMap::<String, Value>::from([(
                 "value".to_string(),
                 Value::Concrete(ConcreteValue::String(value.to_string().into())),
-            )]),
+            )])
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    value
+                        .knowledge(
+                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
+                        )
+                        .map(|proof| proof.into_classification())
+                        .unwrap(),
+                )
+            })
+            .collect(),
             &|_| false,
             &custom_types,
         )

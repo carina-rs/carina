@@ -1,59 +1,27 @@
-//! `concat(items, base_list)` built-in function
-
-use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
-
+//! Concatenate exact list shapes, preserving pending leaves and data-last order.
 use super::value_type_name;
-
-/// `concat(items, base_list)` - Concatenate two lists into one.
-///
-/// Follows F#/Haskell convention: data argument (base_list) is last,
-/// so pipe form works naturally: `base_list |> concat(items)`.
-///
-/// The result is `base_list ++ items` (base first, then items appended).
-///
-/// - First argument: items to append (List)
-/// - Second argument: base list (List) — the data argument
-/// - Returns: a new List with base_list elements followed by items
-///
-/// Examples:
-/// ```text
-/// concat([3, 4], [1, 2])         // => [1, 2, 3, 4]
-/// [1, 2] |> concat([3, 4])       // => [1, 2, 3, 4] (pipe form)
-/// ```
-pub(crate) fn builtin_concat<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
+use crate::resource::knowledge::PlanIterable;
+use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value};
+pub fn builtin_concat<B: BindingAddress>(
+    items: &PlanIterable<'_, NoPlaceholder, B>,
+    base: &PlanIterable<'_, NoPlaceholder, B>,
 ) -> Result<Value<NoPlaceholder, B>, String> {
-    if args.len() != 2 {
+    let items = items.for_expansion();
+    let Value::Concrete(ConcreteValue::List(items)) = items else {
         return Err(format!(
-            "concat() expects 2 arguments (items, base_list), got {}",
-            args.len()
+            "concat() first argument must be a list, got {}",
+            value_type_name(&items)
         ));
-    }
-
-    let items = match &args[0] {
-        Value::Concrete(ConcreteValue::List(items)) => items,
-        other => {
-            return Err(format!(
-                "concat() first argument must be a list, got {}",
-                value_type_name(other)
-            ));
-        }
     };
-
-    let base = match &args[1] {
-        Value::Concrete(ConcreteValue::List(items)) => items,
-        other => {
-            return Err(format!(
-                "concat() second argument must be a list, got {}",
-                value_type_name(other)
-            ));
-        }
+    let base = base.for_expansion();
+    let Value::Concrete(ConcreteValue::List(mut base)) = base else {
+        return Err(format!(
+            "concat() second argument must be a list, got {}",
+            value_type_name(&base)
+        ));
     };
-
-    // base_list first, then items appended
-    let mut result = base.clone();
-    result.extend(items.iter().cloned());
-    Ok(Value::Concrete(ConcreteValue::List(result)))
+    base.extend(items);
+    Ok(Value::Concrete(ConcreteValue::List(base)))
 }
 
 #[cfg(test)]

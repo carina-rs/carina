@@ -1498,12 +1498,12 @@ mod judgement {
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum Knowledge {
+    enum Classification {
         Known,
         Deferred,
     }
 
-    impl From<bool> for Knowledge {
+    impl From<bool> for Classification {
         fn from(known: bool) -> Self {
             if known { Self::Known } else { Self::Deferred }
         }
@@ -1511,25 +1511,25 @@ mod judgement {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum InferredKind {
-        Ordinary(Knowledge),
+        Ordinary(Classification),
         // Schema-projected references retain the existing binding check and
         // apply-time value validation, rather than acquiring a new nominal
         // declaration obligation at a function boundary.
-        Reference(Knowledge),
+        Reference(Classification),
         Literal,
         EnumIdentifier,
-        StringConstruction(Knowledge),
+        StringConstruction(Classification),
         // Builtins keep ordinary assignment diagnostics outside string sinks.
-        BuiltinConstruction(Knowledge),
-        BuiltinStringList(Knowledge),
-        List(Knowledge),
-        Map(Knowledge),
+        BuiltinConstruction(Classification),
+        BuiltinStringList(Classification),
+        List(Classification),
+        Map(Classification),
         // Loop slots are inferred from the iterable, never annotated sources.
         LoopSlot,
     }
 
     impl InferredKind {
-        fn knowledge(self) -> Knowledge {
+        fn knowledge(self) -> Classification {
             match self {
                 Self::Ordinary(knowledge)
                 | Self::Reference(knowledge)
@@ -1538,8 +1538,8 @@ mod judgement {
                 | Self::BuiltinStringList(knowledge)
                 | Self::List(knowledge)
                 | Self::Map(knowledge) => knowledge,
-                Self::Literal | Self::EnumIdentifier => Knowledge::Known,
-                Self::LoopSlot => Knowledge::Deferred,
+                Self::Literal | Self::EnumIdentifier => Classification::Known,
+                Self::LoopSlot => Classification::Deferred,
             }
         }
     }
@@ -1630,7 +1630,7 @@ mod judgement {
         },
         ValueDependent {
             reason: NotInferableReason,
-            shape: Option<(CollectionKind, Knowledge)>,
+            shape: Option<(CollectionKind, Classification)>,
             owner: FailureOwner,
         },
         AuthorityUnavailable(ProviderAuthorityUnavailable),
@@ -1773,26 +1773,32 @@ mod judgement {
                 ExprJudgement::AuthorityUnavailable(_) | ExprJudgement::Declaration => {}
             }
         }
-        fn with_kind(mut self, kind: impl FnOnce(Knowledge) -> InferredKind) -> Self {
+        fn with_kind(mut self, kind: impl FnOnce(Classification) -> InferredKind) -> Self {
             self.set_kind(kind);
             self
         }
-        fn set_kind(&mut self, kind: impl FnOnce(Knowledge) -> InferredKind) {
+        fn set_kind(&mut self, kind: impl FnOnce(Classification) -> InferredKind) {
             if let ExprJudgement::Typed { kind: current, .. } = &mut self.data_mut().judgement {
                 *current = kind(current.knowledge());
             }
         }
-        fn materialize_output(&mut self) {
+        fn materialize_output<
+            P: crate::resource::PlaceholderKind,
+            B: crate::resource::BindingAddress,
+        >(
+            &mut self,
+            _value: &crate::resource::knowledge::KnownValue<'_, P, B>,
+        ) {
             if let ExprJudgement::Typed { kind, .. } = &mut self.data_mut().judgement {
                 *kind = match *kind {
                     InferredKind::StringConstruction(_) => {
-                        InferredKind::StringConstruction(Knowledge::Known)
+                        InferredKind::StringConstruction(Classification::Known)
                     }
                     InferredKind::BuiltinConstruction(_) => {
-                        InferredKind::BuiltinConstruction(Knowledge::Known)
+                        InferredKind::BuiltinConstruction(Classification::Known)
                     }
                     InferredKind::BuiltinStringList(_) => {
-                        InferredKind::BuiltinStringList(Knowledge::Known)
+                        InferredKind::BuiltinStringList(Classification::Known)
                     }
                     other => other,
                 };
@@ -1800,14 +1806,34 @@ mod judgement {
         }
         fn concrete(&self) -> bool {
             matches!(self.judgement, ExprJudgement::Typed { kind, .. }
-                if kind.knowledge() == Knowledge::Known)
+                if kind.knowledge() == Classification::Known)
                 || matches!(
                     self.judgement,
                     ExprJudgement::ValueDependent {
-                        shape: Some((_, Knowledge::Known)),
+                        shape: Some((_, Classification::Known)),
                         ..
                     }
                 )
+        }
+        fn inherit_output_materialization(&mut self, previous: &JudgedExpr) {
+            // Refresh carries an already-judged output fact. It neither
+            // classifies a value nor constructs a new value-knowledge proof.
+            if previous.concrete()
+                && let ExprJudgement::Typed { kind, .. } = &mut self.data_mut().judgement
+            {
+                *kind = match *kind {
+                    InferredKind::StringConstruction(_) => {
+                        InferredKind::StringConstruction(Classification::Known)
+                    }
+                    InferredKind::BuiltinConstruction(_) => {
+                        InferredKind::BuiltinConstruction(Classification::Known)
+                    }
+                    InferredKind::BuiltinStringList(_) => {
+                        InferredKind::BuiltinStringList(Classification::Known)
+                    }
+                    other => other,
+                };
+            }
         }
         fn failed(&self) -> bool {
             self.failure().is_some()
@@ -2280,9 +2306,11 @@ mod judgement {
                 return Ok(ProviderPending(authority.clone()));
             }
             ExprJudgement::Declaration => return Err(assignment_error(&expression, sink)),
-            ExprJudgement::Typed { ty, kind, .. } => {
-                (Some(ty), Some(kind), kind.knowledge() == Knowledge::Known)
-            }
+            ExprJudgement::Typed { ty, kind, .. } => (
+                Some(ty),
+                Some(kind),
+                kind.knowledge() == Classification::Known,
+            ),
             ExprJudgement::ValueDependent { .. } => (None, None, false),
         };
         if !expression.alternatives.is_empty() {
@@ -2443,8 +2471,8 @@ mod judgement {
         if matches!(
             kind,
             Some(
-                InferredKind::StringConstruction(Knowledge::Deferred)
-                    | InferredKind::BuiltinConstruction(Knowledge::Deferred)
+                InferredKind::StringConstruction(Classification::Deferred)
+                    | InferredKind::BuiltinConstruction(Classification::Deferred)
             )
         ) {
             return if sink.is_string_shaped() || matches!(sink, TypeExpr::Ref(_)) {
@@ -2751,7 +2779,7 @@ mod judgement {
                         .cloned();
                     match evidence {
                         Ok(mut expression) => {
-                            let resolved = file
+                            let _resolved = file
                                 .compositions
                                 .iter()
                                 .filter(|composition| composition.binding.as_ref() == Some(binding))
@@ -2762,10 +2790,7 @@ mod judgement {
                                         .get(declaration.detail().name())
                                 })
                                 .filter_map(|attribute| attribute.value())
-                                .any(|value| value.is_fully_resolved());
-                            if resolved {
-                                expression.materialize_output();
-                            }
+                                .find_map(|value|value.knowledge(&crate::resource::knowledge::KnowledgeContext::validation()).map(|proof| proof.into_classification()).ok().and_then(|value|value.into_known().ok()).map(|known|expression.materialize_output(&known)));
                             Arc::make_mut(&mut self.module_attributes).insert(
                                 (binding.clone(), declaration.detail().name().to_string()),
                                 expression,
@@ -3166,9 +3191,7 @@ mod judgement {
                 Some(authored) => self.judge(authored),
                 None => incomplete("authored module output origin"),
             };
-            if evidence.concrete() {
-                output.materialize_output();
-            }
+            output.inherit_output_materialization(evidence);
             output
         }
         fn check_function_sink(
@@ -3217,7 +3240,7 @@ mod judgement {
                 finding
             };
             if expression.for_sink(sink, self.config).kind()
-                == Some(InferredKind::StringConstruction(Knowledge::Deferred))
+                == Some(InferredKind::StringConstruction(Classification::Deferred))
                 && !self.function_errors.contains(&finding)
             {
                 self.function_errors.push(finding.clone());
@@ -4259,6 +4282,59 @@ mod judgement {
         )));
         result
     }
+    #[test]
+    fn pending_secret_output_cannot_gain_materialized_value_evidence() {
+        let config = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let raw: crate::resource::Value =
+            crate::resource::Value::root_resource_ref("producer", "value", vec![]).into_secret();
+        let proof = raw
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap();
+        assert!(matches!(
+            &proof,
+            crate::resource::knowledge::Classification::Pending(_)
+        ));
+        let mut expression =
+            declared(Ok(TypeExpr::String), false).with_kind(InferredKind::BuiltinConstruction);
+        if let Ok(known) = proof.into_known() {
+            expression.materialize_output(&known);
+        }
+        assert_eq!(
+            admit_with_context(
+                &expression,
+                &TypeExpr::String,
+                AdmissionContext::Assignment,
+                &config
+            ),
+            Ok(ExpressionAdmission::DeferredInterpolation)
+        );
+    }
+
+    #[test]
+    fn refreshed_output_preserves_materialized_admission_without_a_value_substitute() {
+        let config = super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        for (known, expected) in [
+            (false, ExpressionAdmission::DeferredInterpolation),
+            (true, ExpressionAdmission::ValueCheck),
+        ] {
+            let previous =
+                declared(Ok(TypeExpr::String), known).with_kind(InferredKind::BuiltinConstruction);
+            let mut refreshed =
+                declared(Ok(TypeExpr::String), false).with_kind(InferredKind::BuiltinConstruction);
+            refreshed.inherit_output_materialization(&previous);
+            assert_eq!(
+                admit_with_context(
+                    &refreshed,
+                    &TypeExpr::String,
+                    AdmissionContext::Assignment,
+                    &config,
+                ),
+                Ok(expected),
+            );
+        }
+    }
+
     #[test]
     fn value_dependent_admission_requires_authority() {
         let mut expression = constraint_fixture();

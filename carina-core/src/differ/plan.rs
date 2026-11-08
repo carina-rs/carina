@@ -7,7 +7,9 @@ use crate::effect::{
     ChangedCreateOnly, DeferredCreatePayload, DeferredReplaceDelete, DeferredReplacePayload,
     Effect, EffectGeneration, NonEmptyDeletes, OutcomeUnknownImportReplacement,
 };
-use crate::parser::{DeferredForExpression, ResolvedDeferredForExpressions};
+#[cfg(test)]
+use crate::parser::DeferredForExpression;
+use crate::parser::ResolvedDeferredForExpressions;
 use crate::plan::{
     CreateBeforeDestroyError, Plan, PlanError, PlanErrorKind, PreventDestroyAction,
     ReplacementGroup,
@@ -41,15 +43,6 @@ mod deferred_tests;
 #[cfg(test)]
 #[path = "creation_tests.rs"]
 mod creation_tests;
-
-/// Select how a finalized deferred loop crosses the plan-time expansion seam.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeferredForExpansionChoice {
-    /// Expand now, preserving a parser residual if expansion is still unresolved.
-    Expand,
-    /// Retain the template for apply-time expansion and planning dependencies.
-    Retain,
-}
 
 /// The apply-time target set retained for one planning call.
 ///
@@ -87,11 +80,48 @@ impl DeferredCreateTargets {
     /// produces its (empty) target set; callers cannot substitute an iterator.
     pub fn partition_for_expansion(
         expressions: ResolvedDeferredForExpressions,
-        mut classify: impl FnMut(&DeferredForExpression) -> DeferredForExpansionChoice,
+        bindings: &crate::binding_index::IterableBindings<'_>,
+        config: &crate::parser::ProviderContext,
     ) -> (ResolvedDeferredForExpressions, Self) {
-        let (selected, retained) = expressions
-            .partition(|deferred| classify(deferred) == DeferredForExpansionChoice::Expand);
+        use crate::resource::knowledge::Classification;
+        let context = bindings.knowledge_context();
+        let (selected, retained) = expressions.partition(|deferred| {
+            let value = match bindings.resolve_value(&deferred.iterable, config) {
+                Ok(
+                    crate::resolver::ValueResolution::Present(value)
+                    | crate::resolver::ValueResolution::Unknown(value),
+                ) => value,
+                Ok(crate::resolver::ValueResolution::Absent(_)) => return false,
+                // The replay owner supplies its existing located resolution error.
+                Err(_) => return true,
+            };
+            match value
+                .knowledge(&context)
+                .map(|proof| proof.into_classification())
+            {
+                Ok(Classification::Known(_)) => true,
+                Ok(Classification::ShapeKnown(_)) => true,
+                Ok(Classification::Pending(_)) => false,
+                Ok(Classification::Failed(_)) | Err(_) => true,
+            }
+        });
         (selected, Self(retained))
+    }
+
+    /// Restrict an already-retained effect inventory without minting a new
+    /// readiness decision. Used by isolated fixture routing.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn restrict_to_bindings(&mut self, bindings: &HashSet<AbsoluteBindingAddress>) {
+        self.0 = self
+            .0
+            .clone()
+            .partition(|template| {
+                template
+                    .root_bindings()
+                    .iter()
+                    .any(|binding| bindings.contains(binding))
+            })
+            .0;
     }
 
     /// Read-only templates, also retained in the expanded parser view for

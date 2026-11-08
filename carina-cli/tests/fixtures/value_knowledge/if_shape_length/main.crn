@@ -1,0 +1,4 @@
+let role = mock.test.resource { name = "role" }
+fn choose(count: Int): Bool { true }
+let result = if choose(length([role.identifier])) { "selected" } else { "unused" }
+mock.test.resource { name = "consumer" comment = result }

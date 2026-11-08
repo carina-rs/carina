@@ -358,12 +358,26 @@ where
         let rhs = values.next().expect("two integer operands");
         validate(&lhs, IntegerOperandSide::Left).map_err(IntegerExpressionError::Operand)?;
         validate(&rhs, IntegerOperandSide::Right).map_err(IntegerExpressionError::Operand)?;
-        if concrete_integer(&rhs) == Some(0)
+        let literal_integer = |value: &Value<P, B>| {
+            if !matches!(value, Value::Concrete(ConcreteValue::Int(_))) {
+                return None;
+            }
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .ok()
+                .and_then(|proof| proof.into_known().ok())
+                .as_ref()
+                .and_then(concrete_integer)
+        };
+        let lhs_integer = literal_integer(&lhs);
+        let rhs_integer = literal_integer(&rhs);
+        if rhs_integer == Some(0)
             && let Some(error) = zero_divisor_error(op)
         {
             return Err(IntegerExpressionError::Evaluation(error));
         }
-        Ok(match (concrete_integer(&lhs), concrete_integer(&rhs)) {
+        Ok(match (lhs_integer, rhs_integer) {
             (Some(lhs), Some(rhs)) => Value::Concrete(ConcreteValue::Int(
                 evaluate_checked_integer(lhs, op, rhs)
                     .map_err(IntegerExpressionError::Evaluation)?,
@@ -378,12 +392,16 @@ where
     })
 }
 
-fn concrete_integer<P: ValueKind, B: BindingAddress>(value: &Value<P, B>) -> Option<i64> {
-    match value {
-        Value::Concrete(ConcreteValue::Int(value)) => Some(*value),
-        Value::Deferred(DeferredValue::Secret(payload)) => payload.visit(concrete_integer),
-        _ => None,
-    }
+fn concrete_integer<P: PlaceholderKind, B: BindingAddress>(
+    value: &crate::resource::knowledge::KnownValue<'_, P, B>,
+) -> Option<i64> {
+    value.visit(
+        |value| match value {
+            crate::resource::knowledge::KnownView::Int(value) => Some(value),
+            _ => None,
+        },
+        |secret| secret.integer_operand(),
+    )
 }
 
 fn validate_post_validation_operand_shape<P: ValueKind, B: BindingAddress>(

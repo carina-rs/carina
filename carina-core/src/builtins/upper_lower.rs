@@ -14,8 +14,13 @@ use super::value_type_name;
 /// upper("hello")  // => "HELLO"
 /// ```
 pub(crate) fn builtin_upper<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
+    args: &[crate::resource::knowledge::KnownValue<'_, NoPlaceholder, B>],
 ) -> Result<Value<NoPlaceholder, B>, String> {
+    let values = args
+        .iter()
+        .map(|value| value.to_value())
+        .collect::<Vec<_>>();
+    let args = values.as_slice();
     if args.len() != 1 {
         return Err(format!(
             "upper() expects 1 argument (string), got {}",
@@ -44,8 +49,13 @@ pub(crate) fn builtin_upper<B: BindingAddress>(
 /// lower("HELLO")  // => "hello"
 /// ```
 pub(crate) fn builtin_lower<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
+    args: &[crate::resource::knowledge::KnownValue<'_, NoPlaceholder, B>],
 ) -> Result<Value<NoPlaceholder, B>, String> {
+    let values = args
+        .iter()
+        .map(|value| value.to_value())
+        .collect::<Vec<_>>();
+    let args = values.as_slice();
     if args.len() != 1 {
         return Err(format!(
             "lower() expects 1 argument (string), got {}",

@@ -21,7 +21,7 @@ use super::value_type_name;
 /// min(1, 2.5)    // => 1.0
 /// ```
 pub(crate) fn builtin_min<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
+    args: &[crate::resource::knowledge::KnownValue<'_, NoPlaceholder, B>],
 ) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 2 {
         return Err(format!("min() expects 2 arguments, got {}", args.len()));
@@ -43,7 +43,7 @@ pub(crate) fn builtin_min<B: BindingAddress>(
 /// max(1, 2.5)    // => 2.5
 /// ```
 pub(crate) fn builtin_max<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
+    args: &[crate::resource::knowledge::KnownValue<'_, NoPlaceholder, B>],
 ) -> Result<Value<NoPlaceholder, B>, String> {
     if args.len() != 2 {
         return Err(format!("max() expects 2 arguments, got {}", args.len()));
@@ -55,11 +55,14 @@ pub(crate) fn builtin_max<B: BindingAddress>(
 /// On equal comparisons, treat Float(-0.0) as smaller than +0 (including Int(0)),
 /// selecting the second for remaining ties.
 fn compare_values<B: BindingAddress>(
-    a: &Value<NoPlaceholder, B>,
-    b: &Value<NoPlaceholder, B>,
+    a: &crate::resource::knowledge::KnownValue<'_, NoPlaceholder, B>,
+    b: &crate::resource::knowledge::KnownValue<'_, NoPlaceholder, B>,
     func_name: &str,
     prefer_first: Ordering,
 ) -> Result<Value<NoPlaceholder, B>, String> {
+    let a_value = a.to_value();
+    let b_value = b.to_value();
+    let (a, b) = (&a_value, &b_value);
     let pair = match (a, b) {
         (Value::Concrete(a), Value::Concrete(b)) => NumericPair::new(a, b),
         _ => None,

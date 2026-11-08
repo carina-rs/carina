@@ -67,12 +67,16 @@ fn issue_4276_known_provider_populated_ancestry_keeps_required_fields_inert() {
     )]);
     // main enters through EffectiveAttribute::validate with ProviderPopulated ancestry.
     assert_eq!(
-        schema.validate_known_values_with_origins_and_lookup(&attributes, &|_| false, no_lookup()),
+        schema.validate_known_values_with_origins_and_lookup(
+            &crate::schema::classified_attributes(&attributes).unwrap(),
+            &|_| false,
+            no_lookup()
+        ),
         Ok(())
     );
     assert_eq!(
         schema.validate_selected_known_values_with_origins_and_lookup(
-            &attributes,
+            &crate::schema::classified_attributes(&attributes).unwrap(),
             &HashSet::from(["output".into()]),
             &|_| false,
             no_lookup(),
@@ -113,7 +117,11 @@ fn issue_4276_known_provider_populated_ancestry_rejects_nested_assignment() {
         .unwrap_err()
         .with_attribute("output");
     assert_eq!(
-        schema.validate_known_values_with_origins_and_lookup(&attributes, &|_| false, no_lookup()),
+        schema.validate_known_values_with_origins_and_lookup(
+            &crate::schema::classified_attributes(&attributes).unwrap(),
+            &|_| false,
+            no_lookup()
+        ),
         Err(vec![expected])
     );
 }
@@ -317,7 +325,10 @@ fn map_length_is_checked_for_every_validation_purpose() {
             assert!(
                 fit_value_to_type_on_path(
                     &map,
-                    &map_entries(count),
+                    &(map_entries(count))
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .unwrap(),
                     empty_defs_for_schema_walks(),
                     FieldAncestry::WRITABLE,
                     purpose,
@@ -1160,7 +1171,10 @@ fn unique_enum_list_read_side_fits_and_canonicalizes_duplicate_api_spellings() {
         ] {
             let fit = fit_value_to_type_on_path(
                 &list,
-                &state,
+                &(state)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap(),
                 empty_defs_for_schema_walks(),
                 FieldAncestry::WRITABLE,
                 purpose,
@@ -1300,7 +1314,10 @@ fn unique_list_only_checks_authored_purposes_and_always_checks_length() {
         let fits = |value: &Value| {
             fit_value_to_type_on_path(
                 &list,
-                value,
+                &(value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap(),
                 empty_defs_for_schema_walks(),
                 FieldAncestry::WRITABLE,
                 purpose,
@@ -1375,7 +1392,10 @@ fn unique_list_constraints_collect_length_and_element_errors_together() {
         assert!(
             fit_value_to_type_on_path(
                 &list,
-                &value,
+                &(value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap(),
                 empty_defs_for_schema_walks(),
                 FieldAncestry::WRITABLE,
                 CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
@@ -1637,7 +1657,10 @@ fn unique_list_state_preserves_duplicates_after_dropping_absent_struct_fields() 
     assert!(
         fit_value_to_type_on_path(
             &list,
-            &value,
+            &(value)
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap(),
             empty_defs_for_schema_walks(),
             FieldAncestry::WRITABLE,
             CanonicalizationPurpose::State,
@@ -1670,7 +1693,10 @@ fn unique_list_state_comparison_preserves_empty_strings() {
     assert!(
         fit_value_to_type_on_path(
             &list,
-            &value,
+            &(value)
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap(),
             empty_defs_for_schema_walks(),
             FieldAncestry::WRITABLE,
             CanonicalizationPurpose::State,
@@ -1732,7 +1758,10 @@ fn unique_float_list_keeps_integer_and_float_spellings_distinct() {
             assert!(
                 fit_value_to_type_on_path(
                     &list,
-                    &value,
+                    &(value)
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .unwrap(),
                     empty_defs_for_schema_walks(),
                     FieldAncestry::WRITABLE,
                     purpose,
@@ -1776,7 +1805,10 @@ fn unique_struct_list_keeps_block_alias_and_canonical_keys_distinct() {
         assert!(
             fit_value_to_type_on_path(
                 &list,
-                &value,
+                &(value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap(),
                 empty_defs_for_schema_walks(),
                 FieldAncestry::WRITABLE,
                 CanonicalizationPurpose::Desired(DesiredValueSource::AuthoredDsl),
@@ -4676,7 +4708,11 @@ fn enum_custom_lookup_receives_resolved_api_spelling() {
     };
 
     schema
-        .validate_known_values_with_origins_and_lookup(&attributes, &|_| false, &lookup)
+        .validate_known_values_with_origins_and_lookup(
+            &crate::schema::classified_attributes(&attributes).unwrap(),
+            &|_| false,
+            &lookup,
+        )
         .unwrap();
 
     let seen = seen.into_inner().unwrap();
@@ -4806,12 +4842,12 @@ fn write_only_bearing_and_projection_walk_ref_list_and_map() {
         paths,
         vec![
             LeafPath::from_segments([
-                LeafPathSegment::MapKey("primary".to_string()),
+                LeafPathSegment::MapKey("primary".into()),
                 LeafPathSegment::ListIndex(0),
                 LeafPathSegment::StructField("client_secret".to_string()),
             ]),
             LeafPath::from_segments([
-                LeafPathSegment::MapKey("primary".to_string()),
+                LeafPathSegment::MapKey("primary".into()),
                 LeafPathSegment::ListIndex(1),
                 LeafPathSegment::StructField("client_secret".to_string()),
             ]),
@@ -6784,7 +6820,11 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
     };
 
     assert_eq!(
-        schema.validate_known_values_with_origins_and_lookup(&attributes, &|_| false, &lookup,),
+        schema.validate_known_values_with_origins_and_lookup(
+            &crate::schema::classified_attributes(&attributes).unwrap(),
+            &|_| false,
+            &lookup,
+        ),
         Ok(())
     );
 
@@ -6803,7 +6843,11 @@ fn validate_known_values_defers_constraints_until_values_are_concrete() {
     );
 
     let errors = schema
-        .validate_known_values_with_origins_and_lookup(&attributes, &|_| false, &lookup)
+        .validate_known_values_with_origins_and_lookup(
+            &crate::schema::classified_attributes(&attributes).unwrap(),
+            &|_| false,
+            &lookup,
+        )
         .expect_err("concrete invalid values must be rejected");
     assert!(
         errors
@@ -6872,7 +6916,11 @@ fn validate_known_values_checks_concrete_siblings_beside_deferred_leaves() {
     )]);
 
     let errors = schema
-        .validate_known_values_with_origins_and_lookup(&attributes, &|_| false, no_lookup())
+        .validate_known_values_with_origins_and_lookup(
+            &crate::schema::classified_attributes(&attributes).unwrap(),
+            &|_| false,
+            no_lookup(),
+        )
         .expect_err("the concrete sibling must still be checked");
     assert!(
         errors.iter().any(|error| matches!(
@@ -7009,7 +7057,11 @@ fn secret_values_are_validated_and_every_rendered_error_is_masked() {
     };
 
     let errors = schema
-        .validate_known_values_with_origins_and_lookup(&attributes, &|_| false, &lookup)
+        .validate_known_values_with_origins_and_lookup(
+            &crate::schema::classified_attributes(&attributes).unwrap(),
+            &|_| false,
+            &lookup,
+        )
         .expect_err("secret values must be checked once their inner values are known");
     let rendered = errors
         .iter()
@@ -7434,7 +7486,7 @@ fn validate_known_values_runs_declared_validator_without_structural_errors() {
 
     assert_eq!(
         schema.validate_known_values_with_origins_and_lookup(
-            &structurally_invalid,
+            &crate::schema::classified_attributes(&structurally_invalid).unwrap(),
             &|_| false,
             no_lookup(),
         ),
@@ -7456,7 +7508,11 @@ fn validate_known_values_runs_declared_validator_without_structural_errors() {
         ]))),
     )]);
     let errors = schema
-        .validate_known_values_with_origins_and_lookup(&malformed_tags, &|_| false, no_lookup())
+        .validate_known_values_with_origins_and_lookup(
+            &crate::schema::classified_attributes(&malformed_tags).unwrap(),
+            &|_| false,
+            no_lookup(),
+        )
         .expect_err("resource validators must run at the known-value gate");
     assert!(matches!(
         errors.as_slice(),
@@ -15909,7 +15965,11 @@ fn resource_schema_custom_lookup_resets_ref_path_after_list_descent() {
     };
 
     assert_eq!(
-        schema.validate_with_origins_and_lookup(&attributes, &|_| false, &lookup),
+        schema.validate_with_origins_and_lookup(
+            &crate::schema::classified_attributes(&attributes).unwrap(),
+            &|_| false,
+            &lookup
+        ),
         Ok(())
     );
     assert_eq!(
@@ -17974,4 +18034,18 @@ fn pattern_reason_controls_are_escaped_in_every_diagnostic() {
         };
         assert_eq!(stored.as_str(), reason);
     }
+}
+#[test]
+fn knowledge_projection_errors_keep_their_typed_cause() {
+    let cause: crate::resource::knowledge::KnowledgeError =
+        crate::resource::knowledge::KnowledgeError::InvalidStage {
+            operation: "known-value projection",
+        };
+    let error = TypeError::from(cause);
+    assert_eq!(
+        error.to_string(),
+        "Validation failed: known-value projection is not valid at this resolution boundary"
+    );
+    assert!(matches!(error, TypeError::Knowledge { error, .. }
+        if matches!(*error, crate::resource::knowledge::KnowledgeDiagnostic::Absolute(crate::resource::knowledge::KnowledgeError::InvalidStage { .. }))));
 }

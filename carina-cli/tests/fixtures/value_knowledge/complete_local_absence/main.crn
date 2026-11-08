@@ -1,0 +1,3 @@
+let role = mock.test.resource { name = "role" tags = {} }
+let local = role.tags
+mock.test.resource { name = "consumer" comment = local.absent }

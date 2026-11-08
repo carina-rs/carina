@@ -361,7 +361,24 @@ fn resource_schema_validate_routes_ref_through_defs() {
     let result = registry
         .get("aws", "wafv2.WebACL", SchemaKind::Resource)
         .expect("cyclic schema fixture must be owner-bound")
-        .validate_with_resolver(&attrs, &|_| false, &resolver);
+        .validate_with_resolver(
+            &attrs
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        value
+                            .knowledge(
+                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
+                            )
+                            .map(|proof| proof.into_classification())
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+            &|_| false,
+            &resolver,
+        );
     assert!(
         result.is_ok(),
         "owner-bound validation on a Ref-typed attribute with valid value \

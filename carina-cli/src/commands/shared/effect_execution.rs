@@ -6,7 +6,7 @@ use carina_core::executor::{
     EffectFailureKind, ExecutionCheckpointSink, ExecutionObserver, ExecutionResult,
     FailureEventContext, FailureReport, ProgressInfo,
 };
-use carina_core::provider::{AppliedIdentifier, HostProvider, ReadRequest};
+use carina_core::provider::{HostProvider, ReadRequest};
 use carina_core::shutdown::{CleanupInterrupted, LoopShutdownPhase, LoopStep, ShutdownToken};
 
 /// Owns all result mutation for one import iteration and publishes at most one
@@ -118,8 +118,14 @@ pub(crate) async fn execute_import_effects<S: Clone>(
             // that performs this check, so any future caller is forced
             // to handle the deferred case explicitly via its `Result`
             // contract rather than rolling its own ad-hoc match.
-            let identifier_str = match resolve_import_identifier(identifier) {
-                Ok(s) => s.to_string(),
+            let identifier_proof = match identifier
+                .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map_err(carina_core::effect::ImportIdentifierError::knowledge_failure)
+                .and_then(carina_core::effect::require_import_value)
+                .and_then(|known| resolve_import_identifier(&known))
+            {
+                Ok(known) => known,
                 Err(e) => {
                     record_import_failure(
                         &mut iteration,
@@ -134,7 +140,9 @@ pub(crate) async fn execute_import_effects<S: Clone>(
                     continue;
                 }
             };
-            let applied_identifier = match AppliedIdentifier::new(identifier_str.clone()) {
+            let applied_identifier = match carina_core::effect::applied_import_identifier(
+                &identifier_proof,
+            ) {
                 Ok(identifier) => identifier,
                 Err(error) => {
                     record_import_failure(
@@ -157,7 +165,7 @@ pub(crate) async fn execute_import_effects<S: Clone>(
                     .path::<carina_core::resource::AbsoluteBindingAddress>(None)
                     .to_dot_string()
             } else {
-                identifier_str
+                applied_identifier.as_str().to_owned()
             };
             println!(
                 "  {} Importing {} (id: {})...",
@@ -285,6 +293,7 @@ mod tests {
     use super::*;
     use carina_core::executor::ExecutionResult;
     use carina_core::plan::Plan;
+    use carina_core::provider::AppliedIdentifier;
     use carina_core::provider::{
         CreateRequest, Provider, ProviderError, ProviderResult, ReadRequest, UpdateRequest,
     };

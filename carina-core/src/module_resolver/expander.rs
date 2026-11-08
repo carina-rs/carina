@@ -2026,7 +2026,8 @@ impl ModuleScopeResolver<'_> {
                             .alias_name()
                             .unwrap_or_else(|| handle.canonical_binding_name()),
                         handle.kind().description(),
-                    ),
+                    )
+                    .into(),
                     parse_error: None,
                 }),
                 StructuralOperandRef::Value(_) => Err(ArgumentSubstitutionError::Evaluation {
@@ -2037,7 +2038,8 @@ impl ModuleScopeResolver<'_> {
                         crate::validation::typecheck::value_kind_name(
                             argument.value().expect("matched a value operand")
                         )
-                    ),
+                    )
+                    .into(),
                     parse_error: None,
                 }),
                 StructuralOperandRef::Parameter {
@@ -2120,7 +2122,8 @@ impl ModuleScopeResolver<'_> {
                     line: argument.source_line(self.arguments.default_line),
                     message: format!(
                         "structural parameter '{binding}' received a value, not a handle"
-                    ),
+                    )
+                    .into(),
                     parse_error: None,
                 }),
                 StructuralOperandRef::Parameter {
@@ -2157,7 +2160,8 @@ impl ModuleScopeResolver<'_> {
                         argument
                             .pending_parameter()
                             .expect("forwarded argument retains its parameter")
-                    ),
+                    )
+                    .into(),
                     parse_error: None,
                 })
             }
@@ -2180,7 +2184,8 @@ impl ModuleScopeResolver<'_> {
             message: format!(
                 "unknown binding '{binding}' in {}",
                 self.scope.description()
-            ),
+            )
+            .into(),
             parse_error: None,
         }
     }
@@ -2667,7 +2672,7 @@ fn bind_constraint_expression(
             return Err(ArgumentSubstitutionError::Evaluation {
                 source_file: Some(source_file.to_path_buf()),
                 line,
-                message: format!("unknown module argument '{argument}'"),
+                message: format!("unknown module argument '{argument}'").into(),
                 parse_error: None,
             });
         };
@@ -2677,7 +2682,7 @@ fn bind_constraint_expression(
                 .map_err(|message| ArgumentSubstitutionError::Evaluation {
                     source_file: Some(source_file.to_path_buf()),
                     line,
-                    message,
+                    message: message.into(),
                     parse_error: None,
                 })?;
         let mut value = substitution.value().clone();
@@ -2687,7 +2692,7 @@ fn bind_constraint_expression(
                 .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: Some(source_file.to_path_buf()),
                     line,
-                    message: error.to_string(),
+                    message: error.to_string().into(),
                     parse_error: None,
                 })?;
         }
@@ -2729,7 +2734,8 @@ fn bind_constraint_expression(
                 line,
                 message: format!(
                     "module constraint for '{argument}' crossed its expansion boundary twice"
-                ),
+                )
+                .into(),
                 parse_error: None,
             });
         }
@@ -2877,128 +2883,58 @@ impl ExpandedIfDependency {
     }
 }
 
-fn expanded_if_dependency(value: &ModuleResolvedValue) -> ExpandedIfDependency {
-    use crate::resource::{ConcreteValue, DeferredValue, InterpolationPart, Value};
-
-    match value {
-        Value::Concrete(ConcreteValue::List(values)) => values
-            .iter()
-            .fold(ExpandedIfDependency::Static, |dependency, value| {
-                dependency.combine(expanded_if_dependency(value))
-            }),
-        Value::Concrete(ConcreteValue::Map(values)) => values
-            .values()
-            .fold(ExpandedIfDependency::Static, |dependency, value| {
-                dependency.combine(expanded_if_dependency(value))
-            }),
-        Value::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        ) => ExpandedIfDependency::Static,
-        Value::Deferred(DeferredValue::ModuleIf(deferred)) => deferred
-            .values()
-            .into_iter()
-            .fold(ExpandedIfDependency::Static, |dependency, value| {
-                dependency.combine(expanded_if_dependency(value))
-            }),
-        Value::Deferred(
-            DeferredValue::FunctionCall {
-                name: _,
-                args,
-                source_line: _,
-            }
-            | DeferredValue::ResolvedFunctionCall {
-                function: _,
-                functions: _,
-                args,
-                source_line: _,
-            },
-        ) => args
-            .iter()
-            .fold(ExpandedIfDependency::Static, |dependency, argument| {
-                dependency.combine(expanded_if_dependency(argument.walker_value()))
-            }),
-        Value::Deferred(DeferredValue::Access(access)) => expanded_if_dependency(access.base()),
-        Value::Deferred(DeferredValue::Interpolation(parts)) => parts.iter().fold(
-            ExpandedIfDependency::Static,
-            |dependency, part| match part {
-                InterpolationPart::Literal(_literal) => dependency,
-                InterpolationPart::Expr(value) => dependency.combine(expanded_if_dependency(value)),
-            },
-        ),
-        Value::Deferred(DeferredValue::Secret(inner)) => inner.visit(expanded_if_dependency),
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            expanded_if_dependency(value).combine(expanded_if_dependency(default))
-        }
-        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            expanded_if_dependency(expression.lhs())
-                .combine(expanded_if_dependency(expression.rhs()))
-        }
-        Value::Deferred(DeferredValue::Unknown(reason)) => expanded_unknown_dependency(reason),
-        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
-            expanded_placeholder_dependency(placeholder)
-        }
-        Value::Deferred(
-            DeferredValue::ResourceRef { path: _ }
-            | DeferredValue::BindingRef { binding: _ }
-            | DeferredValue::Unavailable {
-                name: _,
-                args: _,
-                reason: _,
-                source_line: _,
-            },
-        ) => ExpandedIfDependency::Runtime,
-    }
-}
-
-fn expanded_unknown_dependency<B: BindingAddress>(
-    reason: &ApplyTimeUnknown<B>,
+fn expanded_if_dependency(
+    value: &crate::resource::knowledge::Classification<
+        '_,
+        ParserPlaceholder,
+        AbsoluteBindingAddress,
+    >,
 ) -> ExpandedIfDependency {
-    match reason {
-        ApplyTimeUnknown::UpstreamExport { path: _ }
-        | ApplyTimeUnknown::UpstreamAllExports { binding: _ }
-        | ApplyTimeUnknown::PendingReRead(_) => ExpandedIfDependency::Runtime,
-    }
+    use crate::resource::knowledge::PendingReason;
+    value
+        .sites()
+        .fold(ExpandedIfDependency::Static, |dependency, site| {
+            dependency.combine(match site.reason() {
+                PendingReason::Evaluation(_) => ExpandedIfDependency::Static,
+                PendingReason::ModuleArgument => ExpandedIfDependency::ModuleArgument,
+                PendingReason::ResourceSelection
+                | PendingReason::BindingSelection
+                | PendingReason::UpstreamExport
+                | PendingReason::UpstreamAllExports
+                | PendingReason::ReadBack
+                | PendingReason::FunctionParameter
+                | PendingReason::FunctionLocal
+                | PendingReason::LoopKey
+                | PendingReason::LoopIndex
+                | PendingReason::LoopValue
+                | PendingReason::IncompleteExpression => ExpandedIfDependency::Runtime,
+            })
+        })
 }
 
-fn expanded_placeholder_dependency(placeholder: &ParserPlaceholder) -> ExpandedIfDependency {
-    match placeholder {
-        ParserPlaceholder::ModuleArgument {
-            name: _,
-            diagnostic: _,
-        } => ExpandedIfDependency::ModuleArgument,
-        ParserPlaceholder::FnParam { name: _ }
-        | ParserPlaceholder::FnLocal { name: _ }
-        | ParserPlaceholder::Loop(LoopSlot::Key)
-        | ParserPlaceholder::Loop(LoopSlot::Index)
-        | ParserPlaceholder::Loop(LoopSlot::Value)
-        | ParserPlaceholder::EmptyInterpolation { source: _ } => ExpandedIfDependency::Runtime,
-    }
-}
-
-fn decide_expanded_if_condition(value: &ModuleResolvedValue) -> Result<Option<bool>, String> {
+fn decide_expanded_if_condition(
+    value: &ModuleResolvedValue,
+) -> Result<Option<bool>, crate::resolver::ResolutionError> {
     let mut value = value.clone();
     value.canonicalize_in_place();
-    if let crate::resource::Value::Concrete(crate::resource::ConcreteValue::Bool(condition)) =
-        &value
+    let knowledge = value
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        .map_err(crate::resolver::ResolutionError::from)?;
+    if let crate::resource::knowledge::Classification::Known(value) = &knowledge
+        && let Some(value) = crate::resource::knowledge::known_bool(value)
     {
-        return Ok(Some(*condition));
+        return Ok(Some(value));
     }
-    match expanded_if_dependency(&value) {
+    match expanded_if_dependency(&knowledge) {
         ExpandedIfDependency::ModuleArgument => Ok(None),
         ExpandedIfDependency::Runtime => {
-            Err("if condition depends on a runtime value; condition must be statically known at parse time".to_string())
+            Err("if condition depends on a runtime value; condition must be statically known at parse time".into())
         }
         ExpandedIfDependency::Static => Err(format!(
             "if condition must be a Bool value, got: {}",
             crate::ValueDescription::of(&value)
-        )),
+        ).into()),
     }
 }
 
@@ -3058,7 +2994,7 @@ fn select_expanded_module_ifs(
                 .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: expression.operator_span().line().unwrap_or(0),
-                    message: error.to_string(),
+                    message: error.to_string().into(),
                     parse_error: None,
                 })?
         }
@@ -3127,7 +3063,7 @@ fn select_expanded_module_ifs(
             .map_err(|error| ArgumentSubstitutionError::Evaluation {
                 source_file: None,
                 line: access.source_line(),
-                message: error.to_string(),
+                message: error.to_string().into(),
                 parse_error: None,
             })?,
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
@@ -3146,14 +3082,8 @@ fn select_expanded_module_ifs(
         | Value::Deferred(
             DeferredValue::ResourceRef { path: _ } | DeferredValue::BindingRef { binding: _ },
         ) => value.clone(),
-        Value::Deferred(DeferredValue::Unknown(reason)) => {
-            let _dependency = expanded_unknown_dependency(reason);
-            value.clone()
-        }
-        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
-            let _dependency = expanded_placeholder_dependency(placeholder);
-            value.clone()
-        }
+        Value::Deferred(DeferredValue::Unknown(_)) => value.clone(),
+        Value::Deferred(DeferredValue::Placeholder(_)) => value.clone(),
     })
 }
 
@@ -3207,7 +3137,7 @@ fn evaluate_expanded_module_functions(
                 .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: expression.operator_span().line().unwrap_or(0),
-                    message: error.to_string(),
+                    message: error.to_string().into(),
                     parse_error: None,
                 })?
         }
@@ -3239,7 +3169,12 @@ fn evaluate_expanded_module_functions(
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             if args.iter().all(|argument| {
-                argument.handle().is_none() && argument.walker_value().is_fully_resolved()
+                argument.handle().is_none()
+                    && argument
+                        .walker_value()
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .is_ok_and(|value| value.into_known().is_ok())
             }) {
                 let eval_args = args
                     .iter()
@@ -3249,18 +3184,22 @@ fn evaluate_expanded_module_functions(
                     name.as_str(),
                     &eval_args,
                     config.catalog(),
+                    *source_line,
                 )
-                .map_err(|message| ArgumentSubstitutionError::Evaluation {
-                    source_file: None,
-                    line: source_line.get().unwrap_or(0),
-                    message,
-                    parse_error: None,
+                .map_err(|error| {
+                    let line = source_line.get().unwrap_or(0);
+                    ArgumentSubstitutionError::Evaluation {
+                        source_file: None,
+                        line,
+                        message: error,
+                        parse_error: None,
+                    }
                 })?
                 .into_value()
                 .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: source_line.get().unwrap_or(0),
-                    message: error.to_string(),
+                    message: error.to_string().into(),
                     parse_error: None,
                 })?
             } else {
@@ -3313,7 +3252,7 @@ fn evaluate_expanded_module_functions(
             .map_err(|error| ArgumentSubstitutionError::Evaluation {
                 source_file: None,
                 line: access.source_line(),
-                message: error.to_string(),
+                message: error.to_string().into(),
                 parse_error: None,
             })?,
         Value::Deferred(DeferredValue::Secret(inner)) => Value::Deferred(DeferredValue::Secret(
@@ -3332,14 +3271,8 @@ fn evaluate_expanded_module_functions(
         | Value::Deferred(
             DeferredValue::ResourceRef { path: _ } | DeferredValue::BindingRef { binding: _ },
         ) => value.clone(),
-        Value::Deferred(DeferredValue::Unknown(reason)) => {
-            let _dependency = expanded_unknown_dependency(reason);
-            value.clone()
-        }
-        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
-            let _dependency = expanded_placeholder_dependency(placeholder);
-            value.clone()
-        }
+        Value::Deferred(DeferredValue::Unknown(_)) => value.clone(),
+        Value::Deferred(DeferredValue::Placeholder(_)) => value.clone(),
     })
 }
 
@@ -3350,7 +3283,7 @@ fn function_substitution_error(
     ArgumentSubstitutionError::Evaluation {
         source_file: error.source_file().map(std::path::Path::to_path_buf),
         line: fallback_line,
-        message: error.to_string(),
+        message: error.to_string().into(),
         parse_error: Some(Box::new(error)),
     }
 }
@@ -3462,6 +3395,7 @@ fn expand_module_resource(
         module_call,
         resolver,
     )
+    .map_err(|error| error.with_declaration(&resource.declaration))
 }
 
 fn expand_module_resource_with_identity(
@@ -3804,7 +3738,7 @@ fn expand_module_composition(
                 .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: resolver.arguments.default_line,
-                    message: error.to_string(),
+                    message: error.to_string().into(),
                     parse_error: None,
                 })?;
             check_composition_argument_type(
@@ -3973,7 +3907,7 @@ fn check_composition_argument_type<P: crate::resource::PlaceholderKind, B: Bindi
     .map_err(|error| ArgumentSubstitutionError::Evaluation {
         source_file: None,
         line,
-        message: error.to_string(),
+        message: error.to_string().into(),
         parse_error: None,
     })?
     else {
@@ -3985,7 +3919,7 @@ fn check_composition_argument_type<P: crate::resource::PlaceholderKind, B: Bindi
             return Err(ArgumentSubstitutionError::Evaluation {
                 source_file: None,
                 line,
-                message: format!("parameter '{parameter}': {error}"),
+                message: format!("parameter '{parameter}': {error}").into(),
                 parse_error: None,
             });
         }
@@ -4001,7 +3935,7 @@ fn check_composition_argument_type<P: crate::resource::PlaceholderKind, B: Bindi
         .map_err(|mismatch| ArgumentSubstitutionError::Evaluation {
             source_file: None,
             line,
-            message: format!("parameter '{parameter}': {mismatch}"),
+            message: format!("parameter '{parameter}': {mismatch}").into(),
             parse_error: None,
         })
 }
@@ -4141,15 +4075,16 @@ fn expand_parsed_deferred_for_expression(
     };
     let (iterable, iterable_origin) = iterable.into_parts();
     let mut body = match body {
-        DeferredForBody::Resource(resource) => {
-            DeferredForBody::resource(expand_module_resource_with_identity(
+        DeferredForBody::Resource(resource) => DeferredForBody::resource(
+            expand_module_resource_with_identity(
                 resource.as_resource(),
                 dependency_values,
                 &instance_identity,
                 module_call,
                 resolver,
-            )?)
-        }
+            )
+            .map_err(|error| error.with_declaration(&resource.as_resource().declaration))?,
+        ),
         DeferredForBody::Read(data_source) => DeferredForBody::Read(Box::new(
             expand_module_data_source(data_source, dependency_values, resolver)?,
         )),
@@ -4185,7 +4120,7 @@ pub(super) enum ArgumentSubstitutionError {
     Evaluation {
         source_file: Option<std::path::PathBuf>,
         line: usize,
-        message: String,
+        message: crate::resolver::ResolutionError,
         parse_error: Option<Box<ParseError>>,
     },
     Authored(crate::parser::Located<Box<ArgumentSubstitutionError>>),
@@ -4195,7 +4130,7 @@ pub(super) enum ArgumentSubstitutionError {
 struct ArgumentSubstitutionDetails {
     source_file: Option<std::path::PathBuf>,
     line: usize,
-    message: String,
+    message: crate::resolver::ResolutionError,
     parse_error: Option<Box<ParseError>>,
 }
 
@@ -4203,8 +4138,19 @@ impl crate::resource::InsideSecret for ArgumentSubstitutionError {
     fn inside_secret(self) -> Self {
         match self {
             Self::Evaluation {
-                source_file, line, ..
-            } => Self::InsideSecret { source_file, line },
+                source_file,
+                line,
+                parse_error,
+                ..
+            } => match parse_error {
+                Some(error) => Self::Evaluation {
+                    source_file,
+                    line,
+                    message: crate::resolver::ResolutionError::InsideSecret {},
+                    parse_error: Some(Box::new(error.inside_secret_at(line))),
+                },
+                None => Self::InsideSecret { source_file, line },
+            },
             Self::Authored(finding) => {
                 let (location, error) = finding.into_parts();
                 Self::Authored(crate::parser::Located::new(
@@ -4231,7 +4177,7 @@ impl ArgumentSubstitutionError {
                 ArgumentSubstitutionDetails {
                     source_file,
                     line,
-                    message: crate::resource::INSIDE_SECRET_MESSAGE.into(),
+                    message: crate::resolver::ResolutionError::InsideSecret {},
                     parse_error: None,
                 },
             ),
@@ -4253,6 +4199,23 @@ impl ArgumentSubstitutionError {
                 let (location, error) = finding.into_parts();
                 error.into_diagnostic(&location)
             }
+        }
+    }
+
+    fn with_declaration(self, declaration: &crate::parser::DeclarationProvenance) -> Self {
+        match (self, declaration.location()) {
+            (Self::InsideSecret { source_file, line }, Some(location)) => Self::Evaluation {
+                source_file,
+                line,
+                message: crate::resolver::ResolutionError::InsideSecret {},
+                parse_error: Some(Box::new(ParseError::AtElement(Box::new(
+                    crate::parser::Located::new(
+                        location.clone(),
+                        ParseError::InsideSecret { line },
+                    ),
+                )))),
+            },
+            (error, _) => error,
         }
     }
 
@@ -4355,7 +4318,7 @@ fn select_authored_module_ifs_for_test(
                 .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: Some(deferred.condition().source_file().to_path_buf()),
                     line: deferred.condition().source_line(),
-                    message: error.to_string(),
+                    message: error.to_string().into(),
                     parse_error: None,
                 })? {
                 Some(true) => select_authored_module_ifs_for_test(deferred.then_value(), config)?,
@@ -4421,14 +4384,8 @@ fn select_authored_module_ifs_for_test(
             }
             | DeferredValue::Access(_),
         ) => value.clone(),
-        Value::Deferred(DeferredValue::Unknown(reason)) => {
-            let _dependency = expanded_unknown_dependency(reason);
-            value.clone()
-        }
-        Value::Deferred(DeferredValue::Placeholder(placeholder)) => {
-            let _dependency = expanded_placeholder_dependency(placeholder);
-            value.clone()
-        }
+        Value::Deferred(DeferredValue::Unknown(_)) => value.clone(),
+        Value::Deferred(DeferredValue::Placeholder(_)) => value.clone(),
     })
 }
 
@@ -4535,7 +4492,8 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                             binding: diagnostic.diagnostic_name().unwrap_or(name).to_string(),
                             kind: UnexpandedStructuralHandleKind::ModuleParameter,
                         }
-                        .to_string(),
+                        .to_string()
+                        .into(),
                         parse_error: None,
                     });
                 }
@@ -4576,7 +4534,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                 .map_err(|message| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: source_line,
-                    message,
+                    message: message.into(),
                     parse_error: None,
                 })?
                 .value()
@@ -4592,7 +4550,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                 .map_err(|message| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: source_line,
-                    message,
+                    message: message.into(),
                     parse_error: None,
                 })?;
             let mut substituted = apply_value_path_segment(
@@ -4607,7 +4565,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
             .map_err(|error| ArgumentSubstitutionError::Evaluation {
                 source_file: None,
                 line: source_line,
-                message: error.to_string(),
+                message: error.to_string().into(),
                 parse_error: None,
             })?;
             for segment in path.segments() {
@@ -4621,7 +4579,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                 .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: source_line,
-                    message: error.to_string(),
+                    message: error.to_string().into(),
                     parse_error: None,
                 })?;
             }
@@ -4668,7 +4626,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                         .operator_span()
                         .line()
                         .unwrap_or(arguments.default_line),
-                    message: error.to_string(),
+                    message: error.to_string().into(),
                     parse_error: None,
                 })?
         }
@@ -4769,7 +4727,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
                 .map_err(|error| ArgumentSubstitutionError::Evaluation {
                     source_file: None,
                     line: access.source_line(),
-                    message: error.to_string(),
+                    message: error.to_string().into(),
                     parse_error: None,
                 })?
         }
@@ -4783,10 +4741,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
             | ConcreteValue::Duration(_)
             | ConcreteValue::StringList(_),
         ) => value.clone(),
-        Value::Deferred(DeferredValue::Unknown(reason)) => {
-            let _dependency = expanded_unknown_dependency(reason);
-            value.clone()
-        }
+        Value::Deferred(DeferredValue::Unknown(_)) => value.clone(),
         Value::Deferred(DeferredValue::Secret(inner)) => {
             Value::Deferred(DeferredValue::Secret(inner.try_map(|value| {
                 substitute_arguments_with_position(
@@ -4881,7 +4836,7 @@ fn substitute_arguments_with_position<B: BindingAddress>(
         return Err(ArgumentSubstitutionError::Evaluation {
             source_file,
             line,
-            message: error.to_string(),
+            message: error.to_string().into(),
             parse_error: None,
         });
     }

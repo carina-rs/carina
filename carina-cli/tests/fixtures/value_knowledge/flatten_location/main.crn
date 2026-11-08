@@ -1,0 +1,4 @@
+let producer = mock.test.resource { name = "producer" }
+
+let items = flatten([producer.identifier])
+mock.example.consumer { name = "consumer" list = items }

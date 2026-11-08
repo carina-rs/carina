@@ -33,13 +33,35 @@ fn take_provider_string_attribute(
                 context: format!("provider '{provider_name}' block"),
             })?;
 
-    match value {
-        Value::Concrete(ConcreteValue::String(value)) => Ok(Some((value, line))),
-        Value::Concrete(_) | Value::Deferred(_) => Err(ParseError::InvalidExpression {
+    let known = value
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        .ok()
+        .and_then(|value| value.into_known().ok());
+    known
+        .as_ref()
+        .and_then(provider_string)
+        .map(|value| Some((value, line)))
+        .ok_or_else(|| ParseError::InvalidExpression {
             line,
             message: format!("Provider '{provider_name}': '{attribute}' must be a string literal"),
-        }),
-    }
+        })
+}
+
+fn provider_string(
+    value: &crate::resource::knowledge::KnownValue<
+        '_,
+        crate::resource::ParserPlaceholder,
+        crate::resource::RelativeBindingName,
+    >,
+) -> Option<ValueString> {
+    value.visit(
+        |value| match value {
+            crate::resource::knowledge::KnownView::String(value) => Some(value.clone()),
+            _ => None,
+        },
+        |_| None,
+    )
 }
 
 pub(in crate::parser) fn parse_provider_block(

@@ -318,10 +318,19 @@ fn redact_nested_write_only_leaf(value: &mut serde_json::Value, path: &LeafPath)
     let mut current = value;
     for segment in path.segments() {
         current = match segment {
-            LeafPathSegment::StructField(field) | LeafPathSegment::MapKey(field) => {
+            LeafPathSegment::StructField(field) => {
                 let Some(value) = current
                     .as_object_mut()
                     .and_then(|object| object.get_mut(field))
+                else {
+                    return;
+                };
+                value
+            }
+            LeafPathSegment::MapKey(field) => {
+                let Some(value) = current
+                    .as_object_mut()
+                    .and_then(|object| object.get_mut(field.expose_plaintext()))
                 else {
                     return;
                 };

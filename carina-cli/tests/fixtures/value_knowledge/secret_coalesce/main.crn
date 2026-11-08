@@ -1,0 +1,3 @@
+let role = mock.test.resource { name = "role" }
+let holder = mock.test.resource { name = "holder" comment = secret("arn:${role.identifier}") }
+mock.test.resource { name = "consumer" comment = holder.comment ?? "fallback" }

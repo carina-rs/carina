@@ -21,6 +21,16 @@ impl<P: PlaceholderKind> fmt::Display for SnapshotLeaf<P> {
 }
 
 impl<P: PlaceholderKind> ValueKind for SnapshotLeaf<P> {
+    fn construct_access<B: BindingAddress>(
+        base: Value<Self, B>,
+        step: PathSegment,
+        source_line: usize,
+        policy: AccessMissPolicy,
+    ) -> Result<Value<Self, B>, ValueAccessError> {
+        apply_snapshot_path_segment(base, step, source_line, policy)
+            .and_then(ValuePathSegmentResult::into_value)
+    }
+
     type DirectiveBool<B: BindingAddress> = P::DirectiveBool<B>;
     type DirectivePreventDestroy<B: BindingAddress> = P::DirectivePreventDestroy<B>;
 
@@ -147,10 +157,10 @@ where
 /// }
 /// ```
 ///
-/// ```compile_fail
-/// use carina_core::resource::SnapshotValue;
+/// ```compile_fail,E0599
+/// use carina_core::resource::{SnapshotValue, knowledge::KnowledgeContext};
 /// let snapshot: SnapshotValue = unimplemented!();
-/// snapshot.is_fully_resolved();
+/// snapshot.knowledge(&KnowledgeContext::validation()).map(|proof| proof.into_classification());
 /// ```
 ///
 /// ```compile_fail
@@ -525,7 +535,7 @@ impl<P: PlaceholderKind, B: BindingAddress> SnapshotValue<P, B> {
             if selected.secret_hash().is_some() {
                 return selected.to_value_at(&selected_path).map_err(Into::into);
             }
-            selected = match apply_value_path_segment(selected, segment.clone(), 0, policy)? {
+            selected = match apply_snapshot_path_segment(selected, segment.clone(), 0, policy)? {
                 ValuePathSegmentResult::Resolved(value)
                 | ValuePathSegmentResult::Deferred(value) => value,
                 ValuePathSegmentResult::DeferredMiss(error) => {
@@ -584,4 +594,167 @@ impl crate::resource::InsideSecret for UnavailableSecretError {
     fn inside_secret(self) -> Self {
         Self { path: None }
     }
+}
+
+pub(crate) fn apply_snapshot_path_segment<P: PlaceholderKind, B: BindingAddress>(
+    base: SnapshotValue<P, B>,
+    step: PathSegment,
+    source_line: usize,
+    miss_policy: AccessMissPolicy,
+) -> Result<ValuePathSegmentResult<SnapshotLeaf<P>, B>, ValueAccessError> {
+    if let Value::Deferred(DeferredValue::Secret(payload)) = &base {
+        let mut deferred = false;
+        let selected = payload.try_map(|value| {
+            match apply_snapshot_path_segment(value.clone(), step, source_line, miss_policy)
+                .map_err(|error| SecretSelectionError {
+                    error,
+                    deferred_miss: false,
+                })? {
+                ValuePathSegmentResult::Resolved(value) => Ok(value),
+                ValuePathSegmentResult::Deferred(value) => {
+                    deferred = true;
+                    Ok(value)
+                }
+                ValuePathSegmentResult::DeferredMiss(error) => Err(SecretSelectionError {
+                    error,
+                    deferred_miss: true,
+                }),
+            }
+        });
+        return match selected {
+            Ok(payload) => {
+                let value = Value::Deferred(DeferredValue::Secret(payload));
+                Ok(if deferred {
+                    ValuePathSegmentResult::Deferred(value)
+                } else {
+                    ValuePathSegmentResult::Resolved(value)
+                })
+            }
+            Err(SecretSelectionError {
+                error,
+                deferred_miss: true,
+            }) => Ok(ValuePathSegmentResult::DeferredMiss(error)),
+            Err(SecretSelectionError {
+                error,
+                deferred_miss: false,
+            }) => Err(error),
+        };
+    }
+    let selected = match base {
+        Value::Deferred(DeferredValue::ResourceRef { path }) => {
+            let reference = Value::Deferred(DeferredValue::ResourceRef {
+                path: path.with_appended_segment(step),
+            });
+            return Ok(ValuePathSegmentResult::Deferred(reference));
+        }
+        Value::Deferred(DeferredValue::BindingRef { binding }) => {
+            let reference = match step {
+                PathSegment::Field { name } => Value::Deferred(DeferredValue::ResourceRef {
+                    path: AccessPath::from_binding(binding, name, Vec::new()),
+                }),
+                PathSegment::Subscript {
+                    index: Subscript::Int { index },
+                } => Value::Deferred(DeferredValue::BindingRef {
+                    binding: binding_with_index(&binding, index),
+                }),
+                PathSegment::Subscript {
+                    index: Subscript::Str { key },
+                } => Value::Deferred(DeferredValue::BindingRef {
+                    binding: binding_with_map_key(&binding, &key),
+                }),
+            };
+            return Ok(ValuePathSegmentResult::Deferred(reference));
+        }
+        Value::Deferred(deferred) => {
+            let base = Value::Deferred(deferred);
+            return Ok(ValuePathSegmentResult::Deferred(deferred_access(
+                base,
+                step,
+                source_line,
+            )));
+        }
+        Value::Concrete(ConcreteValue::List(items)) => match &step {
+            PathSegment::Subscript {
+                index: Subscript::Int { index },
+            } => {
+                let position = match checked_list_position(*index, items.len()) {
+                    Ok(position) => position,
+                    Err(error) => {
+                        return handle_access_miss(miss_policy, error);
+                    }
+                };
+                items[position].clone()
+            }
+            _ => {
+                return Err(ValueAccessError::WrongShape {
+                    step: step.clone(),
+                    actual: "list",
+                });
+            }
+        },
+        Value::Concrete(ConcreteValue::StringList(items)) => match &step {
+            PathSegment::Subscript {
+                index: Subscript::Int { index },
+            } => {
+                let position = match checked_list_position(*index, items.len()) {
+                    Ok(position) => position,
+                    Err(error) => {
+                        return handle_access_miss(miss_policy, error);
+                    }
+                };
+                Value::Concrete(ConcreteValue::String(items[position].clone()))
+            }
+            _ => {
+                return Err(ValueAccessError::WrongShape {
+                    step: step.clone(),
+                    actual: "list",
+                });
+            }
+        },
+        Value::Concrete(ConcreteValue::Map(map)) => {
+            let available = Some(map.keys().cloned().collect());
+            let len = map.len();
+            match &step {
+                PathSegment::Field { name } => match map.get(name).cloned() {
+                    Some(value) => value,
+                    None => {
+                        let error = ValueAccessMiss::MissingField {
+                            name: name.clone(),
+                            available,
+                            len,
+                        };
+                        return handle_access_miss(miss_policy, error);
+                    }
+                },
+                PathSegment::Subscript {
+                    index: Subscript::Str { key },
+                } => match map.get(key.expose_plaintext()).cloned() {
+                    Some(value) => value,
+                    None => {
+                        let error = ValueAccessMiss::MissingKey {
+                            key: key.clone(),
+                            available,
+                            len,
+                        };
+                        return handle_access_miss(miss_policy, error);
+                    }
+                },
+                _ => {
+                    return Err(ValueAccessError::WrongShape {
+                        step: step.clone(),
+                        actual: "map",
+                    });
+                }
+            }
+        }
+        Value::Concrete(concrete) => {
+            let actual = concrete_value_shape(&concrete);
+            return Err(ValueAccessError::WrongShape {
+                step: step.clone(),
+                actual,
+            });
+        }
+    };
+
+    Ok(ValuePathSegmentResult::Resolved(selected))
 }

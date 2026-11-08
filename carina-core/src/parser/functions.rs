@@ -630,21 +630,9 @@ fn custom_type_canonicalization_error(
 /// factories, even if their descriptive identity collides with a built-in.
 pub fn validate_custom_type<P: PlaceholderKind, B: BindingAddress>(
     identity: &TypeIdentity,
-    value: &GenericValue<P, B>,
+    value: &crate::resource::knowledge::KnownValue<'_, P, B>,
     _config: &ProviderContext,
 ) -> crate::provider::HostResult<()> {
-    match value {
-        GenericValue::Deferred(DeferredValue::ResourceRef { .. }) => return Ok(()),
-        GenericValue::Deferred(
-            DeferredValue::FunctionCall { .. } | DeferredValue::ResolvedFunctionCall { .. },
-        ) => return Ok(()),
-        GenericValue::Deferred(DeferredValue::Access(_access)) => return Ok(()),
-        GenericValue::Deferred(DeferredValue::Interpolation(_parts)) => return Ok(()),
-        GenericValue::Deferred(DeferredValue::Unknown(_reason)) => return Ok(()),
-        GenericValue::Concrete(_concrete) => {}
-        GenericValue::Deferred(_deferred) => {}
-    }
-
     let declaration = crate::schema::builtin_type_registry()
         .get(identity)
         .ok_or_else(|| {
@@ -657,7 +645,9 @@ pub fn validate_custom_type<P: PlaceholderKind, B: BindingAddress>(
             "Custom type validation failed",
             error,
         )
-        .with_secrets(crate::provider::ProviderValidationInputs::collect([value]).redaction_set())
+        .with_secrets(
+            crate::provider::ProviderValidationInputs::collect([&value.to_value()]).redaction_set(),
+        )
     })
 }
 
@@ -665,12 +655,18 @@ pub fn validate_custom_type<P: PlaceholderKind, B: BindingAddress>(
 /// DSL's textual interpretation of unresolved enum identifiers.
 pub(crate) fn validate_builtin_custom_type<P: PlaceholderKind, B: BindingAddress>(
     declaration: &crate::schema::CompiledAttributeType,
-    value: &GenericValue<P, B>,
+    value: &crate::resource::knowledge::KnownValue<'_, P, B>,
 ) -> Result<(), crate::schema::TypeError> {
-    if let GenericValue::Concrete(ConcreteValue::EnumIdentifier(raw)) = value {
-        declaration.validate_identified_scalar_value(&GenericValue::<P, B>::Concrete(
-            ConcreteValue::String(raw.as_str().to_string().into()),
-        ))
+    let raw = value.to_value();
+    if let GenericValue::Concrete(ConcreteValue::EnumIdentifier(raw)) = &raw {
+        let text: GenericValue =
+            GenericValue::Concrete(ConcreteValue::String(raw.as_str().to_owned().into()));
+        let known = text
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .and_then(|proof| proof.into_known())
+            .map_err(crate::schema::TypeError::from)?;
+        declaration.validate_identified_scalar_value(&known)
     } else {
         declaration.validate_identified_scalar_value(value)
     }
@@ -679,19 +675,19 @@ pub(crate) fn validate_builtin_custom_type<P: PlaceholderKind, B: BindingAddress
 /// Validate an authored provider schema annotation against every owner that
 /// declares its semantic identity.
 ///
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// use carina_core::parser::{
-///     OwnedTypeIdentity, ProviderContext, validate_schema_custom_type,
+///     LoadedProviderContext, OwnedTypeIdentity, validate_schema_custom_type,
 /// };
 /// use carina_core::resource::Value;
 ///
-/// fn check(owned: &OwnedTypeIdentity, value: &Value) {
-///     let _ = validate_schema_custom_type(owned, value, &ProviderContext::new(carina_core::EnvironmentSnapshot::empty()));
+/// fn check(owned: &OwnedTypeIdentity, value: &Value, config: &LoadedProviderContext) {
+///     let _ = validate_schema_custom_type(owned, value, config);
 /// }
 /// ```
 pub fn validate_schema_custom_type<P: PlaceholderKind, B: BindingAddress>(
     owned: &crate::parser::OwnedTypeIdentity,
-    value: &GenericValue<P, B>,
+    value: &crate::resource::knowledge::KnownValue<'_, P, B>,
     config: &crate::parser::LoadedProviderContext,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
     validate_schema_custom_type_key_with_context(owned, value, config, None)
@@ -699,7 +695,7 @@ pub fn validate_schema_custom_type<P: PlaceholderKind, B: BindingAddress>(
 
 pub(crate) fn validate_schema_custom_type_with_context<P: PlaceholderKind, B: BindingAddress>(
     owned: &crate::parser::ResolvedSchemaType,
-    value: &GenericValue<P, B>,
+    value: &crate::resource::knowledge::KnownValue<'_, P, B>,
     config: &ProviderContext,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
     validate_schema_custom_type_key_with_context(owned, value, config, Some(owned))
@@ -707,55 +703,60 @@ pub(crate) fn validate_schema_custom_type_with_context<P: PlaceholderKind, B: Bi
 
 fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAddress>(
     owned: &crate::parser::OwnedTypeIdentity,
-    value: &GenericValue<P, B>,
+    value: &crate::resource::knowledge::KnownValue<'_, P, B>,
     config: &ProviderContext,
     witness: Option<&crate::parser::ResolvedSchemaType>,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
-    match value {
-        GenericValue::Deferred(
-            DeferredValue::ResourceRef { .. }
-            | DeferredValue::FunctionCall { .. }
-            | DeferredValue::ResolvedFunctionCall { .. }
-            | DeferredValue::Access(_)
-            | DeferredValue::Interpolation(_)
-            | DeferredValue::Secret(_)
-            | DeferredValue::Unknown(_)
-            | DeferredValue::Placeholder(_),
-        ) => return Ok(()),
-        GenericValue::Concrete(_) | GenericValue::Deferred(_) => {}
+    if value.visit(
+        |view| {
+            matches!(
+                view,
+                crate::resource::knowledge::KnownView::List(_)
+                    | crate::resource::knowledge::KnownView::Map(_)
+                    | crate::resource::knowledge::KnownView::StringList(_)
+            )
+        },
+        |_| false,
+    ) {
+        return owned
+            .scalar_kind()
+            .identified_type::<crate::schema::Compiled>(owned.identity().clone())
+            .validate_identified_scalar_value(value)
+            .map_err(
+                |error| super::CustomTypeValidationError::InvalidDeclarationValue {
+                    owner: owned
+                        .provider_names()
+                        .next()
+                        .expect("nonempty owners")
+                        .into(),
+                    identity: owned.identity().clone(),
+                    error: Box::new(error),
+                },
+            );
     }
-    let value: GenericValue = match value {
-        GenericValue::Concrete(ConcreteValue::String(value)) => {
-            GenericValue::Concrete(ConcreteValue::String(value.clone()))
-        }
-        GenericValue::Concrete(ConcreteValue::EnumIdentifier(value)) => {
-            GenericValue::Concrete(ConcreteValue::EnumIdentifier(value.clone()))
-        }
-        GenericValue::Concrete(ConcreteValue::CanonicalEnum(value)) => {
-            GenericValue::Concrete(ConcreteValue::CanonicalEnum(value.clone()))
-        }
-        GenericValue::Concrete(ConcreteValue::Int(value)) => {
-            GenericValue::Concrete(ConcreteValue::Int(*value))
-        }
-        GenericValue::Concrete(ConcreteValue::Float(value)) => {
-            GenericValue::Concrete(ConcreteValue::Float(*value))
-        }
-        GenericValue::Concrete(ConcreteValue::Bool(value)) => {
-            GenericValue::Concrete(ConcreteValue::Bool(*value))
-        }
-        GenericValue::Concrete(ConcreteValue::Duration(value)) => {
-            GenericValue::Concrete(ConcreteValue::Duration(*value))
-        }
-        GenericValue::Concrete(ConcreteValue::StringList(value)) => {
-            GenericValue::Concrete(ConcreteValue::StringList(value.clone()))
-        }
-        GenericValue::Concrete(ConcreteValue::List(_) | ConcreteValue::Map(_)) => {
-            unreachable!("custom-type validation receives only scalar values")
-        }
-        GenericValue::Deferred(_) => {
-            unreachable!("deferred values returned before provider validation")
-        }
-    };
+    let raw = value.to_value();
+    if value.visit(|_| false, |_| true) {
+        return Ok(());
+    }
+    let value: GenericValue = raw
+        .try_map_placeholder(&mut |_| Err::<GenericValue<crate::resource::NoPlaceholder, B>, _>(()))
+        .expect("known values contain no substitution slots")
+        .map_bindings(&mut |_| unreachable!("known values contain no reference bindings"));
+    let known = value
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        .and_then(|proof| proof.into_known())
+        .map_err(
+            |error| super::CustomTypeValidationError::InvalidDeclarationValue {
+                owner: owned
+                    .provider_names()
+                    .next()
+                    .expect("nonempty owners")
+                    .into(),
+                identity: owned.identity().clone(),
+                error: Box::new(error.into()),
+            },
+        )?;
     let projection = witness
         .map(|witness| witness.resolve_projection(config))
         .transpose()?
@@ -768,11 +769,11 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
                     owner: owned.provider_names().next().expect("nonempty owners"),
                     declaration,
                 },
-                &value,
+                &known,
             )?;
         } else {
             projection
-                .validate_identified_scalar_value(&value)
+                .validate_identified_scalar_value(&known)
                 .map_err(
                     |error| super::CustomTypeValidationError::InvalidDeclarationValue {
                         owner: owned
@@ -789,7 +790,7 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
         super::validate_custom_type_value(
             config.custom_type_resolver(),
             super::CustomTypeValidationTarget::Annotation(owned),
-            &value,
+            &known,
         )?;
     }
     // The resolved witness can cross a catalog boundary (including serde).
@@ -855,6 +856,11 @@ fn validate_schema_custom_type_key_with_context<P: PlaceholderKind, B: BindingAd
             }
             None => value,
         };
+        let scalar = scalar
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .and_then(|proof| proof.into_known())
+            .map_err(|error| invalid_value(error.into()))?;
         witness
             .materialize()
             .validate_identified_scalar_value(&scalar)
@@ -974,7 +980,12 @@ fn check_fn_arg_type<Source: Clone>(
     let type_expr = resolved_type.as_type_expr();
 
     let provider_context = ctx.typecheck_provider_context();
-    let Some(resolved) = crate::validation::typecheck::ResolvedConstraintValue::new(value) else {
+    let Some(resolved) = (value)
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        .ok()
+        .and_then(|value| value.into_known().ok())
+    else {
         return Ok(if requires_concrete_annotation_check(&type_expr) {
             FunctionArgumentTypeCheck::AwaitingRuntimeValue
         } else {
@@ -984,14 +995,7 @@ fn check_fn_arg_type<Source: Clone>(
     let check = provider_context.check_resolved_constraints(&type_expr, &resolved);
     let result = finish_function_type_check(check, provider_context, site)
         .map_err(|mismatch| function_argument_type_error(fn_name, param_name, mismatch))?;
-    if result == FunctionArgumentTypeCheck::Complete
-        && !value.is_fully_resolved()
-        && requires_concrete_annotation_check(&type_expr)
-    {
-        Ok(FunctionArgumentTypeCheck::AwaitingRuntimeValue)
-    } else {
-        Ok(result)
-    }
+    Ok(result)
 }
 
 /// Shape-only annotations are checked against the declared source by the
@@ -1100,7 +1104,11 @@ pub(crate) fn construct_builtin_call(
         .map_err(|error| builtin.protect_parse_error(error, line))?;
     builtin
         .call(args, line.into(), |value| {
-            if super::is_static_value(&value) {
+            if value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .is_ok_and(|knowledge| knowledge.permits_static_evaluation())
+            {
                 // Normalize successful authored inputs here. A failed static
                 // evaluation stays deferred so the normal strict/permissive
                 // resolver policy still owns unavailable values.
@@ -1251,7 +1259,12 @@ fn check_fn_return_type(
     value: &Value,
     config: crate::validation::typecheck::TypecheckProviderContext<'_>,
 ) -> Result<FunctionArgumentTypeCheck, ParseError> {
-    let Some(resolved) = crate::validation::typecheck::ResolvedConstraintValue::new(value) else {
+    let Some(resolved) = (value)
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        .ok()
+        .and_then(|value| value.into_known().ok())
+    else {
         return Ok(if requires_concrete_annotation_check(type_expr) {
             FunctionArgumentTypeCheck::AwaitingRuntimeValue
         } else {
@@ -1261,14 +1274,7 @@ fn check_fn_return_type(
     let check = config.check_resolved_constraints(type_expr, &resolved);
     let result = finish_function_type_check(check, config, None)
         .map_err(|mismatch| function_return_type_error(fn_name, mismatch))?;
-    if result == FunctionArgumentTypeCheck::Complete
-        && !value.is_fully_resolved()
-        && requires_concrete_annotation_check(type_expr)
-    {
-        Ok(FunctionArgumentTypeCheck::AwaitingRuntimeValue)
-    } else {
-        Ok(result)
-    }
+    Ok(result)
 }
 
 fn function_return_type_error(
@@ -1776,7 +1782,7 @@ pub(crate) fn apply_parser_closure(
             &new_args,
             ctx.config,
         )
-        .map_err(|message| ParseError::InvalidExpression { line, message });
+        .map_err(|error| ParseError::from_resolution(error, line));
     }
 
     let remaining = remaining_arity - new_args.len();
@@ -1850,10 +1856,14 @@ pub(super) fn try_evaluate_fn_value<Source: Clone>(
                 .collect();
             let evaluated_args = evaluated_args?;
 
-            if !evaluated_args
-                .iter()
-                .all(|argument| argument.value().is_some_and(crate::parser::is_static_value))
-            {
+            if !evaluated_args.iter().all(|argument| {
+                argument.value().is_some_and(|value| {
+                    (value)
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .is_ok_and(|knowledge| knowledge.permits_static_evaluation())
+                })
+            }) {
                 return Ok(Value::Deferred(DeferredValue::FunctionCall {
                     name: *name,
                     args: evaluated_args,
@@ -1865,12 +1875,18 @@ pub(super) fn try_evaluate_fn_value<Source: Clone>(
                 .iter()
                 .map(function_argument_as_eval)
                 .collect();
-            crate::builtins::evaluate_builtin_with_config(name.as_str(), &eval_args, ctx.config)
-                .and_then(|result| result.into_value().map_err(|error| error.to_string()))
-                .map_err(|message| ParseError::InvalidExpression {
-                    line: source_line,
-                    message,
-                })
+            crate::builtins::evaluate_builtin_with_config(
+                name.as_str(),
+                &eval_args,
+                ctx.config,
+                source_line.into(),
+            )
+            .and_then(|result| {
+                result
+                    .into_value()
+                    .map_err(|error| crate::resolver::ResolutionError::from(error.to_string()))
+            })
+            .map_err(|error| ParseError::from_resolution(error, source_line))
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let base = try_evaluate_fn_value(access.base().clone(), ctx, access.source_line())?;
@@ -1961,6 +1977,36 @@ pub(super) fn try_evaluate_fn_value<Source: Clone>(
 #[cfg(test)]
 mod secret_origin_tests {
     use super::*;
+
+    #[test]
+    fn known_collection_with_pending_secret_reports_kind_error_without_rebinding() {
+        let owned = crate::parser::OwnedTypeIdentity::provider(
+            "mock",
+            crate::schema::TypeIdentity::new(Some("mock"), ["test"], "Name"),
+            crate::schema::RefinedScalarKind::String,
+        );
+        let value = Value::Concrete(ConcreteValue::List(vec![
+            Value::resource_ref("private_source", "value", vec![]).into_secret(),
+        ]));
+        let proof = value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap();
+        assert!(matches!(
+            &proof,
+            crate::resource::knowledge::Classification::ShapeKnown(_)
+        ));
+        assert!(proof.into_known().is_err());
+        // A partial collection uses the existing structural validator. The
+        // resolved custom-type consumer still accepts KnownValue only.
+        let error = owned
+            .scalar_kind()
+            .identified_type::<crate::schema::Compiled>(owned.identity().clone())
+            .validate(&value)
+            .unwrap_err();
+        assert!(error.to_string().contains("Type mismatch"), "{error}");
+        assert!(!error.to_string().contains("private_source"), "{error}");
+    }
 
     #[test]
     fn secret_origin_4275_closure_and_composition_wrap_deferred_arguments() {

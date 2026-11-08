@@ -200,6 +200,9 @@ pub use carina_provider_protocol::types::{
 };
 pub use pattern_display::{DiagnosticPatternSpec, PatternSpecDisplay};
 pub(crate) mod length_interval;
+use crate::resource::knowledge::{
+    Classification, ClassifiedRef, KnownValue, PendingFit, PlanResolved, StructuralPending,
+};
 use length_interval::length_contains;
 mod input_rules;
 pub use compiled_pattern::{
@@ -241,7 +244,7 @@ mod resolved_union_members;
 mod type_identity;
 mod value_validation;
 pub use value_validation::{
-    LocallyValidatedCustomType, ResourceValueValidation, ValidatedCustomTypeLookup,
+    LocallyValidatedCustomType, ResourceValueValidation, ValidatedCustomTypeLookup, ValueStructure,
     ValueValidationFindings,
 };
 pub(crate) use value_validation::{
@@ -1073,7 +1076,9 @@ impl<R: PatternForm> ProviderPopulatedStructFieldBuilder<R> {
 pub enum LeafPathSegment {
     StructField(String),
     ListIndex(usize),
-    MapKey(String),
+    // Preserve producer sensitivity through every diagnostic rendering of a
+    // selected key; serde and key identity retain their existing string form.
+    MapKey(crate::resource::ValueString),
 }
 
 /// Location of one write-only field inside a top-level attribute value.
@@ -1091,6 +1096,24 @@ impl LeafPath {
     /// Borrow the typed steps from the containing attribute to this leaf.
     pub fn segments(&self) -> &[LeafPathSegment] {
         &self.0
+    }
+}
+
+impl fmt::Display for LeafPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (index, segment) in self.0.iter().enumerate() {
+            match segment {
+                LeafPathSegment::StructField(name) => {
+                    if index > 0 {
+                        f.write_str(".")?;
+                    }
+                    f.write_str(name)?;
+                }
+                LeafPathSegment::ListIndex(index) => write!(f, "[{index}]")?,
+                LeafPathSegment::MapKey(key) => write!(f, "[{key:?}]")?,
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1843,9 +1866,13 @@ impl RootlessType {
         value: &Value<P, B>,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
+        let knowledge = value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .map_err(|error| vec![knowledge_type_error(error)])?;
         let findings = value_validation::validate_value_with_lookup(
             &self.schema.root,
-            value,
+            &knowledge,
             &self.schema.defs,
             FieldAncestry::WRITABLE,
             lookup,
@@ -2081,9 +2108,16 @@ impl Schema {
         &self,
         value: &Value<P, B>,
     ) -> Vec<(FieldPath, TypeError)> {
+        let knowledge = match value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+        {
+            Ok(value) => value,
+            Err(error) => return vec![(FieldPath::new(), knowledge_type_error(error))],
+        };
         value_validation::validate_value_locally(
             &self.root,
-            value,
+            &knowledge,
             &self.defs,
             FieldAncestry::WRITABLE,
         )
@@ -2100,13 +2134,37 @@ impl Schema {
     }
 }
 
+fn knowledge_type_error<B: BindingAddress>(
+    error: crate::resource::knowledge::KnowledgeError<B>,
+) -> TypeError {
+    TypeError::from(error)
+}
+#[cfg(test)]
+pub(crate) fn classified_attributes<'v, P: PlaceholderKind, B: BindingAddress>(
+    attributes: &'v HashMap<String, Value<P, B>>,
+) -> Result<HashMap<String, Classification<'v, P, B>>, Vec<TypeError>> {
+    attributes
+        .iter()
+        .map(|(name, value)| {
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .map(|value| (name.clone(), value))
+                .map_err(|error| vec![knowledge_type_error(error).with_attribute(name)])
+        })
+        .collect()
+}
 pub(crate) fn validate_attr_with_defs<P: PlaceholderKind, B: BindingAddress>(
     attr: &PatternAttributeType<Compiled>,
     value: &Value<P, B>,
     defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
 ) -> Result<(), TypeError> {
-    value_validation::validate_value_locally(attr, value, defs, ancestry).into_local_result()
+    let knowledge = value
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        .map_err(knowledge_type_error)?;
+    value_validation::validate_value_locally(attr, &knowledge, defs, ancestry).into_local_result()
 }
 
 impl<R: PatternForm> fmt::Debug for AttrTypeKind<R> {
@@ -3297,7 +3355,7 @@ impl PatternAttributeType<Compiled> {
     /// public rootless constructor for arbitrary resource-path types.
     pub(crate) fn validate_identified_scalar_value<P: PlaceholderKind, B: BindingAddress>(
         &self,
-        value: &Value<P, B>,
+        value: &KnownValue<'_, P, B>,
     ) -> Result<(), TypeError> {
         debug_assert!(matches!(
             self.kind,
@@ -3307,12 +3365,14 @@ impl PatternAttributeType<Compiled> {
                 | AttrTypeKind::Float { .. }
                 | AttrTypeKind::Enum { .. }
         ));
-        validate_attr_with_defs(
+        let knowledge: Classification<'_, P, B> = Classification::Known(value.clone());
+        value_validation::validate_value_locally(
             self,
-            value,
+            &knowledge,
             empty_defs_for_schema_walks(),
             FieldAncestry::WRITABLE,
         )
+        .into_local_result()
     }
 
     /// Validate a primitive (`String`/`Int`/`Float`/`Bool`/`Duration`) value.
@@ -4656,7 +4716,9 @@ pub(crate) struct Fit<'a> {
 
 pub(crate) enum FitKind<'a> {
     PassThrough,
-    Deferred,
+    Deferred(PendingFit),
+    Failed,
+    HistoricalOpaque,
     Secret(Box<Fit<'a>>),
     Coalesce {
         value: Box<Fit<'a>>,
@@ -4686,7 +4748,9 @@ fn canonical_enum_key_from_fit(fit: &Fit<'_>) -> Option<String> {
         FitKind::Enum { canonical, .. } => Some(canonical.api_value().to_string()),
         FitKind::Union { fit, .. } => canonical_enum_key_from_fit(fit),
         FitKind::PassThrough
-        | FitKind::Deferred
+        | FitKind::Deferred(_)
+        | FitKind::Failed
+        | FitKind::HistoricalOpaque
         | FitKind::Secret(_)
         | FitKind::Coalesce { .. }
         | FitKind::List(_)
@@ -4864,20 +4928,52 @@ struct UnionFit<'a> {
 /// Ref paths are retained only while examining the same value node. Container
 /// descent starts a fresh path because it consumes one value level, allowing a
 /// recursive schema to revisit the same definition for a child value.
+#[cfg(test)]
 fn fit_value_to_type_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
     attr: &'a PatternAttributeType<Compiled>,
-    value: &Value<P, B>,
+    value: &Classification<'_, P, B>,
     defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
     visited_refs: &mut Vec<&'a str>,
 ) -> Option<Fit<'a>> {
-    inspect_structure_with_defs_on_path(attr, value, defs, ancestry, purpose, visited_refs)
+    inspect_structure_with_defs_on_path(attr, value.into(), defs, ancestry, purpose, visited_refs)
 }
-
-fn inspect_structure_with_defs_on_path<'a, P: crate::resource::ValueKind, B: BindingAddress>(
+pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
     attr: &'a PatternAttributeType<Compiled>,
-    value: &Value<P, B>,
+    value: &Classification<'_, P, B>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
+    ancestry: FieldAncestry,
+    purpose: CanonicalizationPurpose<'_>,
+    visited_refs: &mut Vec<&'a str>,
+) -> Option<Fit<'a>> {
+    inspect_value_structure_on_path(attr, value.into(), defs, ancestry, purpose, visited_refs)
+}
+pub(crate) fn inspect_snapshot_state_structure<'a, B: BindingAddress>(
+    attr: &'a PatternAttributeType<Compiled>,
+    value: &crate::resource::SnapshotValue<crate::resource::NoPlaceholder, B>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
+    ancestry: FieldAncestry,
+    visited_refs: &mut Vec<&'a str>,
+) -> Option<Fit<'a>> {
+    inspect_value_structure_on_path_snapshot(
+        attr,
+        value,
+        defs,
+        ancestry,
+        CanonicalizationPurpose::State,
+        visited_refs,
+    )
+}
+fn inspect_structure_with_defs_on_path<
+    'a,
+    'v,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    T: StructuralPending<'v, P, B>,
+>(
+    attr: &'a PatternAttributeType<Compiled>,
+    value: ClassifiedRef<'_, 'v, P, B, T>,
     defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
@@ -4891,40 +4987,15 @@ fn inspect_structure_with_defs_on_path<'a, P: crate::resource::ValueKind, B: Bin
     fit
 }
 
-pub(crate) fn fit_value_to_resolved_type_on_path<'a, P: PlaceholderKind, B: BindingAddress>(
+fn inspect_value_structure_on_path<
+    'a,
+    'v,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    T: StructuralPending<'v, P, B>,
+>(
     attr: &'a PatternAttributeType<Compiled>,
-    value: &Value<P, B>,
-    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
-    ancestry: FieldAncestry,
-    purpose: CanonicalizationPurpose<'_>,
-    visited_refs: &mut Vec<&'a str>,
-) -> Option<Fit<'a>> {
-    inspect_value_structure_on_path(attr, value, defs, ancestry, purpose, visited_refs)
-}
-
-/// Inspect persisted structure while retaining hashes as opaque state leaves.
-/// Its witness describes historical state only; evaluable validation and
-/// expression type selection retain their PlaceholderKind entry points.
-pub(crate) fn inspect_snapshot_state_structure<'a, B: BindingAddress>(
-    attr: &'a PatternAttributeType<Compiled>,
-    value: &crate::resource::SnapshotValue<crate::resource::NoPlaceholder, B>,
-    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
-    ancestry: FieldAncestry,
-    visited_refs: &mut Vec<&'a str>,
-) -> Option<Fit<'a>> {
-    inspect_value_structure_on_path(
-        attr,
-        value,
-        defs,
-        ancestry,
-        CanonicalizationPurpose::State,
-        visited_refs,
-    )
-}
-
-fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: BindingAddress>(
-    attr: &'a PatternAttributeType<Compiled>,
-    value: &Value<P, B>,
+    value: ClassifiedRef<'_, 'v, P, B, T>,
     defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
@@ -4949,12 +5020,16 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
         | AT::Union(_)
         | AT::Ref(_) => {}
     }
-    if let Value::Deferred(DeferredValue::Secret(inner)) = value {
+    if let Some(inner) = value.secret() {
         let inner = inner
             .try_project_plaintext(|value| {
+                let knowledge = value
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(|_| ())?;
                 inspect_value_structure_on_path(
                     attr,
-                    value,
+                    (&knowledge).into(),
                     defs,
                     ancestry.inside_secret(),
                     purpose,
@@ -4971,7 +5046,7 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
         ));
     }
 
-    if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
+    if let Some((value, default)) = value.coalesce() {
         let value_fit = inspect_structure_with_defs_on_path(
             attr,
             value,
@@ -5000,17 +5075,476 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
         ));
     }
 
+    if let ClassifiedRef::Pending(pending) = value {
+        if pending.arithmetic() {
+            return match &attr.kind {
+                AT::UnloadedSchemaType(_) => None,
+                AT::Int { .. } => Some(Fit::with_kind(
+                    FitExactness::EXACT,
+                    attr,
+                    FitKind::Deferred(pending.fit()),
+                )),
+                AT::Float { .. } => Some(Fit::with_kind(
+                    FitExactness::COERCIBLE,
+                    attr,
+                    FitKind::Deferred(pending.fit()),
+                )),
+                AT::Union(members) => {
+                    let selected = inspect_union_structure_on_path(
+                        members.as_raw_slice(),
+                        value,
+                        defs,
+                        ancestry,
+                        purpose,
+                        visited_refs,
+                    )?;
+                    let exactness = selected.fit.exactness;
+                    Some(Fit::with_kind(
+                        exactness,
+                        attr,
+                        FitKind::Union {
+                            member: selected.member,
+                            fit: Box::new(selected.fit),
+                        },
+                    ))
+                }
+                AT::Ref(_) => unreachable!("fit dispatch received an unresolved Ref"),
+                AT::Reference { .. }
+                | AT::String { .. }
+                | AT::ResourceHandle { .. }
+                | AT::StringLiteralSet { .. }
+                | AT::Bool
+                | AT::Duration
+                | AT::Enum { .. }
+                | AT::List { .. }
+                | AT::Map { .. }
+                | AT::Struct { .. } => None,
+            };
+        }
+        return Some(Fit::with_kind(
+            FitExactness::EXACT,
+            attr,
+            FitKind::Deferred(pending.fit()),
+        ));
+    }
+    match value {
+        ClassifiedRef::Failed(_) => {
+            return Some(Fit::with_kind(FitExactness::EXACT, attr, FitKind::Failed));
+        }
+        ClassifiedRef::Known(_) | ClassifiedRef::Shape(_) | ClassifiedRef::Pending(_) => {}
+    }
+    let concrete = value.concrete()?;
+
+    match (&attr.kind, concrete) {
+        (AT::Enum { identity, .. }, ConcreteValueRef::CanonicalEnum(canonical))
+            if canonical.identity().same_type(identity) =>
+        {
+            Some(Fit::with_kind(
+                FitExactness::EXACT,
+                attr,
+                FitKind::Enum {
+                    canonical: canonical.clone(),
+                    rewrite: false,
+                },
+            ))
+        }
+        (AT::Enum { identity, .. }, ConcreteValueRef::EnumIdentifier(raw)) => {
+            let resolver = EnumValueResolver::with_defs(attr, defs);
+            let canonical = if purpose.resolves_identifiers_as_state_text() {
+                resolver.resolve_state_text(raw.as_str())
+            } else if let Some(provider_name) = purpose.provider_config_name() {
+                crate::value::resolve_provider_config_enum_identifier(
+                    &resolver,
+                    raw,
+                    identity,
+                    provider_name,
+                )
+            } else {
+                resolver.resolve_raw(raw)
+            }
+            .ok()?;
+            Some(Fit::with_kind(
+                FitExactness::EXACT,
+                attr,
+                FitKind::Enum {
+                    canonical,
+                    rewrite: true,
+                },
+            ))
+        }
+        (AT::Enum { values, .. }, ConcreteValueRef::String(text))
+            if purpose.accepts_enum_string(values.is_some()) =>
+        {
+            let canonical = EnumValueResolver::with_defs(attr, defs)
+                .resolve_state_text(text.expose_plaintext())
+                .ok()?;
+            Some(Fit::with_kind(
+                FitExactness::COERCIBLE,
+                attr,
+                FitKind::Enum {
+                    canonical,
+                    rewrite: purpose.canonicalizes_full_shape(),
+                },
+            ))
+        }
+        (
+            AT::List {
+                element_type,
+                constraints,
+                ordered: _ordered,
+            },
+            ConcreteValueRef::List(items),
+        ) => {
+            let mut exactness = FitExactness::EXACT;
+            let mut item_fits = Vec::with_capacity(items.len());
+            let mut cached = value.list()?.into_iter();
+            for result in constraints.check(items.iter(), defs, ancestry, purpose, |_| {
+                inspect_structure_with_defs_on_path(
+                    element_type,
+                    cached.next().expect("cached list membership"),
+                    defs,
+                    ancestry,
+                    purpose,
+                    &mut Vec::new(),
+                )
+            }) {
+                let (_, child) = result.ok()?;
+                let child = child?;
+                exactness.combine(child.exactness);
+                item_fits.push(child);
+            }
+            Some(Fit::with_kind(exactness, attr, FitKind::List(item_fits)))
+        }
+        (
+            AT::List {
+                element_type,
+                constraints,
+                ordered: _ordered,
+            },
+            ConcreteValueRef::StringList(items),
+        ) => {
+            let mut exactness = FitExactness::EXACT;
+            let mut item_fits = Vec::with_capacity(items.len());
+            let values = items
+                .iter()
+                .map(|item| Value::Concrete(ConcreteValue::String(item.clone())));
+            for result in
+                constraints.check(values, defs, ancestry, purpose, |item: &Value<P, B>| {
+                    inspect_structure_with_defs_on_path(
+                        element_type,
+                        (&item
+                            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                            .map(|proof| proof.into_classification())
+                            .ok()?)
+                            .into(),
+                        defs,
+                        ancestry,
+                        purpose,
+                        &mut Vec::new(),
+                    )
+                })
+            {
+                let (_, child) = result.ok()?;
+                let child = child?;
+                exactness.combine(child.exactness);
+                item_fits.push(child);
+            }
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::StringList(item_fits),
+            ))
+        }
+        (
+            AT::Map {
+                key,
+                value: value_type,
+                constraints,
+            },
+            ConcreteValueRef::Map(map),
+        ) => {
+            constraints.check(map.len()).ok()?;
+            let mut exactness = FitExactness::GENERIC_MAP;
+            let mut entry_fits = Vec::with_capacity(map.len());
+            let cached = value.map()?;
+            for (map_key, _map_value) in map {
+                let lifted_key: Value<P, B> = lift_map_key(key, map_key, defs);
+                let key_fit = inspect_structure_with_defs_on_path(
+                    key,
+                    (&lifted_key
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .ok()?)
+                        .into(),
+                    defs,
+                    ancestry,
+                    purpose,
+                    &mut Vec::new(),
+                )?;
+                exactness.combine(key_fit.exactness);
+                let canonical_key = canonical_enum_key_from_fit(&key_fit);
+                let value_fit = inspect_structure_with_defs_on_path(
+                    value_type,
+                    cached[map_key.as_str()],
+                    defs,
+                    ancestry,
+                    purpose,
+                    &mut Vec::new(),
+                )?;
+                exactness.combine(value_fit.exactness);
+                entry_fits.push(MapEntryFit {
+                    canonical_key,
+                    value: value_fit,
+                });
+            }
+            Some(Fit::with_kind(exactness, attr, FitKind::Map(entry_fits)))
+        }
+        (
+            AT::Struct {
+                fields,
+                field_groups,
+                ..
+            },
+            ConcreteValueRef::Map(map),
+        ) => {
+            for field in fields {
+                if ancestry.effective_input_mode(field).is_required()
+                    && !struct_field_is_present(fields, map, field, ancestry)
+                {
+                    return None;
+                }
+            }
+            if purpose.validates_struct_assignments()
+                && violated_struct_field_groups(fields, field_groups, map, ancestry)
+                    .next()
+                    .is_some()
+            {
+                return None;
+            }
+
+            let mut exactness = FitExactness::EXACT;
+            let mut field_fits = Vec::with_capacity(map.len());
+            let cached = value.map()?;
+            for (input_name, _field_value) in map {
+                let field = struct_field_for_key(fields, input_name, ancestry)?;
+                if purpose.validates_struct_assignments()
+                    && validate_struct_field_assignment(field, input_name, ancestry).is_some()
+                {
+                    return None;
+                }
+                let child = inspect_structure_with_defs_on_path(
+                    &field.field_type,
+                    cached[input_name.as_str()],
+                    defs,
+                    ancestry.descend(field),
+                    purpose,
+                    &mut Vec::new(),
+                )?;
+                exactness.combine(child.exactness);
+                field_fits.push(child);
+            }
+            Some(Fit::with_kind(exactness, attr, FitKind::Struct(field_fits)))
+        }
+        (AT::Union(members), _) => {
+            let selected = inspect_union_structure_on_path(
+                members.as_raw_slice(),
+                value,
+                defs,
+                ancestry,
+                purpose,
+                visited_refs,
+            )?;
+            let exactness = selected.fit.exactness;
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::Union {
+                    member: selected.member,
+                    fit: Box::new(selected.fit),
+                },
+            ))
+        }
+        (AT::Ref(_), _) => unreachable!("fit dispatch received an unresolved Ref"),
+        (
+            AT::Reference { .. }
+            | AT::String { .. }
+            | AT::ResourceHandle { .. }
+            | AT::StringLiteralSet { .. }
+            | AT::Int { .. }
+            | AT::Float { .. }
+            | AT::Bool
+            | AT::Duration,
+            _,
+        ) => {
+            attr.inspect_primitive(concrete).ok()?;
+            let exactness = if matches!(
+                (&attr.kind, concrete),
+                (AT::Float { .. }, ConcreteValueRef::Int(_))
+            ) {
+                FitExactness::COERCIBLE
+            } else {
+                FitExactness::EXACT
+            };
+            Some(Fit::with_kind(exactness, attr, FitKind::PassThrough))
+        }
+        _ => None,
+    }
+}
+
+fn inspect_union_structure_on_path<
+    'a,
+    'v,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    T: StructuralPending<'v, P, B>,
+>(
+    members: &'a [PatternAttributeType<Compiled>],
+    value: ClassifiedRef<'_, 'v, P, B, T>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
+    ancestry: FieldAncestry,
+    purpose: CanonicalizationPurpose<'_>,
+    visited_refs: &mut Vec<&'a str>,
+) -> Option<UnionFit<'a>> {
+    let mut best: Option<UnionFit<'a>> = None;
+    for member in members {
+        let Some(fit) = inspect_structure_with_defs_on_path(
+            member,
+            value,
+            defs,
+            ancestry,
+            purpose,
+            visited_refs,
+        ) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|current| fit > current.fit) {
+            best = Some(UnionFit { member, fit });
+        }
+        if best
+            .as_ref()
+            .is_some_and(|selected| selected.fit.exactness.is_maximal())
+        {
+            break;
+        }
+    }
+    best
+}
+
+fn inspect_structure_with_defs_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAddress>(
+    attr: &'a PatternAttributeType<Compiled>,
+    value: &crate::resource::SnapshotValue<P, B>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
+    ancestry: FieldAncestry,
+    purpose: CanonicalizationPurpose<'_>,
+    visited_refs: &mut Vec<&'a str>,
+) -> Option<Fit<'a>> {
+    let resolution = resolve_refs_on_path(attr, defs, visited_refs).ok()?;
+    let resolved = resolution.attr;
+    let fit = inspect_value_structure_on_path_snapshot(
+        resolved,
+        value,
+        defs,
+        ancestry,
+        purpose,
+        visited_refs,
+    );
+    visited_refs.truncate(resolution.restore_len);
+    fit
+}
+
+fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAddress>(
+    attr: &'a PatternAttributeType<Compiled>,
+    value: &crate::resource::SnapshotValue<P, B>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
+    ancestry: FieldAncestry,
+    purpose: CanonicalizationPurpose<'_>,
+    visited_refs: &mut Vec<&'a str>,
+) -> Option<Fit<'a>> {
+    use AttrTypeKind as AT;
+
+    match &attr.kind {
+        AT::UnloadedSchemaType(_) => return None,
+        AT::Reference { .. }
+        | AT::String { .. }
+        | AT::ResourceHandle { .. }
+        | AT::StringLiteralSet { .. }
+        | AT::Int { .. }
+        | AT::Float { .. }
+        | AT::Bool
+        | AT::Duration
+        | AT::Enum { .. }
+        | AT::List { .. }
+        | AT::Map { .. }
+        | AT::Struct { .. }
+        | AT::Union(_)
+        | AT::Ref(_) => {}
+    }
+    if let Value::Deferred(DeferredValue::Secret(inner)) = value {
+        let inner = inner
+            .try_project_plaintext(|value| {
+                inspect_value_structure_on_path_snapshot(
+                    attr,
+                    value,
+                    defs,
+                    ancestry.inside_secret(),
+                    purpose,
+                    visited_refs,
+                )
+                .ok_or(())
+            })
+            .ok()?;
+        let exactness = inner.exactness;
+        return Some(Fit::with_kind(
+            exactness,
+            attr,
+            FitKind::Secret(Box::new(inner)),
+        ));
+    }
+
+    if let Value::Deferred(DeferredValue::Coalesce { value, default }) = value {
+        let value_fit = inspect_structure_with_defs_on_path_snapshot(
+            attr,
+            value,
+            defs,
+            ancestry,
+            purpose,
+            &mut Vec::new(),
+        )?;
+        let default_fit = inspect_structure_with_defs_on_path_snapshot(
+            attr,
+            default,
+            defs,
+            ancestry,
+            purpose,
+            &mut Vec::new(),
+        )?;
+        let mut exactness = value_fit.exactness;
+        exactness.combine(default_fit.exactness);
+        return Some(Fit::with_kind(
+            exactness,
+            attr,
+            FitKind::Coalesce {
+                value: Box::new(value_fit),
+                default: Box::new(default_fit),
+            },
+        ));
+    }
+
     if matches!(value, Value::Deferred(DeferredValue::IntegerArithmetic(_))) {
         return match &attr.kind {
             AT::UnloadedSchemaType(_) => None,
-            AT::Int { .. } => Some(Fit::with_kind(FitExactness::EXACT, attr, FitKind::Deferred)),
+            AT::Int { .. } => Some(Fit::with_kind(
+                FitExactness::EXACT,
+                attr,
+                FitKind::HistoricalOpaque,
+            )),
             AT::Float { .. } => Some(Fit::with_kind(
                 FitExactness::COERCIBLE,
                 attr,
-                FitKind::Deferred,
+                FitKind::HistoricalOpaque,
             )),
             AT::Union(members) => {
-                let selected = inspect_union_structure_on_path(
+                let selected = inspect_union_structure_on_path_snapshot(
                     members.as_raw_slice(),
                     value,
                     defs,
@@ -5043,7 +5577,11 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
     }
 
     let Some(concrete) = value.as_concrete() else {
-        return Some(Fit::with_kind(FitExactness::EXACT, attr, FitKind::Deferred));
+        return Some(Fit::with_kind(
+            FitExactness::EXACT,
+            attr,
+            FitKind::HistoricalOpaque,
+        ));
     };
 
     match (&attr.kind, concrete) {
@@ -5109,7 +5647,7 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
             let mut exactness = FitExactness::EXACT;
             let mut item_fits = Vec::with_capacity(items.len());
             for result in constraints.check(items.iter(), defs, ancestry, purpose, |item| {
-                inspect_structure_with_defs_on_path(
+                inspect_structure_with_defs_on_path_snapshot(
                     element_type,
                     item,
                     defs,
@@ -5138,9 +5676,13 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
             let values = items
                 .iter()
                 .map(|item| Value::Concrete(ConcreteValue::String(item.clone())));
-            for result in
-                constraints.check(values, defs, ancestry, purpose, |item: &Value<P, B>| {
-                    inspect_structure_with_defs_on_path(
+            for result in constraints.check(
+                values,
+                defs,
+                ancestry,
+                purpose,
+                |item: &crate::resource::SnapshotValue<P, B>| {
+                    inspect_structure_with_defs_on_path_snapshot(
                         element_type,
                         item,
                         defs,
@@ -5148,8 +5690,8 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
                         purpose,
                         &mut Vec::new(),
                     )
-                })
-            {
+                },
+            ) {
                 let (_, child) = result.ok()?;
                 let child = child?;
                 exactness.combine(child.exactness);
@@ -5173,8 +5715,9 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
             let mut exactness = FitExactness::GENERIC_MAP;
             let mut entry_fits = Vec::with_capacity(map.len());
             for (map_key, map_value) in map {
-                let lifted_key: Value<P, B> = lift_map_key(key, map_key, defs);
-                let key_fit = inspect_structure_with_defs_on_path(
+                let lifted_key: crate::resource::SnapshotValue<P, B> =
+                    lift_map_key(key, map_key, defs);
+                let key_fit = inspect_structure_with_defs_on_path_snapshot(
                     key,
                     &lifted_key,
                     defs,
@@ -5184,7 +5727,7 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
                 )?;
                 exactness.combine(key_fit.exactness);
                 let canonical_key = canonical_enum_key_from_fit(&key_fit);
-                let value_fit = inspect_structure_with_defs_on_path(
+                let value_fit = inspect_structure_with_defs_on_path_snapshot(
                     value_type,
                     map_value,
                     defs,
@@ -5232,7 +5775,7 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
                 {
                     return None;
                 }
-                let child = inspect_structure_with_defs_on_path(
+                let child = inspect_structure_with_defs_on_path_snapshot(
                     &field.field_type,
                     field_value,
                     defs,
@@ -5246,7 +5789,7 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
             Some(Fit::with_kind(exactness, attr, FitKind::Struct(field_fits)))
         }
         (AT::Union(members), _) => {
-            let selected = inspect_union_structure_on_path(
+            let selected = inspect_union_structure_on_path_snapshot(
                 members.as_raw_slice(),
                 value,
                 defs,
@@ -5291,9 +5834,9 @@ fn inspect_value_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
     }
 }
 
-fn inspect_union_structure_on_path<'a, P: crate::resource::ValueKind, B: BindingAddress>(
+fn inspect_union_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAddress>(
     members: &'a [PatternAttributeType<Compiled>],
-    value: &Value<P, B>,
+    value: &crate::resource::SnapshotValue<P, B>,
     defs: &'a BTreeMap<String, PatternAttributeType<Compiled>>,
     ancestry: FieldAncestry,
     purpose: CanonicalizationPurpose<'_>,
@@ -5301,7 +5844,7 @@ fn inspect_union_structure_on_path<'a, P: crate::resource::ValueKind, B: Binding
 ) -> Option<UnionFit<'a>> {
     let mut best: Option<UnionFit<'a>> = None;
     for member in members {
-        let Some(fit) = inspect_structure_with_defs_on_path(
+        let Some(fit) = inspect_structure_with_defs_on_path_snapshot(
             member,
             value,
             defs,
@@ -6697,6 +7240,7 @@ fn contains_union_alternatives_mismatch(error: &TypeError) -> bool {
         }
         | TypeError::StringLiteralExpectedEnum { .. }
         | TypeError::ValidationFailed { .. }
+        | TypeError::Knowledge { .. }
         | TypeError::CustomTypeValidation { .. }
         | TypeError::ResourceValidationFailed { .. }
         | TypeError::MissingRequired { .. }
@@ -6838,6 +7382,18 @@ pub enum TypeError {
     #[error("Validation failed: {message}")]
     ValidationFailed { message: DiagnosticText },
 
+    /// Classification/projection errors retain their typed diagnostic metadata.
+    ///
+    /// ```compile_fail,E0308
+    /// use carina_core::schema::TypeError;
+    /// let _ = TypeError::Knowledge { error: Box::new("flattened".to_string()), attribute: None };
+    /// ```
+    #[error("{}: {error}", if attribute.is_some() { "Resource validation failed" } else { "Validation failed" })]
+    Knowledge {
+        error: Box<crate::resource::knowledge::KnowledgeDiagnostic>,
+        attribute: Option<String>,
+    },
+
     #[error("{error}")]
     CustomTypeValidation {
         error: Box<crate::parser::CustomTypeValidationError>,
@@ -6915,6 +7471,15 @@ pub enum TypeError {
         DiagnosticText::new(attribute)
     )]
     BlockSyntaxNotAllowed { attribute: String },
+}
+
+impl<B: BindingAddress> From<crate::resource::knowledge::KnowledgeError<B>> for TypeError {
+    fn from(error: crate::resource::knowledge::KnowledgeError<B>) -> Self {
+        Self::Knowledge {
+            error: Box::new(error.into()),
+            attribute: None,
+        }
+    }
 }
 
 impl From<crate::parser::CustomTypeValidationError> for TypeError {
@@ -7007,7 +7572,8 @@ impl TypeError {
                 first_index: _,
             }
             | TypeError::StringLiteralExpectedEnum { attribute, .. }
-            | TypeError::ResourceValidationFailed { attribute, .. } => attribute.as_deref(),
+            | TypeError::ResourceValidationFailed { attribute, .. }
+            | TypeError::Knowledge { attribute, .. } => attribute.as_deref(),
             TypeError::ReadOnlyAttribute { name }
             | TypeError::UnknownAttribute { name, .. }
             | TypeError::BlockSyntaxNotAllowed { attribute: name } => Some(name),
@@ -7061,6 +7627,13 @@ impl TypeError {
                         .map(|failure| failure.with_attribute(attribute.clone())),
                 )
             }
+            TypeError::Knowledge {
+                error,
+                attribute: existing,
+            } => TypeError::Knowledge {
+                error,
+                attribute: existing.or(Some(attribute)),
+            },
             TypeError::ValidationFailed { message } => TypeError::ResourceValidationFailed {
                 message,
                 attribute: Some(attribute),
@@ -8469,9 +9042,18 @@ impl<'a> EffectiveType<'a> {
         &self,
         value: &Value<P, B>,
     ) -> ValueValidationFindings {
+        let knowledge = match value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return value_validation::classification_error(knowledge_type_error(error));
+            }
+        };
         value_validation::validate_value_locally(
             self.attr_type,
-            value,
+            &knowledge,
             self.defs,
             self.field_ancestry,
         )
@@ -8992,7 +9574,7 @@ impl ValidatedResourceSchema {
 
     pub(crate) fn validate_with_origins_and_lookup<P: PlaceholderKind, B: BindingAddress>(
         &self,
-        attributes: &HashMap<String, Value<P, B>>,
+        attributes: &HashMap<String, Classification<'_, P, B>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
@@ -9000,9 +9582,24 @@ impl ValidatedResourceSchema {
             .validate_values_with_origins_and_lookup(attributes, is_string_literal, lookup)
     }
 
-    pub(crate) fn validate_known_values_with_origins_and_lookup(
+    pub(crate) fn validate_known_values_with_origins_and_lookup<
+        'v,
+        T: StructuralPending<
+                'v,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+            >,
+    >(
         &self,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<
+            String,
+            Classification<
+                'v,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                T,
+            >,
+        >,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
@@ -9013,9 +9610,24 @@ impl ValidatedResourceSchema {
         )
     }
 
-    pub(crate) fn validate_selected_known_values_with_origins_and_lookup(
+    pub(crate) fn validate_selected_known_values_with_origins_and_lookup<
+        'v,
+        T: StructuralPending<
+                'v,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+            >,
+    >(
         &self,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<
+            String,
+            Classification<
+                'v,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                T,
+            >,
+        >,
         selected: &HashSet<String>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
@@ -10925,7 +11537,7 @@ fn project_write_only_leaves<'schema, R: PatternForm, P: crate::resource::ValueK
                 return;
             };
             for (key, entry) in entries {
-                path.push(LeafPathSegment::MapKey(key.clone()));
+                path.push(LeafPathSegment::MapKey(key.clone().into()));
                 project_write_only_leaves(
                     value_type,
                     entry,
@@ -13733,9 +14345,17 @@ impl<'a> OwnerBoundResourceSchema<'a> {
 
     /// Validate authored resource values with custom-type routing derived from
     /// this schema's registered owner.
+    ///
+    /// ```compile_fail,E0308
+    /// use std::collections::HashMap;
+    /// use carina_core::{parser::CustomTypeResolver, resource::Value, schema::OwnerBoundResourceSchema};
+    /// fn bypass(schema: OwnerBoundResourceSchema<'_>, raw: &HashMap<String, Value>, resolver: &dyn CustomTypeResolver) {
+    ///     let _ = schema.validate_with_resolver(raw, &|_| false, resolver);
+    /// }
+    /// ```
     pub fn validate_with_resolver<P: PlaceholderKind, B: BindingAddress>(
         self,
-        attributes: &HashMap<String, Value<P, B>>,
+        attributes: &HashMap<String, Classification<'_, P, B>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         resolver: &dyn crate::parser::CustomTypeResolver,
     ) -> Result<(), Vec<TypeError>> {
@@ -13747,7 +14367,7 @@ impl<'a> OwnerBoundResourceSchema<'a> {
     /// Validate once, retaining source paths for diagnostic renderers.
     pub fn validate_values_with_resolver<P: PlaceholderKind, B: BindingAddress>(
         self,
-        attributes: &HashMap<String, Value<P, B>>,
+        attributes: &HashMap<String, Classification<'_, P, B>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         resolver: &dyn crate::parser::CustomTypeResolver,
     ) -> ResourceValueValidation {
@@ -13759,35 +14379,48 @@ impl<'a> OwnerBoundResourceSchema<'a> {
 
     /// Validate every concrete value known at the provider boundary, routing
     /// identified declarations through this schema's registered owner.
+    ///
+    /// ```compile_fail,E0308
+    /// use std::collections::HashMap;
+    /// use carina_core::{parser::CustomTypeResolver, resource::Value, schema::OwnerBoundResourceSchema};
+    /// fn bypass(schema: OwnerBoundResourceSchema<'_>, raw: &HashMap<String, Value>, resolver: &dyn CustomTypeResolver) {
+    ///     let _ = schema.validate_known_values_with_resolver(raw, &|_| false, resolver);
+    /// }
+    /// ```
     pub fn validate_known_values_with_resolver(
         self,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<String, KnownValue<'_>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         resolver: &dyn crate::parser::CustomTypeResolver,
     ) -> Result<(), Vec<TypeError>> {
+        let attributes: HashMap<String, Classification<'_>> = attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), Classification::Known(value.clone())))
+            .collect();
         let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
         self.schema.validate_known_values_with_origins_and_lookup(
-            attributes,
+            &attributes,
             is_string_literal,
             &lookup,
         )
     }
 
-    pub(crate) fn validate_selected_known_values_with_resolver(
+    pub fn validate_plan_value_constraints_with_resolver(
         self,
-        attributes: &HashMap<String, Value>,
-        selected: &HashSet<String>,
+        attributes: &HashMap<String, PlanResolved<'_>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         resolver: &dyn crate::parser::CustomTypeResolver,
     ) -> Result<(), Vec<TypeError>> {
+        let attributes = attributes
+            .iter()
+            .map(|(key, value)| (key.clone(), value.knowledge().clone()))
+            .collect();
         let lookup = crate::parser::custom_type_lookup_for_schema(resolver, self);
-        self.schema
-            .validate_selected_known_values_with_origins_and_lookup(
-                attributes,
-                selected,
-                is_string_literal,
-                &lookup,
-            )
+        self.schema.validate_known_values_with_origins_and_lookup(
+            &attributes,
+            is_string_literal,
+            &lookup,
+        )
     }
 }
 
@@ -14472,7 +15105,11 @@ impl PatternResourceSchema<Compiled> {
     /// (see #2094).
     #[cfg(test)]
     fn validate_values(&self, attributes: &HashMap<String, Value>) -> Result<(), Vec<TypeError>> {
-        self.validate_inner(attributes, &|_attr_name| false, no_lookup())
+        self.validate_inner(
+            &classified_attributes(attributes)?,
+            &|_attr_name| false,
+            no_lookup(),
+        )
     }
 
     /// Validate resource attributes, reshaping enum-variant errors into
@@ -14491,16 +15128,25 @@ impl PatternResourceSchema<Compiled> {
         attributes: &HashMap<String, Value>,
         is_string_literal: &dyn Fn(&str) -> bool,
     ) -> Result<(), Vec<TypeError>> {
-        self.validate_inner(attributes, is_string_literal, no_lookup())
+        self.validate_inner(
+            &classified_attributes(attributes)?,
+            is_string_literal,
+            no_lookup(),
+        )
     }
 
     /// As [`validate_with_origins`], but also runs `lookup` on every
     /// refined primitive identity reached during traversal so
     /// provider-supplied validators that the schema itself cannot
     /// carry (WASM plugin path) still get to reject bad values.
-    fn validate_values_with_origins_and_lookup<P: PlaceholderKind, B: BindingAddress>(
+    fn validate_values_with_origins_and_lookup<
+        'v,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
         &self,
-        attributes: &HashMap<String, Value<P, B>>,
+        attributes: &HashMap<String, Classification<'v, P, B, T>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
@@ -14519,9 +15165,24 @@ impl PatternResourceSchema<Compiled> {
     /// Deferred leaves are ignored while concrete siblings in the same
     /// collection are still checked. The resource validator is re-run because
     /// it may express cross-attribute value constraints.
-    fn validate_known_values_with_origins_and_lookup(
+    fn validate_known_values_with_origins_and_lookup<
+        'v,
+        T: StructuralPending<
+                'v,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+            >,
+    >(
         &self,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<
+            String,
+            Classification<
+                'v,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                T,
+            >,
+        >,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
@@ -14536,7 +15197,18 @@ impl PatternResourceSchema<Compiled> {
             .into_errors();
 
         if let Some(validator) = self.validator()
-            && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
+            && let Err(mut validation_errors) = run_resource_validator(
+                validator,
+                &attributes
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            ClassifiedRef::from(value).diagnostic_value().clone(),
+                        )
+                    })
+                    .collect(),
+            )
         {
             errors.append(&mut validation_errors);
         }
@@ -14556,9 +15228,24 @@ impl PatternResourceSchema<Compiled> {
     /// provider custom-type checks are restricted to `selected`; every other
     /// value was checked at an earlier boundary and may now be in a normalized
     /// representation that intentionally differs from the authored form.
-    fn validate_selected_known_values_with_origins_and_lookup(
+    fn validate_selected_known_values_with_origins_and_lookup<
+        'v,
+        T: StructuralPending<
+                'v,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+            >,
+    >(
         &self,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<
+            String,
+            Classification<
+                'v,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                T,
+            >,
+        >,
         selected: &HashSet<String>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
@@ -14575,7 +15262,18 @@ impl PatternResourceSchema<Compiled> {
 
         if !selected.is_empty()
             && let Some(validator) = self.validator()
-            && let Err(mut validation_errors) = run_resource_validator(validator, attributes)
+            && let Err(mut validation_errors) = run_resource_validator(
+                validator,
+                &attributes
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            ClassifiedRef::from(value).diagnostic_value().clone(),
+                        )
+                    })
+                    .collect(),
+            )
         {
             errors.append(&mut validation_errors);
         }
@@ -14587,9 +15285,9 @@ impl PatternResourceSchema<Compiled> {
         }
     }
 
-    fn validate_inner<P: PlaceholderKind, B: BindingAddress>(
+    fn validate_inner<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
         &self,
-        attributes: &HashMap<String, Value<P, B>>,
+        attributes: &HashMap<String, Classification<'v, P, B, T>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
@@ -14597,9 +15295,14 @@ impl PatternResourceSchema<Compiled> {
             .into_result()
     }
 
-    fn validate_report<P: PlaceholderKind, B: BindingAddress>(
+    fn validate_report<
+        'v,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
         &self,
-        attributes: &HashMap<String, Value<P, B>>,
+        attributes: &HashMap<String, Classification<'v, P, B, T>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> ResourceValueValidation {
@@ -14640,7 +15343,17 @@ impl PatternResourceSchema<Compiled> {
 
         // Run custom validator if present
         if let Some(validator) = self.validator()
-            && let Some(attributes) = attributes_without_placeholders(attributes)
+            && let Some(attributes) = attributes_without_placeholders(
+                &attributes
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            ClassifiedRef::from(value).diagnostic_value().clone(),
+                        )
+                    })
+                    .collect(),
+            )
             && let Err(mut validation_errors) = run_resource_validator(validator, &attributes)
         {
             report.errors.append(&mut validation_errors);
@@ -14649,9 +15362,14 @@ impl PatternResourceSchema<Compiled> {
         report
     }
 
-    fn validate_value_entries<P: PlaceholderKind, B: BindingAddress>(
+    fn validate_value_entries<
+        'v,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
         &self,
-        attributes: &HashMap<String, Value<P, B>>,
+        attributes: &HashMap<String, Classification<'v, P, B, T>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
         mode: ValueEntryValidation,
@@ -14833,6 +15551,10 @@ impl crate::resource::InsideSecret for TypeError {
                 expected,
                 extra_message: extra_message
                     .map(|_| format!("{SECRET_VALUE_MASK} failed validation").into()),
+            },
+            TypeError::Knowledge { error, attribute } => TypeError::Knowledge {
+                error: Box::new((*error).inside_secret()),
+                attribute,
             },
             TypeError::ValidationFailed { .. } => TypeError::ValidationFailed {
                 message: format!("{SECRET_VALUE_MASK} failed validation").into(),

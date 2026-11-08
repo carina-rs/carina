@@ -1,0 +1,4 @@
+fn prefix(value: String): String { "pre-${value}" }
+fn names(resource: mock.test.resource): list(String) {
+  ["${prefix(resource.name)}-x"]
+}

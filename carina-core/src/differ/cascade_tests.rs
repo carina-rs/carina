@@ -1100,7 +1100,8 @@ fn deferred_for_dependent_promotes_replaced_producer_to_cbd_and_avoids_cycle() {
                     crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
                         deferred.clone(),
                     ]),
-                    |_| DeferredForExpansionChoice::Retain,
+                    &crate::binding_index::IterableBindings::from_upstream_only(Default::default()),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .1,
                 &unresolved,
@@ -1242,7 +1243,10 @@ fn deferred_for_loop_locals_do_not_promote_colliding_top_level_producer() {
                         crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
                             deferred,
                         ]),
-                        |_| DeferredForExpansionChoice::Retain,
+                        &crate::binding_index::IterableBindings::from_upstream_only(
+                            Default::default(),
+                        ),
+                        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                     )
                     .1,
                     &unresolved,
@@ -1319,7 +1323,8 @@ fn deferred_create_cbd_plan(
                     crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
                         deferred,
                     ]),
-                    |_| DeferredForExpansionChoice::Retain,
+                    &crate::binding_index::IterableBindings::from_upstream_only(Default::default()),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .1,
                 &unresolved,
@@ -1751,7 +1756,8 @@ fn issue_4283_known_conflicting_child_cbd_rejected_before_parent_applies() {
                     crate::parser::ResolvedDeferredForExpressions::from_expressions_for_test([
                         deferred.clone(),
                     ]),
-                    |_| DeferredForExpansionChoice::Retain,
+                    &crate::binding_index::IterableBindings::from_upstream_only(Default::default()),
+                    &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
                 )
                 .1,
                 &unresolved,

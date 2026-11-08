@@ -59,6 +59,12 @@ awscc.ec2.Vpc {
 }
 ```
 
+Collection operations use the information they need. `length` can count a list with pending elements, and `keys` can return a known map's keys while its values await apply. `values`, `concat`, `lookup`, and `map` preserve pending selected values and their dependencies. `flatten` needs the inner collection shapes for the level it flattens. Scalar operations such as `join` need their element values before evaluation.
+
+A secret passed through a typed function parameter or return keeps its input timing. A `String` annotation does not force a secret containing a resource reference to evaluate during validation.
+
+This does not make an arbitrary provider output's membership known. A loop over `keys(resource.tags)` still requires the map's keys to be available at that loop's supported expansion boundary.
+
 ### Numeric functions
 
 | Function | Signature | Description |

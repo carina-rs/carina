@@ -1,0 +1,2 @@
+let producer = mock.test.resource { name = "producer" }
+mock.test.resource { name = "consumer" tags = producer }

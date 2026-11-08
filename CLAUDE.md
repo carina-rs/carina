@@ -682,7 +682,7 @@ A struct type represents a nested object with typed fields.
   across or explicitly bound and documented as unavailable on the destination
   side. Never use a catch-all `_` or `..` at this seam; a silently dropped field
   is invisible in production and cost carina#3034 its effect (carina#3772).
-- **Desired normalization is per leaf** (carina#4194). One core classifier,
+- **Desired normalization is per leaf** (carina#4194). The normalization opacity policy,
   `carina_core::resource::is_deferred_desired_leaf`, marks every
   `Value::Deferred` leaf (references, unknowns, secrets, other unresolved
   expressions) inside concrete lists/maps. The SDK's `DesiredView` presents
@@ -700,6 +700,44 @@ A struct type represents a nested object with typed fields.
   config and persisted-state values never carry slots, and create/update still
   deliver real secret values. Don't reintroduce a top-level deferred-name list
   or let provider code see a deferred leaf's value.
+- **Runtime value knowledge** (carina#4316) is classified by
+  `Value::knowledge()` in `carina-core/src/resource/knowledge.rs`. Concrete
+  lists/maps can have exact membership while their leaves remain pending.
+  Scalar builtin, shape builtin, child-expansion, ordinary wire, import,
+  and resolved function-constraint boundaries take knowledge proofs. The
+  classifier retains Secret as an opaque node. Known means fully evaluable,
+  including a Secret payload. Pending Secret keeps protected child evidence
+  and inherits its timing; payload errors propagate. Inner proofs and data
+  never leave that boundary; named protected operations own payload computation. Knowledge grants no plaintext access or transport
+  permission. Attempted failures are separate Failed nodes: structural checks
+  retain known sibling findings, while known-value, expansion and plan-boundary
+  projections reject failures in active positions. An unselected coalesce
+  alternative stays typed evidence behind its coalesce-pending node, including
+  after plan projection; selecting it reports the original failure. Protected
+  coalesce and expression timing consume the same classified child evidence.
+  Syntax/type
+  judgement and normalization opacity remain separate policies. The plan
+  boundary accepts only `Knowledge<Plan>` and projects pending results to
+  `PlanResolved`, rejecting remaining Plan-phase work. Validation, Plan, and
+  Apply are distinct context markers, and the Plan and Apply contexts both take
+  the same `ResolvedBindings` type. Structural `Classification` views cannot
+  mint stage proofs, but can yield a fully known, stage-independent `KnownValue`
+  through `into_known`. The apply-specific `KnownValue::from_apply` entry point
+  takes only `Knowledge<Apply>`; it is not the only way to obtain `KnownValue`.
+  Resource and data-source dispatch classify their final attributes with
+  `KnowledgeContext::apply(bindings)` and obtain proofs through
+  `KnownValue::from_apply`. Structural serialization checks do not replace
+  this dispatch gate.
+  Reference timing uses the resolver's shared typed
+  plan-reference decision. Per-attribute validation keeps failed inputs present
+  and continues checking their siblings. Pending sites use LeafPath and operand steps, are enumerated
+  from cached classifications on demand, and remain runtime-only. Visitors
+  stay crate-private to Knowledge consumers. Lexical UserFunction body/local
+  analysis shares immutable evidence within one classification, keyed by the
+  existing function Arc identity. The private lookup is discarded on return;
+  arguments and site paths remain specific to each call. Typed plan projection
+  preserves that sharing without reclassifying source values. Saved candidates
+  must be re-admitted by the admission owner.
 - **LSP integration**: when adding Struct validation, update
   `carina-lsp/src/diagnostics/validation.rs` to validate nested fields;
   completion should work recursively for struct fields.

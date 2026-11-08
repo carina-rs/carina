@@ -24,6 +24,7 @@ pub(crate) mod directive_expr;
 pub(crate) use directive_expr::Substituted;
 mod enum_value;
 mod ignore_changes;
+pub mod knowledge;
 mod loop_origin;
 mod reference_visit;
 mod secret_diagnostic;
@@ -2312,6 +2313,9 @@ impl<'a, B: BindingAddress> From<&'a ReferencePath<B>> for ReferencePathRef<'a, 
 /// concrete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueAccessError {
+    Classification {
+        error: Box<crate::resolver::ResolutionError>,
+    },
     IndexOutOfRange {
         index: i64,
         len: usize,
@@ -2372,6 +2376,7 @@ impl ValueAccessError {
 impl std::fmt::Display for ValueAccessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Classification { error } => error.fmt(f),
             Self::IndexOutOfRange { index, len } => {
                 write!(f, "index {index} out of range for list of length {len}")
             }
@@ -2543,6 +2548,9 @@ struct SecretSelectionError {
 impl InsideSecret for SecretSelectionError {
     fn inside_secret(mut self) -> Self {
         match &mut self.error {
+            ValueAccessError::Classification { error } => {
+                **error = crate::resolver::ResolutionError::InsideSecret {}
+            }
             ValueAccessError::MissingField { available, .. }
             | ValueAccessError::MissingKey { available, .. } => *available = None,
             ValueAccessError::IndexOutOfRange { .. } | ValueAccessError::WrongShape { .. } => {}
@@ -2562,174 +2570,274 @@ fn handle_access_miss<P: ValueKind, B: BindingAddress>(
     }
 }
 
-/// Apply one field/index step to a value.
-///
-/// This is the single semantic primitive used by parsing, runtime resolution,
-/// and [`navigate_value_path`]. Concrete containers are navigated immediately;
-/// a deferred base is retained as [`DeferredValue::Access`]. Secret wrappers
-/// are peeled before navigation and restored around the selected value.
-pub(crate) fn apply_value_path_segment<P: ValueKind, B: BindingAddress>(
+/// A single syntax member selected from a proven concrete root shape. This
+/// neither inspects other children nor grants evaluability to the member.
+enum ConcreteSelection<'a, P: ValueKind, B: BindingAddress> {
+    Member {
+        value: &'a Value<P, B>,
+        step: &'a PathSegment,
+    },
+    String(&'a ValueString),
+}
+impl<P: ValueKind, B: BindingAddress> ConcreteSelection<'_, P, B> {
+    fn into_value(self) -> Value<P, B> {
+        match self {
+            Self::Member { value, .. } => value.clone(),
+            Self::String(value) => Value::Concrete(ConcreteValue::String(value.clone())),
+        }
+    }
+}
+fn select_concrete_member<'a, P: ValueKind, B: BindingAddress>(
+    root: ConcreteValueRef<'a, P, B>,
+    step: &'a PathSegment,
+) -> Result<ConcreteSelection<'a, P, B>, ValueAccessError> {
+    let wrong_shape = |actual| ValueAccessError::WrongShape {
+        step: step.clone(),
+        actual,
+    };
+    match root {
+        ConcreteValueRef::List(items) => match step {
+            PathSegment::Subscript {
+                index: Subscript::Int { index },
+            } => {
+                let position =
+                    checked_list_position(*index, items.len()).map_err(ValueAccessError::from)?;
+                Ok(ConcreteSelection::Member {
+                    value: &items[position],
+                    step,
+                })
+            }
+            PathSegment::Field { .. }
+            | PathSegment::Subscript {
+                index: Subscript::Str { .. },
+            } => Err(wrong_shape("list")),
+        },
+        ConcreteValueRef::StringList(items) => match step {
+            PathSegment::Subscript {
+                index: Subscript::Int { index },
+            } => {
+                let position =
+                    checked_list_position(*index, items.len()).map_err(ValueAccessError::from)?;
+                Ok(ConcreteSelection::String(&items[position]))
+            }
+            PathSegment::Field { .. }
+            | PathSegment::Subscript {
+                index: Subscript::Str { .. },
+            } => Err(wrong_shape("list")),
+        },
+        ConcreteValueRef::Map(items) => {
+            let key = match step {
+                PathSegment::Field { name } => name.as_str(),
+                PathSegment::Subscript {
+                    index: Subscript::Str { key },
+                } => key.expose_plaintext(),
+                PathSegment::Subscript {
+                    index: Subscript::Int { .. },
+                } => return Err(wrong_shape("map")),
+            };
+            if let Some(value) = items.get(key) {
+                return Ok(ConcreteSelection::Member { value, step });
+            }
+            let available = Some(items.keys().cloned().collect());
+            let len = items.len();
+            Err(match step {
+                PathSegment::Field { name } => ValueAccessError::MissingField {
+                    name: name.clone(),
+                    available,
+                    len,
+                },
+                PathSegment::Subscript {
+                    index: Subscript::Str { key },
+                } => ValueAccessError::MissingKey {
+                    key: key.clone(),
+                    available,
+                    len,
+                },
+                PathSegment::Subscript {
+                    index: Subscript::Int { .. },
+                } => wrong_shape("map"),
+            })
+        }
+        ConcreteValueRef::String(_) => Err(wrong_shape("string")),
+        ConcreteValueRef::EnumIdentifier(_) | ConcreteValueRef::CanonicalEnum(_) => {
+            Err(wrong_shape("enum"))
+        }
+        ConcreteValueRef::Int(_) => Err(wrong_shape("integer")),
+        ConcreteValueRef::Float(_) => Err(wrong_shape("float")),
+        ConcreteValueRef::Bool(_) => Err(wrong_shape("boolean")),
+        ConcreteValueRef::Duration(_) => Err(wrong_shape("duration")),
+    }
+}
+fn select_concrete_segment<P: PlaceholderKind, B: BindingAddress>(
+    root: ConcreteValueRef<'_, P, B>,
+    step: &PathSegment,
+    miss_policy: AccessMissPolicy,
+) -> Result<ValuePathSegmentResult<P, B>, ValueAccessError> {
+    match select_concrete_member(root, step) {
+        Ok(selected) => Ok(ValuePathSegmentResult::Resolved(selected.into_value())),
+        Err(
+            error @ (ValueAccessError::MissingField { .. }
+            | ValueAccessError::MissingKey { .. }
+            | ValueAccessError::IndexOutOfRange { .. }),
+        ) if miss_policy == AccessMissPolicy::Defer => {
+            Ok(ValuePathSegmentResult::DeferredMiss(error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Prepare newly constructed syntax for the typed selection operation.
+pub(crate) fn apply_value_path_segment<P: PlaceholderKind, B: BindingAddress>(
     base: Value<P, B>,
     step: PathSegment,
     source_line: usize,
     miss_policy: AccessMissPolicy,
 ) -> Result<ValuePathSegmentResult<P, B>, ValueAccessError> {
+    // Postfix construction consumes only root syntax. ConcreteValueRef proves
+    // that root's shape without recursively classifying unrelated members.
+    if let Some(root) = base.as_concrete() {
+        return select_concrete_segment(root, &step, miss_policy);
+    }
     if let Value::Deferred(DeferredValue::Secret(payload)) = &base {
-        let mut deferred = false;
-        let selected = payload.try_map(|value| {
-            match apply_value_path_segment(value.clone(), step, source_line, miss_policy).map_err(
-                |error| SecretSelectionError {
-                    error,
-                    deferred_miss: false,
-                },
-            )? {
-                ValuePathSegmentResult::Resolved(value) => Ok(value),
-                ValuePathSegmentResult::Deferred(value) => {
-                    deferred = true;
-                    Ok(value)
-                }
-                ValuePathSegmentResult::DeferredMiss(error) => Err(SecretSelectionError {
-                    error,
-                    deferred_miss: true,
-                }),
-            }
-        });
-        return match selected {
-            Ok(payload) => {
-                let value = Value::Deferred(DeferredValue::Secret(payload));
-                Ok(if deferred {
-                    ValuePathSegmentResult::Deferred(value)
-                } else {
-                    ValuePathSegmentResult::Resolved(value)
-                })
-            }
-            Err(SecretSelectionError {
-                error,
-                deferred_miss: true,
-            }) => Ok(ValuePathSegmentResult::DeferredMiss(error)),
-            Err(SecretSelectionError {
+        return select_secret_segment(payload, step, source_line, miss_policy);
+    }
+    // Syntax construction retains both coalesce operands. Resolution owns
+    // choosing an operand; projecting its membership here would discard the
+    // authored expression needed by type judgement and diagnostics.
+    if matches!(&base, Value::Deferred(DeferredValue::Coalesce { .. })) {
+        return Ok(ValuePathSegmentResult::Deferred(deferred_access(
+            base,
+            step,
+            source_line,
+        )));
+    }
+    let proof = base
+        .knowledge(&knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        .map_err(|error| ValueAccessError::Classification {
+            error: Box::new(error.into()),
+        })?;
+    select_classified_segment((&proof).into(), step, source_line, miss_policy)
+}
+fn select_secret_segment<P: PlaceholderKind, B: BindingAddress>(
+    payload: &SecretPayload<P, B>,
+    step: PathSegment,
+    source_line: usize,
+    miss_policy: AccessMissPolicy,
+) -> Result<ValuePathSegmentResult<P, B>, ValueAccessError> {
+    let mut deferred = false;
+    let selected = payload.try_map(|value| {
+        match apply_value_path_segment(value.clone(), step, source_line, miss_policy).map_err(
+            |error| SecretSelectionError {
                 error,
                 deferred_miss: false,
-            }) => Err(error),
-        };
+            },
+        )? {
+            ValuePathSegmentResult::Resolved(value) => Ok(value),
+            ValuePathSegmentResult::Deferred(value) => {
+                deferred = true;
+                Ok(value)
+            }
+            ValuePathSegmentResult::DeferredMiss(error) => Err(SecretSelectionError {
+                error,
+                deferred_miss: true,
+            }),
+        }
+    });
+    match selected {
+        Ok(payload) => {
+            let value = Value::Deferred(DeferredValue::Secret(payload));
+            Ok(if deferred {
+                ValuePathSegmentResult::Deferred(value)
+            } else {
+                ValuePathSegmentResult::Resolved(value)
+            })
+        }
+        Err(SecretSelectionError {
+            error,
+            deferred_miss: true,
+        }) => Ok(ValuePathSegmentResult::DeferredMiss(error)),
+        Err(SecretSelectionError {
+            error,
+            deferred_miss: false,
+        }) => Err(error),
     }
-    let selected = match base {
-        Value::Deferred(DeferredValue::ResourceRef { path }) => {
-            let reference = Value::Deferred(DeferredValue::ResourceRef {
-                path: path.with_appended_segment(step),
-            });
-            return Ok(ValuePathSegmentResult::Deferred(reference));
-        }
-        Value::Deferred(DeferredValue::BindingRef { binding }) => {
-            let reference = match step {
-                PathSegment::Field { name } => Value::Deferred(DeferredValue::ResourceRef {
-                    path: AccessPath::from_binding(binding, name, Vec::new()),
-                }),
-                PathSegment::Subscript {
-                    index: Subscript::Int { index },
-                } => Value::Deferred(DeferredValue::BindingRef {
-                    binding: binding_with_index(&binding, index),
-                }),
-                PathSegment::Subscript {
-                    index: Subscript::Str { key },
-                } => Value::Deferred(DeferredValue::BindingRef {
-                    binding: binding_with_map_key(&binding, &key),
-                }),
-            };
-            return Ok(ValuePathSegmentResult::Deferred(reference));
-        }
-        Value::Deferred(deferred) => {
-            let base = Value::Deferred(deferred);
-            return Ok(ValuePathSegmentResult::Deferred(deferred_access(
-                base,
-                step,
-                source_line,
-            )));
-        }
-        Value::Concrete(ConcreteValue::List(items)) => match &step {
-            PathSegment::Subscript {
-                index: Subscript::Int { index },
-            } => {
-                let position = match checked_list_position(*index, items.len()) {
-                    Ok(position) => position,
-                    Err(error) => {
-                        return handle_access_miss(miss_policy, error);
-                    }
-                };
-                items[position].clone()
-            }
-            _ => {
-                return Err(ValueAccessError::WrongShape {
-                    step: step.clone(),
-                    actual: "list",
-                });
-            }
-        },
-        Value::Concrete(ConcreteValue::StringList(items)) => match &step {
-            PathSegment::Subscript {
-                index: Subscript::Int { index },
-            } => {
-                let position = match checked_list_position(*index, items.len()) {
-                    Ok(position) => position,
-                    Err(error) => {
-                        return handle_access_miss(miss_policy, error);
-                    }
-                };
-                Value::Concrete(ConcreteValue::String(items[position].clone()))
-            }
-            _ => {
-                return Err(ValueAccessError::WrongShape {
-                    step: step.clone(),
-                    actual: "list",
-                });
-            }
-        },
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            let available = Some(map.keys().cloned().collect());
-            let len = map.len();
-            match &step {
-                PathSegment::Field { name } => match map.get(name).cloned() {
-                    Some(value) => value,
-                    None => {
-                        let error = ValueAccessMiss::MissingField {
-                            name: name.clone(),
-                            available,
-                            len,
-                        };
-                        return handle_access_miss(miss_policy, error);
-                    }
-                },
-                PathSegment::Subscript {
-                    index: Subscript::Str { key },
-                } => match map.get(key.expose_plaintext()).cloned() {
-                    Some(value) => value,
-                    None => {
-                        let error = ValueAccessMiss::MissingKey {
-                            key: key.clone(),
-                            available,
-                            len,
-                        };
-                        return handle_access_miss(miss_policy, error);
-                    }
-                },
-                _ => {
-                    return Err(ValueAccessError::WrongShape {
-                        step: step.clone(),
-                        actual: "map",
-                    });
-                }
-            }
-        }
-        Value::Concrete(concrete) => {
-            let actual = concrete_value_shape(&concrete);
-            return Err(ValueAccessError::WrongShape {
-                step: step.clone(),
-                actual,
-            });
-        }
-    };
+}
 
-    Ok(ValuePathSegmentResult::Resolved(selected))
+/// The classified selector belongs to the internal knowledge consumers.
+///
+/// ```compile_fail,E0603
+/// use carina_core::resource::select_classified_segment;
+/// ```
+fn select_classified_segment<P: PlaceholderKind, B: BindingAddress>(
+    base: knowledge::ClassifiedRef<'_, '_, P, B>,
+    step: PathSegment,
+    source_line: usize,
+    miss_policy: AccessMissPolicy,
+) -> Result<ValuePathSegmentResult<P, B>, ValueAccessError> {
+    use knowledge::ClassifiedRef;
+    if let Some(payload) = base.secret() {
+        return select_secret_segment(payload, step, source_line, miss_policy);
+    }
+    match base {
+        ClassifiedRef::Pending(_) => {
+            let value = match base.diagnostic_value() {
+                Value::Deferred(DeferredValue::ResourceRef { path }) => {
+                    Value::Deferred(DeferredValue::ResourceRef {
+                        path: path.clone().with_appended_segment(step),
+                    })
+                }
+                Value::Deferred(DeferredValue::BindingRef { binding }) => match step {
+                    PathSegment::Field { name } => Value::Deferred(DeferredValue::ResourceRef {
+                        path: AccessPath::from_binding(binding.clone(), name, Vec::new()),
+                    }),
+                    PathSegment::Subscript {
+                        index: Subscript::Int { index },
+                    } => Value::Deferred(DeferredValue::BindingRef {
+                        binding: binding_with_index(binding, index),
+                    }),
+                    PathSegment::Subscript {
+                        index: Subscript::Str { key },
+                    } => Value::Deferred(DeferredValue::BindingRef {
+                        binding: binding_with_map_key(binding, &key),
+                    }),
+                },
+                Value::Deferred(DeferredValue::Secret(_)) => {
+                    unreachable!("Secret has an opaque known arm")
+                }
+                Value::Deferred(
+                    DeferredValue::ModuleIf(_)
+                    | DeferredValue::Coalesce { .. }
+                    | DeferredValue::IntegerArithmetic(_)
+                    | DeferredValue::Interpolation(_)
+                    | DeferredValue::FunctionCall { .. }
+                    | DeferredValue::Unavailable { .. }
+                    | DeferredValue::ResolvedFunctionCall { .. }
+                    | DeferredValue::Access(_)
+                    | DeferredValue::Unknown(_)
+                    | DeferredValue::Placeholder(_),
+                ) => deferred_access(base.diagnostic_value().clone(), step, source_line),
+                Value::Concrete(_) => unreachable!("concrete roots carry classified structure"),
+            };
+            Ok(ValuePathSegmentResult::Deferred(value))
+        }
+        ClassifiedRef::Failed(_) => Ok(ValuePathSegmentResult::Deferred(deferred_access(
+            base.diagnostic_value().clone(),
+            step,
+            source_line,
+        ))),
+        ClassifiedRef::Known(_) | ClassifiedRef::Shape(_) => match base.concrete() {
+            Some(root) => select_concrete_segment(root, &step, miss_policy),
+            None => Err(ValueAccessError::Classification {
+                error: Box::new(
+                    knowledge::KnowledgeError::<B>::InvalidStage {
+                        operation: "selection of classified structure",
+                    }
+                    .into(),
+                ),
+            }),
+        },
+    }
 }
 
 /// Construct one postfix access through the canonical access seam.
@@ -2744,8 +2852,7 @@ pub fn apply_postfix_access<P: ValueKind, B: BindingAddress>(
     source_line: usize,
     miss_policy: AccessMissPolicy,
 ) -> Result<Value<P, B>, ValueAccessError> {
-    apply_value_path_segment(base, step, source_line, miss_policy)
-        .and_then(ValuePathSegmentResult::into_value)
+    P::construct_access(base, step, source_line, miss_policy)
 }
 
 /// Build the parser-stage access rooted at a deferred for-loop binding.
@@ -2792,7 +2899,7 @@ pub(crate) fn parser_deferred_for_access(
 /// [`DeferredValue::Access`] for a concrete navigation result. A
 /// loop-variable path that does not navigate is "not resolvable here", never
 /// a panic or a wrong value.
-pub fn navigate_value_path<P: ValueKind, B: BindingAddress>(
+pub fn navigate_value_path<P: PlaceholderKind, B: BindingAddress>(
     root: &Value<P, B>,
     path: &AccessPath<B>,
 ) -> Option<Value<P, B>> {
@@ -2822,15 +2929,13 @@ pub fn navigate_value_path<P: ValueKind, B: BindingAddress>(
                 }
             };
     }
-    value_has_concrete_root(&current).then_some(current)
-}
-
-fn value_has_concrete_root<P: ValueKind, B: BindingAddress>(value: &Value<P, B>) -> bool {
-    match value {
-        Value::Concrete(_) => true,
-        Value::Deferred(DeferredValue::Secret(payload)) => payload.visit(value_has_concrete_root),
-        Value::Deferred(_) => false,
-    }
+    matches!(
+        current
+            .knowledge(&knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification()),
+        Ok(knowledge::Classification::Known(_) | knowledge::Classification::ShapeKnown(_))
+    )
+    .then_some(current)
 }
 
 /// Serde adapter that maps `std::time::Duration` ↔ integer seconds.
@@ -4059,7 +4164,10 @@ impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
         base: Value<P, B>,
         step: PathSegment,
         miss_policy: AccessMissPolicy,
-    ) -> Result<ValuePathSegmentResult<P, B>, ValueAccessError> {
+    ) -> Result<ValuePathSegmentResult<P, B>, ValueAccessError>
+    where
+        P: PlaceholderKind,
+    {
         apply_value_path_segment(base, step, self.source_line, miss_policy).map(|result| {
             let restore_display_root = |value: Value<P, B>| match &self.display_root {
                 Some(LoopAccessDisplayRoot::Rooted(root))
@@ -4108,7 +4216,10 @@ impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
         base: Value<P, B>,
         step: PathSegment,
         miss_policy: AccessMissPolicy,
-    ) -> Result<Value<P, B>, ValueAccessError> {
+    ) -> Result<Value<P, B>, ValueAccessError>
+    where
+        P: PlaceholderKind,
+    {
         self.rebuild_result(base, step, miss_policy)
             .and_then(ValuePathSegmentResult::into_value)
     }
@@ -4117,7 +4228,10 @@ impl<P: ValueKind, B: BindingAddress> AccessExpr<P, B> {
         &self,
         base: Value<P, B>,
         miss_policy: AccessMissPolicy,
-    ) -> Result<Value<P, B>, ValueAccessError> {
+    ) -> Result<Value<P, B>, ValueAccessError>
+    where
+        P: PlaceholderKind,
+    {
         self.rebuild(base, self.step.clone(), miss_policy)
     }
 
@@ -4180,34 +4294,9 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
         }
     }
 
-    /// Whether this value is the one syntactic shape for which `??` may
-    /// interpret a missing selection as absence: a direct reference, or an
-    /// access chain whose base is itself a direct reference.
-    ///
-    /// References nested in collections, interpolations, function arguments,
-    /// or secret wrappers are inputs to a larger computation. Their absence is
-    /// therefore not the absence of that computation.
-    pub fn is_coalesce_optional_reference(&self) -> bool {
-        match self {
-            Value::Deferred(
-                DeferredValue::ResourceRef { .. } | DeferredValue::BindingRef { .. },
-            ) => true,
-            Value::Deferred(DeferredValue::Access(access)) => {
-                access.base().is_coalesce_optional_reference()
-            }
-            _ => false,
-        }
-    }
-
-    /// Whether this expression can propagate definitive absence when it is
-    /// itself the left operand of another coalesce. Besides a direct optional
-    /// reference, a nested coalesce can do so: in `(a ?? b) ?? c`, both `a`
-    /// and `b` are optional alternatives before `c` is selected.
-    pub fn is_coalesce_optional_operand(&self) -> bool {
-        match self {
-            Value::Deferred(DeferredValue::Coalesce { .. }) => true,
-            _ => self.is_coalesce_optional_reference(),
-        }
+    /// Describe the syntactic operands whose definitive misses may propagate through coalesce.
+    pub fn optional_operand(&self) -> Option<knowledge::OptionalOperand<'_, P, B>> {
+        knowledge::OptionalOperand::classify(self)
     }
 
     /// Collect the root binding names referenced anywhere in this value.
@@ -4238,48 +4327,6 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
             }
         });
         source
-    }
-
-    /// Whether this value contains no runtime-deferred computation.
-    pub fn is_fully_resolved(&self) -> bool
-    where
-        P: PlaceholderKind,
-    {
-        match self {
-            Value::Concrete(ConcreteValue::List(values)) => {
-                values.iter().all(Value::is_fully_resolved)
-            }
-            Value::Concrete(ConcreteValue::Map(values)) => {
-                values.values().all(Value::is_fully_resolved)
-            }
-            Value::Deferred(DeferredValue::Secret(inner)) => {
-                inner.visit(|secret_value| secret_value.is_fully_resolved())
-            }
-            Value::Concrete(
-                ConcreteValue::String(_)
-                | ConcreteValue::EnumIdentifier(_)
-                | ConcreteValue::CanonicalEnum(_)
-                | ConcreteValue::Int(_)
-                | ConcreteValue::Float(_)
-                | ConcreteValue::Bool(_)
-                | ConcreteValue::Duration(_)
-                | ConcreteValue::StringList(_),
-            ) => true,
-            Value::Deferred(
-                DeferredValue::ModuleIf(_)
-                | DeferredValue::ResourceRef { .. }
-                | DeferredValue::BindingRef { .. }
-                | DeferredValue::Coalesce { .. }
-                | DeferredValue::IntegerArithmetic(_)
-                | DeferredValue::Interpolation(_)
-                | DeferredValue::FunctionCall { .. }
-                | DeferredValue::Unavailable { .. }
-                | DeferredValue::ResolvedFunctionCall { .. }
-                | DeferredValue::Access(_)
-                | DeferredValue::Unknown(_)
-                | DeferredValue::Placeholder(_),
-            ) => false,
-        }
     }
 
     /// Preserve an authored reference occurrence after substituting its base.
@@ -6257,6 +6304,12 @@ pub enum PlaceholderTypeAuthority<'a> {
 /// Internal behavior shared by the three stage marker types.
 #[doc(hidden)]
 pub trait ValueKind: Clone + PartialEq + fmt::Debug + fmt::Display + serde::Serialize {
+    fn construct_access<B: BindingAddress>(
+        base: Value<Self, B>,
+        step: PathSegment,
+        source_line: usize,
+        policy: AccessMissPolicy,
+    ) -> Result<Value<Self, B>, ValueAccessError>;
     /// Lifecycle settings follow the same authored-to-expanded phase as values.
     type DirectiveBool<B: BindingAddress>: Clone + fmt::Debug + PartialEq + Default + Send + Sync;
     type DirectivePreventDestroy<B: BindingAddress>: Clone
@@ -6325,10 +6378,9 @@ pub trait ValueKind: Clone + PartialEq + fmt::Debug + fmt::Display + serde::Seri
 }
 
 mod evaluable_leaf {
-    pub trait Sealed {}
-    impl Sealed for super::NoPlaceholder {}
-    impl Sealed for super::ParserPlaceholder {}
-    impl Sealed for super::LoopSlot {}
+    pub trait Sealed {
+        fn substitution_kind(&self) -> super::knowledge::SubstitutionKind;
+    }
 }
 
 /// A leaf permitted in evaluation, validation, and expansion inputs.
@@ -6366,6 +6418,16 @@ impl PlaceholderKind for LoopSlot {
 }
 
 impl ValueKind for NoPlaceholder {
+    fn construct_access<B: BindingAddress>(
+        base: Value<Self, B>,
+        step: PathSegment,
+        source_line: usize,
+        policy: AccessMissPolicy,
+    ) -> Result<Value<Self, B>, ValueAccessError> {
+        apply_value_path_segment(base, step, source_line, policy)
+            .and_then(ValuePathSegmentResult::into_value)
+    }
+
     type DirectiveBool<B: BindingAddress> = bool;
     type DirectivePreventDestroy<B: BindingAddress> = PreventDestroy;
     fn rebind_directives<B: BindingAddress, C: BindingAddress>(
@@ -6399,6 +6461,16 @@ impl fmt::Display for LoopSlot {
 }
 
 impl ValueKind for LoopSlot {
+    fn construct_access<B: BindingAddress>(
+        base: Value<Self, B>,
+        step: PathSegment,
+        source_line: usize,
+        policy: AccessMissPolicy,
+    ) -> Result<Value<Self, B>, ValueAccessError> {
+        apply_value_path_segment(base, step, source_line, policy)
+            .and_then(ValuePathSegmentResult::into_value)
+    }
+
     type DirectiveBool<B: BindingAddress> = LoopDirective<bool, B>;
     type DirectivePreventDestroy<B: BindingAddress> = LoopDirective<PreventDestroy, B>;
     fn rebind_directives<B: BindingAddress, C: BindingAddress>(
@@ -6439,6 +6511,16 @@ impl ValueKind for LoopSlot {
 }
 
 impl ValueKind for ParserPlaceholder {
+    fn construct_access<B: BindingAddress>(
+        base: Value<Self, B>,
+        step: PathSegment,
+        source_line: usize,
+        policy: AccessMissPolicy,
+    ) -> Result<Value<Self, B>, ValueAccessError> {
+        apply_value_path_segment(base, step, source_line, policy)
+            .and_then(ValuePathSegmentResult::into_value)
+    }
+
     type DirectiveBool<B: BindingAddress> = Option<DirectiveExpr<B>>;
     type DirectivePreventDestroy<B: BindingAddress> = Option<DirectiveExpr<B>>;
     fn rebind_directives<B: BindingAddress, C: BindingAddress>(
@@ -7342,12 +7424,19 @@ fn canonicalize_interpolation<P: PlaceholderKind, B: BindingAddress>(
             InterpolationPart::Literal(s) => InterpolationPart::Literal(s),
             InterpolationPart::Expr(mut v) => {
                 v.canonicalize_in_place();
-                match value_into_literal(v) {
-                    Ok((s, is_secret)) => {
+                let literal = v
+                    .knowledge(&knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .ok()
+                    .and_then(|knowledge| knowledge.into_known().ok())
+                    .as_ref()
+                    .and_then(value_into_literal);
+                match literal {
+                    Some((s, is_secret)) => {
                         contains_folded_secret |= is_secret;
                         InterpolationPart::Literal(s)
                     }
-                    Err(other) => InterpolationPart::Expr(other),
+                    None => InterpolationPart::Expr(v),
                 }
             }
         };
@@ -7388,32 +7477,25 @@ fn canonicalize_interpolation<P: PlaceholderKind, B: BindingAddress>(
 /// A scalar inside `Secret(_)` is folded through the same conversion and
 /// reports that provenance to the caller, which wraps the completed
 /// interpolation in `Secret` rather than dropping the sensitivity tag.
-fn value_into_literal<P: ValueKind, B: BindingAddress>(
-    v: Value<P, B>,
-) -> Result<(ValueString, bool), Value<P, B>> {
-    match v {
-        Value::Concrete(ConcreteValue::String(s)) => Ok((s, false)),
-        Value::Concrete(ConcreteValue::Int(n)) => Ok((n.to_string().into(), false)),
-        Value::Concrete(ConcreteValue::Float(f)) => Ok((f.to_string().into(), false)),
-        Value::Concrete(ConcreteValue::Bool(b)) => Ok((b.to_string().into(), false)),
-        secret @ Value::Deferred(DeferredValue::Secret(_)) => {
-            let Value::Deferred(DeferredValue::Secret(payload)) = &secret else {
-                unreachable!()
-            };
-            let literal = payload
-                .try_project_plaintext(|value| {
-                    value_into_literal(value.clone())
-                        .map(|(text, _)| text)
-                        .map_err(|_| ())
-                })
-                .ok();
-            match literal {
-                Some(text) => Ok((text, true)),
-                None => Err(secret),
-            }
-        }
-        other => Err(other),
-    }
+fn value_into_literal<P: PlaceholderKind, B: BindingAddress>(
+    v: &knowledge::KnownValue<'_, P, B>,
+) -> Option<(ValueString, bool)> {
+    use knowledge::KnownView;
+    v.visit(
+        |v| match v {
+            KnownView::String(s) => Some((s.clone(), false)),
+            KnownView::Int(n) => Some((n.to_string().into(), false)),
+            KnownView::Float(n) => Some((n.to_string().into(), false)),
+            KnownView::Bool(n) => Some((n.to_string().into(), false)),
+            KnownView::EnumIdentifier(_)
+            | KnownView::CanonicalEnum(_)
+            | KnownView::Duration(_)
+            | KnownView::List(_)
+            | KnownView::StringList(_)
+            | KnownView::Map(_) => None,
+        },
+        |secret| secret.interpolation_literal().map(|text| (text, true)),
+    )
 }
 
 /// Whether a resource reference must exist or is the value tested by `??`.
@@ -7650,13 +7732,13 @@ impl<P: ValueKind, B: BindingAddress> Value<P, B> {
                 access.base().visit_resource_refs_in_scope(usage, scope, f);
             }
             Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-                let value_usage = if value.is_coalesce_optional_operand() {
+                let value_usage = if value.optional_operand().is_some() {
                     ResourceRefUsage::CoalesceValue
                 } else {
                     ResourceRefUsage::Required
                 };
                 let default_usage = if usage == ResourceRefUsage::CoalesceValue
-                    && default.is_coalesce_optional_operand()
+                    && default.optional_operand().is_some()
                 {
                     ResourceRefUsage::CoalesceValue
                 } else {
@@ -7834,7 +7916,7 @@ pub fn is_deferred_desired_leaf(value: &Value) -> bool {
 ///
 /// This structural inventory enforces the state-format invariant; it makes no
 /// claim that the tree can be evaluated or that historical hashes are values.
-pub fn value_contains_unknown<P: ValueKind>(value: &Value<P>) -> bool {
+pub fn value_contains_unknown<P: ValueKind, B: BindingAddress>(value: &Value<P, B>) -> bool {
     match value {
         Value::Deferred(DeferredValue::ModuleIf(deferred)) => {
             deferred.values().into_iter().any(value_contains_unknown)
@@ -10665,40 +10747,122 @@ mod enum_attr_tests {
     }
 }
 
-/// Check that a resource's attribute tree is free of provider-ineligible
-/// [`Value::Deferred`] payloads before provider dispatch.
-pub(crate) fn assert_resource_fully_resolved<S, D>(
+/// Require apply-stage known-value proofs for every provider-bound attribute.
+pub(crate) fn assert_resource_known_for_apply<S, D>(
     resource: &Resource<S, NoPlaceholder, AbsoluteBindingAddress, D>,
+    context: &knowledge::KnowledgeContext<
+        '_,
+        NoPlaceholder,
+        AbsoluteBindingAddress,
+        knowledge::Apply,
+    >,
 ) -> Result<(), crate::value::SerializationError> {
     for value in resource.attributes.values() {
-        assert_value_fully_resolved(value)?;
+        require_known_for_apply(
+            value
+                .knowledge(context)
+                .map_err(knowledge_serialization_error)?,
+        )?;
     }
     Ok(())
 }
 
-pub(crate) fn assert_value_fully_resolved(
-    value: &Value,
-) -> Result<(), crate::value::SerializationError> {
+/// Apply dispatch can obtain a value only through the apply-stage projection.
+pub(crate) fn require_known_for_apply<'a>(
+    value: knowledge::Knowledge<'a, NoPlaceholder, AbsoluteBindingAddress, knowledge::Apply>,
+) -> Result<knowledge::KnownValue<'a>, crate::value::SerializationError> {
+    let rejection = serialization_rejection(&value);
+    knowledge::KnownValue::from_apply(value)
+        .map_err(|error| rejection.unwrap_or_else(|| knowledge_serialization_error(error)))
+}
+
+/// Narrow structural classifier evidence while preserving serialization diagnostics.
+pub(crate) fn require_known_value<'a>(
+    value: knowledge::Classification<'a>,
+) -> Result<knowledge::KnownValue<'a>, crate::value::SerializationError> {
+    value.project_known(|value| {
+        serialization_rejection(value).unwrap_or_else(|| {
+            knowledge_serialization_error(knowledge::KnowledgeError::InvalidStage {
+                operation: "known-value projection",
+            })
+        })
+    })
+}
+
+fn serialization_rejection(
+    value: &knowledge::Classification<'_>,
+) -> Option<crate::value::SerializationError> {
+    use knowledge::{Classification, ShapeView};
+    match value {
+        Classification::Known(_) => None,
+        Classification::Failed(value) => Some(knowledge_serialization_error(value.error())),
+        Classification::ShapeKnown(shape) => {
+            // Coalesce can expose known membership while its selection has
+            // not run. Its root expression remains ineligible for dispatch.
+            if knowledge::ClassifiedRef::Shape(shape).coalesce().is_some() {
+                return Some(crate::value::SerializationError::UnresolvedCoalesce {
+                    context: crate::value::SerializationContext::WasmBoundary,
+                });
+            }
+            shape.visit(
+                |view| match view {
+                    ShapeView::List(items) => items.iter().find_map(serialization_rejection),
+                    ShapeView::Map(items) => items.values().find_map(serialization_rejection),
+                },
+                |secret| secret.require_known_for_serialization().err(),
+            )
+        }
+        Classification::Pending(value) => value.visit(
+            |_, _, _| unresolved_value_error(&value.to_value()).err(),
+            |secret| secret.require_known_for_serialization().err(),
+        ),
+    }
+}
+pub(crate) fn knowledge_serialization_error(
+    error: knowledge::KnowledgeError,
+) -> crate::value::SerializationError {
+    use crate::value::{SerializationContext, SerializationError};
+    use knowledge::KnowledgeError;
+    match error {
+        KnowledgeError::Unavailable { name, reason, .. } => {
+            let error = SerializationError::UnresolvedFunctionCall {
+                name,
+                context: SerializationContext::WasmBoundary,
+            };
+            match reason {
+                SecretDiagnosticError::Public(_) => error,
+                SecretDiagnosticError::InsideSecret => error.inside_secret(),
+            }
+        }
+        KnowledgeError::UnavailableHistoricalSecret(error) => {
+            SerializationError::UnavailableSecret(error)
+        }
+        KnowledgeError::UnresolvedAtBoundary { .. }
+        | KnowledgeError::InvalidStage { .. }
+        | KnowledgeError::Cycle { .. } => SerializationError::Knowledge {
+            error: Box::new(error.into()),
+            context: SerializationContext::WasmBoundary,
+        },
+    }
+}
+
+// Select the established diagnostic for a pending expression. Availability is
+// decided by Classification before this formatter is entered.
+fn unresolved_value_error(value: &Value) -> Result<(), crate::value::SerializationError> {
     let context = crate::value::SerializationContext::WasmBoundary;
     match value {
         Value::Deferred(DeferredValue::ModuleIf(_)) => {
             Err(crate::value::SerializationError::UnexpandedModuleIf { context })
         }
-        Value::Concrete(ConcreteValue::List(items)) => {
-            for item in items {
-                assert_value_fully_resolved(item)?;
-            }
-            Ok(())
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            for v in map.values() {
-                assert_value_fully_resolved(v)?;
-            }
-            Ok(())
-        }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            inner.try_inspect(assert_value_fully_resolved)
-        }
+        Value::Deferred(DeferredValue::Secret(inner)) => inner.try_inspect(|value| {
+            require_known_value(
+                value
+                    .knowledge(&knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .map_err(knowledge_serialization_error)?,
+            )
+            .map(|_| ())
+        }),
         Value::Deferred(DeferredValue::ResourceRef { path }) => {
             Err(crate::value::SerializationError::UnresolvedResourceRef {
                 path: path.to_dot_string(),
@@ -10745,14 +10909,11 @@ pub(crate) fn assert_value_fully_resolved(
             })
         }
         Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
-        Value::Concrete(ConcreteValue::String(_))
-        | Value::Concrete(ConcreteValue::EnumIdentifier(_))
-        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
-        | Value::Concrete(ConcreteValue::Int(_))
-        | Value::Concrete(ConcreteValue::Float(_))
-        | Value::Concrete(ConcreteValue::Bool(_))
-        | Value::Concrete(ConcreteValue::Duration(_))
-        | Value::Concrete(ConcreteValue::StringList(_)) => Ok(()),
+        Value::Concrete(_) => Err(knowledge_serialization_error(
+            knowledge::KnowledgeError::InvalidStage {
+                operation: "known-value projection",
+            },
+        )),
     }
 }
 
@@ -11523,3 +11684,92 @@ pub(crate) use snapshot::state_value_snapshot;
 pub type SnapshotState = State<SnapshotLeaf>;
 
 pub(crate) use snapshot::convert_directives;
+
+#[cfg(test)]
+pub(crate) mod known_value_gate_tests {
+    use super::*;
+    pub(crate) fn coalesces() -> [Value; 2] {
+        [
+            ConcreteValue::List(vec![Value::Concrete(ConcreteValue::Int(1))]),
+            ConcreteValue::Map(indexmap::IndexMap::from([(
+                "key".into(),
+                Value::Concrete(ConcreteValue::Int(1)),
+            )])),
+        ]
+        .map(|left| {
+            Value::Deferred(DeferredValue::Coalesce {
+                value: Box::new(Value::Concrete(left)),
+                default: Box::new(Value::Concrete(ConcreteValue::List(vec![]))),
+            })
+        })
+    }
+    #[test]
+    fn known_projection_rejects_coalesce_with_known_collection_children() {
+        for value in coalesces() {
+            assert!(matches!(
+                require_known_value(
+                    value
+                        .knowledge(&knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .unwrap()
+                ),
+                Err(crate::value::SerializationError::UnresolvedCoalesce { .. })
+            ));
+        }
+    }
+    #[test]
+    fn resource_gate_rejects_coalesce_with_known_collection_children() {
+        for value in coalesces() {
+            let resource: Resource = Resource::with_provider("test", "widget", "example", None)
+                .with_attribute("value", value);
+            assert!(matches!(
+                assert_resource_known_for_apply(
+                    &resource,
+                    &knowledge::KnowledgeContext::apply(
+                        &crate::binding_index::ResolvedBindings::default()
+                    )
+                ),
+                Err(crate::value::SerializationError::UnresolvedCoalesce { .. })
+            ));
+        }
+    }
+    #[test]
+    fn protected_gate_rejects_coalesce_with_known_collection_children() {
+        for value in coalesces() {
+            let value: Value = Value::Deferred(DeferredValue::Secret(Box::new(value).into()));
+            let proof = value
+                .knowledge(&knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap();
+            let knowledge::Classification::Pending(pending) = proof else {
+                panic!("pending secret")
+            };
+            let result = pending.visit(
+                |_, _, _| panic!("opaque secret"),
+                |secret| secret.require_known_for_serialization(),
+            );
+            assert!(matches!(
+                result,
+                Err(crate::value::SerializationError::InsideSecret { .. })
+            ));
+        }
+    }
+    #[test]
+    fn protocol_gate_rejects_coalesce_with_known_collection_children() {
+        for value in coalesces() {
+            assert!(matches!(
+                crate::protocol_convert::require_known_for_protocol(
+                    value
+                        .knowledge(&knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .unwrap()
+                ),
+                Err(
+                    crate::protocol_convert::ProtocolConvertError::NonWireValue {
+                        variant: "Coalesce"
+                    }
+                )
+            ));
+        }
+    }
+}

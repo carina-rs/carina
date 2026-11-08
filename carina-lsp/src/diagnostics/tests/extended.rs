@@ -805,7 +805,10 @@ fn unique_list_item_error_does_not_mark_a_duplicate_as_reported() {
         "an item error must not suppress a duplicate in a later pass"
     );
     let evaluated = carina_core::parser::evaluate_static_value_for_validation(
-        value,
+        &value
+            .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap(),
         document.provider_context(),
     )
     .unwrap();
@@ -3643,7 +3646,21 @@ fn suspension_deduplication_does_not_turn_validation_errors_into_success() {
     let validate = || {
         schema
             .validate_with_resolver(
-                &attributes,
+                &attributes
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.clone(),
+                            value
+                                .knowledge(
+                                    &carina_core::resource::knowledge::KnowledgeContext::validation(
+                                    ),
+                                )
+                                .map(|proof| proof.into_classification())
+                                .unwrap(),
+                        )
+                    })
+                    .collect(),
                 &|_| false,
                 engine.provider_context.custom_type_resolver(),
             )
@@ -3962,7 +3979,20 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
         )
         .expect("test schema must be owner-bound")
         .validate_with_resolver(
-            &attributes,
+            &attributes
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        value
+                            .knowledge(
+                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
+                            )
+                            .map(|proof| proof.into_classification())
+                            .unwrap(),
+                    )
+                })
+                .collect(),
             &|name| name == "hosted_zone_id",
             &core_resolver,
         )

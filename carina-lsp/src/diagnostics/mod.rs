@@ -30,6 +30,8 @@ use carina_core::validation::DeferredAccessTypeError;
 
 type Value = GenericValue<ParserPlaceholder, RelativeBindingName>;
 
+use carina_core::resource::knowledge::collect_classified_attributes;
+
 type ExpandedAnalysis<'a> = carina_core::parser::AnalysisTree<
     'a,
     ParserPlaceholder,
@@ -1531,22 +1533,68 @@ impl DiagnosticRun<'_> {
                     let schema = validated_schema.as_schema();
                     // Build block_name -> canonical_name map for this schema
                     let bn_map = schema.block_name_map();
-                    let mut resolved_attrs = semantic_resource_attributes
+                    let resolved_attrs = semantic_resource_attributes
                         .as_ref()
                         .map(carina_core::resource::attrs_to_hashmap)
                         .unwrap_or_else(|| rref.resolved_attributes());
-                    for value in resolved_attrs.values_mut() {
-                        if let Some(evaluated) =
+                    let knowledge_context =
+                        carina_core::resource::knowledge::KnowledgeContext::validation();
+                    let mut classification_error =
+                        |name: &str,
+                         error: carina_core::resource::knowledge::KnowledgeError<
+                            carina_core::resource::RelativeBindingName,
+                        >| {
+                            let finding = carina_core::parser::Located::new(
+                                rref.attribute_value_location(
+                                    name,
+                                    &carina_core::schema::FieldPath::new(),
+                                )
+                                .clone(),
+                                error.to_string(),
+                            );
+                            diagnostics.extend(render_merged(
+                                doc,
+                                &finding,
+                                DiagnosticSeverity::ERROR,
+                                finding.detail().clone(),
+                            ));
+                        };
+                    let mut classified_attrs = collect_classified_attributes(
+                        resolved_attrs
+                            .iter()
+                            .map(|(name, value)| (name.clone(), value)),
+                        &knowledge_context,
+                        &mut classification_error,
+                    );
+                    // Reuse each authored classification. Fully known inputs
+                    // already contain their value; only a newly evaluated
+                    // candidate needs its own classification.
+                    let evaluated_attrs = classified_attrs
+                        .iter()
+                        .filter_map(|(name, knowledge)| {
+                            if matches!(
+                                knowledge,
+                                carina_core::resource::knowledge::Classification::Known(_)
+                            ) {
+                                return None;
+                            }
                             carina_core::parser::evaluate_static_value_for_validation(
-                                value,
+                                knowledge,
                                 self.provider_context.catalog(),
                             )
-                        {
-                            *value = evaluated;
-                        }
-                    }
+                            .filter(|value| value != &resolved_attrs[name])
+                            .map(|value| (name.clone(), value))
+                        })
+                        .collect::<HashMap<_, _>>();
+                    classified_attrs.extend(collect_classified_attributes(
+                        evaluated_attrs
+                            .iter()
+                            .map(|(name, value)| (name.clone(), value)),
+                        &knowledge_context,
+                        classification_error,
+                    ));
                     let mut value_validation = validated_schema.validate_values_with_resolver(
-                        &resolved_attrs,
+                        &classified_attrs,
                         &|attr| resource_quoted_string_attrs.contains(attr),
                         self.provider_context.catalog().custom_type_resolver(),
                     );
@@ -2011,7 +2059,33 @@ impl DiagnosticRun<'_> {
                                         .and_then(&mut diagnose_schema_error)
                                 }
 
-                                _ => None,
+                                // Root kind mismatches are suppressed by the
+                                // whole-resource pass because this attribute
+                                // pass owns their precise source location.
+                                (_, Value::Concrete(_))
+                                    if !contains_function_call(authored_attr_value) =>
+                                {
+                                    value_findings
+                                        .local_error()
+                                        .filter(|error| {
+                                            matches!(error, TypeError::TypeMismatch { .. })
+                                        })
+                                        .cloned()
+                                        .and_then(&mut diagnose_schema_error)
+                                }
+                                (_, Value::Deferred(DeferredValue::Secret(_))) => None,
+                                (
+                                    _,
+                                    Value::Concrete(_)
+                                    | Value::Deferred(
+                                        DeferredValue::Interpolation(_)
+                                        | DeferredValue::FunctionCall { .. }
+                                        | DeferredValue::ResolvedFunctionCall { .. }
+                                        | DeferredValue::Unknown(_)
+                                        | DeferredValue::Placeholder(_)
+                                        | DeferredValue::Unavailable { .. },
+                                    ),
+                                ) => None,
                             };
                             if let Some(message) = type_error {
                                 reported_attribute_diagnostics.insert(canonical_name.to_string());
@@ -2042,16 +2116,15 @@ impl DiagnosticRun<'_> {
                             // drop `Ref` and skip the entire pass.
                             if contains_struct
                                 || matches!(
-                                    (effective_type.shape(), attr_value),
+                                    (effective_type.shape(), attr_findings.structure()),
                                     (
                                         carina_core::schema::Shape::List { .. },
-                                        Value::Concrete(
-                                            ConcreteValue::List(_) | ConcreteValue::StringList(_)
-                                        ) | Value::Deferred(DeferredValue::Secret(_))
+                                        carina_core::schema::ValueStructure::List
+                                            | carina_core::schema::ValueStructure::Protected
                                     ) | (
                                         carina_core::schema::Shape::Map { .. },
-                                        Value::Concrete(ConcreteValue::Map(_))
-                                            | Value::Deferred(DeferredValue::Secret(_))
+                                        carina_core::schema::ValueStructure::Map
+                                            | carina_core::schema::ValueStructure::Protected
                                     )
                                 )
                             {
@@ -2631,6 +2704,10 @@ fn is_duplicate_list_error(error: &TypeError) -> bool {
             extra_message: _,
         }
         | TypeError::ValidationFailed { message: _ }
+        | TypeError::Knowledge {
+            error: _,
+            attribute: _,
+        }
         | TypeError::CustomTypeValidation {
             error: _,
             attribute: _,

@@ -1003,6 +1003,9 @@ impl std::error::Error for AwsCredentialStartupError {}
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error(transparent)]
+    PlanPreparation(Box<crate::wiring::PlanPreparationError>),
+
+    #[error(transparent)]
     CommandInput(#[from] std::sync::Arc<CommandInputError>),
 
     #[error(transparent)]
@@ -1643,6 +1646,21 @@ impl From<String> for AppError {
 impl From<&str> for AppError {
     fn from(s: &str) -> Self {
         AppError::Config(s.to_string())
+    }
+}
+
+impl From<crate::wiring::PlanPreparationError> for AppError {
+    fn from(error: crate::wiring::PlanPreparationError) -> Self {
+        match error {
+            crate::wiring::PlanPreparationError::Provider(error) => Self::Provider(error),
+            crate::wiring::PlanPreparationError::ModuleConstraint(error) => {
+                Self::ModuleConstraint(error)
+            }
+            error @ (crate::wiring::PlanPreparationError::Knowledge { .. }
+            | crate::wiring::PlanPreparationError::Plan(_)) => {
+                Self::PlanPreparation(Box::new(error))
+            }
+        }
     }
 }
 

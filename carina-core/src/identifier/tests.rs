@@ -10159,6 +10159,47 @@ fn historical_identity_inspection_preserves_hashes_and_propagates_selection_erro
 }
 
 #[test]
+fn deferred_identity_propagates_an_unavailable_historical_secret() {
+    let mut bindings = ResolvedBindings::default();
+    bindings.set_historical_with_completeness(
+        "history",
+        HashMap::from([("token".into(), redacted_identity_value())]),
+        BindingValueSource::Local,
+        BindingCompleteness::Complete,
+    );
+    let selected = Value::root_resource_ref("history", "token", vec![]);
+    let error = selected
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::plan(
+            &bindings,
+        ))
+        .expect_err("a historical secret is not a live value");
+    assert!(
+        matches!(
+            crate::resolver::ResolutionError::from(error),
+            crate::resolver::ResolutionError::UnavailableSecret(_)
+        ),
+        "classifier and resolver must use the same historical-secret representation"
+    );
+    let value = Value::Deferred(DeferredValue::FunctionCall {
+        name: crate::builtins::BuiltinFunction::upper,
+        args: vec![Value::root_resource_ref("history", "token", vec![]).into()],
+        source_line: 7.into(),
+    });
+    let result = resolve_deferred_create_only_value(
+        &value,
+        &|_| {
+            vec![AnonymousIdBindingStateInfo {
+                name: "history".into(),
+                attribute_values: HashMap::from([("token".into(), redacted_identity_value())]),
+            }]
+        },
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    );
+    let error = result.expect_err("historical secret must not become an unresolved identity");
+    assert_eq!(error.path(), "history.token");
+}
+
+#[test]
 fn identity_projection_evaluates_env_from_the_caller_snapshot() {
     let schema = PatternResourceSchema::new("test.resource")
         .attribute(

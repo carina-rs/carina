@@ -1,83 +1,129 @@
-//! `map(accessor, collection)` built-in function
-
-use indexmap::IndexMap;
-
-use crate::resource::{BindingAddress, ConcreteValue, NoPlaceholder, Value, ValueString};
-
+//! Field projection preserves collection membership and reference selectors.
 use super::value_type_name;
-
-/// `map(accessor, collection)` - Extract a field from each element of a collection.
-///
-/// - First argument: a field accessor string starting with `.` (e.g., `".subnet_id"`)
-/// - Second argument: a List of Maps, or a Map of Maps
-/// - Returns: List or Map with each element replaced by the extracted field value
-///
-/// The argument order matches pipe convention: the collection (pipe target) is the
-/// last argument. `subnets |> map(".subnet_id")` desugars to `map(".subnet_id", subnets)`.
-///
-/// Examples:
-/// ```text
-/// map(".id", [{name: "a", id: "1"}, {name: "b", id: "2"}])  // => ["1", "2"]
-/// subnets |> map(".subnet_id")  // pipe syntax
-/// ```
-pub(crate) fn builtin_map<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
-) -> Result<Value<NoPlaceholder, B>, String> {
-    if args.len() != 2 {
-        return Err(format!("map() requires 2 arguments, got {}", args.len()));
-    }
-
-    let accessor_value = match &args[0] {
-        Value::Concrete(ConcreteValue::String(s)) if s.expose_plaintext().starts_with('.') => s,
-        _ => {
-            return Err(
-                "map() first argument must be a field accessor string starting with '.' (e.g., \".field_name\")".to_string(),
-            );
-        }
+use crate::resolver::ResolutionError;
+use crate::resource::knowledge::{Classification, KnownValue, KnownView, PlanIterable, ShapeView};
+use crate::resource::{
+    AccessMissPolicy, BindingAddress, ConcreteValue, NoPlaceholder, PathSegment, Value,
+    ValuePathSegmentResult, ValueString,
+};
+use indexmap::IndexMap;
+pub fn builtin_map<B: BindingAddress>(
+    accessor: &KnownValue<'_, NoPlaceholder, B>,
+    collection: &PlanIterable<'_, NoPlaceholder, B>,
+) -> Result<Value<NoPlaceholder, B>, ResolutionError> {
+    let accessor = accessor.to_value();
+    let Value::Concrete(ConcreteValue::String(accessor)) = accessor else {
+        return Err("map() first argument must be a field accessor string starting with '.' (e.g., \".field_name\")".into());
     };
-    let accessor = &accessor_value.expose_plaintext()[1..];
-
-    match &args[1] {
-        Value::Concrete(ConcreteValue::List(items)) => {
-            let mapped: Result<Vec<Value<NoPlaceholder, B>>, String> = items
+    if !accessor.expose_plaintext().starts_with('.') {
+        return Err("map() first argument must be a field accessor string starting with '.' (e.g., \".field_name\")".into());
+    }
+    collection.visit(
+        |view| match view {
+            KnownView::List(items) => items
                 .iter()
-                .map(|item| match item {
-                    Value::Concrete(ConcreteValue::Map(map)) => map
-                        .get(accessor)
-                        .cloned()
-                        .ok_or_else(|| missing_field(accessor_value, "in map element")),
-                    other => Err(format!(
-                        "map() expects list of maps, got list of {}",
-                        value_type_name(other)
-                    )),
+                .map(|item| {
+                    extract(
+                        &Classification::Known(item.clone()),
+                        &accessor,
+                        "in map element",
+                        "list of",
+                    )
                 })
-                .collect();
-            Ok(Value::Concrete(ConcreteValue::List(mapped?)))
-        }
-        Value::Concrete(ConcreteValue::Map(map)) => {
-            let mapped: Result<IndexMap<String, Value<NoPlaceholder, B>>, String> = map
+                .collect::<Result<Vec<_>, _>>()
+                .map(|items| Value::Concrete(ConcreteValue::List(items))),
+            KnownView::Map(items) => items
                 .iter()
-                .map(|(k, v)| match v {
-                    Value::Concrete(ConcreteValue::Map(inner)) => inner
-                        .get(accessor)
-                        .cloned()
-                        .map(|val| (k.clone(), val))
-                        .ok_or_else(|| missing_field(accessor_value, "in map value")),
-                    other => Err(format!(
-                        "map() expects map of maps, got map with {} value",
-                        value_type_name(other)
-                    )),
+                .map(|(key, item)| {
+                    extract(
+                        &Classification::Known(item.clone()),
+                        &accessor,
+                        "in map value",
+                        "map with",
+                    )
+                    .map(|value| (key.to_owned(), value))
                 })
-                .collect();
-            Ok(Value::Concrete(ConcreteValue::Map(mapped?)))
-        }
-        other => Err(format!(
-            "map() second argument must be a list or map, got {}",
-            value_type_name(other)
-        )),
+                .collect::<Result<IndexMap<_, _>, _>>()
+                .map(|items| Value::Concrete(ConcreteValue::Map(items))),
+            _ => Err(format!(
+                "map() second argument must be a list or map, got {}",
+                value_type_name(&collection.source_value())
+            )
+            .into()),
+        },
+        |view| match view {
+            ShapeView::List(items) => items
+                .iter()
+                .map(|item| extract(item, &accessor, "in map element", "list of"))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|items| Value::Concrete(ConcreteValue::List(items))),
+            ShapeView::Map(items) => items
+                .iter()
+                .map(|(key, item)| {
+                    extract(item, &accessor, "in map value", "map with")
+                        .map(|value| ((*key).to_owned(), value))
+                })
+                .collect::<Result<IndexMap<_, _>, _>>()
+                .map(|items| Value::Concrete(ConcreteValue::Map(items))),
+        },
+        |_| Err("map() second argument must be a list or map, got Secret".into()),
+    )
+}
+fn extract<B: BindingAddress>(
+    value: &Classification<'_, NoPlaceholder, B>,
+    accessor: &ValueString,
+    location: &str,
+    kind: &str,
+) -> Result<Value<NoPlaceholder, B>, ResolutionError> {
+    let field = &accessor.expose_plaintext()[1..];
+    let wrong = || {
+        format!(
+            "map() expects {} maps, got {kind} {}{}",
+            if kind == "map with" { "map of" } else { kind },
+            value_type_name(&value.to_value()),
+            if kind == "map with" { " value" } else { "" }
+        )
+    };
+    match value {
+        Classification::Known(known) => known.visit(
+            |view| match view {
+                KnownView::Map(map) => map
+                    .iter()
+                    .find(|(key, _)| *key == field)
+                    .map(|(_, value)| value.to_value())
+                    .ok_or_else(|| ResolutionError::from(missing_field(accessor, location))),
+                _ => Err(wrong().into()),
+            },
+            |_| Err(wrong().into()),
+        ),
+        Classification::ShapeKnown(shape) => shape.visit(
+            |view| match view {
+                ShapeView::Map(map) => map
+                    .get(field)
+                    .map(Classification::to_value)
+                    .ok_or_else(|| ResolutionError::from(missing_field(accessor, location))),
+                ShapeView::List(_) => Err(wrong().into()),
+            },
+            |_| Err(wrong().into()),
+        ),
+        Classification::Failed(value) => Err(value.error().into()),
+        Classification::Pending(_) => crate::resource::apply_value_path_segment(
+            value.to_value(),
+            PathSegment::Field {
+                name: field.to_owned(),
+            },
+            0,
+            AccessMissPolicy::Error,
+        )
+        .map_err(ResolutionError::from)
+        .and_then(|value| match value {
+            ValuePathSegmentResult::Resolved(value) | ValuePathSegmentResult::Deferred(value) => {
+                Ok(value)
+            }
+            ValuePathSegmentResult::DeferredMiss(error) => Err(error.into()),
+        }),
     }
 }
-
 fn missing_field(accessor: &ValueString, location: &str) -> String {
     match accessor.diagnostic_literal() {
         Some(accessor) => format!("map(): field '{}' not found {location}", &accessor[1..]),

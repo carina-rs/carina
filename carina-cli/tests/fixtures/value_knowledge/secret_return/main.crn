@@ -1,0 +1,3 @@
+let role = mock.test.resource { name = "role" }
+fn result(): String { secret("arn:${role.identifier}") }
+mock.test.resource { name = "consumer" comment = result() }

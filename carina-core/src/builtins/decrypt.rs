@@ -13,9 +13,14 @@ use super::value_type_name;
 
 /// `decrypt()` implementation that uses the decryptor from [`ProviderContext`].
 pub(crate) fn builtin_decrypt_with_config<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
+    args: &[crate::resource::knowledge::KnownValue<'_, NoPlaceholder, B>],
     config: &ProviderContext,
 ) -> Result<Value<NoPlaceholder, B>, String> {
+    let values = args
+        .iter()
+        .map(|value| value.to_value())
+        .collect::<Vec<_>>();
+    let args = values.as_slice();
     let (ciphertext, key) = parse_decrypt_args(args)?;
     let decryptor = config.decryptor.as_ref().ok_or_else(|| {
         "decrypt() requires a configured provider with encryption support. \
@@ -104,7 +109,7 @@ mod tests {
             Ok(format!("decrypted:{ciphertext}"))
         }));
 
-        let args = vec![Value::Concrete(ConcreteValue::String("AQICAHh".into()))];
+        let args = [Value::Concrete(ConcreteValue::String("AQICAHh".into()))];
         let result = evaluate_builtin_with_config("decrypt", &args, &config).unwrap();
         assert_eq!(
             result,
@@ -144,28 +149,40 @@ mod tests {
     fn decrypt_without_decryptor_returns_error() {
         let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
 
-        let args = vec![Value::Concrete(ConcreteValue::String("AQICAHh".into()))];
+        let args = [Value::Concrete(ConcreteValue::String("AQICAHh".into()))];
         let result = evaluate_builtin_with_config("decrypt", &args, &config);
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
+                .to_string()
                 .contains("requires a configured provider")
         );
     }
 
     #[test]
     fn decrypt_dispatch_without_decryptor_returns_error() {
-        let args = vec![Value::Concrete(ConcreteValue::String("AQICAHh".into()))];
+        let args = [Value::Concrete(ConcreteValue::String("AQICAHh".into()))];
         let result = crate::builtins::evaluate_builtin_to_value(
             "decrypt",
-            &args,
+            &(args)
+                .iter()
+                .map(|value| {
+                    value
+                        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                        .map(|proof| proof.into_classification())
+                        .unwrap()
+                        .into_known()
+                        .unwrap()
+                })
+                .collect::<Vec<_>>(),
             &ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         );
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
+                .to_string()
                 .contains("requires a configured provider")
         );
     }

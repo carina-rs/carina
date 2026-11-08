@@ -20,8 +20,13 @@ use super::value_type_name;
 /// cidr_subnet("10.0.0.0/16", 8, 255) // => "10.0.255.0/24"
 /// ```
 pub(crate) fn builtin_cidr_subnet<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
+    args: &[crate::resource::knowledge::KnownValue<'_, NoPlaceholder, B>],
 ) -> Result<Value<NoPlaceholder, B>, String> {
+    let values = args
+        .iter()
+        .map(|value| value.to_value())
+        .collect::<Vec<_>>();
+    let args = values.as_slice();
     if args.len() != 3 {
         return Err(format!(
             "cidr_subnet() expects 3 arguments (prefix, newbits, netnum), got {}",

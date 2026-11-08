@@ -177,7 +177,12 @@ fn single_reference_interpolation_preserves_child_judgement_and_literal_folding(
                     "{definition}: {sink}"
                 );
             }
-            if parsed.variables["direct"].is_fully_resolved() {
+            if matches!(
+                (parsed.variables["direct"])
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification()),
+                Ok(crate::resource::knowledge::Classification::Known(_))
+            ) {
                 assert_eq!(parsed.variables["wrapped"], parsed.variables["direct"]);
             }
         }

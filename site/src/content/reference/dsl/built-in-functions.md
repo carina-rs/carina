@@ -88,6 +88,8 @@ join('-', ['a', 'b', 'c'])    # => 'a-b-c'
 join(', ', ['hello', 42])     # => 'hello, 42'
 ```
 
+Collection membership and element values can become available separately. `length` and `keys` can compute from known membership even when elements or values still await apply. Collection-producing functions preserve those pending leaves and their dependency selectors; `flatten` additionally needs each inner shape at the level being flattened. `join` requires known scalar elements.
+
 ## List Functions
 
 ### `concat`
@@ -294,6 +296,8 @@ let db_host = env('DB_HOST')
 ### `secret`
 
 Marks a value as secret. The value is sent to the provider, and plan output displays `(secret)` instead of the actual value. The serialized representation of `Secret` in resource state is an Argon2id hash rather than plaintext. Applying `secret()` to an already-secret value is idempotent.
+
+Secret values become available when their inputs do. For example, `upper(secret(resource.identifier))` waits for the identifier while keeping the result protected.
 
 `carina plan --out` also stores only an Argon2id hash in a typed secret
 placeholder. `carina apply <plan.json>` re-evaluates the source configuration,

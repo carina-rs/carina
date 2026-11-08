@@ -26,7 +26,7 @@
 //! `notes/specs/2026-05-14-deferred-populate-attribute-design.md`.
 //!
 //! Defense-in-depth: the apply-time fail-fast in
-//! `executor/basic.rs::assert_fully_resolved` (carina#3032 / #3033)
+//! `executor/basic.rs::assert_known_attribute` (carina#3032 / #3033)
 //! still catches misannotated attributes at apply time. This pass
 //! moves the *common* case to validate time so the user gets the
 //! error in milliseconds, with an actionable suggestion, rather than

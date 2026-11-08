@@ -25,6 +25,39 @@ use crate::resource::{
     LoopSlot, LoopSource, ParserPlaceholder, RelativeBindingName, UnboundLoopTemplate,
 };
 
+use crate::resource::knowledge::{Classification, ClassifiedRef, KnowledgeContext};
+
+enum ParserIterable<'s, 'a> {
+    List(Vec<ClassifiedRef<'s, 'a, ParserPlaceholder, RelativeBindingName>>),
+    Map(indexmap::IndexMap<&'a str, ClassifiedRef<'s, 'a, ParserPlaceholder, RelativeBindingName>>),
+    Deferred,
+    Other,
+}
+
+// Parsing preserves failed members for later diagnostics. This is structural
+// traversal, and never grants the PlanIterable required by child admission.
+fn parser_iterable<'s, 'a>(
+    value: &'s Classification<'a, ParserPlaceholder, RelativeBindingName>,
+) -> ParserIterable<'s, 'a> {
+    let value = ClassifiedRef::from(value);
+    match value {
+        ClassifiedRef::Known(_) | ClassifiedRef::Shape(_) => {
+            if value.secret().is_some() {
+                return ParserIterable::Deferred;
+            }
+            if let Some(items) = value.list() {
+                return ParserIterable::List(items);
+            }
+            if let Some(items) = value.map() {
+                return ParserIterable::Map(items);
+            }
+            ParserIterable::Other
+        }
+        ClassifiedRef::Pending(_) => ParserIterable::Deferred,
+        ClassifiedRef::Failed(_) => ParserIterable::Deferred,
+    }
+}
+
 /// Binding pattern for a for expression
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ForBinding {
@@ -432,9 +465,13 @@ pub(crate) fn parse_for_expr(
         }
     };
 
-    // Expand based on iterable type
-    match (&binding, &iterable) {
-        (ForBinding::Simple(var), Value::Concrete(ConcreteValue::List(items))) => {
+    let classified = iterable
+        .knowledge(&KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        .map_err(|error| ParseError::from_resolution(error.into(), for_line))?;
+    let iterable_for_expansion = parser_iterable(&classified);
+    match (&binding, &iterable_for_expansion) {
+        (ForBinding::Simple(var), ParserIterable::List(items)) => {
             for (i, item) in items.iter().enumerate() {
                 let element = ForLoopElement::Index(i);
                 let expansion_key = target.element_address(&element);
@@ -453,7 +490,7 @@ pub(crate) fn parse_for_expr(
                 bind_eval(
                     &mut iter_ctx,
                     var,
-                    EvalValue::computed(item.clone(), metadata),
+                    EvalValue::computed(item.diagnostic_value().clone(), metadata),
                 );
                 let result = parse_for_body(
                     body_pair.clone(),
@@ -472,7 +509,7 @@ pub(crate) fn parse_for_expr(
                 );
             }
         }
-        (ForBinding::Indexed(idx_var, val_var), Value::Concrete(ConcreteValue::List(items))) => {
+        (ForBinding::Indexed(idx_var, val_var), ParserIterable::List(items)) => {
             for (i, item) in items.iter().enumerate() {
                 let element = ForLoopElement::Index(i);
                 let expansion_key = target.element_address(&element);
@@ -496,7 +533,7 @@ pub(crate) fn parse_for_expr(
                 bind_eval(
                     &mut iter_ctx,
                     val_var,
-                    EvalValue::computed(item.clone(), metadata),
+                    EvalValue::computed(item.diagnostic_value().clone(), metadata),
                 );
                 let result = parse_for_body(
                     body_pair.clone(),
@@ -515,19 +552,19 @@ pub(crate) fn parse_for_expr(
                 );
             }
         }
-        (ForBinding::Map(key_var, val_var), Value::Concrete(ConcreteValue::Map(map))) => {
+        (ForBinding::Map(key_var, val_var), ParserIterable::Map(map)) => {
             // Sort keys for deterministic output
-            let mut keys: Vec<&String> = map.keys().collect();
+            let mut keys: Vec<&str> = map.keys().copied().collect();
             keys.sort();
             for key in keys {
                 let val = &map[key];
-                let element = ForLoopElement::Key(key.clone());
+                let element = ForLoopElement::Key(key.to_owned());
                 let expansion_key = target.element_address(&element);
                 let mut iter_ctx = ctx.child_scope();
                 bind(
                     &mut iter_ctx,
                     key_var,
-                    Value::Concrete(ConcreteValue::String(key.clone().into())),
+                    Value::Concrete(ConcreteValue::String(key.into())),
                 );
                 let metadata = match structural_handle_metadata.as_ref() {
                     Some(UnexpandedStructuralHandleMetadata::Map(entries)) => {
@@ -543,7 +580,7 @@ pub(crate) fn parse_for_expr(
                 bind_eval(
                     &mut iter_ctx,
                     val_var,
-                    EvalValue::computed(val.clone(), metadata),
+                    EvalValue::computed(val.diagnostic_value().clone(), metadata),
                 );
                 let result = parse_for_body(
                     body_pair.clone(),
@@ -566,7 +603,7 @@ pub(crate) fn parse_for_expr(
         // replayed at plan/apply time. In particular, `ref ?? default` must
         // not collapse to the default before the reference snapshot is known
         // to be complete.
-        (_, Value::Deferred(_)) => {
+        (_, ParserIterable::Deferred) => {
             let iterable_surface = match &iterable {
                 Value::Deferred(
                     DeferredValue::Placeholder(ParserPlaceholder::ModuleArgument { .. })
@@ -868,4 +905,49 @@ pub(crate) fn parse_for_body(
         expected: "resource expression or module call".to_string(),
         context: "for body".to_string(),
     })
+}
+
+#[cfg(test)]
+mod knowledge_tests {
+    use super::*;
+    use crate::resource::knowledge::{
+        Classification, KnowledgeContext, KnowledgeError, PlanIterable,
+    };
+
+    #[test]
+    fn parse_time_membership_preserves_failure_without_admitting_it_to_expansion() {
+        let failure = Value::Deferred(DeferredValue::Unavailable {
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![],
+            reason: crate::resource::UnavailableReason::from_builtin_error("attempted".into()),
+            source_line: 0.into(),
+        });
+        let value = Value::Concrete(ConcreteValue::List(vec![
+            Value::Concrete(ConcreteValue::Int(7)),
+            failure,
+        ]));
+        let proof = value
+            .knowledge(&KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap();
+        let ParserIterable::List(items) = parser_iterable(&proof) else {
+            panic!("parse-time membership remains usable")
+        };
+        assert_eq!(items.len(), 2);
+        assert_eq!(
+            items[0].diagnostic_value(),
+            &Value::Concrete(ConcreteValue::Int(7))
+        );
+        assert!(matches!(
+            items[1],
+            crate::resource::knowledge::ClassifiedRef::Failed(_)
+        ));
+        let Classification::ShapeKnown(shape) = proof else {
+            panic!("partial collection")
+        };
+        assert!(matches!(
+            PlanIterable::from_shape(shape),
+            Err(KnowledgeError::Unavailable { .. })
+        ));
+    }
 }

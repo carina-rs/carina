@@ -1,0 +1,2 @@
+let role = mock.test.resource { name = "role" }
+let result = if secret(role.identifier) { true } else { false }

@@ -194,7 +194,12 @@ fn single_reference_integer_interpolation_checks_resolved_string_constraints() {
         assert_eq!(checked.is_ok(), accepted, "{port}: {checked:?}");
     }
     assert!(
-        !authored.is_fully_resolved(),
+        !matches!(
+            (authored)
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification()),
+            Ok(crate::resource::knowledge::Classification::Known(_))
+        ),
         "checking must preserve the deferred source"
     );
 }
@@ -9692,7 +9697,12 @@ fn value_contains_unresolved_ref_detects_nested_resource_ref() {
     let assume_role = RuntimeValue::Concrete(RuntimeConcreteValue::Map(inner));
 
     assert!(
-        value_contains_unresolved_ref(&assume_role),
+        !matches!(
+            assume_role
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification()),
+            Ok(crate::resource::knowledge::Classification::Known(_))
+        ),
         "nested ResourceRef inside a Map must be detected",
     );
 }
@@ -9707,7 +9717,11 @@ fn value_contains_unresolved_ref_false_for_pure_literal() {
     let v = RuntimeValue::Concrete(RuntimeConcreteValue::Map(m));
 
     assert!(
-        !value_contains_unresolved_ref(&v),
+        matches!(
+            v.knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification()),
+            Ok(crate::resource::knowledge::Classification::Known(_))
+        ),
         "fully-literal value must not be flagged",
     );
 }
@@ -9723,7 +9737,11 @@ fn value_contains_unresolved_ref_detects_list_element() {
         }),
     ]));
     assert!(
-        value_contains_unresolved_ref(&v),
+        !matches!(
+            v.knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification()),
+            Ok(crate::resource::knowledge::Classification::Known(_))
+        ),
         "ResourceRef inside a List element must be detected",
     );
 }
@@ -9739,8 +9757,13 @@ fn value_contains_unresolved_ref_unwraps_secret() {
         .into(),
     ));
     assert!(
-        value_contains_unresolved_ref(&secret_with_ref),
-        "Secret(ResourceRef) must propagate the unresolved signal",
+        matches!(
+            secret_with_ref
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification()),
+            Ok(crate::resource::knowledge::Classification::Pending(_))
+        ),
+        "Secret(ResourceRef) must be pending"
     );
 
     let secret_literal = RuntimeValue::Deferred(RuntimeDeferredValue::Secret(
@@ -9750,7 +9773,16 @@ fn value_contains_unresolved_ref_unwraps_secret() {
         .into(),
     ));
     assert!(
-        !value_contains_unresolved_ref(&secret_literal),
+        matches!(
+            secret_literal
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation()).map(|proof| proof.into_classification())
+                .map_err(crate::resource::knowledge_serialization_error)
+                .and_then(crate::resource::require_known_value)
+                .map(
+                    crate::resource::knowledge::Classification::<crate::resource::NoPlaceholder>::Known
+                ),
+            Ok(crate::resource::knowledge::Classification::Known(_))
+        ),
         "Secret(literal) must not be flagged",
     );
 }
@@ -10538,7 +10570,15 @@ fn bare_binding_precheck_preserves_rejection_after_constant_folding() {
         else {
             panic!("value binding expected");
         };
-        assert!(value.is_fully_resolved(), "{rhs}: {value:?}");
+        assert!(
+            matches!(
+                (value)
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification()),
+                Ok(crate::resource::knowledge::Classification::Known(_))
+            ),
+            "{rhs}: {value:?}"
+        );
         let expected = TypeExpr::String;
         let error = precheck_value_source(
             &record.authored,
@@ -11024,7 +11064,15 @@ fn issue_4282_deferred_builtin_results_use_existing_resolved_value_checks() {
             .resolve_root(&RootScope::new())
             .into_expanded()
             .unwrap();
-        assert!(!authored.is_fully_resolved());
+        assert!(
+            matches!(
+                authored
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification()),
+                Ok(crate::resource::knowledge::Classification::Pending(_))
+            ),
+            "{expression} must remain pending"
+        );
         assert!(
             typecheck::check_type_expr_value(&expected, &authored, &config, evidence)
                 .require_provider_schemas()
@@ -11076,6 +11124,15 @@ fn issue_4282_deferred_builtin_results_use_existing_resolved_value_checks() {
                 }
             }
         }
-        assert!(!authored.is_fully_resolved());
+        assert!(!matches!(
+            (authored)
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation()).map(|proof| proof.into_classification())
+                .map_err(crate::resource::knowledge_serialization_error)
+                .and_then(crate::resource::require_known_value)
+                .map(
+                    crate::resource::knowledge::Classification::<crate::resource::NoPlaceholder>::Known
+                ),
+            Ok(crate::resource::knowledge::Classification::Known(_))
+        ));
     }
 }

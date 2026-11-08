@@ -39,7 +39,7 @@ use crate::provider_text::{
 };
 pub use crate::resource::ProviderDirectiveSchema;
 use crate::resource::{
-    CanonicalEnumValue, ConcreteValue, DeferredValue, Directives, PartialReadMarker, PendingReRead,
+    CanonicalEnumValue, ConcreteValue, Directives, PartialReadMarker, PendingReRead,
     PreventDestroyResolution, PreventDestroySource, ProviderResource, Resource, ResourceId,
     SnapshotState, SnapshotValue, State, StateValueLeaf, UnavailableSecretError, Value,
     ValueString,
@@ -6613,50 +6613,73 @@ impl From<&ResourceId> for ProviderInstanceKey {
 
 /// Check a default-tag value before host-owned merging. Unresolved values are
 /// skippable; redacted secrets are fatal.
-fn assert_default_tag_value_encodable(value: &Value) -> Result<(), SerializationError> {
+fn assert_default_tag_value_encodable(
+    value: &crate::resource::knowledge::Classification<'_>,
+) -> Result<(), SerializationError> {
+    use crate::resource::knowledge::{Classification, KnownValue, KnownView, ShapeView};
+    if crate::resource::knowledge::ClassifiedRef::from(value)
+        .secret()
+        .is_some()
+    {
+        return Ok(());
+    }
+    fn known(value: &KnownValue<'_>) -> Result<(), SerializationError> {
+        value.visit(
+            |value| match value {
+                KnownView::EnumIdentifier(value) => {
+                    Err(SerializationError::UnresolvedEnumIdentifier {
+                        value: value.to_string(),
+                        context: crate::value::SerializationContext::WasmBoundary,
+                    })
+                }
+                KnownView::List(items) => {
+                    for value in items.iter() {
+                        known(value)?;
+                    }
+                    Ok(())
+                }
+                KnownView::Map(items) => {
+                    for (_, value) in items.iter() {
+                        known(value)?;
+                    }
+                    Ok(())
+                }
+                KnownView::String(_)
+                | KnownView::CanonicalEnum(_)
+                | KnownView::Int(_)
+                | KnownView::Float(_)
+                | KnownView::Bool(_)
+                | KnownView::Duration(_)
+                | KnownView::StringList(_) => Ok(()),
+            },
+            |_| Ok(()),
+        )
+    }
     match value {
-        Value::Concrete(ConcreteValue::List(items)) => {
-            for item in items {
-                assert_default_tag_value_encodable(item)?;
-            }
-            Ok(())
+        Classification::Known(value) => known(value),
+        Classification::Failed(value) => Err(crate::resource::knowledge_serialization_error(
+            value.error(),
+        )),
+        Classification::ShapeKnown(value) => value.visit(
+            |view| match view {
+                ShapeView::List(items) => {
+                    for value in items {
+                        assert_default_tag_value_encodable(value)?;
+                    }
+                    Ok(())
+                }
+                ShapeView::Map(items) => {
+                    for value in items.values() {
+                        assert_default_tag_value_encodable(value)?;
+                    }
+                    Ok(())
+                }
+            },
+            |_| Ok(()),
+        ),
+        Classification::Pending(value) => {
+            crate::resource::require_known_value(Classification::Pending(value.clone())).map(|_| ())
         }
-        Value::Concrete(ConcreteValue::Map(entries)) => {
-            for value in entries.values() {
-                assert_default_tag_value_encodable(value)?;
-            }
-            Ok(())
-        }
-        // The former seal path replaced a whole secret with an opaque token
-        // before encoding, so its plaintext was not inspected by the boundary.
-        Value::Deferred(DeferredValue::Secret(_)) => Ok(()),
-        Value::Concrete(ConcreteValue::EnumIdentifier(value)) => {
-            Err(SerializationError::UnresolvedEnumIdentifier {
-                value: value.to_string(),
-                context: crate::value::SerializationContext::WasmBoundary,
-            })
-        }
-        Value::Concrete(ConcreteValue::String(_))
-        | Value::Concrete(ConcreteValue::CanonicalEnum(_))
-        | Value::Concrete(ConcreteValue::Int(_))
-        | Value::Concrete(ConcreteValue::Float(_))
-        | Value::Concrete(ConcreteValue::Bool(_))
-        | Value::Concrete(ConcreteValue::Duration(_))
-        | Value::Concrete(ConcreteValue::StringList(_))
-        | Value::Deferred(DeferredValue::ModuleIf(_))
-        | Value::Deferred(DeferredValue::ResourceRef { .. })
-        | Value::Deferred(DeferredValue::BindingRef { .. })
-        | Value::Deferred(DeferredValue::Coalesce { .. })
-        | Value::Deferred(DeferredValue::IntegerArithmetic(_))
-        | Value::Deferred(DeferredValue::Interpolation(_))
-        | Value::Deferred(DeferredValue::FunctionCall { .. })
-        | Value::Deferred(DeferredValue::Unavailable { .. })
-        | Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
-        | Value::Deferred(DeferredValue::Access(_))
-        | Value::Deferred(DeferredValue::Unknown(_)) => {
-            crate::resource::assert_value_fully_resolved(value)
-        }
-        Value::Deferred(DeferredValue::Placeholder(never)) => match *never {},
     }
 }
 
@@ -6711,7 +6734,12 @@ pub fn merge_default_tags<S, D>(
     // cannot leave a partially merged desired state behind.
     let mut default_tags = IndexMap::new();
     for (key, value) in &config.default_tags {
-        match assert_default_tag_value_encodable(value) {
+        match value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .map_err(crate::resource::knowledge_serialization_error)
+            .and_then(|value| assert_default_tag_value_encodable(&value))
+        {
             Ok(()) => {
                 default_tags.insert(key.clone(), value.clone());
             }
@@ -6723,6 +6751,7 @@ pub fn merge_default_tags<S, D>(
                 | SerializationError::UnresolvedInterpolation { .. }
                 | SerializationError::UnresolvedFunctionCall { .. }
                 | SerializationError::UnresolvedAccess { .. }
+                | SerializationError::Knowledge { .. }
                 | SerializationError::SecretNotAllowed { .. }
                 | SerializationError::SavedPlanFieldSecretNotAllowed { .. }),
             ) => {
@@ -8705,7 +8734,7 @@ impl std::error::Error for CustomTypeFactoryValidationError {}
 pub fn validate_custom_type_with_factory(
     factory: &dyn ProviderFactory,
     declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
-    value: &Value,
+    value: &crate::resource::knowledge::KnownValue<'_>,
 ) -> Result<(), CustomTypeFactoryValidationError> {
     crate::schema::validate_custom_type_leaf(declaration, value, |proof| {
         proof.map_or(Ok(()), |proof| {
@@ -8774,7 +8803,18 @@ pub(crate) fn validate_custom_type_declaration_with_factory(
     value: &Value,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
     let owner = factory.name();
-    validate_custom_type_with_factory(factory, declaration, value)
+    let known = value
+        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+        .map(|proof| proof.into_classification())
+        .and_then(|proof| proof.into_known())
+        .map_err(|error| {
+            owner_validation_error(
+                owner,
+                declaration.identity(),
+                CustomTypeFactoryValidationError::InvalidValue(error.into()),
+            )
+        })?;
+    validate_custom_type_with_factory(factory, declaration, &known)
         .map_err(|error| owner_validation_error(owner, declaration.identity(), error))
 }
 
@@ -9405,7 +9445,7 @@ pub fn loaded_provider_snapshot_from_factories(
 pub(crate) fn validate_custom_type_annotation(
     resolver: &dyn crate::parser::CustomTypeResolver,
     owned: &crate::parser::OwnedTypeIdentity,
-    value: &Value,
+    value: &crate::resource::knowledge::KnownValue<'_>,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
     use crate::parser::{CustomTypeValidationError, SchemaTypeOwner};
 
@@ -10801,6 +10841,26 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
     }
 
     #[test]
+    fn declaration_validation_helper_returns_pending_projection_error() {
+        let factory = ConfigOnlyCustomTypeFactory;
+        let schema = factory.provider_config_attribute_types();
+        let declaration =
+            crate::parser::IdentifiedCustomTypeDeclaration::new(&schema.parts()["endpoint"])
+                .unwrap();
+        let pending = Value::root_resource_ref("producer", "identifier", Vec::new());
+
+        let result = validate_custom_type_declaration_with_factory(&factory, declaration, &pending);
+
+        assert!(matches!(
+            result,
+            Err(crate::parser::CustomTypeValidationError::InvalidDeclarationValue {
+                error,
+                ..
+            }) if matches!(*error, crate::schema::TypeError::Knowledge { .. })
+        ));
+    }
+
+    #[test]
     fn issue_4276_annotation_reference_stays_offline() {
         use crate::parser::{CustomTypeValidationError, OwnedTypeIdentity};
         let identity = TypeIdentity::bare("Reference");
@@ -10822,11 +10882,29 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         );
         // main validates Reference constraints locally and never creates a provider bridge.
         assert_eq!(
-            validate_custom_type_annotation(&resolver, &owned, &string_value("valid")),
+            validate_custom_type_annotation(
+                &resolver,
+                &owned,
+                &(string_value("valid"))
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                    .into_known()
+                    .unwrap()
+            ),
             Ok(())
         );
         assert!(matches!(
-            validate_custom_type_annotation(&resolver, &owned, &string_value("x")),
+            validate_custom_type_annotation(
+                &resolver,
+                &owned,
+                &(string_value("x"))
+                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap()
+                    .into_known()
+                    .unwrap()
+            ),
             Err(CustomTypeValidationError::InvalidDeclarationValue { .. })
         ));
     }
@@ -10850,7 +10928,16 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
             index,
             &SchemaRegistry::new(),
         );
-        let result = validate_custom_type_annotation(&resolver, &owned, &string_value("value"));
+        let result = validate_custom_type_annotation(
+            &resolver,
+            &owned,
+            &(string_value("value"))
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap()
+                .into_known()
+                .unwrap(),
+        );
         // main's local declaration check/canonicalizer returns a typed failure here.
         assert!(
             matches!(
@@ -10948,7 +11035,12 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
                     crate::schema::RefinedScalarKind::String,
                 ),
             ),
-            &Value::Concrete(ConcreteValue::String("https://example.test".into())),
+            &(Value::Concrete(ConcreteValue::String("https://example.test".into())))
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .map(|proof| proof.into_classification())
+                .unwrap()
+                .into_known()
+                .unwrap(),
         )
         .expect("the same factory source must drive recognition and resolution");
     }
@@ -11872,6 +11964,65 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         assert!(
             digest.verify(desired_material),
             "provider-only null fields must not create a phantom secret diff",
+        );
+    }
+
+    #[test]
+    fn default_tag_encoding_requires_classified_input() {
+        let value: Value = Value::Concrete(ConcreteValue::Int(7));
+        let proof = value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .map(|proof| proof.into_classification())
+            .unwrap();
+        assert!(assert_default_tag_value_encodable(&proof).is_ok());
+    }
+
+    #[test]
+    fn default_tag_opacity_preserves_attempted_failure_inside_secret() {
+        let unavailable = Value::Deferred(DeferredValue::Unavailable {
+            name: crate::builtins::BuiltinFunction::env,
+            args: vec![],
+            reason: crate::resource::UnavailableReason::from_builtin_error("attempted".into()),
+            source_line: 0.into(),
+        });
+        let protected = Value::Deferred(DeferredValue::Secret(Box::new(unavailable).into()));
+        let config = ProviderConfig {
+            name: "aws".into(),
+            attributes: IndexMap::new(),
+            default_tags: IndexMap::from([("Protected".into(), protected.clone())]),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: IndexMap::new(),
+            binding: None,
+        };
+        let mut resources: Vec<Resource> = vec![Resource::with_provider(
+            "aws",
+            "service.Widget",
+            "example",
+            None,
+        )];
+        let mut registry = SchemaRegistry::new();
+        registry.insert(
+            "aws",
+            PatternResourceSchema::new("service.Widget")
+                .attribute(
+                    PatternAttributeSchema::optional(
+                        "tags",
+                        PatternAttributeType::map(PatternAttributeType::string()),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        merge_default_tags(&config, &mut resources, &registry).unwrap();
+        assert_eq!(
+            resources[0].get_attr("tags"),
+            Some(&Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                "Protected".into(),
+                protected
+            )]))))
         );
     }
 

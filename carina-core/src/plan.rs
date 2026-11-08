@@ -178,6 +178,12 @@ pub enum PlanErrorKind {
         /// Schema or provider-validator diagnostic.
         message: crate::provider_text::DiagnosticText,
     },
+    /// Runtime-only classifier evidence cannot be written into a saved plan.
+    #[serde(skip)]
+    Knowledge {
+        attribute: String,
+        error: Box<crate::resource::knowledge::KnowledgeError>,
+    },
     /// An update would have to resend an ignored write-only value that the
     /// provider cannot return on read.
     IgnoredWriteOnlyValueUnavailable {
@@ -457,6 +463,7 @@ impl PlanErrorKind {
                 wait_binding,
                 reason,
             } => write!(f, "wait `{wait_binding}`: {reason}"),
+            Self::Knowledge { attribute, error } => write!(f, "{attribute}: {error}"),
             Self::ResolvedValueConstraint {
                 attributes,
                 origins,
@@ -509,6 +516,9 @@ impl PlanError {
             // The synthetic `_virtual` id is internal correlation metadata,
             // not a second user-facing resource identity.
             PlanErrorKind::ModuleConstraint(diagnostic) => write!(f, "{diagnostic}"),
+            PlanErrorKind::Knowledge { attribute, error } => {
+                write!(f, "{}.{attribute}: {error}", self.resource_id)
+            }
             kind @ (PlanErrorKind::PreventDestroy { .. }
             | PlanErrorKind::InputRule { .. }
             | PlanErrorKind::SchemaNotRegistered(_)

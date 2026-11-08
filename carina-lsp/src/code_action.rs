@@ -151,6 +151,7 @@ pub(crate) fn enum_diagnostic_data_for_error(error: &TypeError) -> Option<EnumDi
             attribute: _,
         }
         | TypeError::ValidationFailed { .. }
+        | TypeError::Knowledge { .. }
         | TypeError::CustomTypeValidation { .. }
         | TypeError::ResourceValidationFailed { .. }
         | TypeError::MissingRequired { .. }
@@ -567,7 +568,25 @@ mod tests {
         let mut errs = registry
             .get("aws", "aws.iam.PolicyDocument", SchemaKind::Resource)
             .expect("quick-fix schema must be owner-bound")
-            .validate_with_resolver(&attrs, &|_| false, &resolver)
+            .validate_with_resolver(
+                &attrs
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.clone(),
+                            value
+                                .knowledge(
+                                    &carina_core::resource::knowledge::KnowledgeContext::validation(
+                                    ),
+                                )
+                                .map(|proof| proof.into_classification())
+                                .unwrap(),
+                        )
+                    })
+                    .collect(),
+                &|_| false,
+                &resolver,
+            )
             .unwrap_err();
         let err = errs.remove(0);
         let TypeError::InvalidEnumVariant { expected, .. } = err else {

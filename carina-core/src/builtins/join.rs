@@ -1,102 +1,11 @@
 //! `join(separator, list)` built-in function
-
-use crate::resource::{
-    BindingAddress, ConcreteValue, DeferredValue, NoPlaceholder, Value, ValueString,
-};
-
-use super::value_type_name;
-
-/// `join(separator, list)` - Join list elements into a string with a separator.
-///
-/// - First argument: separator (String)
-/// - Second argument: list of values (each converted to string)
-/// - Returns: String
-///
-/// Examples:
-/// ```text
-/// join("-", ["a", "b", "c"])  // => "a-b-c"
-/// ["a", "b"] |> join("-")     // => "a-b" (pipe form)
-/// ```
+use crate::resolver::ResolutionError;
+use crate::resource::knowledge::KnownValue;
+use crate::resource::{BindingAddress, NoPlaceholder, Value};
 pub(crate) fn builtin_join<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
-) -> Result<Value<NoPlaceholder, B>, String> {
-    if args.len() != 2 {
-        return Err(format!(
-            "join() expects 2 arguments (separator, list), got {}",
-            args.len()
-        ));
-    }
-
-    let separator = match &args[0] {
-        Value::Concrete(ConcreteValue::String(s)) => s,
-        other => {
-            return Err(format!(
-                "join() first argument must be a string, got {}",
-                value_type_name(other)
-            ));
-        }
-    };
-
-    let items = match &args[1] {
-        Value::Concrete(ConcreteValue::List(items)) => items,
-        other => {
-            return Err(format!(
-                "join() second argument must be a list, got {}",
-                value_type_name(other)
-            ));
-        }
-    };
-
-    let mut contains_secret = false;
-    let rendered = items
-        .iter()
-        .map(|value| {
-            let (text, item_secret) = join_scalar(value)?;
-            contains_secret |= item_secret;
-            Ok(text)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let joined = rendered
-        .iter()
-        .map(ValueString::expose_plaintext)
-        .collect::<Vec<_>>()
-        .join(separator.expose_plaintext());
-    let joined =
-        ValueString::derived_from(joined, std::iter::once(separator).chain(rendered.iter()));
-    let value = Value::Concrete(ConcreteValue::String(joined));
-    if contains_secret {
-        Ok(Value::Deferred(DeferredValue::Secret(
-            Box::new(value).into(),
-        )))
-    } else {
-        Ok(value)
-    }
-}
-
-fn join_scalar<B: BindingAddress>(
-    value: &Value<NoPlaceholder, B>,
-) -> Result<(ValueString, bool), String> {
-    match value {
-        Value::Concrete(ConcreteValue::String(value)) => Ok((value.clone(), false)),
-        Value::Concrete(ConcreteValue::EnumIdentifier(value)) => Ok((value.as_str().into(), false)),
-        Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
-            Ok((value.api_value().into(), false))
-        }
-        Value::Concrete(ConcreteValue::Int(value)) => Ok((value.to_string().into(), false)),
-        Value::Concrete(ConcreteValue::Float(value)) => Ok((value.to_string().into(), false)),
-        Value::Concrete(ConcreteValue::Bool(value)) => Ok((value.to_string().into(), false)),
-        Value::Concrete(ConcreteValue::Duration(value)) => {
-            Ok((crate::value::render_duration(*value).into(), false))
-        }
-        Value::Deferred(DeferredValue::Secret(inner)) => {
-            let (text, _) = inner.try_project_plaintext(join_scalar)?;
-            Ok((text, true))
-        }
-        other => Err(format!(
-            "join() list elements must be scalar, got {}",
-            value_type_name(other)
-        )),
-    }
+    args: &[KnownValue<'_, NoPlaceholder, B>],
+) -> Result<Value<NoPlaceholder, B>, ResolutionError> {
+    crate::resource::knowledge::join_known_values(args)
 }
 
 #[cfg(test)]

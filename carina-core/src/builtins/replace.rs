@@ -20,8 +20,13 @@ use super::value_type_name;
 /// "hello-world" |> replace("-", "_") // => "hello_world" (pipe form)
 /// ```
 pub(crate) fn builtin_replace<B: BindingAddress>(
-    args: &[Value<NoPlaceholder, B>],
+    args: &[crate::resource::knowledge::KnownValue<'_, NoPlaceholder, B>],
 ) -> Result<Value<NoPlaceholder, B>, String> {
+    let values = args
+        .iter()
+        .map(|value| value.to_value())
+        .collect::<Vec<_>>();
+    let args = values.as_slice();
     if args.len() != 3 {
         return Err(format!(
             "replace() expects 3 arguments (search, replacement, string), got {}",
