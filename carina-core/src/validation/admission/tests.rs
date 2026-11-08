@@ -21,7 +21,7 @@ fn string_type(name: &str, max: Option<u64>) -> AttributeType {
     )
 }
 
-fn fixture<R>(
+pub(super) fn fixture<R>(
     source: AttributeType,
     target: AttributeType,
     f: impl FnOnce(
@@ -92,6 +92,67 @@ fn validate<K: DestinationKind>(
 }
 
 #[test]
+fn replacing_candidate_value_carries_all_original_obligations() {
+    fixture(
+        string_type("GroupId", Some(64)),
+        string_type("GroupId", Some(36)),
+        |catalog, _, bindings, _| {
+            with_session_for_test(catalog, |session| {
+                let value = reference();
+                let (candidate, _) = Candidate::validation(
+                    value.knowledge(&KnowledgeContext::validation()).unwrap(),
+                    bindings,
+                    session,
+                );
+                let original = candidate.clone();
+                let resolved = text("fits");
+                let bindings = ResolvedBindings::default();
+                let (replaced, boundary) = candidate
+                    .at_apply(
+                        resolved
+                            .knowledge(&KnowledgeContext::apply(&bindings))
+                            .unwrap(),
+                        session,
+                    )
+                    .unwrap();
+                assert_eq!(replaced.obligations, original.obligations);
+                assert_eq!(replaced.value, resolved);
+                assert_eq!(replaced.obligations.identity, boundary.identity);
+            });
+        },
+    );
+}
+
+#[test]
+fn reference_without_bindings_is_never_proven_even_with_no_pending_sites() {
+    fixture(
+        string_type("GroupId", Some(64)),
+        string_type("GroupId", Some(36)),
+        |catalog, _, _, destination| {
+            with_session_for_test(catalog, |session| {
+                let value = text("fits");
+                let bindings = ResolvedBindings::default();
+                let proof = PlanResolved::try_from(
+                    value.knowledge(&KnowledgeContext::plan(&bindings)).unwrap(),
+                )
+                .unwrap();
+                let (_, context) = Candidate::plan(proof, session);
+                assert!(context.sites().is_empty());
+                let assignment::CandidateOrigin::Reference(reference) =
+                    assignment::CandidateOrigin::of(&reference())
+                else {
+                    panic!("reference origin")
+                };
+                assert!(matches!(
+                    reference.judge_assignment(destination, &context).unwrap(),
+                    AssignmentVerdict::NeedsSchema(_)
+                ));
+            });
+        },
+    );
+}
+
+#[test]
 fn wider_same_identity_length_records_destination_obligation() {
     fixture(
         string_type("GroupId", Some(64)),
@@ -108,6 +169,85 @@ fn wider_same_identity_length_records_destination_obligation() {
                 );
                 assert_eq!(pending.sites().len(), 1);
             })
+        },
+    );
+}
+
+#[test]
+fn resource_callers_admit_wider_same_identity_references() {
+    fixture(
+        string_type("GroupId", Some(64)),
+        string_type("GroupId", Some(36)),
+        |catalog, schemas, _, _| {
+            let parsed = crate::parser::parse_file(
+                "let producer = test.Source {}\nlet sink = test.Sink { target = producer.output }",
+                std::path::Path::new("callers.crn"),
+                catalog,
+            )
+            .unwrap()
+            .resolve_root_for_test();
+            let bindings = BindingIndex::from_parsed(&parsed, schemas, catalog);
+            let configuration =
+                crate::config_loader::load_buffer_configuration(&parsed, schemas, catalog);
+            crate::validation::validate_resources(
+                &parsed,
+                schemas,
+                &std::collections::HashSet::from(["test".into()]),
+                catalog,
+            )
+            .unwrap();
+            crate::validation::validate_resource_ref_types(
+                configuration.judged(),
+                &std::collections::HashSet::new(),
+                &bindings,
+            )
+            .expect("same-identity resource reference is pending until resolution");
+        },
+    );
+}
+
+#[test]
+fn declared_reference_defers_same_identity_local_constraints_at_resource_sink() {
+    let source = string_type("GroupId", Some(64));
+    fixture(
+        source,
+        string_type("GroupId", Some(36)),
+        |catalog, schemas, bindings, destination| {
+            let schema = schemas
+                .get("test", "Source", crate::schema::SchemaKind::Resource)
+                .unwrap();
+            let source = schema
+                .effective_attribute_by_authored_name("output")
+                .unwrap();
+            let declaration = crate::parser::TypeExpr::SchemaType {
+                owned: crate::parser::ResolvedSchemaType::from_schema_declaration(
+                    "test",
+                    source.field_type(),
+                )
+                .unwrap(),
+            };
+            with_session_for_test(catalog, |session| {
+                let value = reference();
+                let crate::binding_index::RefType::Typed(source) =
+                    bindings.ref_type(&crate::resource::AccessPath::root("producer", "output"))
+                else {
+                    panic!("typed source");
+                };
+                let declared = source
+                    .with_value_declaration(&declaration, bindings)
+                    .unwrap();
+                let (candidate, mut context) = Candidate::validation(
+                    value.knowledge(&KnowledgeContext::validation()).unwrap(),
+                    bindings,
+                    session,
+                );
+                context.declaration = Some(("argument", &declared));
+                let pending = admit(destination, candidate, &context)
+                    .unwrap()
+                    .ready()
+                    .unwrap_err();
+                assert!(pending.local_obligation().is_some());
+            });
         },
     );
 }

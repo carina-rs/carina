@@ -1540,7 +1540,7 @@ fn production_inference_retains_constraints_for_coalesce_collections_and_branche
 }
 
 #[test]
-fn reference_boundaries_retain_both_names_from_the_shared_formatter() {
+fn resource_reference_is_pending_while_strict_boundaries_retain_both_names() {
     let snapshot = snapshot(vec![("p", vec![string(1, 128, None), string(1, 64, None)])]);
     let context = snapshot.provider_context().as_provider_context();
     let mut parsed = crate::parser::parse(
@@ -1553,19 +1553,18 @@ fn reference_boundaries_retain_both_names_from_the_shared_formatter() {
     .unwrap();
     let parsed = inference::apply_inference(parsed, snapshot.schema_registry(), context);
     let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
-    let messages = [
-        validate_resource_ref_types(
-            crate::config_loader::load_buffer_configuration(
-                &parsed,
-                snapshot.schema_registry(),
-                context,
-            )
-            .judged(),
-            &HashSet::new(),
-            &bindings,
+    validate_resource_ref_types(
+        crate::config_loader::load_buffer_configuration(
+            &parsed,
+            snapshot.schema_registry(),
+            context,
         )
-        .unwrap_err()
-        .to_string(),
+        .judged(),
+        &HashSet::new(),
+        &bindings,
+    )
+    .expect("same-identity resource reference defers its local constraints");
+    let messages = [
         validate_attribute_param_ref_types_with_bindings(&parsed.attribute_params, &bindings)
             .unwrap_err(),
         validate_export_param_ref_types_with_bindings(&parsed.export_params, &bindings)
@@ -1584,6 +1583,66 @@ fn reference_boundaries_retain_both_names_from_the_shared_formatter() {
             "{message}"
         );
     }
+}
+
+#[test]
+fn wider_name_resource_reference_discharge_matches_the_destination_literal_error() {
+    use crate::binding_index::{BindingValueSource, ResolvedBindings};
+    use crate::resource::knowledge::KnowledgeContext;
+    use crate::validation::admission::{Candidate, admit};
+    let snapshot = snapshot(vec![("p", vec![string(1, 128, None), string(1, 64, None)])]);
+    let context = snapshot.provider_context().as_provider_context();
+    let parsed = crate::parser::parse_file(
+        "let source = p.Values {}\nlet target = p.Values { value1 = source.value0 }\n",
+        std::path::Path::new("main.crn"),
+        context,
+    )
+    .unwrap()
+    .resolve_root_for_test();
+    let bindings = BindingIndex::from_parsed(&parsed, snapshot.schema_registry(), context);
+    let destination = snapshot
+        .schema_registry()
+        .resource_attribute_destination(&parsed.resources[1].id, "value1", context)
+        .unwrap();
+    deferred_types::with_session_for_test(snapshot.provider_context(), |session| {
+        let reference = crate::resource::Value::root_resource_ref("source", "value0", vec![]);
+        let (candidate, boundary) = Candidate::validation(
+            reference
+                .knowledge(&KnowledgeContext::validation())
+                .unwrap(),
+            &bindings,
+            session,
+        );
+        let pending = admit(&destination, candidate, &boundary)
+            .unwrap()
+            .ready()
+            .unwrap_err();
+        let literal = crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+            "A".repeat(65).into(),
+        ));
+        let (candidate, boundary) = Candidate::validation(
+            literal.knowledge(&KnowledgeContext::validation()).unwrap(),
+            &bindings,
+            session,
+        );
+        let literal_error = admit(&destination, candidate, &boundary).unwrap_err();
+        let mut resolved = ResolvedBindings::default();
+        resolved.set(
+            "source",
+            HashMap::from([("value0".into(), literal)]),
+            BindingValueSource::Local,
+        );
+        let error = pending.discharge(&resolved, session).unwrap_err();
+        assert_eq!(error.resolution_error(), literal_error.resolution_error());
+        assert_eq!(
+            error
+                .resolution_error()
+                .to_string()
+                .matches("value1:")
+                .count(),
+            1
+        );
+    });
 }
 
 #[test]

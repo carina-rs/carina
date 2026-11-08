@@ -540,6 +540,7 @@ enum AssignmentCheck {
     /// identified leaves need this proof; their rule-7 containment still applies.
     IdentifiedLeaves,
     Reference,
+    IdentifiedReferenceLeaves,
 }
 
 impl TypeInSchema<'_, super::Compiled> {
@@ -616,7 +617,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     /// full assignment. An earlier owner's edge is not proof for this sink.
     /// Identity-less leaves keep the declaration's deferred value checks;
     /// identified leaves retain ordinary identity admission and containment.
-    fn identity_assignment_to<'query>(
+    pub(crate) fn identity_assignment_to<'query>(
         self,
         sink: AssignmentSink<'query, R>,
     ) -> TypeAssignability<'query>
@@ -651,6 +652,23 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         )
     }
 
+    pub(crate) fn identified_reference_assignment_to<'query, B: crate::resource::BindingAddress>(
+        self,
+        sink: AssignmentSink<'query, R>,
+        _reference: &crate::validation::admission::ReferenceCandidate<B>,
+    ) -> AssignmentRelation<'query>
+    where
+        'source: 'query,
+    {
+        let source: TypeInSchema<'query, R> = self;
+        source.assignment_on_paths(
+            sink,
+            AssignmentCheck::IdentifiedReferenceLeaves,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+    }
+
     fn assignment_on_paths<'sink>(
         self,
         sink: AssignmentSink<'sink, R>,
@@ -672,11 +690,13 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         let right = sink.rebind(target.attr);
         use AssignmentRelation::*;
         use AttrTypeKind::*;
-        let same_identity = check == AssignmentCheck::Reference
-            && identity_leaf(&source.attr.kind)
-                .and_then(|leaf| leaf.identity())
-                .zip(identity_leaf(&target.attr.kind).and_then(|leaf| leaf.identity()))
-                .is_some_and(|(source, target)| source == target);
+        let same_identity = matches!(
+            check,
+            AssignmentCheck::Reference | AssignmentCheck::IdentifiedReferenceLeaves
+        ) && identity_leaf(&source.attr.kind)
+            .and_then(|leaf| leaf.identity())
+            .zip(identity_leaf(&target.attr.kind).and_then(|leaf| leaf.identity()))
+            .is_some_and(|(source, target)| source == target);
         if same_identity {
             source_refs.truncate(source.restore_len);
             sink_refs.truncate(target.restore_len);
@@ -690,8 +710,10 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 Mismatch
             }
             (_, kind)
-                if check == AssignmentCheck::IdentifiedLeaves
-                    && identity_leaf(kind).is_none()
+                if matches!(
+                    check,
+                    AssignmentCheck::IdentifiedLeaves | AssignmentCheck::IdentifiedReferenceLeaves
+                ) && identity_leaf(kind).is_none()
                     && !matches!(kind, List { .. } | Map { .. } | Struct { .. } | Union(_)) =>
             {
                 Assignable

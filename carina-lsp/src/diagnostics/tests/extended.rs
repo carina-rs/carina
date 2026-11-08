@@ -10220,7 +10220,7 @@ fn named_annotation_lsp_literals_keep_the_declared_length_bound() {
 }
 
 #[test]
-fn named_reference_mismatch_keeps_both_constraint_aware_names_in_lsp() {
+fn wider_same_identity_name_reference_is_pending_in_lsp() {
     let engine = named_annotation_engine(128);
     let diagnostics = engine.analyze(
         &create_document(
@@ -10229,9 +10229,77 @@ fn named_reference_mismatch_keeps_both_constraint_aware_names_in_lsp() {
         None,
     );
     assert!(
-        diagnostics.iter().any(|diagnostic| diagnostic.message
-            == "Type mismatch: expected aws.iam.Role.Name (length 1..=64), got aws.iam.Role.Name (length 1..=128) (from source.name)"),
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Type mismatch")),
         "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once() {
+    use carina_core::binding_index::{BindingIndex, BindingValueSource, ResolvedBindings};
+    use carina_core::resource::knowledge::KnowledgeContext;
+    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::validation::admission::{Candidate, admit};
+    let engine = named_annotation_engine(128);
+    let parsed = carina_core::parser::parse_file(
+        "provider aws {}\nlet source = aws.NameSource {}\nlet role = aws.iam.Role { role_name = source.name }\n",
+        std::path::Path::new("main.crn"), &engine.provider_context,
+    ).unwrap().resolve_root_for_test();
+    let bindings = BindingIndex::from_parsed(&parsed, &engine.schemas, &engine.provider_context);
+    let destination = engine
+        .schemas
+        .resource_attribute_destination(
+            &parsed.resources[1].id,
+            "role_name",
+            &engine.provider_context,
+        )
+        .unwrap();
+    carina_core::validation::deferred_types::with_session_for_test(
+        &engine.provider_context,
+        |session| {
+            let reference = Value::<carina_core::resource::NoPlaceholder>::Deferred(
+                carina_core::resource::DeferredValue::ResourceRef {
+                    path: carina_core::resource::AccessPath::new("source", "name")
+                        .resolve_root_for_test(),
+                },
+            );
+            let (candidate, boundary) = Candidate::validation(
+                reference
+                    .knowledge(&KnowledgeContext::validation())
+                    .unwrap(),
+                &bindings,
+                session,
+            );
+            let pending = admit(&destination, candidate, &boundary)
+                .unwrap()
+                .ready()
+                .expect_err("the reference must be pending");
+            let literal = Value::Concrete(ConcreteValue::String("A".repeat(65).into()));
+            let (candidate, boundary) = Candidate::validation(
+                literal.knowledge(&KnowledgeContext::validation()).unwrap(),
+                &bindings,
+                session,
+            );
+            let literal_error = admit(&destination, candidate, &boundary).unwrap_err();
+            let mut resolved = ResolvedBindings::default();
+            resolved.set(
+                "source",
+                HashMap::from([("name".into(), literal)]),
+                BindingValueSource::Local,
+            );
+            let error = pending.discharge(&resolved, session).unwrap_err();
+            assert_eq!(error.resolution_error(), literal_error.resolution_error());
+            assert_eq!(
+                error
+                    .resolution_error()
+                    .to_string()
+                    .matches("role_name:")
+                    .count(),
+                1
+            );
+        },
     );
 }
 

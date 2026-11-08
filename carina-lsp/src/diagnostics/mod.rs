@@ -324,73 +324,76 @@ type ExpandedConfiguration<'a> = carina_core::parser::retained::JudgedFile<
     >,
     AbsoluteBindingAddress,
 >;
-type ExpandedTree<'a> = carina_core::parser::AnalysisTree<
-    'a,
-    ParserPlaceholder,
-    ParserPlaceholder,
-    carina_core::parser::ResolvedDeferredForPhase<
-        ParserPlaceholder,
-        ParserPlaceholder,
-        AbsoluteBindingAddress,
-    >,
-    AbsoluteBindingAddress,
->;
-
 struct ExpandedDiagnosticValidationInputs<'a> {
     configuration: &'a ExpandedConfiguration<'a>,
-    tree: ExpandedTree<'a>,
+    tree: ExpandedAnalysis<'a>,
     binding_index: carina_core::binding_index::BindingIndex<'a, AbsoluteBindingAddress>,
 }
 
 impl ExpandedDiagnosticValidationInputs<'_> {
-    fn check_resource_access(
+    fn resource_admissions(
         &self,
         resource_id: &carina_core::resource::ResourceId,
-        attribute: &str,
-        expected: carina_core::schema::AssignmentSink<'_, carina_core::schema::Compiled>,
-    ) -> Option<Result<(), carina_core::validation::DeferredAccessTypeError>> {
+        session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
+    ) -> Option<carina_core::schema::ResourceValueValidation> {
+        use carina_core::validation::admission::{attributes::resource_attribute_admissions, kind};
         let resource = self
-            .configuration
-            .file()
-            .iter_all_resources()
-            .find(|candidate| candidate.id() == resource_id)?;
+            .tree
+            .resources()
+            .find(|resource| resource.id() == resource_id)?;
+        let schemas = self.configuration.schemas();
+        let schema = resource.schema(schemas)?;
         let attributes = resource.attributes();
-        let value = attributes.get(attribute)?;
-        let evidence = self
-            .configuration
-            .report()
-            .for_resource(resource_id)
-            .and_then(|report| {
-                self.tree
-                    .resources()
-                    .find(|resource| resource.id() == resource_id)
-                    .ok_or_else(|| {
-                        carina_core::parser::retained::MissingEvidence::for_resource(resource_id)
-                    })
-                    .and_then(|resource| {
-                        report.expression(resource.attribute_value_location(
-                            attribute,
-                            &carina_core::schema::FieldPath::new(),
-                        ))
-                    })
-            });
-        let expression = match evidence {
-            Ok(expression) => expression,
-            Err(error) => {
-                return Some(Err(
-                    carina_core::validation::DeferredAccessTypeError::InvalidAccess {
-                        error: error.into(),
-                    },
-                ));
+        let mut classified = collect_classified_attributes(
+            attributes.iter().map(|(name, value)| (name.clone(), value)),
+            &carina_core::resource::knowledge::KnowledgeContext::validation(),
+            |_, _| {},
+        );
+        let evaluated = classified
+            .iter()
+            .filter_map(|(name, proof)| {
+                carina_core::parser::evaluate_expanded_value_for_validation(proof, session)
+                    .filter(|value| value != &attributes[name])
+                    .map(|value| (name.clone(), value))
+            })
+            .collect::<HashMap<_, _>>();
+        classified.extend(collect_classified_attributes(
+            evaluated.iter().map(|(name, value)| (name.clone(), value)),
+            &carina_core::resource::knowledge::KnowledgeContext::validation(),
+            |_, _| {},
+        ));
+        let report = self.configuration.report().for_resource(resource_id).ok()?;
+        Some(match resource.kind() {
+            carina_core::parser::AnalysisItemKind::DataSource => {
+                resource_attribute_admissions::<kind::DataSourceAttribute, _, _, _>(
+                    resource,
+                    self.configuration.file(),
+                    schema,
+                    &classified,
+                    resource.quoted_string_attrs(),
+                    report,
+                    &self.binding_index,
+                    session,
+                    schemas,
+                )
             }
-        };
-        Some(carina_core::validation::check_deferred_access_type(
-            value,
-            expected,
-            expression,
-            self.configuration.schemas(),
-            &self.binding_index,
-        ))
+            carina_core::parser::AnalysisItemKind::Resource
+            | carina_core::parser::AnalysisItemKind::DeferredResource
+            | carina_core::parser::AnalysisItemKind::Composition
+            | carina_core::parser::AnalysisItemKind::Wait => {
+                resource_attribute_admissions::<kind::ResourceAttribute, _, _, _>(
+                    resource,
+                    self.configuration.file(),
+                    schema,
+                    &classified,
+                    resource.quoted_string_attrs(),
+                    report,
+                    &self.binding_index,
+                    session,
+                    schemas,
+                )
+            }
+        })
     }
 }
 
@@ -1597,11 +1600,28 @@ impl DiagnosticRun<'_> {
                         &knowledge_context,
                         classification_error,
                     ));
-                    let mut value_validation = validated_schema.validate_values_with_resolver(
-                        &classified_attrs,
-                        &|attr| resource_quoted_string_attrs.contains(attr),
-                        self.provider_context.catalog().custom_type_resolver(),
-                    );
+                    // Expansion supplies the binding authority for composition
+                    // exports. Select that input before admitting attributes;
+                    // the authored tree below supplies only rendering locations.
+                    let uses_composition_output = rref.references().iter().any(|reference| {
+                        pre_expansion_input.module_calls.iter().any(|call| {
+                            call.binding_name.as_ref().is_some_and(|binding| {
+                                reference.binding_matches(|key| key.matches(binding))
+                            })
+                        })
+                    });
+                    let mut value_validation = expanded_validation_inputs.as_ref()
+                        .filter(|_| uses_composition_output)
+                        .and_then(|inputs| inputs.resource_admissions(resource_id, self.provider_context))
+                        .unwrap_or_else(|| match rref.kind() {
+                        carina_core::parser::AnalysisItemKind::DataSource => carina_core::validation::admission::attributes::resource_attribute_admissions::<carina_core::validation::admission::kind::DataSourceAttribute, _, _, _>(
+                            rref, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, expression_report, &binding_index, self.provider_context, &self.schemas,
+                        ),
+                        carina_core::parser::AnalysisItemKind::Resource | carina_core::parser::AnalysisItemKind::DeferredResource => carina_core::validation::admission::attributes::resource_attribute_admissions::<carina_core::validation::admission::kind::ResourceAttribute, _, _, _>(
+                            rref, parsed, validated_schema, &classified_attrs, resource_quoted_string_attrs, expression_report, &binding_index, self.provider_context, &self.schemas,
+                        ),
+                        carina_core::parser::AnalysisItemKind::Composition | carina_core::parser::AnalysisItemKind::Wait => Default::default(),
+                    });
                     let mut reported_attribute_diagnostics = HashSet::new();
                     for (attr_name, authored_attr_value) in resource_attributes.iter() {
                         let location = rref.attribute_value_location(
@@ -1711,45 +1731,15 @@ impl DiagnosticRun<'_> {
                                 continue;
                             }
 
-                            // Arithmetic is a typed computed expression. Send
-                            // the complete authored tree through core's shared
-                            // checker before the legacy shape-oriented cases;
-                            // this also reaches arithmetic nested in secrets,
-                            // interpolation, collections, and coalesces.
-                            let arithmetic_findings = tree.integer_arithmetic_findings(
-                                rref,
-                                attr_name,
-                                validated_schema,
-                                &binding_index,
-                            );
-                            if !arithmetic_findings.is_empty() {
-                                for finding in arithmetic_findings {
-                                    if let Some(diagnostic) = render_merged(
-                                        doc,
-                                        &finding,
-                                        DiagnosticSeverity::ERROR,
-                                        finding.detail().to_string(),
-                                    ) && !diagnostics.iter().any(|existing| {
-                                        existing.range == diagnostic.range
-                                            && existing.message == diagnostic.message
-                                    }) {
-                                        diagnostics.push(diagnostic);
-                                    }
-                                }
-                                continue;
-                            }
-
-                            // Check for block syntax on bare Struct attributes:
-                            // Block syntax produces Value::Concrete(ConcreteValue::List), but bare Struct requires
-                            // map assignment syntax: attr = { ... }.
-                            // Use `Shape` (Ref-peeled) so a Ref-typed
-                            // bare-struct attribute is still caught (same
-                            // bug class as carina#3349).
+                            let attr_findings = value_validation
+                                .take_attribute(attr_name)
+                                .unwrap_or_default();
+                            // Admission owns the syntax verdict. Parser-owned
+                            // block keys supply the established guidance ranges.
                             if matches!(
-                                effective_type.shape(),
-                                carina_core::schema::Shape::Struct { .. }
-                            ) && matches!(attr_value, Value::Concrete(ConcreteValue::List(_)))
-                            {
+                                attr_findings.local_error(),
+                                Some(TypeError::BlockSyntaxNotAllowed { .. })
+                            ) {
                                 let search_name = attr_schema.block_name().unwrap_or(attr_name);
                                 let mut reported_block_syntax = false;
                                 for location in rref.attribute_block_keys(attr_name) {
@@ -1773,32 +1763,8 @@ impl DiagnosticRun<'_> {
                                 }
                             }
 
-                            // #2309: direct Enum attributes use the dedicated
-                            // structured diagnostic path. Union attributes stay in
-                            // the guarded match below so deferred values keep #2847's
-                            // behavior and static values are validated only once.
-                            // Reuse a report only for the value it actually checked.
-                            // Authored containers and assignment expressions can
-                            // differ from the statically evaluated resource value.
-                            let mut cached_findings = value_validation.take_attribute(attr_name);
-                            let mut findings_for = |value: &Value| {
-                                if resolved_attrs.get(attr_name).is_some_and(|cached_value| {
-                                    validation::same_validation_input(cached_value, value)
-                                }) && let Some(findings) = cached_findings.take()
-                                {
-                                    findings
-                                } else {
-                                    effective_type.validate_findings(value)
-                                }
-                            };
-                            let attr_findings = findings_for(attr_value);
                             let assignment_value =
                                 judged_expression.assignment_value(typecheck_value);
-                            let assignment_findings =
-                                (!validation::same_validation_input(assignment_value, attr_value))
-                                    .then(|| findings_for(assignment_value));
-                            let value_findings =
-                                assignment_findings.as_ref().unwrap_or(&attr_findings);
                             if matches!(
                                 effective_type.shape(),
                                 carina_core::schema::Shape::Enum { .. }
@@ -1815,31 +1781,10 @@ impl DiagnosticRun<'_> {
                                 // is already reported with the richer diagnostic.
                                 continue;
                             }
-                            // Use `Shape` to peel `AttributeType::Ref` against
-                            // `schema.defs` at the type-system level. Shape
-                            // intentionally has no `Ref` variant — the
-                            // wildcard arm cannot silently drop a Ref-typed
-                            // attribute (carina#3349 invariant lifted into
-                            // the type system).
-                            let attr_shape = effective_type.shape();
-                            let contains_struct = effective_type.contains_struct();
-                            let mut type_error_severity = DiagnosticSeverity::WARNING;
-                            let mut diagnose_access_error = |error: DeferredAccessTypeError| {
-                                type_error_severity = match &error {
-                                    DeferredAccessTypeError::InvalidAccess { .. } => {
-                                        DiagnosticSeverity::ERROR
-                                    }
-                                    DeferredAccessTypeError::TypeMismatch { .. } => {
-                                        DiagnosticSeverity::WARNING
-                                    }
-                                };
-                                error.to_string()
-                            };
-                            let mut diagnose_schema_error = |error: TypeError| {
-                                let tagged = error.with_attribute(attr_name);
-                                if is_duplicate_list_error(&tagged)
-                                    || crate::code_action::enum_diagnostic_data_for_error(&tagged)
-                                        .is_some()
+                            if let Some(error) = attr_findings.local_error() {
+                                let tagged = error.clone().with_attribute(attr_name);
+                                if crate::code_action::enum_diagnostic_data_for_error(&tagged)
+                                    .is_some()
                                 {
                                     let finding = carina_core::parser::Located::new(
                                         rref.attribute_value_location(
@@ -1849,302 +1794,211 @@ impl DiagnosticRun<'_> {
                                         .clone(),
                                         tagged,
                                     );
-                                    if let Some(diagnostic) = render_schema_diagnostic(
+                                    diagnostics.extend(render_schema_diagnostic(
                                         doc,
                                         &finding,
                                         rref.replaceable_attribute_value(attr_name),
-                                    ) {
-                                        reported_attribute_diagnostics
-                                            .insert(canonical_name.to_string());
-                                        diagnostics.push(diagnostic);
-                                    }
-                                    None
-                                } else {
-                                    Some(tagged.to_string())
+                                    ));
+                                    reported_attribute_diagnostics
+                                        .insert(canonical_name.to_string());
+                                    continue;
                                 }
-                            };
-                            let type_error = match (attr_shape, assignment_value) {
-                                // Each undecided branch contributes its own
-                                // local/provider errors to the shared report.
-                                (_, Value::Deferred(DeferredValue::ModuleIf(_))) => None,
-                                // Bool type should not receive String
-                                (
-                                    carina_core::schema::Shape::Bool,
-                                    Value::Concrete(ConcreteValue::String(_)),
-                                ) => Some(format!(
-                                    "Type mismatch: expected Bool, got {}. Use true or false.",
-                                    carina_core::ValueDescription::of(attr_value)
-                                )),
-                                // Int type should not receive String
-                                (
-                                    carina_core::schema::Shape::Int { .. },
-                                    Value::Concrete(ConcreteValue::String(_)),
-                                ) => Some(format!(
-                                    "Type mismatch: expected Int, got {}.",
-                                    carina_core::ValueDescription::of(attr_value)
-                                )),
-                                // Float type should not receive String
-                                (
-                                    carina_core::schema::Shape::Float { .. },
-                                    Value::Concrete(ConcreteValue::String(_)),
-                                ) => Some(format!(
-                                    "Type mismatch: expected Float, got {}.",
-                                    carina_core::ValueDescription::of(attr_value)
-                                )),
-                                // The shared authority chooses BindingIndex
-                                // for canonical reference paths and inference
-                                // for computed Access values. Callers do not
-                                // classify binding kinds independently.
-                                (_, value @ Value::Deferred(DeferredValue::Coalesce { .. })) => {
-                                    value_findings
-                                        .local_error()
-                                        .cloned()
-                                        .map(|error| error.with_attribute(attr_name).to_string())
-                                        .or_else(|| {
-                                            carina_core::validation::check_deferred_access_type(
-                                                value,
-                                                validated_schema.assignment_sink(
-                                                    attr_schema.attr_type(),
-                                                    &self.provider_context.catalog().custom_types,
-                                                ),
-                                                judged_expression,
-                                                &self.schemas,
-                                                &binding_index,
-                                            )
-                                            .err()
-                                            .map(&mut diagnose_access_error)
-                                        })
-                                }
-                                (
-                                    _,
-                                    value @ Value::Deferred(
-                                        DeferredValue::ResourceRef { .. }
-                                        | DeferredValue::Access(_),
-                                    ),
-                                ) => expanded_validation_inputs
-                                    .as_ref()
-                                    .and_then(|inputs| {
-                                        inputs.check_resource_access(
-                                            resource_id,
-                                            attr_name,
-                                            validated_schema.assignment_sink(
-                                                attr_schema.attr_type(),
-                                                &self.provider_context.catalog().custom_types,
-                                            ),
-                                        )
-                                    })
-                                    .unwrap_or_else(|| {
-                                        carina_core::validation::check_deferred_access_type(
-                                            value,
-                                            validated_schema.assignment_sink(
-                                                attr_schema.attr_type(),
-                                                &self.provider_context.catalog().custom_types,
-                                            ),
-                                            judged_expression,
-                                            &self.schemas,
-                                            &binding_index,
-                                        )
-                                    })
-                                    .err()
-                                    .map(&mut diagnose_access_error),
-                                (_, Value::Deferred(DeferredValue::BindingRef { binding })) => {
-                                    check_resource_ref_type_mismatch(
-                                        &binding_index,
-                                        validated_schema.assignment_sink(
-                                            attr_schema.attr_type(),
-                                            &self.provider_context.catalog().custom_types,
-                                        ),
-                                        binding.into(),
-                                    )
-                                }
-                                (
-                                    _,
-                                    value @ Value::Deferred(DeferredValue::Placeholder(
-                                        ParserPlaceholder::ModuleArgument {
-                                            name: _name,
-                                            diagnostic: _diagnostic,
-                                        },
-                                    )),
-                                ) => carina_core::resource::module_argument_reference_path(value)
-                                    .and_then(|path| {
-                                        check_resource_ref_type_mismatch(
-                                            &binding_index,
-                                            validated_schema.assignment_sink(
-                                                attr_schema.attr_type(),
-                                                &self.provider_context.catalog().custom_types,
-                                            ),
-                                            (&path).into(),
-                                        )
-                                    }),
-                                // Core's arithmetic checker above owns both operand and
-                                // result-sink diagnostics for this typed expression.
-                                (_, Value::Deferred(DeferredValue::IntegerArithmetic(_))) => None,
-                                // Enum: the structured-payload path
-                                // above handles `InvalidEnumVariant` /
-                                // `StringLiteralExpectedEnum` and
-                                // `continue`s past this match. We only
-                                // reach this arm when that path declined
-                                // (e.g. `TypeMismatch` from a non-string
-                                // value, or `ValidationFailed` from the
-                                // namespace-shape fallback) — surface the
-                                // plain message so the user still sees a
-                                // diagnostic, just without the quick-fix.
-                                (carina_core::schema::Shape::Enum { .. }, _value) => {
-                                    value_findings.local_error().cloned().map(|e| {
-                                        let tagged = e.with_attribute(attr_name);
-                                        let reshaped =
-                                            if resource_quoted_string_attrs.contains(attr_name) {
-                                                tagged.into_string_literal_diagnostic()
-                                            } else {
-                                                tagged
-                                            };
-                                        reshaped.to_string()
-                                    })
-                                }
-                                // The shared whole-schema pass below validates identified
-                                // scalars with the owner-bound lookup. Doing it here as well
-                                // would execute native or bridged callbacks twice per edit.
-                                (
-                                    carina_core::schema::Shape::Reference {
-                                        identity: _identity,
-                                        pattern: _,
-                                        length: _,
-                                    },
-                                    _value,
-                                )
-                                | (
-                                    carina_core::schema::Shape::String {
-                                        identity: Some(_identity),
-                                        ..
-                                    },
-                                    _value,
-                                )
-                                | (
-                                    carina_core::schema::Shape::Int {
-                                        identity: Some(_identity),
-                                        ..
-                                    },
-                                    _value,
-                                )
-                                | (
-                                    carina_core::schema::Shape::Float {
-                                        identity: Some(_identity),
-                                        ..
-                                    },
-                                    _value,
-                                ) => None,
-                                // Collections use the path-tagged collector below,
-                                // including count bounds and nested leaf errors.
-                                (
-                                    carina_core::schema::Shape::List { .. },
-                                    Value::Concrete(ConcreteValue::List(_)),
-                                )
-                                | (
-                                    carina_core::schema::Shape::Map { .. },
-                                    Value::Concrete(ConcreteValue::Map(_)),
-                                ) => None,
-                                // Validate Union static values (non-ResourceRef, non-BindingRef).
-                                // Ref-shaped values are unresolved at this
-                                // checkpoint and must not be type-checked
-                                // against Union members here — see #2847
-                                // for the bare-binding (`BindingRef`) form.
-                                (carina_core::schema::Shape::Union, value)
-                                    if !contains_struct
-                                        && !matches!(
-                                            value,
-                                            Value::Deferred(DeferredValue::ResourceRef { .. })
-                                                | Value::Deferred(DeferredValue::BindingRef { .. })
-                                                | Value::Deferred(DeferredValue::Coalesce { .. })
-                                        ) =>
-                                {
-                                    value_findings
-                                        .local_error()
-                                        .cloned()
-                                        .and_then(&mut diagnose_schema_error)
-                                }
-
-                                // Root kind mismatches are suppressed by the
-                                // whole-resource pass because this attribute
-                                // pass owns their precise source location.
-                                (_, Value::Concrete(_))
-                                    if !contains_function_call(authored_attr_value) =>
-                                {
-                                    value_findings
-                                        .local_error()
-                                        .filter(|error| {
-                                            matches!(error, TypeError::TypeMismatch { .. })
-                                        })
-                                        .cloned()
-                                        .and_then(&mut diagnose_schema_error)
-                                }
-                                (_, Value::Deferred(DeferredValue::Secret(_))) => None,
-                                (
-                                    _,
-                                    Value::Concrete(_)
-                                    | Value::Deferred(
-                                        DeferredValue::Interpolation(_)
-                                        | DeferredValue::FunctionCall { .. }
-                                        | DeferredValue::ResolvedFunctionCall { .. }
-                                        | DeferredValue::Unknown(_)
-                                        | DeferredValue::Placeholder(_)
-                                        | DeferredValue::Unavailable { .. },
-                                    ),
-                                ) => None,
-                            };
-                            if let Some(message) = type_error {
+                            }
+                            let symbolic = attr_findings.symbolic_errors().to_vec();
+                            for (_path, error) in &symbolic {
                                 reported_attribute_diagnostics.insert(canonical_name.to_string());
-                                let finding = carina_core::parser::Located::new(
-                                    rref.attribute_key_location(attr_name).clone(),
-                                    message,
-                                );
-                                diagnostics.extend(render_merged(
-                                    doc,
-                                    &finding,
-                                    type_error_severity,
-                                    finding.detail().clone(),
-                                ));
+                                use carina_core::resource::SecretDiagnosticError;
+                                use carina_core::validation::admission::AdmissionReferenceError;
+                                let (location, severity, message) = match error {
+                                    TypeError::Reference { error, .. } => match error.as_ref() {
+                                        SecretDiagnosticError::Public(
+                                            AdmissionReferenceError::Arithmetic(finding),
+                                        ) => (
+                                            finding.location(),
+                                            DiagnosticSeverity::ERROR,
+                                            finding.detail().to_string(),
+                                        ),
+                                        SecretDiagnosticError::Public(
+                                            AdmissionReferenceError::Computed(error),
+                                        ) => (
+                                            rref.attribute_key_location(attr_name),
+                                            match error {
+                                                DeferredAccessTypeError::InvalidAccess {
+                                                    ..
+                                                } => DiagnosticSeverity::ERROR,
+                                                DeferredAccessTypeError::TypeMismatch {
+                                                    ..
+                                                } => DiagnosticSeverity::WARNING,
+                                            },
+                                            error.to_string(),
+                                        ),
+                                        // The reference existence pass owns these same findings.
+                                        SecretDiagnosticError::Public(
+                                            AdmissionReferenceError::UnknownBinding { .. }
+                                            | AdmissionReferenceError::Path(_)
+                                            | AdmissionReferenceError::ProtectedBinding
+                                            | AdmissionReferenceError::ProtectedAttribute,
+                                        ) => continue,
+                                        SecretDiagnosticError::Public(
+                                            AdmissionReferenceError::Authored(finding),
+                                        ) if finding.is_lookup_error() => continue,
+                                        SecretDiagnosticError::Public(
+                                            AdmissionReferenceError::ResourceHandle {
+                                                reference,
+                                                types,
+                                            },
+                                        ) => (
+                                            rref.attribute_key_location(attr_name),
+                                            DiagnosticSeverity::WARNING,
+                                            format!("Type mismatch: {types} (from {reference})"),
+                                        ),
+                                        SecretDiagnosticError::Public(
+                                            AdmissionReferenceError::Resolution(_)
+                                            | AdmissionReferenceError::Authored(_),
+                                        )
+                                        | SecretDiagnosticError::InsideSecret => (
+                                            rref.attribute_key_location(attr_name),
+                                            DiagnosticSeverity::ERROR,
+                                            error.to_string(),
+                                        ),
+                                    },
+                                    TypeError::TypeMismatch { .. } => {
+                                        let origin = match assignment_value {
+                                            Value::Deferred(DeferredValue::ResourceRef {
+                                                path,
+                                            }) => Some(path.to_dot_string()),
+                                            Value::Deferred(DeferredValue::BindingRef {
+                                                binding,
+                                            }) => Some(binding.to_string()),
+                                            _ => None,
+                                        };
+                                        let message = origin.map_or_else(
+                                            || error.to_string(),
+                                            |origin| format!("{error} (from {origin})"),
+                                        );
+                                        (
+                                            rref.attribute_key_location(attr_name),
+                                            DiagnosticSeverity::WARNING,
+                                            message,
+                                        )
+                                    }
+                                    _ => (
+                                        rref.attribute_key_location(attr_name),
+                                        DiagnosticSeverity::WARNING,
+                                        error.to_string(),
+                                    ),
+                                };
+                                let finding =
+                                    carina_core::parser::Located::new(location.clone(), message);
+                                if let Some(diagnostic) =
+                                    render_merged(doc, &finding, severity, finding.detail().clone())
+                                    && !diagnostics.iter().any(|existing| {
+                                        existing.range == diagnostic.range
+                                            && existing.message == diagnostic.message
+                                    })
+                                {
+                                    diagnostics.push(diagnostic);
+                                }
+                                reported_attribute_diagnostics.insert(canonical_name.to_string());
                             }
 
-                            // Container validation. The wrapper borrows
-                            // the schema's `AttributeType` directly so we
-                            // don't deep-clone the field set on every
-                            // keystroke (LSP `analyze` is on
-                            // the per-keystroke hot path).
-                            //
-                            // Use `Shape` (Ref-peeled) so cyclic-CFN
-                            // attributes (e.g.
-                            // `awscc.s3.Bucket.lifecycle_configuration:
-                            // Ref("LifecycleConfiguration")`) still trigger
-                            // struct-field validation. Same bug class as
-                            // carina#3349 — a raw match arm would silently
-                            // drop `Ref` and skip the entire pass.
-                            if contains_struct
+                            let container_findings = attr_findings
+                                .local_findings()
+                                .iter()
+                                .any(|(path, _)| !path.is_empty())
                                 || matches!(
-                                    (effective_type.shape(), attr_findings.structure()),
-                                    (
-                                        carina_core::schema::Shape::List { .. },
-                                        carina_core::schema::ValueStructure::List
-                                            | carina_core::schema::ValueStructure::Protected
-                                    ) | (
-                                        carina_core::schema::Shape::Map { .. },
-                                        carina_core::schema::ValueStructure::Map
-                                            | carina_core::schema::ValueStructure::Protected
-                                    )
+                                    attr_findings.structure(),
+                                    carina_core::schema::ValueStructure::List
+                                        | carina_core::schema::ValueStructure::Map
                                 )
-                            {
-                                let local_findings = attr_findings.into_local_findings();
-                                let (nested_diagnostics, reported_duplicate) = self
-                                    .render_container_findings(
-                                        doc,
-                                        rref,
-                                        attr_name,
-                                        local_findings,
-                                    );
+                                || matches!(
+                                    attr_findings.local_error(),
+                                    Some(
+                                        TypeError::ListItemError { .. }
+                                            | TypeError::MapValueError { .. }
+                                            | TypeError::StructFieldError { .. }
+                                    )
+                                );
+                            if container_findings {
+                                let findings = attr_findings
+                                    .into_local_findings()
+                                    .into_iter()
+                                    .filter(|(path, error)| {
+                                        (!path.is_empty()
+                                            || !contains_function_call(authored_attr_value))
+                                            && !symbolic.iter().any(
+                                                |(symbolic_path, symbolic_error)| {
+                                                    path.canonical() == *symbolic_path
+                                                        && error == symbolic_error
+                                                },
+                                            )
+                                    })
+                                    .collect();
+                                let (nested, reported_duplicate) =
+                                    self.render_container_findings(doc, rref, attr_name, findings);
                                 if reported_duplicate {
                                     reported_attribute_diagnostics
                                         .insert(canonical_name.to_string());
                                 }
-                                diagnostics.extend(nested_diagnostics);
+                                diagnostics.extend(nested);
+                            } else if symbolic.is_empty() {
+                                let error = attr_findings.local_error();
+                                let message = match error {
+                                    Some(TypeError::TypeMismatch { types }) => {
+                                        match (types.expected(), assignment_value) {
+                                            ("Bool", Value::Concrete(ConcreteValue::String(_))) => {
+                                                Some(format!(
+                                                    "Type mismatch: expected Bool, got {}. Use true or false.",
+                                                    carina_core::ValueDescription::of(attr_value)
+                                                ))
+                                            }
+                                            ("Int", Value::Concrete(ConcreteValue::String(_))) => {
+                                                Some(format!(
+                                                    "Type mismatch: expected Int, got {}.",
+                                                    carina_core::ValueDescription::of(attr_value)
+                                                ))
+                                            }
+                                            (
+                                                "Float",
+                                                Value::Concrete(ConcreteValue::String(_)),
+                                            ) => Some(format!(
+                                                "Type mismatch: expected Float, got {}.",
+                                                carina_core::ValueDescription::of(attr_value)
+                                            )),
+                                            _ => error
+                                                .filter(|_| {
+                                                    !contains_function_call(authored_attr_value)
+                                                })
+                                                .map(ToString::to_string),
+                                        }
+                                    }
+                                    Some(
+                                        TypeError::InvalidEnumVariant { .. }
+                                        | TypeError::BindingShadowsEnumMember(_)
+                                        | TypeError::UnionStructMismatch { .. }
+                                        | TypeError::UnionAlternativesMismatch { .. }
+                                        | TypeError::BlockSyntaxNotAllowed { .. },
+                                    ) => error
+                                        .filter(|_| !contains_function_call(authored_attr_value))
+                                        .map(|error| {
+                                            error.clone().with_attribute(attr_name).to_string()
+                                        }),
+                                    _ => None,
+                                };
+                                if let Some(message) = message {
+                                    reported_attribute_diagnostics
+                                        .insert(canonical_name.to_string());
+                                    let finding = carina_core::parser::Located::new(
+                                        rref.attribute_key_location(attr_name).clone(),
+                                        message,
+                                    );
+                                    diagnostics.extend(render_merged(
+                                        doc,
+                                        &finding,
+                                        DiagnosticSeverity::WARNING,
+                                        finding.detail().clone(),
+                                    ));
+                                }
                             }
                         }
                     }
@@ -2168,26 +2022,6 @@ impl DiagnosticRun<'_> {
                                 continue;
                             }
                             if !provider_validation_deduplicator.should_emit_type_error(&error) {
-                                continue;
-                            }
-                            let deferred_attribute = error.attribute_name();
-                            // Unknown names are invalid even while their values
-                            // are deferred; core is their only diagnostic owner.
-                            if !matches!(
-                                &error,
-                                TypeError::UnknownAttribute {
-                                    name: _,
-                                    suggestion: _
-                                }
-                            ) && deferred_attribute.is_some_and(|attribute| {
-                                matches!(
-                                    resource_attributes.get(attribute),
-                                    Some(Value::Deferred(DeferredValue::ResourceRef { path: _ }))
-                                        | Some(Value::Deferred(DeferredValue::BindingRef {
-                                            binding: _
-                                        }))
-                                )
-                            }) {
                                 continue;
                             }
                             // Skip errors that are already reported with precise positions
@@ -2216,17 +2050,25 @@ impl DiagnosticRun<'_> {
                             if !is_duplicate_list_error(&error)
                                 && matches!(
                                     &error,
-                                    carina_core::schema::TypeError::BlockSyntaxNotAllowed { .. }
-                                        | carina_core::schema::TypeError::TypeMismatch { .. }
-                                        | carina_core::schema::TypeError::BindingShadowsEnumMember(_)
-                                        | carina_core::schema::TypeError::InvalidEnumVariant { .. }
-                                        | carina_core::schema::TypeError::UnknownStructField { .. }
-                                        | carina_core::schema::TypeError::UnionStructMismatch { .. }
-                                        | carina_core::schema::TypeError::UnionAlternativesMismatch { .. }
-                                        | carina_core::schema::TypeError::StructFieldError { .. }
-                                        | carina_core::schema::TypeError::ListItemError { .. }
-                                        | carina_core::schema::TypeError::MapValueError { .. }
+                                    TypeError::BlockSyntaxNotAllowed { .. }
+                                        | TypeError::TypeMismatch { .. }
+                                        | TypeError::BindingShadowsEnumMember(_)
+                                        | TypeError::InvalidEnumVariant { .. }
+                                        | TypeError::UnknownStructField { .. }
+                                        | TypeError::UnionStructMismatch { .. }
+                                        | TypeError::UnionAlternativesMismatch { .. }
+                                        | TypeError::StructFieldError { .. }
+                                        | TypeError::ListItemError { .. }
+                                        | TypeError::MapValueError { .. }
                                 )
+                            {
+                                continue;
+                            }
+                            if matches!(&error, TypeError::Reference { .. })
+                                && error.attribute_name().is_some_and(|name| {
+                                    binding_error_sinks
+                                        .contains(&(resource_id.clone(), name.to_string()))
+                                })
                             {
                                 continue;
                             }
@@ -2712,6 +2554,10 @@ fn is_duplicate_list_error(error: &TypeError) -> bool {
             error: _,
             attribute: _,
         }
+        | TypeError::Reference {
+            error: _,
+            attribute: _,
+        }
         | TypeError::CustomTypeValidation {
             error: _,
             attribute: _,
@@ -2767,33 +2613,4 @@ fn decorate_schema_diagnostic(diagnostic: &mut Diagnostic, error: &carina_core::
     if let Some(data) = crate::code_action::enum_diagnostic_data_for_error(error) {
         diagnostic.data = Some(serde_json::to_value(data).expect("EnumDiagnosticData serialize"));
     }
-}
-
-/// Check whether a ResourceRef value is type-compatible with the expected attribute type.
-/// Returns `Some(message)` on mismatch, `None` when compatible or when the binding/attribute
-/// cannot be resolved (unknown bindings are not flagged here).
-fn check_resource_ref_type_mismatch(
-    binding_index: &carina_core::binding_index::BindingIndex<'_, RelativeBindingName>,
-    expected: carina_core::schema::AssignmentSink<'_, carina_core::schema::Compiled>,
-    path: carina_core::resource::ReferencePathRef<'_, RelativeBindingName>,
-) -> Option<String> {
-    let carina_core::binding_index::RefType::Typed(source) = binding_index.ref_type(path) else {
-        return None;
-    };
-
-    // Directional: the ref (source) must be assignable to the expected (sink).
-    let mismatch = match source
-        .is_assignable_to_sink(expected, binding_index)
-        .err()?
-    {
-        carina_core::binding_index::RefTypeAssignabilityError::Mismatch(mismatch) => mismatch,
-        carina_core::binding_index::RefTypeAssignabilityError::Unchecked(reason) => {
-            return Some(reason.to_string());
-        }
-    };
-    Some(format!(
-        "Type mismatch: {} ({})",
-        mismatch.type_names(),
-        mismatch.origin_description(path),
-    ))
 }

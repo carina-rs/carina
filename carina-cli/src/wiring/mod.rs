@@ -3065,6 +3065,27 @@ pub fn validate_resources_with_ctx<
     ))
 }
 
+/// Shared authored admission pass; callers supply their enriched binding index.
+pub fn validate_resource_admissions_with_ctx<
+    E: carina_core::parser::ExportParamLike<ParserPlaceholder, B>,
+    B: BindingAddress,
+    D: carina_core::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+>(
+    ctx: &WiringContext,
+    judged: &carina_core::parser::retained::JudgedFile<'_, E, D, B>,
+    bindings: &carina_core::binding_index::BindingIndex<'_, B>,
+) -> Vec<AppError> {
+    match validation::validate_resource_admissions(judged, bindings, ctx.known_providers()) {
+        Ok(()) => Vec::new(),
+        Err(validation::ResourceRefTypeValidationError::Validation(message)) => {
+            split_validation_message(&message)
+        }
+        Err(validation::ResourceRefTypeValidationError::AnalysisInvariant(error)) => {
+            vec![AppError::AnalysisInvariant(error)]
+        }
+    }
+}
+
 /// Surface `directives.depends_on` analysis-pass error diagnostics as
 /// `AppError::Validation`. Warnings are emitted to stderr (no
 /// AppError::Warning variant exists today) so they don't fail the
@@ -4287,14 +4308,16 @@ fn validate_resolved_value_constraints(
             bindings,
             &mut plan_errors,
         );
-        append_resolved_value_constraint_errors(
+        append_resolved_value_constraint_errors::<
+            carina_core::validation::admission::kind::ResourceAttribute,
+        >(
             &mut plan_errors,
             &resource.id,
             schema,
             &classified,
             &resource.quoted_string_attrs,
             &origin.attributes,
-            ctx.custom_type_resolver(),
+            session,
         );
     }
 
@@ -4327,47 +4350,49 @@ fn validate_resolved_value_constraints(
             .collect();
         let classified =
             project_plan_attributes(&resource.id, &attributes, bindings, &mut plan_errors);
-        append_resolved_value_constraint_errors(
+        append_resolved_value_constraint_errors::<
+            carina_core::validation::admission::kind::DataSourceAttribute,
+        >(
             &mut plan_errors,
             &resource.id,
             schema,
             &classified,
             &resource.quoted_string_attrs,
             &origin.attributes,
-            ctx.custom_type_resolver(),
+            session,
         );
     }
 
     plan_errors
 }
 
-fn append_resolved_value_constraint_errors(
+fn append_resolved_value_constraint_errors<
+    K: carina_core::validation::admission::RechecksResolved,
+>(
     plan_errors: &mut Vec<PlanError>,
     id: &ResourceId,
     schema: OwnerBoundResourceSchema<'_>,
     attributes: &HashMap<String, carina_core::resource::knowledge::PlanResolved<'_>>,
     quoted_string_attrs: &HashSet<String>,
     origin_attributes: &IndexMap<String, Value>,
-    resolver: &dyn carina_core::parser::CustomTypeResolver,
+    session: &dyn carina_core::validation::deferred_types::ProviderTypeCheckContext,
 ) {
-    let is_string_literal = |attribute: &str| quoted_string_attrs.contains(attribute);
-    let Err(errors) = schema.validate_plan_value_constraints_with_resolver(
+    let report = carina_core::validation::admission::attributes::admit_plan_attributes::<K>(
+        schema,
+        id,
         attributes,
-        &is_string_literal,
-        resolver,
-    ) else {
-        return;
-    };
-
-    for error in errors {
+        quoted_string_attrs,
+        session,
+    );
+    for error in report.errors() {
         let (attributes, origins) =
-            resolved_constraint_context(&error, origin_attributes, schema.schema().as_schema());
+            resolved_constraint_context(error, origin_attributes, schema.schema().as_schema());
         plan_errors.push(PlanError::new(
             id.clone(),
             PlanErrorKind::ResolvedValueConstraint {
                 attributes,
                 origins,
-                message: error.to_string().into(),
+                message: report.diagnostic_error(error).to_string().into(),
             },
         ));
     }

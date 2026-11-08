@@ -1,0 +1,7 @@
+let admins = aws.identitystore.Group {}
+for account in ["111111111111"] {
+  awscc.sso.Assignment {
+    account_id = account
+    principal_id = admins.group_id
+  }
+}

@@ -135,7 +135,7 @@ use crate::resource::{
 use crate::schema::{CompiledAttributeType, FieldAncestry, LeafPath, TypeError};
 
 mod assignment;
-mod attributes;
+pub mod attributes;
 #[cfg(test)]
 mod tests;
 
@@ -158,6 +158,11 @@ mod sealed {
         where
             Self: super::DestinationKind;
         fn reference_assignment<'a, B: super::BindingAddress>(
+            source: crate::schema::TypeInSchema<'a, crate::schema::Compiled>,
+            sink: crate::schema::AssignmentSink<'a, crate::schema::Compiled>,
+            reference: &super::ReferenceCandidate<B>,
+        ) -> crate::schema::assignability::AssignmentRelation<'a>;
+        fn reference_original_assignment<'a, B: super::BindingAddress>(
             source: crate::schema::TypeInSchema<'a, crate::schema::Compiled>,
             sink: crate::schema::AssignmentSink<'a, crate::schema::Compiled>,
             reference: &super::ReferenceCandidate<B>,
@@ -185,6 +190,11 @@ pub mod kind {
                 ) -> crate::schema::assignability::AssignmentRelation<'a> {
                     source.assignment_to(sink).into()
                 }
+                fn reference_original_assignment<'a, B: super::BindingAddress>(
+                    source: crate::schema::TypeInSchema<'a, crate::schema::Compiled>,
+                    sink: crate::schema::AssignmentSink<'a, crate::schema::Compiled>,
+                    _: &super::ReferenceCandidate<B>,
+                ) -> crate::schema::assignability::AssignmentRelation<'a> { source.identity_assignment_to(sink).into() }
             }
             impl super::DestinationKind for $name {
                 type LocalObligation = std::convert::Infallible;
@@ -215,6 +225,11 @@ pub mod kind {
                 ) -> crate::schema::assignability::AssignmentRelation<'a> {
                     source.reference_assignment_to(sink, reference)
                 }
+                fn reference_original_assignment<'a, B: super::BindingAddress>(
+                    source: crate::schema::TypeInSchema<'a, crate::schema::Compiled>,
+                    sink: crate::schema::AssignmentSink<'a, crate::schema::Compiled>,
+                    reference: &super::ReferenceCandidate<B>,
+                ) -> crate::schema::assignability::AssignmentRelation<'a> { source.identified_reference_assignment_to(sink, reference) }
             }
             impl super::DestinationKind for $name { type LocalObligation = super::DeferredLocal<Self>; }
             impl super::sealed::Rechecks for $name {}
@@ -350,14 +365,20 @@ impl<K: DestinationKind> Destination<K> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate<P: PlaceholderKind = NoPlaceholder, B: BindingAddress = AbsoluteBindingAddress>
 {
-    identity: DeclarationId,
     value: Value<P, B>,
+    obligations: CandidateObligations<B>,
+}
+
+/// Value replacement moves this whole bundle. Future evidence belongs here.
+#[derive(Debug, Clone, PartialEq)]
+struct CandidateObligations<B: BindingAddress> {
+    identity: DeclarationId,
     origin: assignment::CandidateOrigin<B>,
     schema: SchemaObligation,
 }
 
 enum AdmissionProof<'a, P: PlaceholderKind, B: BindingAddress> {
-    Validation(Knowledge<'a, P, B, Validation>),
+    Validation(crate::resource::knowledge::Classification<'a, P, B>),
     Plan(PlanResolved<'a, P, B>),
     Apply(KnownValue<'a, P, B>),
 }
@@ -371,6 +392,10 @@ pub struct AdmissionContext<
     proof: AdmissionProof<'a, P, B>,
     bindings: Option<&'a BindingIndex<'a, B>>,
     provider: &'a dyn ProviderTypeCheckContext,
+    lookup: Option<crate::schema::CustomTypeLookup<'a>>,
+    assignment: crate::schema::value_validation::AssignmentCheck<'a, P, B>,
+    untyped: Option<&'a dyn Fn() -> Vec<TypeError>>,
+    declaration: Option<(&'a str, &'a crate::binding_index::DeclaredValueSource)>,
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
@@ -381,10 +406,21 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
     ) -> (Self, AdmissionContext<'a, P, B>) {
         Self::paired(
             proof.to_value(),
-            AdmissionProof::Validation(proof),
+            AdmissionProof::Validation(proof.into_classification()),
             Some(bindings),
             provider,
         )
+    }
+
+    pub(crate) fn validation_classified<'a>(
+        proof: crate::resource::knowledge::Classification<'a, P, B>,
+        bindings: Option<&'a BindingIndex<'a, B>>,
+        provider: &'a dyn ProviderTypeCheckContext,
+    ) -> (Self, AdmissionContext<'a, P, B>) {
+        let value = crate::resource::knowledge::ClassifiedRef::from(&proof)
+            .diagnostic_value()
+            .clone();
+        Self::paired(value, AdmissionProof::Validation(proof), bindings, provider)
     }
 
     pub fn plan<'a>(
@@ -405,8 +441,20 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         proof: Knowledge<'a, P, B, Apply>,
         provider: &'a dyn ProviderTypeCheckContext,
     ) -> Result<(Self, AdmissionContext<'a, P, B>), AdmissionErrors> {
+        let proof = Self::known_at_apply(proof)?;
+        Ok(Self::paired(
+            proof.to_value(),
+            AdmissionProof::Apply(proof),
+            None,
+            provider,
+        ))
+    }
+
+    fn known_at_apply(
+        proof: Knowledge<'_, P, B, Apply>,
+    ) -> Result<KnownValue<'_, P, B>, AdmissionErrors> {
         let sites = proof.sites().collect();
-        let proof = KnownValue::from_apply(proof).map_err(|error| match error {
+        Ok(KnownValue::from_apply(proof).map_err(|error| match error {
             KnowledgeError::InvalidStage { operation: _ } => {
                 KnowledgeError::UnresolvedAtBoundary { sites }
             }
@@ -414,12 +462,35 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             | KnowledgeError::Cycle { .. }
             | KnowledgeError::UnavailableHistoricalSecret(_)
             | KnowledgeError::UnresolvedAtBoundary { .. }) => error,
-        })?;
-        Ok(Self::paired(
-            proof.to_value(),
-            AdmissionProof::Apply(proof),
-            None,
+        })?)
+    }
+
+    fn at_apply<'a>(
+        self,
+        proof: Knowledge<'a, P, B, Apply>,
+        provider: &'a dyn ProviderTypeCheckContext,
+    ) -> Result<(Self, AdmissionContext<'a, P, B>), AdmissionErrors> {
+        let Self {
+            value: _,
+            obligations,
+        } = self;
+        let proof = Self::known_at_apply(proof)?;
+        let context = AdmissionContext {
+            identity: obligations.identity,
+            proof: AdmissionProof::Apply(proof.clone()),
+            bindings: None,
             provider,
+            lookup: None,
+            assignment: None,
+            untyped: None,
+            declaration: None,
+        };
+        Ok((
+            Self {
+                value: proof.to_value(),
+                obligations,
+            },
+            context,
         ))
     }
 
@@ -432,9 +503,11 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
         let identity = DeclarationId::default();
         (
             Self {
-                identity,
-                origin: assignment::CandidateOrigin::of(&value),
-                schema: SchemaObligation::default(),
+                obligations: CandidateObligations {
+                    identity,
+                    origin: assignment::CandidateOrigin::of(&value),
+                    schema: SchemaObligation::default(),
+                },
                 value,
             },
             AdmissionContext {
@@ -442,13 +515,17 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
                 proof,
                 bindings,
                 provider,
+                lookup: None,
+                assignment: None,
+                untyped: None,
+                declaration: None,
             },
         )
     }
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> AdmissionContext<'_, P, B> {
-    fn validation_proof(&self) -> Option<&Knowledge<'_, P, B, Validation>> {
+    fn validation_proof(&self) -> Option<&crate::resource::knowledge::Classification<'_, P, B>> {
         match &self.proof {
             AdmissionProof::Validation(proof) => Some(proof),
             AdmissionProof::Plan(_) | AdmissionProof::Apply(_) => None,
@@ -474,6 +551,7 @@ pub struct PlacedValue<
     inner: Box<PlacedInner<K, P, B>>,
 }
 struct PlacedInner<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> {
+    findings: crate::schema::ValueValidationFindings,
     destination: Destination<K>,
     value: Value<P, B>,
 }
@@ -481,6 +559,7 @@ impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> Clone for Placed
     fn clone(&self) -> Self {
         Self {
             inner: Box::new(PlacedInner {
+                findings: self.inner.findings.clone(),
                 destination: self.inner.destination.clone(),
                 value: self.inner.value.clone(),
             }),
@@ -519,6 +598,7 @@ pub struct PendingAdmission<
 }
 #[derive(Debug, Clone, PartialEq)]
 struct PendingCandidate<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> {
+    findings: crate::schema::ValueValidationFindings,
     candidate: Candidate<P, B>,
     local: Option<K::LocalObligation>,
     schema: Option<SchemaObligation>,
@@ -537,10 +617,27 @@ pub enum Admission<
 /// Reference lookup failures retain their original structured information.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AdmissionReferenceError {
+    #[error("{0}")]
+    Authored(Box<crate::validation::ReferenceFinding>),
+    #[error("unknown attribute inside secret(...)")]
+    ProtectedAttribute,
+    #[error("unknown binding inside secret(...)")]
+    ProtectedBinding,
+    #[error("{0}")]
+    Computed(crate::validation::DeferredAccessTypeError),
+    #[error("{0}")]
+    Arithmetic(crate::parser::Located<crate::validation::IntegerArithmeticTypeFinding>),
+    #[error("{0}")]
+    Resolution(Box<ResolutionError>),
     #[error("unknown binding '{binding}' in reference {binding}.{attribute}")]
     UnknownBinding { binding: String, attribute: String },
     #[error("{0}")]
     Path(crate::binding_index::RefTypeError),
+    #[error("'{reference}' is a resource handle, not a value")]
+    ResourceHandle {
+        reference: String,
+        types: crate::schema::MismatchTypeNames,
+    },
 }
 
 /// A typed finding retains the original error and a canonical value location.
@@ -602,9 +699,10 @@ impl std::fmt::Display for AdmissionFindings {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 #[error("{operation} admission failed")] // error-chain: caller-renders-sources
 pub struct AdmissionErrors {
+    findings: Option<Box<crate::schema::ValueValidationFindings>>,
     operation: AdmissionOperation,
     #[source]
     source: ResolutionError,
@@ -622,10 +720,17 @@ impl std::fmt::Display for AdmissionOperation {
         })
     }
 }
+impl PartialEq for AdmissionErrors {
+    fn eq(&self, other: &Self) -> bool {
+        self.operation == other.operation && self.source == other.source
+    }
+}
+impl Eq for AdmissionErrors {}
 impl From<ResolutionError> for AdmissionErrors {
     fn from(source: ResolutionError) -> Self {
         Self {
             operation: AdmissionOperation::Value,
+            findings: None,
             source,
         }
     }
@@ -644,6 +749,9 @@ impl crate::resource::InsideSecret for AdmissionErrors {
     fn inside_secret(self) -> Self {
         Self {
             operation: self.operation,
+            findings: self
+                .findings
+                .map(|findings| Box::new((*findings).inside_secret())),
             source: self.source.inside_secret(),
         }
     }
@@ -656,11 +764,15 @@ fn constraints(findings: Vec<AdmissionFinding>) -> AdmissionErrors {
 }
 
 impl AdmissionErrors {
+    pub(crate) fn take_findings(&mut self) -> Option<crate::schema::ValueValidationFindings> {
+        self.findings.take().map(|findings| *findings)
+    }
     /// Preserve #4260's pinned error-chain label when conversion orchestration
     /// rebases onto this shared wrapper. This grants no placement authority.
     pub fn conversion(source: ResolutionError) -> Self {
         Self {
             operation: AdmissionOperation::Conversion,
+            findings: None,
             source,
         }
     }
@@ -677,7 +789,8 @@ pub fn admit<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
     candidate: Candidate<P, B>,
     context: &AdmissionContext<'_, P, B>,
 ) -> Result<Admission<K, P, B>, AdmissionErrors> {
-    let verdict = judge_assignment(destination, &candidate, context)?;
+    let assignment::AssignmentJudgement { verdict, findings } =
+        assignment::judge_with_findings(destination, &candidate, context)?;
     let sites = context.sites();
     let (local, schema) = match verdict {
         AssignmentVerdict::Proven(_) => (None, None),
@@ -694,6 +807,7 @@ pub fn admit<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
         return Ok(Admission::Pending(PendingAdmission {
             destination: destination.clone(),
             inner: Box::new(PendingCandidate {
+                findings,
                 candidate,
                 local,
                 schema,
@@ -703,6 +817,7 @@ pub fn admit<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
     }
     Ok(Admission::Ready(PlacedValue {
         inner: Box::new(PlacedInner {
+            findings,
             destination: destination.clone(),
             value: candidate.value,
         }),
@@ -718,14 +833,21 @@ impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> PendingAdmission
         // previous placement receipt. The sole apply proof then re-enters admit.
         let value =
             crate::resolver::resolve_ref_value(&self.inner.candidate.value, resolved, context)?;
-        let (mut candidate, boundary) = Candidate::apply(
+        let mut candidate = self.inner.candidate;
+        candidate
+            .obligations
+            .schema
+            .extend(self.inner.schema.unwrap_or_default());
+        if let Some(local) = self.inner.local {
+            candidate
+                .obligations
+                .schema
+                .extend(K::schema(&local).clone());
+        }
+        let (candidate, boundary) = candidate.at_apply(
             value.knowledge(&KnowledgeContext::apply(resolved))?,
             context,
         )?;
-        candidate.schema = self.inner.schema.unwrap_or_default();
-        if let Some(local) = self.inner.local {
-            candidate.schema.extend(K::schema(&local).clone());
-        }
         admit(&self.destination, candidate, &boundary)
     }
     pub fn sites(&self) -> &[PendingSite<B>] {
@@ -790,6 +912,13 @@ impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> TypedSlot<K, P, 
     }
 }
 impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> Admission<K, P, B> {
+    pub(crate) fn take_findings(&mut self) -> crate::schema::ValueValidationFindings {
+        match self {
+            Self::Ready(placed) => std::mem::take(&mut placed.inner.findings),
+            Self::Pending(pending) => std::mem::take(&mut pending.inner.findings),
+        }
+    }
+
     pub fn ready(self) -> Result<PlacedValue<K, P, B>, PendingAdmission<K, P, B>> {
         match self {
             Self::Ready(value) => Ok(value),

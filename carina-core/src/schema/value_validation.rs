@@ -95,7 +95,7 @@ fn value_structure<P: PlaceholderKind, B: BindingAddress, T>(
 
 /// Cached findings for one attribute. The primary error retains the CLI's
 /// established nesting; paths retain the LSP's established element locations.
-#[derive(Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ValueValidationFindings {
     structure: ValueStructure,
     local_error: Option<TypeError>,
@@ -103,6 +103,7 @@ pub struct ValueValidationFindings {
     local: Vec<(FieldPath, TypeError)>,
     located: Vec<(LeafPath, TypeError)>,
     assignment: AssignmentFindings,
+    pub(crate) symbolic: Vec<(LeafPath, TypeError)>,
     pub(super) provider: Vec<(FieldPath, TypeError)>,
 }
 
@@ -134,11 +135,19 @@ impl ValueValidationFindings {
         self.local
     }
 
+    pub fn symbolic_errors(&self) -> &[(LeafPath, TypeError)] {
+        &self.symbolic
+    }
+
+    pub fn local_findings(&self) -> &[(FieldPath, TypeError)] {
+        &self.local
+    }
+
     pub fn local_error(&self) -> Option<&TypeError> {
         self.local_error.as_ref()
     }
 
-    pub(super) fn local_errors(&self) -> impl Iterator<Item = &TypeError> {
+    pub(crate) fn local_errors(&self) -> impl Iterator<Item = &TypeError> {
         self.local_error.iter().chain(&self.additional_local_errors)
     }
 
@@ -164,6 +173,11 @@ impl InsideSecret for ValueValidationFindings {
                 .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
                 .collect(),
             assignment: self.assignment.inside_secret(),
+            symbolic: self
+                .symbolic
+                .into_iter()
+                .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
+                .collect(),
             provider: self.provider.inside_secret(),
         }
     }
@@ -177,19 +191,70 @@ pub struct ResourceValueValidation {
 }
 
 impl ResourceValueValidation {
+    /// Render a destination once, using the location retained by the shared
+    /// walk. The original TypeError remains available through errors().
+    pub fn diagnostic_error(&self, error: &TypeError) -> TypeError {
+        let Some(attribute) = error.attribute_name() else {
+            return error.clone();
+        };
+        let Some(findings) = self.attributes.get(attribute) else {
+            return error.clone();
+        };
+        let path = if findings
+            .local_error
+            .as_ref()
+            .is_some_and(|primary| primary.clone().with_attribute(attribute) == *error)
+        {
+            findings.located.first().map(|(path, _)| path.clone())
+        } else {
+            findings
+                .provider
+                .iter()
+                .find(|(_, finding)| finding.clone().with_attribute(attribute) == *error)
+                .map(|(path, _)| path.canonical())
+        };
+        match path {
+            // List and map wrappers already identify their elements and keep
+            // the established top-level attribute label. Struct paths use the
+            // canonical dotted destination from the same recorded location.
+            Some(path)
+                if !path.segments().is_empty()
+                    && path.segments().iter().all(|segment| {
+                        matches!(segment, super::LeafPathSegment::StructField(_))
+                    }) =>
+            {
+                let path = LeafPath::from_segments(
+                    std::iter::once(super::LeafPathSegment::StructField(attribute.into()))
+                        .chain(path.segments().iter().cloned()),
+                );
+                error.clone().with_attribute(path.to_string())
+            }
+            Some(_) | None => error.clone(),
+        }
+    }
+
     pub fn take_attribute(&mut self, name: &str) -> Option<ValueValidationFindings> {
         self.attributes.remove(name)
+    }
+
+    pub fn symbolic_errors(&self) -> impl Iterator<Item = (&str, &LeafPath, &TypeError)> {
+        self.attributes.iter().flat_map(|(name, findings)| {
+            findings
+                .symbolic
+                .iter()
+                .map(move |(path, error)| (name.as_str(), path, error))
+        })
     }
 
     pub fn errors(&self) -> impl Iterator<Item = &TypeError> {
         self.errors.iter()
     }
 
-    pub(super) fn into_errors(self) -> Vec<TypeError> {
+    pub(crate) fn into_errors(self) -> Vec<TypeError> {
         self.errors
     }
 
-    pub(super) fn into_result(self) -> Result<(), Vec<TypeError>> {
+    pub(crate) fn into_result(self) -> Result<(), Vec<TypeError>> {
         let errors = self.into_errors();
         if errors.is_empty() {
             Ok(())
@@ -394,6 +459,7 @@ impl<'a> CheckedValue<'a> {
             local: self.findings.local,
             located: self.findings.located,
             assignment: self.findings.assignment,
+            symbolic: Vec::new(),
             additional_local_errors: self.findings.additional_local_errors,
             provider: self.findings.provider,
         }
@@ -405,7 +471,26 @@ struct ValueValidator<'a> {
     lookup: Option<CustomTypeLookup<'a>>,
 }
 
-pub(super) fn classification_error(error: TypeError) -> ValueValidationFindings {
+pub(crate) fn untyped_symbolic_errors(errors: Vec<TypeError>) -> ValueValidationFindings {
+    let mut findings = ValueValidationFindings::default();
+    for error in errors {
+        findings
+            .symbolic
+            .push((LeafPath::from_segments([]), error.clone()));
+        findings.local.push((FieldPath::new(), error.clone()));
+        findings
+            .located
+            .push((LeafPath::from_segments([]), error.clone()));
+        if findings.local_error.is_none() {
+            findings.local_error = Some(error);
+        } else {
+            findings.additional_local_errors.push(error);
+        }
+    }
+    findings
+}
+
+pub(crate) fn classification_error(error: TypeError) -> ValueValidationFindings {
     CheckedValue::rejected(&FieldPath::new(), error).into_findings()
 }
 pub(super) fn validate_value_locally<
@@ -539,15 +624,17 @@ struct CanonicalLeafError<'a> {
 
 /// An admission callback participates in this traversal and its Union choice.
 /// It never classifies a value or walks children.
-#[derive(Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct AssignmentFindings {
     pub(crate) local: Vec<LeafPath>,
     pub(crate) schema: crate::validation::admission::SchemaObligation,
+    pub(crate) errors: Vec<(LeafPath, TypeError)>,
 }
 impl AssignmentFindings {
     fn extend(&mut self, other: Self) {
         self.local.extend(other.local);
         self.schema.extend(other.schema);
+        self.errors.extend(other.errors);
     }
 }
 impl InsideSecret for AssignmentFindings {
@@ -559,16 +646,24 @@ impl InsideSecret for AssignmentFindings {
                 .map(InsideSecret::inside_secret)
                 .collect(),
             schema: self.schema,
+            errors: self
+                .errors
+                .into_iter()
+                .map(|(path, error)| (path.inside_secret(), error.inside_secret()))
+                .collect(),
         }
     }
 }
-type AssignmentCheck<'a, P, B> = Option<
+pub(crate) type AssignmentCheck<'a, P, B> = Option<
     &'a dyn Fn(
         &CompiledAttributeType,
         &Value<P, B>,
         &LeafPath,
     ) -> Result<AssignmentFindings, TypeError>,
 >;
+
+pub(crate) type AttributeAdmission<'a, 'v, P, B, T> =
+    &'a dyn Fn(&str, &Classification<'v, P, B, T>) -> ValueValidationFindings;
 
 struct AdmittedUnion<'a> {
     selected: UnionFit<'a>,
@@ -691,9 +786,22 @@ impl<'a> ValueValidator<'a> {
                 findings: checked.findings,
             };
         }
-        if let Some((value, default)) = value.coalesce() {
-            let mut left =
-                self.walk_with_assignment(attr, value, path, ancestry, &mut Vec::new(), assignment);
+        if let Some((left_value, default)) = value.coalesce() {
+            // A coalesce has an authored assignment of its own. Retain that
+            // judgement while the existing walk checks both classified
+            // alternatives, including their provider callbacks.
+            let parent_assignment = match assignment {
+                Some(check) => check(attr, value.diagnostic_value(), &path.canonical()),
+                None => Ok(AssignmentFindings::default()),
+            };
+            let mut left = self.walk_with_assignment(
+                attr,
+                left_value,
+                path,
+                ancestry,
+                &mut Vec::new(),
+                assignment,
+            );
             let right = self.walk_with_assignment(
                 attr,
                 default,
@@ -733,6 +841,19 @@ impl<'a> ValueValidator<'a> {
                 (LocalOutcome::Rejected { primary }, _)
                 | (_, LocalOutcome::Rejected { primary }) => LocalOutcome::Rejected { primary },
             };
+            match parent_assignment {
+                Ok(findings) => left.findings.assignment.extend(findings),
+                // A branch's local error is the established primary diagnostic
+                // at this authored coalesce. Do not add its inferred echo.
+                Err(_) if left.local.error().is_some() => {}
+                Err(error) => {
+                    left.reject(path, error.clone());
+                    left.findings
+                        .assignment
+                        .errors
+                        .push((path.canonical(), error));
+                }
+            }
             return left;
         }
         if let Some(branches) = value.branches() {
@@ -795,7 +916,15 @@ impl<'a> ValueValidator<'a> {
         let findings = match assignment {
             Some(check) => match check(attr, value.diagnostic_value(), &path.canonical()) {
                 Ok(findings) => findings,
-                Err(error) => return CheckedValue::rejected(path, error),
+                Err(error) => {
+                    let mut checked = CheckedValue::rejected(path, error.clone());
+                    checked
+                        .findings
+                        .assignment
+                        .errors
+                        .push((path.canonical(), error));
+                    return checked;
+                }
             },
             None => AssignmentFindings::default(),
         };
@@ -1345,6 +1474,7 @@ impl<'a> ValueValidator<'a> {
         let mut provider_failure: Option<UnionProviderFailure<'a>> = None;
         let mut sibling_provider_errors = Vec::new();
         let mut sibling_local_errors = Vec::new();
+        let mut sibling_assignment = AssignmentFindings::default();
         for member in members {
             let checked =
                 self.walk_with_assignment(member, value, path, ancestry, visited, assignment);
@@ -1415,6 +1545,7 @@ impl<'a> ValueValidator<'a> {
                     *current = BestUnionMemberFailures::new(judgement.failure_rank, candidate);
                     sibling_provider_errors = checked.findings.provider;
                     sibling_local_errors = checked.findings.additional_local_errors;
+                    sibling_assignment = checked.findings.assignment;
                 }
                 Some(current) if judgement.failure_rank == current.failure_rank => {
                     current.tied.push(candidate);
@@ -1429,6 +1560,7 @@ impl<'a> ValueValidator<'a> {
                     ));
                     sibling_provider_errors = checked.findings.provider;
                     sibling_local_errors = checked.findings.additional_local_errors;
+                    sibling_assignment = checked.findings.assignment;
                 }
             }
         }
@@ -1468,6 +1600,7 @@ impl<'a> ValueValidator<'a> {
             findings: CheckedFindings {
                 additional_local_errors: sibling_local_errors,
                 provider: sibling_provider_errors,
+                assignment: sibling_assignment,
                 ..Default::default()
             },
         }))

@@ -168,7 +168,9 @@ pub(crate) use resolve::{
     resolve_resource_refs_defer_unknown_functions, resolve_resource_refs_for_diagnostics,
     resolve_snapshot_function_calls_with_config,
 };
-pub use static_eval::evaluate_static_value_for_validation;
+pub use static_eval::{
+    evaluate_expanded_value_for_validation, evaluate_static_value_for_validation,
+};
 pub use types::{
     BuiltinTypeName, UnloadedSchemaType, builtin_bare_custom_types, parse_type_expr_str,
     resolve_type_expr_from_schemas,

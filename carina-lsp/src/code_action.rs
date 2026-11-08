@@ -151,6 +151,10 @@ pub(crate) fn enum_diagnostic_data_for_error(error: &TypeError) -> Option<EnumDi
             attribute: _,
         }
         | TypeError::ValidationFailed { .. }
+        | TypeError::Reference {
+            error: _,
+            attribute: _,
+        }
         | TypeError::Knowledge { .. }
         | TypeError::CustomTypeValidation { .. }
         | TypeError::ResourceValidationFailed { .. }

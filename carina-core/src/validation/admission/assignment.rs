@@ -6,6 +6,48 @@ use crate::resource::{DeferredValue, ReferencePath};
 use crate::schema::SinkAuthority;
 use crate::schema::assignability::AssignmentRelation;
 
+#[test]
+fn reference_judgement_uses_the_contract_already_found() {
+    use crate::schema::{AttributeType, TypeIdentity};
+    let string = |max| {
+        AttributeType::refined_string(
+            Some(TypeIdentity::bare("Id")),
+            None,
+            Some((None, Some(max))),
+            None,
+        )
+    };
+    super::tests::fixture(
+        string(64),
+        string(36),
+        |catalog, _, bindings, destination| {
+            crate::validation::deferred_types::with_session_for_test(catalog, |session| {
+                let value = Value::root_resource_ref("producer", "output", vec![]);
+                let (_, context) = Candidate::validation(
+                    value.knowledge(&KnowledgeContext::validation()).unwrap(),
+                    bindings,
+                    session,
+                );
+                let CandidateOrigin::Reference(reference) = CandidateOrigin::of(&value) else {
+                    panic!("reference origin")
+                };
+                let contract = destination.contract.as_deref().unwrap();
+                let mut findings = crate::schema::value_validation::AssignmentFindings::default();
+                reference
+                    .judge_at::<kind::ResourceAttribute, NoPlaceholder>(
+                        contract,
+                        &contract.attr,
+                        &contract.path,
+                        &context,
+                        &mut findings,
+                    )
+                    .unwrap();
+                assert_eq!(findings.local, vec![contract.path.clone()]);
+            });
+        },
+    );
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssignmentProof<K: DestinationKind> {
     destination: Destination<K>,
@@ -83,7 +125,7 @@ impl<B: BindingAddress> CandidateOrigin<B> {
 /// A typed reference origin; there is no public constructor from a raw value.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReferenceCandidate<B: BindingAddress = AbsoluteBindingAddress> {
-    reference: ReferencePath<B>,
+    pub(super) reference: ReferencePath<B>,
 }
 
 impl<B: BindingAddress> ReferenceCandidate<B> {
@@ -100,8 +142,8 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
             ));
         };
         let mut findings = crate::schema::value_validation::AssignmentFindings::default();
-        self.judge_at(
-            destination,
+        self.judge_at::<K, P>(
+            contract,
             &contract.attr,
             &contract.path,
             context,
@@ -116,24 +158,90 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
         Ok(verdict(destination, findings))
     }
 
-    fn judge_at<K: DestinationKind, P: PlaceholderKind>(
+    pub(super) fn judge_at<K: DestinationKind, P: PlaceholderKind>(
         &self,
-        destination: &Destination<K>,
+        contract: &DestinationContract,
         attr: &CompiledAttributeType,
         path: &LeafPath,
         context: &AdmissionContext<'_, P, B>,
         findings: &mut crate::schema::value_validation::AssignmentFindings,
     ) -> Result<(), TypeError> {
         let Some(bindings) = context.bindings else {
+            findings
+                .schema
+                .requirements
+                .push(SchemaRequirement::Reference);
             return Ok(());
         };
-        let contract = destination.contract.as_deref().expect("attribute contract");
         let sink = attr.in_schema(&contract.defs).with_authority(
             &context.provider.catalog().custom_types,
             SinkAuthority::Owner(&contract.owner),
         );
-        match bindings.ref_type(self.reference.as_ref()) {
+        if path == &contract.path
+            && let Some((name, declared)) = context.declaration
+        {
+            let mismatch = |types| {
+                reference_error(AdmissionReferenceError::Computed(
+                    crate::validation::DeferredAccessTypeError::TypeMismatch {
+                        types,
+                        origin: format!("from {name}"),
+                    },
+                ))
+            };
+            let declaration = declared.declaration_type();
+            let relation = K::reference_assignment(declaration, sink, self);
+            if matches!(relation, AssignmentRelation::Mismatch) {
+                return Err(mismatch(crate::schema::MismatchTypeNames::for_types(
+                    *sink,
+                    declaration,
+                )));
+            }
+            let original = match declared.original().reference_assignment(sink, |source| {
+                K::reference_original_assignment(source, sink, self)
+            }) {
+                Ok(relation) => relation,
+                Err(_) if declared.incoming_mismatch(bindings) => return Ok(()),
+                Err(error) => return Err(mismatch(error.type_names().clone())),
+            };
+            match AssignmentRelation::all([relation, original]) {
+                AssignmentRelation::Assignable => {}
+                AssignmentRelation::NeedsLocal(missing) => {
+                    findings.local.push(path.clone());
+                    if let Some(missing) = missing {
+                        findings
+                            .schema
+                            .requirements
+                            .extend(missing.into_types().map(SchemaRequirement::Type));
+                    }
+                }
+                AssignmentRelation::Unchecked(missing) => findings
+                    .schema
+                    .requirements
+                    .extend(missing.into_types().map(SchemaRequirement::Type)),
+                AssignmentRelation::Mismatch => {
+                    return Err(mismatch(crate::schema::MismatchTypeNames::for_types(
+                        *sink,
+                        declaration,
+                    )));
+                }
+            }
+            return Ok(());
+        }
+        let source = match self.reference.as_ref() {
+            crate::resource::ReferencePathRef::Access(path) => bindings.postfix_ref_type(path),
+            crate::resource::ReferencePathRef::Binding(binding) => bindings.ref_type(binding),
+            reference @ crate::resource::ReferencePathRef::BindingAccess { .. } => {
+                bindings.ref_type(reference)
+            }
+        };
+        match source {
             RefType::Typed(source) => {
+                if source.resource_handle_type().is_some() {
+                    return Err(reference_error(AdmissionReferenceError::ResourceHandle {
+                        reference: self.reference.as_ref().to_dot_string(),
+                        types: source.mismatch_type_names(*sink),
+                    }));
+                }
                 match AssignmentRelation::all(
                     source
                         .constraints()
@@ -174,6 +282,20 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
                     attribute,
                 }));
             }
+            RefType::UnknownAttribute(crate::binding_index::RefTypeError::InvalidAccess {
+                step,
+                actual,
+                ..
+            }) => {
+                return Err(reference_error(AdmissionReferenceError::Computed(
+                    crate::validation::DeferredAccessTypeError::InvalidAccess {
+                        error: crate::validation::inference::InferenceError::InvalidAccess {
+                            base_type: actual,
+                            step,
+                        },
+                    },
+                )));
+            }
             RefType::UnknownAttribute(error) => {
                 return Err(reference_error(AdmissionReferenceError::Path(error)));
             }
@@ -182,7 +304,7 @@ impl<B: BindingAddress> ReferenceCandidate<B> {
     }
 }
 
-fn reference_error(error: AdmissionReferenceError) -> TypeError {
+pub(super) fn reference_error(error: AdmissionReferenceError) -> TypeError {
     TypeError::Reference {
         error: Box::new(crate::resource::SecretDiagnosticError::Public(error)),
         attribute: None,
@@ -196,6 +318,7 @@ fn verdict<K: DestinationKind>(
     let crate::schema::value_validation::AssignmentFindings {
         local: paths,
         schema,
+        errors: _,
     } = findings;
     if !paths.is_empty() {
         // Only the sealed migrated kinds can have produced these paths.
@@ -216,7 +339,20 @@ pub fn judge_assignment<K: DestinationKind, P: PlaceholderKind, B: BindingAddres
     candidate: &Candidate<P, B>,
     context: &AdmissionContext<'_, P, B>,
 ) -> Result<AssignmentVerdict<K>, AdmissionErrors> {
-    if candidate.identity != context.identity {
+    judge_with_findings(destination, candidate, context).map(|judged| judged.verdict)
+}
+
+pub(super) struct AssignmentJudgement<K: DestinationKind> {
+    pub(super) verdict: AssignmentVerdict<K>,
+    pub(super) findings: crate::schema::ValueValidationFindings,
+}
+
+pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
+    destination: &Destination<K>,
+    candidate: &Candidate<P, B>,
+    context: &AdmissionContext<'_, P, B>,
+) -> Result<AssignmentJudgement<K>, AdmissionErrors> {
+    if candidate.obligations.identity != context.identity {
         return Err(KnowledgeError::<B>::InvalidStage {
             operation: "candidate/proof pairing",
         }
@@ -239,29 +375,50 @@ pub fn judge_assignment<K: DestinationKind, P: PlaceholderKind, B: BindingAddres
         return Err(error.into());
     }
     let Some(contract) = destination.contract.as_deref() else {
-        return Ok(AssignmentVerdict::NeedsSchema(
-            SchemaObligation::destination(),
-        ));
+        if let Some(check) = context.untyped {
+            let errors = check();
+            if !errors.is_empty() {
+                let checked = crate::schema::value_validation::untyped_symbolic_errors(errors);
+                let mut error = constraints(
+                    checked
+                        .clone()
+                        .into_located()
+                        .into_iter()
+                        .map(|(path, error)| AdmissionFinding { path, error })
+                        .collect(),
+                );
+                error.findings = Some(Box::new(checked));
+                return Err(error);
+            }
+        }
+        return Ok(AssignmentJudgement {
+            verdict: AssignmentVerdict::NeedsSchema(SchemaObligation::destination()),
+            findings: Default::default(),
+        });
     };
     let check = |attr: &CompiledAttributeType, value: &Value<P, B>, path: &LeafPath| {
         let path = join(&contract.path, path);
         let origin = if std::ptr::eq(
             value,
             crate::resource::knowledge::ClassifiedRef::from(
-                &**context.validation_proof().expect("validation proof"),
+                context.validation_proof().expect("validation proof"),
             )
             .diagnostic_value(),
         ) {
-            candidate.origin.clone()
+            candidate.obligations.origin.clone()
         } else {
             CandidateOrigin::of(value)
         };
         let mut findings = crate::schema::value_validation::AssignmentFindings::default();
         match origin {
             CandidateOrigin::Reference(reference) => {
-                reference.judge_at(destination, attr, &path, context, &mut findings)?
+                reference.judge_at::<K, P>(contract, attr, &path, context, &mut findings)?
             }
-            CandidateOrigin::Expression => {}
+            CandidateOrigin::Expression => {
+                if let Some(check) = context.assignment {
+                    return check(attr, value, &path);
+                }
+            }
         }
         Ok(findings)
     };
@@ -269,6 +426,7 @@ pub fn judge_assignment<K: DestinationKind, P: PlaceholderKind, B: BindingAddres
         owner: &contract.owner,
         resolver: context.provider.catalog().custom_type_resolver(),
     };
+    let lookup = context.lookup.unwrap_or(&lookup);
     let mut checked = match &context.proof {
         AdmissionProof::Validation(proof) => {
             crate::schema::value_validation::validate_value_for_admission(
@@ -276,7 +434,7 @@ pub fn judge_assignment<K: DestinationKind, P: PlaceholderKind, B: BindingAddres
                 proof,
                 &contract.defs,
                 contract.ancestry,
-                &lookup,
+                lookup,
                 Some(&check),
             )
         }
@@ -285,7 +443,7 @@ pub fn judge_assignment<K: DestinationKind, P: PlaceholderKind, B: BindingAddres
             proof.knowledge(),
             &contract.defs,
             contract.ancestry,
-            &lookup,
+            lookup,
         ),
         AdmissionProof::Apply(proof) => {
             crate::schema::value_validation::validate_value_with_lookup(
@@ -293,14 +451,17 @@ pub fn judge_assignment<K: DestinationKind, P: PlaceholderKind, B: BindingAddres
                 &crate::resource::knowledge::Classification::<P, B>::Known(proof.clone()),
                 &contract.defs,
                 contract.ancestry,
-                &lookup,
+                lookup,
             )
         }
     };
     let mut assignment = checked.take_assignment();
-    assignment.schema.extend(candidate.schema.clone());
+    assignment
+        .schema
+        .extend(candidate.obligations.schema.clone());
+    checked.symbolic = std::mem::take(&mut assignment.errors);
     let mut errors = Vec::new();
-    for (path, error) in checked.into_located() {
+    for (path, error) in checked.clone().into_located() {
         match error {
             TypeError::CustomTypeValidation {
                 ref error,
@@ -322,9 +483,14 @@ pub fn judge_assignment<K: DestinationKind, P: PlaceholderKind, B: BindingAddres
         }
     }
     if !errors.is_empty() {
-        return Err(constraints(errors));
+        let mut error = constraints(errors);
+        error.findings = Some(Box::new(checked));
+        return Err(error);
     }
-    Ok(verdict(destination, assignment))
+    Ok(AssignmentJudgement {
+        verdict: verdict(destination, assignment),
+        findings: checked,
+    })
 }
 
 /// Owner authority comes from the descriptor; a caller cannot replace it.

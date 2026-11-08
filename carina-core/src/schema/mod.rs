@@ -2444,7 +2444,7 @@ impl FieldPath {
         next
     }
 
-    pub(crate) fn canonical(&self) -> LeafPath {
+    pub fn canonical(&self) -> LeafPath {
         LeafPath::from_segments(self.canonical.iter().cloned())
     }
 
@@ -9911,6 +9911,7 @@ impl ValidatedResourceSchema {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn validate_selected_known_values_with_origins_and_lookup<
         'v,
         T: StructuralPending<
@@ -15497,6 +15498,7 @@ impl PatternResourceSchema<Compiled> {
                 lookup,
                 ValueEntryValidation::KnownWritableOnly,
                 None,
+                None,
             )
             .into_errors();
 
@@ -15532,6 +15534,7 @@ impl PatternResourceSchema<Compiled> {
     /// provider custom-type checks are restricted to `selected`; every other
     /// value was checked at an earlier boundary and may now be in a normalized
     /// representation that intentionally differs from the authored form.
+    #[cfg(test)]
     fn validate_selected_known_values_with_origins_and_lookup<
         'v,
         T: StructuralPending<
@@ -15561,6 +15564,7 @@ impl PatternResourceSchema<Compiled> {
                 lookup,
                 ValueEntryValidation::KnownWritableOnly,
                 Some(selected),
+                None,
             )
             .into_errors();
 
@@ -15599,7 +15603,7 @@ impl PatternResourceSchema<Compiled> {
             .into_result()
     }
 
-    fn validate_report<
+    pub(crate) fn validate_report<
         'v,
         P: PlaceholderKind,
         B: BindingAddress,
@@ -15609,6 +15613,21 @@ impl PatternResourceSchema<Compiled> {
         attributes: &HashMap<String, Classification<'v, P, B, T>>,
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
+    ) -> ResourceValueValidation {
+        self.validate_admission_report(attributes, is_string_literal, lookup, None)
+    }
+
+    pub(crate) fn validate_admission_report<
+        'v,
+        P: PlaceholderKind,
+        B: BindingAddress,
+        T: StructuralPending<'v, P, B>,
+    >(
+        &self,
+        attributes: &HashMap<String, Classification<'v, P, B, T>>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+        admission: Option<value_validation::AttributeAdmission<'_, 'v, P, B, T>>,
     ) -> ResourceValueValidation {
         let mut report = ResourceValueValidation::default();
 
@@ -15627,6 +15646,7 @@ impl PatternResourceSchema<Compiled> {
             lookup,
             ValueEntryValidation::FullInput,
             None,
+            admission,
         );
         report.errors.extend(values.errors);
         report.attributes = values.attributes;
@@ -15666,6 +15686,63 @@ impl PatternResourceSchema<Compiled> {
         report
     }
 
+    pub(crate) fn validate_resolved_admission_report<
+        'v,
+        T: StructuralPending<
+                'v,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+            >,
+    >(
+        &self,
+        attributes: &HashMap<
+            String,
+            Classification<
+                'v,
+                crate::resource::NoPlaceholder,
+                crate::resource::AbsoluteBindingAddress,
+                T,
+            >,
+        >,
+        selected: Option<&HashSet<String>>,
+        is_string_literal: &dyn Fn(&str) -> bool,
+        lookup: CustomTypeLookup<'_>,
+        admission: value_validation::AttributeAdmission<
+            '_,
+            'v,
+            crate::resource::NoPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+            T,
+        >,
+    ) -> ResourceValueValidation {
+        let mut report = self.validate_value_entries(
+            attributes,
+            is_string_literal,
+            lookup,
+            ValueEntryValidation::KnownWritableOnly,
+            selected,
+            Some(admission),
+        );
+        if selected.is_none_or(|names| !names.is_empty())
+            && let Some(validator) = self.validator()
+            && let Err(mut errors) = run_resource_validator(
+                validator,
+                &attributes
+                    .iter()
+                    .map(|(key, value)| {
+                        (
+                            key.clone(),
+                            ClassifiedRef::from(value).diagnostic_value().clone(),
+                        )
+                    })
+                    .collect(),
+            )
+        {
+            report.errors.append(&mut errors);
+        }
+        report
+    }
+
     fn validate_value_entries<
         'v,
         P: PlaceholderKind,
@@ -15678,6 +15755,7 @@ impl PatternResourceSchema<Compiled> {
         lookup: CustomTypeLookup<'_>,
         mode: ValueEntryValidation,
         selected: Option<&HashSet<String>>,
+        admission: Option<value_validation::AttributeAdmission<'_, 'v, P, B, T>>,
     ) -> ResourceValueValidation {
         let mut report = ResourceValueValidation::default();
 
@@ -15715,13 +15793,16 @@ impl PatternResourceSchema<Compiled> {
                     continue;
                 }
 
-                let findings = value_validation::validate_value_with_lookup(
-                    &schema.attr_type,
-                    value,
-                    &self.defs,
-                    FieldAncestry::from_input_mode(effective_attribute.effective_input_mode()),
-                    lookup,
-                );
+                let findings = match admission {
+                    Some(admit) => admit(name, value),
+                    None => value_validation::validate_value_with_lookup(
+                        &schema.attr_type,
+                        value,
+                        &self.defs,
+                        FieldAncestry::from_input_mode(effective_attribute.effective_input_mode()),
+                        lookup,
+                    ),
+                };
                 for error in findings.local_errors() {
                     let tagged = error.clone().with_attribute(name);
                     let reshaped = if is_string_literal(name.as_str())
@@ -15741,6 +15822,9 @@ impl PatternResourceSchema<Compiled> {
                 );
                 report.attributes.insert(name.clone(), findings);
             } else if mode == ValueEntryValidation::FullInput {
+                if let Some(admit) = admission {
+                    report.attributes.insert(name.clone(), admit(name, value));
+                }
                 let id_attribute = format!("{name}_id");
                 let suggestion = if known.contains(&id_attribute.as_str()) {
                     Some(id_attribute)
@@ -15868,10 +15952,36 @@ impl crate::resource::InsideSecret for TypeError {
                 expected,
                 extra_message: extra_message.map(ProviderValidation::inside_secret),
             },
-            TypeError::Reference { error, attribute } => TypeError::Reference {
-                error: Box::new((*error).inside_secret()),
-                attribute,
-            },
+            TypeError::Reference { error, attribute } => {
+                use crate::resource::SecretDiagnosticError;
+                use crate::validation::admission::AdmissionReferenceError;
+                let error = match *error {
+                    SecretDiagnosticError::Public(
+                        AdmissionReferenceError::UnknownBinding { .. }
+                        | AdmissionReferenceError::ProtectedBinding,
+                    ) => SecretDiagnosticError::Public(AdmissionReferenceError::ProtectedBinding),
+                    SecretDiagnosticError::Public(
+                        AdmissionReferenceError::Path(_)
+                        | AdmissionReferenceError::ProtectedAttribute,
+                    ) => SecretDiagnosticError::Public(AdmissionReferenceError::ProtectedAttribute),
+                    SecretDiagnosticError::Public(AdmissionReferenceError::Authored(finding)) => {
+                        SecretDiagnosticError::Public(AdmissionReferenceError::Authored(Box::new(
+                            (*finding).inside_secret(),
+                        )))
+                    }
+                    SecretDiagnosticError::Public(
+                        AdmissionReferenceError::Computed(_)
+                        | AdmissionReferenceError::Arithmetic(_)
+                        | AdmissionReferenceError::Resolution(_)
+                        | AdmissionReferenceError::ResourceHandle { .. },
+                    )
+                    | SecretDiagnosticError::InsideSecret => SecretDiagnosticError::InsideSecret,
+                };
+                TypeError::Reference {
+                    error: Box::new(error),
+                    attribute,
+                }
+            }
             TypeError::Knowledge { error, attribute } => TypeError::Knowledge {
                 error: Box::new((*error).inside_secret()),
                 attribute,

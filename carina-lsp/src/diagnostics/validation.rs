@@ -6,62 +6,6 @@ use carina_core::parser::{AnalysisResourceRef, Located};
 use carina_core::schema::{FieldPath, FieldPathStep, TypeError, ValidatedResourceSchema};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-/// Runtime equality ignores string provenance and equates some enum/string
-/// spellings. Cached diagnostics require the same authored representation.
-pub(super) fn same_validation_input(left: &super::Value, right: &super::Value) -> bool {
-    use carina_core::resource::{ConcreteValue, DeferredValue, Value};
-
-    if std::ptr::eq(left, right) {
-        return true;
-    }
-    match (left, right) {
-        (
-            Value::Concrete(ConcreteValue::String(left)),
-            Value::Concrete(ConcreteValue::String(right)),
-        ) => left == right && left.is_diagnostic_sensitive() == right.is_diagnostic_sensitive(),
-        (
-            Value::Concrete(ConcreteValue::List(left)),
-            Value::Concrete(ConcreteValue::List(right)),
-        ) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| same_validation_input(left, right))
-        }
-        (Value::Concrete(ConcreteValue::Map(left)), Value::Concrete(ConcreteValue::Map(right))) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|((left_key, left), (right_key, right))| {
-                        left_key == right_key && same_validation_input(left, right)
-                    })
-        }
-        (
-            Value::Deferred(DeferredValue::Secret(left)),
-            Value::Deferred(DeferredValue::Secret(right)),
-        ) => left.visit(|left| right.visit(|right| same_validation_input(left, right))),
-        (
-            Value::Deferred(DeferredValue::Coalesce {
-                value: left,
-                default: left_default,
-            }),
-            Value::Deferred(DeferredValue::Coalesce {
-                value: right,
-                default: right_default,
-            }),
-        ) => {
-            same_validation_input(left, right) && same_validation_input(left_default, right_default)
-        }
-        (Value::Concrete(left_value), Value::Concrete(right_value)) => {
-            std::mem::discriminant(left_value) == std::mem::discriminant(right_value)
-                && left == right
-        }
-        _ => false,
-    }
-}
-
 impl DiagnosticEngine {
     /// Attach each cached path-tagged error to the
     /// authored key, list element, or nearest authored computed parent.

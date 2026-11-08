@@ -17,7 +17,7 @@ pub(crate) mod state_output;
 pub mod validate;
 
 use carina_core::paths::ResolvedPath;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::output_style::Colorize;
@@ -51,7 +51,7 @@ use crate::wiring::{
     validate_no_backend_in_modules, validate_no_exports_in_modules,
     validate_no_provider_in_modules, validate_no_state_blocks_in_modules,
     validate_no_upstream_states_in_modules, validate_provider_region_with_ctx,
-    validate_resources_with_ctx, validate_wait_bindings_with_ctx,
+    validate_resource_admissions_with_ctx, validate_wait_bindings_with_ctx,
 };
 use carina_core::hint::ProjectCommand;
 
@@ -963,11 +963,6 @@ pub(crate) fn validate_and_resolve_errors_inner(
     }
 
     if let Some(analysis) = &expanded_analysis {
-        errors.extend(validate_resources_with_ctx(
-            ctx,
-            parsed,
-            enriched_context.catalog(),
-        ));
         errors.extend(validate_depends_on_with_ctx(
             analysis,
             &resolved_argument_types,
@@ -1004,20 +999,11 @@ pub(crate) fn validate_and_resolve_errors_inner(
             ctx.schemas(),
             enriched_context.catalog(),
         );
-        if let Err(message) = carina_core::validation::validate_resource_ref_types(
+        errors.extend(validate_resource_admissions_with_ctx(
+            ctx,
             configuration.judged(),
-            &HashSet::new(),
             &bindings,
-        ) {
-            match message {
-                carina_core::validation::ResourceRefTypeValidationError::Validation(message) => {
-                    errors.extend(split_validation_message(&message))
-                }
-                carina_core::validation::ResourceRefTypeValidationError::AnalysisInvariant(
-                    error,
-                ) => errors.push(AppError::AnalysisInvariant(error)),
-            }
-        }
+        ));
         if let Err(message) =
             carina_core::validation::validate_attribute_param_ref_types_with_bindings(
                 &parsed.attribute_params,
