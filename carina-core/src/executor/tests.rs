@@ -1,5 +1,7 @@
 use super::*;
 use crate::provider::Provider;
+#[path = "admission_resolution_tests.rs"]
+mod admission_resolution_tests;
 #[path = "input_discharge_tests.rs"]
 mod input_discharge_tests;
 use crate::schema::{

@@ -264,9 +264,24 @@ fn admit_apply_attributes<K: RechecksResolved>(
     let mut projected = std::collections::HashMap::new();
     let mut projection_errors = Vec::new();
     for (name, value) in resource_attributes {
-        let value = authored
-            .and_then(|(attributes, _)| attributes.get(name))
-            .unwrap_or(value);
+        let value = match authored {
+            Some((attributes, names)) => {
+                let Some(authored_value) = attributes.get(name) else {
+                    // Provider normalization can add keys at plan time. They
+                    // are provider input, outside the authored validation set.
+                    continue;
+                };
+                if names.contains(name) {
+                    // Admission candidates come from the resolved resource.
+                    value
+                } else {
+                    // Cross-attribute checks retain the plan-validated spelling
+                    // of literals alongside the newly resolved candidates.
+                    authored_value
+                }
+            }
+            None => value,
+        };
         match value.knowledge(&KnowledgeContext::apply(bindings)) {
             Ok(proof) => {
                 projected.insert(name.clone(), proof);

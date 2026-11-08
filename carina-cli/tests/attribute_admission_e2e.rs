@@ -13,96 +13,15 @@ use carina_core::executor::{
     prepare_provider_ready_resource,
 };
 use carina_core::plan::PlanErrorKind;
-use carina_core::provider::{BoxFuture, ProviderFactory, ProviderInitialization, ProviderResult};
+use carina_core::provider::ProviderFactory;
 use carina_core::resource::{ConcreteValue, SavedResource, Value};
-use carina_core::schema::{
-    AttributeSchema, AttributeType, PatternMatch, PatternSpec, ResourceSchema, SchemaKind,
-    SchemaRegistry, StructField, TypeIdentity, ValidatedResourceSchema,
-};
+use carina_core::schema::{SchemaKind, SchemaRegistry};
 use carina_state::{ResourceState, StateFile};
 use tower_lsp::lsp_types::DiagnosticSeverity;
 
-struct InfraFactory(&'static str);
-
-impl ProviderFactory for InfraFactory {
-    fn name(&self) -> &str {
-        self.0
-    }
-    fn display_name(&self) -> &str {
-        "Admission infrastructure fixture"
-    }
-    fn provider_config_attribute_types(&self) -> carina_core::schema::ValidatedConfigSchema {
-        Default::default()
-    }
-    fn validate_config(
-        &self,
-        _: &carina_core::provider::CanonicalProviderConfigAttributes,
-        _: &carina_core::provider::ProviderValidationInputs,
-    ) -> ProviderResult<()> {
-        Ok(())
-    }
-    fn create_provider(
-        &self,
-        _: &carina_core::provider::ProviderSession,
-        _: carina_core::provider::InitializeOutcomeMint,
-    ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
-        Box::pin(async {
-            unreachable!(
-                "these fixtures use the planner and preparation gate without cloud dispatch"
-            )
-        })
-    }
-    fn schema_witness(&self) -> carina_core::schema::ValidatedProviderSchemaWitness {
-        carina_core::schema::ValidatedProviderSchemaWitness::new(
-            self.schemas(),
-            self.provider_config_attribute_types(),
-            Default::default(),
-            Vec::new(),
-        )
-        .unwrap()
-    }
-    fn schemas(&self) -> Vec<ValidatedResourceSchema> {
-        let group = |max| {
-            AttributeType::refined_string(
-                Some(TypeIdentity::from_dotted("aws.identitystore.Group.Id")),
-                None,
-                Some((Some(1), Some(max))),
-                None,
-            )
-        };
-        let arn = |length| {
-            AttributeType::refined_string(
-                Some(TypeIdentity::from_dotted("aws.iam.Role.Arn")),
-                None,
-                length,
-                None,
-            )
-        };
-        let drafts = match self.0 {
-            "aws" => vec![
-                ResourceSchema::new("identitystore.Group").attribute(AttributeSchema::provider_populated("group_id", group(64)).build()),
-                ResourceSchema::new("iam.Role").attribute(AttributeSchema::provider_populated("arn", arn(None)).build()),
-            ],
-            "awscc" => vec![
-                ResourceSchema::new("sso.Assignment")
-                    .attribute(AttributeSchema::optional("account_id", AttributeType::string()).create_only().identity().build())
-                    .attribute(AttributeSchema::required("principal_id", AttributeType::refined_string(
-                        Some(TypeIdentity::from_dotted("aws.identitystore.Group.Id")),
-                        Some(PatternSpec::new("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", PatternMatch::Full)),
-                        Some((Some(1), Some(36))), None,
-                    )).build()),
-                ResourceSchema::new("scheduler.Schedule").attribute(AttributeSchema::required("target", AttributeType::struct_("Target", vec![
-                    StructField::required("role_arn", arn(Some((Some(1), Some(1600))))).build(),
-                ])).build()),
-            ],
-            owner => panic!("unexpected fixture provider {owner}"),
-        };
-        drafts
-            .into_iter()
-            .map(|schema| schema.validate().unwrap())
-            .collect()
-    }
-}
+#[path = "support/attribute_admission_infra.rs"]
+mod infra;
+use infra::InfraFactory;
 
 fn factories() -> Vec<Box<dyn ProviderFactory>> {
     vec![
@@ -488,4 +407,191 @@ fn publish_first_timing_and_saved_live_apply() {
 #[test]
 fn publish_second_timing_and_saved_live_apply() {
     timing_matrix("publish_second");
+}
+
+struct ApplyObserver;
+
+impl carina_core::executor::ExecutionObserver for ApplyObserver {
+    fn on_event(&self, _: &carina_core::executor::ExecutionEvent) {}
+}
+
+/// Exercise basic.rs resolution and ApplyResolved, with an output unavailable
+/// until the upstream create in this execution has completed.
+fn executor_timing_matrix(name: &str) {
+    use carina_core::data_source_value::ExecutableDataSourceValues;
+    use carina_core::executor::{
+        EffectFailureKind, ExecutionCheckpointSink, ExecutionOutcome, LiveExecutionInput,
+        ProviderCheckInputs, execute_live_plan_for_test,
+    };
+    use carina_core::resource::{Current, ResolvedResourceId};
+    use std::sync::Mutex;
+
+    let case = Case::new(name);
+    for (output, fits) in case.values() {
+        let fixture = case.plan();
+        assert!(
+            fixture.plan.errors().is_empty(),
+            "{:?}",
+            fixture.plan.errors()
+        );
+        assert!(
+            fixture
+                .managed_current
+                .values()
+                .all(|value| matches!(value, Current::Absent(_)))
+        );
+        let destinations: Vec<_> = fixture
+            .unresolved_resources
+            .iter()
+            .filter(|origin| origin.as_resource().id.resource_type == case.destination)
+            .map(|origin| origin.as_resource().id.clone())
+            .collect();
+        assert_eq!(
+            destinations.len(),
+            1,
+            "the fixture contains one destination"
+        );
+        let origins = fixture
+            .unresolved_resources
+            .iter()
+            .map(|origin| {
+                (
+                    ResolvedResourceId::new(origin.as_resource().id.clone()),
+                    origin.clone(),
+                )
+            })
+            .collect();
+        let creates = Arc::new(Mutex::new(Vec::new()));
+        let factories = infra::runtime_factories(&output, &creates);
+        let loaded = carina_core::provider::loaded_provider_snapshot_from_factories(
+            Arc::new(infra::runtime_factories(&output, &creates)),
+            SchemaRegistry::new(),
+            carina_core::EnvironmentSnapshot::empty(),
+        );
+        let expected = infra::literal_errors(
+            &fixture.schemas,
+            loaded.provider_context(),
+            &destinations[0],
+            case.attribute,
+            case.literal(&output),
+        );
+        let provider = infra::OutputProvider {
+            name: "aws",
+            output: output.clone(),
+            creates: creates.clone(),
+        };
+        let outcome = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(execute_live_plan_for_test(
+                &carina_cli::test_support::boundary(Box::new(provider)),
+                LiveExecutionInput {
+                    plan: fixture
+                        .checked
+                        .as_ref()
+                        .expect("unknown output is admitted at plan"),
+                    provider_check_inputs: ProviderCheckInputs::PlanNormalized {
+                        resource_origins: &origins,
+                        data_source_origins: &[],
+                    },
+                    compositions: &fixture.compositions,
+                    bindings: ResolvedBindings::default(),
+                    managed_current: fixture.managed_current,
+                    data_source_values: ExecutableDataSourceValues::empty(),
+                    normalizer: &carina_core::provider::NoopNormalizer,
+                    provider_configs: &[],
+                    provider_context: carina_core::parser::ProviderContext::clone(
+                        loaded.provider_context(),
+                    ),
+                    factories: &factories,
+                    schemas: &fixture.schemas,
+                    parallelism: carina_cli::DEFAULT_PARALLELISM,
+                    precompleted_success_count: 0,
+                    checkpoint_sink: ExecutionCheckpointSink::noop(),
+                },
+                &ApplyObserver,
+                carina_core::shutdown::ShutdownToken::running(),
+            ));
+        let ExecutionOutcome::Completed(result) = outcome else {
+            panic!("fixture apply cancelled")
+        };
+        let creates = creates.lock().unwrap();
+        assert_eq!(
+            creates
+                .iter()
+                .filter(|resource| resource.id.resource_type == case.source_type)
+                .count(),
+            1
+        );
+        if fits {
+            assert_eq!(result.failure_count(), 0, "{:?}", result.failures());
+            assert_eq!(result.success_count, destinations.len() + 1);
+            assert_eq!(creates.len(), destinations.len() + 1);
+            for destination in &destinations {
+                let request = creates
+                    .iter()
+                    .find(|resource| &resource.id == destination)
+                    .unwrap();
+                assert_eq!(
+                    request.get_attr(case.attribute),
+                    Some(&case.literal(&output))
+                );
+            }
+        } else {
+            assert_eq!(
+                creates.len(),
+                1,
+                "invalid destinations crossed the provider gate"
+            );
+            assert_eq!(result.success_count, 1);
+            assert_eq!(
+                result.failure_count(),
+                destinations.len(),
+                "{:?}",
+                result.failures()
+            );
+            for failure in result.failures() {
+                let EffectFailureKind::Execution { error } = failure.kind() else {
+                    panic!("{failure:?}")
+                };
+                let Some(ProviderPreparationError::ValueConstraint { errors, .. }) =
+                    error.as_error().downcast_ref::<ProviderPreparationError>()
+                else {
+                    panic!("{failure:?}")
+                };
+                assert_eq!(errors.errors(), expected);
+                assert!(
+                    errors
+                        .errors()
+                        .iter()
+                        .all(|error| error.attribute_name() == Some(case.attribute))
+                );
+                let message = failure.to_string();
+                assert_eq!(message.matches(case.path).count(), 1, "{message}");
+                assert_eq!(
+                    errors.to_string(),
+                    expected[0].clone().with_attribute(case.path).to_string()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn assignment_direct_unknown_at_plan_resolves_in_executor() {
+    executor_timing_matrix("assignment_direct");
+}
+
+#[test]
+fn assignment_loop_unknown_at_plan_resolves_in_executor() {
+    executor_timing_matrix("assignment_loop");
+}
+
+#[test]
+fn publish_first_unknown_at_plan_resolves_in_executor() {
+    executor_timing_matrix("publish_first");
+}
+
+#[test]
+fn publish_second_unknown_at_plan_resolves_in_executor() {
+    executor_timing_matrix("publish_second");
 }
