@@ -60,10 +60,9 @@ pub mod wasm_guest;
 pub mod wasi_http;
 
 // `wasi_http_body` is compiled for every target so its pure-Rust
-// classification helpers can be unit-tested on the host. The only
-// non-test caller (`wasi_http::make_request`) is wasm32-only, so on
-// host builds the items are dead from the lib's point of view —
-// silence the warning rather than guard the module on every fn.
+// classification helpers can be unit-tested on the host. Outside tests and
+// `test-utils`, the transport callers are wasm32-only, so silence dead-code
+// warnings on host builds rather than guard the module on every fn.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 mod wasi_http_body;
 

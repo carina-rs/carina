@@ -42,5 +42,5 @@ carina-core = { path = "../carina-core", features = ["test-utils", "provider-hos
 tokio = { version = "1", features = ["macros", "rt"] }
 wasi = "0.14"
 aws-smithy-runtime-api = { version = "1", features = ["client", "http-1x", "test-util"] }
-aws-smithy-types = "1"
+aws-smithy-types = { version = "1", features = ["http-body-1-x"] }
 aws-types = "1"
