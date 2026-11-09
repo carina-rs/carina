@@ -37,8 +37,8 @@ class TouchedCratesTests(unittest.TestCase):
         self.packages = []
         for name, dependencies in [
             ("carina-plugin-sdk", []),
-            ("carina-provider-mock", [("carina-plugin-sdk", None)]),
-            ("carina-plugin-host", [("carina-provider-mock", "dev")]),
+            ("carina-provider-example", [("carina-plugin-sdk", None)]),
+            ("carina-plugin-host", [("carina-provider-example", "dev")]),
             ("carina-cli", [("carina-plugin-host", "build")]),
             ("carina-tui", []),
         ]:
@@ -65,24 +65,24 @@ class TouchedCratesTests(unittest.TestCase):
 
     def test_transitive_reverse_dependencies_include_dev_and_build_edges(self):
         self.assertEqual(self.scope("carina-plugin-sdk/src/lib.rs"),
-                         "-p carina-cli -p carina-plugin-host -p carina-plugin-sdk -p carina-provider-mock")
-        self.assertEqual(self.scope("carina-provider-mock/src/lib.rs"),
-                         "-p carina-cli -p carina-plugin-host -p carina-provider-mock")
+                         "-p carina-cli -p carina-plugin-host -p carina-plugin-sdk -p carina-provider-example")
+        self.assertEqual(self.scope("carina-provider-example/src/lib.rs"),
+                         "-p carina-cli -p carina-plugin-host -p carina-provider-example")
         self.assertEqual(self.scope("carina-cli/src/lib.rs"), "-p carina-cli")
 
     def test_leaf_scope_and_deduplication_are_deterministic(self):
         self.assertEqual(self.scope("carina-tui/src/lib.rs", "carina-tui/src/lib.rs"), "-p carina-tui")
         self.assertEqual(self.scope("carina-tui/README.md"), "-p carina-tui")
-        self.assertEqual(self.scope("carina-tui/src/lib.rs", "carina-provider-mock/src/lib.rs"),
-                         "-p carina-cli -p carina-plugin-host -p carina-provider-mock -p carina-tui")
+        self.assertEqual(self.scope("carina-tui/src/lib.rs", "carina-provider-example/src/lib.rs"),
+                         "-p carina-cli -p carina-plugin-host -p carina-provider-example -p carina-tui")
 
     def test_full_closure_becomes_workspace(self):
         self.assertEqual(self.scope("carina-plugin-sdk/src/lib.rs", "carina-tui/src/lib.rs"), "--workspace")
 
     def test_cycles_terminate(self):
         self.packages[0]["dependencies"].append(self.dependency("carina-plugin-host", "dev"))
-        self.assertEqual(self.scope("carina-provider-mock/src/lib.rs"),
-                         "-p carina-cli -p carina-plugin-host -p carina-plugin-sdk -p carina-provider-mock")
+        self.assertEqual(self.scope("carina-provider-example/src/lib.rs"),
+                         "-p carina-cli -p carina-plugin-host -p carina-plugin-sdk -p carina-provider-example")
 
     def test_optional_and_target_specific_edges_are_included(self):
         self.packages[-1]["dependencies"].append(
@@ -100,7 +100,7 @@ class TouchedCratesTests(unittest.TestCase):
         # A path dependency outside the workspace must not become a member.
         self.packages[0]["dependencies"].append(self.dependency("vendor/helper"))
         self.assertEqual(self.scope("carina-plugin-sdk/src/lib.rs"),
-                         "-p carina-cli -p carina-plugin-host -p carina-plugin-sdk -p carina-provider-mock")
+                         "-p carina-cli -p carina-plugin-host -p carina-plugin-sdk -p carina-provider-example")
 
     def test_fallbacks_remain_workspace(self):
         for filename in ("carina-core/src/lib.rs", "Cargo.toml", "Cargo.lock",
@@ -108,11 +108,37 @@ class TouchedCratesTests(unittest.TestCase):
             with self.subTest(filename=filename):
                 self.assertEqual(self.scope(filename), "--workspace")
 
+    def test_wasm_fixture_changes_include_consumers_without_cargo_edges(self):
+        for crate in ("carina-provider-mock", "carina-provider-mock-http"):
+            self.packages.append({
+                "id": crate, "name": crate, "dependencies": [],
+                "manifest_path": str(self.root / crate / "Cargo.toml"),
+            })
+            for filename in (crate + "/src/lib.rs", crate + "/src/bin/fixture.rs"):
+                with self.subTest(filename=filename):
+                    self.assertEqual(self.scope(filename), "--workspace")
+
+    def test_cargo_execution_definitions_require_workspace(self):
+        for filename in (
+            "scripts/verify.sh", "scripts/touched-crates.sh",
+            "scripts/test-in-process-isolation.sh", "scripts/setup-nextest-user-dirs.sh",
+            "scripts/require-wasm-fixtures.sh", "scripts/wasm-fixture-crates.txt",
+            ".config/nextest.toml", ".config/nested/new-config.toml",
+            ".cargo/config.toml", ".cargo/nested/new-config.toml",
+            ".github/workflows/ci.yml", ".github/actions/rust-cache/action.yml",
+            ".github/actions/nested/setup/helper.py",
+        ):
+            with self.subTest(filename=filename):
+                self.assertEqual(self.scope(filename), "--workspace")
+        self.assertFalse(self.trace.exists())
+
     def test_empty_and_ignored_changes_do_not_run_cargo(self):
         self.assertEqual(self.scope(), "")
-        self.assertEqual(self.scope("README.md", "CLAUDE.md", "scripts/verify.sh",
-                                    ".github/workflows/ci.yml", "site/src/index.ts",
-                                    "notes/example.txt", "infra/example.crn"), "")
+        for filename in ("README.md", "CLAUDE.md", "scripts/check-plan-fixtures.sh",
+                         ".github/ISSUE_TEMPLATE/bug.yml", "site/src/index.ts",
+                         "notes/example.txt", "infra/example.crn"):
+            with self.subTest(filename=filename):
+                self.assertEqual(self.scope(filename), "")
         self.assertFalse(self.trace.exists())
 
     def test_metadata_failure_falls_back_to_workspace(self):

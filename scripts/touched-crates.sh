@@ -21,13 +21,16 @@
 #   1. A change to any `Cargo.toml` or `Cargo.lock` ⇒ `--workspace`.
 #   2. A change to `carina-core/**` ⇒ `--workspace` (everything depends
 #      on carina-core; running its tests alone is insufficient).
-#   3. Otherwise, find the workspace members owning the changed files
+#   3. WASM fixture crates and files defining Cargo check execution
+#      (verify/test setup, .config, .cargo, CI and local actions) ⇒ `--workspace`.
+#      Artifact consumers have no Cargo dependency edge to their fixtures.
+#   4. Otherwise, find the workspace members owning the changed files
 #      using Cargo metadata. Include all transitive reverse dependencies,
 #      including dev, build, optional and target-specific dependencies.
 #      If any changed file is outside a workspace crate
-#      AND outside the "ignore" set (site/notes/CI/scripts/infra), emit
+#      AND outside the "ignore" set (site/notes/other CI/scripts/infra), emit
 #      `--workspace` to be safe.
-#   4. Files in the ignore set (CLAUDE.md, .github/**, scripts/**,
+#   5. Remaining files in the ignore set (CLAUDE.md, .github/**, scripts/**,
 #      site/**, notes/**, infra/**, README.md, .gitignore, *.md at root) do
 #      not trigger any test crates on their own.
 
@@ -85,6 +88,9 @@ if [[ ${#files[@]} -eq 0 ]]; then
     exit 0
 fi
 
+# Keep artifact scope in sync with verify.sh's wasm-fixtures build.
+mapfile -t fixture_crates < "$(dirname "${BASH_SOURCE[0]}")/wasm-fixture-crates.txt"
+
 is_ignorable() {
     local f="$1"
     case "$f" in
@@ -104,9 +110,24 @@ for f in "${files[@]}"; do
             echo '--workspace'
             exit 0
             ;;
+        scripts/verify.sh|scripts/touched-crates.sh|scripts/test-in-process-isolation.sh|\
+        scripts/setup-nextest-user-dirs.sh|scripts/require-wasm-fixtures.sh|scripts/wasm-fixture-crates.txt|\
+        .config/*|.cargo/*|.github/workflows/ci.yml|.github/actions/*)
+            echo '--workspace'
+            exit 0
+            ;;
     esac
 
-    # Ignorable site/notes/CI/script change?
+    for fixture in "${fixture_crates[@]}"; do
+        case "$f" in
+            "$fixture"|"$fixture"/*)
+                echo '--workspace'
+                exit 0
+                ;;
+        esac
+    done
+
+    # Static scripts run regardless of crate scope; docs need no Cargo check.
     if is_ignorable "$f"; then
         continue
     fi

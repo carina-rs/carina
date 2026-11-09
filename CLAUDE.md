@@ -313,9 +313,14 @@ aws-vault exec <profile> -- cargo run -- plan
 
 ## Verify Protocol
 
-`scripts/verify.sh` needs cargo-nextest, cargo-hack, and the `wasm32-wasip2`
-target (`rustup target add wasm32-wasip2`) for its full check set. When selecting
-kinds, only their required tools are checked before execution.
+`scripts/verify.sh` requires Bash 4.4 or newer and needs cargo-nextest,
+cargo-hack, and the `wasm32-wasip2` target (`rustup target add wasm32-wasip2`)
+for its full check set. When selecting kinds, only their required tools are
+checked before execution.
+
+`--local` has a known limit: a `-p` scope resolves dependency features only for
+the selected packages, so feature unification can differ from CI's `--workspace`
+run. When in doubt, run `scripts/verify.sh` without `--local`.
 
 1. Run `scripts/verify.sh --local` before `gh pr create` and before pushing
    follow-up commits to an open PR. It runs the same check definitions and
@@ -361,14 +366,15 @@ git diff --name-only | scripts/touched-crates.sh --stdin   # custom file list
 | Output           | Meaning                                                   |
 | ---------------- | --------------------------------------------------------- |
 | `-p <crate> ...` | Run touched crates and all transitive reverse dependents in the workspace. |
-| `--workspace`    | Cross-cutting change (touched `carina-core`, any `Cargo.toml`/`Cargo.lock`, or an unrecognized path), or the dependency closure covers every member. Sweep the whole workspace. |
-| (empty)          | No test-relevant files changed (only docs / CI / scripts / infra). Skip the test step. |
+| `--workspace`    | Cross-cutting change (core, manifests, WASM fixture crates, Cargo execution scripts/configuration, CI/local actions, or an unrecognized path), or the dependency closure covers every member. Sweep the whole workspace. |
+| (empty)          | No test-relevant files changed (only docs, static-check scripts, other CI files, or infra). Skip the test step. |
 
-The helper is intentionally pessimistic. Two "fall back to `--workspace`"
-rules: **(1) `carina-core` touched** — every other crate depends on it, so
-testing only `carina-core` would miss downstream regressions; **(2) unknown
-path** — a new top-level directory or unclassified file is treated as
-workspace-wide until the helper learns about it.
+The helper is intentionally pessimistic. Changes to `carina-core`, manifests,
+WASM fixture crates, or Cargo execution configuration require the full
+workspace. Artifact consumers have no Cargo dependency edge to the fixture
+crates listed in `scripts/wasm-fixture-crates.txt`. A new top-level directory or
+unclassified file also requires the full workspace until the helper learns
+about it.
 
 ## Plan Display Testing
 

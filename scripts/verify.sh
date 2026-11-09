@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
 # The check definitions shared by CI and local pre-PR verification.
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    echo "verify.sh: Bash 4.4 or newer is required (running $BASH_VERSION)" >&2
+    exit 2
+fi
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+default_kinds=(
+    fmt provider-boundaries error-source-display no-wall-clock-test-assertions
+    docs-spellings resources-access cli-hints no-home-env-reads
+    crates-not-publishable wit-bindgen-workspace plan-fixtures rust-cache
+    vendored-patches check feature-isolation clippy validate-crn example-warnings
+    wasm-fixtures nextest isolation provider-cause doctests
+)
+mechanic_kinds=(nextest-compile nextest-archive nextest-partition)
 
 usage() {
     cat <<'USAGE'
@@ -11,6 +24,8 @@ No KIND runs all checks, with static checks first. --local only changes
 crate scope, using touched-crates.sh (including reverse dependents and
 uncommitted changes).
 --base <ref> is passed to touched-crates.sh; it requires --local.
+--list-kinds prints the default kinds, one per line, without running checks.
+--list-kinds=ci also lists CI mechanics (isolation-with-archive means isolation <archive>).
 
 Kinds:
   fmt provider-boundaries error-source-display no-wall-clock-test-assertions
@@ -34,6 +49,11 @@ base_args=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --local) local_mode=true; shift ;;
+        --list-kinds) printf '%s\n' "${default_kinds[@]}"; exit 0 ;;
+        --list-kinds=ci)
+            printf '%s\n' "${default_kinds[@]}" "${mechanic_kinds[@]}" isolation-with-archive
+            exit 0
+            ;;
         --base)
             if [[ $# -lt 2 || -z "$2" || "$2" == --* ]]; then
                 echo 'verify.sh: --base requires a ref' >&2
@@ -149,7 +169,11 @@ run_kind() {
         validate-crn) bash scripts/validate-crn-files.sh ;;
         example-warnings) bash scripts/check-example-warnings.sh ;;
         wasm-fixtures)
-            cargo build -p carina-provider-mock -p carina-provider-mock-http --target wasm32-wasip2
+            local fixture
+            local -a fixture_crates fixture_packages=()
+            mapfile -t fixture_crates < scripts/wasm-fixture-crates.txt
+            for fixture in "${fixture_crates[@]}"; do fixture_packages+=(-p "$fixture"); done
+            cargo build "${fixture_packages[@]}" --target wasm32-wasip2
             ;;
         nextest) cargo nextest run "${test_selection[@]}" --no-fail-fast ;;
         nextest-compile) cargo nextest run "${test_selection[@]}" --no-run ;;
@@ -178,14 +202,6 @@ run_kind() {
     esac
 }
 
-default_kinds=(
-    fmt provider-boundaries error-source-display no-wall-clock-test-assertions
-    docs-spellings resources-access cli-hints no-home-env-reads
-    crates-not-publishable wit-bindgen-workspace plan-fixtures rust-cache
-    vendored-patches check feature-isolation clippy validate-crn example-warnings
-    wasm-fixtures nextest isolation provider-cause doctests
-)
-mechanic_kinds=(nextest-compile nextest-archive nextest-partition)
 is_kind() {
     local candidate
     for candidate in "${default_kinds[@]}" "${mechanic_kinds[@]}"; do

@@ -144,6 +144,7 @@ class WorkflowConditionTests(unittest.TestCase):
             (root / "scripts").mkdir()
             (root / "bin").mkdir()
             shutil.copyfile(repo / "scripts/verify.sh", root / "scripts/verify.sh")
+            shutil.copyfile(repo / "scripts/wasm-fixture-crates.txt", root / "scripts/wasm-fixture-crates.txt")
             # Keep real Rust tools out of these tests, including prerequisite
             # discovery. Missing-tool cases must not find the host installation.
             for tool in ("bash", "dirname", "grep"):
@@ -361,6 +362,22 @@ class WorkflowConditionTests(unittest.TestCase):
         self.assertIn("nextest", ci_kinds)
         self.assertNotIn("nextest-archive", ci_kinds)
 
+    def test_list_kinds_matches_default_dispatch_without_prerequisites(self):
+        default, _ = self.verify_commands()
+        result, commands = self.verify_commands(
+            "--list-kinds", missing=("cargo", "cargo-nextest", "cargo-hack", "rustup"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, [])
+        self.assertEqual(result.stdout.splitlines(),
+                         re.findall(r"^=== ([a-z-]+) ===$", default.stdout, re.MULTILINE))
+        ci, commands = self.verify_commands(
+            "--list-kinds=ci", missing=("cargo", "cargo-nextest", "cargo-hack", "rustup"))
+        self.assertEqual(ci.returncode, 0, ci.stderr)
+        self.assertEqual(commands, [])
+        self.assertEqual(ci.stdout.splitlines(), result.stdout.splitlines() + [
+            "nextest-compile", "nextest-archive", "nextest-partition", "isolation-with-archive",
+        ])
+
     def test_ci_mechanics_validate_exact_arguments_before_running_checks(self):
         for arguments in (
             ("nextest-compile", "fmt"), ("fmt", "nextest-compile"),
@@ -450,6 +467,7 @@ class WorkflowConditionTests(unittest.TestCase):
             scripts = root / "scripts"
             scripts.mkdir()
             shutil.copyfile(repo / "scripts/verify.sh", scripts / "verify.sh")
+            shutil.copyfile(repo / "scripts/wasm-fixture-crates.txt", scripts / "wasm-fixture-crates.txt")
             for script in (repo / "scripts").glob("*.sh"):
                 if script.name != "verify.sh":
                     (scripts / script.name).touch()
@@ -460,11 +478,24 @@ class WorkflowConditionTests(unittest.TestCase):
 
             original = WORKFLOW.read_text()
             self.assertEqual(audit(original).returncode, 0)
+            for style in ("|", ">-"):
+                command = "scripts/verify.sh fmt" if style == "|" else "scripts/verify.sh\n          fmt"
+                source = original.replace("run: scripts/verify.sh fmt\n",
+                                          f"run: {style}\n          {command}\n", 1)
+                self.assertEqual(audit(source).returncode, 0)
             for command in (
                 "cargo check --all-features",
+                "cargo-nextest run --workspace",
+                "cargo-hack check --each-feature",
+                '\"$CARGO\" check --workspace',
+                "${CARGO} check --workspace",
+                '\"${CARGO}\" check --workspace',
                 "bash scripts/check-plan-fixtures.sh",
                 "bash scripts/test-check-docs-spellings.sh",
                 "bash scripts/validate-crn-files.sh",
+                "python3 scripts/check-synthetic.py",
+                "scripts/check-synthetic",
+                "bash scripts/nested/check-synthetic.bash",
                 "|\n          scripts/verify.sh check\n          env CARGO_BUILD_JOBS=2 cargo check",
                 ">-\n          cargo\n          nextest run --workspace",
             ):
@@ -478,7 +509,9 @@ class WorkflowConditionTests(unittest.TestCase):
             for path in (root / ".github/workflows/extra.yml",
                          root / ".github/actions/nested/fixture/action.yml"):
                 path.parent.mkdir(parents=True, exist_ok=True)
-                for command in ("cargo check", "bash scripts/validate-crn-files.sh"):
+                for command in ("cargo check", "cargo-nextest run", '\"$CARGO\" check',
+                                "bash scripts/validate-crn-files.sh", "python3 scripts/check-synthetic.py",
+                                "scripts/check-synthetic"):
                     with self.subTest(path=path, command=command):
                         path.write_text("runs:\n  using: composite\n  steps:\n"
                                         f"    - shell: bash\n      run: {command}\n")
@@ -492,11 +525,56 @@ class WorkflowConditionTests(unittest.TestCase):
             for job, allowed in (("changes", "bash scripts/classify-ci-diff.sh a b"),
                                  ("test-partition", "bash scripts/require-wasm-fixtures.sh"),
                                  ("binary-build", "cargo build --release --bin carina")):
-                source = f"jobs:\n  {job}:\n    steps:\n      - run: {allowed}\n"
+                block = self.jobs[job]
+                source = original.replace(block, block + f"      - run: {allowed}\n", 1)
                 self.assertEqual(audit(source).returncode, 0)
-                result = audit(source.rstrip() + " && bash scripts/validate-crn-files.sh\n")
+                result = audit(source.replace(f"run: {allowed}\n",
+                                             f"run: {allowed} && bash scripts/validate-crn-files.sh\n", 1))
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertIn("bypasses verify.sh", result.stderr)
+
+            # Every declared default must retain its CI execution, including
+            # partitioned nextest. Removing a mechanic must fail separately.
+            kinds = subprocess.check_output(["bash", str(scripts / "verify.sh"), "--list-kinds"],
+                                            text=True).splitlines()
+            for kind in kinds + ["nextest-compile", "nextest-archive", "nextest-partition"]:
+                ci_kind = "nextest-partition" if kind == "nextest" else kind
+                source, removed = re.subn(
+                    r"(?m)^([ \t]*(?:- )?run: )scripts/verify\.sh " + re.escape(ci_kind) + r"(?: [^\n]*)?\n",
+                    r"\1echo omitted\n", original)
+                self.assertGreater(removed, 0, kind)
+                with self.subTest(missing_ci_kind=kind):
+                    result = audit(source)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(f"kind {kind} is not run by ci.yml", result.stderr)
+            for mention in ("echo omitted # scripts/verify.sh fmt", "echo 'scripts/verify.sh fmt'",
+                            "|\n          scripts/verify.sh check\n          fmt"):
+                source = original.replace("run: scripts/verify.sh fmt\n", f"run: {mention}\n", 1)
+                with self.subTest(mention=mention):
+                    result = audit(source)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn("kind fmt is not run by ci.yml", result.stderr)
+            source = original.replace("scripts/verify.sh isolation nextest-archive.tar.zst",
+                                      "scripts/verify.sh isolation")
+            result = audit(source)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("kind isolation-with-archive is not run by ci.yml", result.stderr)
+
+            dispatcher = scripts / "verify.sh"
+            original_dispatcher = dispatcher.read_text()
+            dispatcher.write_text(original_dispatcher.replace("default_kinds=(\n",
+                                                            "default_kinds=(\n    synthetic-kind\n", 1))
+            result = audit(original)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("kind synthetic-kind is not run by ci.yml", result.stderr)
+            dispatcher.write_text(original_dispatcher)
+            dispatcher.write_text(original_dispatcher.replace("mechanic_kinds=(",
+                                                            "mechanic_kinds=(synthetic-mechanic ", 1))
+            result = audit(original)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("kind synthetic-mechanic is not run by ci.yml", result.stderr)
+            dispatcher.write_text(original_dispatcher)
+
             for filename in ("check-synthetic.sh", "test-check-synthetic.sh", "test-synthetic.sh"):
                 with self.subTest(filename=filename):
                     added = scripts / filename

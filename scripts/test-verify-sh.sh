@@ -4,13 +4,20 @@
 set -euo pipefail
 repo_root=${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
 verify="$repo_root/scripts/verify.sh"
+required_kinds=$(bash "$verify" --list-kinds=ci)
+# BSD awk cannot accept literal newlines in a -v assignment.
+required_kinds=${required_kinds//$'\n'/ }
+if [[ ! -f "$repo_root/.github/workflows/ci.yml" ]]; then
+    echo 'ERROR: ci.yml is missing; cannot check verify.sh kind coverage' >&2
+    exit 1
+fi
 
 # Parse run scalars by indentation, including inline, literal and folded
 # forms. This deliberately needs only awk/Bash, not a YAML package.
 shopt -s globstar nullglob
 for workflow in "$repo_root"/.github/workflows/**/* "$repo_root"/.github/actions/**/action.yml; do
     [[ -f "$workflow" ]] || continue
-    awk -v source="${workflow#"$repo_root"/}" '
+    awk -v source="${workflow#"$repo_root"/}" -v required_kinds="$required_kinds" '
 function allowed_script(script) {
     if (script == "scripts/verify.sh") return 1 # The shared dispatcher.
     # Diff classification selects jobs; it does not perform verification.
@@ -38,22 +45,54 @@ function violation(i, line) {
     printf "ERROR: %s:%d (%s) bypasses verify.sh: %s\n", source, lines[i], job, line > "/dev/stderr"
     failed = 1
 }
-function inspect(    i, line, rest, script) {
+function record_ci_kinds(run,    rest, words, n, i, kind, archive) {
+    if (source != ".github/workflows/ci.yml") return
+    gsub(/\\\n[[:space:]]*/, " ", run)
+    while (match(run, /(^|[;&|\n])[[:space:]]*(bash[[:space:]]+)?["\047]?(\.\/)?scripts\/verify\.sh["\047]?([[:space:]]|$)/)) {
+        rest = substr(run, RSTART + RLENGTH)
+        run = rest
+        sub(/\n.*/, "", rest)
+        sub(/^[[:space:]]+/, "", rest)
+        n = split(rest, words, /[[:space:]]+/)
+        for (i = 1; i <= n; i++) {
+            kind = words[i]
+            if (!(kind in required)) break
+            seen[kind] = 1
+            # CI runs the default nextest check in archive partitions.
+            if (kind == "nextest-partition") seen["nextest"] = 1
+            if (kind == "isolation") {
+                archive = words[i + 1]
+                if (archive != "" && archive !~ /^[-;&|#]/ &&
+                    !(archive in required))
+                    seen["isolation-with-archive"] = 1
+            }
+        }
+    }
+}
+function inspect(    i, line, rest, script, run) {
+    run = ""
     for (i = 1; i <= count; i++) {
         line = body[i]
         sub(/^[[:space:]]*#[^\n]*/, "", line)
-        if (line ~ /(^|[^[:alnum:]_-])cargo([[:space:]]|$)/ && !allowed_cargo(line))
+        run = run (run_folded ? " " : "\n") line
+        if (line ~ /(^|[^[:alnum:]_-])(cargo(-[[:alnum:]_-]+)?|\$CARGO|\$\{CARGO\})([[:space:]"\047]|$)/ && !allowed_cargo(line))
             violation(i, line)
         rest = line
-        while (match(rest, /scripts\/[[:alnum:]_.\/-]+\.sh/)) {
+        # Require a filename, so the changes filter pattern scripts/.* is data.
+        while (match(rest, /scripts\/[[:alnum:]_.\/-]*[[:alnum:]_-][[:alnum:]_.\/-]*/)) {
             script = substr(rest, RSTART, RLENGTH)
             if (!allowed_script(script)) violation(i, line)
             rest = substr(rest, RSTART + RLENGTH)
         }
     }
+    record_ci_kinds(run)
     count = 0
 }
-BEGIN { job = "composite" }
+BEGIN {
+    job = "composite"
+    n = split(required_kinds, kinds, /[[:space:]]+/)
+    for (i = 1; i <= n; i++) required[kinds[i]] = 1
+}
 /^  [[:alnum:]_-]+:/ {
     inspect()
     if (source ~ /^\.github\/workflows\//) {
@@ -76,13 +115,26 @@ BEGIN { job = "composite" }
         in_run = 1
         line = $0
         sub(/^[[:space:]]*(- )?run:[[:space:]]*/, "", line)
+        run_folded = (line ~ /^>/)
+        if (line ~ /^[|>]/) next
     } else if (in_run) {
         line = $0
     } else next
     body[++count] = line
     lines[count] = NR
 }
-END { inspect(); exit failed }
+END {
+    inspect()
+    if (source == ".github/workflows/ci.yml") {
+        for (kind in required) {
+            if (!seen[kind]) {
+                printf "ERROR: verify.sh kind %s is not run by ci.yml\n", kind > "/dev/stderr"
+                failed = 1
+            }
+        }
+    }
+    exit failed
+}
 ' "$workflow"
 done
 
@@ -90,6 +142,7 @@ fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/scripts" "$fixture/bin"
 cp "$verify" "$fixture/scripts/verify.sh"
+cp "$repo_root/scripts/wasm-fixture-crates.txt" "$fixture/scripts/wasm-fixture-crates.txt"
 # Observe the default dispatch with substitutes: no Rust tools or invariant
 # scripts execute. A case arm left out of the default kinds must fail too.
 for script in "$repo_root"/scripts/*.sh; do
@@ -122,4 +175,4 @@ for script in "$repo_root"/scripts/check-*.sh "$repo_root"/scripts/test-*.sh; do
     fi
 done
 if [[ $missing -ne 0 ]]; then exit 1; fi
-echo 'OK: workflow/action checks route through verify.sh and every check/test script is included.'
+echo 'OK: workflow/action checks route through verify.sh, CI covers every kind, and every check/test script is included.'
