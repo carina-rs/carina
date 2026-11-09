@@ -376,7 +376,7 @@ fn directory_diagnostics(
 }
 
 #[test]
-fn input_rules_produce_no_lsp_value_findings() {
+fn create_only_input_rules_produce_lsp_warnings() {
     use carina_core::schema::{InputPath, InputPredicate, InputRule, InputRuleCode};
     let engine = engine_with_schema(
         ResourceSchema::new("test.Widget")
@@ -400,7 +400,12 @@ fn input_rules_produce_no_lsp_value_findings() {
         ],
         "main.crn",
     );
-    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+    assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+    assert_eq!(
+        diagnostics[0].message,
+        "test.test.Widget.bucket: name [test.not_ipv4]: has IPv4 dotted-quad form (rejected if this resource is created)"
+    );
 }
 
 #[test]
@@ -456,11 +461,24 @@ fn input_every_write_matches_validate_for_multifile_desired_values_and_defaults(
                 .collect::<Vec<_>>();
             assert_eq!(
                 findings.len(),
-                usize::from(scope == InputRuleScope::EveryWrite),
+                1,
                 "{scope:?}, default={via_default}: {diagnostics:#?}"
             );
             for finding in findings {
-                assert_eq!(finding.severity, Some(DiagnosticSeverity::ERROR));
+                let (severity, suffix) = match scope {
+                    InputRuleScope::CreateOnly => (
+                        DiagnosticSeverity::WARNING,
+                        " (rejected if this resource is created)",
+                    ),
+                    InputRuleScope::EveryWrite => (DiagnosticSeverity::ERROR, ""),
+                };
+                assert_eq!(finding.severity, Some(severity));
+                assert_eq!(
+                    finding.message,
+                    format!(
+                        "test.test.Widget.bucket: tags [tags.reserved_prefix]: has a forbidden prefix{suffix}"
+                    )
+                );
                 assert!(finding.message.contains("has a forbidden prefix"));
                 assert!(!finding.message.contains("private-key"));
                 assert!(!finding.message.contains("secret-value"));

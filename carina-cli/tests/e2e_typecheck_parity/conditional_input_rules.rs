@@ -7,6 +7,92 @@ use carina_core::schema::{
 };
 
 #[test]
+fn create_only_s3_rules_have_multifile_cli_lsp_warning_and_pending_parity() {
+    let identity =
+        carina_core::schema::TypeIdentity::new(Some("test"), ["s3", "Bucket"], "Namespace");
+    let namespace_type = AttributeType::enum_(
+        identity.clone(),
+        Some(vec!["global".into(), "account-regional".into()]),
+        vec![
+            ("global".into(), "global".into()),
+            ("account-regional".into(), "account_regional".into()),
+        ],
+        None,
+        None,
+    );
+    let schema = ResourceSchema::new("s3.Bucket")
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("bucket_namespace", namespace_type.clone()).build())
+        .input_rule(
+            InputRule::value(
+                InputRuleScope::CreateOnly,
+                InputPath::new("name").unwrap(),
+                InputRuleCode::new("s3.bucket.namespace_suffix").unwrap(),
+                InputPredicate::NoSuffix(carina_core::schema::NonEmptyString::new("-an").unwrap()),
+            )
+            .with_condition(InputCondition::Not(Box::new(InputCondition::Equals {
+                path: InputPath::new("bucket_namespace").unwrap(),
+                literal: InputLiteral::Enum {
+                    identity,
+                    api_value: "account-regional".into(),
+                },
+            }))),
+        );
+    for (namespace, expected_count) in [
+        ("", 1),
+        (
+            "bucket_namespace = test.s3.Bucket.Namespace.account_regional",
+            0,
+        ),
+        ("bucket_namespace = namespace.value", 0),
+    ] {
+        let source = format!("let bucket = test.s3.Bucket {{ name = bucket_name {namespace} }}\n");
+        let fixture = write_fixture(&[
+            ("main.crn", &source),
+            (
+                "providers.crn",
+                "provider test {}\nlet bucket_name = 'bucket-an'\nlet namespace = test.s3.Namespace {}\n",
+            ),
+        ]);
+        let mut schemas = single_schema_map(schema.clone());
+        schemas.insert(
+            "test",
+            ResourceSchema::new("s3.Namespace")
+                .attribute(
+                    AttributeSchema::provider_populated("value", namespace_type.clone()).build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let cli = carina_cli::commands::validate::validate_diagnostics_with_factories(
+            &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+            carina_cli::wiring::LoadedProviderFactory::for_test(factories_for(&schemas)),
+            Default::default(),
+        );
+        assert!(cli.errors.is_empty(), "{namespace}: {:?}", cli.errors);
+        assert_eq!(cli.input_warnings.len(), expected_count);
+        let diagnostics = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        let lsp = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("[s3.bucket.namespace_suffix]"))
+            .collect::<Vec<_>>();
+        assert_eq!(lsp.len(), expected_count, "{namespace}: {diagnostics:#?}");
+        for (warning, diagnostic) in cli.input_warnings.iter().zip(lsp) {
+            assert_eq!(
+                warning.severity(),
+                carina_core::input_rules::InputFindingSeverity::Warning
+            );
+            assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+            assert_eq!(warning.to_string(), diagnostic.message);
+            assert_eq!(
+                diagnostic.message,
+                "test.s3.Bucket.bucket: name [s3.bucket.namespace_suffix]: has a forbidden suffix when not (bucket_namespace equals test.s3.Bucket.Namespace::\"account-regional\") (rejected if this resource is created)"
+            );
+        }
+    }
+}
+
+#[test]
 fn every_write_conditional_rules_have_multifile_cli_lsp_message_and_path_parity() {
     let declaration = |target: &str, code: &str, condition| {
         InputRule::value(

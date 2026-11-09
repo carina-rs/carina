@@ -1292,11 +1292,11 @@ impl DiagnosticRun<'_> {
                     for finding in findings {
                         let Some(resource) = preferred_tree
                             .resources()
-                            .find(|resource| resource.id() == &finding.resource_id)
+                            .find(|resource| resource.id() == finding.resource_id())
                         else {
                             continue;
                         };
-                        let path = finding.violation.path();
+                        let path = finding.violation().path();
                         let attribute = path.root();
                         let location = if resource.attribute_keys().iter().any(|key| matches!(key.path().first(), Some(carina_core::parser::AttributePathSegment::Attribute(name)) if name == attribute)) {
                             if path.relative().is_empty() { resource.attribute_key_location(attribute) }
@@ -1305,7 +1305,14 @@ impl DiagnosticRun<'_> {
                         diagnostics.extend(render_merged(
                             doc,
                             &carina_core::parser::Located::new(location.clone(), ()),
-                            DiagnosticSeverity::ERROR,
+                            match finding.severity() {
+                                carina_core::input_rules::InputFindingSeverity::Error => {
+                                    DiagnosticSeverity::ERROR
+                                }
+                                carina_core::input_rules::InputFindingSeverity::Warning => {
+                                    DiagnosticSeverity::WARNING
+                                }
+                            },
                             finding.to_string(),
                         ));
                     }

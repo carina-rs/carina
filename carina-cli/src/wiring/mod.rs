@@ -981,6 +981,7 @@ impl ValidationProviderCatalogExt for ValidationProviderCatalog<'_> {
 pub(crate) struct ValidationReport<'a, T = carina_core::parser::ModuleResolvedInferredFile> {
     result: Result<T, NonEmptyValidationErrors>,
     warnings: Vec<carina_core::parser::ParseWarning>,
+    input_warnings: Vec<carina_core::input_rules::InputFinding>,
     schemas: &'a SchemaRegistry,
 }
 
@@ -991,10 +992,17 @@ impl ValidationReport<'_> {
         self.result = self.result.and_then(|parsed| {
             let report = carina_core::input_rules::check_authored_inputs(&parsed, self.schemas)
                 .map_err(|error| NonEmptyValidationErrors(vec![AppError::Provider(error)]))?;
-            let errors = report
-                .into_iter()
-                .map(|finding| AppError::Validation(finding.to_string()))
-                .collect::<Vec<_>>();
+            let mut errors = Vec::new();
+            for finding in report {
+                match finding.severity() {
+                    carina_core::input_rules::InputFindingSeverity::Error => {
+                        errors.push(AppError::Validation(finding.to_string()));
+                    }
+                    carina_core::input_rules::InputFindingSeverity::Warning => {
+                        self.input_warnings.push(finding);
+                    }
+                }
+            }
             if errors.is_empty() {
                 Ok(parsed)
             } else {
@@ -1036,6 +1044,7 @@ impl<'a, T> ValidationReport<'a, T> {
         Self {
             result,
             warnings: sink.warnings,
+            input_warnings: Vec::new(),
             schemas,
         }
     }
@@ -1051,14 +1060,16 @@ impl<'a, T> ValidationReport<'a, T> {
         }
     }
     #[cfg(any(test, feature = "test-utils"))]
-    pub(crate) fn into_test_diagnostics(
-        self,
-    ) -> (Vec<AppError>, Vec<carina_core::parser::ParseWarning>) {
+    pub(crate) fn into_test_diagnostics(self) -> crate::commands::validate::ValidateDiagnostics {
         let errors = match self.result {
             Ok(_) => Vec::new(),
             Err(errors) => errors.into_vec(),
         };
-        (errors, self.warnings)
+        crate::commands::validate::ValidateDiagnostics {
+            errors,
+            warnings: self.warnings,
+            input_warnings: self.input_warnings,
+        }
     }
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn into_errors(self) -> Vec<AppError> {
@@ -1075,7 +1086,14 @@ impl<'a, T> ValidationReport<'a, T> {
         for warning in self.warnings {
             crate::commands::validate::print_provider_type_warning(&warning);
         }
+        for warning in self.input_warnings {
+            crate::commands::validate::print_input_warning(&warning);
+        }
         (self.result, self.schemas)
+    }
+
+    pub(crate) fn input_warnings(&self) -> &[carina_core::input_rules::InputFinding] {
+        &self.input_warnings
     }
     #[cfg(test)]
     pub(crate) fn schemas(&self) -> &SchemaRegistry {

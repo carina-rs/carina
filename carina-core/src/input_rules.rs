@@ -207,6 +207,7 @@ impl WriteSite<'_> {
 pub struct ApplicableInputRule<'s, 'a> {
     site: &'s WriteSite<'a>,
     rule: &'a InputRule<Compiled>,
+    kind: InputFindingKind,
     owner_type: Option<&'a CompiledAttributeType>,
     owner: Vec<instances::Step>,
     path: InputDiagnosticPath,
@@ -228,6 +229,14 @@ impl ApplicableInputRule<'_, '_> {
                 InputVerdict::Violation(violation)
             }
             InputVerdict::Proven | InputVerdict::Undecided => verdict,
+        }
+    }
+
+    fn finding(&self, violation: InputViolation) -> InputFinding {
+        InputFinding {
+            resource_id: self.site.resource_id.clone(),
+            violation,
+            kind: self.kind,
         }
     }
 }
@@ -493,10 +502,8 @@ fn classify_write_site<'a, S>(
     };
     // Discharge consumes the declarations admitted for this slot. Update
     // applicability is decided from the same sent projection at both phases.
-    let mut rules = declarations
-        .iter()
-        .filter(|rule| scope_applies(rule.scope(), context))
-        .collect::<Vec<_>>();
+    // Scope is classified when root and Struct declarations bind to instances.
+    let mut rules = declarations.iter().collect::<Vec<_>>();
     rules.sort_by(|a, b| (a.target(), a.code()).cmp(&(b.target(), b.code())));
     Ok(Some(WriteSite {
         target,
@@ -512,8 +519,11 @@ fn classify_write_site<'a, S>(
     }))
 }
 
-// The one scope decision shared by root and Struct declarations.
-fn scope_applies(scope: InputRuleScope, context: InputWriteContext) -> bool {
+// Applicability and finding kind are one decision for both declaration owners.
+fn scope_classification(
+    scope: InputRuleScope,
+    context: InputWriteContext,
+) -> Option<InputFindingKind> {
     match scope {
         InputRuleScope::CreateOnly => match context {
             InputWriteContext::Create
@@ -522,8 +532,9 @@ fn scope_applies(scope: InputRuleScope, context: InputWriteContext) -> bool {
             }
             | InputWriteContext::ResumeCreate
             | InputWriteContext::DeferredCreate
-            | InputWriteContext::DeferredReplacement => true,
-            InputWriteContext::Update | InputWriteContext::AuthoredDesired => false,
+            | InputWriteContext::DeferredReplacement => Some(InputFindingKind::Violation),
+            InputWriteContext::AuthoredDesired => Some(InputFindingKind::CreateOnlyPreview),
+            InputWriteContext::Update => None,
         },
         InputRuleScope::EveryWrite => match context {
             InputWriteContext::Create
@@ -534,7 +545,7 @@ fn scope_applies(scope: InputRuleScope, context: InputWriteContext) -> bool {
             | InputWriteContext::DeferredCreate
             | InputWriteContext::DeferredReplacement
             | InputWriteContext::Update
-            | InputWriteContext::AuthoredDesired => true,
+            | InputWriteContext::AuthoredDesired => Some(InputFindingKind::Violation),
         },
     }
 }
@@ -766,7 +777,6 @@ impl<S> FinalizedPlan<S> {
             if !instances::has_declarations(&view) {
                 continue;
             }
-            let resource_id = view.resource_id;
             let context = view.context;
             let mut undecided = Vec::new();
             let schema = Arc::new(view.schema.clone());
@@ -784,7 +794,7 @@ impl<S> FinalizedPlan<S> {
                 match applicable.evaluate() {
                     InputVerdict::Proven => {}
                     InputVerdict::Violation(violation) => {
-                        diagnostics.push((resource_id.clone(), context, violation))
+                        diagnostics.push((context, applicable.finding(violation)))
                     }
                     InputVerdict::Undecided => {
                         undecided.push((applicable.path().clone(), applicable.code().clone()))
@@ -805,7 +815,11 @@ impl<S> FinalizedPlan<S> {
             }
         }
         // Include provider-instance routing, which display spelling omits.
-        diagnostics.sort_by(|(a, _, av), (b, _, bv)| {
+        diagnostics.sort_by(|(_, a), (_, b)| {
+            let av = &a.violation;
+            let bv = &b.violation;
+            let a = &a.resource_id;
+            let b = &b.resource_id;
             (
                 &a.provider,
                 &a.provider_instance,
@@ -823,13 +837,14 @@ impl<S> FinalizedPlan<S> {
                     bv.code(),
                 ))
         });
-        for (resource_id, context, violation) in diagnostics {
+        for (context, finding) in diagnostics {
+            let violation = &finding.violation;
             self.plan.add_error(PlanError::new(
-                resource_id,
+                finding.resource_id.clone(),
                 PlanErrorKind::InputRule {
                     path: violation.path().as_str().into(),
                     code: violation.code().as_str().into(),
-                    reason: violation.message().to_string(),
+                    reason: finding.message().to_string(),
                     context,
                 },
             ));
@@ -1319,16 +1334,68 @@ fn peel_secret<P: ValueKind>(mut value: &Value<P>) -> &Value<P> {
     value
 }
 
-/// A value-free diagnostic on authored input, shared by validate and the LSP.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuthoredInputFinding {
-    pub resource_id: ResourceId,
-    pub violation: InputViolation,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputFindingKind {
+    Violation,
+    CreateOnlyPreview,
 }
 
-impl std::fmt::Display for AuthoredInputFinding {
+/// Presentation severity derived from the finding kind in core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputFindingSeverity {
+    Error,
+    Warning,
+}
+
+/// A value-free diagnostic shared by authored previews and finalized plans.
+/// The classified rule carries its finding kind into the evaluator violation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputFinding {
+    resource_id: ResourceId,
+    violation: InputViolation,
+    kind: InputFindingKind,
+}
+
+impl InputFinding {
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource_id
+    }
+    pub fn violation(&self) -> &InputViolation {
+        &self.violation
+    }
+    pub fn severity(&self) -> InputFindingSeverity {
+        match self.kind {
+            InputFindingKind::Violation => InputFindingSeverity::Error,
+            InputFindingKind::CreateOnlyPreview => InputFindingSeverity::Warning,
+        }
+    }
+    pub fn message(&self) -> impl std::fmt::Display + '_ {
+        struct Message<'a>(&'a InputFinding);
+        impl std::fmt::Display for Message<'_> {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.0.violation.message())?;
+                match self.0.kind {
+                    InputFindingKind::Violation => Ok(()),
+                    InputFindingKind::CreateOnlyPreview => {
+                        f.write_str(" (rejected if this resource is created)")
+                    }
+                }
+            }
+        }
+        Message(self)
+    }
+}
+
+impl std::fmt::Display for InputFinding {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.resource_id, self.violation)
+        write!(
+            f,
+            "{}: {} [{}]: {}",
+            self.resource_id,
+            self.violation.path(),
+            self.violation.code(),
+            self.message()
+        )
     }
 }
 
@@ -1336,7 +1403,7 @@ impl std::fmt::Display for AuthoredInputFinding {
 /// want to distinguish an established pass from unavailable evidence.
 #[derive(Debug, Clone, Default)]
 pub struct AuthoredInputReport {
-    findings: Vec<AuthoredInputFinding>,
+    findings: Vec<InputFinding>,
     pending: Vec<AuthoredPendingInput>,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1351,22 +1418,23 @@ impl AuthoredInputReport {
     }
 }
 impl Deref for AuthoredInputReport {
-    type Target = [AuthoredInputFinding];
+    type Target = [InputFinding];
     fn deref(&self) -> &Self::Target {
         &self.findings
     }
 }
 impl IntoIterator for AuthoredInputReport {
-    type Item = AuthoredInputFinding;
+    type Item = InputFinding;
     type IntoIter = std::vec::IntoIter<Self::Item>;
     fn into_iter(self) -> Self::IntoIter {
         self.findings.into_iter()
     }
 }
 
-/// Check known EveryWrite inputs in a parser-owned configuration. Raw resource,
+/// Check authored inputs in a parser-owned configuration. Raw resource,
 /// state and attribute-map callers cannot manufacture this source authority.
-/// CreateOnly declarations are filtered by the same classifier used by plans.
+/// The shared classifier marks CreateOnly previews as warnings and EveryWrite
+/// violations as errors. Unknown evidence remains a pending obligation.
 pub fn check_authored_inputs<E, P, T, D, B>(
     parsed: &crate::parser::File<E, P, T, D, B>,
     schemas: &SchemaRegistry,
@@ -1438,10 +1506,7 @@ where
             for rule in site.applicable_rules() {
                 match rule.evaluate() {
                     InputVerdict::Violation(violation) => {
-                        report.findings.push(AuthoredInputFinding {
-                            resource_id: resource.id.clone(),
-                            violation,
-                        })
+                        report.findings.push(rule.finding(violation))
                     }
                     InputVerdict::Undecided => report.pending.push(AuthoredPendingInput {
                         resource_id: resource.id.clone(),

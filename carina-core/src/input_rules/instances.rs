@@ -75,9 +75,6 @@ pub(super) fn canonical_path(owner: &[Step], path: &InputPath) -> crate::schema:
 }
 
 fn active(site: &WriteSite<'_>, owner: &[Step], rule: &InputRule<Compiled>) -> bool {
-    if !scope_applies(rule.scope(), site.context) {
-        return false;
-    }
     let Some(update) = &site.update else {
         return true;
     };
@@ -112,23 +109,26 @@ fn bind<'s, 'a>(
     owner_type: Option<&'a CompiledAttributeType>,
     owner: &[Step],
     pending_instance: bool,
-) -> ApplicableInputRule<'s, 'a> {
-    ApplicableInputRule {
+) -> Option<ApplicableInputRule<'s, 'a>> {
+    let kind = scope_classification(rule.scope(), site.context)?;
+    if !active(site, owner, rule) {
+        return None;
+    }
+    Some(ApplicableInputRule {
         site,
         rule,
+        kind,
         owner_type,
         owner: owner.to_vec(),
         path: diagnostic_path(owner, rule.path()),
         pending_instance,
-    }
+    })
 }
 
 pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRule<'s, 'a>> {
     let mut instances = Vec::new();
     for &rule in &site.rules {
-        if active(site, &[], rule) {
-            instances.push(bind(site, rule, None, &[], false));
-        }
+        instances.extend(bind(site, rule, None, &[], false));
     }
     let values = site
         .update
@@ -222,9 +222,7 @@ fn walk<'s, 'a>(
             ..
         } => {
             for rule in input_rules {
-                if active(site, owner, rule) {
-                    out.push(bind(site, rule, Some(ty), owner, pending));
-                }
+                out.extend(bind(site, rule, Some(ty), owner, pending));
             }
             for field in declarations {
                 if field.parts().declared_input_mode.is_provider_populated() {
@@ -343,7 +341,7 @@ fn has_struct_rules(
         } => {
             input_rules
                 .iter()
-                .any(|r| scope_applies(r.scope(), context))
+                .any(|r| scope_classification(r.scope(), context).is_some())
                 || fields
                     .iter()
                     .any(|f| has_struct_rules(&f.field_type, defs, context, seen))
@@ -375,7 +373,11 @@ fn has_struct_rules(
 }
 
 pub(super) fn has_declarations(site: &WriteSite<'_>) -> bool {
-    !site.rules.is_empty()
+    // Probe declarations rather than current instances: normalization may add
+    // an instance or activate a rule before the final dispatch check.
+    site.rules
+        .iter()
+        .any(|rule| scope_classification(rule.scope(), site.context).is_some())
         || site.schema.as_schema().attributes.values().any(|a| {
             has_struct_rules(
                 &a.attr_type,

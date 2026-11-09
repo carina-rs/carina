@@ -758,7 +758,19 @@ fn s3_account_regional_suffix_is_create_only_and_imports_are_excluded() {
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    assert!(check_authored_inputs(&file, &schemas).unwrap().is_empty());
+    let report = check_authored_inputs(&file, &schemas).unwrap();
+    assert_eq!(report.len(), 1);
+    assert_eq!(
+        report[0].severity(),
+        carina_core::input_rules::InputFindingSeverity::Warning
+    );
+    assert_eq!(
+        report[0].to_string(),
+        format!(
+            "{}: target [s3.bucket.namespace_suffix]: has a forbidden suffix when not (guard equals mock.s3.Bucket.Namespace::\"account-regional\") (rejected if this resource is created)",
+            file.resources[0].id
+        )
+    );
 }
 
 #[test]
@@ -1075,6 +1087,104 @@ fn authored_report_retains_pending_guards_as_obligations() {
     assert_eq!(report.pending().len(), 1);
     assert_eq!(report.pending()[0].path.as_str(), "target");
     assert_eq!(report.pending()[0].code.as_str(), "test.dependency");
+}
+
+#[test]
+fn create_only_s3_namespace_preview_preserves_pending_create_obligations() {
+    use carina_core::{input_rules::InputFindingSeverity, schema::TypeIdentity};
+    fn namespace_value<
+        P: carina_core::resource::ValueKind,
+        B: carina_core::resource::BindingAddress,
+    >(
+        api_value: Option<&str>,
+    ) -> Value<P, B> {
+        match api_value {
+            Some(value) => Value::Concrete(ConcreteValue::String(value.into())),
+            None => Value::Deferred(carina_core::resource::DeferredValue::Unknown(
+                carina_core::resource::ApplyTimeUnknown::PendingReRead(
+                    carina_core::resource::PendingReRead::not_found(),
+                ),
+            )),
+        }
+    }
+    let identity = TypeIdentity::new(Some("mock"), ["s3", "Bucket"], "Namespace");
+    let schemas = registry(
+        ResourceSchema::new("test.Conditional")
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "bucket_namespace",
+                    enumeration(
+                        &identity,
+                        &[
+                            ("global", "global"),
+                            ("account-regional", "account_regional"),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .input_rule(
+                InputRule::value(
+                    InputRuleScope::CreateOnly,
+                    path("target"),
+                    InputRuleCode::new("s3.bucket.namespace_suffix").unwrap(),
+                    InputPredicate::NoSuffix(NonEmptyString::new("-an").unwrap()),
+                )
+                .with_condition(InputCondition::Not(Box::new(
+                    InputCondition::Equals {
+                        path: path("bucket_namespace"),
+                        literal: enum_literal(&identity, "account-regional"),
+                    },
+                ))),
+            ),
+    );
+    for (namespace, violations, pending_count) in [
+        (None, 1, 0),
+        (Some(Some("global")), 1, 0),
+        (Some(Some("account-regional")), 0, 0),
+        (Some(None), 0, 1),
+    ] {
+        let mut file = carina_core::parser::parse_file(
+            "let bucket = mock.test.Conditional { target = 'bucket-an' }",
+            std::path::Path::new("main.crn"),
+            &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let mut fields = vec![("target", string("bucket-an"))];
+        if let Some(namespace) = namespace {
+            file.resources[0]
+                .attributes
+                .insert("bucket_namespace".into(), namespace_value(namespace));
+            fields.push(("bucket_namespace", namespace_value(namespace)));
+        }
+        let report = check_authored_inputs(&file, &schemas).unwrap();
+        assert_eq!(report.len(), violations);
+        assert_eq!(report.pending().len(), pending_count);
+        for finding in report.iter() {
+            assert_eq!(finding.severity(), InputFindingSeverity::Warning);
+            assert_eq!(
+                finding.to_string(),
+                format!(
+                    "{}: target [s3.bucket.namespace_suffix]: has a forbidden suffix when not (bucket_namespace equals mock.s3.Bucket.Namespace::\"account-regional\") (rejected if this resource is created)",
+                    file.resources[0].id
+                )
+            );
+        }
+        match check(&schemas, desired(&schemas, fields)) {
+            Ok(plan) => {
+                assert_eq!(violations, 0);
+                assert_eq!(plan.pending_inputs().len(), pending_count);
+            }
+            Err(plan) => {
+                assert_eq!(violations, 1);
+                assert_eq!(plan.errors().len(), 1);
+                assert!(
+                    matches!(&plan.errors()[0].kind, PlanErrorKind::InputRule { code, reason, .. } if code == "s3.bucket.namespace_suffix" && reason == "has a forbidden suffix when not (bucket_namespace equals mock.s3.Bucket.Namespace::\"account-regional\")")
+                );
+            }
+        }
+    }
 }
 
 #[test]

@@ -695,7 +695,11 @@ A struct type represents a nested object with typed fields.
   uses runtime knowledge for presence and equality; unknown guards remain pending,
   including under negation. Update guards use admitted desired context overlaid
   with the exact patch, including removals, never observed state. Both owners use
-  the same write-scope classifier; `AuthoredDesired` still excludes `CreateOnly`.
+  the same write-scope classifier; `AuthoredDesired` evaluates `CreateOnly` as
+  warnings with core-rendered rejected-if-created wording, while `EveryWrite`
+  remains an error. The core finding derives severity from rule scope and write
+  context once; CLI and LSP render that fact. Unknown guards remain pending.
+  Plans reject `CreateOnly` violations only at create-capable write sites.
   Semantic fingerprints encode conditions and nested rules in encoding v13. Adding
   a protocol field must break compilation until it is consciously carried
   across or explicitly bound and documented as unavailable on the destination
