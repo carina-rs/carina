@@ -12,6 +12,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 mod estimator;
+mod evidence;
 mod instances;
 mod type_context;
 use type_context::TypeFacts;
@@ -42,6 +43,10 @@ use crate::{
 // granting them provider-readiness or changing their knowledge provenance.
 type InputValue = Value<ParserPlaceholder>;
 type InputAttributes = IndexMap<String, InputValue>;
+use evidence::{InputEvidence, RuleEvidence, SiteEvidence};
+
+// Only this classified write-site owner can open protected input evidence.
+pub(crate) struct InputEvidenceAuthority(());
 
 /// The desired-write context selected by the sole site classifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -223,6 +228,7 @@ pub struct ApplicableInputRule<'s, 'a> {
     owner: Vec<instances::Step>,
     path: InputDiagnosticPath,
     pending_instance: bool,
+    evidence: RuleEvidence<'s>,
 }
 
 impl ApplicableInputRule<'_, '_> {
@@ -952,7 +958,7 @@ enum Truth {
 }
 
 enum PathEvidence<'a> {
-    Present(&'a InputValue),
+    Present(InputEvidence<'a>),
     Absent { optional: bool },
     Pending,
     // Ignored inputs and unsent omissions provide no applied evidence. In
@@ -961,13 +967,11 @@ enum PathEvidence<'a> {
     Failed,
 }
 
-fn path_evidence<'a>(
-    applicable: &'a ApplicableInputRule<'_, '_>,
+fn path_evidence<'s>(
+    applicable: &ApplicableInputRule<'s, '_>,
     path: &InputPath,
-) -> PathEvidence<'a> {
-    use crate::resource::knowledge::{Classification, ClassifiedRef, KnowledgeContext};
-    let site = applicable.site;
-    if let Some(update) = &site.update {
+) -> PathEvidence<'s> {
+    if let Some(update) = &applicable.site.update {
         let concrete = instances::diagnostic_path(&applicable.owner, path);
         let leaf = instances::canonical_path(&applicable.owner, path);
         if update
@@ -978,66 +982,41 @@ fn path_evidence<'a>(
             return PathEvidence::Withheld;
         }
     }
-    let fields = site.attributes.as_deref();
-    let Some(fields) = fields else {
-        return PathEvidence::Pending;
-    };
-    let steps = applicable
-        .owner
-        .iter()
-        .cloned()
-        .chain(
-            path.segments()
-                .map(|s| instances::Step::Field(s.to_owned())),
-        )
-        .collect::<Vec<_>>();
-    let Some(instances::Step::Field(root)) = steps.first() else {
-        unreachable!("paths start at an attribute");
-    };
-    let Some(mut value) = fields.get(root) else {
-        return if site
-            .update
-            .as_ref()
-            .is_some_and(|u| !u.removed.contains(root))
-        {
-            PathEvidence::Withheld
-        } else {
-            absent_evidence(applicable, path, 0)
-        };
-    };
-    for (index, step) in steps.iter().enumerate().skip(1) {
-        let knowledge = match peel_secret(value).knowledge(&KnowledgeContext::validation()) {
-            Ok(k) if k.failure().is_none() => k.into_classification(),
-            Ok(_) => return PathEvidence::Failed,
-            Err(_) => return PathEvidence::Failed,
-        };
-        let next = match &knowledge {
-            Classification::Failed(_) => return PathEvidence::Failed,
-            Classification::Pending(_) => return PathEvidence::Pending,
-            Classification::Known(_) | Classification::ShapeKnown(_) => {
-                let evidence = ClassifiedRef::from(&knowledge);
-                match step {
-                    instances::Step::Field(name) => match evidence.map() {
-                        Some(fields) => fields.get(name.as_str()).map(|v| v.diagnostic_value()),
-                        None => return PathEvidence::Pending,
-                    },
-                    instances::Step::Key(name) => match evidence.map() {
-                        Some(fields) => fields
-                            .get(name.expose_plaintext())
-                            .map(|v| v.diagnostic_value()),
-                        None => return PathEvidence::Pending,
-                    },
-                    instances::Step::Index(index) => match evidence.list() {
-                        Some(items) => items.get(*index).map(|v| v.diagnostic_value()),
-                        None => return PathEvidence::Pending,
-                    },
-                }
+    let mut segments = path.segments().enumerate();
+    let mut value = match &applicable.evidence {
+        RuleEvidence::Resource(inputs) => {
+            if !inputs.membership_known() {
+                return PathEvidence::Pending;
             }
-        };
-        match next {
-            Some(next) => value = next,
-            None => return absent_evidence(applicable, path, index),
+            let (_, root) = segments.next().expect("admitted nonempty path");
+            let Some(value) = inputs.field(root) else {
+                return if applicable
+                    .site
+                    .update
+                    .as_ref()
+                    .is_some_and(|update| !update.removed.contains(root))
+                {
+                    PathEvidence::Withheld
+                } else {
+                    absent_evidence(applicable, path, 0)
+                };
+            };
+            value
         }
+        RuleEvidence::Instance(Some(value)) => value.clone(),
+        RuleEvidence::Instance(None) => return PathEvidence::Pending,
+    };
+    for (index, segment) in segments {
+        if value.computation_failed() {
+            return PathEvidence::Failed;
+        }
+        if !value.map_known() {
+            return PathEvidence::Pending;
+        }
+        let Some(child) = value.field(segment) else {
+            return absent_evidence(applicable, path, applicable.owner.len() + index);
+        };
+        value = child;
     }
     PathEvidence::Present(value)
 }
@@ -1055,15 +1034,17 @@ fn absent_evidence(
 }
 
 fn presence(evidence: PathEvidence<'_>) -> Truth {
-    use crate::resource::knowledge::KnowledgeContext;
     match evidence {
         PathEvidence::Absent { .. } => Truth::False,
         PathEvidence::Pending | PathEvidence::Withheld => Truth::Pending,
         PathEvidence::Failed => Truth::Failed,
-        PathEvidence::Present(value) => match value.knowledge(&KnowledgeContext::validation()) {
-            Ok(k) if k.failure().is_none() => Truth::True,
-            Ok(_) | Err(_) => Truth::Failed,
-        },
+        PathEvidence::Present(value) => {
+            if value.failed() {
+                Truth::Failed
+            } else {
+                Truth::True
+            }
+        }
     }
 }
 
@@ -1114,26 +1095,20 @@ fn scalar_equals(
     literal: &InputLiteral,
     evidence: PathEvidence<'_>,
 ) -> Truth {
-    use crate::resource::knowledge::{Classification, KnowledgeContext};
     use crate::resource::{ConcreteValueRef, EnumValueResolver};
-    let value = match evidence {
-        PathEvidence::Present(value) => peel_secret(value),
+    let evidence = match evidence {
+        PathEvidence::Present(value) => value,
         PathEvidence::Absent { .. } => return Truth::False,
         PathEvidence::Pending | PathEvidence::Withheld => return Truth::Pending,
         PathEvidence::Failed => return Truth::Failed,
     };
-    let knowledge = match value.knowledge(&KnowledgeContext::validation()) {
-        Ok(k) => k.into_classification(),
-        Err(_) => return Truth::Failed,
-    };
-    if knowledge.failure().is_some() {
+    if evidence.failed() {
         return Truth::Failed;
     }
-    match knowledge {
-        Classification::Known(_) => {}
-        Classification::ShapeKnown(_) | Classification::Pending(_) => return Truth::Pending,
-        Classification::Failed(_) => return Truth::Failed,
+    if !evidence.known() {
+        return Truth::Pending;
     }
+    let value = evidence.source();
     let ty = literal_type(applicable, path);
     let resolver =
         ty.map(|ty| EnumValueResolver::with_defs(ty, applicable.site.schema.as_schema().defs()));
@@ -1223,13 +1198,7 @@ fn verdict(applicable: &ApplicableInputRule<'_, '_>) -> InputVerdict {
     if applicable.pending_instance {
         return match path_evidence(applicable, rule.path()) {
             PathEvidence::Failed => failed_verdict(rule),
-            PathEvidence::Present(value)
-                if value
-                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-                    .is_ok_and(|k| k.failure().is_some()) =>
-            {
-                failed_verdict(rule)
-            }
+            PathEvidence::Present(value) if value.failed() => failed_verdict(rule),
             _ => InputVerdict::Undecided,
         };
     }
@@ -1302,21 +1271,20 @@ fn target_verdict(applicable: &ApplicableInputRule<'_, '_>) -> InputVerdict {
         PathEvidence::Failed => return failed_verdict(rule),
         PathEvidence::Pending => {}
         PathEvidence::Present(value) => {
-            match value.knowledge(&crate::resource::knowledge::KnowledgeContext::validation()) {
-                Ok(knowledge) if knowledge.failure().is_none() => {}
-                Ok(_) | Err(_) => return failed_verdict(rule),
+            if value.failed() {
+                return failed_verdict(rule);
             }
-            let value = peel_secret(value);
+            let source = value.source();
             match rule.target() {
                 InputRuleTarget::Value(_) => {
-                    if let Some(text) = known_string(applicable, rule.path(), value) {
+                    if let Some(text) = known_string(applicable, rule.path(), &value) {
                         return evaluate_string(rule, &text)
                             .map_or_else(InputVerdict::Violation, |()| InputVerdict::Proven);
                     }
                 }
                 InputRuleTarget::MapKeys(_) => {
                     if let Some(crate::resource::ConcreteValueRef::Map(fields)) =
-                        value.as_concrete()
+                        source.as_concrete()
                     {
                         let defs = view.schema.as_schema().defs();
                         let Some(ty) = literal_type(applicable, rule.path()) else {
@@ -1339,7 +1307,7 @@ fn target_verdict(applicable: &ApplicableInputRule<'_, '_>) -> InputVerdict {
                     }
                 }
             }
-            return estimator::estimate(applicable, Some(value));
+            return estimator::estimate(applicable, Some(source));
         }
     }
     estimator::estimate(applicable, None)
@@ -1348,13 +1316,13 @@ fn target_verdict(applicable: &ApplicableInputRule<'_, '_>) -> InputVerdict {
 fn known_string(
     applicable: &ApplicableInputRule<'_, '_>,
     path: &InputPath,
-    value: &InputValue,
+    value: &InputEvidence<'_>,
 ) -> Option<String> {
     use crate::resource::{ConcreteValueRef, EnumValueResolver};
-    let knowledge = value
-        .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-        .ok()?;
-    knowledge.into_classification().into_known().ok()?;
+    if !value.known() {
+        return None;
+    }
+    let value = value.source();
     match value.as_concrete()? {
         ConcreteValueRef::String(value) => Some(value.expose_plaintext().to_owned()),
         ConcreteValueRef::CanonicalEnum(value) => Some(value.api_value().to_owned()),

@@ -1066,3 +1066,251 @@ fn suffix_estimation_uses_the_expression_bound_after_list_reordering() {
         .collect::<Vec<_>>();
     assert_eq!(paths, vec!["items[1].name"]);
 }
+
+fn conditional_list_schema(
+    predicate: InputPredicate<crate::schema::PatternSpec>,
+) -> SchemaRegistry {
+    registry(
+        ResourceSchema::new("Review").attribute(
+            AttributeSchema::optional(
+                "items",
+                AttributeType::list(AttributeType::struct_with_rules(
+                    "Item",
+                    vec![
+                        StructField::optional("guard", AttributeType::bool()).build(),
+                        StructField::optional("target", AttributeType::string()).build(),
+                    ],
+                    vec![],
+                    vec![rule(
+                        "target",
+                        predicate,
+                        InputCondition::Equals {
+                            path: path("guard"),
+                            literal: InputLiteral::Bool(true),
+                        },
+                    )],
+                )),
+            )
+            .build(),
+        ),
+    )
+}
+
+#[test]
+fn erased_reordered_instances_do_not_use_unmatched_authored_expressions() {
+    let schemas = conditional_list_schema(InputPredicate::NoSuffix(
+        crate::schema::NonEmptyString::new(".fifo").unwrap(),
+    ));
+    let authored_item = |guard, suffix: &str| {
+        object([
+            ("guard", Value::Concrete(ConcreteValue::Bool(guard))),
+            (
+                "target",
+                Value::Deferred(DeferredValue::Interpolation(vec![
+                    crate::resource::InterpolationPart::Expr(Value::root_resource_ref(
+                        "producer",
+                        "name",
+                        vec![],
+                    )),
+                    crate::resource::InterpolationPart::Literal(suffix.into()),
+                ])),
+            ),
+        ])
+    };
+    let authored = Resource::with_provider("mock", "Review", "example", None).with_attribute(
+        "items",
+        Value::Concrete(ConcreteValue::List(vec![
+            authored_item(false, ".fifo"),
+            authored_item(true, ".standard"),
+        ])),
+    );
+    let types = InputTypeContext::from_sources(
+        &[crate::effect::deps::UnresolvedResource::from_pre_resolve(
+            authored,
+        )],
+        &[],
+        std::iter::empty(),
+        &[],
+        &schemas,
+    );
+    let actual = Resource::with_provider("mock", "Review", "example", None).with_attribute(
+        "items",
+        Value::Concrete(ConcreteValue::List(vec![
+            object([
+                ("guard", Value::Concrete(ConcreteValue::Bool(true))),
+                ("target", pending()),
+            ]),
+            object([
+                ("guard", Value::Concrete(ConcreteValue::Bool(false))),
+                ("target", pending()),
+            ]),
+        ])),
+    );
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resolved_input_fixture(actual, &schemas)));
+    let checked = FinalizedPlan::new(plan)
+        .check_inputs_with_types(&schemas, &HashMap::new(), &types)
+        .expect("unmatched authored instances cannot reject a valid normalized create");
+    assert_eq!(checked.pending_inputs().len(), 1);
+    let rows = checked.pending_rows(0);
+    assert!(
+        matches!(&rows[..], [crate::detail_rows::DetailRow::PendingInput { path, .. }] if path.as_str() == "items[0].target")
+    );
+}
+
+#[test]
+fn conditional_list_evaluation_has_a_linear_classification_budget() {
+    const COUNT: usize = 2_000;
+    let schemas = conditional_list_schema(InputPredicate::Present);
+    let items = (0..COUNT)
+        .map(|index| {
+            object([
+                (
+                    "guard",
+                    Value::Concrete(ConcreteValue::Bool(index % 2 == 0)),
+                ),
+                (
+                    "target",
+                    Value::Concrete(ConcreteValue::String("valid".into())),
+                ),
+            ])
+        })
+        .collect();
+    crate::resource::knowledge::with_classification_budget(COUNT * 4 + 100, || {
+        let verdicts = evaluate(
+            &schemas,
+            [("items", Value::Concrete(ConcreteValue::List(items)))],
+        );
+        assert_eq!(verdicts.len(), COUNT);
+        assert!(
+            verdicts
+                .iter()
+                .all(|verdict| *verdict == InputVerdict::Proven)
+        );
+    });
+}
+
+#[test]
+fn failed_sibling_payloads_do_not_poison_unselected_targets_or_guards() {
+    let schemas = conditional_list_schema(InputPredicate::Present);
+    let verdicts = evaluate(
+        &schemas,
+        [(
+            "items",
+            Value::Concrete(ConcreteValue::List(vec![
+                object([
+                    ("guard", Value::Concrete(ConcreteValue::Bool(false))),
+                    ("target", failed_value()),
+                ]),
+                object([
+                    ("guard", Value::Concrete(ConcreteValue::Bool(false))),
+                    (
+                        "target",
+                        Value::Concrete(ConcreteValue::String("valid".into())),
+                    ),
+                ]),
+            ])),
+        )],
+    );
+    assert_eq!(verdicts, vec![InputVerdict::Proven, InputVerdict::Proven]);
+}
+
+#[test]
+fn collection_evidence_keeps_selected_failures_and_enclosing_computation_failures() {
+    let schemas = conditional_list_schema(InputPredicate::Present);
+    let item = |guard, target| {
+        object([
+            ("guard", Value::Concrete(ConcreteValue::Bool(guard))),
+            ("target", target),
+        ])
+    };
+    for secret in [false, true] {
+        let protect = |value: Value| if secret { value.into_secret() } else { value };
+        let verdicts = evaluate(
+            &schemas,
+            [(
+                "items",
+                protect(Value::Concrete(ConcreteValue::List(vec![
+                    item(true, failed_value()),
+                    item(
+                        false,
+                        Value::Concrete(ConcreteValue::String("valid".into())),
+                    ),
+                ]))),
+            )],
+        );
+        assert_failed(&verdicts[0]);
+        assert_eq!(verdicts[1], InputVerdict::Proven);
+
+        let computed = Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::Concrete(ConcreteValue::List(vec![
+                item(false, failed_value()),
+                item(
+                    false,
+                    Value::Concrete(ConcreteValue::String("valid".into())),
+                ),
+            ]))),
+            default: Box::new(Value::Concrete(ConcreteValue::List(vec![]))),
+        });
+        let verdicts = evaluate(&schemas, [("items", protect(computed))]);
+        assert_eq!(verdicts.len(), 2);
+        for verdict in verdicts {
+            assert_failed(&verdict);
+        }
+    }
+}
+
+#[test]
+fn guard_selection_keeps_unrelated_failed_fields_out_of_resource_struct_and_map_rules() {
+    let config = || {
+        AttributeType::struct_with_rules(
+            "Config",
+            vec![
+                StructField::optional("guard", AttributeType::bool()).build(),
+                StructField::optional("target", AttributeType::string()).build(),
+            ],
+            vec![],
+            vec![rule(
+                "target",
+                InputPredicate::Present,
+                InputCondition::Equals {
+                    path: path("guard"),
+                    literal: InputLiteral::Bool(true),
+                },
+            )],
+        )
+    };
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("config", config()).build())
+            .attribute(AttributeSchema::optional("entries", AttributeType::map(config())).build())
+            .input_rule(rule(
+                "config.target",
+                InputPredicate::Present,
+                InputCondition::Equals {
+                    path: path("config.guard"),
+                    literal: InputLiteral::Bool(true),
+                },
+            )),
+    );
+    for secret in [false, true] {
+        let protect = |value: Value| if secret { value.into_secret() } else { value };
+        let item = || {
+            object([
+                ("guard", Value::Concrete(ConcreteValue::Bool(false))),
+                ("target", failed_value()),
+            ])
+        };
+        let verdicts = evaluate(
+            &schemas,
+            [
+                ("config", protect(item())),
+                (
+                    "entries",
+                    protect(object([("one", item()), ("two", item())])),
+                ),
+            ],
+        );
+        assert_eq!(verdicts, vec![InputVerdict::Proven; 4]);
+    }
+}

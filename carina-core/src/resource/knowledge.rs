@@ -611,7 +611,11 @@ pub fn collect_classified_attributes<
                 Ok(knowledge) => knowledge.into_classification(),
                 Err(error) => {
                     failed(&name, error.clone());
-                    Classification::Failed(AttemptedFailure { source, error })
+                    Classification::Failed(AttemptedFailure {
+                        source,
+                        error: Arc::new(error),
+                        protected: None,
+                    })
                 }
             };
             (name, classification)
@@ -735,13 +739,15 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> Classification<'a, P, B> {
 }
 /// A fully known, stage-independent value. Structural `Classification::into_known`
 /// can produce this proof; `from_apply` additionally checks its input stage.
+/// Immutable nodes are shared so selected proofs can be retained without
+/// copying or reclassifying their sibling payloads.
 #[derive(Clone)]
 pub struct KnownValue<
     'a,
     P: PlaceholderKind = NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
 > {
-    node: kernel::KnownNode<'a, P, B>,
+    node: Arc<kernel::KnownNode<'a, P, B>>,
     source: &'a Value<P, B>,
 }
 #[derive(Clone)]
@@ -771,10 +777,12 @@ pub(crate) enum KnownView<
 #[derive(Clone)]
 pub struct ProtectedSecret<'a, P: PlaceholderKind, B: BindingAddress> {
     payload: &'a SecretPayload<P, B>,
+    evidence: Arc<Classification<'a, P, B>>,
 }
 
-// Only this private wrapper can return a protected classification. Its inner
-// proof is never delivered to ordinary visitors or exported outside Classification.
+// Initial classification crosses SecretPayload only through this sealed wrapper.
+// The cached inner proof stays private to knowledge and the authorized input-rule
+// computation; ordinary visitors never receive it.
 struct SecretClassification<'a, P: PlaceholderKind, B: BindingAddress>(Classification<'a, P, B>);
 impl<P: PlaceholderKind, B: BindingAddress> super::SealedSecretReadResult
     for SecretClassification<'_, P, B>
@@ -790,7 +798,8 @@ pub struct ShapeKnown<
     T = Pending<'a, P, B>,
 > {
     source: &'a Value<P, B>,
-    node: kernel::ShapeNode<'a, P, B, T>,
+    node: Arc<kernel::ShapeNode<'a, P, B, T>>,
+    failure: Option<Arc<KnowledgeError<B>>>,
     apply_required: bool,
 }
 pub(crate) enum ShapeView<
@@ -810,11 +819,12 @@ pub struct AttemptedFailure<
     B: BindingAddress = AbsoluteBindingAddress,
 > {
     source: &'a Value<P, B>,
-    error: KnowledgeError<B>,
+    error: Arc<KnowledgeError<B>>,
+    protected: Option<ProtectedSecret<'a, P, B>>,
 }
 impl<P: PlaceholderKind, B: BindingAddress> AttemptedFailure<'_, P, B> {
     pub fn error(&self) -> KnowledgeError<B> {
-        self.error.clone()
+        self.error.as_ref().clone()
     }
 }
 #[derive(Clone)]
@@ -824,7 +834,8 @@ pub struct Pending<
     B: BindingAddress = AbsoluteBindingAddress,
 > {
     source: &'a Value<P, B>,
-    node: kernel::PendingNode<'a, P, B, Self, kernel::Input<'a, P, B>>,
+    node: Arc<kernel::PendingNode<'a, P, B, Self, kernel::Input<'a, P, B>>>,
+    failure: Option<Arc<KnowledgeError<B>>>,
     phase: Phase,
     reason: PendingReason,
     wait_on: WaitOn<B>,
@@ -836,7 +847,7 @@ pub struct PlanIterable<
     B: BindingAddress = AbsoluteBindingAddress,
     T = Pending<'a, P, B>,
 > {
-    node: kernel::IterableNode<'a, P, B, T>,
+    node: Arc<kernel::IterableNode<'a, P, B, T>>,
 }
 /// A pending result admitted at the plan boundary. Its constructor and sites
 /// are private and there is no phase field to set.
@@ -849,7 +860,7 @@ pub struct ApplyPending<
     source: &'a Value<P, B>,
     reason: PendingReason,
     wait_on: WaitOn<B>,
-    node: kernel::PendingNode<'a, P, B, Self, kernel::ApplyInput<'a, P, B>>,
+    node: Arc<kernel::PendingNode<'a, P, B, Self, kernel::ApplyInput<'a, P, B>>>,
 }
 /// A validation classification cannot cross the plan boundary.
 ///
@@ -1221,7 +1232,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> KnownValue<'a, P, B> {
         secret: impl FnOnce(&ProtectedSecret<'_, P, B>) -> R,
     ) -> R {
         use kernel::KnownNode as N;
-        ordinary(match &self.node {
+        ordinary(match self.node.as_ref() {
             N::String(v) => KnownView::String(v),
             N::EnumIdentifier(v) => KnownView::EnumIdentifier(v),
             N::CanonicalEnum(v) => KnownView::CanonicalEnum(v),
@@ -1285,7 +1296,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> KnownMap<'a, P, B> {
 }
 impl<'a, P: PlaceholderKind, B: BindingAddress, T> ShapeKnown<'a, P, B, T> {
     pub fn len(&self) -> usize {
-        match &self.node {
+        match self.node.as_ref() {
             kernel::ShapeNode::List(v) => v.len(),
             kernel::ShapeNode::Map(v) => v.len(),
             kernel::ShapeNode::Coalesce(pending) => pending.value.len(),
@@ -1299,7 +1310,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, T> ShapeKnown<'a, P, B, T> {
         ordinary: impl FnOnce(ShapeView<'_, P, B, T>) -> R,
         _secret: impl FnOnce(&ProtectedSecret<'_, P, B>) -> R,
     ) -> R {
-        match &self.node {
+        match self.node.as_ref() {
             kernel::ShapeNode::List(v) => ordinary(ShapeView::List(v)),
             kernel::ShapeNode::Map(v) => ordinary(ShapeView::Map(v)),
             kernel::ShapeNode::Coalesce(pending) => pending.value.visit(ordinary, _secret),
@@ -1311,7 +1322,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress, T> ShapeKnown<'a, P, B, T> {
 }
 impl<'a, P: PlaceholderKind, B: BindingAddress> ShapeKnown<'a, P, B> {
     fn permits_static_evaluation(&self) -> bool {
-        match &self.node {
+        match self.node.as_ref() {
             kernel::ShapeNode::List(items) => {
                 items.iter().all(Classification::permits_static_evaluation)
             }
@@ -1325,11 +1336,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> ShapeKnown<'a, P, B> {
         }
     }
     fn failure(&self) -> Option<KnowledgeError<B>> {
-        match &self.node {
-            kernel::ShapeNode::List(items) => items.iter().find_map(Classification::failure),
-            kernel::ShapeNode::Map(items) => items.values().find_map(Classification::failure),
-            kernel::ShapeNode::Coalesce(pending) => pending.value.failure(),
-        }
+        self.failure.as_ref().map(|error| error.as_ref().clone())
     }
 }
 impl<'a, P: PlaceholderKind, B: BindingAddress> Pending<'a, P, B> {
@@ -1347,7 +1354,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> Pending<'a, P, B> {
         ordinary: impl FnOnce(Phase, &PendingReason, PendingSites<'_, B>) -> R,
         secret: impl FnOnce(&ProtectedSecret<'_, P, B>) -> R,
     ) -> R {
-        match &self.node {
+        match self.node.as_ref() {
             kernel::PendingNode::Secret { protected, .. } => secret(protected),
             kernel::PendingNode::Ordinary(_) | kernel::PendingNode::Coalesce(_) => {
                 ordinary(self.phase, &self.reason, self.sites())
@@ -1401,7 +1408,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> Classification<'a, P, B> {
             Self::ShapeKnown(value) => value.permits_static_evaluation(),
             Self::Pending(value) => {
                 matches!(value.reason, PendingReason::Evaluation(_))
-                    && match &value.node {
+                    && match value.node.as_ref() {
                         kernel::PendingNode::Ordinary(inputs) => {
                             inputs.iter().filter(|input| input.visible).all(|input| {
                                 match &input.value {
@@ -1435,19 +1442,31 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> Classification<'a, P, B> {
         }
     }
     pub(crate) fn failure(&self) -> Option<KnowledgeError<B>> {
+        self.failure_shared().map(|error| error.as_ref().clone())
+    }
+    pub(crate) fn has_failure(&self) -> bool {
+        self.failure_shared().is_some()
+    }
+    /// Literal container membership survives failures in other payloads.
+    /// A failed computation enclosing the container still belongs to every
+    /// selected path through that computation.
+    pub(crate) fn has_computation_failure(&self) -> bool {
+        match self {
+            Self::Known(_) => false,
+            Self::ShapeKnown(value) => match value.node.as_ref() {
+                kernel::ShapeNode::List(_) | kernel::ShapeNode::Map(_) => false,
+                kernel::ShapeNode::Coalesce(_) => value.failure.is_some(),
+            },
+            Self::Pending(value) => value.failure.is_some(),
+            Self::Failed(_) => true,
+        }
+    }
+    fn failure_shared(&self) -> Option<Arc<KnowledgeError<B>>> {
         match self {
             Self::Known(_) => None,
-            Self::ShapeKnown(value) => value.failure(),
-            Self::Pending(value) => match &value.node {
-                kernel::PendingNode::Ordinary(inputs) => {
-                    inputs.iter().find_map(kernel::Input::failure)
-                }
-                kernel::PendingNode::Coalesce(pending) => pending.value.failure(),
-                kernel::PendingNode::Secret { inner, .. } => {
-                    inner.failure().map(InsideSecret::inside_secret)
-                }
-            },
-            Self::Failed(value) => Some(value.error()),
+            Self::ShapeKnown(value) => value.failure.clone(),
+            Self::Pending(value) => value.failure.clone(),
+            Self::Failed(value) => Some(Arc::clone(&value.error)),
         }
     }
     pub(crate) fn apply_required(&self) -> bool {
@@ -1501,7 +1520,7 @@ pub(crate) trait StructuralPending<'a, P: PlaceholderKind + 'a, B: BindingAddres
 }
 impl<'a, P: PlaceholderKind, B: BindingAddress> StructuralPending<'a, P, B> for Pending<'a, P, B> {
     fn structure(&self) -> PendingStructure<'_, 'a, P, B, Self> {
-        let (coalesce, branches) = match &self.node {
+        let (coalesce, branches) = match self.node.as_ref() {
             kernel::PendingNode::Coalesce(pending) => (
                 Some((
                     pending.value.as_ref(),
@@ -1591,7 +1610,7 @@ impl<'s, 'a, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'a, P, 
     }
     pub(crate) fn concrete(self) -> Option<super::ConcreteValueRef<'a, P, B>> {
         match self {
-            Self::Known(value) => match value.node {
+            Self::Known(value) => match value.node.as_ref() {
                 kernel::KnownNode::Secret(_) => None,
                 kernel::KnownNode::String(_)
                 | kernel::KnownNode::EnumIdentifier(_)
@@ -1604,7 +1623,7 @@ impl<'s, 'a, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'a, P, 
                 | kernel::KnownNode::List(_)
                 | kernel::KnownNode::Map(_) => value.source.as_concrete(),
             },
-            Self::Shape(value) => match &value.node {
+            Self::Shape(value) => match value.node.as_ref() {
                 kernel::ShapeNode::Coalesce(pending) => {
                     ClassifiedRef::Shape(&pending.value).concrete()
                 }
@@ -1617,7 +1636,7 @@ impl<'s, 'a, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'a, P, 
     }
     pub(crate) fn secret(self) -> Option<&'a SecretPayload<P, B>> {
         match self {
-            Self::Known(value) => match &value.node {
+            Self::Known(value) => match value.node.as_ref() {
                 kernel::KnownNode::Secret(secret) => Some(secret.payload),
                 kernel::KnownNode::String(_)
                 | kernel::KnownNode::EnumIdentifier(_)
@@ -1639,7 +1658,7 @@ impl<'s, 'a, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'a, P, 
     }
     pub(crate) fn list(self) -> Option<Vec<Self>> {
         match self {
-            Self::Known(value) => match &value.node {
+            Self::Known(value) => match value.node.as_ref() {
                 kernel::KnownNode::List(items) => Some(items.iter().map(Self::Known).collect()),
                 kernel::KnownNode::Secret(_) => None,
                 kernel::KnownNode::String(_)
@@ -1652,7 +1671,7 @@ impl<'s, 'a, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'a, P, 
                 | kernel::KnownNode::StringList(_)
                 | kernel::KnownNode::Map(_) => None,
             },
-            Self::Shape(value) => match &value.node {
+            Self::Shape(value) => match value.node.as_ref() {
                 kernel::ShapeNode::List(items) => Some(items.iter().map(Self::from).collect()),
                 kernel::ShapeNode::Map(_) => None,
                 kernel::ShapeNode::Coalesce(pending) => Self::Shape(&pending.value).list(),
@@ -1660,9 +1679,68 @@ impl<'s, 'a, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'a, P, 
             Self::Pending(_) | Self::Failed(_) => None,
         }
     }
+    /// Select membership without allocating every sibling reference.
+    pub(crate) fn list_item(self, index: usize) -> Option<Self> {
+        match self {
+            Self::Known(value) => match value.node.as_ref() {
+                kernel::KnownNode::List(items) => items.items.get(index).map(Self::Known),
+                _ => None,
+            },
+            Self::Shape(value) => match value.node.as_ref() {
+                kernel::ShapeNode::List(items) => items.get(index).map(Self::from),
+                kernel::ShapeNode::Coalesce(pending) => {
+                    Self::Shape(&pending.value).list_item(index)
+                }
+                kernel::ShapeNode::Map(_) => None,
+            },
+            Self::Pending(_) | Self::Failed(_) => None,
+        }
+    }
+    pub(crate) fn list_len(self) -> Option<usize> {
+        match self {
+            Self::Known(value) => match value.node.as_ref() {
+                kernel::KnownNode::List(items) => Some(items.len()),
+                _ => None,
+            },
+            Self::Shape(value) => match value.node.as_ref() {
+                kernel::ShapeNode::List(items) => Some(items.len()),
+                kernel::ShapeNode::Coalesce(pending) => Self::Shape(&pending.value).list_len(),
+                kernel::ShapeNode::Map(_) => None,
+            },
+            Self::Pending(_) | Self::Failed(_) => None,
+        }
+    }
+    pub(crate) fn map_field(self, name: &str) -> Option<Self> {
+        match self {
+            Self::Known(value) => match value.node.as_ref() {
+                kernel::KnownNode::Map(items) => items.entries.get(name).map(Self::Known),
+                _ => None,
+            },
+            Self::Shape(value) => match value.node.as_ref() {
+                kernel::ShapeNode::Map(items) => items.get(name).map(Self::from),
+                kernel::ShapeNode::Coalesce(pending) => Self::Shape(&pending.value).map_field(name),
+                kernel::ShapeNode::List(_) => None,
+            },
+            Self::Pending(_) | Self::Failed(_) => None,
+        }
+    }
+    pub(crate) fn map_len(self) -> Option<usize> {
+        match self {
+            Self::Known(value) => match value.node.as_ref() {
+                kernel::KnownNode::Map(items) => Some(items.len()),
+                _ => None,
+            },
+            Self::Shape(value) => match value.node.as_ref() {
+                kernel::ShapeNode::Map(items) => Some(items.len()),
+                kernel::ShapeNode::Coalesce(pending) => Self::Shape(&pending.value).map_len(),
+                kernel::ShapeNode::List(_) => None,
+            },
+            Self::Pending(_) | Self::Failed(_) => None,
+        }
+    }
     pub(crate) fn map(self) -> Option<IndexMap<&'a str, Self>> {
         match self {
-            Self::Known(value) => match &value.node {
+            Self::Known(value) => match value.node.as_ref() {
                 kernel::KnownNode::Map(items) => Some(
                     items
                         .entries
@@ -1681,7 +1759,7 @@ impl<'s, 'a, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'a, P, 
                 | kernel::KnownNode::StringList(_)
                 | kernel::KnownNode::List(_) => None,
             },
-            Self::Shape(value) => match &value.node {
+            Self::Shape(value) => match value.node.as_ref() {
                 kernel::ShapeNode::Map(items) => {
                     Some(items.iter().map(|(k, v)| (*k, Self::from(v))).collect())
                 }
@@ -1693,7 +1771,7 @@ impl<'s, 'a, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'a, P, 
     }
     pub(crate) fn coalesce(self) -> Option<(Self, Self)> {
         match self {
-            Self::Shape(value) => match &value.node {
+            Self::Shape(value) => match value.node.as_ref() {
                 kernel::ShapeNode::Coalesce(pending) => Some((
                     Self::Shape(&pending.value),
                     Self::from(pending.alternative.evidence.as_ref()),
@@ -1713,6 +1791,47 @@ impl<'s, 'a, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'a, P, 
                 .map(|values| values.into_iter().map(Self::from).collect()),
             Self::Known(_) | Self::Shape(_) | Self::Failed(_) => None,
         }
+    }
+}
+
+impl<'s, 'a, P: PlaceholderKind, B: BindingAddress> ClassifiedRef<'s, 'a, P, B> {
+    /// The scoped input-rule owner may compute through Secret while carrying
+    /// its diagnostic protection. Ordinary knowledge visitors remain opaque.
+    pub(crate) fn for_input_rules(
+        self,
+        _authority: &crate::input_rules::InputEvidenceAuthority,
+    ) -> (Classification<'a, P, B>, DiagnosticScope) {
+        let mut current = self;
+        let mut scope = DiagnosticScope::Public;
+        loop {
+            let protected = match current {
+                Self::Known(value) => match value.node.as_ref() {
+                    kernel::KnownNode::Secret(secret) => Some(secret),
+                    _ => None,
+                },
+                Self::Pending(value) => match value.node.as_ref() {
+                    kernel::PendingNode::Secret { protected, .. } => Some(protected),
+                    _ => None,
+                },
+                Self::Failed(value) => value.protected.as_ref(),
+                Self::Shape(_) => None,
+            };
+            let Some(protected) = protected else {
+                if current.secret().is_some() {
+                    scope = DiagnosticScope::Secret;
+                }
+                break;
+            };
+            scope = DiagnosticScope::Secret;
+            current = Self::from(protected.evidence.as_ref());
+        }
+        let classification = match current {
+            Self::Known(value) => Classification::Known(value.clone()),
+            Self::Shape(value) => Classification::ShapeKnown(value.clone()),
+            Self::Pending(value) => Classification::Pending(value.clone()),
+            Self::Failed(value) => Classification::Failed(value.clone()),
+        };
+        (classification, scope)
     }
 }
 // The cursor keeps one mutable prefix. Only a yielded event materializes a
@@ -1847,7 +1966,7 @@ impl<P: PlaceholderKind, B: BindingAddress, T: SiteSource<B>> SiteSource<B>
     fn enqueue<'s>(&'s self, sites: &mut PendingSites<'s, B>) {
         let stack = &mut sites.stack;
         use crate::schema::LeafPathSegment;
-        match &self.node {
+        match self.node.as_ref() {
             kernel::ShapeNode::List(items) => {
                 for (index, value) in items.iter().enumerate().rev() {
                     stack.push(SiteFrame::Enter(SiteEdge {
@@ -2014,7 +2133,7 @@ impl<'a, B: BindingAddress, T: SiteSource<B>> SiteSource<B> for kernel::Function
 impl<P: PlaceholderKind, B: BindingAddress> SiteSource<B> for Pending<'_, P, B> {
     fn enqueue<'s>(&'s self, sites: &mut PendingSites<'s, B>) {
         let stack = &mut sites.stack;
-        match &self.node {
+        match self.node.as_ref() {
             kernel::PendingNode::Coalesce(pending) => enqueue_coalesce(pending, self.phase, stack),
             kernel::PendingNode::Ordinary(inputs) => {
                 enqueue_inputs(inputs, &self.wait_on, self.phase, &self.reason, stack)
@@ -2033,7 +2152,7 @@ impl<P: PlaceholderKind, B: BindingAddress> SiteSource<B> for Pending<'_, P, B> 
 impl<P: PlaceholderKind, B: BindingAddress> SiteSource<B> for ApplyPending<'_, P, B> {
     fn enqueue<'s>(&'s self, sites: &mut PendingSites<'s, B>) {
         let stack = &mut sites.stack;
-        match &self.node {
+        match self.node.as_ref() {
             kernel::PendingNode::Coalesce(pending) => {
                 enqueue_coalesce(pending, Phase::Apply, stack)
             }
@@ -2053,7 +2172,7 @@ impl<P: PlaceholderKind, B: BindingAddress> SiteSource<B> for ApplyPending<'_, P
 }
 impl<'a, P: PlaceholderKind, B: BindingAddress> PlanIterable<'a, P, B> {
     pub(crate) fn for_expansion(&self) -> Value<P, B> {
-        match &self.node {
+        match self.node.as_ref() {
             kernel::IterableNode::Known { value, .. } => value.to_value(),
             kernel::IterableNode::Shape(value) => value.visit(
                 |view| match view {
@@ -2078,13 +2197,13 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> PlanIterable<'a, P, B> {
         shape: impl FnOnce(ShapeView<'_, P, B, Pending<'a, P, B>>) -> R,
         secret: impl FnOnce(&ProtectedSecret<'_, P, B>) -> R,
     ) -> R {
-        match &self.node {
+        match self.node.as_ref() {
             kernel::IterableNode::Known { value, .. } => value.visit(known, secret),
             kernel::IterableNode::Shape(value) => value.visit(shape, secret),
         }
     }
     pub(crate) fn source_value(&self) -> Value<P, B> {
-        match &self.node {
+        match self.node.as_ref() {
             kernel::IterableNode::Known { value, .. } => value.source.clone(),
             kernel::IterableNode::Shape(value) => value.source.clone(),
         }
@@ -2125,7 +2244,7 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> PlanIterable<'a, P, B> {
             },
         )?;
         Some(Self {
-            node: kernel::IterableNode::Known { value, collection },
+            node: Arc::new(kernel::IterableNode::Known { value, collection }),
         })
     }
     pub fn from_shape(value: ShapeKnown<'a, P, B>) -> Result<Self, KnowledgeError<B>> {
@@ -2133,13 +2252,13 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> PlanIterable<'a, P, B> {
             return Err(error);
         }
         Ok(Self {
-            node: kernel::IterableNode::Shape(value),
+            node: Arc::new(kernel::IterableNode::Shape(value)),
         })
     }
 }
 impl<'a, P: PlaceholderKind, B: BindingAddress, T> PlanIterable<'a, P, B, T> {
     pub fn len(&self) -> usize {
-        match &self.node {
+        match self.node.as_ref() {
             kernel::IterableNode::Shape(v) => v.len(),
             kernel::IterableNode::Known { collection, .. } => collection.len(),
         }
@@ -2230,7 +2349,8 @@ fn project_shape<'a, P: PlaceholderKind, B: BindingAddress>(
     Ok(ShapeKnown {
         source: value.source,
         apply_required: true,
-        node: match value.node {
+        failure: value.failure.clone(),
+        node: Arc::new(match Arc::unwrap_or_clone(value.node) {
             kernel::ShapeNode::List(items) => kernel::ShapeNode::List(
                 items
                     .into_iter()
@@ -2249,7 +2369,7 @@ fn project_shape<'a, P: PlaceholderKind, B: BindingAddress>(
                     alternative: pending.alternative.project(functions)?,
                 })
             }
-        },
+        }),
     })
 }
 fn project_plan<'a, P: PlaceholderKind, B: BindingAddress>(
@@ -2270,7 +2390,7 @@ fn project_plan<'a, P: PlaceholderKind, B: BindingAddress>(
             source: value.source,
             wait_on: value.wait_on,
             reason: value.reason,
-            node: match value.node {
+            node: Arc::new(match Arc::unwrap_or_clone(value.node) {
                 kernel::PendingNode::Secret { protected, inner } => kernel::PendingNode::Secret {
                     protected,
                     inner: Box::new(
@@ -2321,7 +2441,7 @@ fn project_plan<'a, P: PlaceholderKind, B: BindingAddress>(
                         })
                         .collect::<Result<_, KnowledgeError<B>>>()?,
                 ),
-            },
+            }),
         }),
     })
 }
@@ -2477,13 +2597,8 @@ impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
     /// Preserve shared knowledge, protected failures and typed substitutions
     /// across parser/template phases. Preview grants no execution authority.
     pub(crate) fn input_preview(&self) -> Value<ParserPlaceholder> {
-        let source = match self.knowledge(&KnowledgeContext::validation()) {
-            Ok(knowledge) => knowledge.to_value(),
-            // Keep the source of classification failures too: a later consumer
-            // must still see that failure, never a successful unknown leaf.
-            Err(_) => self.clone(),
-        };
-        let projected = source
+        let projected = self
+            .clone()
             .try_map_placeholder(&mut |placeholder| {
                 Ok::<_, std::convert::Infallible>(Value::Deferred(DeferredValue::Placeholder(
                     placeholder.into_preview(),
@@ -2572,7 +2687,8 @@ fn pending<'a, P: PlaceholderKind, B: BindingAddress>(
 ) -> Classification<'a, P, B> {
     Classification::Pending(Pending {
         source,
-        node: kernel::PendingNode::Ordinary(Vec::new()),
+        failure: None,
+        node: Arc::new(kernel::PendingNode::Ordinary(Vec::new())),
         phase,
         reason,
         wait_on,
@@ -2599,7 +2715,16 @@ fn expression<'a, P: PlaceholderKind, B: BindingAddress>(
     }
     Classification::Pending(Pending {
         source,
-        node: kernel::PendingNode::Ordinary(inputs),
+        failure: inputs.iter().find_map(|input| {
+            if input.guard.is_some() {
+                return None;
+            }
+            match &input.value {
+                kernel::InputValue::Value(value) => value.failure_shared(),
+                kernel::InputValue::Lexical(value) => value.failure.clone().map(Arc::new),
+            }
+        }),
+        node: Arc::new(kernel::PendingNode::Ordinary(inputs)),
         phase,
         reason: PendingReason::Evaluation(kind),
         wait_on: WaitOn::Evaluation(kind),
@@ -2715,7 +2840,7 @@ fn classify_value<
     let known = |node| {
         Ok(Classification::Known(KnownValue {
             source: value,
-            node,
+            node: Arc::new(node),
         }))
     };
     match value {
@@ -2756,7 +2881,8 @@ fn classify_value<
                     let apply_required = children.iter().any(Classification::apply_required);
                     Ok(Classification::ShapeKnown(ShapeKnown {
                         source: value,
-                        node: kernel::ShapeNode::List(children),
+                        failure: children.iter().find_map(Classification::failure_shared),
+                        node: Arc::new(kernel::ShapeNode::List(children)),
                         apply_required,
                     }))
                 }
@@ -2795,7 +2921,8 @@ fn classify_value<
                     let apply_required = children.values().any(Classification::apply_required);
                     Ok(Classification::ShapeKnown(ShapeKnown {
                         source: value,
-                        node: kernel::ShapeNode::Map(children),
+                        failure: children.values().find_map(Classification::failure_shared),
+                        node: Arc::new(kernel::ShapeNode::Map(children)),
                         apply_required,
                     }))
                 }
@@ -2807,11 +2934,18 @@ fn classify_value<
             if let Some(error) = inner.failure() {
                 return Ok(Classification::Failed(AttemptedFailure {
                     source: value,
-                    error: error.inside_secret(),
+                    error: Arc::new(error.inside_secret()),
+                    protected: Some(ProtectedSecret {
+                        payload,
+                        evidence: Arc::new(inner),
+                    }),
                 }));
             }
             match inner {
-                Classification::Known(_) => known(N::Secret(ProtectedSecret { payload })),
+                inner @ Classification::Known(_) => known(N::Secret(ProtectedSecret {
+                    payload,
+                    evidence: Arc::new(inner),
+                })),
                 inner @ (Classification::ShapeKnown(_) | Classification::Pending(_)) => {
                     let apply = inner.apply_required();
                     let site = inner.sites().next().ok_or(KnowledgeError::InvalidStage {
@@ -2819,18 +2953,26 @@ fn classify_value<
                     })?;
                     Ok(Classification::Pending(Pending {
                         source: value,
+                        failure: None,
                         phase: if apply { Phase::Apply } else { Phase::Plan },
                         reason: site.reason,
                         wait_on: site.wait_on,
-                        node: kernel::PendingNode::Secret {
-                            protected: ProtectedSecret { payload },
+                        node: Arc::new(kernel::PendingNode::Secret {
+                            protected: ProtectedSecret {
+                                payload,
+                                evidence: Arc::new(inner.clone()),
+                            },
                             inner: Box::new(inner),
-                        },
+                        }),
                     }))
                 }
                 Classification::Failed(failure) => Ok(Classification::Failed(AttemptedFailure {
                     source: value,
-                    error: failure.error().inside_secret(),
+                    error: Arc::new(failure.error().inside_secret()),
+                    protected: Some(ProtectedSecret {
+                        payload,
+                        evidence: Arc::new(Classification::Failed(failure)),
+                    }),
                 })),
             }
         }
@@ -2880,11 +3022,12 @@ fn classify_value<
             source_line,
         }) => Ok(Classification::Failed(AttemptedFailure {
             source: value,
-            error: KnowledgeError::Unavailable {
+            protected: None,
+            error: Arc::new(KnowledgeError::Unavailable {
                 name: name.to_string(),
                 reason: SecretDiagnosticError::Public(reason.clone()),
                 source_line: *source_line,
-            },
+            }),
         })),
         Value::Deferred(DeferredValue::IntegerArithmetic(expr)) => Ok(expression(
             value,
@@ -3011,25 +3154,27 @@ fn classify_value<
             let apply = left.apply_required();
             let shape = match left {
                 Classification::ShapeKnown(shape) => Ok(shape),
-                Classification::Known(mut known) => match &mut known.node {
+                Classification::Known(mut known) => match Arc::make_mut(&mut known.node) {
                     N::List(items) => Ok(ShapeKnown {
                         source: left_source,
-                        node: kernel::ShapeNode::List(
+                        failure: None,
+                        node: Arc::new(kernel::ShapeNode::List(
                             std::mem::take(&mut items.items)
                                 .into_iter()
                                 .map(Classification::Known)
                                 .collect(),
-                        ),
+                        )),
                         apply_required: apply,
                     }),
                     N::Map(items) => Ok(ShapeKnown {
                         source: left_source,
-                        node: kernel::ShapeNode::Map(
+                        failure: None,
+                        node: Arc::new(kernel::ShapeNode::Map(
                             std::mem::take(&mut items.entries)
                                 .into_iter()
                                 .map(|(k, v)| (k, Classification::Known(v)))
                                 .collect(),
-                        ),
+                        )),
                         apply_required: apply,
                     }),
                     N::String(_)
@@ -3050,18 +3195,20 @@ fn classify_value<
             match shape {
                 Ok(shape) => Ok(Classification::ShapeKnown(ShapeKnown {
                     source: value,
-                    node: kernel::ShapeNode::Coalesce(kernel::CoalescePending {
+                    failure: shape.failure.clone(),
+                    node: Arc::new(kernel::ShapeNode::Coalesce(kernel::CoalescePending {
                         value: Box::new(shape),
                         alternative,
-                    }),
+                    })),
                     apply_required: apply,
                 })),
                 Err(left) => Ok(Classification::Pending(Pending {
                     source: value,
-                    node: kernel::PendingNode::Coalesce(kernel::CoalescePending {
+                    failure: left.failure_shared(),
+                    node: Arc::new(kernel::PendingNode::Coalesce(kernel::CoalescePending {
                         value: Box::new(left),
                         alternative,
-                    }),
+                    })),
                     phase: if apply { Phase::Apply } else { Phase::Plan },
                     reason: PendingReason::Evaluation(EvaluationKind::Coalesce),
                     wait_on: WaitOn::Evaluation(EvaluationKind::Coalesce),
@@ -3205,7 +3352,7 @@ impl KnownValue<'_> {
         &self,
     ) -> Result<crate::provider::AppliedIdentifier, crate::provider::EmptyAppliedIdentifier> {
         use kernel::KnownNode as N;
-        match &self.node {
+        match self.node.as_ref() {
             N::String(value) => crate::provider::AppliedIdentifier::new(value.expose_plaintext()),
             N::EnumIdentifier(value) => crate::provider::AppliedIdentifier::new(value.as_str()),
             N::Secret(secret) => secret.payload.try_project_plaintext(|value| match value {

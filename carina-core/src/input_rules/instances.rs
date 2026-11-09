@@ -1,7 +1,7 @@
 //! Bind admitted declarations to existing object instances. No predicates are
 //! evaluated here; every instance goes through ApplicableInputRule::evaluate.
 use super::*;
-use crate::resource::knowledge::{Classification, ClassifiedRef, KnowledgeContext};
+use crate::resource::knowledge::Classification;
 use crate::resource::{DiagnosticScope, ValueString};
 use crate::schema::{AttrTypeKind, PatternAttributeType};
 
@@ -109,6 +109,7 @@ fn bind<'s, 'a>(
     owner_type: Option<&'a CompiledAttributeType>,
     owner: &[Step],
     pending_instance: bool,
+    evidence: RuleEvidence<'s>,
 ) -> Option<ApplicableInputRule<'s, 'a>> {
     let kind = scope_classification(rule.scope(), site.context)?;
     if !active(site, owner, rule) {
@@ -122,30 +123,38 @@ fn bind<'s, 'a>(
         owner: owner.to_vec(),
         path: diagnostic_path(owner, rule.path()),
         pending_instance,
+        evidence,
     })
 }
 
 pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRule<'s, 'a>> {
     let mut instances = Vec::new();
+    let evidence = Arc::new(SiteEvidence::new(site));
     for &rule in &site.rules {
-        instances.extend(bind(site, rule, None, &[], false));
+        instances.extend(bind(
+            site,
+            rule,
+            None,
+            &[],
+            false,
+            RuleEvidence::Resource(Arc::clone(&evidence)),
+        ));
     }
-    let values = site.attributes.as_deref();
     for (name, attribute) in &site.schema.as_schema().attributes {
         if attribute.input_mode.is_provider_populated() {
             continue;
         }
-        let value = values.and_then(|values| values.get(name));
+        let value = evidence.field(name);
         // Omitted objects have no instances. A deferred whole resource has
         // unknown membership, so its nested declarations retain obligations.
-        if value.is_none() && values.is_some() {
+        if value.is_none() && evidence.membership_known() {
             continue;
         }
         let mut owner = vec![Step::Field(name.clone())];
         walk(
             site,
             &attribute.attr_type,
-            value,
+            value.as_ref(),
             &mut owner,
             &mut HashSet::new(),
             &mut instances,
@@ -159,7 +168,7 @@ pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRu
 fn walk<'s, 'a>(
     site: &'s WriteSite<'a>,
     ty: &'a CompiledAttributeType,
-    value: Option<&InputValue>,
+    value: Option<&InputEvidence<'s>>,
     owner: &mut Vec<Step>,
     visited_refs: &mut HashSet<String>,
     out: &mut Vec<ApplicableInputRule<'s, 'a>>,
@@ -169,37 +178,12 @@ fn walk<'s, 'a>(
     if !has_struct_rules(ty, defs, site.context, &mut HashSet::new()) {
         return;
     }
-    // Inspect membership through the shared knowledge boundary, including
-    // concrete containers whose child payloads are still pending.
-    let evidence = value
-        .and_then(|value| value.knowledge(&KnowledgeContext::validation()).ok())
-        .map(|k| k.into_classification());
-    let protected = evidence
-        .as_ref()
-        .is_some_and(|e| ClassifiedRef::from(e).secret().is_some());
-    let scope = if protected {
+    let scope = if value.is_some_and(|value| value.scope().is_secret()) {
         DiagnosticScope::Secret
     } else {
         scope
     };
-    // This evaluator owns the protected computation. Diagnostic paths inherit
-    // its scope; neither the proof nor a protected key is exposed to clients.
-    let evidence = if protected {
-        value
-            .map(peel_secret)
-            .and_then(|value| value.knowledge(&KnowledgeContext::validation()).ok())
-            .map(|k| k.into_classification())
-    } else {
-        evidence
-    };
-    let fields = evidence.as_ref().and_then(|e| ClassifiedRef::from(e).map());
-    let items = evidence
-        .as_ref()
-        .and_then(|e| ClassifiedRef::from(e).list());
-    let pending = !matches!(
-        &evidence,
-        Some(Classification::Known(_) | Classification::ShapeKnown(_))
-    );
+    let pending = !value.is_some_and(InputEvidence::shape_known);
     match &ty.kind {
         AttrTypeKind::Ref(name) => {
             if !visited_refs.insert(name.clone()) {
@@ -216,16 +200,20 @@ fn walk<'s, 'a>(
             ..
         } => {
             for rule in input_rules {
-                out.extend(bind(site, rule, Some(ty), owner, pending));
+                out.extend(bind(
+                    site,
+                    rule,
+                    Some(ty),
+                    owner,
+                    pending,
+                    RuleEvidence::Instance(value.cloned()),
+                ));
             }
             for field in declarations {
                 if field.parts().declared_input_mode.is_provider_populated() {
                     continue;
                 }
-                let child = fields
-                    .as_ref()
-                    .and_then(|fields| fields.get(field.name.as_str()))
-                    .map(|value| value.diagnostic_value());
+                let child = value.and_then(|value| value.field(&field.name));
                 if child.is_none() && !pending {
                     continue;
                 }
@@ -234,7 +222,7 @@ fn walk<'s, 'a>(
                 walk(
                     site,
                     &field.field_type,
-                    child,
+                    child.as_ref(),
                     owner,
                     if child.is_some() {
                         &mut child_refs
@@ -248,13 +236,14 @@ fn walk<'s, 'a>(
             }
         }
         AttrTypeKind::List { element_type, .. } => {
-            if let Some(items) = items {
-                for (index, item) in items.into_iter().enumerate() {
+            if let Some(count) = value.and_then(InputEvidence::list_len) {
+                for index in 0..count {
+                    let item = value.and_then(|value| value.index(index));
                     owner.push(Step::Index(index));
                     walk(
                         site,
                         element_type,
-                        Some(item.diagnostic_value()),
+                        item.as_ref(),
                         owner,
                         &mut HashSet::new(),
                         out,
@@ -269,7 +258,7 @@ fn walk<'s, 'a>(
         AttrTypeKind::Map {
             value: value_type, ..
         } => {
-            if let Some(fields) = fields {
+            if let Some(fields) = value.and_then(InputEvidence::fields) {
                 for (key, value) in fields {
                     owner.push(Step::Key(if scope.is_secret() {
                         ValueString::diagnostic_sensitive(key)
@@ -279,7 +268,7 @@ fn walk<'s, 'a>(
                     walk(
                         site,
                         value_type,
-                        Some(value.diagnostic_value()),
+                        Some(&value),
                         owner,
                         &mut HashSet::new(),
                         out,
@@ -295,7 +284,7 @@ fn walk<'s, 'a>(
             let crate::schema::RawShape::Union(members) = ty.raw_shape() else {
                 unreachable!("union declaration");
             };
-            match &evidence {
+            match value.map(InputEvidence::proof) {
                 Some(known @ Classification::Known(_)) => {
                     let mut ref_path = visited_refs
                         .iter()

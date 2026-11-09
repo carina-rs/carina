@@ -784,7 +784,8 @@ pub(super) fn estimate(
     };
     // A retained expression already bound to this instance is authoritative,
     // including after normalization reorders collections. Consult authored
-    // source only when the current projection has erased that expression.
+    // source only when the erased expression retains correspondence to a
+    // top-level attribute. Collection positions do not establish identity.
     if let Some(value) = value.filter(|value| {
         !matches!(
             peel_secret(value),
@@ -825,6 +826,32 @@ pub(super) fn estimate(
     let Some(tail) = tail else {
         return InputVerdict::Undecided;
     };
+    if let Some(attributes) = site.attributes.as_deref() {
+        let Some(current_root) = attributes.get(&root) else {
+            return InputVerdict::Undecided;
+        };
+        if !tail.is_empty()
+            && matches!(
+                peel_secret(current_root),
+                Value::Deferred(DeferredValue::Unknown(_))
+            )
+        {
+            return InputVerdict::Undecided;
+        }
+        if !matches!(
+            peel_secret(current_root),
+            Value::Deferred(DeferredValue::Unknown(_))
+        ) {
+            // Normalization preserves top-level attribute identity, but can
+            // reorder/move values within it. An erased child has no proven
+            // correspondence to the authored child at the same position.
+            if value.is_some() {
+                return InputVerdict::Undecided;
+            }
+            return from_attributes(attributes, &root, &tail, &mut estimator, rule)
+                .unwrap_or(InputVerdict::Undecided);
+        }
+    }
     let retained = match &site.authored {
         Some(AuthoredAttributes::Resource(attributes)) => {
             from_attributes(attributes, &root, &tail, &mut estimator, rule)

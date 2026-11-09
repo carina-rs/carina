@@ -1,10 +1,13 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **25**.
+The next protocol is **25**, planned for Carina **v0.14.0** and currently
+unreleased. This development branch speaks protocol 25 and requires provider
+protocol 25. Released Carina v0.13.1 speaks protocol **24**, with minimum provider
+protocol **24**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
-| 25 | 25 | Required typed input-rule conditions and Struct-local input rules; CreateOnly authoring previews. |
+| 25 (unreleased, planned for v0.14.0) | 25 | Required typed input-rule conditions and Struct-local input rules; CreateOnly authoring previews. |
 | 24 | 24 | Required typed pattern specifications with explicit Full or justified Substring matching. |
 | 23 | 23 | Required scoped desired-input rules on every resource schema. |
 | 22 | 22 | Optional entry-count bound on `Map` attribute types. |
@@ -19,11 +22,15 @@ The current protocol and minimum supported provider protocol are both **25**.
 
 ## Version 25
 
+Unreleased; planned for Carina v0.14.0.
+
 ### Conditional input rules (#4263)
 
-`PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both 25. Providers
-built for protocol 24 or earlier must rebuild against the current SDK. The host
-checks the version before decoding schemas, including schema-only loading.
+`PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are both 25 on this
+development branch. Providers targeting this unreleased host must rebuild
+against the matching unreleased SDK. Released v0.13.1 requires protocol 24 and
+rejects protocol-25 providers. The host checks the version before decoding
+schemas, including schema-only loading.
 These changes affect schema JSON; WIT and provider CRUD requests are unchanged.
 
 Every `InputRule` requires `condition`, alongside `scope`, `target`, `code` and
@@ -202,12 +209,12 @@ serialized. Saved plans are re-admitted under the apply lock, and dispatch
 discharges pending rules against resolved desired inputs and exact requests.
 
 Version 23 introduced the required `input_rules`, `scope` and `target` fields.
-The current host requires protocol 25, including explicit pattern modes,
-conditions and Struct rule arrays, and rejects older providers before schema
+This unreleased development host requires protocol 25, including explicit
+pattern modes, conditions and Struct rule arrays, and rejects older providers before schema
 decoding. The v12 migration adapter has
 been removed. The SDK's schema JSON export carries these rules; no WIT function
 or CRUD request field is added. AWS, AWSCC, and GitHub providers must rebuild
-against protocol 25.
+against protocol 25 to target this unreleased host.
 
 ## Version 22
 
@@ -259,8 +266,9 @@ identity conversion; the existing length and range checks still apply, and sink
 validators still run on values during validation, planning, and apply.
 
 Version 21 introduced this required edge array. Hosts and providers must rebuild
-together; the current minimum is 25. Protocol-12 metadata is rejected, including
-on read-only schema loading paths.
+together; the minimum on this development branch is 25, while released v0.13.1
+requires 24. Protocol-12 metadata is rejected, including on read-only schema
+loading paths.
 
 ## Version 20
 
