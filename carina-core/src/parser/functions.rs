@@ -8,7 +8,7 @@ use super::error::{ParseError, ParseWarning};
 use super::types::parse_type_expr;
 use super::{ParsedFunctionArgument as FunctionArgument, ParsedValue as Value};
 use super::{ProviderContext, Rule, is_static_eval, parse_expression};
-use crate::eval_value::{BareStructuralHandle, EvalValue, UnexpandedStructuralHandleKind};
+use crate::eval_value::{EvalValue, UnexpandedStructuralHandleKind};
 use crate::resource::InsideSecret;
 use crate::resource::{
     BindingAddress, ConcreteValue, DeferredValue, ParserPlaceholder, PlaceholderKind,
@@ -329,7 +329,7 @@ fn prepare_user_function_call<'cfg, Source: Clone>(
 
     // Evaluate local lets, substituting and resolving each one
     for (let_name, let_expr, source_line) in &func.local_lets {
-        let local = substitute_function_call_argument(
+        let local = crate::value_walk::substitute_function_call_argument(
             &FunctionArgument::from_value(let_expr.clone()),
             &substitutions,
             *source_line,
@@ -588,16 +588,20 @@ pub(crate) fn custom_type_lookup_for_owner<'resolver, 'owner>(
 
 /// Bind a provider-config value validator to its selected factory. Dispatch
 /// consumes the proof produced by the combined walk, never a raw value.
-pub fn custom_type_lookup_for_factory(
-    factory: &dyn crate::provider::ProviderFactory,
-) -> impl crate::schema::ValidatedCustomTypeLookup + '_ {
-    struct Lookup<'a>(&'a dyn crate::provider::ProviderFactory);
+pub fn custom_type_lookup_for_factory<'a>(
+    factory: &'a dyn crate::provider::ProviderFactory,
+    host: &'a crate::provider::ProviderValidationInputs,
+) -> impl crate::schema::ValidatedCustomTypeLookup + 'a {
+    struct Lookup<'a>(
+        &'a dyn crate::provider::ProviderFactory,
+        &'a crate::provider::ProviderValidationInputs,
+    );
     impl crate::schema::ValidatedCustomTypeLookup for Lookup<'_> {
         fn validate(
             &self,
             value: crate::schema::LocallyValidatedCustomType<'_>,
         ) -> Result<(), crate::schema::TypeError> {
-            crate::provider::validate_validated_custom_type_with_factory(self.0, value)
+            crate::provider::validate_validated_custom_type_with_factory(self.0, value, self.1)
                 .map_err(Into::into)
         }
 
@@ -609,7 +613,7 @@ pub fn custom_type_lookup_for_factory(
             custom_type_canonicalization_error(self.0.name(), declaration, error)
         }
     }
-    Lookup(factory)
+    Lookup(factory, host)
 }
 
 pub(crate) fn custom_type_canonicalization_error(
@@ -651,7 +655,11 @@ pub fn validate_custom_type<P: PlaceholderKind, B: BindingAddress>(
             error,
         )
         .with_secrets(
-            crate::provider::ProviderValidationInputs::collect([&value.to_value()]).redaction_set(),
+            crate::provider::ProviderValidationInputs::collect(
+                identity.provider.as_deref().unwrap_or("builtin"),
+                [&value.to_value()],
+            )
+            .redaction_set(),
         )
     })
 }
@@ -1321,9 +1329,13 @@ pub(crate) fn evaluate_user_function<Source: Clone>(
         }
     };
 
-    let substituted_body =
-        substitute_fn_params(&func.body.value, &substitutions, func.body.source_line)
-            .map_err(|error| locate_function_body_error(func, error))?;
+    let substituted_body = crate::value_walk::substitute_function_parameters(
+        &func.body.value,
+        &substitutions,
+        func.body.source_line,
+        crate::value_walk::RewritePosition::Value,
+    )
+    .map_err(|error| locate_function_body_error(func, error))?;
     let result = try_evaluate_fn_value(substituted_body, &child_ctx, func.body.source_line)
         .map_err(|error| locate_function_body_error(func, error))?
         .canonicalize();
@@ -1431,281 +1443,6 @@ pub fn contains_function_call(value: &Value) -> bool {
         }
         _ => false,
     }
-}
-
-#[derive(Clone, Copy)]
-enum FunctionSubstitutionPosition {
-    Value,
-    AccessBase,
-}
-
-type ParserStageValue<B> = GenericValue<ParserPlaceholder, B>;
-type ParserStageFunctionArgument<B> = crate::resource::FunctionArgument<ParserPlaceholder, B>;
-
-fn substituted_function_argument<B: BindingAddress>(
-    name: &str,
-    argument: &ParserStageFunctionArgument<B>,
-    position: FunctionSubstitutionPosition,
-    source_line: usize,
-) -> Result<ParserStageValue<B>, ParseError> {
-    if let Some(value) = argument.value() {
-        return Ok(value.clone());
-    }
-    match position {
-        FunctionSubstitutionPosition::AccessBase => Ok(argument.walker_value().clone()),
-        FunctionSubstitutionPosition::Value => Err(ParseError::from_eval_value(
-            crate::eval_value::EvalValueError::BareStructuralHandle(BareStructuralHandle {
-                binding: name.to_string(),
-                kind: UnexpandedStructuralHandleKind::FunctionParameter,
-            }),
-            source_line,
-        )),
-    }
-}
-
-fn substitute_function_call_argument<B: BindingAddress>(
-    argument: &ParserStageFunctionArgument<B>,
-    substitutions: &HashMap<String, ParserStageFunctionArgument<B>>,
-    source_line: usize,
-) -> Result<ParserStageFunctionArgument<B>, ParseError> {
-    let Some(value) = argument.value() else {
-        return Ok(argument.clone());
-    };
-    if let GenericValue::Deferred(DeferredValue::Placeholder(
-        ParserPlaceholder::FnParam { name } | ParserPlaceholder::FnLocal { name },
-    )) = value
-        && let Some(substitution) = substitutions.get(name)
-    {
-        return Ok(substitution.clone());
-    }
-    argument.try_map_value(|value| {
-        substitute_fn_params_with_position(
-            value,
-            substitutions,
-            source_line,
-            FunctionSubstitutionPosition::Value,
-        )
-    })
-}
-
-/// Recursively substitute function parameter placeholders with actual values.
-/// A handle is legal only while it is the access base of `param.field` or a
-/// typed argument to another deferred function call.
-pub(crate) fn substitute_fn_params<B: BindingAddress>(
-    value: &ParserStageValue<B>,
-    substitutions: &HashMap<String, ParserStageFunctionArgument<B>>,
-    source_line: usize,
-) -> Result<ParserStageValue<B>, ParseError> {
-    substitute_fn_params_with_position(
-        value,
-        substitutions,
-        source_line,
-        FunctionSubstitutionPosition::Value,
-    )
-}
-
-fn substitute_fn_params_with_position<B: BindingAddress>(
-    value: &ParserStageValue<B>,
-    substitutions: &HashMap<String, ParserStageFunctionArgument<B>>,
-    source_line: usize,
-    position: FunctionSubstitutionPosition,
-) -> Result<ParserStageValue<B>, ParseError> {
-    Ok(match value {
-        GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
-            let deferred = deferred
-                .try_map(|value| substitute_fn_params(value, substitutions, source_line))?;
-            GenericValue::Deferred(DeferredValue::ModuleIf(Box::new(deferred)))
-        }
-        GenericValue::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnParam { name }))
-        | GenericValue::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnLocal { name })) => {
-            match substitutions.get(name) {
-                Some(argument) => {
-                    substituted_function_argument(name, argument, position, source_line)?
-                }
-                None => value.clone(),
-            }
-        }
-        GenericValue::Deferred(DeferredValue::ResourceRef { path })
-            if substitutions.contains_key(path.binding()) =>
-        {
-            let Some(base) = substitutions.get(path.binding()) else {
-                unreachable!("substitution presence was checked above")
-            };
-            let mut substituted = crate::resource::apply_value_path_segment(
-                base.walker_value().clone(),
-                crate::resource::PathSegment::Field {
-                    name: path.attribute().to_string(),
-                },
-                source_line,
-                crate::resource::AccessMissPolicy::Error,
-            )
-            .and_then(crate::resource::ValuePathSegmentResult::into_value)
-            .map_err(|error| ParseError::InvalidExpression {
-                line: source_line,
-                message: error.to_string(),
-            })?;
-            for segment in path.segments() {
-                substituted = crate::resource::apply_value_path_segment(
-                    substituted,
-                    segment.clone(),
-                    source_line,
-                    crate::resource::AccessMissPolicy::Error,
-                )
-                .and_then(crate::resource::ValuePathSegmentResult::into_value)
-                .map_err(|error| ParseError::InvalidExpression {
-                    line: source_line,
-                    message: error.to_string(),
-                })?;
-            }
-            substituted
-        }
-        GenericValue::Concrete(ConcreteValue::List(items)) => {
-            GenericValue::Concrete(ConcreteValue::List(
-                items
-                    .iter()
-                    .map(|v| substitute_fn_params(v, substitutions, source_line))
-                    .collect::<Result<_, _>>()?,
-            ))
-        }
-        GenericValue::Concrete(ConcreteValue::Map(map)) => {
-            GenericValue::Concrete(ConcreteValue::Map(
-                map.iter()
-                    .map(|(k, v)| {
-                        Ok((
-                            k.clone(),
-                            substitute_fn_params(v, substitutions, source_line)?,
-                        ))
-                    })
-                    .collect::<Result<_, ParseError>>()?,
-            ))
-        }
-        GenericValue::Deferred(DeferredValue::ResolvedFunctionCall {
-            function,
-            functions,
-            args,
-            source_line: call_line,
-        }) => GenericValue::Deferred(DeferredValue::ResolvedFunctionCall {
-            function: function.clone(),
-            functions: functions.clone(),
-            args: args
-                .iter()
-                .map(|argument| {
-                    substitute_function_call_argument(
-                        argument,
-                        substitutions,
-                        call_line.unwrap_or(source_line),
-                    )
-                })
-                .collect::<Result<_, _>>()?,
-            source_line: *call_line,
-        }),
-        GenericValue::Deferred(DeferredValue::FunctionCall {
-            name,
-            args,
-            source_line: call_line,
-        }) => GenericValue::Deferred(DeferredValue::FunctionCall {
-            name: *name,
-            args: args
-                .iter()
-                .map(|argument| {
-                    substitute_function_call_argument(
-                        argument,
-                        substitutions,
-                        call_line.unwrap_or(source_line),
-                    )
-                })
-                .collect::<Result<_, _>>()?,
-            source_line: *call_line,
-        }),
-        GenericValue::Deferred(DeferredValue::Unavailable {
-            name,
-            args,
-            reason,
-            source_line: call_line,
-        }) => GenericValue::Deferred(DeferredValue::Unavailable {
-            name: *name,
-            args: args
-                .iter()
-                .map(|argument| {
-                    substitute_function_call_argument(
-                        argument,
-                        substitutions,
-                        call_line.unwrap_or(source_line),
-                    )
-                })
-                .collect::<Result<_, _>>()?,
-            reason: reason.clone(),
-            source_line: *call_line,
-        }),
-        GenericValue::Deferred(DeferredValue::Access(access)) => access
-            .rebuild_with_base(
-                substitute_fn_params_with_position(
-                    access.base(),
-                    substitutions,
-                    access.source_line(),
-                    FunctionSubstitutionPosition::AccessBase,
-                )?,
-                crate::resource::AccessMissPolicy::Error,
-            )
-            .map_err(|error| ParseError::InvalidExpression {
-                line: access.source_line(),
-                message: error.to_string(),
-            })?,
-        GenericValue::Deferred(DeferredValue::Interpolation(parts)) => {
-            GenericValue::Deferred(DeferredValue::Interpolation(
-                parts
-                    .iter()
-                    .map(|p| match p {
-                        crate::resource::InterpolationPart::Expr(v) => {
-                            substitute_fn_params(v, substitutions, source_line)
-                                .map(crate::resource::InterpolationPart::Expr)
-                        }
-                        other => Ok(other.clone()),
-                    })
-                    .collect::<Result<_, _>>()?,
-            ))
-        }
-        GenericValue::Deferred(DeferredValue::Secret(inner)) => {
-            GenericValue::Deferred(DeferredValue::Secret(
-                inner.try_map(|value| substitute_fn_params(value, substitutions, source_line))?,
-            ))
-        }
-        GenericValue::Deferred(DeferredValue::Coalesce { value, default }) => {
-            GenericValue::Deferred(DeferredValue::Coalesce {
-                value: Box::new(substitute_fn_params(value, substitutions, source_line)?),
-                default: Box::new(substitute_fn_params(default, substitutions, source_line)?),
-            })
-        }
-        GenericValue::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            let lhs = substitute_fn_params(expression.lhs(), substitutions, source_line)?;
-            let rhs = substitute_fn_params(expression.rhs(), substitutions, source_line)?;
-            let span = expression.operator_span();
-            expression
-                .evaluate_with_operands(lhs, rhs)
-                .map_err(|error| ParseError::integer_arithmetic(span, source_line, error))?
-        }
-        GenericValue::Deferred(DeferredValue::Unknown(_))
-        | GenericValue::Deferred(DeferredValue::Placeholder(
-            ParserPlaceholder::ModuleArgument {
-                name: _,
-                diagnostic: _,
-            }
-            | ParserPlaceholder::Loop(_)
-            | ParserPlaceholder::EmptyInterpolation { source: _ },
-        ))
-        | GenericValue::Deferred(DeferredValue::ResourceRef { path: _ })
-        | GenericValue::Deferred(DeferredValue::BindingRef { binding: _ })
-        | GenericValue::Concrete(
-            ConcreteValue::String(_)
-            | ConcreteValue::EnumIdentifier(_)
-            | ConcreteValue::CanonicalEnum(_)
-            | ConcreteValue::Int(_)
-            | ConcreteValue::Float(_)
-            | ConcreteValue::Bool(_)
-            | ConcreteValue::Duration(_)
-            | ConcreteValue::StringList(_),
-        ) => value.clone(),
-    })
 }
 
 /// Try to evaluate a value (resolve function calls including user-defined ones).

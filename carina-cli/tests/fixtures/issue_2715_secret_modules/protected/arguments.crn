@@ -1,0 +1,4 @@
+arguments {
+  password: String
+  enabled: Bool
+}

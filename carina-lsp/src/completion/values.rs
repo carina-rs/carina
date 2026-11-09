@@ -2721,7 +2721,7 @@ fn join_relative(up_depth: usize, parts: &[&str]) -> String {
 /// The walk is directory-scoped: a binding declared in `providers.crn`
 /// must surface as a completion candidate while the user is editing
 /// `main.crn` in the same directory ([[feedback_directory_scoped_features]]).
-/// `parse_directory` is the right entry point because it merges every
+/// `parse_directory_for_metadata` merges every
 /// sibling `.crn` regardless of whether the directory is a module
 /// (input/output shape) or a root config — `load_module` returns
 /// `None` for root configs and would miss the bindings entirely.
@@ -2737,7 +2737,12 @@ fn collect_named_provider_instance_bindings(
     } else {
         base.clone()
     };
-    let parsed = match carina_core::config_loader::parse_directory(&dir, provider_ctx.catalog()) {
+    let parsed = match carina_core::config_loader::parse_directory_for_metadata(
+        &dir,
+        provider_ctx.catalog(),
+        &std::collections::HashMap::new(),
+        &carina_core::schema::SchemaRegistry::new(),
+    ) {
         Ok(p) => p,
         Err(_) => return Vec::new(),
     };

@@ -409,10 +409,11 @@ fn function_body_access_occurrence_survives_argument_substitution()
         })
         .into(),
     )]);
-    let substituted = super::functions::substitute_fn_params(
+    let substituted = crate::value_walk::substitute_function_parameters(
         &function.body.value,
         &substitutions,
         function.body.source_line,
+        crate::value_walk::RewritePosition::Value,
     )
     .unwrap();
     let mut parsed = files

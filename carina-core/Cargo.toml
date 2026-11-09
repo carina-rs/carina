@@ -13,7 +13,8 @@ workspace = true
 
 [features]
 async-io = ["tokio/fs", "tokio/rt"]
-guest-runtime = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http"]
+provider-host = []
+guest-runtime = ["provider-host", "dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http"]
 test-shutdown = []
 test-utils = ["dep:tempfile"]
 
@@ -36,7 +37,7 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 indexmap = { version = "2", features = ["serde"] }
 log = "0.4"
-tokio = { version = "1", features = ["macros", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = "0.7"
 tracing = "0.1"
 chrono = "0.4"
@@ -51,6 +52,6 @@ libc = "0.2"
 
 [dev-dependencies]
 # Integration fixtures use the same gated helpers as the crate's unit tests.
-carina-core = { path = ".", features = ["test-utils"] }
+carina-core = { path = ".", features = ["test-utils", "provider-host"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "test-util"] }
 tempfile = "3"

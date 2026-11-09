@@ -416,19 +416,22 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
             out.insert(us.binding.clone(), HashMap::new());
             continue;
         }
-        match crate::config_loader::parse_directory_with_overrides(
+        match crate::config_loader::parse_directory_for_metadata(
             &source_abs,
             config.catalog(),
             &crate::config_loader::directory_source_overrides(&source_abs, overrides),
+            schemas.unwrap_or(&crate::schema::SchemaRegistry::new()),
         ) {
             Ok(parsed) => {
-                let mut parsed = parsed.into_parsed();
+                let parsed = parsed.try_update(|parsed| {
+                    crate::validation::resolve_file_type_exprs_best_effort(parsed, config)
+                })?;
                 // Normalize every consumer-visible declaration before module
                 // expansion and export inference. Inference compares the
                 // structural TypeExpr values it receives, so leaving one
                 // declaration as DottedUnresolved while an equivalent schema
                 // projection is already SchemaType creates a false mismatch.
-                crate::validation::resolve_file_type_exprs_best_effort(&mut parsed, config)?;
+
                 // Expand module calls before inference so that
                 // `attributes { ... }`-typed `Virtual` resources land in
                 // `parsed.resources` (#2493). Without this the inferer

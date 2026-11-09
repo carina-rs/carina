@@ -1021,10 +1021,11 @@ impl DiagnosticRun<'_> {
         if let Some(name) = current_file_name {
             overrides.insert(name.to_string(), doc.text());
         }
-        let merged = carina_core::config_loader::parse_directory_with_overrides(
+        let merged = carina_core::config_loader::parse_directory_for_metadata(
             base_path,
             self.provider_context.catalog(),
             &overrides,
+            &self.schemas,
         )
         .ok()?;
         let module_resolution =

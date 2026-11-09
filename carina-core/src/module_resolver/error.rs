@@ -616,6 +616,7 @@ fn parse_error_is_deferred_for_body_rejection(error: &ParseError) -> bool {
         | ParseError::InternalError { .. }
         | ParseError::RecursiveFunction(_)
         | ParseError::CyclicLetBinding { .. }
+        | ParseError::ValueWalk(_)
         | ParseError::UserFunctionError(_) => false,
     }
 }

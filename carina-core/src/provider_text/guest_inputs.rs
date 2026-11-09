@@ -49,16 +49,43 @@ use crate::resource::{AbsoluteBindingAddress, DeferredValue, NoPlaceholder, Secr
 #[derive(Clone, Debug)]
 pub struct GuestInputInventory {
     secrets: RedactionSet,
+    diagnostics: super::ProviderDiagnosticChannel,
+    _diagnostic_owner: super::DiagnosticOwner,
 }
 impl GuestInputInventory {
     pub(super) fn new(inputs: &ProviderValidationInputs) -> Self {
         Self {
             secrets: inputs.redaction_set().clone(),
+            diagnostics: inputs.diagnostics(),
+            _diagnostic_owner: inputs.diagnostic_owner(),
         }
     }
     /// Bind stderr directly without exposing the inventory's redaction set.
     pub fn line_writer<W: std::io::Write>(&self, sink: W) -> super::RedactingLineWriter<W> {
         super::RedactingLineWriter::new(&self.secrets, sink)
+    }
+    pub fn diagnostics(&self) -> super::ProviderDiagnosticChannel {
+        self.diagnostics.clone()
+    }
+    pub fn validation_inputs(&self) -> ProviderValidationInputs {
+        ProviderValidationInputs::from_parts(
+            self.secrets.clone(),
+            self.diagnostics.clone(),
+            self._diagnostic_owner.clone(),
+        )
+    }
+    host_api! {
+        fn for_diagnostic_call(&self) -> (Self, super::ProviderDiagnosticCall) {
+            let (diagnostics, call) = self.diagnostics.for_call();
+            (
+                Self {
+                    secrets: self.secrets.clone(),
+                    diagnostics,
+                    _diagnostic_owner: self._diagnostic_owner.clone(),
+                },
+                call,
+            )
+        }
     }
     /// Preserve inputs handed to an earlier store when adopting its owner.
     pub fn join(&self, other: &Self) {

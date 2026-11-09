@@ -1,3 +1,4 @@
+pub mod diagnostics;
 mod finite_f64;
 mod host_pattern;
 pub mod http_trace;

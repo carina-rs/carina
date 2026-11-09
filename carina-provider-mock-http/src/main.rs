@@ -1,5 +1,8 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
+#[cfg(target_arch = "wasm32")]
+mod diagnostic_credentials;
+
 use std::collections::BTreeMap;
 
 use carina_plugin_sdk::core::provider_text::{ProviderDiagnostic, ProviderText};
@@ -133,6 +136,10 @@ impl CarinaProvider for MockHttpProvider {
         _identifier: &AppliedIdentifier,
         _request: ReadRequest,
     ) -> Result<ReadOutcome, ProviderError> {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(outcome) = diagnostic_credentials::read(id, _identifier.as_str())? {
+            return Ok(outcome);
+        }
         Ok(ReadOutcome::NotFound { id: id.clone() })
     }
 

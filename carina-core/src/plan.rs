@@ -1856,10 +1856,10 @@ impl<S> Plan<S> {
         for effect in self.effects() {
             match effect.as_resource_ref() {
                 Some(crate::parser::ResourceRef::Resource(resource)) => {
-                    plan.include(&resource.id, resource.attributes.values())
+                    plan.include(&resource.id, resource.attributes.iter())
                 }
                 Some(crate::parser::ResourceRef::DataSource(source)) => {
-                    plan.include(&source.id, source.attributes.values())
+                    plan.include(&source.id, source.attributes.iter())
                 }
                 _ => {}
             }

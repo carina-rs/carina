@@ -1,0 +1,34 @@
+let direct = mock.test.resource {
+  name = "direct"
+  comment = secret(password)
+}
+
+let local_value = mock.test.resource {
+  name = "local"
+  comment = secret(local)
+}
+
+let interpolated = mock.test.resource {
+  name = "interpolation"
+  comment = secret("prefix-${password}")
+}
+
+let function_value = mock.test.resource {
+  name = "function"
+  comment = protect(password)
+}
+
+let conditional = mock.test.resource {
+  name = "conditional"
+  comment = secret(if enabled { local } else { "private-inactive-2715" })
+}
+
+let conditional_secret = mock.test.resource {
+  name = "conditional-secret"
+  comment = if enabled { secret(local) } else { secret("private-inactive-2715") }
+}
+
+let reference = mock.test.resource {
+  name = "reference"
+  comment = secret(direct.identifier)
+}

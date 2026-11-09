@@ -78,6 +78,16 @@ impl<M: WalkMode, P: ValueKind, B: BindingAddress> LeafInput<'_, M, P, B> {
     }
 }
 impl<P: ValueKind, B: BindingAddress> LeafInput<'_, Transform, P, B> {
+    pub(super) fn cloned_value(&self) -> Value<P, B> {
+        Value::Deferred(match self {
+            Self::ResourceRef(path) => DeferredValue::ResourceRef { path: path.clone() },
+            Self::BindingRef(binding) => DeferredValue::BindingRef {
+                binding: binding.clone(),
+            },
+            Self::Unknown(reason) => DeferredValue::Unknown(reason.clone()),
+            Self::Placeholder(slot) => DeferredValue::Placeholder(slot.clone()),
+        })
+    }
     pub(super) fn into_value(self) -> Value<P, B> {
         Value::Deferred(match self {
             Self::ResourceRef(path) => DeferredValue::ResourceRef { path },
@@ -323,6 +333,14 @@ pub(super) fn dispatch<'v, M: WalkMode, P: ValueKind + 'v, B: BindingAddress, A:
     algebra: &mut A,
 ) -> Result<M::Product<A::Output, P, B>, WalkError> {
     M::dispatch(input, at, algebra)
+}
+
+pub(super) fn dispatch_bound<'v, P: ValueKind + 'v, B: BindingAddress, A: BoundTransform<P, B>>(
+    input: Value<P, B>,
+    at: At<'v>,
+    algebra: &mut A,
+) -> Result<RewriteProduct<A::Output, P, B>, WalkError> {
+    dispatch_variants!(Transform, P, B, input, at, algebra)
 }
 fn children<'v, M: WalkMode, P: ValueKind + 'v, B: BindingAddress>(
     parts: Parts<'v, M, P, B>,
@@ -601,23 +619,52 @@ impl<O: WalkOutput> TransformFold<O> {
             changed: false,
         }
     }
-    fn value<P: ValueKind, B: BindingAddress, A: Algebra<Transform, Output = O>>(
+    fn value<
+        P: ValueKind,
+        B: BindingAddress,
+        A: BoundTransform<P, B> + TransformOutput<Output = O>,
+    >(
         &mut self,
         value: Value<P, B>,
         at: At<'_>,
         algebra: &mut A,
     ) -> Result<Value<P, B>, WalkError> {
-        let product = dispatch::<Transform, _, _, _>(value, at, algebra)?;
+        let product = dispatch_bound(value, at, algebra)?;
         self.output.push(product.output);
         self.changed |= product.changed;
         Ok(product.value)
     }
-    fn argument<P: ValueKind, B: BindingAddress, A: Algebra<Transform, Output = O>>(
+    fn argument<
+        P: ValueKind,
+        B: BindingAddress,
+        A: BoundTransform<P, B> + TransformOutput<Output = O>,
+    >(
         &mut self,
         argument: FunctionArgument<P, B>,
         at: At<'_>,
         algebra: &mut A,
     ) -> Result<FunctionArgument<P, B>, WalkError> {
+        if let Some(replacement) = algebra.argument(&at, &argument)? {
+            // Replacement must not bypass Secret in an auxiliary access base
+            // or in the original argument. Inventory it before completing the
+            // replacement; inserted values follow leaf-replacement semantics.
+            let mut inspector = StructuralInspector {
+                locator: None,
+                found: None,
+            };
+            let mut index = 0;
+            argument.try_visit_values(&mut |value| {
+                dispatch::<Inspect, _, _, _>(
+                    value,
+                    at.operand(ExpressionEdge::ArgumentValue(index)),
+                    &mut inspector,
+                )?;
+                index += 1;
+                Ok::<_, WalkError>(())
+            })?;
+            self.changed = true;
+            return Ok(replacement);
+        }
         let mut nested = Self::new();
         let mut index = 0;
         let argument = argument.try_map_values(|value| {
@@ -633,7 +680,11 @@ impl<O: WalkOutput> TransformFold<O> {
         self.changed |= nested.changed;
         Ok(argument)
     }
-    fn arguments<P: ValueKind, B: BindingAddress, A: Algebra<Transform, Output = O>>(
+    fn arguments<
+        P: ValueKind,
+        B: BindingAddress,
+        A: BoundTransform<P, B> + TransformOutput<Output = O>,
+    >(
         &mut self,
         args: Vec<FunctionArgument<P, B>>,
         at: &At<'_>,
@@ -650,7 +701,10 @@ impl<O: WalkOutput> TransformFold<O> {
             })
             .collect()
     }
-    fn function<B: BindingAddress, A: Algebra<Transform, Output = O>>(
+    fn function<
+        B: BindingAddress,
+        A: BoundTransform<crate::resource::ParserPlaceholder, B> + TransformOutput<Output = O>,
+    >(
         &mut self,
         mut function: UserFunction<B>,
         at: At<'_>,
@@ -685,7 +739,10 @@ impl<O: WalkOutput> TransformFold<O> {
         )?;
         Ok(function)
     }
-    fn function_candidate<B: BindingAddress, A: Algebra<Transform, Output = O>>(
+    fn function_candidate<
+        B: BindingAddress,
+        A: BoundTransform<crate::resource::ParserPlaceholder, B> + TransformOutput<Output = O>,
+    >(
         &mut self,
         function: &UserFunction<B>,
         at: At<'_>,
@@ -698,8 +755,24 @@ impl<O: WalkOutput> TransformFold<O> {
         Ok(nested.changed.then_some(candidate))
     }
 }
+/// Transform one typed argument through the same fold used by call operands.
+/// Whole-argument replacement still inventories every original Secret operand.
+pub(super) fn transform_argument_bound<
+    P: ValueKind,
+    B: BindingAddress,
+    A: BoundTransform<P, B> + BoundTransform<crate::resource::ParserPlaceholder, B>,
+>(
+    argument: FunctionArgument<P, B>,
+    at: At<'_>,
+    algebra: &mut A,
+) -> Result<FunctionArgument<P, B>, WalkError> {
+    TransformFold::<A::Output>::new().argument(argument, at, algebra)
+}
+
 impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
-    pub(super) fn transform<A: Algebra<Transform>>(
+    pub(super) fn transform<
+        A: BoundTransform<P, B> + BoundTransform<crate::resource::ParserPlaceholder, B>,
+    >(
         self,
         at: At<'v>,
         algebra: &mut A,
@@ -799,11 +872,10 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
                 name,
                 args,
                 source_line,
-            } => Value::Deferred(DeferredValue::FunctionCall {
-                name,
-                args: walked.arguments(args, &at, algebra)?,
-                source_line,
-            }),
+            } => {
+                let args = walked.arguments(args, &at, algebra)?;
+                algebra.call(&at, name, args, source_line)?
+            }
             Self::Unavailable {
                 name,
                 args,
@@ -852,12 +924,7 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
                     Arc::new(changed)
                 };
                 let args = walked.arguments(args, &at, algebra)?;
-                Value::Deferred(DeferredValue::ResolvedFunctionCall {
-                    function,
-                    functions,
-                    args,
-                    source_line,
-                })
+                algebra.resolved_call(&at, function, functions, args, source_line)?
             }
             Self::Access(access) => {
                 // Keep the shell without relying on Value's nonreflexive Eq.
@@ -893,19 +960,21 @@ impl<'v, P: ValueKind, B: BindingAddress> Parts<'v, Transform, P, B> {
 
 /// Locating a saved protected position is another algebra over the one fold,
 /// never a second representation walker. No payload leaves this resolver.
-struct LocatorResolver<'a> {
-    locator: &'a ProtectedLocator,
+struct StructuralInspector<'a> {
+    locator: Option<&'a ProtectedLocator>,
     found: Option<Scoped<()>>,
 }
-impl LocatorResolver<'_> {
+impl StructuralInspector<'_> {
     fn record(&mut self, at: &At<'_>) {
-        let ProtectedLocator(_, anchor, node) = self.locator;
+        let Some(ProtectedLocator(_, anchor, node)) = self.locator else {
+            return;
+        };
         if at.is_secret() && at.secret_anchor.as_ref() == Some(anchor) && &at.position == node {
             self.found = Some(Scoped::new(at, ()));
         }
     }
 }
-impl Algebra<Inspect> for LocatorResolver<'_> {
+impl Algebra<Inspect> for StructuralInspector<'_> {
     type Output = ();
     fn scalar<P: ValueKind, B: BindingAddress>(
         &mut self,
@@ -961,8 +1030,8 @@ pub(super) fn resolve_protected<P: ValueKind, B: BindingAddress>(
     root: WalkRoot<'_>,
     value: &Value<P, B>,
 ) -> Result<Scoped<()>, WalkError> {
-    let mut resolver = LocatorResolver {
-        locator,
+    let mut resolver = StructuralInspector {
+        locator: Some(locator),
         found: None,
     };
     inspect(root, value, &mut resolver)?;

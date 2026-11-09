@@ -1716,7 +1716,7 @@ pub(crate) fn wit_to_wire_provider_error(err: wit::ProviderError) -> proto::Prov
 
 /// Rehydrate untrusted wire text only inside the native host decoder.
 /// Provider authoring has no entry point accepting this record.
-fn decode_provider_error(error: proto::ProviderError) -> CoreProviderError {
+pub(super) fn decode_provider_error(error: proto::ProviderError) -> CoreProviderError {
     use carina_core::provider::ProviderErrorKind;
     use carina_core::provider_text::{ProviderDiagnostic, ProviderErrorText, ProviderText};
     let kind = match error.kind {
@@ -5326,7 +5326,7 @@ mod tests {
         let error = check_protocol_version(
             r#"{"name":"old","display_name":"Old","version":"1.0.0","protocol_version":22}"#,
         )
-        .expect_err("current declarations require a supported protocol");
+        .expect_err("current declarations require the minimum supported protocol");
         assert!(error.contains(&format!(
             "requires at least version {}",
             carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION

@@ -1320,9 +1320,13 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
     }
 
     for (name, expression, source_line) in &function.local_lets {
-        let substituted =
-            crate::parser::substitute_fn_params(expression, &substitutions, *source_line)
-                .map_err(|error| locate_user_function_error(function, error))?;
+        let substituted = crate::value_walk::substitute_function_parameters(
+            expression,
+            &substitutions,
+            *source_line,
+            crate::value_walk::RewritePosition::Value,
+        )
+        .map_err(|error| locate_user_function_error(function, error))?;
         let resolved =
             resolve_ref_value_inner(&substituted, bindings, RuntimeContext::Session(config))
                 .map_err(|message| user_function_runtime_error(*source_line, message))
@@ -1333,10 +1337,11 @@ fn evaluate_runtime_user_function<B: BindingAddress>(
         );
     }
 
-    let substituted = crate::parser::substitute_fn_params(
+    let substituted = crate::value_walk::substitute_function_parameters(
         &function.body.value,
         &substitutions,
         function.body.source_line,
+        crate::value_walk::RewritePosition::Value,
     )
     .map_err(|error| locate_user_function_error(function, error))?;
     let result = resolve_ref_value_inner(&substituted, bindings, RuntimeContext::Session(config))

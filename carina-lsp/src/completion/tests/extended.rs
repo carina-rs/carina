@@ -5685,3 +5685,48 @@ fn reference_input_completion_accepts_compatible_key_output_from_a_sibling_file(
         "{completions:?}"
     );
 }
+
+fn write_bootstrap_completion_directory(directory: &std::path::Path, main: &str) {
+    std::fs::create_dir_all(directory).unwrap();
+    std::fs::write(directory.join("main.crn"), main).unwrap();
+    std::fs::write(directory.join("providers.crn"),
+        "provider test {}\nlet remote = provider test {}\nlet token = secret(env('UNSET_X'))\nlet unused = env('UNSET_Y')\n").unwrap();
+    std::fs::write(
+        directory.join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn bootstrap_provider_instance_completion_ignores_unconsumed_lets() {
+    let directory = tempfile::tempdir().unwrap();
+    write_bootstrap_completion_directory(directory.path(), "test.foo.bar { attr = 'r' }\n");
+    let doc = create_document(
+        "test.foo.bar {\n  attr = \"r\"\n  directives {\n    provider = \n  }\n}\n",
+    );
+    let items = test_provider_single_attr().complete_for_test(
+        &doc,
+        Position::new(3, 15),
+        Some(directory.path()),
+    );
+    assert!(items.iter().any(|item| item.label == "remote"), "{items:?}");
+}
+
+#[test]
+fn bootstrap_module_argument_completion_ignores_unconsumed_lets() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("module");
+    write_bootstrap_completion_directory(&module, "arguments { name: String }\n");
+    let text = "let service = use { source = './module' }\nservice {\n  \n}\n";
+    let doc = Document::new_with_path(
+        text.to_string(),
+        directory.path().join("main.crn"),
+        Arc::new(ProviderContext::new(
+            carina_core::EnvironmentSnapshot::empty(),
+        )),
+    );
+    let items =
+        test_provider().complete_for_test(&doc, Position::new(2, 2), Some(directory.path()));
+    assert!(items.iter().any(|item| item.label == "name"), "{items:?}");
+}

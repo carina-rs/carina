@@ -158,6 +158,8 @@ struct MockIdentifierPayload {
 
 impl Default for MockProcessProvider {
     fn default() -> Self {
+        #[cfg(target_arch = "wasm32")]
+        raw_output_probe("metadata");
         Self {
             reference_table: Default::default(),
             states: Mutex::new(HashMap::new()),
@@ -167,6 +169,76 @@ impl Default for MockProcessProvider {
 }
 
 impl MockProcessProvider {
+    #[cfg(target_arch = "wasm32")]
+    fn diagnostic_probe(
+        &self,
+        id: &ResourceId,
+        mode: &str,
+    ) -> Result<Option<ReadOutcome>, ProviderError> {
+        use carina_core::provider_text::{ProviderDiagnostic, ProviderText};
+        use carina_plugin_sdk::{EventLevel, ProviderDiagnostics, ProviderEvent};
+        if !mode.starts_with("__mock_diag_") {
+            return Ok(None);
+        }
+        let _teardown = RawOutputOnDrop;
+        raw_output_probe("runtime");
+        let diagnostics = ProviderDiagnostics::guest();
+        match mode {
+            "__mock_diag_handled__" => {
+                let error = ProviderError::api_error_caused_by(
+                    "handled operation",
+                    std::io::Error::other("nested ordinary cause input-secret-canary"),
+                )
+                .with_operation("CreateWidget")
+                .with_status(429)
+                .with_code("SlowDown")
+                .with_request_id("request-123");
+                diagnostics.emit(ProviderEvent::failure(
+                    EventLevel::Warn,
+                    ProviderText::new("attempt 2 of 5 input-secret-canary").into(),
+                    &error,
+                ));
+            }
+            "__mock_diag_string_panic__" => panic!("panic keeps context input-secret-canary"),
+            "__mock_diag_expect__" => {
+                let result: Result<(), std::io::Error> =
+                    Err(std::io::Error::other("input-secret-canary"));
+                result.expect("expect keeps context");
+            }
+            "__mock_diag_non_string_panic__" => {
+                std::panic::panic_any(Box::new(String::from("non-string-secret-canary")))
+            }
+            "__mock_diag_typed_panic__" => {
+                carina_plugin_sdk::panic_diagnostic(ProviderDiagnostic::new(std::io::Error::other(
+                    "typed panic ordinary cause input-secret-canary",
+                )))
+            }
+            "__mock_diag_emit_then_trap__" => {
+                let diagnostic = ProviderDiagnostic::message("warning survives trap".into());
+                diagnostics.emit(ProviderEvent::diagnostic(
+                    EventLevel::Warn,
+                    "before trap".into(),
+                    &diagnostic,
+                ));
+                std::arch::wasm32::unreachable();
+            }
+            "__mock_diag_budget__" | "__mock_diag_hook_failure__" => {
+                let diagnostic = ProviderDiagnostic::message("bounded ordinary warning".into());
+                for _ in 0..2048 {
+                    diagnostics.emit(ProviderEvent::diagnostic(
+                        EventLevel::Warn,
+                        "budget".into(),
+                        &diagnostic,
+                    ));
+                }
+                if mode == "__mock_diag_hook_failure__" {
+                    panic!("budget-panic-raw-fallback-canary");
+                }
+            }
+            _ => return Ok(None),
+        }
+        Ok(Some(ReadOutcome::NotFound { id: id.clone() }))
+    }
     fn optional_string_attribute(name: &str) -> CoreAttributeSchema {
         CoreAttributeSchema::optional(name, CoreAttributeType::string())
             .with_description("Mock create/resume test control")
@@ -925,6 +997,8 @@ impl CarinaProvider for MockProcessProvider {
         &mut self,
         attrs: &BTreeMap<String, Value>,
     ) -> Result<ReferenceScope, ProviderError> {
+        #[cfg(target_arch = "wasm32")]
+        raw_output_probe("initialization");
         if let Some(Value::String(cause)) = attrs.get("__mock_initialize_cause__") {
             return Err(ProviderError::api_error_caused_by(
                 "mock initialization request failed",
@@ -968,6 +1042,10 @@ impl CarinaProvider for MockProcessProvider {
         identifier: &AppliedIdentifier,
         _request: ReadRequest,
     ) -> Result<ReadOutcome, ProviderError> {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(outcome) = self.diagnostic_probe(id, identifier.as_str())? {
+            return Ok(outcome);
+        }
         if identifier.as_str() == "__mock_read_error__" {
             return Err(Self::operation_error("read", id));
         }
@@ -2047,6 +2125,29 @@ impl CarinaProvider for MockProcessProvider {
             states.insert("__mock_guest_rekeyed_state__".to_string(), state);
         }
         Ok(())
+    }
+}
+
+// Deliberately untyped test canaries: the host must discard every byte, even
+// when emitted through std, dependency-style writers, direct WASI or Drop.
+#[cfg(target_arch = "wasm32")]
+fn raw_output_probe(stage: &str) {
+    use std::io::Write as _;
+    eprintln!("raw-eprintln-{stage}-canary");
+    println!("raw-stdout-{stage}-canary");
+    let _ = std::io::stderr().write_all(format!("raw-writer-{stage}-canary\n").as_bytes());
+    let text = format!("raw-wasi-{stage}-canary\n");
+    for chunk in text.as_bytes().chunks(3) {
+        let _ = wasi::cli::stderr::get_stderr().blocking_write_and_flush(chunk);
+        let _ = wasi::cli::stdout::get_stdout().blocking_write_and_flush(chunk);
+    }
+}
+#[cfg(target_arch = "wasm32")]
+struct RawOutputOnDrop;
+#[cfg(target_arch = "wasm32")]
+impl Drop for RawOutputOnDrop {
+    fn drop(&mut self) {
+        raw_output_probe("teardown");
     }
 }
 
