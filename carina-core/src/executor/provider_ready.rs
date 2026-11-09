@@ -7,6 +7,7 @@
 
 #[cfg(test)]
 use crate::provider::ProviderNormalizer;
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::ops::Deref;
@@ -183,7 +184,108 @@ impl<T: ResourceWirePayload, K: RechecksResolved> Deref for ProviderReady<T, K> 
 }
 
 /// A fully resolved managed resource whose known value constraints have run.
+/// Its transport attributes are distinct from protected input-rule evidence:
+/// the latter can only be constructed inside provider preparation.
+///
+/// ```compile_fail,E0603
+/// use carina_core::executor::provider_ready::ProtectedInputProjection;
+/// ```
 pub type ProviderReadyResource = ProviderReady<ResolvedResource<ProviderModuleSource>>;
+
+/// Protected desired evidence for the input-rule discharge boundary. Only
+/// provider preparation can construct it; transport attributes cannot enter
+/// discharge directly.
+pub(crate) struct ProtectedInputProjection<'a> {
+    resource_id: &'a ResourceId,
+    attributes: Cow<'a, IndexMap<String, Value>>,
+    membership: Option<ProtectedPatchMembership>,
+}
+
+pub(crate) struct ProtectedPatchMembership {
+    pub(crate) changed: HashSet<String>,
+    pub(crate) removed: HashSet<String>,
+}
+
+impl ProtectedInputProjection<'_> {
+    pub(crate) fn resource_id(&self) -> &ResourceId {
+        self.resource_id
+    }
+    pub(crate) fn attributes(&self) -> &IndexMap<String, Value> {
+        &self.attributes
+    }
+    pub(crate) fn membership(&self) -> Option<&ProtectedPatchMembership> {
+        self.membership.as_ref()
+    }
+}
+
+impl ProviderReadyResource {
+    pub(crate) fn protected_input_projection(&self) -> ProtectedInputProjection<'_> {
+        ProtectedInputProjection {
+            resource_id: &self.id,
+            attributes: Cow::Borrowed(&self.diagnostic_attributes),
+            membership: None,
+        }
+    }
+    pub(crate) fn protected_update_projection(
+        &self,
+        patch: &crate::provider::UpdatePatch,
+    ) -> ProtectedInputProjection<'_> {
+        let mut attributes = self.diagnostic_attributes.clone();
+        let mut membership = ProtectedPatchMembership {
+            changed: HashSet::new(),
+            removed: HashSet::new(),
+        };
+        for op in &patch.ops {
+            let key = op.key();
+            membership.changed.insert(key.to_owned());
+            if let Some(sent) = op.sent_value() {
+                // Patch values are transport values. Restore the protection
+                // of the exact normalized desired tree before overlaying them.
+                attributes.insert(key.to_owned(), self.diagnostic_value(key, sent));
+            } else {
+                attributes.shift_remove(key);
+                membership.removed.insert(key.to_owned());
+            }
+        }
+        ProtectedInputProjection {
+            resource_id: &self.id,
+            attributes: Cow::Owned(attributes),
+            membership: Some(membership),
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl<'a> ProtectedInputProjection<'a> {
+    pub(crate) fn fixture_update(
+        resource: &'a Resource,
+        patch: &crate::provider::UpdatePatch,
+    ) -> Self {
+        let mut attributes = resource.attributes.clone();
+        let mut changed = HashSet::new();
+        let mut removed = HashSet::new();
+        for op in &patch.ops {
+            changed.insert(op.key().to_owned());
+            if let Some(sent) = op.sent_value() {
+                let protected = resource.attributes.get(op.key()).map_or_else(
+                    || sent.clone(),
+                    |source| {
+                        crate::value::mask_plaintext_using_secret_shape_fail_closed(sent, source)
+                    },
+                );
+                attributes.insert(op.key().to_owned(), protected);
+            } else {
+                attributes.shift_remove(op.key());
+                removed.insert(op.key().to_owned());
+            }
+        }
+        Self {
+            resource_id: &resource.id,
+            attributes: Cow::Owned(attributes),
+            membership: Some(ProtectedPatchMembership { changed, removed }),
+        }
+    }
+}
 
 /// A fully resolved data source whose known input constraints have run.
 pub type ProviderReadyDataSource =

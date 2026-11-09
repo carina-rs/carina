@@ -11,10 +11,12 @@ use std::{
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+mod declarations;
 mod estimator;
 mod evidence;
 mod instances;
 mod type_context;
+mod union_fits;
 use type_context::TypeFacts;
 pub use type_context::{InputCompositions, InputTypeContext};
 
@@ -43,6 +45,7 @@ use crate::{
 // granting them provider-readiness or changing their knowledge provenance.
 type InputValue = Value<ParserPlaceholder>;
 type InputAttributes = IndexMap<String, InputValue>;
+pub(crate) use declarations::InputRuleDeclarations;
 use evidence::{InputEvidence, RuleEvidence, SiteEvidence};
 
 // Only this classified write-site owner can open protected input evidence.
@@ -160,6 +163,7 @@ pub struct WriteSite<'a> {
     attributes: Option<Cow<'a, InputAttributes>>,
     authored: Option<AuthoredAttributes<'a>>,
     types: Option<&'a TypeFacts>,
+    default_members: Option<&'a [evidence::MapMember]>,
     context: InputWriteContext,
     schema: &'a ValidatedResourceSchema,
     rules: Vec<&'a InputRule<Compiled>>,
@@ -272,23 +276,7 @@ enum WriteSiteSource<'a, S> {
         #[allow(dead_code)] // Type-level construction authority; no runtime data.
         authority: &'a crate::executor::input_discharge::DischargeToken,
         admission: &'a PendingInputObligation,
-        inputs: ExecutorWriteInputs<'a>,
-    },
-}
-
-/// Dispatch evidence carries the resolved desired owner with every update.
-/// Observed state and the provider patch cannot stand in for unchanged siblings.
-pub(crate) enum ExecutorWriteInputs<'a> {
-    Create(&'a crate::provider::ProviderReadyResource),
-    Update {
-        desired: &'a crate::provider::ProviderReadyResource,
-        patch: &'a crate::provider::UpdatePatch,
-    },
-    #[cfg(any(test, feature = "test-utils"))]
-    FixtureUpdate {
-        resource_id: &'a ResourceId,
-        desired: &'a IndexMap<String, Value>,
-        patch: &'a crate::provider::UpdatePatch,
+        inputs: &'a crate::executor::provider_ready::ProtectedInputProjection<'a>,
     },
 }
 
@@ -301,6 +289,7 @@ fn classify_write_site<'a, S>(
     schemas: &'a SchemaRegistry,
 ) -> Result<Option<WriteSite<'a>>, crate::provider::UpdatePatchError> {
     let mut update = None;
+    let mut default_members = None;
     let (
         target,
         resource_id,
@@ -318,28 +307,13 @@ fn classify_write_site<'a, S>(
             inputs,
         } => {
             update = admission.update.clone();
-            let (resource_id, desired, patch) = match inputs {
-                ExecutorWriteInputs::Create(resource) => (
-                    &resource.as_resource().id,
-                    &resource.as_resource().attributes,
-                    None,
-                ),
-                ExecutorWriteInputs::Update { desired, patch } => (
-                    &desired.as_resource().id,
-                    &desired.as_resource().attributes,
-                    Some(patch),
-                ),
-                #[cfg(any(test, feature = "test-utils"))]
-                ExecutorWriteInputs::FixtureUpdate {
-                    resource_id,
-                    desired,
-                    patch,
-                } => (resource_id, desired, Some(patch)),
-            };
-            let mut attributes = project_attributes(desired);
-            if let (Some(context), Some(patch)) = (&mut update, patch) {
-                context.desired = attributes;
-                attributes = context.overlay(patch);
+            default_members = Some(admission.default_members.as_slice());
+            let resource_id = inputs.resource_id();
+            let attributes = project_attributes(inputs.attributes());
+            if let (Some(context), Some(membership)) = (&mut update, inputs.membership()) {
+                context.desired = attributes.clone();
+                context.changed.clone_from(&membership.changed);
+                context.removed.clone_from(&membership.removed);
             }
             (
                 Some(admission.target.clone()),
@@ -588,6 +562,7 @@ fn classify_write_site<'a, S>(
         attributes,
         authored,
         types,
+        default_members,
         context,
         schema,
         rules,
@@ -646,6 +621,7 @@ pub struct PendingInputObligation {
     paired_deletes: Vec<PairedInputDelete>,
     context: InputWriteContext,
     schema: Arc<ValidatedResourceSchema>,
+    default_members: Vec<evidence::MapMember>,
 }
 
 impl PendingInputObligation {
@@ -866,6 +842,12 @@ impl<S> FinalizedPlan<S> {
                 paired_deletes: view.paired_deletes.clone(),
                 context,
                 schema: Arc::clone(&schema),
+                default_members: types
+                    .facts
+                    .default_keys
+                    .get(view.resource_id)
+                    .cloned()
+                    .unwrap_or_default(),
             });
             for applicable in view.applicable_rules() {
                 match applicable.evaluate() {
@@ -888,6 +870,12 @@ impl<S> FinalizedPlan<S> {
                     paired_deletes: view.paired_deletes,
                     context,
                     schema: Arc::clone(&schema),
+                    default_members: types
+                        .facts
+                        .default_keys
+                        .get(view.resource_id)
+                        .cloned()
+                        .unwrap_or_default(),
                 });
             }
         }
@@ -958,7 +946,7 @@ enum Truth {
 }
 
 enum PathEvidence<'a> {
-    Present(InputEvidence<'a>),
+    Member(InputEvidence<'a>),
     Absent { optional: bool },
     Pending,
     // Ignored inputs and unsent omissions provide no applied evidence. In
@@ -1018,7 +1006,7 @@ fn path_evidence<'s>(
         };
         value = child;
     }
-    PathEvidence::Present(value)
+    PathEvidence::Member(value)
 }
 
 fn absent_evidence(
@@ -1038,11 +1026,14 @@ fn presence(evidence: PathEvidence<'_>) -> Truth {
         PathEvidence::Absent { .. } => Truth::False,
         PathEvidence::Pending | PathEvidence::Withheld => Truth::Pending,
         PathEvidence::Failed => Truth::Failed,
-        PathEvidence::Present(value) => {
+        PathEvidence::Member(value) => {
             if value.failed() {
                 Truth::Failed
             } else {
-                Truth::True
+                match value.membership() {
+                    evidence::Membership::Present => Truth::True,
+                    evidence::Membership::Possible => Truth::Pending,
+                }
             }
         }
     }
@@ -1097,7 +1088,7 @@ fn scalar_equals(
 ) -> Truth {
     use crate::resource::{ConcreteValueRef, EnumValueResolver};
     let evidence = match evidence {
-        PathEvidence::Present(value) => value,
+        PathEvidence::Member(value) => value,
         PathEvidence::Absent { .. } => return Truth::False,
         PathEvidence::Pending | PathEvidence::Withheld => return Truth::Pending,
         PathEvidence::Failed => return Truth::Failed,
@@ -1108,7 +1099,9 @@ fn scalar_equals(
     if !evidence.known() {
         return Truth::Pending;
     }
-    let value = evidence.source();
+    let Some(value) = evidence.source() else {
+        return Truth::Pending;
+    };
     let ty = literal_type(applicable, path);
     let resolver =
         ty.map(|ty| EnumValueResolver::with_defs(ty, applicable.site.schema.as_schema().defs()));
@@ -1193,12 +1186,11 @@ fn failed_verdict(rule: &InputRule<Compiled>) -> InputVerdict {
 }
 
 fn verdict(applicable: &ApplicableInputRule<'_, '_>) -> InputVerdict {
-    let view = applicable.site;
     let rule = applicable.rule;
     if applicable.pending_instance {
         return match path_evidence(applicable, rule.path()) {
             PathEvidence::Failed => failed_verdict(rule),
-            PathEvidence::Present(value) if value.failed() => failed_verdict(rule),
+            PathEvidence::Member(value) if value.failed() => failed_verdict(rule),
             _ => InputVerdict::Undecided,
         };
     }
@@ -1208,30 +1200,10 @@ fn verdict(applicable: &ApplicableInputRule<'_, '_>) -> InputVerdict {
         Truth::Failed => return failed_verdict(rule),
         Truth::True => {}
     }
-    let mut verdict = target_verdict(applicable);
-    if matches!(verdict, InputVerdict::Violation(_)) {
-        return verdict;
-    }
-    if applicable.owner.is_empty()
-        && matches!(rule.target(), InputRuleTarget::MapKeys(path) if path.as_str() == "tags")
-        && let Some(keys) = view
-            .types
-            .and_then(|types| types.default_keys.get(view.resource_id))
-    {
-        for (key, mandatory) in keys {
-            if let Err(violation) = evaluate_string(rule, key) {
-                if *mandatory {
-                    return InputVerdict::Violation(violation);
-                }
-                verdict = InputVerdict::Undecided;
-            }
-        }
-    }
-    verdict
+    target_verdict(applicable)
 }
 
 fn target_verdict(applicable: &ApplicableInputRule<'_, '_>) -> InputVerdict {
-    let view = applicable.site;
     let rule = applicable.rule;
     let truth = match rule.predicate() {
         InputPredicate::Present => Some(presence(path_evidence(applicable, rule.path()))),
@@ -1270,7 +1242,7 @@ fn target_verdict(applicable: &ApplicableInputRule<'_, '_>) -> InputVerdict {
         PathEvidence::Withheld => return InputVerdict::Undecided,
         PathEvidence::Failed => return failed_verdict(rule),
         PathEvidence::Pending => {}
-        PathEvidence::Present(value) => {
+        PathEvidence::Member(value) => {
             if value.failed() {
                 return failed_verdict(rule);
             }
@@ -1282,35 +1254,60 @@ fn target_verdict(applicable: &ApplicableInputRule<'_, '_>) -> InputVerdict {
                             .map_or_else(InputVerdict::Violation, |()| InputVerdict::Proven);
                     }
                 }
-                InputRuleTarget::MapKeys(_) => {
-                    if let Some(crate::resource::ConcreteValueRef::Map(fields)) =
-                        source.as_concrete()
-                    {
-                        let defs = view.schema.as_schema().defs();
-                        let Some(ty) = literal_type(applicable, rule.path()) else {
-                            return failed_verdict(rule);
-                        };
-                        let crate::schema::Shape::Map { key, .. } = ty.shape_with_defs(defs) else {
-                            return failed_verdict(rule);
-                        };
-                        for text in fields.keys() {
-                            let Ok(text) =
-                                crate::value::canonicalize_authored_map_key_text(text, key, defs)
-                            else {
-                                return failed_verdict(rule);
-                            };
-                            if let Err(violation) = evaluate_string(rule, &text) {
-                                return InputVerdict::Violation(violation);
-                            }
-                        }
-                        return InputVerdict::Proven;
-                    }
-                }
+                InputRuleTarget::MapKeys(_) => return map_keys_verdict(applicable, &value),
             }
-            return estimator::estimate(applicable, Some(source));
+            return estimator::estimate(applicable, source);
         }
     }
     estimator::estimate(applicable, None)
+}
+
+fn map_keys_verdict(
+    applicable: &ApplicableInputRule<'_, '_>,
+    evidence: &InputEvidence<'_>,
+) -> InputVerdict {
+    let rule = applicable.rule;
+    let mut possible_violation = false;
+    for member in evidence.additional_members() {
+        if let Err(violation) = evaluate_string(rule, &member.key) {
+            match member.membership {
+                evidence::Membership::Present => return InputVerdict::Violation(violation),
+                evidence::Membership::Possible => possible_violation = true,
+            }
+        }
+    }
+    let base = if let Some(source) = evidence.source() {
+        if let Some(crate::resource::ConcreteValueRef::Map(fields)) = source.as_concrete() {
+            let defs = applicable.site.schema.as_schema().defs();
+            let Some(ty) = literal_type(applicable, rule.path()) else {
+                return failed_verdict(rule);
+            };
+            let crate::schema::Shape::Map { key, .. } = ty.shape_with_defs(defs) else {
+                return failed_verdict(rule);
+            };
+            for text in fields.keys() {
+                let Ok(text) = crate::value::canonicalize_authored_map_key_text(text, key, defs)
+                else {
+                    return failed_verdict(rule);
+                };
+                if let Err(violation) = evaluate_string(rule, &text) {
+                    return InputVerdict::Violation(violation);
+                }
+            }
+            InputVerdict::Proven
+        } else {
+            estimator::estimate(applicable, Some(source))
+        }
+    } else {
+        // This optional map can contain only the explicitly represented
+        // possible/mandatory members, all checked above.
+        InputVerdict::Proven
+    };
+    match base {
+        InputVerdict::Violation(_) | InputVerdict::Undecided => base,
+        InputVerdict::Proven if possible_violation => InputVerdict::Undecided,
+        InputVerdict::Proven => InputVerdict::Proven,
+    }
 }
 
 fn known_string(
@@ -1322,7 +1319,7 @@ fn known_string(
     if !value.known() {
         return None;
     }
-    let value = value.source();
+    let value = value.source()?;
     match value.as_concrete()? {
         ConcreteValueRef::String(value) => Some(value.expose_plaintext().to_owned()),
         ConcreteValueRef::CanonicalEnum(value) => Some(value.api_value().to_owned()),
@@ -1491,37 +1488,49 @@ where
             Some(resource)
         })
         .collect::<Vec<_>>();
-    for config in &parsed.providers {
-        let crate::parser::ProviderConfig {
-            name,
-            attributes,
-            default_tags,
-            source,
-            version,
-            revision,
-            unresolved_attributes,
-            binding,
-        } = config;
-        let config = crate::parser::ProviderConfig {
-            name: name.clone(),
-            attributes: project_attributes(attributes),
-            default_tags: project_attributes(default_tags),
-            source: source.clone(),
-            version: version.clone(),
-            revision: revision.clone(),
-            unresolved_attributes: project_attributes(unresolved_attributes),
-            binding: binding.clone(),
-        };
+    let configs = parsed
+        .providers
+        .iter()
+        .map(|config| {
+            let crate::parser::ProviderConfig {
+                name,
+                attributes,
+                default_tags,
+                source,
+                version,
+                revision,
+                unresolved_attributes,
+                binding,
+            } = config;
+            crate::parser::ProviderConfig {
+                name: name.clone(),
+                attributes: project_attributes(attributes),
+                default_tags: project_attributes(default_tags),
+                source: source.clone(),
+                version: version.clone(),
+                revision: revision.clone(),
+                unresolved_attributes: project_attributes(unresolved_attributes),
+                binding: binding.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let types = InputTypeContext::<ModuleSource>::empty().with_default_tag_projection(
+        &configs,
+        schemas,
+        resources.iter().map(|resource| &resource.id),
+    )?;
+    for config in &configs {
         // This is the existing host merge, also called by plan preprocessing
         // and dispatch normalization before WireReady admission (#4279).
-        crate::provider::merge_default_tags_with_placeholders(&config, &mut resources, schemas)?;
+        crate::provider::merge_default_tags_with_placeholders(config, &mut resources, schemas)?;
     }
     let mut report = AuthoredInputReport::default();
     for resource in &resources {
-        if let Some(site) =
+        if let Some(mut site) =
             classify_write_site::<ModuleSource>(WriteSiteSource::Preview(resource), schemas)
                 .map_err(|error| crate::provider::HostError::invalid_input(error.to_string()))?
         {
+            site.types = Some(&types.facts);
             for rule in site.applicable_rules() {
                 match rule.evaluate() {
                     InputVerdict::Violation(violation) => {
@@ -1670,7 +1679,7 @@ impl<S: Clone> crate::plan::AdmittedPlan<S> {
 pub(crate) fn executor_write_site<'a>(
     authority: &'a crate::executor::input_discharge::DischargeToken,
     admission: &'a PendingInputObligation,
-    inputs: ExecutorWriteInputs<'a>,
+    inputs: &'a crate::executor::provider_ready::ProtectedInputProjection<'a>,
     schemas: &'a SchemaRegistry,
 ) -> Result<Option<WriteSite<'a>>, crate::provider::UpdatePatchError> {
     classify_write_site::<ModuleSource>(

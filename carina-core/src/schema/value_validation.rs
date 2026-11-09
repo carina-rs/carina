@@ -577,6 +577,40 @@ pub(super) fn validate_value_locally<
 
 /// Consume the ordinary validator's selected fit, retaining the caller's
 /// non-consuming reference path while comparing declaration-ordered members.
+pub(crate) struct SelectedInputUnion<'a> {
+    pub(crate) member: &'a CompiledAttributeType,
+    pub(crate) fit: Fit<'a>,
+}
+
+pub(crate) fn select_input_union_fit_on_path<
+    'a,
+    'v,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    T: StructuralPending<'v, P, B>,
+>(
+    members: &'a [CompiledAttributeType],
+    value: &Classification<'v, P, B, T>,
+    defs: &'a BTreeMap<String, CompiledAttributeType>,
+    visited: &mut Vec<&'a str>,
+) -> Option<SelectedInputUnion<'a>> {
+    ValueValidator { defs, lookup: None }
+        .union_with_assignment(
+            members,
+            value.into(),
+            &FieldPath::new(),
+            FieldAncestry::WRITABLE,
+            visited,
+            None,
+        )
+        .ok()
+        .map(|admitted| SelectedInputUnion {
+            member: admitted.selected.member,
+            fit: admitted.selected.fit,
+        })
+}
+
+#[cfg(test)]
 pub(crate) fn select_union_member_from_knowledge_on_path<
     'a,
     'v,
@@ -589,17 +623,7 @@ pub(crate) fn select_union_member_from_knowledge_on_path<
     defs: &'a BTreeMap<String, CompiledAttributeType>,
     visited: &mut Vec<&'a str>,
 ) -> Option<&'a CompiledAttributeType> {
-    ValueValidator { defs, lookup: None }
-        .union_with_assignment(
-            members,
-            value.into(),
-            &FieldPath::new(),
-            FieldAncestry::WRITABLE,
-            visited,
-            None,
-        )
-        .ok()
-        .map(|admitted| admitted.selected.member)
+    select_input_union_fit_on_path(members, value, defs, visited).map(|selected| selected.member)
 }
 
 #[cfg(test)]

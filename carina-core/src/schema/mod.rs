@@ -9712,14 +9712,28 @@ impl<'a> EffectiveSchemaNode<'a> {
 }
 
 /// A resource schema that has passed every whole-schema rule.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ValidatedResourceSchema {
     pub(crate) admission_identity: crate::validation::admission::DeclarationId,
     schema: Arc<PatternResourceSchema<Compiled>>,
     identity_paths: Vec<IdentityPath>,
+    input_rule_declarations: Arc<crate::input_rules::InputRuleDeclarations>,
+}
+
+impl std::fmt::Debug for ValidatedResourceSchema {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValidatedResourceSchema")
+            .field("admission_identity", &self.admission_identity)
+            .field("schema", &self.schema)
+            .field("identity_paths", &self.identity_paths)
+            .finish()
+    }
 }
 
 impl ValidatedResourceSchema {
+    pub(crate) fn input_rule_declarations(&self) -> &crate::input_rules::InputRuleDeclarations {
+        &self.input_rule_declarations
+    }
     pub fn as_schema(&self) -> &PatternResourceSchema<Compiled> {
         &self.schema
     }
@@ -15191,10 +15205,14 @@ fn finish_resource_schema_validation(
     match schema {
         Some(mut schema) if issues.is_empty() => {
             schema.duplicate_attributes.clear();
+            let schema = Arc::new(schema);
+            let input_rule_declarations =
+                Arc::new(crate::input_rules::InputRuleDeclarations::new(&schema));
             Ok(ValidatedResourceSchema {
                 admission_identity: Default::default(),
-                schema: Arc::new(schema),
+                schema,
                 identity_paths,
+                input_rule_declarations,
             })
         }
         _ => Err(ResourceSchemaValidationError {

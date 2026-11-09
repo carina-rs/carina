@@ -1314,3 +1314,315 @@ fn guard_selection_keeps_unrelated_failed_fields_out_of_resource_struct_and_map_
         assert_eq!(verdicts, vec![InputVerdict::Proven; 4]);
     }
 }
+
+fn fallback_tags_schema() -> SchemaRegistry {
+    registry(
+        ResourceSchema::new("Review")
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .attribute(AttributeSchema::optional("fallback", AttributeType::string()).build())
+            .input_rule(rule(
+                "fallback",
+                InputPredicate::Present,
+                InputCondition::Not(Box::new(InputCondition::Present(path("tags")))),
+            )),
+    )
+}
+
+#[test]
+fn possible_default_tags_keep_authored_absence_conditions_pending() {
+    let schemas = fallback_tags_schema();
+    let mut file = crate::parser::parse_file(
+        "provider mock {}\nlet example = mock.Review {}",
+        std::path::Path::new("main.crn"),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    file.providers[0].default_tags.insert(
+        "app".into(),
+        Value::resource_ref(
+            crate::resource::RelativeBindingName::new("producer"),
+            "value",
+            vec![],
+        ),
+    );
+    let report = check_authored_inputs(&file, &schemas).unwrap();
+    assert!(
+        report.is_empty(),
+        "possible tags cannot prove the absence guard: {:?}",
+        report.iter().map(ToString::to_string).collect::<Vec<_>>()
+    );
+    assert_eq!(report.pending().len(), 1);
+}
+
+#[test]
+fn possible_default_tags_keep_plan_absence_conditions_pending() {
+    let schemas = fallback_tags_schema();
+    let target = Resource::with_provider("mock", "Review", "example", None);
+    let config = crate::parser::ProviderConfig {
+        name: "mock".into(),
+        attributes: Default::default(),
+        default_tags: IndexMap::from([(
+            "app".into(),
+            Value::root_resource_ref("producer", "value", vec![]),
+        )]),
+        source: None,
+        version: None,
+        revision: None,
+        unresolved_attributes: Default::default(),
+        binding: None,
+    };
+    let types = InputTypeContext::<ModuleSource>::empty()
+        .with_default_tags(&[config], &schemas, [&target.id])
+        .unwrap();
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resolved_input_fixture(target, &schemas)));
+    let checked = FinalizedPlan::new(plan)
+        .check_inputs_with_types(&schemas, &HashMap::new(), &types)
+        .expect("possible default tags must not establish absence");
+    assert_eq!(checked.pending_inputs().len(), 1);
+}
+
+#[test]
+fn default_tag_membership_is_shared_by_presence_predicates_and_conditions() {
+    for (target, predicate, condition) in [
+        ("tags", InputPredicate::Present, InputCondition::Always),
+        ("tags", InputPredicate::Absent, InputCondition::Always),
+        (
+            "fallback",
+            InputPredicate::Present,
+            InputCondition::Present(path("tags")),
+        ),
+        (
+            "fallback",
+            InputPredicate::Present,
+            InputCondition::Not(Box::new(InputCondition::Present(path("tags")))),
+        ),
+    ] {
+        let schemas = registry(
+            ResourceSchema::new("Review")
+                .attribute(
+                    AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                        .build(),
+                )
+                .attribute(AttributeSchema::optional("fallback", AttributeType::string()).build())
+                .input_rule(rule(target, predicate, condition)),
+        );
+        let resource = Resource::with_provider("mock", "Review", "example", None);
+        let config = crate::parser::ProviderConfig {
+            name: "mock".into(),
+            attributes: Default::default(),
+            default_tags: IndexMap::from([(
+                "app".into(),
+                Value::root_resource_ref("producer", "value", vec![]),
+            )]),
+            source: None,
+            version: None,
+            revision: None,
+            unresolved_attributes: Default::default(),
+            binding: None,
+        };
+        let types = InputTypeContext::<ModuleSource>::empty()
+            .with_default_tags(&[config], &schemas, [&resource.id])
+            .unwrap();
+        let mut site =
+            classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+                .unwrap()
+                .unwrap();
+        site.types = Some(&types.facts);
+        assert_eq!(
+            site.applicable_rules()
+                .map(|r| r.evaluate())
+                .collect::<Vec<_>>(),
+            vec![InputVerdict::Undecided]
+        );
+    }
+}
+
+#[test]
+fn failed_collection_and_union_owners_keep_failure_separate_from_membership() {
+    let local = || {
+        AttributeType::struct_with_rules(
+            "Item",
+            vec![StructField::optional("target", AttributeType::string()).build()],
+            vec![],
+            vec![rule(
+                "target",
+                InputPredicate::Present,
+                InputCondition::Always,
+            )],
+        )
+    };
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("items", AttributeType::list(local())).build())
+            .attribute(AttributeSchema::optional("objects", AttributeType::map(local())).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "choice",
+                    AttributeType::union(vec![local(), AttributeType::bool()]),
+                )
+                .build(),
+            ),
+    );
+    let verdicts = evaluate(
+        &schemas,
+        [
+            ("items", failed_value()),
+            ("objects", failed_value()),
+            ("choice", failed_value()),
+        ],
+    );
+    assert_eq!(verdicts.len(), 3);
+    assert!(verdicts.iter().all(|verdict| matches!(verdict, InputVerdict::Violation(v) if v.reason() == InputViolationReason::EvaluationFailed)), "{verdicts:?}");
+    assert_eq!(
+        evaluate(
+            &schemas,
+            [
+                ("items", pending()),
+                ("objects", pending()),
+                ("choice", pending())
+            ]
+        ),
+        vec![InputVerdict::Undecided; 3]
+    );
+}
+
+#[test]
+fn enclosing_failures_reach_nested_rules_without_consuming_unknown_instances() {
+    let leaf = AttributeType::struct_with_rules(
+        "Leaf",
+        vec![StructField::optional("target", AttributeType::string()).build()],
+        vec![],
+        vec![rule(
+            "target",
+            InputPredicate::Present,
+            InputCondition::Always,
+        )],
+    );
+    let node = AttributeType::struct_(
+        "Node",
+        vec![
+            StructField::optional("child", AttributeType::ref_("Node")).build(),
+            StructField::optional("leaf", leaf).build(),
+        ],
+    );
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .with_def("Node", node)
+            .attribute(
+                AttributeSchema::optional(
+                    "items",
+                    AttributeType::list(AttributeType::ref_("Node")),
+                )
+                .build(),
+            ),
+    );
+    let failed = evaluate(&schemas, [("items", failed_value())]);
+    assert_eq!(failed.len(), 1);
+    assert_failed(&failed[0]);
+    assert_eq!(
+        evaluate(&schemas, [("items", pending())]),
+        vec![InputVerdict::Undecided]
+    );
+}
+
+#[test]
+fn recursive_union_binding_reuses_fits_with_a_linear_validator_budget() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const COUNT: usize = 12;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&calls);
+    let scalar = AttributeType::refined_int_with_validator(
+        TypeIdentity::new(Some("mock"), ["Review"], "Counted"),
+        None,
+        crate::schema::validator(move |_| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }),
+    );
+    let node = AttributeType::struct_with_rules(
+        "NodeObject",
+        vec![
+            StructField::optional("number", scalar).build(),
+            StructField::optional("target", AttributeType::bool()).build(),
+            StructField::optional("child", AttributeType::ref_("Node")).build(),
+        ],
+        vec![],
+        vec![rule(
+            "target",
+            InputPredicate::Present,
+            InputCondition::Always,
+        )],
+    );
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .with_def(
+                "Node",
+                AttributeType::union(vec![node, AttributeType::bool()]),
+            )
+            .attribute(AttributeSchema::optional("node", AttributeType::ref_("Node")).build()),
+    );
+    let mut node = object([
+        ("number", Value::Concrete(ConcreteValue::Int(1))),
+        ("target", Value::Concrete(ConcreteValue::Bool(true))),
+    ]);
+    for _ in 1..COUNT {
+        node = object([
+            ("number", Value::Concrete(ConcreteValue::Int(1))),
+            ("target", Value::Concrete(ConcreteValue::Bool(true))),
+            ("child", node),
+        ]);
+    }
+    calls.store(0, Ordering::Relaxed);
+    let verdicts = evaluate(&schemas, [("node", node)]);
+    assert_eq!(verdicts.len(), COUNT);
+    assert!(verdicts.iter().all(|v| *v == InputVerdict::Proven));
+    let actual = calls.load(Ordering::Relaxed);
+    assert!(
+        actual <= COUNT,
+        "{actual} scalar validator calls exceed the linear budget {COUNT}"
+    );
+}
+
+#[test]
+fn deep_rule_reachability_is_shared_with_a_linear_schema_visit_budget() {
+    const DEPTH: usize = 64;
+    let mut ty = AttributeType::struct_with_rules(
+        "Leaf",
+        vec![StructField::optional("target", AttributeType::bool()).build()],
+        vec![],
+        vec![rule(
+            "target",
+            InputPredicate::Present,
+            InputCondition::Always,
+        )],
+    );
+    let mut value = object([("target", Value::Concrete(ConcreteValue::Bool(true)))]);
+    for _ in 1..DEPTH {
+        ty = AttributeType::struct_("Parent", vec![StructField::optional("child", ty).build()]);
+        value = object([("child", value)]);
+    }
+    instances::with_schema_visit_budget(DEPTH + 8, || {
+        let schemas = registry(
+            ResourceSchema::new("Review").attribute(AttributeSchema::optional("root", ty).build()),
+        );
+        for _ in 0..4 {
+            let resource = Resource::with_provider("mock", "Review", "example", None)
+                .with_attribute("root", value.clone());
+            let site =
+                classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+                    .unwrap()
+                    .unwrap();
+            assert!(instances::has_declarations(&site));
+            assert_eq!(
+                site.applicable_rules()
+                    .map(|r| r.evaluate())
+                    .collect::<Vec<_>>(),
+                vec![InputVerdict::Proven]
+            );
+        }
+    });
+}

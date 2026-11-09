@@ -267,7 +267,8 @@ impl private::Sealed for RelativeBindingName {
     fn input_preview<P: super::ValueKind>(value: super::Value<P, Self>) -> super::Value<P> {
         // Parser-owned directories have root-relative bindings. Qualification
         // preserves their structure; preview knowledge never resolves them.
-        value.resolve_root(&super::RootScope::new())
+        let scope = super::RootScope::new();
+        value.resolve_bindings(&mut |binding| scope.resolve(binding))
     }
 
     fn knowledge_diagnostic(

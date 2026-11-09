@@ -36,6 +36,137 @@ fn string(value: &str) -> Value {
     Value::Concrete(ConcreteValue::String(value.into()))
 }
 
+async fn assert_late_secret_map_failure_is_protected(update: bool) {
+    const PRIVATE_KEY: &str = "private-late-rule-key";
+    let mut schemas = SchemaRegistry::new();
+    let local = PatternAttributeType::struct_with_rules(
+        "Object",
+        vec![
+            PatternStructField::optional("guard", PatternAttributeType::bool()).build(),
+            PatternStructField::optional("target", PatternAttributeType::string()).build(),
+        ],
+        vec![],
+        vec![
+            InputRule::value(
+                InputRuleScope::EveryWrite,
+                InputPath::new("target").unwrap(),
+                InputRuleCode::new("test.late.target").unwrap(),
+                InputPredicate::Present,
+            )
+            .with_condition(crate::schema::InputCondition::Equals {
+                path: InputPath::new("guard").unwrap(),
+                literal: crate::schema::InputLiteral::Bool(true),
+            }),
+        ],
+    );
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .attribute(
+                PatternAttributeSchema::optional("value", PatternAttributeType::bool()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("objects", PatternAttributeType::map(local))
+                    .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let objects = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+        PRIVATE_KEY.into(),
+        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "guard".into(),
+            Value::root_resource_ref("source", "value", vec![]),
+        )]))),
+    )])))
+    .into_secret();
+    let mut consumer = Resource::new("test", "consumer").with_attribute("objects", objects);
+    consumer.binding = Some(absolute_binding("consumer"));
+    consumer
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("source"));
+    let mut resources = resolved_fixture_resources(vec![source(), consumer]);
+    let consumer = resources.remove(1);
+    let source = resources.remove(0);
+    let provider = MockProvider::new();
+    provider.push_create(Ok(State::existing(
+        source.id.clone(),
+        crate::test_support::snapshot_attributes(HashMap::from([(
+            "value".into(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        )])),
+    )
+    .with_identifier("source-id")));
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(source));
+    if update {
+        provider.push_update(Ok(ok_state(&consumer.id)));
+        plan.add(Effect::Update {
+            from: Box::new(
+                State::existing(
+                    consumer.id.clone(),
+                    crate::test_support::snapshot_attributes(HashMap::from([(
+                        "objects".into(),
+                        Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                            PRIVATE_KEY.into(),
+                            Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                                "guard".into(),
+                                Value::Concrete(ConcreteValue::Bool(false)),
+                            )]))),
+                        )]))),
+                    )])),
+                )
+                .with_identifier("old-id"),
+            ),
+            identifier: AppliedIdentifier::new("old-id").unwrap(),
+            to: consumer,
+            changed_attributes: vec!["objects".into()],
+        });
+    } else {
+        provider.push_create(Ok(ok_state(&consumer.id)));
+        plan.add(Effect::Create(consumer));
+    }
+    let checked = FinalizedPlan::new(plan.clone())
+        .check_inputs(&schemas, &HashMap::new())
+        .unwrap();
+    assert_eq!(checked.pending_inputs().len(), 1);
+    let (result, _) = run(
+        &provider,
+        plan,
+        &schemas,
+        HashMap::new(),
+        Default::default(),
+        &NoopNormalizer,
+    )
+    .await;
+    assert_eq!((result.success_count, result.failure_count()), (1, 1));
+    assert_eq!(provider.captured_create_resources().len(), 1);
+    assert!(provider.captured_update_requests().is_empty());
+    let failure = result.failures()[0].kind();
+    assert_eq!(failure.label(), "input rule violation");
+    assert!(!format!("{:?}", result.failures()[0]).contains(PRIVATE_KEY));
+    let mut error: Option<&dyn std::error::Error> = Some(failure);
+    while let Some(current) = error {
+        let rendered = format!("{current}\n{current:?}");
+        assert!(
+            !rendered.contains(PRIVATE_KEY),
+            "secret map key leaked at dispatch: {rendered}"
+        );
+        error = current.source();
+    }
+}
+
+#[tokio::test]
+async fn input_discharge_create_protects_secret_map_keys_in_late_rule_failures() {
+    assert_late_secret_map_failure_is_protected(false).await;
+}
+
+#[tokio::test]
+async fn input_discharge_update_protects_secret_map_keys_in_late_rule_failures() {
+    assert_late_secret_map_failure_is_protected(true).await;
+}
+
 #[tokio::test]
 async fn input_discharge_enum_identifier_is_proven_on_its_wire_string() {
     let mut schemas = SchemaRegistry::new();

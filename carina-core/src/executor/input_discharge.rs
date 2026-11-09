@@ -10,7 +10,7 @@ use super::provider_ready::{CheckInput, ProviderPreparationContext};
 use crate::{
     binding_index::SecretPreservingAttributes,
     effect::{DeletedInstanceKey, Effect, EffectGeneration},
-    input_rules::{ExecutorWriteInputs, InputVerdict, PendingInputObligation, executor_write_site},
+    input_rules::{InputVerdict, PendingInputObligation, executor_write_site},
     provider::{
         AppliedIdentifier, CreateRequest, HostProvider, ProviderReadyResource, UpdateRequest,
     },
@@ -263,7 +263,7 @@ impl WriteCheck {
 
     fn discharge(
         &self,
-        inputs: ExecutorWriteInputs<'_>,
+        inputs: &super::provider_ready::ProtectedInputProjection<'_>,
         schemas: &SchemaRegistry,
     ) -> Result<(), EffectFailureKind> {
         let Some(admission) = &self.admission else {
@@ -298,7 +298,7 @@ impl WriteCheck {
         writeback: SecretPreservingAttributes,
         schemas: &SchemaRegistry,
     ) -> Result<PreparedWrite<CreateRequest>, EffectFailureKind> {
-        self.discharge(ExecutorWriteInputs::Create(request.resource()), schemas)?;
+        self.discharge(&request.resource().protected_input_projection(), schemas)?;
         let resource_id = request.resource().id.clone();
         let request = Arc::new(request);
         let retained_request = Arc::clone(&request);
@@ -328,10 +328,7 @@ impl WriteCheck {
         let request = UpdateRequest::checked(from, changed, &desired, schema)
             .map_err(EffectFailureKind::execution)?;
         self.discharge(
-            ExecutorWriteInputs::Update {
-                desired: &desired,
-                patch: request.patch(),
-            },
+            &desired.protected_update_projection(request.patch()),
             schemas,
         )?;
         Ok(self.seal_update(desired.as_resource().id.clone(), request, writeback))
@@ -346,11 +343,10 @@ impl WriteCheck {
         schemas: &SchemaRegistry,
     ) -> Result<PreparedWrite<UpdateRequest>, EffectFailureKind> {
         self.discharge(
-            ExecutorWriteInputs::FixtureUpdate {
-                resource_id: &desired.id,
-                desired: &desired.attributes,
-                patch: request.patch(),
-            },
+            &super::provider_ready::ProtectedInputProjection::fixture_update(
+                desired,
+                request.patch(),
+            ),
             schemas,
         )?;
         Ok(self.seal_update(desired.id.clone(), request, writeback))

@@ -3,7 +3,7 @@
 use super::*;
 use crate::resource::knowledge::Classification;
 use crate::resource::{DiagnosticScope, ValueString};
-use crate::schema::{AttrTypeKind, PatternAttributeType};
+use crate::schema::AttrTypeKind;
 
 #[derive(Debug, Clone)]
 pub(super) enum Step {
@@ -129,6 +129,7 @@ fn bind<'s, 'a>(
 
 pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRule<'s, 'a>> {
     let mut instances = Vec::new();
+    let mut fits = super::union_fits::UnionFits::default();
     let evidence = Arc::new(SiteEvidence::new(site));
     for &rule in &site.rules {
         instances.extend(bind(
@@ -159,12 +160,14 @@ pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRu
             &mut HashSet::new(),
             &mut instances,
             DiagnosticScope::Public,
+            &mut fits,
         );
     }
     instances.sort_by(|a, b| (&a.path, a.rule.code()).cmp(&(&b.path, b.rule.code())));
     instances
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk<'s, 'a>(
     site: &'s WriteSite<'a>,
     ty: &'a CompiledAttributeType,
@@ -173,9 +176,14 @@ fn walk<'s, 'a>(
     visited_refs: &mut HashSet<String>,
     out: &mut Vec<ApplicableInputRule<'s, 'a>>,
     scope: DiagnosticScope,
+    fits: &mut super::union_fits::UnionFits<'a>,
 ) {
     let defs = site.schema.as_schema().defs();
-    if !has_struct_rules(ty, defs, site.context, &mut HashSet::new()) {
+    if !site
+        .schema
+        .input_rule_declarations()
+        .reachable(ty, site.context)
+    {
         return;
     }
     let scope = if value.is_some_and(|value| value.scope().is_secret()) {
@@ -190,7 +198,16 @@ fn walk<'s, 'a>(
                 return;
             }
             if let Some(definition) = defs.get(name) {
-                walk(site, definition, value, owner, visited_refs, out, scope);
+                walk(
+                    site,
+                    definition,
+                    value,
+                    owner,
+                    visited_refs,
+                    out,
+                    scope,
+                    fits,
+                );
             }
             visited_refs.remove(name);
         }
@@ -217,20 +234,23 @@ fn walk<'s, 'a>(
                 if child.is_none() && !pending {
                     continue;
                 }
+                let consumes_value = child.is_some();
+                let unselected = value.filter(|_| pending).map(InputEvidence::unselected);
                 owner.push(Step::Field(field.name.clone()));
                 let mut child_refs = HashSet::new();
                 walk(
                     site,
                     &field.field_type,
-                    child.as_ref(),
+                    child.as_ref().or(unselected.as_ref()),
                     owner,
-                    if child.is_some() {
+                    if consumes_value {
                         &mut child_refs
                     } else {
                         visited_refs
                     },
                     out,
                     scope,
+                    fits,
                 );
                 owner.pop();
             }
@@ -248,11 +268,22 @@ fn walk<'s, 'a>(
                         &mut HashSet::new(),
                         out,
                         scope,
+                        fits,
                     );
                     owner.pop();
                 }
             } else if pending {
-                walk(site, element_type, None, owner, visited_refs, out, scope);
+                let unselected = value.map(InputEvidence::unselected);
+                walk(
+                    site,
+                    element_type,
+                    unselected.as_ref(),
+                    owner,
+                    visited_refs,
+                    out,
+                    scope,
+                    fits,
+                );
             }
         }
         AttrTypeKind::Map {
@@ -273,45 +304,60 @@ fn walk<'s, 'a>(
                         &mut HashSet::new(),
                         out,
                         scope,
+                        fits,
                     );
                     owner.pop();
                 }
             } else if pending {
-                walk(site, value_type, None, owner, visited_refs, out, scope);
+                let unselected = value.map(InputEvidence::unselected);
+                walk(
+                    site,
+                    value_type,
+                    unselected.as_ref(),
+                    owner,
+                    visited_refs,
+                    out,
+                    scope,
+                    fits,
+                );
             }
         }
         AttrTypeKind::Union(_) => {
             let crate::schema::RawShape::Union(members) = ty.raw_shape() else {
                 unreachable!("union declaration");
             };
-            match value.map(InputEvidence::proof) {
-                Some(known @ Classification::Known(_)) => {
+            match value.and_then(InputEvidence::proof) {
+                Some(Classification::Known(_)) => {
                     let mut ref_path = visited_refs
                         .iter()
                         .filter_map(|name| defs.get_key_value(name).map(|(name, _)| name.as_str()))
                         .collect();
                     if let Some(member) =
-                        crate::schema::value_validation::select_union_member_from_knowledge_on_path(
-                            members,
-                            known,
-                            defs,
-                            &mut ref_path,
-                        )
+                        value.and_then(|value| fits.select(ty, value, defs, &mut ref_path))
                     {
-                        walk(site, member, value, owner, visited_refs, out, scope);
+                        walk(site, member, value, owner, visited_refs, out, scope, fits);
                     }
                 }
-                // These are possible branches, not selected instances. Erase
-                // branch evidence so their rules remain pending until a fit
-                // can be established from the complete value.
+                // Branch membership remains unknown; an attempted failure
+                // enclosing those possible branches remains a failure.
                 Some(
                     Classification::ShapeKnown(_)
                     | Classification::Pending(_)
                     | Classification::Failed(_),
                 )
                 | None => {
+                    let unselected = value.map(InputEvidence::unselected);
                     for member in members {
-                        walk(site, member, None, owner, visited_refs, out, scope);
+                        walk(
+                            site,
+                            member,
+                            unselected.as_ref(),
+                            owner,
+                            visited_refs,
+                            out,
+                            scope,
+                            fits,
+                        );
                     }
                 }
             }
@@ -329,63 +375,37 @@ fn walk<'s, 'a>(
     }
 }
 
-fn has_struct_rules(
-    ty: &PatternAttributeType<Compiled>,
-    defs: &BTreeMap<String, CompiledAttributeType>,
-    context: InputWriteContext,
-    seen: &mut HashSet<String>,
-) -> bool {
-    match &ty.kind {
-        AttrTypeKind::Struct {
-            fields,
-            input_rules,
-            ..
-        } => {
-            input_rules
-                .iter()
-                .any(|r| scope_classification(r.scope(), context).is_some())
-                || fields
-                    .iter()
-                    .any(|f| has_struct_rules(&f.field_type, defs, context, seen))
+#[cfg(test)]
+thread_local! { static SCHEMA_VISIT_BUDGET: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+pub(super) fn with_schema_visit_budget<R>(limit: usize, operation: impl FnOnce() -> R) -> R {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SCHEMA_VISIT_BUDGET.set(None);
         }
-        AttrTypeKind::List { element_type, .. } => {
-            has_struct_rules(element_type, defs, context, seen)
-        }
-        AttrTypeKind::Map { value, .. } => has_struct_rules(value, defs, context, seen),
-        AttrTypeKind::Union(_) => {
-            let crate::schema::RawShape::Union(members) = ty.raw_shape() else {
-                unreachable!("union declaration");
-            };
-            members
-                .iter()
-                .any(|t| has_struct_rules(t, defs, context, seen))
-        }
-        AttrTypeKind::Ref(name) => {
-            if !seen.insert(name.clone()) {
-                return false;
-            }
-            let result = defs
-                .get(name)
-                .is_some_and(|t| has_struct_rules(t, defs, context, seen));
-            seen.remove(name);
-            result
-        }
-        _ => false,
     }
+    SCHEMA_VISIT_BUDGET.set(Some((0, limit)));
+    let _reset = Reset;
+    operation()
+}
+
+#[cfg(test)]
+pub(super) fn schema_visit() {
+    SCHEMA_VISIT_BUDGET.with(|budget| {
+        if let Some((count, limit)) = budget.get() {
+            assert!(
+                count < limit,
+                "input-rule reachability exceeded {limit} schema visits"
+            );
+            budget.set(Some((count + 1, limit)));
+        }
+    });
 }
 
 pub(super) fn has_declarations(site: &WriteSite<'_>) -> bool {
-    // Probe declarations rather than current instances: normalization may add
-    // an instance or activate a rule before the final dispatch check.
-    site.rules
-        .iter()
-        .any(|rule| scope_classification(rule.scope(), site.context).is_some())
-        || site.schema.as_schema().attributes.values().any(|a| {
-            has_struct_rules(
-                &a.attr_type,
-                site.schema.as_schema().defs(),
-                site.context,
-                &mut HashSet::new(),
-            )
-        })
+    site.schema
+        .input_rule_declarations()
+        .has_declarations(site.context)
 }
