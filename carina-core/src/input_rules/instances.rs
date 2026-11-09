@@ -173,13 +173,15 @@ pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRu
         );
     }
     for (name, attribute) in &site.schema.as_schema().attributes {
-        if attribute.input_mode.is_provider_populated() {
+        if attribute.input_mode.is_provider_populated()
+            || !site
+                .schema
+                .input_rule_declarations()
+                .reachable(&attribute.attr_type, site.context)
+        {
             continue;
         }
-        let read = site.input.read(
-            InstanceRef::Resource,
-            &InputPath::new(name).expect("admitted canonical attribute"),
-        );
+        let read = site.input.root(name);
         if matches!(read, InputRead::Absent(_)) {
             continue;
         }
@@ -272,7 +274,12 @@ fn walk<'s, 'a>(
                 );
             }
             for field in declarations {
-                if field.parts().declared_input_mode.is_provider_populated() {
+                if field.parts().declared_input_mode.is_provider_populated()
+                    || !site
+                        .schema
+                        .input_rule_declarations()
+                        .reachable(&field.field_type, site.context)
+                {
                     continue;
                 }
                 let child = match value.node(&site.input).map(|node| node.field(&field.name)) {

@@ -7,6 +7,137 @@ use carina_core::schema::{
 };
 
 #[test]
+fn module_default_tags_have_cli_lsp_conditional_rule_parity() {
+    let schema = ResourceSchema::new("test.Conditional")
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        )
+        .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+        .input_rule(
+            InputRule::value(
+                InputRuleScope::EveryWrite,
+                InputPath::new("target").unwrap(),
+                InputRuleCode::new("test.tagged_target").unwrap(),
+                InputPredicate::Present,
+            )
+            .with_condition(InputCondition::Present(InputPath::new("tags").unwrap())),
+        );
+    let fixture = write_fixture(&[
+        (
+            "main.crn",
+            "let tag_module = use { source = './tag-module' }\nlet tags = tag_module {}\nlet example = test.test.Conditional {}\n",
+        ),
+        (
+            "providers.crn",
+            "provider test { default_tags = tags.tags }\n",
+        ),
+    ]);
+    std::fs::create_dir(fixture.path().join("tag-module")).unwrap();
+    std::fs::write(
+        fixture.path().join("tag-module/main.crn"),
+        "attributes { tags = { owner = 'known' } }\n",
+    )
+    .unwrap();
+    let schemas = single_schema_map(schema);
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let cli_findings = cli
+        .iter()
+        .flat_map(|message| message.lines())
+        .filter(|message| message.contains("[test.tagged_target]"))
+        .collect::<Vec<_>>();
+    assert_eq!(cli_findings.len(), 1, "{cli:#?}");
+    let diagnostics = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    let lsp_findings = diagnostics
+        .iter()
+        .filter(|finding| finding.message.contains("[test.tagged_target]"))
+        .collect::<Vec<_>>();
+    assert_eq!(lsp_findings.len(), 1, "{diagnostics:#?}");
+    assert_eq!(cli_findings[0], lsp_findings[0].message);
+    assert_eq!(lsp_findings[0].severity, Some(DiagnosticSeverity::ERROR));
+}
+
+#[test]
+fn unrelated_type_errors_preserve_cli_lsp_input_errors_and_warnings() {
+    let schema = ResourceSchema::new("test.Conditional")
+        .attribute(AttributeSchema::optional("count", AttributeType::int()).build())
+        .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+        .input_rule(InputRule::value(
+            InputRuleScope::CreateOnly,
+            InputPath::new("name").unwrap(),
+            InputRuleCode::new("test.creation_name").unwrap(),
+            InputPredicate::NoSuffix(carina_core::schema::NonEmptyString::new("-an").unwrap()),
+        ))
+        .input_rule(
+            InputRule::value(
+                InputRuleScope::EveryWrite,
+                InputPath::new("target").unwrap(),
+                InputRuleCode::new("test.required_target").unwrap(),
+                InputPredicate::Present,
+            )
+            .with_condition(InputCondition::Equals {
+                path: InputPath::new("guard").unwrap(),
+                literal: InputLiteral::Bool(true),
+            }),
+        );
+    let fixture = write_fixture(&[
+        (
+            "main.crn",
+            "let example = test.test.Conditional { name = 'bucket-an' guard = true }\n",
+        ),
+        ("providers.crn", "provider test {}\n"),
+        (
+            "broken.crn",
+            "let broken = test.test.Conditional { count = 'not-a-number' }\n",
+        ),
+    ]);
+    let schemas = single_schema_map(schema);
+    let cli = carina_cli::commands::validate::validate_diagnostics_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        carina_cli::wiring::LoadedProviderFactory::for_test(factories_for(&schemas)),
+        Default::default(),
+    );
+    let cli_errors = cli
+        .errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    assert!(
+        cli_errors.iter().any(|message| message.contains("Int")),
+        "{cli_errors:?}"
+    );
+    assert_eq!(cli.input_warnings.len(), 1, "{cli_errors:?}");
+    let errors = cli_errors
+        .iter()
+        .flat_map(|message| message.lines())
+        .filter(|message| message.contains("[test.required_target]"))
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 1, "{cli_errors:?}");
+    let engine = engine_with_schemas(schemas);
+    let diagnostics = lsp_diagnostics(&engine, &fixture, "main.crn");
+    for (message, severity) in [
+        (errors[0].to_owned(), DiagnosticSeverity::ERROR),
+        (
+            cli.input_warnings[0].to_string(),
+            DiagnosticSeverity::WARNING,
+        ),
+    ] {
+        let findings = diagnostics
+            .iter()
+            .filter(|finding| finding.message == message)
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 1, "{diagnostics:#?}");
+        assert_eq!(findings[0].severity, Some(severity));
+    }
+    let broken = lsp_diagnostics(&engine, &fixture, "broken.crn");
+    assert!(
+        broken.iter().any(|finding| finding.message.contains("Int")),
+        "{broken:#?}"
+    );
+}
+
+#[test]
 fn renamed_blocks_have_multifile_cli_lsp_conditional_rule_parity() {
     let schema = ResourceSchema::new("test.Conditional").attribute(
         AttributeSchema::optional(

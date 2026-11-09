@@ -980,6 +980,7 @@ impl ValidationProviderCatalogExt for ValidationProviderCatalog<'_> {
 /// Terminal validation output, constructed only from a scoped settlement.
 pub(crate) struct ValidationReport<'a, T = carina_core::parser::ModuleResolvedInferredFile> {
     result: Result<T, NonEmptyValidationErrors>,
+    authored_inputs: carina_core::input_rules::AuthoredInputs,
     warnings: Vec<carina_core::parser::ParseWarning>,
     input_warnings: Vec<carina_core::input_rules::InputFinding>,
     schemas: &'a SchemaRegistry,
@@ -989,31 +990,23 @@ impl ValidationReport<'_> {
     /// Explicit validate/editor preview only. Execution-oriented validation
     /// retains the effect-specific input gate instead.
     pub(crate) fn check_authored_inputs(mut self) -> Self {
-        self.result = self.result.and_then(|parsed| {
-            let authored = parsed.authored_inputs().ok_or_else(|| {
-                NonEmptyValidationErrors(vec![AppError::Validation(
-                    "configuration has no authored input authority".into(),
-                )])
-            })?;
-            let report = carina_core::input_rules::check_authored_inputs(authored, self.schemas)
-                .map_err(|error| NonEmptyValidationErrors(vec![AppError::Provider(error)]))?;
-            let mut errors = Vec::new();
-            for finding in report {
-                match finding.severity() {
-                    carina_core::input_rules::InputFindingSeverity::Error => {
-                        errors.push(AppError::Validation(finding.to_string()));
-                    }
-                    carina_core::input_rules::InputFindingSeverity::Warning => {
-                        self.input_warnings.push(finding);
+        let mut errors = Vec::new();
+        match carina_core::input_rules::check_authored_inputs(&self.authored_inputs, self.schemas) {
+            Ok(report) => {
+                for finding in report {
+                    match finding.severity() {
+                        carina_core::input_rules::InputFindingSeverity::Error => {
+                            errors.push(AppError::Validation(finding.to_string()));
+                        }
+                        carina_core::input_rules::InputFindingSeverity::Warning => {
+                            self.input_warnings.push(finding);
+                        }
                     }
                 }
             }
-            if errors.is_empty() {
-                Ok(parsed)
-            } else {
-                Err(NonEmptyValidationErrors(errors))
-            }
-        });
+            Err(error) => errors.push(AppError::Provider(error)),
+        }
+        self.result = append_load_findings(self.result, errors);
         self
     }
 }
@@ -1033,21 +1026,35 @@ impl carina_core::validation::deferred_types::ProviderTypeCheckSink for Validati
         }
     }
 }
+
+fn settle_provider_checks<T>(
+    checks: carina_core::validation::deferred_types::ProviderTypeCheckResult<T>,
+) -> (T, ValidationReportSink) {
+    let mut sink = ValidationReportSink {
+        warnings: Vec::new(),
+        errors: Vec::new(),
+    };
+    (checks.publish(&mut sink), sink)
+}
+
 impl<'a, T> ValidationReport<'a, T> {
     fn settle(
         checks: carina_core::validation::deferred_types::ProviderTypeCheckResult<
-            Result<T, NonEmptyValidationErrors>,
+            crate::commands::ConfigurationValidation<T>,
         >,
         schemas: &'a SchemaRegistry,
     ) -> Self {
-        let mut sink = ValidationReportSink {
-            warnings: Vec::new(),
-            errors: Vec::new(),
-        };
-        let result = checks.publish(&mut sink);
+        let (
+            crate::commands::ConfigurationValidation {
+                result,
+                authored_inputs,
+            },
+            sink,
+        ) = settle_provider_checks(checks);
         let result = append_load_findings(result, sink.errors);
         Self {
             result,
+            authored_inputs,
             warnings: sink.warnings,
             input_warnings: Vec::new(),
             schemas,
@@ -1147,7 +1154,10 @@ fn validation_report_with<'a, T>(
     );
     let checks =
         carina_core::validation::deferred_types::TypeCheckSession::run(&catalog, |catalog| {
-            let result = match crate::commands::validate_and_resolve_errors_inner(
+            let crate::commands::ConfigurationValidation {
+                result,
+                authored_inputs,
+            } = crate::commands::validate_and_resolve_report_inner(
                 &ValidationPipelineAccess::new(),
                 parsed.clone(),
                 base_dir,
@@ -1157,7 +1167,8 @@ fn validation_report_with<'a, T>(
                 skip_resource_validation,
                 duplicate_declarations,
                 crate::commands::ConfigNameResolution::EvaluatedOnly,
-            ) {
+            );
+            let result = match result {
                 Ok(crate::commands::ResolvedConfig::Evaluated { parsed }) => {
                     finish(*parsed, catalog).map_err(|error| {
                         NonEmptyValidationErrors::try_from(vec![error])
@@ -1169,7 +1180,10 @@ fn validation_report_with<'a, T>(
                 }
                 Err(errors) => Err(errors),
             };
-            append_load_findings(result, load_findings)
+            crate::commands::ConfigurationValidation {
+                result: append_load_findings(result, load_findings),
+                authored_inputs,
+            }
         });
     ValidationReport::settle(checks, context.schemas())
 }
@@ -1319,9 +1333,11 @@ fn resolve_config_pair_errors_with_catalog(
             });
             append_load_findings(result, load_findings)
         });
-    ValidationReport::settle(checks, context.schemas())
-        .into_parts()
-        .0
+    let (result, sink) = settle_provider_checks(checks);
+    for warning in sink.warnings {
+        crate::commands::validate::print_provider_type_warning(&warning);
+    }
+    append_load_findings(result, sink.errors)
 }
 
 #[allow(clippy::too_many_arguments)]

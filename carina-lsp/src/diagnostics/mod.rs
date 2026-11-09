@@ -1274,17 +1274,21 @@ impl DiagnosticRun<'_> {
             });
             let semantic_tree = semantic_file
                 .and_then(|file| carina_core::parser::AnalysisTree::try_from_file(file).ok());
-            let authored_inputs = match directory.as_ref() {
-                Some(directory) => Some(
-                    carina_core::input_rules::AuthoredInputs::for_directory_in_session(
-                        &directory.parsed,
-                        self.provider_context,
+            let authored_inputs = if let Some(graph) = expanded_graph {
+                graph.authored_inputs().cloned()
+            } else {
+                match directory.as_ref() {
+                    Some(directory) => Some(
+                        carina_core::input_rules::AuthoredInputs::for_directory_in_session(
+                            &directory.parsed,
+                            self.provider_context,
+                        ),
                     ),
-                ),
-                None => doc
-                    .parsed()
-                    .and_then(|parsed| parsed.authored_inputs())
-                    .map(|inputs| inputs.resolved_in_session(self.provider_context)),
+                    None => doc
+                        .parsed()
+                        .and_then(|parsed| parsed.authored_inputs())
+                        .map(|inputs| inputs.resolved_in_session(self.provider_context)),
+                }
             };
             let input_findings = authored_inputs.map_or_else(
                 || Ok(carina_core::input_rules::AuthoredInputReport::default()),

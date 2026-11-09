@@ -2,7 +2,7 @@
 //! All knowledge, membership, expression and masking queries originate here.
 use super::*;
 use crate::resource::knowledge::{Classification, ClassifiedRef, KnowledgeContext};
-use crate::resource::{DiagnosticScope, ResolvedIgnoreChanges, ValueString};
+use crate::resource::{DiagnosticScope, ResolvedIgnoreChanges};
 use yoke::{Yoke, Yokeable};
 
 /// An immutable current-stage desired input. Only stage-specific constructors
@@ -143,7 +143,96 @@ enum PatchOperation {
 
 struct UpdateOverlay {
     operations: IndexMap<String, PatchOperation>,
-    ignored: ResolvedIgnoreChanges,
+    ignored: IgnoreIndex,
+}
+
+#[derive(Default)]
+struct IgnoreIndex {
+    roots: HashMap<String, IgnoreNode>,
+}
+
+#[derive(Default)]
+struct IgnoreNode {
+    terminal: bool,
+    names: HashMap<String, IgnoreNode>,
+    indices: HashMap<usize, IgnoreNode>,
+}
+
+/// A cursor retains the matched prefix, so descending never rescans an ignored
+/// path from its root. A terminal ancestor continues to withhold every child.
+#[derive(Clone, Copy, Default)]
+struct IgnoreCursor<'a> {
+    node: Option<&'a IgnoreNode>,
+    blocked: bool,
+}
+
+impl IgnoreIndex {
+    fn new(policy: &ResolvedIgnoreChanges) -> Self {
+        use crate::schema::LeafPathSegment;
+        let mut index = Self::default();
+        for path in policy.iter() {
+            #[cfg(test)]
+            record_ignore_path_work(1);
+            let mut node = index.roots.entry(path.attribute().into()).or_default();
+            for segment in path.leaf().segments() {
+                #[cfg(test)]
+                record_ignore_path_work(1);
+                node = match segment {
+                    LeafPathSegment::StructField(name) => {
+                        node.names.entry(name.clone()).or_default()
+                    }
+                    LeafPathSegment::MapKey(name) => node
+                        .names
+                        .entry(name.expose_plaintext().into())
+                        .or_default(),
+                    LeafPathSegment::ListIndex(index) => node.indices.entry(*index).or_default(),
+                };
+            }
+            node.terminal = true;
+        }
+        index
+    }
+
+    fn root(&self, name: &str) -> IgnoreCursor<'_> {
+        #[cfg(test)]
+        record_ignore_path_work(1);
+        IgnoreCursor::new(self.roots.get(name), false)
+    }
+}
+
+impl<'a> IgnoreCursor<'a> {
+    fn new(node: Option<&'a IgnoreNode>, ancestor_blocked: bool) -> Self {
+        Self {
+            node,
+            blocked: ancestor_blocked || node.is_some_and(|node| node.terminal),
+        }
+    }
+
+    fn field(self, name: &str) -> Self {
+        #[cfg(test)]
+        record_ignore_path_work(1);
+        Self::new(
+            self.node.and_then(|node| node.names.get(name)),
+            self.blocked,
+        )
+    }
+
+    fn item(self, index: usize) -> Self {
+        #[cfg(test)]
+        record_ignore_path_work(1);
+        Self::new(
+            self.node.and_then(|node| node.indices.get(&index)),
+            self.blocked,
+        )
+    }
+
+    fn masked_children(self) -> HashSet<String> {
+        self.node.map_or_else(HashSet::new, |node| {
+            #[cfg(test)]
+            record_ignore_path_work(node.names.len());
+            node.names.keys().cloned().collect()
+        })
+    }
 }
 
 struct InputStorage {
@@ -430,7 +519,7 @@ impl RuleInput {
         self.finish(node)
     }
 
-    fn root(&self, name: &str) -> InputRead<'_> {
+    pub(super) fn root(&self, name: &str) -> InputRead<'_> {
         if let Some(&id) = self.graph().roots.get(name) {
             return self.finish(NodeRef { input: self, id });
         }
@@ -551,7 +640,7 @@ impl UpdateOverlay {
                     )
                 })
                 .collect(),
-            ignored,
+            ignored: IgnoreIndex::new(&ignored),
         }
     }
 }
@@ -598,8 +687,10 @@ impl<'a> EvidenceGraph<'a> {
                 DiagnosticScope::Public,
                 false,
                 completeness,
-                &mut vec![crate::schema::LeafPathSegment::StructField(key.into())],
-                input,
+                input
+                    .update
+                    .as_ref()
+                    .map_or_else(IgnoreCursor::default, |update| update.ignored.root(key)),
             );
             graph.roots.insert(key.to_owned(), id);
         }
@@ -625,15 +716,11 @@ impl<'a> EvidenceGraph<'a> {
         scope: DiagnosticScope,
         enclosing_failure: bool,
         completeness: Completeness,
-        path: &mut Vec<crate::schema::LeafPathSegment>,
-        input: &'a InputStorage,
+        ignore: IgnoreCursor<'_>,
     ) -> NodeId {
         let (proof, protection) = classified.for_input_rules(&InputEvidenceAuthority(()));
         let scope = if scope.is_secret() { scope } else { protection };
-        let blocked = input
-            .update
-            .as_ref()
-            .is_some_and(|update| ignored(path, &update.ignored));
+        let blocked = ignore.blocked;
         let source = ClassifiedRef::from(&proof).diagnostic_value();
         let correspondence = if matches!(
             peel_secret(source),
@@ -648,11 +735,7 @@ impl<'a> EvidenceGraph<'a> {
         let children = if let Some(fields) = ClassifiedRef::from(&proof).map() {
             let mut members = IndexMap::new();
             for (key, value) in fields {
-                path.push(crate::schema::LeafPathSegment::MapKey(ValueString::plain(
-                    key,
-                )));
-                let child = self.push(value, scope, child_failure, completeness, path, input);
-                path.pop();
+                let child = self.push(value, scope, child_failure, completeness, ignore.field(key));
                 full_proof &= self.nodes[child.0].full_proof;
                 members.insert(key, child);
             }
@@ -667,9 +750,13 @@ impl<'a> EvidenceGraph<'a> {
                 let value = ClassifiedRef::from(&proof)
                     .list_item(index)
                     .expect("known list membership");
-                path.push(crate::schema::LeafPathSegment::ListIndex(index));
-                let child = self.push(value, scope, child_failure, completeness, path, input);
-                path.pop();
+                let child = self.push(
+                    value,
+                    scope,
+                    child_failure,
+                    completeness,
+                    ignore.item(index),
+                );
                 full_proof &= self.nodes[child.0].full_proof;
                 items.push(child);
             }
@@ -685,7 +772,7 @@ impl<'a> EvidenceGraph<'a> {
             scope,
             enclosing_failure,
             blocked,
-            masked_children: masked_children(path, input),
+            masked_children: ignore.masked_children(),
             membership: Membership::Present,
             completeness,
             correspondence,
@@ -702,6 +789,10 @@ impl<'a> EvidenceGraph<'a> {
             {
                 continue;
             }
+            let ignore = input
+                .update
+                .as_ref()
+                .map_or_else(IgnoreCursor::default, |update| update.ignored.root("tags"));
             for (key, value) in &config.default_tags {
                 let proof = classify(value);
                 let encodable = crate::provider::assert_default_tag_value_encodable(&proof).is_ok();
@@ -724,11 +815,8 @@ impl<'a> EvidenceGraph<'a> {
                         },
                         scope: DiagnosticScope::Public,
                         enclosing_failure: false,
-                        blocked: false,
-                        masked_children: masked_children(
-                            &[crate::schema::LeafPathSegment::StructField("tags".into())],
-                            input,
-                        ),
+                        blocked: ignore.blocked,
+                        masked_children: ignore.masked_children(),
                         membership,
                         completeness: if input.update.is_some() {
                             Completeness::Unsent
@@ -757,11 +845,7 @@ impl<'a> EvidenceGraph<'a> {
                     self.nodes[root.0].scope,
                     false,
                     self.nodes[root.0].completeness,
-                    &mut vec![
-                        crate::schema::LeafPathSegment::StructField("tags".into()),
-                        crate::schema::LeafPathSegment::MapKey(ValueString::plain(key)),
-                    ],
-                    input,
+                    ignore.field(key),
                 );
                 self.nodes[child.0].membership = membership;
                 self.nodes[root.0].derived_failure |= self.nodes[child.0]
@@ -814,64 +898,28 @@ fn accepts_defaults(schema: &ValidatedResourceSchema) -> bool {
         })
 }
 
-fn masked_children(
-    path: &[crate::schema::LeafPathSegment],
-    input: &InputStorage,
-) -> HashSet<String> {
-    use crate::schema::LeafPathSegment;
-    let Some(update) = &input.update else {
-        return HashSet::new();
-    };
-    let Some(LeafPathSegment::StructField(root)) = path.first() else {
-        return HashSet::new();
-    };
-    update
-        .ignored
-        .for_attribute(root)
-        .filter_map(|ignore| {
-            let leaf = ignore.leaf().segments();
-            if leaf.len() < path.len()
-                || !leaf.iter().zip(&path[1..]).all(|(a, b)| same_segment(a, b))
-            {
-                return None;
-            }
-            match &leaf[path.len() - 1] {
-                LeafPathSegment::StructField(name) => Some(name.clone()),
-                LeafPathSegment::MapKey(name) => Some(name.expose_plaintext().to_owned()),
-                LeafPathSegment::ListIndex(_) => None,
-            }
-        })
-        .collect()
+#[cfg(test)]
+thread_local! {
+    static IGNORE_PATH_WORK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-fn same_segment(a: &crate::schema::LeafPathSegment, b: &crate::schema::LeafPathSegment) -> bool {
-    use crate::schema::LeafPathSegment;
-    match (a, b) {
-        (LeafPathSegment::StructField(a), LeafPathSegment::StructField(b)) => a == b,
-        (LeafPathSegment::StructField(a), LeafPathSegment::MapKey(b))
-        | (LeafPathSegment::MapKey(b), LeafPathSegment::StructField(a)) => {
-            b.diagnostic_literal().is_some_and(|b| a == b)
+#[cfg(test)]
+fn record_ignore_path_work(segments: usize) {
+    IGNORE_PATH_WORK.set(IGNORE_PATH_WORK.get().map(|work| work + segments));
+}
+
+#[cfg(test)]
+pub(super) fn with_ignore_path_work<R>(operation: impl FnOnce() -> R) -> (R, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            IGNORE_PATH_WORK.set(None);
         }
-        (LeafPathSegment::MapKey(a), LeafPathSegment::MapKey(b)) => a == b,
-        (LeafPathSegment::ListIndex(a), LeafPathSegment::ListIndex(b)) => a == b,
-        _ => false,
     }
-}
-
-fn ignored(path: &[crate::schema::LeafPathSegment], policy: &ResolvedIgnoreChanges) -> bool {
-    use crate::schema::LeafPathSegment;
-    let Some(LeafPathSegment::StructField(root)) = path.first() else {
-        return false;
-    };
-    policy.for_attribute(root).any(|ignore| {
-        ignore.leaf().segments().len() < path.len()
-            && ignore
-                .leaf()
-                .segments()
-                .iter()
-                .zip(&path[1..])
-                .all(|(a, b)| same_segment(a, b))
-    })
+    IGNORE_PATH_WORK.set(Some(0));
+    let _reset = Reset;
+    let result = operation();
+    (result, IGNORE_PATH_WORK.get().unwrap())
 }
 
 impl<'a> NodeRef<'a> {

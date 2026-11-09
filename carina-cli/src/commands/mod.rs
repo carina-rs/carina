@@ -514,8 +514,75 @@ fn extend_expanded_binding_use_errors<P: carina_core::resource::PlaceholderKind>
     );
 }
 
+/// Validation retains its complete authored authority even when ordinary
+/// diagnostics prevent producing an execution-ready configuration.
+pub(crate) struct ConfigurationValidation<T> {
+    pub(crate) result: Result<T, NonEmptyValidationErrors>,
+    pub(crate) authored_inputs: carina_core::input_rules::AuthoredInputs,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn validate_and_resolve_errors_inner(
+    access: &crate::wiring::ValidationPipelineAccess,
+    parsed: carina_core::config_loader::InferredRootDirectory,
+    base_dir: &ResolvedPath,
+    ctx: &WiringContext,
+    enriched_context: &ValidationProviderCatalog,
+    _load_errors: &HashMap<String, String>,
+    skip_resource_validation: bool,
+    duplicate_declarations: &[DuplicateDeclaration],
+    name_resolution: ConfigNameResolution,
+) -> Result<ResolvedConfig, NonEmptyValidationErrors> {
+    validate_and_resolve_report_inner(
+        access,
+        parsed,
+        base_dir,
+        ctx,
+        enriched_context,
+        _load_errors,
+        skip_resource_validation,
+        duplicate_declarations,
+        name_resolution,
+    )
+    .result
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_and_resolve_report_inner(
+    access: &crate::wiring::ValidationPipelineAccess,
+    parsed: carina_core::config_loader::InferredRootDirectory,
+    base_dir: &ResolvedPath,
+    ctx: &WiringContext,
+    enriched_context: &ValidationProviderCatalog,
+    _load_errors: &HashMap<String, String>,
+    skip_resource_validation: bool,
+    duplicate_declarations: &[DuplicateDeclaration],
+    name_resolution: ConfigNameResolution,
+) -> ConfigurationValidation<ResolvedConfig> {
+    let mut authored_inputs = carina_core::input_rules::AuthoredInputs::for_directory_in_session(
+        &parsed,
+        enriched_context,
+    );
+    let result = validate_and_resolve_configuration(
+        access,
+        parsed,
+        base_dir,
+        ctx,
+        enriched_context,
+        _load_errors,
+        skip_resource_validation,
+        duplicate_declarations,
+        name_resolution,
+        &mut authored_inputs,
+    );
+    ConfigurationValidation {
+        result,
+        authored_inputs,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_and_resolve_configuration(
     access: &crate::wiring::ValidationPipelineAccess,
     mut parsed: carina_core::config_loader::InferredRootDirectory,
     base_dir: &ResolvedPath,
@@ -525,6 +592,7 @@ pub(crate) fn validate_and_resolve_errors_inner(
     skip_resource_validation: bool,
     duplicate_declarations: &[DuplicateDeclaration],
     name_resolution: ConfigNameResolution,
+    authored_inputs: &mut carina_core::input_rules::AuthoredInputs,
 ) -> Result<ResolvedConfig, NonEmptyValidationErrors> {
     let resolved_base = base_dir.clone();
     let base_dir = &resolved_base;
@@ -774,6 +842,9 @@ pub(crate) fn validate_and_resolve_errors_inner(
     );
     let mut parsed = match module_resolution {
         module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
+            if let Some(inputs) = graph.authored_inputs() {
+                *authored_inputs = inputs.clone();
+            }
             extend_module_call_errors(&mut errors, authored_module_call_findings);
             if !errors.is_empty() {
                 return Err(non_empty_validation_failure(errors));

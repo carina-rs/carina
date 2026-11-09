@@ -452,3 +452,131 @@ fn public_ast_mutations_cannot_reseal_authored_input() {
     let fabricated = crate::parser::ExpandedParsedFile::default();
     assert!(fabricated.authored_inputs().is_none());
 }
+
+#[test]
+fn admitted_literal_attribute_names_do_not_panic_input_validation() {
+    for rules_elsewhere in [false, true] {
+        let mut schema = ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("x-y", AttributeType::string()).build());
+        if rules_elsewhere {
+            schema = schema.attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_with_rules(
+                        "Settings",
+                        vec![StructField::optional("target", AttributeType::string()).build()],
+                        vec![],
+                        vec![InputRule::value(
+                            InputRuleScope::EveryWrite,
+                            InputPath::new("target").unwrap(),
+                            InputRuleCode::new("settings.target").unwrap(),
+                            InputPredicate::Present,
+                        )],
+                    ),
+                )
+                .build(),
+            );
+        }
+        let schemas = registry(schema);
+        let source = if rules_elsewhere {
+            "let example = mock.Review { settings = {} }"
+        } else {
+            "let example = mock.Review {}"
+        };
+        let parsed = crate::parser::parse_file(
+            source,
+            std::path::Path::new("main.crn"),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let findings = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas).unwrap();
+        assert_eq!(findings.len(), usize::from(rules_elsewhere));
+    }
+}
+
+#[test]
+fn deep_ignore_masks_have_linear_prefix_work() {
+    const COUNT: usize = 32;
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .with_def(
+                "Node",
+                AttributeType::struct_with_rules(
+                    "Node",
+                    vec![
+                        StructField::optional("target", AttributeType::string()).build(),
+                        StructField::optional("child", AttributeType::ref_("Node")).build(),
+                    ],
+                    vec![],
+                    vec![InputRule::value(
+                        InputRuleScope::EveryWrite,
+                        InputPath::new("target").unwrap(),
+                        InputRuleCode::new("node.target").unwrap(),
+                        InputPredicate::Present,
+                    )],
+                ),
+            )
+            .attribute(AttributeSchema::optional("root", AttributeType::ref_("Node")).build()),
+    );
+    let mut value = object([("target", text("valid"))]);
+    for _ in 1..COUNT {
+        value = object([("target", text("valid")), ("child", value)]);
+    }
+    let previous = value.clone();
+    let mut desired =
+        Resource::with_provider("mock", "Review", "example", None).with_attribute("root", value);
+    let mut path = vec![ParsedIgnorePathSegment::Attribute("root".into())];
+    path.extend((1..COUNT).map(|_| ParsedIgnorePathSegment::Attribute("child".into())));
+    path.push(ParsedIgnorePathSegment::Attribute("target".into()));
+    desired.directives.ignore_changes = vec![ParsedIgnorePath::new(path)];
+    let finalized = update(desired, previous, "root", &schemas);
+    let (_, comparisons) = rule_input::with_ignore_path_work(|| {
+        finalized.check_inputs(&schemas, &HashMap::new()).unwrap();
+    });
+    assert!(
+        comparisons <= COUNT * 16,
+        "{comparisons} ignore-prefix comparisons for {COUNT} recursive instances"
+    );
+}
+
+#[test]
+fn wide_ignore_masks_have_linear_prefix_work() {
+    const COUNT: usize = 128;
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .input_rule(InputRule::new(
+                InputRuleScope::EveryWrite,
+                InputRuleTarget::MapKeys(InputPath::new("tags").unwrap()),
+                InputRuleCode::new("tags.reserved").unwrap(),
+                InputPredicate::NoPrefix(crate::schema::NonEmptyString::new("aws:").unwrap()),
+            )),
+    );
+    let value = Value::Concrete(ConcreteValue::Map(
+        (0..COUNT)
+            .map(|index| (format!("key_{index}"), text("valid")))
+            .collect(),
+    ));
+    let previous = value.clone();
+    let mut desired =
+        Resource::with_provider("mock", "Review", "example", None).with_attribute("tags", value);
+    desired.directives.ignore_changes = (0..COUNT)
+        .map(|index| {
+            ParsedIgnorePath::new(vec![
+                ParsedIgnorePathSegment::Attribute("tags".into()),
+                ParsedIgnorePathSegment::MapKey(format!("key_{index}")),
+            ])
+        })
+        .collect();
+    let finalized = update(desired, previous, "tags", &schemas);
+    let (_, comparisons) = rule_input::with_ignore_path_work(|| {
+        finalized.check_inputs(&schemas, &HashMap::new()).unwrap();
+    });
+    assert!(
+        comparisons <= COUNT * 16,
+        "{comparisons} ignore-prefix comparisons for {COUNT} map entries"
+    );
+}
