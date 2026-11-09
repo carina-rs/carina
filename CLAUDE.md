@@ -727,6 +727,12 @@ A struct type represents a nested object with typed fields.
   error with its source chain. Direct WASI AWS
   client constructors remain private. This guarantees paired installation on
   that builder; later changes through AWS APIs remain under caller control.
+  The synchronous WASI HTTP transport accepts only fully buffered request
+  bodies and carries `RequestBody::Empty` / `Sized` through to explicit
+  `Content-Length` framing. `TryFrom<&SdkBody>` rejects streaming or taken
+  bodies with `UnbufferedRequestBody`, retained as the source of a non-retryable
+  `ConnectorError::user` before sending. It never polls or buffers a stream.
+  The generic HTTP path classifies its owned `Vec<u8>` infallibly.
   Per-request headers and query fields use the existing
   structural HTTP trace masking, followed by the session `RedactionSet`. Each
   request emits one completed HTTP event, including early failures; signing
