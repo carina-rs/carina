@@ -12,6 +12,12 @@ use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass, Verifie
 use wit_component::{ComponentEncoder, StringEncoding};
 use wit_parser::{ManglingAndAbi, Resolve};
 
+fn engine() -> wasmtime::Engine {
+    let mut config = wasmtime::Config::new();
+    config.wasm_component_model(true).epoch_interruption(true);
+    wasmtime::Engine::new(&config).unwrap()
+}
+
 fn test_identity(name: &str) -> ProviderLoadIdentity {
     ProviderLoadIdentity::for_test(name, ProviderTrustClass::Untrusted)
 }
@@ -45,7 +51,7 @@ fn concurrent_precompile_writers_publish_complete_artifacts() {
                 scope.spawn(|| {
                     barrier.wait();
                     for _ in 0..8 {
-                        WasmProviderFactory::precompile(&bytes, &path)
+                        WasmProviderFactory::precompile(&engine(), &bytes, &path)
                             .expect("every concurrent writer must publish atomically");
                     }
                 })
@@ -256,7 +262,8 @@ async fn test_precompile_cache_creation() {
     let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
 
     // Precompile and write .cwasm
-    WasmProviderFactory::precompile(&wasm, &cwasm_path).expect("precompile should succeed");
+    WasmProviderFactory::precompile(&engine(), &wasm, &cwasm_path)
+        .expect("precompile should succeed");
 
     // .cwasm file should now exist
     assert!(cwasm_path.exists(), ".cwasm file should have been created");
@@ -564,8 +571,12 @@ async fn protocol_v2_is_rejected_before_current_world_binding() {
 async fn from_precompiled_classifies_failure_by_step() {
     let source_dir = tempfile::tempdir().expect("Failed to create source temp dir");
     let cwasm_path = source_dir.path().join("non-instantiable.cwasm");
-    WasmProviderFactory::precompile(NON_INSTANTIABLE_COMPONENT_WAT.as_bytes(), &cwasm_path)
-        .expect("test component should precompile");
+    WasmProviderFactory::precompile(
+        &engine(),
+        NON_INSTANTIABLE_COMPONENT_WAT.as_bytes(),
+        &cwasm_path,
+    )
+    .expect("test component should precompile");
 
     let bring_up_error =
         match WasmProviderFactory::from_precompiled(&cwasm_path, test_identity("mock")).await {
@@ -596,7 +607,8 @@ async fn precompiled_factory_is_schema_only() {
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
 
-    WasmProviderFactory::precompile(&wasm, &cwasm_path).expect("precompile should succeed");
+    WasmProviderFactory::precompile(&engine(), &wasm, &cwasm_path)
+        .expect("precompile should succeed");
 
     let factory = WasmProviderFactory::from_precompiled(&cwasm_path, test_identity("mock"))
         .await
@@ -698,7 +710,8 @@ async fn precompile_preserves_prior_factory_mmap() {
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
     let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
 
-    WasmProviderFactory::precompile(&wasm, &cwasm_path).expect("initial precompile should succeed");
+    WasmProviderFactory::precompile(&engine(), &wasm, &cwasm_path)
+        .expect("initial precompile should succeed");
     let factory1 = WasmProviderFactory::from_precompiled(&cwasm_path, test_identity("mock"))
         .await
         .expect("first from_precompiled should succeed");
@@ -706,7 +719,8 @@ async fn precompile_preserves_prior_factory_mmap() {
     // Overwrite the cache file via the public API while `factory1` still
     // holds its mmap. A `precompile` implementation that writes in place
     // would pull backing pages out from under `factory1`'s Component.
-    WasmProviderFactory::precompile(&wasm, &cwasm_path).expect("second precompile should succeed");
+    WasmProviderFactory::precompile(&engine(), &wasm, &cwasm_path)
+        .expect("second precompile should succeed");
 
     let factory2 = WasmProviderFactory::from_precompiled(&cwasm_path, test_identity("mock"))
         .await

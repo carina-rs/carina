@@ -43,8 +43,9 @@ if len(sys.argv) > 2:
 build_args = (
     ["--archive-file", sys.argv[1], "--workspace-remap", ".",
      "--extract-to", ".", "--extract-overwrite"]
-    if len(sys.argv) == 2 else ["-p", "carina-cli", "-p", "carina-provider-mock",
-                              "--lib", "--bins", "--all-features"]
+    # Match CI's archive feature unification before selecting the same three
+    # suites below. Package-scoped builds can produce different executables.
+    if len(sys.argv) == 2 else ["--workspace", "--all-features"]
 )
 listing = run([
     os.environ.get("CARGO", "cargo"), "nextest", "list",

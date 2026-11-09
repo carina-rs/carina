@@ -4886,9 +4886,7 @@ pub(super) mod tests {
         };
         let wasm_bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
         let private = tempfile::tempdir().expect("create fallback compiled cache");
-        let cache = std::env::var_os("CARINA_TEST_WASM_CACHE_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| private.path().to_path_buf());
+        let cache = crate::test_utils::compiled_wasm_cache_dir(private.path());
         let load = VerifiedLoad::for_test(&wasm_bytes, test_load_identity("mock"));
         let declaration = VerifiedEgressDeclaration::read(&load).unwrap();
         let locked = test_explicit_egress(&declaration);
@@ -6800,6 +6798,7 @@ pub(super) mod tests {
             "x".repeat(20 * 1024)
         );
         let error = WasmProviderFactory::precompile(
+            &WasmProviderFactory::create_engine().unwrap(),
             component.as_bytes(),
             &directory.path().join("test.cwasm"),
         )
@@ -8721,6 +8720,49 @@ pub(super) mod tests {
         let key2 = WasmProviderFactory::cache_key(b"same_content", &engine);
 
         assert_eq!(key1, key2, "cache key should be stable for same content");
+    }
+
+    #[tokio::test]
+    async fn uncached_fallback_retains_the_callers_engine() {
+        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let bytes =
+            std::fs::read(workspace.join("target/wasm32-wasip2/debug/carina-provider-mock.wasm"))
+                .expect("the mock WASM fixture is required");
+        let engine = WasmProviderFactory::create_engine().unwrap();
+        let identity = test_load_identity("mock");
+        let factory = WasmProviderFactory::new_uncached_configured(
+            engine.clone(),
+            &bytes,
+            ConfiguredProvider::new(&identity),
+            GuestNetworkRequest::SchemaOnly,
+        )
+        .await
+        .unwrap();
+        assert!(
+            Engine::same(&engine, &factory.engine),
+            "cache fallback must reuse its caller's engine"
+        );
+    }
+
+    #[test]
+    fn precompile_uses_the_engine_that_keys_the_cache() {
+        let mut config = build_engine_config();
+        config.epoch_interruption(false);
+        config
+            .module_version(wasmtime::ModuleVersionStrategy::Custom(
+                "cache-owner-engine".into(),
+            ))
+            .unwrap();
+        let engine = Engine::new(&config).unwrap();
+        let bytes = wat::parse_str("(component)").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let artifact = cache
+            .path()
+            .join(WasmProviderFactory::cache_key(&bytes, &engine));
+
+        WasmProviderFactory::precompile(&engine, &bytes, &artifact).unwrap();
+        WasmProviderFactory::deserialize_precompiled_component(&engine, &artifact)
+            .expect("the engine that selected the cache key must deserialize its compiled bytes");
     }
 
     #[test]

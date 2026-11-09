@@ -9,6 +9,7 @@ import sys
 import subprocess
 import tempfile
 import textwrap
+from types import SimpleNamespace
 import unittest
 
 WORKFLOW = Path(sys.argv.pop(1))
@@ -49,11 +50,13 @@ def field(block, name, prefix="    "):
     return matches[0] if matches else None
 
 
-def selected(condition, event, code, version_only, changes_result="success"):
+def selected(condition, event, code, version_only, changes_result="success", cache_job=""):
     if condition is None:
         return True
+    condition = condition.removeprefix("${{").removesuffix("}}").strip()
     values = {
         "github.event_name": event,
+        "inputs.cache-job": cache_job,
         "needs.changes.result": changes_result,
         "needs.changes.outputs.code": str(code).lower(),
         "needs.changes.outputs.version_only": str(version_only).lower(),
@@ -134,16 +137,66 @@ class WorkflowConditionTests(unittest.TestCase):
     def test_push_only_compiles_test_artifacts(self):
         build = "cargo build -p carina-provider-mock -p carina-provider-mock-http --target wasm32-wasip2"
         archive = "cargo nextest archive --workspace --all-features --archive-file nextest-archive.tar.zst"
-        for event in ("push", "merge_group", "pull_request"):
-            self.assertEqual(self.commands("test", event), [build, archive])
+        version = "rustc --version | awk '{print \"version=\" $2}' >> \"$GITHUB_OUTPUT\""
+        self.assertEqual(self.commands("test", "push"), [version, build, "cargo nextest run --workspace --all-features --no-run"])
+        for event in ("merge_group", "pull_request"):
+            self.assertEqual(self.commands("test", event), [version, build, archive])
         self.assertEqual(self.commands("test-doctests", "pull_request"), ["cargo test --workspace --doc --all-features"])
-        self.assertEqual(self.commands("test-provider-cause", "pull_request"), ["bash scripts/check-provider-cause-test-api.sh"])
         self.assertNotIn("shared-key:", self.jobs["test"])
         self.assertNotIn("cache-job:", self.jobs["test"])
         for name in AUX_CACHE_JOBS:
             self.assertIn("cache-job: test", self.jobs[name])
         action = (WORKFLOW.parent.parent / "actions/rust-cache/action.yml").read_text()
         self.assertIn("format('{0}-{1}', steps.manifest.outputs.key, inputs.cache-job)", action)
+
+    def test_provider_cause_fetches_before_offline_checks(self):
+        self.assertEqual(self.commands("test-provider-cause", "pull_request"),
+                         ["cargo fetch --locked", "bash scripts/check-provider-cause-test-api.sh"])
+
+    def test_archive_consumers_install_the_build_rustc_release(self):
+        build = self.jobs["test"]
+        self.assertIn("toolchain: ${{ steps.toolchain.outputs.version }}", build)
+        self.assertIn("      - id: toolchain", build)
+        for job in ("test-partition", "test-isolation"):
+            with self.subTest(job=job):
+                self.assertNotIn("uses: dtolnay/rust-toolchain@stable", self.jobs[job])
+                self.assertIn("uses: dtolnay/rust-toolchain@master", self.jobs[job])
+                self.assertIn("toolchain: ${{ needs.test.outputs.toolchain }}", self.jobs[job])
+
+    def test_cache_consumers_never_save_the_build_cache(self):
+        action = (WORKFLOW.parent.parent / "actions/rust-cache/action.yml").read_text()
+        condition = field(action, "save-if", "        ")
+        for event in ("push", "pull_request", "merge_group"):
+            for cache_job in ("", "test", "check"):
+                with self.subTest(event=event, cache_job=cache_job):
+                    self.assertEqual(selected(condition, event, True, False, cache_job=cache_job),
+                                     not cache_job and event != "merge_group")
+
+    def test_artifact_uploads_support_failed_job_reruns(self):
+        uploads = [step for step in re.split(r"(?m)(?=^      - )", self.jobs["test"])
+                   if "uses: actions/upload-artifact@v4" in step]
+        self.assertEqual(len(uploads), 2)
+        for upload in uploads:
+            with self.subTest(upload=upload):
+                self.assertIn("overwrite: true", upload)
+                self.assertIn("retention-days: 3", upload)
+
+    def test_local_and_archive_isolation_use_the_same_workspace_features(self):
+        repo = WORKFLOW.parent.parent.parent
+        source = (repo / "scripts/test-in-process-isolation.sh").read_text()
+        program = source.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+        assignment = next(node for node in ast.parse(program).body
+                          if isinstance(node, ast.Assign)
+                          and any(isinstance(target, ast.Name) and target.id == "build_args"
+                                  for target in node.targets))
+        # Inspect only argument selection. Never execute isolation, Cargo or
+        # native test binaries from this workflow self-check.
+        expression = compile(ast.Expression(assignment.value), "isolation build_args", "eval")
+        local = eval(expression, {"sys": SimpleNamespace(argv=["isolation"])})
+        archived = eval(expression, {"sys": SimpleNamespace(argv=["isolation", "fixtures.tar.zst"])})
+        self.assertEqual(local, ["--workspace", "--all-features"])
+        self.assertEqual(archived, ["--archive-file", "fixtures.tar.zst", "--workspace-remap", ".",
+                                    "--extract-to", ".", "--extract-overwrite"])
 
     def test_archive_and_fixtures_are_used_by_every_consumer(self):
         self.assertIn("partition: [1, 2, 3, 4, 5, 6]", self.jobs["test-partition"])
@@ -209,8 +262,11 @@ class WorkflowConditionTests(unittest.TestCase):
                 test_home = Path(environment["CARINA_TEST_HOME"])
                 self.assertEqual(Path(environment["HOME"]), test_home)
                 self.assertEqual(Path(environment["TMPDIR"]), test_home / "tmp")
-                self.assertEqual(Path(environment["CARINA_TEST_WASM_CACHE_DIR"]), test_home / ".carina/cache")
-                self.assertTrue(Path(environment["CARINA_TEST_WASM_CACHE_DIR"]).is_dir())
+                self.assertEqual(Path(environment["CARINA_TEST_WASM_CACHE_DIR"]), test_home / "shared-compiled-wasm")
+                shared_cache = Path(environment["CARINA_TEST_WASM_CACHE_DIR"])
+                self.assertTrue(shared_cache.is_dir())
+                (shared_cache / "shared.cwasm").write_bytes(b"shared compiled code")
+                self.assertFalse(list((test_home / ".carina/cache").iterdir()))
                 homes.append(test_home)
             self.assertNotEqual(*homes)
 

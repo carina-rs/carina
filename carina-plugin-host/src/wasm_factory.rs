@@ -3898,14 +3898,14 @@ impl WasmProviderFactory {
         let cwasm_name = Self::cache_key(wasm_bytes, &engine);
         let cwasm_path = cache_dir.join(&cwasm_name);
 
-        // A cold-cache write can fail because the cache directory is
-        // unavailable. Resolve that fallback before creating the runtime so
-        // `new_uncached` remains the only runtime owner on this path.
+        // Keep this engine if a cold-cache publication fails; fallback must
+        // not create a second engine or change the compilation environment.
         if !cwasm_path.exists()
-            && let Err(error) = Self::precompile(wasm_bytes, &cwasm_path)
+            && let Err(error) = Self::precompile(&engine, wasm_bytes, &cwasm_path)
         {
             eprintln!("Failed to write precompile cache, loading directly: {error}");
-            return Self::new_uncached_configured(wasm_bytes, configured, network_request).await;
+            return Self::new_uncached_configured(engine, wasm_bytes, configured, network_request)
+                .await;
         }
 
         // On resolver-backed loads, verified provider bytes select the
@@ -3916,7 +3916,7 @@ impl WasmProviderFactory {
             CachedComponentAcquisition::Hit(component) => component,
             CachedComponentAcquisition::Miss => {
                 // Try to precompile and cache.
-                match Self::precompile(wasm_bytes, &cwasm_path) {
+                match Self::precompile(&engine, wasm_bytes, &cwasm_path) {
                     Ok(()) => Self::deserialize_precompiled_component(&engine, &cwasm_path)
                         .map_err(WasmProviderLoadError::PrecompiledDeserialization)?,
                     Err(error) => {
@@ -3948,6 +3948,7 @@ impl WasmProviderFactory {
         let egress =
             ConsentedEgress::from_lock(Some(&locked_egress), declaration, load.carina_rs_signed())?;
         Self::new_uncached_configured(
+            Self::create_engine()?,
             load.bytes().as_bytes(),
             configured,
             GuestNetworkRequest::Runtime { egress, aws },
@@ -3956,18 +3957,18 @@ impl WasmProviderFactory {
     }
 
     async fn new_uncached_configured(
+        engine: Engine,
         wasm_bytes: &[u8],
         configured: ConfiguredProvider,
         network_request: GuestNetworkRequest<'_>,
     ) -> Result<Self, WasmProviderLoadError> {
-        let engine = Self::create_engine()?;
         let component = Self::load_component_from_bytes(&engine, wasm_bytes)?;
         let epoch_ticker = EpochTicker::start(engine.clone());
 
         Self::bring_up_component(engine, component, epoch_ticker, configured, network_request).await
     }
 
-    /// Precompile provider bytes and save the result to a .cwasm file.
+    /// Precompile provider bytes with the cache-key engine and publish a .cwasm file.
     ///
     /// **Mmap safety invariant:** `deserialize_precompiled_component` loads
     /// `.cwasm` via `Component::deserialize_file`, which keeps the file
@@ -3987,10 +3988,11 @@ impl WasmProviderFactory {
     ///
     /// Each publication uses a unique sibling path, including within one
     /// process, so concurrent writers cannot clobber in-progress writes.
-    pub fn precompile(wasm_bytes: &[u8], cwasm_path: &Path) -> Result<(), DiagnosticText> {
-        let config = build_engine_config();
-        let engine =
-            Engine::new(&config).map_err(|e| DiagnosticText::new(format!("Engine error: {e}")))?;
+    pub fn precompile(
+        engine: &Engine,
+        wasm_bytes: &[u8],
+        cwasm_path: &Path,
+    ) -> Result<(), DiagnosticText> {
         let serialized = engine
             .precompile_component(wasm_bytes)
             .map_err(|e| DiagnosticText::new(format!("Precompile error: {e:#}")))?;

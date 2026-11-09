@@ -2,6 +2,7 @@
 
 #[path = "../../carina-core/tests/support/provider_text.rs"]
 mod provider_text_fixtures;
+use carina_plugin_host::test_utils::compiled_wasm_cache_dir as compiled_cache_dir;
 use carina_plugin_host::wasm_factory::PollEventForTest;
 use provider_text_fixtures::InitializeFixture;
 #[path = "../../carina-core/tests/support/provider_config_error.rs"]
@@ -790,14 +791,6 @@ fn default_aws_provisioner() -> FixedAwsCredentialProvisioner {
     FixedAwsCredentialProvisioner(Ok(Arc::new(FixedAwsCredentialSource(Ok(
         test_aws_credentials("AKIADEFAULT"),
     )))))
-}
-
-// The setup script owns this directory for one nextest run. Only immutable
-// compiled code is shared; egress locks and all other mutable state stay private.
-fn compiled_cache_dir(private: &std::path::Path) -> PathBuf {
-    std::env::var_os("CARINA_TEST_WASM_CACHE_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| private.join("compiled"))
 }
 
 /// Load using the run's compiled cache while retaining a private egress lock.
