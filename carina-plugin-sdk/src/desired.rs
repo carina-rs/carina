@@ -234,7 +234,12 @@ impl DesiredInputs<'_> {
     /// use carina_plugin_sdk::{DesiredInputs, core::provider::UpdateRequest};
     /// fn bypass(request: &UpdateRequest) { let _ = DesiredInputs::from_update(request); }
     /// ```
-    pub fn from_provider_ready<T: ResourceWirePayload>(resource: &ProviderReady<T>) -> Self {
+    pub fn from_provider_ready<
+        T: ResourceWirePayload,
+        K: carina_core::validation::admission::RechecksResolved,
+    >(
+        resource: &ProviderReady<T, K>,
+    ) -> Self {
         let owner = Arc::new(());
         let entries = resource
             .wire_attributes()

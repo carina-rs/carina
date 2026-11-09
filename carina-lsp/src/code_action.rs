@@ -151,6 +151,10 @@ pub(crate) fn enum_diagnostic_data_for_error(error: &TypeError) -> Option<EnumDi
             attribute: _,
         }
         | TypeError::ValidationFailed { .. }
+        | TypeError::Reference {
+            error: _,
+            attribute: _,
+        }
         | TypeError::Knowledge { .. }
         | TypeError::CustomTypeValidation { .. }
         | TypeError::ResourceValidationFailed { .. }
@@ -565,29 +569,28 @@ mod tests {
         let mut registry = SchemaRegistry::new();
         registry.insert("aws", schema);
         let resolver = carina_core::parser::ProviderCustomTypes::default();
-        let mut errs = registry
-            .get("aws", "aws.iam.PolicyDocument", SchemaKind::Resource)
-            .expect("quick-fix schema must be owner-bound")
-            .validate_with_resolver(
-                &attrs
-                    .iter()
-                    .map(|(name, value)| {
-                        (
-                            name.clone(),
-                            value
-                                .knowledge(
-                                    &carina_core::resource::knowledge::KnowledgeContext::validation(
-                                    ),
-                                )
-                                .map(|proof| proof.into_classification())
-                                .unwrap(),
-                        )
-                    })
-                    .collect(),
-                &|_| false,
-                &resolver,
-            )
-            .unwrap_err();
+        let mut errs = carina_core::test_utils::admit_resource_attributes(
+            registry
+                .get("aws", "aws.iam.PolicyDocument", SchemaKind::Resource)
+                .expect("quick-fix schema must be owner-bound"),
+            &attrs
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        value
+                            .knowledge(
+                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
+                            )
+                            .map(|proof| proof.into_classification())
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+            &|_| false,
+            &resolver,
+        )
+        .unwrap_err();
         let err = errs.remove(0);
         let TypeError::InvalidEnumVariant { expected, .. } = err else {
             panic!("expected InvalidEnumVariant, got {err:?}");

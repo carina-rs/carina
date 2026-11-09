@@ -427,7 +427,15 @@ fn fixture_schemas() -> carina_core::schema::SchemaRegistry {
 async fn create_request_for_test(resource: Resource) -> CreateRequest {
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = fixture_schemas();
+    let mut schemas = fixture_schemas();
+    if schemas.get_for(&resource).is_none() {
+        schemas
+            .extend(carina_core::test_utils::preparation_schemas(
+                &resource.id,
+                carina_core::schema::SchemaKind::Resource,
+            ))
+            .expect("test preparation schema should extend the fixture registry");
+    }
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
         schemas.clone(),
@@ -916,7 +924,10 @@ fn aws_credential_probe_data_source() -> carina_core::provider::ProviderReadyDat
     let resource = DataSource::with_provider("aws", "test.aws_credentials", "credentials", None);
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::schema::SchemaRegistry::new();
+    let schemas = carina_core::test_utils::preparation_schemas(
+        &resource.id,
+        carina_core::schema::SchemaKind::DataSource,
+    );
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
         schemas.clone(),
@@ -1809,26 +1820,26 @@ async fn sdk_schema_validator_dispatches_through_the_wasm_host_without_an_overri
         Value::Concrete(ConcreteValue::String("rejected".into())),
     )]);
 
-    let errors = schema
-        .validate_with_resolver(
-            &attributes
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.clone(),
-                        value
-                            .knowledge(
-                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                            )
-                            .map(|proof| proof.into_classification())
-                            .unwrap(),
-                    )
-                })
-                .collect(),
-            &|_| false,
-            &custom_types,
-        )
-        .expect_err("the SDK schema callback must reject through the guest bridge");
+    let errors = carina_core::test_utils::admit_resource_attributes(
+        schema,
+        &attributes
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    value
+                        .knowledge(
+                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
+                        )
+                        .map(|proof| proof.into_classification())
+                        .unwrap(),
+                )
+            })
+            .collect(),
+        &|_| false,
+        &custom_types,
+    )
+    .expect_err("the SDK schema callback must reject through the guest bridge");
     assert!(
         errors.iter().any(|error| error
             .to_string()
@@ -4795,29 +4806,27 @@ async fn test_wasm_validate_custom_type_rebuilds_after_validate_config_timeout()
         .expect("the recovery probe schema must cross the host boundary");
     let custom_types =
         carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
-    schema
-        .validate_with_resolver(
-            &HashMap::<String, Value>::from([(
-                "value".to_string(),
-                Value::Concrete(ConcreteValue::String("clean".into())),
-            )])
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.clone(),
-                    value
-                        .knowledge(
-                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                        )
-                        .map(|proof| proof.into_classification())
-                        .unwrap(),
-                )
-            })
-            .collect(),
-            &|_| false,
-            &custom_types,
-        )
-        .expect("validate_custom_type should rebuild the timed-out init instance");
+    carina_core::test_utils::admit_resource_attributes(
+        schema,
+        &HashMap::<String, Value>::from([(
+            "value".to_string(),
+            Value::Concrete(ConcreteValue::String("clean".into())),
+        )])
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.clone(),
+                value
+                    .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+                    .map(|proof| proof.into_classification())
+                    .unwrap(),
+            )
+        })
+        .collect(),
+        &|_| false,
+        &custom_types,
+    )
+    .expect("validate_custom_type should rebuild the timed-out init instance");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4841,7 +4850,8 @@ async fn test_wasm_repeated_validate_custom_type_timeout_suspends_only_that_valu
     let custom_types =
         carina_core::provider::provider_custom_types_from_factories(Arc::clone(&factories));
     let validate = |value: &str| {
-        schema.validate_with_resolver(
+        carina_core::test_utils::admit_resource_attributes(
+            schema,
             &HashMap::<String, Value>::from([(
                 "value".to_string(),
                 Value::Concrete(ConcreteValue::String(value.to_string().into())),
@@ -7102,7 +7112,10 @@ async fn test_wasm_mock_provider_read_data_source_dispatches_override() {
     ]);
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::schema::SchemaRegistry::new();
+    let schemas = carina_core::test_utils::preparation_schemas(
+        &resource.id,
+        carina_core::schema::SchemaKind::DataSource,
+    );
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
         schemas.clone(),
@@ -7345,7 +7358,10 @@ async fn raw_data_source_floats_retain_resource_operation_and_constructor_source
         let resource = DataSource::with_provider("mock", "test.data_source", selector, None);
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = carina_core::schema::SchemaRegistry::new();
+        let schemas = carina_core::test_utils::preparation_schemas(
+            &resource.id,
+            carina_core::schema::SchemaKind::DataSource,
+        );
         carina_core::validation::deferred_types::with_session_for_test_async(
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
             async |type_checks| {

@@ -1,0 +1,4 @@
+let admins = aws.identitystore.Group {}
+let assignment = awscc.sso.Assignment {
+  principal_id = admins.group_id
+}

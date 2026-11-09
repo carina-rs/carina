@@ -3,61 +3,95 @@
 use super::{DiagnosticEngine, render_merged, render_schema_diagnostic};
 use crate::document::Document;
 use carina_core::parser::{AnalysisResourceRef, Located};
-use carina_core::schema::{FieldPath, FieldPathStep, TypeError, ValidatedResourceSchema};
+use carina_core::schema::{
+    FieldPath, FieldPathStep, LeafPath, LeafPathSegment, MismatchTypeNames, TypeError,
+    ValidatedResourceSchema,
+};
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity};
 
-/// Runtime equality ignores string provenance and equates some enum/string
-/// spellings. Cached diagnostics require the same authored representation.
-pub(super) fn same_validation_input(left: &super::Value, right: &super::Value) -> bool {
+pub(super) fn reference_mismatch_message(
+    value: &super::Value,
+    path: &LeafPath,
+    attribute: &str,
+    types: &MismatchTypeNames,
+) -> String {
     use carina_core::resource::{ConcreteValue, DeferredValue, Value};
 
-    if std::ptr::eq(left, right) {
+    let leaf = path
+        .segments()
+        .iter()
+        .try_fold(value, |value, step| match (value, step) {
+            (Value::Concrete(ConcreteValue::List(values)), LeafPathSegment::ListIndex(index)) => {
+                values.get(*index)
+            }
+            (Value::Concrete(ConcreteValue::Map(values)), LeafPathSegment::StructField(name)) => {
+                values.get(name)
+            }
+            (Value::Concrete(ConcreteValue::Map(values)), LeafPathSegment::MapKey(key)) => {
+                values.get(key.expose_plaintext())
+            }
+            _ => None,
+        });
+    let origin = match leaf {
+        Some(Value::Deferred(DeferredValue::ResourceRef { path })) => {
+            Some(format!("from {}", path.to_dot_string()))
+        }
+        Some(Value::Deferred(DeferredValue::BindingRef { binding })) => {
+            Some(format!("from {binding}"))
+        }
+        _ => None,
+    };
+    carina_core::validation::reference_type_mismatch_message(
+        (!path.segments().is_empty()).then_some(attribute),
+        types,
+        origin
+            .as_ref()
+            .map(|origin| origin as &dyn std::fmt::Display),
+    )
+}
+
+/// A container summary is redundant only when every error it describes has
+/// already been rendered from admission at the same authored value path.
+pub(super) fn covered_by_symbolic_findings(
+    path: &FieldPath,
+    error: &TypeError,
+    symbolic: &[(LeafPath, TypeError)],
+) -> bool {
+    if symbolic.iter().any(|(symbolic_path, symbolic_error)| {
+        error == symbolic_error
+            && path.steps().len() == symbolic_path.segments().len()
+            && path
+                .steps()
+                .iter()
+                .zip(symbolic_path.segments())
+                .all(|(step, segment)| match (step, segment) {
+                    (FieldPathStep::Field(field), LeafPathSegment::StructField(name)) => {
+                        field == name
+                    }
+                    (FieldPathStep::Field(field), LeafPathSegment::MapKey(key)) => {
+                        field == key.expose_plaintext()
+                    }
+                    (FieldPathStep::Index(index), LeafPathSegment::ListIndex(other)) => {
+                        index == other
+                    }
+                    _ => false,
+                })
+    }) {
         return true;
     }
-    match (left, right) {
-        (
-            Value::Concrete(ConcreteValue::String(left)),
-            Value::Concrete(ConcreteValue::String(right)),
-        ) => left == right && left.is_diagnostic_sensitive() == right.is_diagnostic_sensitive(),
-        (
-            Value::Concrete(ConcreteValue::List(left)),
-            Value::Concrete(ConcreteValue::List(right)),
-        ) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|(left, right)| same_validation_input(left, right))
+    match error {
+        TypeError::ListItemError { index, inner } => {
+            covered_by_symbolic_findings(&path.push_index(*index), inner, symbolic)
         }
-        (Value::Concrete(ConcreteValue::Map(left)), Value::Concrete(ConcreteValue::Map(right))) => {
-            left.len() == right.len()
-                && left
-                    .iter()
-                    .zip(right)
-                    .all(|((left_key, left), (right_key, right))| {
-                        left_key == right_key && same_validation_input(left, right)
-                    })
+        TypeError::MapValueError { key, inner } => {
+            covered_by_symbolic_findings(&path.push_field(key), inner, symbolic)
         }
-        (
-            Value::Deferred(DeferredValue::Secret(left)),
-            Value::Deferred(DeferredValue::Secret(right)),
-        ) => left.visit(|left| right.visit(|right| same_validation_input(left, right))),
-        (
-            Value::Deferred(DeferredValue::Coalesce {
-                value: left,
-                default: left_default,
-            }),
-            Value::Deferred(DeferredValue::Coalesce {
-                value: right,
-                default: right_default,
-            }),
-        ) => {
-            same_validation_input(left, right) && same_validation_input(left_default, right_default)
+        TypeError::StructFieldError { field, inner } => {
+            covered_by_symbolic_findings(&path.push_field(field), inner, symbolic)
         }
-        (Value::Concrete(left_value), Value::Concrete(right_value)) => {
-            std::mem::discriminant(left_value) == std::mem::discriminant(right_value)
-                && left == right
-        }
+        TypeError::UnionAlternativesMismatch { failures } => failures
+            .iter()
+            .all(|error| covered_by_symbolic_findings(path, error, symbolic)),
         _ => false,
     }
 }

@@ -146,12 +146,14 @@ pub(crate) use expressions::string_literal::{
     display_double_quoted_literal_part, escape_double_quoted_character, unescape_string,
 };
 pub use expressions::string_literal::{display_string_literal, encode_string_literal};
+#[cfg(test)]
+pub(crate) use functions::custom_type_lookup_for_schema;
 pub use functions::{
     contains_function_call, custom_type_lookup_for_factory, validate_custom_type,
     validate_schema_custom_type,
 };
 pub(crate) use functions::{
-    contains_module_argument_matching, custom_type_lookup_for_schema, function_argument_as_eval,
+    contains_module_argument_matching, custom_type_lookup_for_owner, function_argument_as_eval,
     substitute_fn_params, validate_builtin_custom_type, validate_schema_custom_type_with_context,
 };
 pub use resolve::{
@@ -167,7 +169,9 @@ pub(crate) use resolve::{
     resolve_resource_refs_defer_unknown_functions, resolve_resource_refs_for_diagnostics,
     resolve_snapshot_function_calls_with_config,
 };
-pub use static_eval::evaluate_static_value_for_validation;
+pub use static_eval::{
+    evaluate_expanded_value_for_validation, evaluate_static_value_for_validation,
+};
 pub use types::{
     BuiltinTypeName, UnloadedSchemaType, builtin_bare_custom_types, parse_type_expr_str,
     resolve_type_expr_from_schemas,

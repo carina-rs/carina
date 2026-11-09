@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "tests/attribute_admission.rs"]
+mod attribute_admission;
 #[path = "tests/cancellation_fixture.rs"]
 mod cancellation_fixture;
 

@@ -3088,6 +3088,7 @@ mock.test.Thing {
         &schemas,
         &std::collections::HashSet::from(["mock".to_string()]),
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
+        &mut Vec::new(),
     )
     .expect_err("core validation rejects Count");
     assert!(
@@ -3644,30 +3645,29 @@ fn suspension_deduplication_does_not_turn_validation_errors_into_success() {
         )
         .expect("suspended-validation schema must be registered");
     let validate = || {
-        schema
-            .validate_with_resolver(
-                &attributes
-                    .iter()
-                    .map(|(name, value)| {
-                        (
-                            name.clone(),
-                            value
-                                .knowledge(
-                                    &carina_core::resource::knowledge::KnowledgeContext::validation(
-                                    ),
-                                )
-                                .map(|proof| proof.into_classification())
-                                .unwrap(),
-                        )
-                    })
-                    .collect(),
-                &|_| false,
-                engine.provider_context.custom_type_resolver(),
-            )
-            .expect_err("validation must remain an error")
-            .into_iter()
-            .find(|error| error.host_cause().is_some())
-            .expect("provider validation error must retain host policy metadata")
+        carina_core::test_utils::admit_resource_attributes(
+            schema,
+            &attributes
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        value
+                            .knowledge(
+                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
+                            )
+                            .map(|proof| proof.into_classification())
+                            .unwrap(),
+                    )
+                })
+                .collect(),
+            &|_| false,
+            &engine.provider_context.custom_types,
+        )
+        .expect_err("validation must remain an error")
+        .into_iter()
+        .find(|error| error.host_cause().is_some())
+        .expect("provider validation error must retain host policy metadata")
     };
 
     let first = validate();
@@ -3971,32 +3971,32 @@ fn tied_scalar_union_diagnostic_is_directory_scoped_and_matches_core() {
         carina_core::provider::provider_custom_types_from_factories(Arc::new(factories));
     let mut schemas = SchemaRegistry::new();
     schemas.insert("test", schema);
-    let core_errors = schemas
-        .get(
-            "test",
-            "route53.Record",
-            carina_core::schema::SchemaKind::Resource,
-        )
-        .expect("test schema must be owner-bound")
-        .validate_with_resolver(
-            &attributes
-                .iter()
-                .map(|(name, value)| {
-                    (
-                        name.clone(),
-                        value
-                            .knowledge(
-                                &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                            )
-                            .map(|proof| proof.into_classification())
-                            .unwrap(),
-                    )
-                })
-                .collect(),
-            &|name| name == "hosted_zone_id",
-            &core_resolver,
-        )
-        .expect_err("core validation must reject both union alternatives");
+    let core_errors = carina_core::test_utils::admit_resource_attributes(
+        schemas
+            .get(
+                "test",
+                "route53.Record",
+                carina_core::schema::SchemaKind::Resource,
+            )
+            .expect("test schema must be owner-bound"),
+        &attributes
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    value
+                        .knowledge(
+                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
+                        )
+                        .map(|proof| proof.into_classification())
+                        .unwrap(),
+                )
+            })
+            .collect(),
+        &|name| name == "hosted_zone_id",
+        &core_resolver,
+    )
+    .expect_err("core validation must reject both union alternatives");
     assert_eq!(core_errors.len(), 1, "core errors: {core_errors:#?}");
     let core_message = core_errors[0].to_string();
     assert!(
@@ -10220,7 +10220,7 @@ fn named_annotation_lsp_literals_keep_the_declared_length_bound() {
 }
 
 #[test]
-fn named_reference_mismatch_keeps_both_constraint_aware_names_in_lsp() {
+fn wider_same_identity_name_reference_is_pending_in_lsp() {
     let engine = named_annotation_engine(128);
     let diagnostics = engine.analyze(
         &create_document(
@@ -10229,9 +10229,81 @@ fn named_reference_mismatch_keeps_both_constraint_aware_names_in_lsp() {
         None,
     );
     assert!(
-        diagnostics.iter().any(|diagnostic| diagnostic.message
-            == "Type mismatch: expected aws.iam.Role.Name (length 1..=64), got aws.iam.Role.Name (length 1..=128) (from source.name)"),
+        !diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("Type mismatch")),
         "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn wider_same_identity_name_reference_discharge_reports_the_literal_error_once() {
+    use carina_core::binding_index::{BindingIndex, BindingValueSource, ResolvedBindings};
+    use carina_core::resource::knowledge::KnowledgeContext;
+    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::validation::admission::{Candidate, admit};
+    let engine = named_annotation_engine(128);
+    let parsed = carina_core::parser::parse_file(
+        "provider aws {}\nlet source = aws.NameSource {}\nlet role = aws.iam.Role { role_name = source.name }\n",
+        std::path::Path::new("main.crn"), &engine.provider_context,
+    ).unwrap().resolve_root_for_test();
+    let bindings = BindingIndex::from_parsed(&parsed, &engine.schemas, &engine.provider_context);
+    let destination = engine
+        .schemas
+        .resource_attribute_destination(
+            &parsed.resources[1].id,
+            "role_name",
+            &engine.provider_context,
+        )
+        .unwrap();
+    carina_core::validation::deferred_types::with_session_for_test(
+        &engine.provider_context,
+        |session| {
+            let reference = Value::<carina_core::resource::NoPlaceholder>::Deferred(
+                carina_core::resource::DeferredValue::ResourceRef {
+                    path: carina_core::resource::AccessPath::new("source", "name")
+                        .resolve_root_for_test(),
+                },
+            );
+            let (candidate, boundary) = Candidate::validation_classified(
+                reference
+                    .knowledge(&KnowledgeContext::validation())
+                    .unwrap()
+                    .into_classification(),
+                Some(&bindings),
+                session,
+            );
+            let pending = admit(&destination, candidate, &boundary)
+                .unwrap()
+                .ready()
+                .expect_err("the reference must be pending");
+            let literal = Value::Concrete(ConcreteValue::String("A".repeat(65).into()));
+            let (candidate, boundary) = Candidate::validation_classified(
+                literal
+                    .knowledge(&KnowledgeContext::validation())
+                    .unwrap()
+                    .into_classification(),
+                Some(&bindings),
+                session,
+            );
+            let literal_error = admit(&destination, candidate, &boundary).unwrap_err();
+            let mut resolved = ResolvedBindings::default();
+            resolved.set(
+                "source",
+                HashMap::from([("name".into(), literal)]),
+                BindingValueSource::Local,
+            );
+            let error = pending.discharge(&resolved, session).unwrap_err();
+            assert_eq!(error.resolution_error(), literal_error.resolution_error());
+            assert_eq!(
+                error
+                    .resolution_error()
+                    .to_string()
+                    .matches("role_name:")
+                    .count(),
+                1
+            );
+        },
     );
 }
 
@@ -17767,5 +17839,86 @@ fn secret_origin_4275_lsp_reference_errors_are_redacted() {
             .unwrap()
             .contains("private_field"),
         "{diagnostics:?}"
+    );
+}
+
+#[test]
+fn review_r4_wait_admission_matches_validation_across_files() {
+    assert!(uses_resource_attribute_admission(
+        carina_core::parser::AnalysisItemKind::Wait
+    ));
+    let fixture = tempfile::tempdir().unwrap();
+    std::fs::write(fixture.path().join("providers.crn"), "provider aws {}\n").unwrap();
+    std::fs::write(
+        fixture.path().join("resources.crn"),
+        "let cert = aws.acm.Certificate { domain_name = 'example.com' }\n",
+    )
+    .unwrap();
+    let source = "let ready = wait cert { until = cert.status == 'ISSUED' }\nlet sink = aws.acm.Certificate { domain_name = [ready.status] }\n";
+    std::fs::write(fixture.path().join("main.crn"), source).unwrap();
+    let engine = test_engine_with_wait_target();
+    let diagnostics = analyze_with_buffer(&engine, fixture.path(), "main.crn", source);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("expected String, got List")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn admission_dispatch_covers_every_analysis_item_kind() {
+    use carina_core::parser::AnalysisItemKind;
+    for kind in [
+        AnalysisItemKind::Resource,
+        AnalysisItemKind::Composition,
+        AnalysisItemKind::DeferredResource,
+        AnalysisItemKind::Wait,
+    ] {
+        assert!(
+            uses_resource_attribute_admission(kind),
+            "{kind:?} must use resource admission"
+        );
+    }
+    assert!(!uses_resource_attribute_admission(
+        AnalysisItemKind::DataSource
+    ));
+}
+
+#[test]
+fn review_r7_skipped_lookup_does_not_suppress_a_list_constraint() {
+    use carina_core::schema::{AttributeSchema, AttributeType, ListElements, ResourceSchema};
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "mock",
+        ResourceSchema::new("Sink")
+            .attribute(
+                AttributeSchema::optional(
+                    "values",
+                    AttributeType::refined_list(
+                        AttributeType::string(),
+                        true,
+                        Some((Some(2), Some(4))),
+                        ListElements::AllowDuplicates,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let diagnostics = engine.analyze(
+        &create_document("let sink = mock.Sink { values = [missing.value] }\n"),
+        None,
+    );
+    assert!(
+        diagnostics.iter().any(
+            |diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+                && diagnostic
+                    .message
+                    .contains("length 1 is outside allowed range [2, 4]")
+        ),
+        "{diagnostics:#?}"
     );
 }

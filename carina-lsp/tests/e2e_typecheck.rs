@@ -21,6 +21,63 @@ use carina_core::schema::{
 use support::fixture::{analyze, engine_with_schemas, single_schema_map, write_fixture};
 
 #[test]
+fn ambiguous_map_shaped_union_checks_upstream_reference_types_across_files() {
+    use tower_lsp::lsp_types::DiagnosticSeverity;
+
+    let schemas = single_schema_map(
+        ResourceSchema::new("r.res").attribute(
+            AttributeSchema::optional(
+                "name",
+                AttributeType::union(vec![
+                    AttributeType::map(AttributeType::string()),
+                    AttributeType::struct_(
+                        "Count",
+                        vec![StructField::optional("count", AttributeType::string()).build()],
+                    ),
+                ]),
+            )
+            .build(),
+        ),
+    );
+    for (ty, value, accepted) in [("Int", "42", false), ("String", "'count'", true)] {
+        let fixture = write_fixture(&[
+            ("providers.crn", "provider test {}\n"),
+            (
+                "upstream.crn",
+                "let orgs = upstream_state { source = './organizations' }\n",
+            ),
+            (
+                "consumer.crn",
+                "test.r.res {\n  name = { count = orgs.count }\n}\n",
+            ),
+        ]);
+        std::fs::create_dir(fixture.path().join("organizations")).unwrap();
+        std::fs::write(
+            fixture.path().join("organizations/exports.crn"),
+            format!("exports {{ count: {ty} = {value} }}\n"),
+        )
+        .unwrap();
+        let engine = engine_with_schemas(schemas.clone());
+        for file in ["providers.crn", "upstream.crn", "consumer.crn"] {
+            let diagnostics = analyze(&engine, &fixture, file);
+            if accepted || file != "consumer.crn" {
+                assert!(diagnostics.is_empty(), "{ty}, {file}: {diagnostics:#?}");
+            } else {
+                assert_eq!(diagnostics.len(), 1, "{ty}, {file}: {diagnostics:#?}");
+                assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+                assert!(
+                    diagnostics[0].message.contains(
+                        "cannot assign Int to 'name': expected String, got Int (from orgs.count)"
+                    ),
+                    "{diagnostics:#?}"
+                );
+                assert_eq!(diagnostics[0].range.start.line, 1);
+            }
+        }
+    }
+}
+
+#[test]
 fn single_reference_interpolation_scalar_constraints_and_module_call() {
     use carina_core::schema::TypeIdentity;
     use tower_lsp::lsp_types::DiagnosticSeverity;

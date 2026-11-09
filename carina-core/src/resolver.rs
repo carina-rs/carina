@@ -28,6 +28,8 @@ pub enum ResolutionError {
     Message(String),
     #[error(transparent)]
     Knowledge(Box<crate::resource::knowledge::KnowledgeDiagnostic>),
+    #[error(transparent)]
+    AdmissionConstraints(Box<crate::validation::admission::AdmissionFindings>),
     #[error("{context}{error}")]
     Context {
         context: String,
@@ -63,6 +65,9 @@ impl crate::resource::InsideSecret for ResolutionError {
     fn inside_secret(self) -> Self {
         match self {
             Self::UnavailableSecret(error) => Self::UnavailableSecret(error.inside_secret()),
+            Self::AdmissionConstraints(findings) => {
+                Self::AdmissionConstraints(Box::new((*findings).inside_secret()))
+            }
             _ => Self::InsideSecret {},
         }
     }
@@ -99,9 +104,9 @@ impl From<crate::parser::ParseError> for ResolutionError {
             }
             crate::parser::ParseError::Located { path, error } => match Self::from(*error) {
                 Self::Message(message) => Self::Message(format!("{}: {message}", path.display())),
-                error @ (Self::Knowledge(_) | Self::Context { .. }) => {
-                    error.with_context(format!("{}: ", path.display()))
-                }
+                error @ (Self::Knowledge(_)
+                | Self::AdmissionConstraints(_)
+                | Self::Context { .. }) => error.with_context(format!("{}: ", path.display())),
                 unavailable @ (Self::UnavailableSecret(_) | Self::InsideSecret { .. }) => {
                     unavailable
                 }
@@ -112,7 +117,9 @@ impl From<crate::parser::ParseError> for ResolutionError {
                     Self::Message(message) => {
                         Self::Message(crate::parser::Located::new(location, message).to_string())
                     }
-                    error @ (Self::Knowledge(_) | Self::Context { .. }) => {
+                    error @ (Self::Knowledge(_)
+                    | Self::AdmissionConstraints(_)
+                    | Self::Context { .. }) => {
                         error.with_context(crate::parser::Located::new(location, "").to_string())
                     }
                     unavailable @ (Self::UnavailableSecret(_) | Self::InsideSecret { .. }) => {
@@ -610,6 +617,7 @@ pub fn resolve_value_for_plan(
             ResolutionError::Message(_)
             | ResolutionError::InsideSecret { .. }
             | ResolutionError::Knowledge(_)
+            | ResolutionError::AdmissionConstraints(_)
             | ResolutionError::Context { .. },
         ) => value.clone(),
     };

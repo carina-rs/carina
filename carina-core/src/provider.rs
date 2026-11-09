@@ -12640,7 +12640,10 @@ mod tests {
     fn resolved_for_test(resource: Resource) -> ProviderReadyResource {
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = crate::schema::SchemaRegistry::new();
+        let schemas = crate::test_utils::preparation_schemas(
+            &resource.id,
+            crate::schema::SchemaKind::Resource,
+        );
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |type_checks| {
@@ -12664,7 +12667,10 @@ mod tests {
     fn ready_data_source_for_test(resource: DataSource) -> ProviderReadyDataSource {
         let bindings = crate::binding_index::ResolvedBindings::default();
         let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = crate::schema::SchemaRegistry::new();
+        let schemas = crate::test_utils::preparation_schemas(
+            &resource.id,
+            crate::schema::SchemaKind::DataSource,
+        );
         crate::validation::deferred_types::with_session_for_test(
             &crate::parser::LoadedProviderContext::empty_for_test(),
             |type_checks| {

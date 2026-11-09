@@ -5722,19 +5722,19 @@ fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
             )
         })
         .collect();
-    let core_errors = core_registry
-        .get(
-            "test",
-            "route53.Record",
-            carina_core::schema::SchemaKind::Resource,
-        )
-        .expect("test schema must be owner-bound")
-        .validate_with_resolver(
-            &classified_attributes,
-            &|name| name == "hosted_zone_id",
-            &core_resolver,
-        )
-        .expect_err("both union alternatives must reject the value");
+    let core_errors = carina_core::test_utils::admit_resource_attributes(
+        core_registry
+            .get(
+                "test",
+                "route53.Record",
+                carina_core::schema::SchemaKind::Resource,
+            )
+            .expect("test schema must be owner-bound"),
+        &classified_attributes,
+        &|name| name == "hosted_zone_id",
+        &core_resolver,
+    )
+    .expect_err("both union alternatives must reject the value");
     assert_eq!(core_errors.len(), 1, "core errors: {core_errors:#?}");
     let expected = core_errors[0].to_string();
     assert!(

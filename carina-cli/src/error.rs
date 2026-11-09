@@ -1784,7 +1784,13 @@ mod tests {
                     let id = resource.id.clone();
                     let bindings = carina_core::binding_index::ResolvedBindings::default();
                     let gate = ModuleConstraintGate::from_live_compositions(&[]);
-                    let schemas = carina_core::schema::SchemaRegistry::new();
+                    let mut schemas = carina_core::schema::SchemaRegistry::new();
+                    schemas.insert(
+                        "mock",
+                        carina_core::schema::PatternResourceSchema::new("sqs.Queue")
+                            .validate()
+                            .unwrap(),
+                    );
                     let context = ProviderPreparationContext::new(
                         &bindings,
                         &gate,

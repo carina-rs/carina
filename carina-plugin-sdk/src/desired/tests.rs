@@ -944,6 +944,13 @@ async fn provider_ready_inputs_are_infallible_and_preserve_checked_scalar_and_se
         )
         .unwrap();
         schemas.insert_provider_witness("test", &witness).unwrap();
+        schemas.insert(
+            "test",
+            PatternResourceSchema::new("lookup")
+                .as_data_source()
+                .validate()
+                .unwrap(),
+        );
         let config = carina_core::parser::ExpandedProviderConfig {
             name: "test".into(),
             attributes: Default::default(),
@@ -1043,7 +1050,10 @@ async fn provider_ready_inputs_preserve_env_string_diagnostic_sensitivity() {
             );
         let bindings = carina_core::binding_index::ResolvedBindings::default();
         let gate = ModuleConstraintGate::from_live_compositions(&[]);
-        let schemas = carina_core::schema::SchemaRegistry::new();
+        let schemas = carina_core::test_utils::preparation_schemas(
+            &resource.id,
+            carina_core::schema::SchemaKind::Resource,
+        );
         let context = ProviderPreparationContext::new(
             &bindings,
             &gate,
@@ -1126,7 +1136,10 @@ async fn native_and_wasm_views_share_sorted_order_for_unsorted_authored_maps() {
         .unwrap();
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let gate = ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = carina_core::schema::SchemaRegistry::new();
+    let schemas = carina_core::test_utils::preparation_schemas(
+        &resource.id,
+        carina_core::schema::SchemaKind::Resource,
+    );
     let request = with_type_checks(async |type_checks| {
         let context = ProviderPreparationContext::new(
             &bindings,

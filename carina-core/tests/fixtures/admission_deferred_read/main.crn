@@ -1,0 +1,2 @@
+let up = upstream_state { source = './up' }
+let r = for n in up.names { read mock.iam.Roles { name_regex = n } }
