@@ -1567,12 +1567,17 @@ impl ShapeWalkBudget {
         }
     }
 
-    pub(crate) fn take(&mut self) -> bool {
+    /// Consume one traversal step, returning false when no steps remain.
+    pub fn take(&mut self) -> bool {
         let Some(next) = self.remaining.checked_sub(1) else {
             return false;
         };
         self.remaining = next;
         true
+    }
+
+    pub fn is_exhausted(&self) -> bool {
+        self.remaining == 0
     }
 }
 
@@ -9470,6 +9475,27 @@ impl<'a> EffectiveType<'a> {
             path: self.path.clone(),
             field_ancestry: self.field_ancestry,
         })
+    }
+
+    /// Preserve definition and ancestry context when descending into an enum base.
+    pub fn enum_base(&self) -> Option<Self> {
+        let Shape::Enum { base, .. } = self.shape() else {
+            return None;
+        };
+        Some(Self {
+            attr_type: base,
+            defs: self.defs,
+            path: self.path.clone(),
+            field_ancestry: self.field_ancestry,
+        })
+    }
+
+    /// Enumerate union alternatives while retaining the shared traversal budget.
+    pub fn union_members_with_budget(&self, budget: &mut ShapeWalkBudget) -> Vec<Self> {
+        if !budget.take() {
+            return Vec::new();
+        }
+        self.union_members()
     }
 
     pub(crate) fn union_members(&self) -> Vec<Self> {

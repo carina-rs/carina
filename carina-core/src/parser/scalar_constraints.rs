@@ -96,18 +96,26 @@ fn required_pattern<'de, D: serde::Deserializer<'de>>(
     Option::deserialize(deserializer)
 }
 
-/// Scalar evidence retains the two layers even for exact schema projections.
+/// Exact schema-declaration evidence is the only payload with member constraints.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub(super) struct ScalarConstraints {
     scalar: ScalarConstraintKind,
     empty_intersection: bool,
-    // A conjunction across owners keeps each owner's single-pattern
-    // identity layer. This is annotation evidence, not extra slots on a declaration.
+}
+
+/// An authored annotation names an identity. No member slots exist here.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct IdentityConstraints {
+    scalar: IdentityConstraintKind,
+    empty_intersection: bool,
+    // Preserve each owner's identity pattern, not a selected member pattern.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     owner_layers: Vec<StringIdentityConstraints>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StringIdentityConstraints {
     length: Bounds<u64>,
     #[serde(deserialize_with = "required_pattern")]
@@ -148,6 +156,20 @@ enum ScalarConstraintKind {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum IdentityConstraintKind {
+    String {
+        identity_layer: StringIdentityConstraints,
+    },
+    Int {
+        identity_range: Bounds<i64>,
+    },
+    Float {
+        range: Bounds<crate::FiniteF64>,
+    },
+}
+
 fn normalize_float_bounds(bounds: Bounds<crate::FiniteF64>) -> Bounds<crate::FiniteF64> {
     let endpoint = |value: Endpoint<crate::FiniteF64>| {
         value
@@ -172,17 +194,9 @@ impl ScalarConstraints {
         let mut constraints = Self {
             scalar,
             empty_intersection: false,
-            owner_layers: Vec::new(),
         };
         constraints.empty_intersection = constraints.bounds_are_empty();
         constraints
-    }
-
-    pub(super) fn from_identity(declaration: &CompiledAttributeType) -> Self {
-        // Project the compiled identity intact; regex cloning shares its
-        // compiled automaton rather than recompiling on annotation resolution.
-        Self::from_declaration(&declaration.identity_only_declaration())
-            .expect("admitted scalar identity")
     }
 
     pub(super) fn from_declaration(declaration: &CompiledAttributeType) -> Option<Self> {
@@ -262,103 +276,72 @@ impl ScalarConstraints {
     }
 
     pub(super) fn validate_record(&mut self) -> Result<(), &'static str> {
-        self.owner_layers.sort();
-        self.owner_layers.dedup();
         if self.empty_intersection != self.bounds_are_empty() {
             return Err("scalar bounds and empty-intersection marker disagree");
         }
         if let ScalarConstraintKind::Float { range } = &mut self.scalar {
             *range = normalize_float_bounds(*range);
         }
-        if let Some(first) = self.owner_layers.first() {
-            let mut expected = first.clone();
-            for owner in &self.owner_layers[1..] {
-                expected.intersect(owner);
-            }
-            if !matches!(&self.scalar, ScalarConstraintKind::String { identity_layer, .. } if *identity_layer == expected)
-            {
-                return Err("owner layer conjunction does not match scalar constraints");
-            }
-        }
         Ok(())
     }
 
-    pub(super) fn intersect(&mut self, other: &Self) {
-        if let (
+    pub(super) fn identity_constraints(&self) -> IdentityConstraints {
+        IdentityConstraints::new(match &self.scalar {
             ScalarConstraintKind::String {
                 identity_layer,
                 member_layer: _,
+            } => IdentityConstraintKind::String {
+                identity_layer: identity_layer.clone(),
             },
-            ScalarConstraintKind::String {
-                identity_layer: other_identity,
-                member_layer: _,
+            ScalarConstraintKind::Int {
+                identity_range,
+                member_range: _,
+            } => IdentityConstraintKind::Int {
+                identity_range: *identity_range,
             },
-        ) = (&self.scalar, &other.scalar)
-        {
-            let own = identity_layer.clone();
-            let incoming = other_identity.clone();
-            if own != incoming || !self.owner_layers.is_empty() || !other.owner_layers.is_empty() {
-                if self.owner_layers.is_empty() {
-                    self.owner_layers.push(own);
-                }
-                if other.owner_layers.is_empty() {
-                    self.owner_layers.push(incoming);
-                } else {
-                    self.owner_layers.extend(other.owner_layers.iter().cloned());
-                }
-                self.owner_layers.sort();
-                self.owner_layers.dedup();
+            ScalarConstraintKind::Float { range } => {
+                IdentityConstraintKind::Float { range: *range }
             }
+        })
+    }
+
+    // Keep portable constraint equality independent of projection provenance.
+    // An annotation is equivalent only to a declaration with no local constraints.
+    pub(super) fn same_constraints_as_annotation(&self, identity: &IdentityConstraints) -> bool {
+        if self.empty_intersection != identity.empty_intersection
+            || !identity.owner_layers.is_empty()
+        {
+            return false;
         }
-        match (&mut self.scalar, &other.scalar) {
+        match (&self.scalar, &identity.scalar) {
             (
                 ScalarConstraintKind::String {
                     identity_layer,
                     member_layer,
                 },
-                ScalarConstraintKind::String {
-                    identity_layer: other_identity,
-                    member_layer: other_member,
+                IdentityConstraintKind::String {
+                    identity_layer: other,
                 },
             ) => {
-                // The representative is stable; the binding retains and
-                // structurally checks every owner's single-pattern layers.
-                identity_layer.intersect(other_identity);
-                member_layer.pattern = member_layer
-                    .pattern
-                    .iter()
-                    .chain(other_member.pattern.iter())
-                    .min()
-                    .cloned();
-                member_layer.length.intersect(&other_member.length);
+                identity_layer == other
+                    && member_layer.pattern.is_none()
+                    && member_layer.length.pair().is_none()
             }
             (
                 ScalarConstraintKind::Int {
                     identity_range,
                     member_range,
                 },
-                ScalarConstraintKind::Int {
-                    identity_range: other_identity,
-                    member_range: other_member,
+                IdentityConstraintKind::Int {
+                    identity_range: other,
                 },
-            ) => {
-                identity_range.intersect(other_identity);
-                member_range.intersect(other_member);
-            }
+            ) => identity_range == other && member_range.pair().is_none(),
             (
                 ScalarConstraintKind::Float { range },
-                ScalarConstraintKind::Float { range: other },
-            ) => range.intersect(other),
-            _ => unreachable!("annotation resolution checks scalar kinds before intersecting"),
+                IdentityConstraintKind::Float { range: other },
+            ) => range == other,
+            _ => false,
         }
-        self.empty_intersection = self.bounds_are_empty();
-    }
-
-    pub(super) fn owner_patterns(&self) -> impl Iterator<Item = &CompiledPattern> {
-        self.owner_layers
-            .iter()
-            .filter_map(|layer| layer.pattern.as_ref())
-            .map(|pattern| &pattern.0)
     }
 
     pub(super) fn materialize(&self, owned: &super::ResolvedSchemaType) -> CompiledAttributeType {
@@ -396,6 +379,180 @@ impl ScalarConstraints {
                 member_layer: crate::schema::IntMemberConstraints::new(member_range.pair()),
             },
             ScalarConstraintKind::Float { range } => AttrTypeKind::Float {
+                binding,
+                range: range.pair(),
+            },
+        };
+        CompiledAttributeType { kind }
+    }
+}
+
+impl IdentityConstraints {
+    fn new(scalar: IdentityConstraintKind) -> Self {
+        let mut constraints = Self {
+            scalar,
+            empty_intersection: false,
+            owner_layers: Vec::new(),
+        };
+        constraints.empty_intersection = constraints.bounds_are_empty();
+        constraints
+    }
+
+    pub(super) fn from_declaration(declaration: &CompiledAttributeType) -> Option<Self> {
+        // Clone the compiled identity pattern directly; never carry member data
+        // into annotation evidence, including enum/reference fallback lookups.
+        Some(Self::new(match declaration.kind() {
+            AttrTypeKind::String {
+                identity_layer,
+                member_layer: _,
+            } => IdentityConstraintKind::String {
+                identity_layer: StringIdentityConstraints {
+                    length: Bounds::new(identity_layer.length),
+                    pattern: identity_layer.pattern.clone().map(DeclarationPattern),
+                },
+            },
+            AttrTypeKind::Reference {
+                pattern, length, ..
+            } => IdentityConstraintKind::String {
+                identity_layer: StringIdentityConstraints {
+                    length: Bounds::new(*length),
+                    pattern: pattern.clone().map(DeclarationPattern),
+                },
+            },
+            AttrTypeKind::Int {
+                identity_layer,
+                member_layer: _,
+            } => IdentityConstraintKind::Int {
+                identity_range: Bounds::new(identity_layer.range),
+            },
+            AttrTypeKind::Float { range, .. } => IdentityConstraintKind::Float {
+                range: normalize_float_bounds(Bounds::new(*range)),
+            },
+            AttrTypeKind::Enum { base, .. } => return Self::from_declaration(base),
+            _ => return None,
+        }))
+    }
+
+    pub(super) fn kind(&self) -> RefinedScalarKind {
+        match self.scalar {
+            IdentityConstraintKind::String { .. } => RefinedScalarKind::String,
+            IdentityConstraintKind::Int { .. } => RefinedScalarKind::Int,
+            IdentityConstraintKind::Float { .. } => RefinedScalarKind::Float,
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.empty_intersection
+    }
+
+    fn bounds_are_empty(&self) -> bool {
+        match &self.scalar {
+            IdentityConstraintKind::String { identity_layer } => identity_layer.length.is_empty(),
+            IdentityConstraintKind::Int { identity_range } => identity_range.is_empty(),
+            IdentityConstraintKind::Float { range } => range.is_empty(),
+        }
+    }
+
+    pub(super) fn validate_record(&mut self) -> Result<(), &'static str> {
+        self.owner_layers.sort();
+        self.owner_layers.dedup();
+        if self.empty_intersection != self.bounds_are_empty() {
+            return Err("scalar bounds and empty-intersection marker disagree");
+        }
+        if let IdentityConstraintKind::Float { range } = &mut self.scalar {
+            *range = normalize_float_bounds(*range);
+        }
+        if let Some(first) = self.owner_layers.first() {
+            let mut expected = first.clone();
+            for owner in &self.owner_layers[1..] {
+                expected.intersect(owner);
+            }
+            if !matches!(&self.scalar, IdentityConstraintKind::String { identity_layer } if *identity_layer == expected)
+            {
+                return Err("owner layer conjunction does not match scalar constraints");
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn intersect(&mut self, other: &Self) {
+        if let (
+            IdentityConstraintKind::String { identity_layer },
+            IdentityConstraintKind::String {
+                identity_layer: incoming,
+            },
+        ) = (&self.scalar, &other.scalar)
+            && (identity_layer != incoming
+                || !self.owner_layers.is_empty()
+                || !other.owner_layers.is_empty())
+        {
+            if self.owner_layers.is_empty() {
+                self.owner_layers.push(identity_layer.clone());
+            }
+            if other.owner_layers.is_empty() {
+                self.owner_layers.push(incoming.clone());
+            } else {
+                self.owner_layers.extend(other.owner_layers.iter().cloned());
+            }
+            self.owner_layers.sort();
+            self.owner_layers.dedup();
+        }
+        match (&mut self.scalar, &other.scalar) {
+            (
+                IdentityConstraintKind::String { identity_layer },
+                IdentityConstraintKind::String {
+                    identity_layer: other,
+                },
+            ) => {
+                // The representative is stable; owner_layers preserves every
+                // identity pattern. Annotation evidence has no member layer.
+                identity_layer.intersect(other);
+            }
+            (
+                IdentityConstraintKind::Int { identity_range },
+                IdentityConstraintKind::Int {
+                    identity_range: other,
+                },
+            ) => identity_range.intersect(other),
+            (
+                IdentityConstraintKind::Float { range },
+                IdentityConstraintKind::Float { range: other },
+            ) => range.intersect(other),
+            _ => unreachable!("annotation resolution checks scalar kinds before intersecting"),
+        }
+        self.empty_intersection = self.bounds_are_empty();
+    }
+
+    pub(super) fn owner_patterns(&self) -> impl Iterator<Item = &CompiledPattern> {
+        self.owner_layers
+            .iter()
+            .filter_map(|layer| layer.pattern.as_ref())
+            .map(|pattern| &pattern.0)
+    }
+
+    pub(super) fn materialize(&self, owned: &super::ResolvedSchemaType) -> CompiledAttributeType {
+        let binding = crate::schema::RefinementBinding::Annotation(owned.clone());
+        let kind = match &self.scalar {
+            IdentityConstraintKind::String { identity_layer } => AttrTypeKind::String {
+                identity_layer: crate::schema::StringIdentityLayer {
+                    binding,
+                    length: identity_layer.length.pair(),
+                    pattern: identity_layer
+                        .pattern
+                        .as_ref()
+                        .map(|pattern| pattern.0.clone()),
+                    to_dsl: None,
+                },
+                member_layer: Default::default(),
+            },
+            IdentityConstraintKind::Int { identity_range } => AttrTypeKind::Int {
+                identity_layer: crate::schema::IntIdentityLayer {
+                    binding,
+                    range: identity_range.pair(),
+                },
+                member_layer: Default::default(),
+            },
+            IdentityConstraintKind::Float { range } => AttrTypeKind::Float {
                 binding,
                 range: range.pair(),
             },
@@ -450,7 +607,7 @@ mod pattern_mode_tests {
                 ))
                 .unwrap(),
             );
-            let mut retained = ScalarConstraints::new(ScalarConstraintKind::String {
+            let retained = ScalarConstraints::new(ScalarConstraintKind::String {
                 identity_layer: StringIdentityConstraints {
                     length: Bounds::new(None),
                     pattern: Some(identity_pattern),
@@ -460,7 +617,6 @@ mod pattern_mode_tests {
                     pattern: Some(member_pattern),
                 },
             });
-            retained.intersect(&retained.clone());
             let json = serde_json::to_string(&retained).unwrap();
             let decoded: ScalarConstraints = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, retained);

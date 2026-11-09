@@ -44,7 +44,10 @@ resource-specific restrictions into the member layer. Across different schema
 owners, such as AWS and AWSCC, annotations conjoin the owners' identity
 constraints, so a value must satisfy every owner. Different identity constraints
 across owners are allowed. Enum definition and canonical-spelling disagreement
-remain typed errors.
+remain typed errors. Authored annotations name an identity: their retained
+constraint payload has no member layer. Only exact schema-declaration projections
+carry member constraints. Annotation records containing member constraints are
+invalid, including records with an empty member layer.
 
 Schema fingerprint encoding is v13. Saved-plan format 44 supersedes 43 because
 the schema fingerprint encoding changed. Saved module `pending_constraints`

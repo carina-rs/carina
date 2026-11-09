@@ -625,8 +625,11 @@ A struct type represents a nested object with typed fields.
   migrations must move resource-specific bounds into the member layer rather
   than redeclaring an identity with different constraints. Across different
   owners (for example AWS and AWSCC), annotation constraints are conjoined:
-  values must satisfy every owner's identity layer. Enum definition and
-  canonical-spelling disagreements remain typed errors. Built-in and aggregate
+  values must satisfy every owner's identity layer. Annotation-origin evidence
+  uses an identity-only payload with no member slots; only exact schema
+  projections retain member constraints. Decoding annotation-origin member
+  records must fail. Enum definition and canonical-spelling disagreements
+  remain typed errors. Built-in and aggregate
   comparisons accept identity-only typed projections. Exact
   declarations and their fingerprints preserve both layers. Hover renders
   both layers; shared provider docgen must do the same. WIT stays 0.2.0.

@@ -20,6 +20,7 @@
             "kind": "Count"
           }
         },
+        "origin": "Projection",
         "constraints": {
           "scalar": {
             "Int": {
@@ -43,7 +44,6 @@
           },
           "empty_intersection": false
         },
-        "origin": "Projection",
         "projection_fingerprint": "9374930cd4ae37a425be15392960f1f1b595c8c25f7043dee829ee50baacd1c9"
       }
     }
@@ -78,6 +78,7 @@
             "kind": "Name"
           }
         },
+        "origin": "Annotation",
         "constraints": {
           "scalar": {
             "String": {
@@ -96,13 +97,6 @@
                     "kind": "full"
                   }
                 }
-              },
-              "member_layer": {
-                "length": {
-                  "min": "Unbounded",
-                  "max": "Unbounded"
-                },
-                "pattern": null
               }
             }
           },
@@ -142,7 +136,6 @@
             }
           ]
         },
-        "origin": "Annotation",
         "projection_fingerprint": null
       }
     }
@@ -174,6 +167,7 @@
             "kind": "Name"
           }
         },
+        "origin": "Projection",
         "constraints": {
           "scalar": {
             "String": {
@@ -208,7 +202,6 @@
           },
           "empty_intersection": false
         },
-        "origin": "Projection",
         "projection_fingerprint": "89d04fe7a71298399dacb5c232aa0839fdbf084580f81f3a0f6746328c391fbe"
       }
     }

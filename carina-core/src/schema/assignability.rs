@@ -422,13 +422,6 @@ impl NominalScalarConstraints {
 
 fn nominal_scalar_constraints<'a, R: PatternForm>(
     ty: TypeInSchema<'a, R>,
-    refs: &[&'a str],
-) -> Option<NominalScalarConstraints> {
-    nominal_scalar_constraints_on_path(ty, &mut refs.to_vec())
-}
-
-fn nominal_scalar_constraints_on_path<'a, R: PatternForm>(
-    ty: TypeInSchema<'a, R>,
     refs: &mut Vec<&'a str>,
 ) -> Option<NominalScalarConstraints> {
     let resolved = resolve_refs_on_path(ty.attr, ty.defs, refs).ok()?;
@@ -455,7 +448,7 @@ fn nominal_scalar_constraints_on_path<'a, R: PatternForm>(
             dsl_aliases: _,
             validate: _,
             to_dsl: _,
-        } => nominal_scalar_constraints_on_path(base.in_schema(ty.defs), refs),
+        } => nominal_scalar_constraints(base.in_schema(ty.defs), refs),
         AttrTypeKind::UnloadedSchemaType(_)
         | AttrTypeKind::Reference {
             identity: _,

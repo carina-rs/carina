@@ -2207,7 +2207,12 @@ fn member_constraints_do_not_enter_multi_owner_identity_annotations() {
         panic!("owned annotation")
     };
     assert_eq!(owned.owners().iter().len(), 2);
-    let lifted = lift_type_expr(&ty).unwrap();
+    let wire = serde_json::to_value(&ty).unwrap();
+    let scalar = &wire["SchemaType"]["owned"]["constraints"]["scalar"]["String"];
+    assert!(scalar.get("member_layer").is_none(), "{scalar}");
+    let restored: TypeExpr = serde_json::from_value(wire).unwrap();
+    assert_eq!(restored, ty);
+    let lifted = lift_type_expr(&restored).unwrap();
     assert!(lifted.validate(&text("ccc")).is_ok());
     assert!(declaration(&loaded, "a", 0).validate(&text("ccc")).is_err());
     assert!(declaration(&loaded, "b", 0).validate(&text("ccc")).is_err());
@@ -2560,4 +2565,28 @@ fn layered_scalar_evidence_fixture_round_trips_and_rebinds() {
             assert_eq!(result.is_ok(), valid, "{key}: {result:?}");
         }
     }
+}
+
+#[test]
+fn annotation_origin_rejects_member_constraint_records() {
+    let fixture: BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(include_str!("fixtures/layered_scalar_evidence.json")).unwrap();
+    for key in ["string", "int"] {
+        let mut tampered = fixture[key].clone();
+        let owned = &mut tampered["SchemaType"]["owned"];
+        owned["origin"] = serde_json::json!("Annotation");
+        owned["projection_fingerprint"] = serde_json::Value::Null;
+        assert!(
+            serde_json::from_value::<TypeExpr>(tampered).is_err(),
+            "annotation origin accepted {key} declaration members"
+        );
+    }
+    let loaded = snapshot(vec![("p", vec![string(1, 32, None)])]);
+    let mut tampered = serde_json::to_value(annotation(&loaded)).unwrap();
+    tampered["SchemaType"]["owned"]["constraints"]["scalar"]["String"]["member_layer"] =
+        serde_json::json!({"pattern": null, "length": {"min":"Unbounded", "max":"Unbounded"}});
+    assert!(
+        serde_json::from_value::<TypeExpr>(tampered).is_err(),
+        "even empty member records are invalid on annotation origin"
+    );
 }

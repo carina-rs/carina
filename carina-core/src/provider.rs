@@ -9520,14 +9520,10 @@ where
                 continue;
             }
             for declaration in declarations {
-                let identity_declaration = declaration.scalar_identity_parts();
-                let declaration = if identity_declaration.is_some() {
-                    ResolvedSchemaType::from_identity_declaration(owner, declaration)
-                } else {
-                    ResolvedSchemaType::from_schema_declaration(owner, declaration)
-                }
-                .filter(|declaration| declaration.scalar_kind() == owned.scalar_kind())
-                .ok_or_else(missing)?;
+                let declaration =
+                    ResolvedSchemaType::from_annotation_declaration(owner, declaration)
+                        .filter(|declaration| declaration.scalar_kind() == owned.scalar_kind())
+                        .ok_or_else(missing)?;
                 resolved = Some(match resolved {
                     Some(existing) => existing.conjoin(&declaration),
                     None => declaration,

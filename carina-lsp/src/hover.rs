@@ -59,9 +59,10 @@ fn find_use_import_path(
 fn refinement_hover(
     ty: &carina_core::schema::EffectiveType<'_>,
     budget: &mut carina_core::schema::ShapeWalkBudget,
-    depth: usize,
+    truncated: &mut bool,
 ) -> String {
-    if depth >= 64 {
+    if *truncated || !budget.take() {
+        *truncated = true;
         return String::new();
     }
     let mut content = String::new();
@@ -106,7 +107,7 @@ fn refinement_hover(
                     "List element",
                     &element,
                     budget,
-                    depth + 1,
+                    truncated,
                 );
             }
         }
@@ -117,19 +118,49 @@ fn refinement_hover(
                     "Map value",
                     &element,
                     budget,
-                    depth + 1,
+                    truncated,
                 );
             }
         }
         Shape::Struct { .. } => {
-            for field in ty.field_candidates_with_budget(budget) {
+            let fields = ty.field_candidates_with_budget(budget);
+            if budget.is_exhausted() {
+                *truncated = true;
+            }
+            for field in fields {
+                if *truncated {
+                    break;
+                }
                 append_nested_refinement_hover(
                     &mut content,
                     &format!("Field `{}`", field.name()),
                     &field.value_type(),
                     budget,
-                    depth + 1,
+                    truncated,
                 );
+            }
+        }
+        Shape::Union => {
+            let members = ty.union_members_with_budget(budget);
+            if budget.is_exhausted() {
+                *truncated = true;
+            }
+            for (index, member) in members.into_iter().enumerate() {
+                if *truncated {
+                    break;
+                }
+                append_nested_refinement_hover(
+                    &mut content,
+                    &format!("Union member {}", index + 1),
+                    &member,
+                    budget,
+                    truncated,
+                );
+            }
+        }
+        Shape::Enum { .. } => {
+            if let Some(base) = ty.enum_base() {
+                append_nested_refinement_hover(&mut content, "Enum base", &base, budget, truncated);
             }
         }
         _ => {}
@@ -143,9 +174,9 @@ fn append_nested_refinement_hover(
     label: &str,
     ty: &carina_core::schema::EffectiveType<'_>,
     budget: &mut carina_core::schema::ShapeWalkBudget,
-    depth: usize,
+    truncated: &mut bool,
 ) {
-    let refinements = refinement_hover(ty, budget, depth);
+    let refinements = refinement_hover(ty, budget, truncated);
     if !refinements.is_empty() {
         content.push_str(&format!(
             "\n\n**{label}** (`{}`):{refinements}",
@@ -661,11 +692,15 @@ impl HoverProvider {
             required
         );
 
+        let mut truncated = false;
         content.push_str(&refinement_hover(
             &attr.value_type(),
             &mut carina_core::schema::ShapeWalkBudget::new(64),
-            0,
+            &mut truncated,
         ));
+        if truncated {
+            content.push_str("\n\n… further nested constraints omitted");
+        }
 
         Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -2904,6 +2939,139 @@ EOT
                 );
             }
         }
+    }
+
+    #[test]
+    fn hover_preserves_union_and_enum_base_refinement_layers() {
+        use carina_core::schema::{
+            IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+            StringMemberConstraints, TypeIdentity,
+        };
+        let name = AttributeType::string_member(
+            StringIdentityLayer::new(
+                Some(TypeIdentity::bare("Name")),
+                Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                None,
+                None,
+            ),
+            StringMemberConstraints::new(None, Some((Some(2), Some(8)))),
+        );
+        let count = AttributeType::int_member(
+            IntIdentityLayer::new(
+                Some(TypeIdentity::bare("Count")),
+                Some((Some(0), Some(100))),
+            ),
+            IntMemberConstraints::new(Some((Some(1), Some(10)))),
+        );
+        let schema = ResourceSchema::new("contact")
+            .attribute(
+                AttributeSchema::optional(
+                    "choice",
+                    AttributeType::union(vec![name.clone(), count]),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "mode",
+                    AttributeType::enum_with_base(
+                        TypeIdentity::from_dotted("test.Mode"),
+                        name,
+                        None,
+                        vec![],
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", schema);
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+        let doc = Document::new(
+            "test.contact {\n choice = 'abc'\n mode = 'ab'\n}\n".into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        for line in [1, 2] {
+            let hover = provider.hover(&doc, Position::new(line, 3)).unwrap();
+            let HoverContents::Markup(content) = hover.contents else {
+                panic!("Markdown hover")
+            };
+            for fragment in ["Identity pattern", "[a-z]+", "Member length", "2..=8"] {
+                assert!(
+                    content.value.contains(fragment),
+                    "line {line}: missing {fragment}: {}",
+                    content.value
+                );
+            }
+            if line == 1 {
+                for fragment in ["Identity range", "0..=100", "Member range", "1..=10"] {
+                    assert!(
+                        content.value.contains(fragment),
+                        "missing {fragment}: {}",
+                        content.value
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hover_marks_truncated_nested_constraints() {
+        use carina_core::schema::{StringIdentityLayer, StringMemberConstraints, TypeIdentity};
+        let name = AttributeType::string_member(
+            StringIdentityLayer::new(Some(TypeIdentity::bare("Name")), None, None, None),
+            StringMemberConstraints::new(None, Some((Some(1), Some(8)))),
+        );
+        let schema = ResourceSchema::new("contact")
+            .attribute(
+                AttributeSchema::optional(
+                    "details",
+                    AttributeType::struct_(
+                        "Details",
+                        (0..100)
+                            .map(|index| {
+                                StructField::optional(format!("name{index}"), name.clone()).build()
+                            })
+                            .collect(),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", schema);
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+        let doc = Document::new(
+            "test.contact {\n details = {}\n}\n".into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        let hover = provider.hover(&doc, Position::new(1, 3)).unwrap();
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("Markdown hover")
+        };
+        assert_eq!(
+            content
+                .value
+                .matches("… further nested constraints omitted")
+                .count(),
+            1,
+            "{}",
+            content.value
+        );
+        assert!(content.value.contains("Member length"), "{}", content.value);
+        assert!(
+            !content.value.contains("Field `name99`"),
+            "{}",
+            content.value
+        );
     }
 
     #[test]

@@ -308,7 +308,7 @@ pub(crate) fn join_inferred_types(
 /// after its accumulator has widened away from exact member declarations.
 pub(crate) struct InferredTypeJoiner<'a> {
     context: &'a crate::parser::ProviderContext,
-    canonical: BTreeMap<crate::schema::TypeIdentity, TypeExpr>,
+    canonical: BTreeMap<crate::schema::TypeIdentity, Option<TypeExpr>>,
 }
 
 impl<'a> InferredTypeJoiner<'a> {
@@ -355,29 +355,24 @@ impl<'a> InferredTypeJoiner<'a> {
         let left_identity = scalar_identity(left)?;
         let right_identity = scalar_identity(right)?;
         for identity in [left_identity, right_identity] {
-            let canonical = match self.canonical.entry(identity.clone()) {
-                std::collections::btree_map::Entry::Occupied(cached) => cached.get().clone(),
-                std::collections::btree_map::Entry::Vacant(cached) => {
-                    let Ok(candidate) = TypeExpr::try_from(identity) else {
-                        continue;
-                    };
-                    let Ok(canonical) = super::resolve_type_expr(&candidate, self.context) else {
-                        continue;
-                    };
-                    cached.insert(canonical).clone()
-                }
+            let canonical = self.canonical.entry(identity.clone()).or_insert_with(|| {
+                let candidate = TypeExpr::try_from(identity).ok()?;
+                super::resolve_type_expr(&candidate, self.context).ok()
+            });
+            let Some(canonical) = canonical else {
+                continue;
             };
             if [left, right].into_iter().all(|source| {
                 matches!(
                     super::typecheck::inferred_type_assignment(
-                        &canonical,
+                        canonical,
                         source,
                         &self.context.custom_types
                     ),
                     crate::schema::TypeAssignability::Assignable,
                 )
             }) {
-                return Some(canonical);
+                return Some(canonical.clone());
             }
         }
         None
@@ -1545,6 +1540,104 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn collection_join_caches_failed_canonical_resolution() {
+        use crate::parser::{
+            CustomTypeResolver, CustomTypeValidationError, OwnedTypeIdentity,
+            ProviderCustomTypeSource, ProviderCustomTypes, ResolvedSchemaType, SchemaTypeOwner,
+        };
+        use crate::schema::{
+            AttributeType as DraftType, RefinedScalarKind, TypeIdentity, ValidatedConfigSchema,
+        };
+        use std::{
+            collections::BTreeSet,
+            sync::{Arc, Mutex},
+        };
+        struct CountingSource {
+            known: BTreeSet<OwnedTypeIdentity>,
+            unresolved: TypeIdentity,
+            calls: Arc<Mutex<BTreeMap<TypeIdentity, usize>>>,
+        }
+        impl CustomTypeResolver for CountingSource {
+            fn validate_validated(
+                &self,
+                _: &str,
+                _: crate::schema::LocallyValidatedCustomType<'_>,
+            ) -> Result<(), CustomTypeValidationError> {
+                unreachable!("no value validation")
+            }
+            fn annotation_declaration(
+                &self,
+                owned: &OwnedTypeIdentity,
+            ) -> Result<ResolvedSchemaType, CustomTypeValidationError> {
+                *self
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .entry(owned.identity().clone())
+                    .or_default() += 1;
+                if owned.identity() == &self.unresolved {
+                    Err(CustomTypeValidationError::MissingDeclaration {
+                        owner: "p".into(),
+                        identity: owned.identity().clone(),
+                    })
+                } else {
+                    Ok(owned.clone().unbounded_witness_for_test())
+                }
+            }
+        }
+        impl ProviderCustomTypeSource for CountingSource {
+            fn known_custom_types(&self) -> BTreeSet<OwnedTypeIdentity> {
+                self.known.clone()
+            }
+            fn assignability_closures(
+                &self,
+            ) -> BTreeMap<SchemaTypeOwner, crate::schema::AssignabilityClosure> {
+                BTreeMap::new()
+            }
+        }
+        let left_id = TypeIdentity::from_dotted("aws.service.Resource.Name");
+        let right_id = TypeIdentity::from_dotted("aws.Name");
+        let calls = Arc::new(Mutex::new(BTreeMap::new()));
+        let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        context.custom_types = ProviderCustomTypes::from_source(CountingSource {
+            known: [left_id.clone(), right_id.clone()]
+                .into_iter()
+                .map(|identity| {
+                    OwnedTypeIdentity::provider("p", identity, RefinedScalarKind::String)
+                })
+                .collect(),
+            unresolved: left_id.clone(),
+            calls: calls.clone(),
+        });
+        let schema = ValidatedConfigSchema::validate(BTreeMap::from([
+            (
+                "left".into(),
+                DraftType::refined_string(Some(left_id.clone()), None, None, None),
+            ),
+            (
+                "right".into(),
+                DraftType::refined_string(Some(right_id.clone()), None, None, None),
+            ),
+        ]))
+        .unwrap();
+        let left = attribute_type_to_type_expr(&schema.parts()["left"], "p");
+        let right = attribute_type_to_type_expr(&schema.parts()["right"], "p");
+        let mut joiner = InferredTypeJoiner::new(&context);
+        for _ in 0..3 {
+            let joined = joiner
+                .join(&left, &right)
+                .expect("try the resolved right canonical");
+            let TypeExpr::SchemaType { owned } = joined else {
+                panic!("canonical schema type")
+            };
+            assert_eq!(owned.identity(), &right_id);
+        }
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls[&right_id], 1, "positive canonical cache");
+        assert_eq!(calls[&left_id], 1, "negative canonical cache");
+    }
 
     #[test]
     fn export_inference_returns_inferred_type() {
