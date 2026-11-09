@@ -11,6 +11,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   NEXTEST_VERSION: 0.9.151
+  # Keep debug data out of CI test archives. Main's cache warmer and every
+  # cache consumer must inherit the same profile overrides (and cache hash).
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
 
 jobs:
   changes:
@@ -283,7 +287,9 @@ jobs:
         run: cargo nextest run --workspace --all-features --no-run
       - name: Archive workspace tests
         if: github.event_name != 'push'
-        run: cargo nextest archive --workspace --all-features --archive-file nextest-archive.tar.zst
+        # Level 1 favors packing speed without the large ratio loss of fast
+        # negative levels; the artifact is already compressed before upload.
+        run: cargo nextest archive --workspace --all-features --archive-file nextest-archive.tar.zst --zstd-level 1
       - uses: actions/upload-artifact@v4
         if: github.event_name != 'push'
         with:
@@ -310,6 +316,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Keep the measured test-execution tail near four minutes. Shrinking
+        # the archive reduces transfer costs for these six jobs and isolation.
         partition: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
@@ -330,8 +338,9 @@ jobs:
           name: wasm-fixtures
           path: target/wasm32-wasip2/debug
       - run: bash scripts/require-wasm-fixtures.sh
-      # Extract into the checkout: integration tests use Cargo's compile-time
-      # binary paths under target/debug, as well as the WASM fixtures above.
+      # Each fresh runner unpacks once. Overwrite permits target/ created by
+      # the fixture download. The checkout location preserves Cargo's
+      # compile-time binary paths; a temporary extraction would break them.
       - run: >-
           cargo nextest run --archive-file nextest-archive.tar.zst
           --workspace-remap . --extract-to . --extract-overwrite

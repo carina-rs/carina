@@ -134,9 +134,22 @@ class WorkflowConditionTests(unittest.TestCase):
             result.append(run)
         return result
 
+    def test_ci_debug_overrides_are_global_and_shared_by_cache_jobs(self):
+        source = WORKFLOW.read_text()
+        environment = source.split("\nenv:\n", 1)[1].split("\njobs:\n", 1)[0]
+        for profile in ("DEV", "TEST"):
+            name = f"CARGO_PROFILE_{profile}_DEBUG"
+            self.assertEqual(field(environment, name, "  "), '\"0\"')
+            # No job/step may override the shared profile, including main's
+            # cache warmer and the restore-only doctest/provider consumers.
+            self.assertNotRegex(source, rf"(?m)^ {{4,}}{name}:")
+        action = (WORKFLOW.parent.parent / "actions/rust-cache/action.yml").read_text()
+        # Swatinem's default environment hash includes all CARGO_* values.
+        self.assertNotIn("add-rust-environment-hash-key: false", action)
+
     def test_push_only_compiles_test_artifacts(self):
         build = "cargo build -p carina-provider-mock -p carina-provider-mock-http --target wasm32-wasip2"
-        archive = "cargo nextest archive --workspace --all-features --archive-file nextest-archive.tar.zst"
+        archive = "cargo nextest archive --workspace --all-features --archive-file nextest-archive.tar.zst --zstd-level 1"
         version = "rustc --version | awk '{print \"version=\" $2}' >> \"$GITHUB_OUTPUT\""
         self.assertEqual(self.commands("test", "push"), [version, build, "cargo nextest run --workspace --all-features --no-run"])
         for event in ("merge_group", "pull_request"):
