@@ -2462,6 +2462,26 @@ impl super::evaluable_leaf::Sealed for super::LoopSlot {
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
+    /// Retain shared knowledge and protected failures across parser/template
+    /// phases. Only substitution slots are erased; expression wrappers and
+    /// lexical bodies keep their evidence for the ordinary classifier.
+    pub(crate) fn input_preview(&self) -> Value {
+        let source = match self.knowledge(&KnowledgeContext::validation()) {
+            Ok(knowledge) => knowledge.to_value(),
+            // Keep the source of classification failures too: a later consumer
+            // must still see that failure, never a successful unknown leaf.
+            Err(_) => self.clone(),
+        };
+        let projected = source
+            .try_map_placeholder(&mut |_| {
+                Ok::<_, std::convert::Infallible>(Value::Deferred(DeferredValue::Unknown(
+                    ApplyTimeUnknown::PendingReRead(super::PendingReRead::not_found()),
+                )))
+            })
+            .unwrap_or_else(|never| match never {});
+        super::binding_address::input_preview(projected)
+    }
+
     pub fn knowledge<'a, S: ClassificationStage>(
         &'a self,
         cx: &KnowledgeContext<'_, P, B, S>,
@@ -2620,6 +2640,9 @@ fn classify_function<'a, P: PlaceholderKind, B: BindingAddress, S: Classificatio
     pos.analyses.insert(id, Arc::clone(&analysis));
     Ok(analysis)
 }
+// Keep recursively nested interpolation out of the large variant dispatch
+// frame. Classifying deep expression evidence must not consume one such frame
+// per operand before the conservative estimator applies its own budget.
 fn classify<
     'a,
     P: PlaceholderKind,
@@ -2633,6 +2656,50 @@ fn classify<
 ) -> Result<Classification<'a, Q, B>, KnowledgeError<B>> {
     #[cfg(test)]
     classification_step();
+    match value {
+        Value::Deferred(DeferredValue::Interpolation(parts)) => {
+            classify_interpolation(value, parts, cx, pos)
+        }
+        value => classify_value(value, cx, pos),
+    }
+}
+
+fn classify_interpolation<
+    'a,
+    P: PlaceholderKind,
+    Q: PlaceholderKind,
+    B: BindingAddress,
+    S: ClassificationStage,
+>(
+    value: &'a Value<Q, B>,
+    parts: &'a [InterpolationPart<Q, B>],
+    cx: &KnowledgeContext<'_, P, B, S>,
+    pos: &mut Position<'a, B>,
+) -> Result<Classification<'a, Q, B>, KnowledgeError<B>> {
+    let mut inputs = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        match part {
+            InterpolationPart::Literal(_) => {}
+            InterpolationPart::Expr(value) => inputs.push(kernel::Input::value(
+                OperandStep::Interpolation(i),
+                classify(value, cx, pos)?,
+            )),
+        }
+    }
+    Ok(expression(value, EvaluationKind::Interpolation, inputs))
+}
+
+fn classify_value<
+    'a,
+    P: PlaceholderKind,
+    Q: PlaceholderKind,
+    B: BindingAddress,
+    S: ClassificationStage,
+>(
+    value: &'a Value<Q, B>,
+    cx: &KnowledgeContext<'_, P, B, S>,
+    pos: &mut Position<'a, B>,
+) -> Result<Classification<'a, Q, B>, KnowledgeError<B>> {
     use kernel::{Input, InputValue, KnownNode as N};
     let known = |node| {
         Ok(Classification::Known(KnownValue {
@@ -2817,17 +2884,7 @@ fn classify<
             ],
         )),
         Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            let mut inputs = Vec::new();
-            for (i, part) in parts.iter().enumerate() {
-                match part {
-                    InterpolationPart::Literal(_) => {}
-                    InterpolationPart::Expr(value) => inputs.push(Input::value(
-                        OperandStep::Interpolation(i),
-                        classify(value, cx, pos)?,
-                    )),
-                }
-            }
-            Ok(expression(value, EvaluationKind::Interpolation, inputs))
+            classify_interpolation(value, parts, cx, pos)
         }
         Value::Deferred(DeferredValue::Access(access)) => {
             let input = match access.base().as_concrete() {

@@ -812,6 +812,100 @@ async fn input_discharge_every_write_update_uses_runtime_value() {
 }
 
 #[tokio::test]
+async fn input_discharge_refreshes_resolved_guard_outside_the_update_patch() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .attribute(
+                PatternAttributeSchema::optional("guard", PatternAttributeType::bool()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("target", PatternAttributeType::string()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("value", PatternAttributeType::bool()).build(),
+            )
+            .input_rule(
+                InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("target").unwrap(),
+                    InputRuleCode::new("test.target.suffix").unwrap(),
+                    InputPredicate::NoSuffix(crate::schema::NonEmptyString::new(".fifo").unwrap()),
+                )
+                .with_condition(crate::schema::InputCondition::Equals {
+                    path: InputPath::new("guard").unwrap(),
+                    literal: crate::schema::InputLiteral::Bool(true),
+                }),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let mut target = Resource::new("test", "consumer")
+        .with_attribute("guard", Value::root_resource_ref("source", "value", vec![]))
+        .with_attribute("target", string("valid-update"));
+    target.binding = Some(absolute_binding("consumer"));
+    target
+        .dependencies
+        .value_bindings
+        .insert(absolute_binding("source"));
+    let mut resources = resolved_fixture_resources(vec![source(), target]);
+    let target = resources.remove(1);
+    let provider = MockProvider::new();
+    provider.push_create(Ok(State::existing(
+        resources[0].id.clone(),
+        crate::test_support::snapshot_attributes(HashMap::from([(
+            "value".into(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        )])),
+    )
+    .with_identifier("source-id")));
+    provider.push_update(Ok(ok_state(&target.id)));
+    let previous = State::existing(
+        target.id.clone(),
+        crate::test_support::snapshot_attributes(HashMap::from([
+            ("guard".into(), Value::Concrete(ConcreteValue::Bool(true))),
+            ("target".into(), string("previous-name")),
+        ])),
+    )
+    .with_identifier("old-id");
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resources.remove(0)));
+    plan.add(Effect::Update {
+        from: Box::new(previous),
+        identifier: AppliedIdentifier::new("old-id").unwrap(),
+        to: target,
+        changed_attributes: vec!["target".into()],
+    });
+    let admission = FinalizedPlan::new(plan.clone())
+        .check_inputs(&schemas, &HashMap::new())
+        .unwrap();
+    assert_eq!(admission.pending_inputs().len(), 1);
+    let (result, events) = run(
+        &provider,
+        plan,
+        &schemas,
+        HashMap::new(),
+        Default::default(),
+        &NoopNormalizer,
+    )
+    .await;
+    assert_eq!(
+        (result.success_count, result.failure_count()),
+        (2, 0),
+        "{events:?}"
+    );
+    let requests = provider.captured_update_requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].patch().ops.len(), 1);
+    assert_eq!(requests[0].patch().ops[0].key(), "target");
+    assert_eq!(
+        requests[0].patch().ops[0].sent_value(),
+        Some(&string("valid-update"))
+    );
+}
+
+#[tokio::test]
 async fn input_discharge_update_only_checks_sent_paths() {
     for write_only in [false, true] {
         let mut schemas = SchemaRegistry::new();

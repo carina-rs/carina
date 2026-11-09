@@ -772,31 +772,71 @@ fn admit_literal<R: PatternForm>(
     let ty = peel_refs(ty, defs).ok_or(InputRuleError::UnknownPath)?;
     let matches = match (&ty.kind, literal) {
         (AttrTypeKind::Bool, InputLiteral::Bool(_)) => true,
-        (AttrTypeKind::Int { range, .. }, InputLiteral::Int(value)) => {
-            range.as_ref().is_none_or(|(min, max)| {
-                min.is_none_or(|min| *value >= min) && max.is_none_or(|max| *value <= max)
-            })
+        (AttrTypeKind::Int { binding, range }, InputLiteral::Int(value)) => {
+            super::validate_scalar_refinement(
+                binding,
+                crate::resource::ConcreteValueRef::<crate::resource::NoPlaceholder>::Int(*value),
+                || super::validate_int_range(*range, *value),
+            )
+            .is_ok()
         }
-        (AttrTypeKind::Float { range, .. }, InputLiteral::Float(value)) => {
-            range.as_ref().is_none_or(|(min, max)| {
-                min.is_none_or(|min| *value >= min) && max.is_none_or(|max| *value <= max)
-            })
+        (AttrTypeKind::Float { binding, range }, InputLiteral::Float(value)) => {
+            super::validate_scalar_refinement(
+                binding,
+                crate::resource::ConcreteValueRef::<crate::resource::NoPlaceholder>::Float(*value),
+                || super::validate_float_range(*range, *value),
+            )
+            .is_ok()
         }
         (
             AttrTypeKind::String {
-                pattern, length, ..
-            }
-            | AttrTypeKind::Reference {
-                pattern, length, ..
+                binding,
+                pattern,
+                length,
+                ..
             },
             InputLiteral::String(value),
         ) => {
-            let count = value.chars().count() as u64;
-            length.as_ref().is_none_or(|(min, max)| {
-                min.is_none_or(|min| count >= min) && max.is_none_or(|max| count <= max)
-            }) && pattern.as_ref().is_none_or(|pattern| {
-                CompiledPattern::try_new(pattern.as_ref()).is_ok_and(|p| p.is_match(value))
-            })
+            let pattern = pattern
+                .as_ref()
+                .map(|pattern| CompiledPattern::try_new(pattern.as_ref()))
+                .transpose()
+                .map_err(|_| InputRuleError::LiteralTypeMismatch)?;
+            let value = crate::resource::ValueString::from(value.clone());
+            super::validate_scalar_refinement(
+                binding,
+                crate::resource::ConcreteValueRef::<crate::resource::NoPlaceholder>::String(&value),
+                || {
+                    super::validate_string_refinement(
+                        binding.identity(),
+                        pattern.as_ref(),
+                        *length,
+                        &value,
+                    )
+                },
+            )
+            .is_ok()
+        }
+        (
+            AttrTypeKind::Reference {
+                identity,
+                pattern,
+                length,
+            },
+            InputLiteral::String(value),
+        ) => {
+            let pattern = pattern
+                .as_ref()
+                .map(|pattern| CompiledPattern::try_new(pattern.as_ref()))
+                .transpose()
+                .map_err(|_| InputRuleError::LiteralTypeMismatch)?;
+            super::validate_string_refinement(
+                Some(identity),
+                pattern.as_ref(),
+                *length,
+                &value.clone().into(),
+            )
+            .is_ok()
         }
         (AttrTypeKind::StringLiteralSet { values }, InputLiteral::String(value)) => {
             values.contains(value)
@@ -900,5 +940,98 @@ fn string_based<R: PatternForm>(
         | AttrTypeKind::List { .. }
         | AttrTypeKind::Map { .. }
         | AttrTypeKind::Struct { .. } => false,
+    }
+}
+
+#[cfg(test)]
+mod scalar_literal_tests {
+    use super::*;
+    use crate::{
+        parser::ResolvedSchemaType,
+        resource::{ConcreteValue, Value},
+        schema::{AttributeType, PatternMatch, PatternSpec, RefinementBinding},
+    };
+
+    #[test]
+    fn literal_admission_checks_all_annotation_patterns() {
+        let identity = TypeIdentity::new(Some("mock"), ["test"], "AnnotatedString");
+        let declaration = |regex| {
+            PatternAttributeType::<Compiled>::refined_string(
+                Some(identity.clone()),
+                Some(
+                    CompiledPattern::try_new(&PatternSpec::new(regex, PatternMatch::Full)).unwrap(),
+                ),
+                None,
+                None,
+            )
+        };
+        let first =
+            ResolvedSchemaType::from_schema_declaration("mock", &declaration("a.*")).unwrap();
+        let second =
+            ResolvedSchemaType::from_schema_declaration("mock", &declaration(".*z")).unwrap();
+        let annotation = first.conjoin(&second).into_annotation();
+        let annotated = AttributeType {
+            kind: AttrTypeKind::String {
+                binding: RefinementBinding::Annotation(annotation),
+                pattern: None,
+                length: None,
+                to_dsl: None,
+            },
+        };
+        for (text, valid) in [("ab", false), ("bz", false), ("az", true)] {
+            assert_eq!(
+                admit_literal(
+                    &annotated,
+                    &InputLiteral::String(text.into()),
+                    &Default::default()
+                )
+                .is_ok(),
+                valid
+            );
+            let compiled = annotated
+                .clone()
+                .compile_patterns(
+                    SchemaValidationIssueLocation::Attribute("value".into()),
+                    &mut vec![],
+                )
+                .unwrap();
+            let value: Value = Value::Concrete(ConcreteValue::String(text.into()));
+            assert_eq!(compiled.validate(&value).is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn literal_admission_rejects_empty_annotation_intersections() {
+        let identity = TypeIdentity::new(Some("mock"), ["test"], "AnnotatedInt");
+        let declaration = |min, max| {
+            PatternAttributeType::<Compiled>::refined_int(
+                Some(identity.clone()),
+                Some((Some(min), Some(max))),
+            )
+        };
+        let first =
+            ResolvedSchemaType::from_schema_declaration("mock", &declaration(1, 2)).unwrap();
+        let second =
+            ResolvedSchemaType::from_schema_declaration("mock", &declaration(3, 4)).unwrap();
+        let annotation = first.conjoin(&second).into_annotation();
+        assert!(annotation.has_empty_intersection());
+        let annotated = AttributeType {
+            kind: AttrTypeKind::Int {
+                binding: RefinementBinding::Annotation(annotation),
+                range: None,
+            },
+        };
+        assert_eq!(
+            admit_literal(&annotated, &InputLiteral::Int(2), &Default::default()),
+            Err(InputRuleError::LiteralTypeMismatch)
+        );
+        let compiled = annotated
+            .compile_patterns(
+                SchemaValidationIssueLocation::Attribute("value".into()),
+                &mut vec![],
+            )
+            .unwrap();
+        let value: Value = Value::Concrete(ConcreteValue::Int(2));
+        assert!(compiled.validate(&value).is_err());
     }
 }

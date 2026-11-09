@@ -4,17 +4,17 @@ use std::{
     sync::Arc,
 };
 
-use indexmap::IndexMap;
-
 use super::EffectFailureKind;
 use super::basic::PreparedBasicRequest;
 use super::provider_ready::{CheckInput, ProviderPreparationContext};
 use crate::{
     binding_index::SecretPreservingAttributes,
     effect::{DeletedInstanceKey, Effect, EffectGeneration},
-    input_rules::{InputVerdict, PendingInputObligation, executor_write_site},
-    provider::{AppliedIdentifier, CreateRequest, HostProvider, UpdateRequest},
-    resource::{Directives, ResourceId, Value},
+    input_rules::{ExecutorWriteInputs, InputVerdict, PendingInputObligation, executor_write_site},
+    provider::{
+        AppliedIdentifier, CreateRequest, HostProvider, ProviderReadyResource, UpdateRequest,
+    },
+    resource::{Directives, ResourceId, SnapshotState},
     schema::SchemaRegistry,
 };
 
@@ -263,16 +263,14 @@ impl WriteCheck {
 
     fn discharge(
         &self,
-        id: &ResourceId,
-        attributes: &IndexMap<String, Value>,
-        patch: Option<&crate::provider::UpdatePatch>,
+        inputs: ExecutorWriteInputs<'_>,
         schemas: &SchemaRegistry,
     ) -> Result<(), EffectFailureKind> {
         let Some(admission) = &self.admission else {
             return Ok(());
         };
         let token = DischargeToken(());
-        let site = executor_write_site(&token, admission, id, attributes, patch, schemas)
+        let site = executor_write_site(&token, admission, inputs, schemas)
             .map_err(EffectFailureKind::execution)?
             .ok_or_else(|| {
                 EffectFailureKind::message("input rule schema unavailable at dispatch")
@@ -300,12 +298,7 @@ impl WriteCheck {
         writeback: SecretPreservingAttributes,
         schemas: &SchemaRegistry,
     ) -> Result<PreparedWrite<CreateRequest>, EffectFailureKind> {
-        self.discharge(
-            &request.resource().id,
-            &request.resource().attributes,
-            None,
-            schemas,
-        )?;
+        self.discharge(ExecutorWriteInputs::Create(request.resource()), schemas)?;
         let resource_id = request.resource().id.clone();
         let request = Arc::new(request);
         let retained_request = Arc::clone(&request);
@@ -324,16 +317,54 @@ impl WriteCheck {
 
     pub(super) fn prepare_update(
         self,
-        id: &ResourceId,
+        from: SnapshotState,
+        changed: &[String],
+        desired: ProviderReadyResource,
+        writeback: SecretPreservingAttributes,
+        schemas: &SchemaRegistry,
+    ) -> Result<PreparedWrite<UpdateRequest>, EffectFailureKind> {
+        let schema = super::provider_ready::managed_update_schema(schemas, desired.as_resource())
+            .map_err(EffectFailureKind::execution)?;
+        let request = UpdateRequest::checked(from, changed, &desired, schema)
+            .map_err(EffectFailureKind::execution)?;
+        self.discharge(
+            ExecutorWriteInputs::Update {
+                desired: &desired,
+                patch: request.patch(),
+            },
+            schemas,
+        )?;
+        Ok(self.seal_update(desired.as_resource().id.clone(), request, writeback))
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) fn prepare_update_fixture(
+        self,
+        desired: &crate::resource::Resource,
         request: UpdateRequest,
         writeback: SecretPreservingAttributes,
         schemas: &SchemaRegistry,
     ) -> Result<PreparedWrite<UpdateRequest>, EffectFailureKind> {
-        let attributes = request.patch().sent_projection();
-        self.discharge(id, &attributes, Some(request.patch()), schemas)?;
-        Ok(PreparedWrite {
+        self.discharge(
+            ExecutorWriteInputs::FixtureUpdate {
+                resource_id: &desired.id,
+                desired: &desired.attributes,
+                patch: request.patch(),
+            },
+            schemas,
+        )?;
+        Ok(self.seal_update(desired.id.clone(), request, writeback))
+    }
+
+    fn seal_update(
+        self,
+        resource_id: ResourceId,
+        request: UpdateRequest,
+        writeback: SecretPreservingAttributes,
+    ) -> PreparedWrite<UpdateRequest> {
+        PreparedWrite {
             request: Arc::new(request),
-            resource_id: id.clone(),
+            resource_id,
             writeback,
             receipt: Arc::new(PreparationReceipt {
                 slot: self.slot,
@@ -341,7 +372,7 @@ impl WriteCheck {
                 deletes: self.deletes,
                 _create_request: None,
             }),
-        })
+        }
     }
 
     pub(super) fn cohort_receipts<R>(
@@ -681,6 +712,7 @@ mod tests {
     use super::*;
     use crate::input_rules::FinalizedPlan;
     use crate::plan::Plan;
+    use crate::resource::Value;
 
     #[test]
     fn input_discharge_invalid_plan_mapping_returns_error_without_panicking() {
@@ -855,21 +887,30 @@ mod tests {
                             }
                         }
                         let from = crate::resource::SnapshotState::not_found(resource.id.clone());
-                        let update =
-                            futures::executor::block_on(super::super::prepare_update_request(
-                                resource,
-                                from,
-                                &["name".into()],
-                                &context,
-                            ))
-                            .unwrap();
+                        let desired = futures::executor::block_on(
+                            super::super::provider_ready::prepare_provider_ready_resource(
+                                resource, &context,
+                            ),
+                        )
+                        .unwrap();
+                        let update = UpdateRequest::checked(
+                            from,
+                            &["name".into()],
+                            &desired,
+                            super::super::provider_ready::managed_update_schema(
+                                &schemas,
+                                desired.as_resource(),
+                            )
+                            .unwrap(),
+                        )
+                        .unwrap();
                         let id = update.from().id.clone();
-                        let mut desired = crate::resource::Resource::from_id(id.clone());
-                        desired.attributes = update.patch().sent_projection();
+                        let mut planned = crate::resource::Resource::from_id(id.clone());
+                        planned.attributes = update.patch().sent_projection();
                         match admit(Effect::Update {
                             from: Box::new(update.from().clone()),
                             identifier: AppliedIdentifier::new("old-id").unwrap(),
-                            to: crate::resource::ResolvedResource::new(desired.into()),
+                            to: crate::resource::ResolvedResource::new(planned.into()),
                             changed_attributes: vec!["name".into()],
                         }) {
                             Ok((ready, check)) => {
@@ -880,7 +921,13 @@ mod tests {
                                     &attributes,
                                 );
                                 let write = check
-                                    .prepare_update(&id, update, writeback, &schemas)
+                                    .prepare_update(
+                                        update.from().clone(),
+                                        &["name".into()],
+                                        desired,
+                                        writeback,
+                                        &schemas,
+                                    )
                                     .unwrap();
                                 let super::super::scheduler::ScheduledBasicEffect::Update {
                                     update,

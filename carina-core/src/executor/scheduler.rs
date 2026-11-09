@@ -98,7 +98,7 @@ pub fn update_permit_with_schemas_for_test(
         Effect::Update {
             from: Box::new(request.from().clone()),
             identifier,
-            to: crate::resource::ResolvedResource::new(desired.into()),
+            to: crate::resource::ResolvedResource::new(desired.clone().into()),
             changed_attributes: request
                 .patch()
                 .ops
@@ -114,7 +114,7 @@ pub fn update_permit_with_schemas_for_test(
         &attributes,
     );
     let write = check
-        .prepare_update(&id, request, writeback, schemas)
+        .prepare_update_fixture(&desired, request, writeback, schemas)
         .expect("fixture input discharge");
     let ScheduledBasicEffect::Update { update, .. } = ready else {
         unreachable!("fixture update slot")

@@ -133,6 +133,151 @@ fn admission_rejects_guard_path_type_depth_and_duplicates() {
     );
 }
 
+fn positive_int() -> AttributeType {
+    AttributeType::refined_int_with_validator(
+        carina_core::schema::TypeIdentity::new(Some("mock"), ["test"], "PositiveInt"),
+        None,
+        carina_core::schema::validator(|value| {
+            if matches!(value, Value::Concrete(ConcreteValue::Int(value)) if *value > 0) {
+                Ok(())
+            } else {
+                Err(carina_core::schema::TypeError::ValidationFailed {
+                    message: "must be positive".into(),
+                })
+            }
+        }),
+    )
+}
+
+fn assert_positive_literal_admission(target_equality: bool) {
+    for value in [0, 1] {
+        let declaration = if target_equality {
+            rule(
+                "guard",
+                InputPredicate::Equals(InputLiteral::Int(value)),
+                InputCondition::Always,
+            )
+        } else {
+            rule(
+                "target",
+                InputPredicate::Present,
+                InputCondition::Equals {
+                    path: path("guard"),
+                    literal: InputLiteral::Int(value),
+                },
+            )
+        };
+        let admitted = ResourceSchema::new("test.Conditional")
+            .attribute(AttributeSchema::optional("guard", positive_int()).build())
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .input_rule(declaration)
+            .validate();
+        if value == 0 {
+            let errors = admitted.expect_err(
+                "ordinary scalar validation rejects zero, so equality must reject it too",
+            );
+            assert!(
+                errors
+                    .input_rule_errors()
+                    .any(|(_, error)| *error == InputRuleError::LiteralTypeMismatch),
+                "{errors}"
+            );
+        } else {
+            admitted.unwrap();
+        }
+    }
+}
+
+#[test]
+fn admission_checks_custom_scalar_refinements_on_condition_literals() {
+    assert_positive_literal_admission(false);
+}
+
+#[test]
+fn admission_checks_custom_scalar_refinements_on_target_literals() {
+    assert_positive_literal_admission(true);
+}
+
+#[test]
+fn admission_uses_the_float_and_string_scalar_refinement_gate() {
+    use carina_core::schema::{TypeError, TypeIdentity, validator};
+    let positive_float = AttributeType::refined_float_with_validator(
+        TypeIdentity::new(Some("mock"), ["test"], "PositiveFloat"),
+        None,
+        validator(|value| match value {
+            Value::Concrete(ConcreteValue::Float(value)) if value.get() > 0.0 => Ok(()),
+            _ => Err(TypeError::ValidationFailed {
+                message: "must be positive".into(),
+            }),
+        }),
+    );
+    let prefixed_string = AttributeType::refined_string_with_validator(
+        TypeIdentity::new(Some("mock"), ["test"], "PrefixedString"),
+        None,
+        None,
+        validator(|value| match value {
+            Value::Concrete(ConcreteValue::String(value))
+                if value.expose_plaintext().starts_with("ok-") =>
+            {
+                Ok(())
+            }
+            _ => Err(TypeError::ValidationFailed {
+                message: "must start with ok-".into(),
+            }),
+        }),
+        None,
+    );
+    for (ty, invalid, valid) in [
+        (
+            positive_float,
+            InputLiteral::Float(carina_core::FiniteF64::new(0.0).unwrap()),
+            InputLiteral::Float(carina_core::FiniteF64::new(1.0).unwrap()),
+        ),
+        (
+            prefixed_string,
+            InputLiteral::String("bad".into()),
+            InputLiteral::String("ok-value".into()),
+        ),
+    ] {
+        for target_equality in [false, true] {
+            for (literal, accepted) in [(invalid.clone(), false), (valid.clone(), true)] {
+                let declaration = if target_equality {
+                    rule(
+                        "guard",
+                        InputPredicate::Equals(literal),
+                        InputCondition::Always,
+                    )
+                } else {
+                    rule(
+                        "target",
+                        InputPredicate::Present,
+                        InputCondition::Equals {
+                            path: path("guard"),
+                            literal,
+                        },
+                    )
+                };
+                let admitted = ResourceSchema::new("test.Conditional")
+                    .attribute(AttributeSchema::optional("guard", ty.clone()).build())
+                    .attribute(AttributeSchema::optional("target", AttributeType::bool()).build())
+                    .input_rule(declaration)
+                    .validate();
+                if accepted {
+                    admitted.unwrap();
+                } else {
+                    let errors = admitted.unwrap_err();
+                    assert!(
+                        errors
+                            .input_rule_errors()
+                            .any(|(_, error)| *error == InputRuleError::LiteralTypeMismatch),
+                        "{errors}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn present_distinguishes_absence_false_and_pending_payload() {
     let schemas = registry(schema().input_rule(rule(

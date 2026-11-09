@@ -3538,16 +3538,7 @@ impl PatternAttributeType<Compiled> {
         &self,
         value: ConcreteValueRef<'_, P, B>,
     ) -> Result<(), TypeError> {
-        if self.has_empty_scalar_intersection() {
-            return Err(TypeError::ValidationFailed {
-                message: format!(
-                    "{} has an empty intersection of scalar constraints",
-                    self.type_name()
-                )
-                .into(),
-            });
-        }
-        match (&self.kind, value) {
+        let constraints = || match (&self.kind, value) {
             (AttrTypeKind::UnloadedSchemaType(_), _) => {
                 Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded.into())
             }
@@ -3559,17 +3550,7 @@ impl PatternAttributeType<Compiled> {
                     ..
                 },
                 ConcreteValueRef::String(s),
-            ) => {
-                validate_string_refinement(binding.identity(), pattern.as_ref(), *length, s)?;
-                if let Some(owned) = binding.annotation() {
-                    for pattern in owned.patterns() {
-                        validate_string_refinement(binding.identity(), Some(pattern), None, s)?;
-                    }
-                }
-                binding
-                    .callback()
-                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
-            }
+            ) => validate_string_refinement(binding.identity(), pattern.as_ref(), *length, s),
             (
                 AttrTypeKind::Reference {
                     identity,
@@ -3583,23 +3564,14 @@ impl PatternAttributeType<Compiled> {
             {
                 Ok(())
             }
-            (AttrTypeKind::Int { binding, range }, ConcreteValueRef::Int(i)) => {
-                validate_int_range(*range, i)?;
-                binding
-                    .callback()
-                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+            (AttrTypeKind::Int { range, .. }, ConcreteValueRef::Int(i)) => {
+                validate_int_range(*range, i)
             }
-            (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Float(f)) => {
-                validate_float_range(*range, f)?;
-                binding
-                    .callback()
-                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+            (AttrTypeKind::Float { range, .. }, ConcreteValueRef::Float(f)) => {
+                validate_float_range(*range, f)
             }
-            (AttrTypeKind::Float { binding, range }, ConcreteValueRef::Int(i)) => {
-                validate_int_in_float_range(*range, i)?;
-                binding
-                    .callback()
-                    .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
+            (AttrTypeKind::Float { range, .. }, ConcreteValueRef::Int(i)) => {
+                validate_int_in_float_range(*range, i)
             }
             (AttrTypeKind::Bool, ConcreteValueRef::Bool(_)) => Ok(()),
             (AttrTypeKind::Duration, ConcreteValueRef::Duration(_)) => Ok(()),
@@ -3607,6 +3579,14 @@ impl PatternAttributeType<Compiled> {
                 self.type_name(),
                 value.type_name().to_string(),
             )),
+        };
+        match &self.kind {
+            AttrTypeKind::String { binding, .. }
+            | AttrTypeKind::Int { binding, .. }
+            | AttrTypeKind::Float { binding, .. } => {
+                validate_scalar_refinement(binding, value, constraints)
+            }
+            _ => constraints(),
         }
     }
 
@@ -4714,6 +4694,38 @@ fn validation_error_message(err: TypeError) -> ProviderValidation {
         TypeError::ValidationFailed { message } => message,
         other => other.into(),
     }
+}
+
+/// The ordinary scalar refinement gate, also used for schema input literals.
+/// Annotation intersections, all annotation patterns and native callbacks stay
+/// together even when a declaration has no inline range or pattern.
+fn validate_scalar_refinement<P: crate::resource::ValueKind, B: BindingAddress>(
+    binding: &RefinementBinding,
+    value: ConcreteValueRef<'_, P, B>,
+    constraints: impl FnOnce() -> Result<(), TypeError>,
+) -> Result<(), TypeError> {
+    if let Some(owned) = binding.annotation() {
+        if owned.has_empty_intersection() {
+            return Err(TypeError::ValidationFailed {
+                message: format!(
+                    "{} has an empty intersection of scalar constraints",
+                    owned.identity()
+                )
+                .into(),
+            });
+        }
+        constraints()?;
+        if let ConcreteValueRef::String(text) = value {
+            for pattern in owned.patterns() {
+                validate_string_refinement(binding.identity(), Some(pattern), None, text)?;
+            }
+        }
+    } else {
+        constraints()?;
+    }
+    binding
+        .callback()
+        .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
 }
 
 fn validate_string_refinement(

@@ -74,7 +74,7 @@ fn assert_failed(verdict: &InputVerdict) {
 }
 
 #[test]
-fn review1_recursive_union_does_not_revisit_same_value() {
+fn recursive_union_does_not_revisit_same_value() {
     let node = AttributeType::struct_with_rules(
         "NodeObject",
         vec![
@@ -112,7 +112,7 @@ fn review1_recursive_union_does_not_revisit_same_value() {
 }
 
 #[test]
-fn review1_union_rules_follow_selected_member() {
+fn union_rules_follow_selected_member() {
     let fields = || vec![StructField::optional("x", AttributeType::bool()).build()];
     let schemas = registry(
         ResourceSchema::new("Review").attribute(
@@ -181,7 +181,7 @@ fn review1_union_rules_follow_selected_member() {
 }
 
 #[test]
-fn review1_float_equality_accepts_exact_integer_representations() {
+fn float_equality_accepts_exact_integer_representations() {
     for (integer, float, equal) in [
         (1, 1.0, true),
         (0, -0.0, true),
@@ -248,7 +248,7 @@ fn failed_coalesce<P: crate::resource::ValueKind, B: crate::resource::BindingAdd
 }
 
 #[test]
-fn review1_nested_guard_retains_coalesce_failure() {
+fn nested_guard_retains_coalesce_failure() {
     for condition in [
         InputCondition::Present(path("settings.flag")),
         InputCondition::Not(Box::new(InputCondition::Present(path("settings.flag")))),
@@ -303,7 +303,7 @@ fn review1_nested_guard_retains_coalesce_failure() {
 }
 
 #[test]
-fn review1_known_invalid_enum_is_failed_instead_of_pending() {
+fn known_invalid_enum_is_failed_instead_of_pending() {
     let identity = TypeIdentity::new(Some("mock"), ["Review"], "Namespace");
     let literal = InputLiteral::Enum {
         identity: identity.clone(),
@@ -375,7 +375,7 @@ fn review1_known_invalid_enum_is_failed_instead_of_pending() {
 }
 
 #[test]
-fn review1_deferred_template_retains_literal_guard_evidence() {
+fn deferred_template_retains_literal_guard_evidence() {
     use crate::parser::{DeferredForExpression, DeferredForTarget, ForBinding};
     let schemas = registry(
         ResourceSchema::new("Review")
@@ -471,6 +471,215 @@ fn review1_deferred_template_retains_literal_guard_evidence() {
                 "pending" => assert_eq!(verdict, InputVerdict::Undecided),
                 _ => unreachable!(),
             }
+        }
+    }
+}
+
+#[test]
+fn ignored_unsent_guard_does_not_use_unapplied_authored_evidence() {
+    use crate::resource::{ParsedIgnorePath, ParsedIgnorePathSegment, ResolvedIgnoreChanges};
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .input_rule(rule(
+                "target",
+                InputPredicate::NoSuffix(crate::schema::NonEmptyString::new(".fifo").unwrap()),
+                InputCondition::Equals {
+                    path: path("guard"),
+                    literal: InputLiteral::Bool(true),
+                },
+            )),
+    );
+    let resource = Resource::with_provider("mock", "Review", "example", None)
+        .with_attribute("guard", Value::Concrete(ConcreteValue::Bool(false)))
+        .with_attribute(
+            "target",
+            Value::Concrete(ConcreteValue::String("bad.fifo".into())),
+        );
+    let mut site =
+        classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+            .unwrap()
+            .unwrap();
+    site.context = InputWriteContext::Update;
+    let mut update = UpdateInputContext {
+        desired: resource.attributes.clone(),
+        projected: IndexMap::new(),
+        changed: HashSet::new(),
+        removed: HashSet::new(),
+        ignored: ResolvedIgnoreChanges::indexed_for_test(
+            "guard",
+            crate::schema::LeafPath::from_segments([]),
+            ParsedIgnorePath::new(vec![ParsedIgnorePathSegment::Attribute("guard".into())]),
+        ),
+    };
+    update.overlay(&crate::provider::UpdatePatch {
+        ops: vec![crate::provider::PatchOp::Replace {
+            key: "target".into(),
+            value: resource.attributes["target"].clone(),
+        }],
+    });
+    site.update = Some(update);
+    assert_eq!(
+        site.applicable_rules().next().unwrap().evaluate(),
+        InputVerdict::Undecided,
+        "the ignored guard is not sent, and its authored false value is not evidence"
+    );
+}
+
+fn failed_value<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>() -> Value<P, B>
+{
+    Value::Deferred(DeferredValue::Unavailable {
+        name: BuiltinFunction::env,
+        args: vec![],
+        reason: UnavailableReason::from_builtin_error("private attempted failure".into()),
+        source_line: DiagnosticSourceLine::default(),
+    })
+}
+
+#[test]
+fn authored_arithmetic_and_access_guards_preserve_failed_knowledge() {
+    use crate::integer_arithmetic::{IntegerOp, IntegerOperatorSpan, ValidatedIntegerExpr};
+    use crate::resource::{AccessMissPolicy, PathSegment, apply_postfix_access};
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("guard", AttributeType::int()).build())
+            .attribute(AttributeSchema::optional("target", AttributeType::bool()).build())
+            .input_rule(rule(
+                "target",
+                InputPredicate::Present,
+                InputCondition::Not(Box::new(InputCondition::Present(path("guard")))),
+            )),
+    );
+    let arithmetic = Value::Deferred(DeferredValue::IntegerArithmetic(
+        ValidatedIntegerExpr::new(
+            failed_value(),
+            IntegerOp::Add,
+            Value::Concrete(ConcreteValue::Int(1)),
+            IntegerOperatorSpan::synthetic(),
+        )
+        .unwrap(),
+    ));
+    let access = apply_postfix_access(
+        failed_value(),
+        PathSegment::Field {
+            name: "flag".into(),
+        },
+        0,
+        AccessMissPolicy::Error,
+    )
+    .unwrap();
+    let mut findings = Vec::new();
+    for value in [
+        arithmetic.clone(),
+        access.clone(),
+        arithmetic.into_secret(),
+        access.into_secret(),
+    ] {
+        assert!(
+            value
+                .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+                .unwrap()
+                .failure()
+                .is_some()
+        );
+        let mut file = crate::parser::parse_file(
+            "let example = mock.Review { guard = 1 }",
+            std::path::Path::new("main.crn"),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        file.resources[0].attributes.insert("guard".into(), value);
+        let report = check_authored_inputs(&file, &schemas).unwrap();
+        assert!(report.pending().is_empty());
+        assert!(!format!("{report:?}").contains("private attempted failure"));
+        findings.push(
+            report
+                .iter()
+                .map(|finding| finding.violation().reason())
+                .collect::<Vec<_>>(),
+        );
+    }
+    assert_eq!(
+        findings,
+        vec![vec![InputViolationReason::EvaluationFailed]; 4]
+    );
+}
+
+#[test]
+fn failed_string_targets_report_the_same_failure_at_resource_and_struct_scope() {
+    let local_rule = || {
+        rule(
+            "target",
+            InputPredicate::NoSuffix(crate::schema::NonEmptyString::new(".fifo").unwrap()),
+            InputCondition::Equals {
+                path: path("guard"),
+                literal: InputLiteral::Bool(true),
+            },
+        )
+    };
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .input_rule(local_rule())
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_with_rules(
+                        "Settings",
+                        vec![
+                            StructField::optional("guard", AttributeType::bool()).build(),
+                            StructField::optional("target", AttributeType::string()).build(),
+                        ],
+                        vec![],
+                        vec![local_rule()],
+                    ),
+                )
+                .build(),
+            ),
+    );
+    for secret in [false, true] {
+        let failed = if secret {
+            failed_value().into_secret()
+        } else {
+            failed_value()
+        };
+        let resource = Resource::with_provider("mock", "Review", "example", None)
+            .with_attribute("guard", Value::Concrete(ConcreteValue::Bool(true)))
+            .with_attribute("target", failed.clone())
+            .with_attribute(
+                "settings",
+                object([
+                    ("guard", Value::Concrete(ConcreteValue::Bool(true))),
+                    ("target", failed),
+                ]),
+            );
+        let authored =
+            classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+                .unwrap()
+                .unwrap();
+        let verdicts = authored
+            .applicable_rules()
+            .map(|rule| rule.evaluate())
+            .collect::<Vec<_>>();
+        assert_eq!(verdicts.len(), 2);
+        for verdict in &verdicts {
+            assert_failed(verdict);
+        }
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(
+            crate::resource::ResolvedResource::resolve_raw_fixture(resource, &schemas).unwrap(),
+        ));
+        let finalized = FinalizedPlan::new(plan);
+        let current = HashMap::new();
+        let site = finalized
+            .write_sites(&schemas, &current)
+            .next()
+            .unwrap()
+            .unwrap();
+        for rule in site.applicable_rules() {
+            assert_failed(&rule.evaluate());
         }
     }
 }

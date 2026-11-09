@@ -22,7 +22,7 @@ mod condition_tests;
 #[cfg(test)]
 mod estimator_tests;
 #[cfg(test)]
-mod review1_tests;
+mod evidence_tests;
 
 use crate::{
     effect::{Effect, EffectGeneration, EffectInstanceKey},
@@ -255,9 +255,23 @@ enum WriteSiteSource<'a, S> {
         #[allow(dead_code)] // Type-level construction authority; no runtime data.
         authority: &'a crate::executor::input_discharge::DischargeToken,
         admission: &'a PendingInputObligation,
+        inputs: ExecutorWriteInputs<'a>,
+    },
+}
+
+/// Dispatch evidence carries the resolved desired owner with every update.
+/// Observed state and the provider patch cannot stand in for unchanged siblings.
+pub(crate) enum ExecutorWriteInputs<'a> {
+    Create(&'a crate::provider::ProviderReadyResource),
+    Update {
+        desired: &'a crate::provider::ProviderReadyResource,
+        patch: &'a crate::provider::UpdatePatch,
+    },
+    #[cfg(any(test, feature = "test-utils"))]
+    FixtureUpdate {
         resource_id: &'a ResourceId,
-        attributes: &'a IndexMap<String, Value>,
-        patch: Option<&'a crate::provider::UpdatePatch>,
+        desired: &'a IndexMap<String, Value>,
+        patch: &'a crate::provider::UpdatePatch,
     },
 }
 
@@ -284,18 +298,39 @@ fn classify_write_site<'a, S>(
         WriteSiteSource::Executor {
             authority: _,
             admission,
-            resource_id,
-            attributes,
-            patch,
+            inputs,
         } => {
             update = admission.update.clone();
-            if let (Some(context), Some(patch)) = (&mut update, patch) {
+            let (resource_id, attributes, refreshed) = match inputs {
+                ExecutorWriteInputs::Create(resource) => (
+                    &resource.as_resource().id,
+                    Cow::Borrowed(&resource.as_resource().attributes),
+                    None,
+                ),
+                ExecutorWriteInputs::Update { desired, patch } => (
+                    &desired.as_resource().id,
+                    Cow::Owned(patch.sent_projection()),
+                    Some((&desired.as_resource().attributes, patch)),
+                ),
+                #[cfg(any(test, feature = "test-utils"))]
+                ExecutorWriteInputs::FixtureUpdate {
+                    resource_id,
+                    desired,
+                    patch,
+                } => (
+                    resource_id,
+                    Cow::Owned(patch.sent_projection()),
+                    Some((desired, patch)),
+                ),
+            };
+            if let (Some(context), Some((desired, patch))) = (&mut update, refreshed) {
+                context.desired = desired.clone();
                 context.overlay(patch);
             }
             (
                 Some(admission.target.clone()),
                 resource_id,
-                Some(Cow::Borrowed(attributes)),
+                Some(attributes),
                 admission.context,
                 admission.paired_deletes.clone(),
                 None,
@@ -979,14 +1014,13 @@ fn guard_evidence<'a>(
     if let Some(update) = &applicable.site.update {
         let concrete = instances::diagnostic_path(&applicable.owner, path);
         let leaf = instances::canonical_path(&applicable.owner, path);
-        if update.changed.contains(concrete.root())
-            && update
-                .ignored
-                .for_attribute(concrete.root())
-                .any(|ignored| leaf.segments().starts_with(ignored.leaf().segments()))
+        if update
+            .ignored
+            .for_attribute(concrete.root())
+            .any(|ignored| leaf.segments().starts_with(ignored.leaf().segments()))
         {
-            // The patch may preserve ignored readable leaves from observation.
-            // Such bytes authorize a sent target, never an authored guard.
+            // Ignored leaves are not applied desired evidence, whether absent
+            // from the patch or preserved within a sent parent object.
             return PathEvidence::Pending;
         }
     }
@@ -1216,23 +1250,26 @@ fn target_verdict(applicable: &ApplicableInputRule<'_, '_>) -> InputVerdict {
             Truth::Failed => failed_verdict(rule),
         };
     }
-    // Preserve the existing estimator for resource-rooted string predicates.
-    // Nested strings use the same concrete predicate after binding an instance.
+    // Failures precede conservative estimation at every scope. Keep the
+    // resource estimator's existing handling of missing and pending evidence.
+    let evidence = path_evidence(applicable, rule.path());
+    match &evidence {
+        PathEvidence::Failed => return failed_verdict(rule),
+        PathEvidence::Present(value) => {
+            match value.knowledge(&crate::resource::knowledge::KnowledgeContext::validation()) {
+                Ok(knowledge) if knowledge.failure().is_none() => {}
+                Ok(_) | Err(_) => return failed_verdict(rule),
+            }
+        }
+        PathEvidence::Absent | PathEvidence::Pending => {}
+    }
     if applicable.owner_type.is_some() || view.update.is_some() {
-        match path_evidence(applicable, rule.path()) {
+        match evidence {
             PathEvidence::Absent => return InputVerdict::Proven,
             PathEvidence::Pending => return InputVerdict::Undecided,
             PathEvidence::Failed => return failed_verdict(rule),
             PathEvidence::Present(value) => {
                 let value = peel_secret(value);
-                let Ok(knowledge) =
-                    value.knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-                else {
-                    return failed_verdict(rule);
-                };
-                if knowledge.failure().is_some() {
-                    return failed_verdict(rule);
-                }
                 if matches!(rule.target(), InputRuleTarget::MapKeys(_)) {
                     if let Some(crate::resource::ConcreteValueRef::Map(fields)) =
                         value.as_concrete()
@@ -1550,7 +1587,7 @@ where
     Ok(report)
 }
 
-fn project_attributes<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+fn project_attributes<P: crate::resource::PlaceholderKind, B: crate::resource::BindingAddress>(
     attributes: &IndexMap<String, Value<P, B>>,
 ) -> IndexMap<String, Value> {
     attributes
@@ -1559,105 +1596,12 @@ fn project_attributes<P: crate::resource::ValueKind, B: crate::resource::Binding
         .collect()
 }
 
-/// Erase unresolved expressions conservatively, retaining known container keys
-/// and secret protection. No read-back value or state is consulted here.
-fn project_known_value<P: crate::resource::ValueKind, B: crate::resource::BindingAddress>(
+/// Preserve shared knowledge, container membership and protected failures while
+/// erasing parser/template substitutions. Read-back values never enter this view.
+fn project_known_value<P: crate::resource::PlaceholderKind, B: crate::resource::BindingAddress>(
     value: &Value<P, B>,
 ) -> Value {
-    match value {
-        Value::Concrete(ConcreteValue::String(value)) => {
-            Value::Concrete(ConcreteValue::String(value.clone()))
-        }
-        Value::Concrete(ConcreteValue::CanonicalEnum(value)) => {
-            Value::Concrete(ConcreteValue::CanonicalEnum(value.clone()))
-        }
-        Value::Concrete(ConcreteValue::EnumIdentifier(value)) => {
-            Value::Concrete(ConcreteValue::EnumIdentifier(value.clone()))
-        }
-        Value::Concrete(ConcreteValue::Int(value)) => Value::Concrete(ConcreteValue::Int(*value)),
-        Value::Concrete(ConcreteValue::Float(value)) => {
-            Value::Concrete(ConcreteValue::Float(*value))
-        }
-        Value::Concrete(ConcreteValue::Bool(value)) => Value::Concrete(ConcreteValue::Bool(*value)),
-        Value::Concrete(ConcreteValue::Duration(value)) => {
-            Value::Concrete(ConcreteValue::Duration(*value))
-        }
-        Value::Concrete(ConcreteValue::StringList(value)) => {
-            Value::Concrete(ConcreteValue::StringList(value.clone()))
-        }
-        Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
-            values.iter().map(project_known_value).collect(),
-        )),
-        Value::Concrete(ConcreteValue::Map(entries)) => {
-            Value::Concrete(ConcreteValue::Map(project_attributes(entries)))
-        }
-        Value::Deferred(DeferredValue::Secret(secret)) => {
-            project_known_value(secret.expose_plaintext()).into_secret()
-        }
-        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
-            Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(project_known_value(value)),
-                default: Box::new(project_known_value(default)),
-            })
-        }
-        Value::Deferred(DeferredValue::Interpolation(parts)) => {
-            Value::Deferred(DeferredValue::Interpolation(
-                parts
-                    .iter()
-                    .map(|part| match part {
-                        crate::resource::InterpolationPart::Literal(text) => {
-                            crate::resource::InterpolationPart::Literal(text.clone())
-                        }
-                        crate::resource::InterpolationPart::Expr(value) => {
-                            crate::resource::InterpolationPart::Expr(project_known_value(value))
-                        }
-                    })
-                    .collect(),
-            ))
-        }
-        Value::Deferred(DeferredValue::FunctionCall {
-            name,
-            args,
-            source_line,
-        }) => Value::Deferred(DeferredValue::FunctionCall {
-            name: *name,
-            args: args.iter().map(project_argument).collect(),
-            source_line: *source_line,
-        }),
-        Value::Deferred(DeferredValue::Unavailable {
-            name,
-            args,
-            reason,
-            source_line,
-        }) => Value::Deferred(DeferredValue::Unavailable {
-            name: *name,
-            args: args.iter().map(project_argument).collect(),
-            reason: reason.clone(),
-            source_line: *source_line,
-        }),
-        Value::Deferred(_) => Value::Deferred(DeferredValue::Unknown(
-            crate::resource::ApplyTimeUnknown::PendingReRead(
-                crate::resource::PendingReRead::not_found(),
-            ),
-        )),
-    }
-}
-
-fn project_argument<P: ValueKind, B: crate::resource::BindingAddress>(
-    argument: &crate::resource::FunctionArgument<P, B>,
-) -> crate::resource::FunctionArgument {
-    crate::resource::FunctionArgument::from_value(
-        argument
-            .value()
-            .map(project_known_value)
-            .unwrap_or_else(|| {
-                Value::Deferred(DeferredValue::Unknown(
-                    crate::resource::ApplyTimeUnknown::PendingReRead(
-                        crate::resource::PendingReRead::not_found(),
-                    ),
-                ))
-            }),
-    )
+    value.input_preview()
 }
 
 /// Every desired write slot either passed or retains an explicit obligation.
@@ -1773,18 +1717,14 @@ impl<S: Clone> crate::plan::AdmittedPlan<S> {
 pub(crate) fn executor_write_site<'a>(
     authority: &'a crate::executor::input_discharge::DischargeToken,
     admission: &'a PendingInputObligation,
-    resource_id: &'a ResourceId,
-    attributes: &'a IndexMap<String, Value>,
-    patch: Option<&'a crate::provider::UpdatePatch>,
+    inputs: ExecutorWriteInputs<'a>,
     schemas: &'a SchemaRegistry,
 ) -> Result<Option<WriteSite<'a>>, crate::provider::UpdatePatchError> {
     classify_write_site::<ModuleSource>(
         WriteSiteSource::Executor {
             authority,
             admission,
-            resource_id,
-            attributes,
-            patch,
+            inputs,
         },
         schemas,
     )
