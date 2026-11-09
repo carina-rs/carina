@@ -35,8 +35,9 @@
 #      `--workspace` to be safe.
 #   5. Otherwise-ignorable files outside crates are owned by crates whose
 #      tracked Rust sources contain a path string literal resolving to the
-#      tracked file or an ancestor directory. Ignore comments and bare names;
-#      resolve relative to the source directory, crate root and repo root.
+#      tracked or changed file or an ancestor directory. Scan doc comments,
+#      excluding ordinary comments and bare names; resolve relative to the
+#      source directory, crate root and repo root, stripping one leading /.
 #      Include reverse dependencies; a carina-core owner means --workspace.
 
 set -euo pipefail
@@ -183,7 +184,8 @@ def is_ignorable(filename):
 # Raw strings have a variable delimiter; character literals must also consume
 # quotes so e.g. a double-quote character cannot start a string token.
 rust_tokens = re.compile(
-    r"//[^\n]*|/\*|(?:br|cr|r)(?P<hashes>#{0,255})\x22"
+    r"(?P<line_doc>(?:///(?!/)|//!)[^\n]*(?:\n[ \t]*(?:///(?!/)|//!)[^\n]*)*)"
+    r"|//[^\n]*|/\*|(?:br|cr|r)(?P<hashes>#{0,255})\x22"
     r"|\x22(?P<quoted>(?:[^\x22\\]|\\.)*)\x22"
     r"|\x27(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^\\\x27\r\n])\x27",
     re.DOTALL,
@@ -207,9 +209,18 @@ def string_literals(text):
     while match := rust_tokens.search(text, position):
         position = match.end()
         token = match[0]
+        if match["line_doc"] is not None:
+            # Keep adjacent doc lines together so multiline Rust strings and
+            # ordinary comments inside doctests retain their token boundaries.
+            body = "\n".join(line.lstrip(" \t")[3:] for line in token.splitlines())
+            yield from string_literals(body)
+            continue
         if token.startswith("//") or token.startswith("\x27"):
             continue
         if token == "/*":
+            is_doc = (text.startswith(("/**", "/*!"), match.start())
+                      and not text.startswith("/***", match.start()))
+            body_start = position + 1
             depth = 1
             while depth:
                 comment = block_comments.search(text, position)
@@ -217,6 +228,8 @@ def string_literals(text):
                     return
                 depth += 1 if comment[0] == "/*" else -1
                 position = comment.end()
+            if is_doc:
+                yield from string_literals(text[body_start:position - 2])
         elif match["hashes"] is not None:
             delimiter = "\x22" + match["hashes"]
             end = text.find(delimiter, position)
@@ -232,8 +245,11 @@ def reference_owners():
     tracked = subprocess.run(["git", "ls-files", "-z"], cwd=root,
                              stdout=subprocess.PIPE, check=True, timeout=30)
     files = {name for name in os.fsdecode(tracked.stdout).split("\0") if name}
-    paths = {str(root / name) for name in files}
-    for name in files:
+    # Deleted and untracked inputs may be absent from the index. Their paths
+    # and ancestors must still match references in the remaining Rust sources.
+    candidate_names = files | set(sys.argv[1:])
+    paths = {str(root / name) for name in candidate_names}
+    for name in candidate_names:
         paths.update(str(root / parent) for parent in Path(name).parents if parent != Path("."))
 
     owners = {}
@@ -250,6 +266,9 @@ def reference_owners():
         for literal in set(string_literals(text)):
             if "/" not in literal:
                 continue
+            # concat!(env!("CARGO_MANIFEST_DIR"), "/../...") has a slash
+            # prefix that must not discard the base passed to os.path.join.
+            literal = literal.removeprefix("/")
             for base in (source.parent, owner, root):
                 resolved = os.path.normpath(os.path.join(base, literal))
                 if resolved in paths:

@@ -183,6 +183,24 @@ class TouchedCratesTests(unittest.TestCase):
         self.assertEqual(self.scope(filename),
                          "-p carina-cli -p carina-plugin-host -p carina-plugin-sdk -p carina-provider-example")
 
+    def test_deleted_inputs_keep_file_and_directory_owners(self):
+        file_input = "editors/vscode/syntaxes/carina.tmLanguage.json"
+        directory_input = "site/fixtures/deleted.md"
+        self.track(file_input, "{}\n")
+        self.track(directory_input, "consumed documentation\n")
+        self.track("carina-plugin-sdk/tests/grammar.rs",
+                   f'include_str!("../../{file_input}");\n')
+        self.track("carina-tui/src/lib.rs", 'let directory = "../site/fixtures/";\n')
+        self.git("commit", "-qm", "consumed inputs")
+        self.git("rm", "--", file_input, directory_input)
+        for committed in (False, True):
+            if committed:
+                self.git("commit", "-qm", "delete consumed inputs")
+            with self.subTest(committed=committed):
+                self.assertEqual(self.scope(file_input),
+                                 "-p carina-cli -p carina-plugin-host -p carina-plugin-sdk -p carina-provider-example")
+                self.assertEqual(self.scope(directory_input), "-p carina-tui")
+
     def test_directory_references_include_every_owner_and_reverse_dependencies(self):
         directory = "site/src/content/reference/registry"
         self.track(directory + "/nested/static-registry.md", "registry documentation\n")
@@ -237,8 +255,11 @@ class TouchedCratesTests(unittest.TestCase):
         self.track("CLAUDE.md", "instructions\n")
         self.track("carina-tui/src/lib.rs", '''
 // Per CLAUDE.md, see "site/comment.md".
+//// include_str!("../../site/comment.md");
+/*** include_str!("../../site/comment.md"); */
 /* "site/comment.md"
    /* nested comment */
+   /** include_str!("../../site/comment.md"); */
    include_str!("../../site/comment.md");
 */
 include_str!("../../site/consumed.md");
@@ -246,7 +267,35 @@ include_str!("../../site/consumed.md");
         self.assertEqual(self.scope("CLAUDE.md", "site/comment.md"), "")
         self.assertEqual(self.scope("site/consumed.md"), "-p carina-tui")
 
-    def test_temporary_and_untracked_paths_do_not_own_inputs(self):
+    def test_doc_comment_code_blocks_own_inputs(self):
+        self.track("site/x.md", "consumed documentation\n")
+        for comment, expected in (
+            ('// "site/x.md"\n', ""),
+            ('/* include_str!("../../site/x.md"); */\n', ""),
+            ('/// ```rust\n/// include_str!("../../site/x.md");\n/// ```\n', "-p carina-tui"),
+            ('//! ```rust\n//! include_str!("../../site/x.md");\n//! ```\n', "-p carina-tui"),
+            ('/**\n * ```rust\n * include_str!("../../site/x.md");\n * ```\n */\n', "-p carina-tui"),
+            ('/*!\n * ```rust\n * include_str!("../../site/x.md");\n * ```\n */\n', "-p carina-tui"),
+        ):
+            with self.subTest(comment=comment):
+                self.track("carina-tui/src/lib.rs", comment)
+                self.assertEqual(self.scope("site/x.md"), expected)
+
+    def test_multiline_doc_comment_strings_preserve_rust_comment_rules(self):
+        self.track("site/consumed.md", "consumed documentation\n")
+        self.track("site/comment.md", "unconsumed\n")
+        self.track("carina-tui/src/lib.rs", r'''
+    /// ```rust
+    /// /* "site/comment.md"
+    ///    include_str!("../../site/comment.md"); */
+    /// include_str!("../../site/\
+    ///               consumed.md");
+    /// ```
+''')
+        self.assertEqual(self.scope("site/consumed.md"), "-p carina-tui")
+        self.assertEqual(self.scope("site/comment.md"), "")
+
+    def test_unchanged_temporary_and_untracked_paths_do_not_own_other_inputs(self):
         self.track("infra/tracked.crn", "tracked sibling\n")
         for filename in ("infra/foo/local.crn", "site/untracked.md"):
             path = self.root / filename
@@ -254,8 +303,13 @@ include_str!("../../site/consumed.md");
             path.write_text("untracked input\n")
         self.track("carina-tui/src/lib.rs",
                    'let project = "infra/foo";\nlet document = "site/untracked.md";\n')
-        self.assertEqual(self.scope("infra/foo", "infra/foo/local.crn", "site/untracked.md"), "")
-        self.git("add", "infra/foo/local.crn", "site/untracked.md")
+        self.assertEqual(self.scope("infra/tracked.crn"), "")
+
+    def test_changed_untracked_inputs_keep_file_and_directory_owners(self):
+        self.track("carina-tui/src/lib.rs",
+                   'let project = "infra/foo";\nlet document = "site/untracked.md";\n')
+        self.assertEqual(self.scope("infra/foo/local.crn"), "-p carina-tui")
+        self.assertEqual(self.scope("site/untracked.md"), "-p carina-tui")
         self.assertEqual(self.scope("infra/foo/local.crn", "site/untracked.md"), "-p carina-tui")
 
     def test_bare_names_and_substrings_do_not_own_tracked_inputs(self):
@@ -268,7 +322,7 @@ let raw = r##"embedded "site/example.md" /* not a comment */"##;
 ''')
         self.assertEqual(self.scope("README.md", "CLAUDE.md", "site/example.md"), "")
 
-    def test_paths_resolve_from_source_crate_and_repo_without_stripping_prefixes(self):
+    def test_paths_resolve_from_source_crate_and_repo(self):
         filename = "site/consumed.md"
         self.track(filename, "consumed\n")
         source = "carina-tui/src/nested/example.rs"
@@ -280,6 +334,22 @@ let raw = r##"embedded "site/example.md" /* not a comment */"##;
         ):
             with self.subTest(literal=literal):
                 self.track(source, f'include_str!("{literal}");\n')
+                self.assertEqual(self.scope(filename), expected)
+
+    def test_manifest_dir_concat_paths_strip_one_leading_slash(self):
+        filename = "site/consumed.md"
+        self.track(filename, "consumed\n")
+        for literal, expected in (
+            ("/../site/consumed.md", "-p carina-tui"),
+            ("/../../../site/consumed.md", "-p carina-tui"),
+            ("/site/consumed.md", "-p carina-tui"),
+            ("/../../site/consumed.md", ""),
+            ("//site/consumed.md", ""),
+        ):
+            with self.subTest(literal=literal):
+                self.track("carina-tui/src/nested/example.rs",
+                           'include_str!(concat!(env!("CARGO_MANIFEST_DIR"), '
+                           f'"{literal}"));\n')
                 self.assertEqual(self.scope(filename), expected)
 
     def test_raw_strings_escapes_and_character_literals_do_not_confuse_scanning(self):
@@ -308,6 +378,11 @@ let lifetime: &'static str = "site/after-lifetime.md";
         filename = "editors/vscode/syntaxes/carina.tmLanguage.json"
         self.track(filename, "{}\n")
         self.track("carina-core/tests/grammar.rs", f'const GRAMMAR: &str = "../{filename}";\n')
+        self.assertEqual(self.scope(filename), "--workspace")
+        self.git("commit", "-qm", "core grammar input")
+        self.git("rm", "--", filename)
+        self.assertEqual(self.scope(filename), "--workspace")
+        self.git("commit", "-qm", "delete core grammar input")
         self.assertEqual(self.scope(filename), "--workspace")
 
     def test_many_changed_files_use_one_tracked_file_query(self):

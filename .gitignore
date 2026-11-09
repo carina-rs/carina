@@ -1,6 +1,9 @@
 # Rust build artifacts
 /target/
 
+# Python bytecode caches
+__pycache__/
+
 # Local cargo config (contains machine-specific paths)
 /.cargo/config.toml
 
