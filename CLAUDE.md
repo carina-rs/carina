@@ -628,11 +628,16 @@ A struct type represents a nested object with typed fields.
   values must satisfy every owner's identity layer. Annotation-origin evidence
   uses an identity-only payload with no member slots; only exact schema
   projections retain member constraints. Decoding annotation-origin member
-  records must fail. Enum definition and canonical-spelling disagreements
-  remain typed errors. Built-in and aggregate
-  comparisons accept identity-only typed projections. Exact
+  records must fail. Single-owner annotations omit `owner_layers`; multi-owner
+  annotations retain one keyed identity record for every owner, with no extras.
+  Portable equality includes origin and projection fingerprint; inferred joins
+  select a canonical identity independently of operand order. Enum definition
+  and canonical-spelling disagreements remain typed errors. Built-in and
+  aggregate comparisons accept identity-only typed projections. Exact
   declarations and their fingerprints preserve both layers. Hover renders
-  both layers; shared provider docgen must do the same. WIT stays 0.2.0.
+  both layers through the core's bounded refinement walk, which counts Refs
+  and nested unions and reports only actual omissions. Shared provider docgen
+  must render both layers too. WIT stays 0.2.0.
   Schema fingerprints use v13 and saved plans use format 44; format 43 plans
   must fail the version gate before decoding the payload. Saved module
   `pending_constraints` contain `ValidateExpr` values, not retained types;

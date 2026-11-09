@@ -101,40 +101,48 @@
             }
           },
           "empty_intersection": false,
-          "owner_layers": [
-            {
-              "length": {
-                "min": {
-                  "Inclusive": 1
-                },
-                "max": {
-                  "Inclusive": 16
-                }
-              },
-              "pattern": {
-                "regex": "[A-Z]+",
-                "mode": {
-                  "kind": "full"
+          "owner_layers": {
+            "p": {
+              "String": {
+                "identity_layer": {
+                  "length": {
+                    "min": {
+                      "Inclusive": 1
+                    },
+                    "max": {
+                      "Inclusive": 16
+                    }
+                  },
+                  "pattern": {
+                    "regex": "[A-Z]+",
+                    "mode": {
+                      "kind": "full"
+                    }
+                  }
                 }
               }
             },
-            {
-              "length": {
-                "min": {
-                  "Inclusive": 3
-                },
-                "max": {
-                  "Inclusive": 32
-                }
-              },
-              "pattern": {
-                "regex": "A.*",
-                "mode": {
-                  "kind": "full"
+            "q": {
+              "String": {
+                "identity_layer": {
+                  "length": {
+                    "min": {
+                      "Inclusive": 3
+                    },
+                    "max": {
+                      "Inclusive": 32
+                    }
+                  },
+                  "pattern": {
+                    "regex": "A.*",
+                    "mode": {
+                      "kind": "full"
+                    }
+                  }
                 }
               }
             }
-          ]
+          }
         },
         "projection_fingerprint": null
       }

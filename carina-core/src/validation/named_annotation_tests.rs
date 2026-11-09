@@ -2455,10 +2455,14 @@ fn owner_conjunction_wire_contains_only_identity_records() {
     let ty = annotation(&loaded);
     let wire = serde_json::to_value(&ty).unwrap();
     let owners = wire["SchemaType"]["owned"]["constraints"]["owner_layers"]
-        .as_array()
+        .as_object()
         .unwrap();
-    assert_eq!(owners.len(), 2);
-    for owner in owners {
+    assert_eq!(
+        owners.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["p", "q"]
+    );
+    for layer in owners.values() {
+        let owner = &layer["String"]["identity_layer"];
         assert!(owner.get("member_layer").is_none(), "{owner}");
         assert!(
             owner.get("pattern").is_some() && owner.get("length").is_some(),
@@ -2589,4 +2593,172 @@ fn annotation_origin_rejects_member_constraint_records() {
         serde_json::from_value::<TypeExpr>(tampered).is_err(),
         "even empty member records are invalid on annotation origin"
     );
+}
+
+#[test]
+fn annotation_projection_equality_matches_wire_equality() {
+    let loaded = snapshot(vec![("p", vec![string(1, 32, None)])]);
+    let annotation = annotation(&loaded);
+    let projection = inference::attribute_type_to_type_expr(declaration(&loaded, "p", 0), "p");
+    assert_eq!(
+        annotation == projection,
+        serde_json::to_value(&annotation).unwrap() == serde_json::to_value(&projection).unwrap()
+    );
+    let mut changed = serde_json::to_value(&projection).unwrap();
+    changed["SchemaType"]["owned"]["projection_fingerprint"] = serde_json::json!("0".repeat(64));
+    let changed: TypeExpr = serde_json::from_value(changed).unwrap();
+    assert_ne!(
+        projection, changed,
+        "fingerprints are portable equality evidence"
+    );
+}
+
+#[test]
+fn annotation_projection_join_is_independent_of_operand_order() {
+    let loaded = snapshot(vec![(
+        "p",
+        vec![DraftType::refined_string_with_validator(
+            identity(),
+            None,
+            Some((Some(1), Some(32))),
+            crate::schema::legacy_validator(|_| Err("projection callback preserved".into())),
+            None,
+        )],
+    )]);
+    let annotation = annotation(&loaded);
+    let projection = inference::attribute_type_to_type_expr(declaration(&loaded, "p", 0), "p");
+    let context = loaded.provider_context().as_provider_context();
+    let left = inference::join_inferred_types(&annotation, &projection, context).unwrap();
+    let right = inference::join_inferred_types(&projection, &annotation, context).unwrap();
+    assert_eq!(
+        serde_json::to_value(&left).unwrap(),
+        serde_json::to_value(&right).unwrap()
+    );
+    let restored: TypeExpr =
+        serde_json::from_value(serde_json::to_value(&projection).unwrap()).unwrap();
+    let TypeExpr::SchemaType { owned } = restored else {
+        panic!("projection")
+    };
+    let declaration = owned.resolve_projection(context).unwrap().unwrap();
+    let error = declaration.validate(&text("valid")).unwrap_err();
+    assert!(
+        error.to_string().contains("projection callback preserved"),
+        "{error}"
+    );
+}
+
+#[test]
+fn annotation_owner_layers_must_match_the_owner_set() {
+    let loaded = snapshot(vec![
+        ("a", vec![string(1, 32, None)]),
+        ("b", vec![string(3, 64, None)]),
+    ]);
+    let wire = serde_json::to_value(annotation(&loaded)).unwrap();
+    for owners in [
+        serde_json::json!([{"Provider":"a"}]),
+        serde_json::json!([{"Provider":"a"},{"Provider":"b"},{"Provider":"extra"}]),
+    ] {
+        let mut tampered = wire.clone();
+        tampered["SchemaType"]["owned"]["owners"] = owners;
+        assert!(
+            serde_json::from_value::<TypeExpr>(tampered).is_err(),
+            "owner layers cannot be extra or missing"
+        );
+    }
+    let layer =
+        serde_json::to_string(&wire["SchemaType"]["owned"]["constraints"]["owner_layers"]["a"])
+            .unwrap();
+    let duplicate = serde_json::to_string(&wire).unwrap().replace(
+        "\"owner_layers\":{",
+        &format!("\"owner_layers\":{{\"a\":{layer},"),
+    );
+    assert!(
+        serde_json::from_str::<TypeExpr>(&duplicate).is_err(),
+        "duplicate owner entries are invalid"
+    );
+}
+
+#[test]
+fn single_owner_annotations_have_one_canonical_layer_form() {
+    let loaded = snapshot(vec![("a", vec![string(1, 32, None)])]);
+    let annotation = annotation(&loaded);
+    let wire = serde_json::to_value(&annotation).unwrap();
+    let identity =
+        wire["SchemaType"]["owned"]["constraints"]["scalar"]["String"]["identity_layer"].clone();
+    for layers in [
+        serde_json::json!([identity.clone()]),
+        serde_json::json!({"a":{"String":{"identity_layer": identity}}}),
+    ] {
+        let mut tampered = wire.clone();
+        tampered["SchemaType"]["owned"]["constraints"]["owner_layers"] = layers;
+        assert!(
+            serde_json::from_value::<TypeExpr>(tampered).is_err(),
+            "single-owner annotations omit owner_layers"
+        );
+    }
+    let restored: TypeExpr = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(restored, annotation);
+    assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+}
+
+#[test]
+fn projection_constraint_records_reject_unknown_fields() {
+    let fixture: BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(include_str!("fixtures/layered_scalar_evidence.json")).unwrap();
+    for key in ["string", "int"] {
+        for extra in ["owner_layers", "future_constraint"] {
+            let mut tampered = fixture[key].clone();
+            tampered["SchemaType"]["owned"]["constraints"][extra] = serde_json::json!([]);
+            assert!(
+                serde_json::from_value::<TypeExpr>(tampered).is_err(),
+                "projection accepted {extra}"
+            );
+        }
+    }
+}
+
+#[test]
+fn enum_identity_annotations_reject_nonmembers_matching_the_base() {
+    let loaded = snapshot(vec![(
+        "p",
+        vec![DraftType::enum_(
+            identity(),
+            Some(vec!["GOOD".into()]),
+            vec![],
+            None,
+            None,
+        )],
+    )]);
+    let annotation = annotation(&loaded);
+    let restored: TypeExpr =
+        serde_json::from_value(serde_json::to_value(&annotation).unwrap()).unwrap();
+    for ty in [&annotation, &restored] {
+        // Main's materialized scalar view is the enum base; contextual
+        // annotation validation also checks the enum declaration's values.
+        assert!(lift_type_expr(ty).unwrap().validate(&text("OTHER")).is_ok());
+        for (value, valid) in [
+            (
+                Value::Concrete(crate::resource::ConcreteValue::CanonicalEnum(
+                    crate::resource::CanonicalEnumValue::new_for_test(identity(), "GOOD"),
+                )),
+                true,
+            ),
+            (text("OTHER"), false),
+            (
+                Value::Concrete(crate::resource::ConcreteValue::EnumIdentifier(
+                    crate::resource::RawEnumIdentifier::parse(format!("{}.OTHER", identity())),
+                )),
+                false,
+            ),
+        ] {
+            let result = typecheck::check_type_expr_value(
+                ty,
+                &value,
+                loaded.provider_context(),
+                &crate::parser::retained::value_dependent_judgement_for_test(),
+            )
+            .require_provider_schemas();
+            assert_eq!(result.is_ok(), valid, "{value:?}: {result:?}");
+        }
+    }
 }

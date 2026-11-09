@@ -9519,6 +9519,9 @@ where
                 });
                 continue;
             }
+            // Enum bases are definition constraints, not scalar member layers.
+            // This view projects the base; owner-bound annotation validation
+            // still checks the complete enum, including its values and aliases.
             for declaration in declarations {
                 let declaration =
                     ResolvedSchemaType::from_annotation_declaration(owner, declaration)

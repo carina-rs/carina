@@ -47,7 +47,12 @@ across owners are allowed. Enum definition and canonical-spelling disagreement
 remain typed errors. Authored annotations name an identity: their retained
 constraint payload has no member layer. Only exact schema-declaration projections
 carry member constraints. Annotation records containing member constraints are
-invalid, including records with an empty member layer.
+invalid, including records with an empty member layer. Single-owner retained
+annotations omit `owner_layers`. Multi-owner records key exactly one identity
+layer by each schema owner's provider name; missing, extra, or duplicate owners
+are invalid. Exact projection records reject unknown constraint fields. Portable
+type equality includes origin and projection fingerprint; canonical collection
+joins are independent of operand order.
 
 Schema fingerprint encoding is v13. Saved-plan format 44 supersedes 43 because
 the schema fingerprint encoding changed. Saved module `pending_constraints`

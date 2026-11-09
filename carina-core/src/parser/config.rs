@@ -244,15 +244,16 @@ impl OwnedTypeIdentity {
     #[cfg(test)]
     pub(crate) fn unbounded_witness_for_test(self) -> ResolvedSchemaType {
         let declared = self.scalar_kind().identified_type(self.identity().clone());
-        ResolvedSchemaType(std::sync::Arc::new(ResolvedScalarDeclaration {
-            evidence: ResolvedConstraintEvidence::Annotation(
-                super::scalar_constraints::IdentityConstraints::from_declaration(&declared)
-                    .unwrap(),
-            ),
-            owned: self,
-            projection: None,
-            projection_fingerprint: None,
-        }))
+        let mut result: Option<ResolvedSchemaType> = None;
+        for owner in self.provider_names() {
+            let declaration =
+                ResolvedSchemaType::from_annotation_declaration(owner, &declared).unwrap();
+            result = Some(match result {
+                Some(existing) => existing.conjoin(&declaration),
+                None => declaration,
+            });
+        }
+        result.expect("nonempty owners")
     }
 
     pub fn owners(&self) -> &NonEmptySchemaTypeOwners {
@@ -322,14 +323,16 @@ struct ResolvedScalarDeclaration {
 // retains callback dispatch provenance without making closures part of equality.
 impl PartialEq for ResolvedScalarDeclaration {
     fn eq(&self, other: &Self) -> bool {
-        self.owned == other.owned && self.evidence.same_constraints(&other.evidence)
+        self.owned == other.owned
+            && self.evidence == other.evidence
+            && self.projection_fingerprint == other.projection_fingerprint
     }
 }
 impl Eq for ResolvedScalarDeclaration {}
 
 /// The origin selects its constraint payload in memory and on the wire.
 /// Annotation payloads cannot contain a member layer.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "origin", content = "constraints")]
 enum ResolvedConstraintEvidence {
     Annotation(super::scalar_constraints::IdentityConstraints),
@@ -344,9 +347,9 @@ impl ResolvedConstraintEvidence {
         }
     }
 
-    fn validate_record(&mut self) -> Result<(), &'static str> {
+    fn validate_record(&mut self, owners: &NonEmptySchemaTypeOwners) -> Result<(), &'static str> {
         match self {
-            Self::Annotation(c) => c.validate_record(),
+            Self::Annotation(c) => c.validate_record(owners),
             Self::Projection(c) => c.validate_record(),
         }
     }
@@ -355,15 +358,6 @@ impl ResolvedConstraintEvidence {
         match self {
             Self::Annotation(c) => c.clone(),
             Self::Projection(c) => c.identity_constraints(),
-        }
-    }
-
-    fn same_constraints(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Annotation(a), Self::Annotation(b)) => a == b,
-            (Self::Projection(a), Self::Projection(b)) => a == b,
-            (Self::Annotation(a), Self::Projection(b))
-            | (Self::Projection(b), Self::Annotation(a)) => b.same_constraints_as_annotation(a),
         }
     }
 
@@ -411,7 +405,7 @@ impl<'de> serde::Deserialize<'de> for ResolvedSchemaType {
             ));
         }
         wire.evidence
-            .validate_record()
+            .validate_record(wire.owned.owners())
             .map_err(serde::de::Error::custom)?;
         match &wire.evidence {
             ResolvedConstraintEvidence::Annotation(_) => {
@@ -506,7 +500,11 @@ impl ResolvedSchemaType {
         assert_eq!(self.identity(), other.identity());
         assert_eq!(self.scalar_kind(), other.scalar_kind());
         let mut constraints = self.0.evidence.identity_constraints();
-        constraints.intersect(&other.0.evidence.identity_constraints());
+        constraints.intersect(
+            self.owners(),
+            &other.0.evidence.identity_constraints(),
+            other.owners(),
+        );
         Self(std::sync::Arc::new(ResolvedScalarDeclaration {
             owned: self
                 .0

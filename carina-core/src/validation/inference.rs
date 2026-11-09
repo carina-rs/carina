@@ -354,15 +354,21 @@ impl<'a> InferredTypeJoiner<'a> {
         };
         let left_identity = scalar_identity(left)?;
         let right_identity = scalar_identity(right)?;
-        for identity in [left_identity, right_identity] {
-            let canonical = self.canonical.entry(identity.clone()).or_insert_with(|| {
-                let candidate = TypeExpr::try_from(identity).ok()?;
-                super::resolve_type_expr(&candidate, self.context).ok()
-            });
-            let Some(canonical) = canonical else {
-                continue;
-            };
-            if [left, right].into_iter().all(|source| {
+        let mut identities = [left_identity, right_identity];
+        identities.sort();
+        // Resolve both candidates through the cache before selecting the first
+        // admitting canonical identity. Selection never depends on operand order.
+        let candidates = identities.map(|identity| {
+            self.canonical
+                .entry(identity.clone())
+                .or_insert_with(|| {
+                    let candidate = TypeExpr::try_from(identity).ok()?;
+                    super::resolve_type_expr(&candidate, self.context).ok()
+                })
+                .clone()
+        });
+        candidates.into_iter().flatten().find(|canonical| {
+            [left, right].into_iter().all(|source| {
                 matches!(
                     super::typecheck::inferred_type_assignment(
                         canonical,
@@ -371,11 +377,8 @@ impl<'a> InferredTypeJoiner<'a> {
                     ),
                     crate::schema::TypeAssignability::Assignable,
                 )
-            }) {
-                return Some(canonical.clone());
-            }
-        }
-        None
+            })
+        })
     }
 }
 
@@ -1962,13 +1965,14 @@ mod tests {
     }
 
     fn owned_vpc_id_type() -> TypeExpr {
+        let schema = vpc_schema().validate().unwrap();
+        let attribute = schema.effective_attribute("vpc_id").unwrap();
         TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::provider(
+            owned: crate::parser::ResolvedSchemaType::from_schema_declaration(
                 "awscc",
-                TypeIdentity::bare("VpcId"),
-                crate::schema::RefinedScalarKind::String,
+                attribute.value_type().as_type(),
             )
-            .unbounded_witness_for_test(),
+            .unwrap(),
         }
     }
 
@@ -2319,12 +2323,8 @@ mod tests {
         assert_eq!(
             attribute_type_to_type_expr(&region, "aws"),
             TypeExpr::SchemaType {
-                owned: crate::parser::OwnedTypeIdentity::provider(
-                    "aws",
-                    TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
-                    crate::schema::RefinedScalarKind::String
-                )
-                .unbounded_witness_for_test(),
+                owned: crate::parser::ResolvedSchemaType::from_schema_declaration("aws", &region)
+                    .unwrap(),
             }
         );
     }
@@ -3041,8 +3041,8 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         // #2493: an `exports` value referencing `<module_call>.<attr>`
         // (e.g. `role_arn = github_actions_carina.role_arn` where
         // `let github_actions_carina = github_module {...}`) must
-        // resolve to the same `TypeExpr` as if the user had annotated
-        // the export explicitly. The module's `attributes { role_arn =
+        // retain the inner attribute's exact schema projection, including
+        // callback provenance. The module's `attributes { role_arn =
         // role.arn }` block lets the type be inferred transitively
         // through the module-call's composition resource (post-expansion)
         // and the inner role's schema attribute.

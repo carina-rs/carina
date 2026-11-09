@@ -56,133 +56,75 @@ fn find_use_import_path(
     None
 }
 
-fn refinement_hover(
-    ty: &carina_core::schema::EffectiveType<'_>,
-    budget: &mut carina_core::schema::ShapeWalkBudget,
-    truncated: &mut bool,
-) -> String {
-    if *truncated || !budget.take() {
-        *truncated = true;
-        return String::new();
-    }
+fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> String {
+    use carina_core::schema::{PatternSpecDisplay, RefinementPathSegment, Shape};
     let mut content = String::new();
-    use carina_core::schema::{PatternSpecDisplay, Shape};
-    let mut pattern = |label: &str, spec: Option<&carina_core::schema::PatternSpec>| {
-        if let Some(spec) = spec {
+    for position in walk.positions {
+        let mut refinements = String::new();
+        match position.value_type().shape() {
+            Shape::String {
+                identity_layer,
+                member_layer,
+            } => {
+                for (label, spec) in [
+                    ("Identity", identity_layer.pattern),
+                    ("Member", member_layer.pattern),
+                ] {
+                    if let Some(spec) = spec {
+                        refinements.push_str(&format!(
+                            "\n- **{label} pattern**: {}",
+                            PatternSpecDisplay::new(spec)
+                        ));
+                    }
+                }
+                if let Some(bounds) = hover_bounds(identity_layer.length) {
+                    refinements.push_str(&format!("\n- **Identity length**: {bounds}"));
+                }
+                if let Some(bounds) = hover_bounds(member_layer.length) {
+                    refinements.push_str(&format!("\n- **Member length**: {bounds}"));
+                }
+            }
+            Shape::Int {
+                identity_layer,
+                member_layer,
+            } => {
+                if let Some(bounds) = hover_bounds(identity_layer.range) {
+                    refinements.push_str(&format!("\n- **Identity range**: {bounds}"));
+                }
+                if let Some(bounds) = hover_bounds(member_layer.range) {
+                    refinements.push_str(&format!("\n- **Member range**: {bounds}"));
+                }
+            }
+            _ => {}
+        }
+        if refinements.is_empty() {
+            continue;
+        }
+        if !position.path().is_empty() {
+            let label = position
+                .path()
+                .iter()
+                .map(|segment| match segment {
+                    RefinementPathSegment::Field(name) => format!("Field `{name}`"),
+                    RefinementPathSegment::ListElement => "List element".into(),
+                    RefinementPathSegment::MapKey => "Map key".into(),
+                    RefinementPathSegment::MapValue => "Map value".into(),
+                    RefinementPathSegment::UnionMember(index) => format!("Union member {index}"),
+                    RefinementPathSegment::EnumBase => "Enum base".into(),
+                })
+                .collect::<Vec<_>>()
+                .join(" → ");
             content.push_str(&format!(
-                "\n- **{label} pattern**: {}",
-                PatternSpecDisplay::new(spec)
+                "\n\n**{label}** (`{}`):",
+                position.value_type().as_type()
             ));
         }
-    };
-    match ty.shape() {
-        Shape::String {
-            identity_layer,
-            member_layer,
-        } => {
-            pattern("Identity", identity_layer.pattern);
-            pattern("Member", member_layer.pattern);
-            if let Some(bounds) = hover_bounds(identity_layer.length) {
-                content.push_str(&format!("\n- **Identity length**: {bounds}"));
-            }
-            if let Some(bounds) = hover_bounds(member_layer.length) {
-                content.push_str(&format!("\n- **Member length**: {bounds}"));
-            }
-        }
-        Shape::Int {
-            identity_layer,
-            member_layer,
-        } => {
-            if let Some(bounds) = hover_bounds(identity_layer.range) {
-                content.push_str(&format!("\n- **Identity range**: {bounds}"));
-            }
-            if let Some(bounds) = hover_bounds(member_layer.range) {
-                content.push_str(&format!("\n- **Member range**: {bounds}"));
-            }
-        }
-        Shape::List { .. } => {
-            if let Some(element) = ty.list_element() {
-                append_nested_refinement_hover(
-                    &mut content,
-                    "List element",
-                    &element,
-                    budget,
-                    truncated,
-                );
-            }
-        }
-        Shape::Map { .. } => {
-            if let Some(element) = ty.map_value() {
-                append_nested_refinement_hover(
-                    &mut content,
-                    "Map value",
-                    &element,
-                    budget,
-                    truncated,
-                );
-            }
-        }
-        Shape::Struct { .. } => {
-            let fields = ty.field_candidates_with_budget(budget);
-            if budget.is_exhausted() {
-                *truncated = true;
-            }
-            for field in fields {
-                if *truncated {
-                    break;
-                }
-                append_nested_refinement_hover(
-                    &mut content,
-                    &format!("Field `{}`", field.name()),
-                    &field.value_type(),
-                    budget,
-                    truncated,
-                );
-            }
-        }
-        Shape::Union => {
-            let members = ty.union_members_with_budget(budget);
-            if budget.is_exhausted() {
-                *truncated = true;
-            }
-            for (index, member) in members.into_iter().enumerate() {
-                if *truncated {
-                    break;
-                }
-                append_nested_refinement_hover(
-                    &mut content,
-                    &format!("Union member {}", index + 1),
-                    &member,
-                    budget,
-                    truncated,
-                );
-            }
-        }
-        Shape::Enum { .. } => {
-            if let Some(base) = ty.enum_base() {
-                append_nested_refinement_hover(&mut content, "Enum base", &base, budget, truncated);
-            }
-        }
-        _ => {}
+        content.push_str(&refinements);
     }
-
+    if walk.truncated {
+        content.push_str("\n\n… further nested constraints omitted");
+    }
     content
-}
-
-fn append_nested_refinement_hover(
-    content: &mut String,
-    label: &str,
-    ty: &carina_core::schema::EffectiveType<'_>,
-    budget: &mut carina_core::schema::ShapeWalkBudget,
-    truncated: &mut bool,
-) {
-    let refinements = refinement_hover(ty, budget, truncated);
-    if !refinements.is_empty() {
-        content.push_str(&format!(
-            "\n\n**{label}** (`{}`):{refinements}",
-            ty.as_type()
-        ));
-    }
 }
 
 fn hover_bounds<T: std::fmt::Display>(bounds: Option<(Option<T>, Option<T>)>) -> Option<String> {
@@ -692,15 +634,9 @@ impl HoverProvider {
             required
         );
 
-        let mut truncated = false;
         content.push_str(&refinement_hover(
-            &attr.value_type(),
-            &mut carina_core::schema::ShapeWalkBudget::new(64),
-            &mut truncated,
+            attr.value_type().refinement_positions(64),
         ));
-        if truncated {
-            content.push_str("\n\n… further nested constraints omitted");
-        }
 
         Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -3069,6 +3005,112 @@ EOT
         assert!(content.value.contains("Member length"), "{}", content.value);
         assert!(
             !content.value.contains("Field `name99`"),
+            "{}",
+            content.value
+        );
+    }
+
+    #[test]
+    fn hover_exactly_fitting_and_empty_struct_walks_are_not_truncated() {
+        use carina_core::schema::{StringIdentityLayer, StringMemberConstraints, TypeIdentity};
+        let name = AttributeType::string_member(
+            StringIdentityLayer::new(Some(TypeIdentity::bare("Name")), None, None, None),
+            StringMemberConstraints::new(None, Some((Some(1), Some(8)))),
+        );
+        for fields in [
+            Vec::new(),
+            (0..63)
+                .map(|index| StructField::optional(format!("name{index}"), name.clone()).build())
+                .collect(),
+        ] {
+            let has_fields = !fields.is_empty();
+            let schema = ResourceSchema::new("contact")
+                .attribute(
+                    AttributeSchema::optional("details", AttributeType::struct_("Details", fields))
+                        .build(),
+                )
+                .validate()
+                .unwrap();
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert("test", schema);
+            let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+            let doc = Document::new(
+                "test.contact {\n details = {}\n}\n".into(),
+                Arc::new(ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )),
+            );
+            let hover = provider.hover(&doc, Position::new(1, 3)).unwrap();
+            let HoverContents::Markup(content) = hover.contents else {
+                panic!("Markdown hover")
+            };
+            assert!(
+                !content.value.contains("further nested constraints omitted"),
+                "{}",
+                content.value
+            );
+            if has_fields {
+                assert!(
+                    content.value.contains("Field `name62`"),
+                    "{}",
+                    content.value
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hover_nested_ref_union_walk_is_bounded() {
+        use carina_core::schema::{StringIdentityLayer, StringMemberConstraints, TypeIdentity};
+        let name = AttributeType::string_member(
+            StringIdentityLayer::new(Some(TypeIdentity::bare("Name")), None, None, None),
+            StringMemberConstraints::new(None, Some((Some(1), Some(8)))),
+        );
+        let mut draft = ResourceSchema::new("contact")
+            .with_def("last", AttributeType::union(vec![name]))
+            .attribute(
+                AttributeSchema::optional(
+                    "choice",
+                    AttributeType::union(vec![
+                        AttributeType::ref_("alias0"),
+                        AttributeType::ref_("alias0"),
+                    ]),
+                )
+                .build(),
+            );
+        for index in 0..40 {
+            let next = if index == 39 {
+                "last".to_owned()
+            } else {
+                format!("alias{}", index + 1)
+            };
+            draft = draft.with_def(format!("alias{index}"), AttributeType::ref_(next));
+        }
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", draft.validate().unwrap());
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+        let doc = Document::new(
+            "test.contact {\n choice = 'abc'\n}\n".into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        let hover = provider.hover(&doc, Position::new(1, 3)).unwrap();
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("Markdown hover")
+        };
+        assert_eq!(
+            content
+                .value
+                .matches("… further nested constraints omitted")
+                .count(),
+            1,
+            "{}",
+            content.value
+        );
+        assert_eq!(
+            content.value.matches("Member length").count(),
+            1,
             "{}",
             content.value
         );
