@@ -1,9 +1,32 @@
 //! Text supplied by providers for host diagnostics.
 
+// Host construction/plumbing is available to native hosts, never to guests.
+// Provider manifests may not enable provider-host/guest-runtime (boundary check).
+macro_rules! host_api {
+    ($(#[$attribute:meta])* fn $name:ident $($tail:tt)*) => {
+        #[cfg(all(feature = "provider-host", not(target_arch = "wasm32")))]
+        $(#[$attribute])* pub fn $name $($tail)*
+        #[cfg(not(all(feature = "provider-host", not(target_arch = "wasm32"))))]
+        // Keep private signatures available for explicit E0624 boundary evidence.
+        #[allow(dead_code, reason = "Host plumbing is unused in provider-only builds")]
+        $(#[$attribute])* pub(crate) fn $name $($tail)*
+    };
+}
+
 pub mod boundary;
+mod events;
+pub(crate) use events::DiagnosticOwner;
+#[cfg(all(feature = "provider-host", not(target_arch = "wasm32")))]
+pub use events::provider_http_trace_enabled;
+pub use events::{
+    BoundProviderEvent, EventLevel, ProviderDiagnosticCall, ProviderDiagnosticChannel,
+    ProviderEvent, ProviderEventPresentation, ProviderValueDiagnostic, ValueOrigin, present_event,
+};
 mod composition_contract;
 #[cfg(test)]
 mod composition_tests;
+#[cfg(test)]
+mod event_tests;
 mod guest_inputs;
 #[cfg(feature = "guest-runtime")]
 mod guest_store;
@@ -681,14 +704,7 @@ impl ErrorText<Unbound> {
         }
     }
     pub(crate) fn into_host(self, secrets: &RedactionSet) -> ErrorText<Bound> {
-        ErrorText {
-            content: TextContent::Bound(vec![Segment::Provider {
-                text: self.opaque(),
-                secrets: secrets.clone(),
-            }]),
-            projection: Default::default(),
-            state: std::marker::PhantomData,
-        }
+        events::bind_text(self.opaque(), secrets)
     }
 }
 impl<S: TextState> From<&str> for ErrorText<S> {
@@ -937,6 +953,20 @@ impl RedactionSet {
                 .copied(),
         );
         values.len() > limit
+    }
+
+    fn unregistered_values<'a>(&self, values: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+        use sha2::{Digest, Sha256};
+        let mut known = self
+            .values
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        values
+            .filter(|value| {
+                !value.is_empty() && known.insert(Sha256::digest(value.as_bytes()).into())
+            })
+            .collect()
     }
 
     fn compare_values(a: &str, b: &str) -> std::cmp::Ordering {
@@ -2322,6 +2352,14 @@ impl RedactedNormalizationCause<'_> {
 impl fmt::Display for Diagnostic<Bound> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.text.fmt(f)
+    }
+}
+
+impl Diagnostic<Bound> {
+    pub(crate) fn event_schema_source(&self) -> Option<&crate::schema::SchemaRegistryError> {
+        self.error
+            .downcast_ref::<boundary::EventSchemaInstallError>()
+            .map(boundary::EventSchemaInstallError::source_error)
     }
 }
 

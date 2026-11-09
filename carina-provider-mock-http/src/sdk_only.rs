@@ -4,4 +4,17 @@
 // main, or this fixture will not cover it.
 fn main() {
     let _ = carina_plugin_sdk::aws_credentials::current();
+    #[cfg(target_arch = "wasm32")]
+    {
+        let diagnostic = carina_plugin_sdk::core::provider_text::ProviderDiagnostic::message(
+            "SDK imports-only fixture".into(),
+        );
+        carina_plugin_sdk::ProviderDiagnostics::guest().emit(
+            carina_plugin_sdk::ProviderEvent::diagnostic(
+                carina_plugin_sdk::EventLevel::Debug,
+                "componentization".into(),
+                &diagnostic,
+            ),
+        );
+    }
 }

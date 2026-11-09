@@ -94,8 +94,23 @@ with tempfile.TemporaryDirectory(prefix="carina-provider-cause-api-") as tempora
         'serde = { version = "1", features = ["derive"] }\n'
         'serde_json = "1"\n\n'
         '[features]\nunified-test-utils = ["carina-core/test-utils", "carina-plugin-sdk/test-utils"]\n'
-        'export-http = []\nexport-aws = []\n\n'
+        'export-http = []\nexport-aws = ["carina-plugin-sdk/aws"]\nforbidden-provider-host = ["dep:host-feature-enabler"]\n\n'
         '[patch.crates-io]',
+    ))
+    # Activate core's host feature through another dependency, not a direct
+    # manifest feature edge. Guest safety must not depend on the lint script.
+    enabler = fixture / "host-feature-enabler"
+    (enabler / "src").mkdir(parents=True)
+    (enabler / "src/lib.rs").write_text("")
+    (enabler / "Cargo.toml").write_text(
+        '[package]\nname = "host-feature-enabler"\nversion = "0.0.0"\nedition = "2024"\n'
+        '[dependencies]\ncarina-core = { path = ' + json.dumps(str(repo / "carina-core"))
+        + ', features = ["provider-host"] }\n'
+    )
+    manifest_path.write_text(manifest_path.read_text().replace(
+        '[dependencies]',
+        '[dependencies]\nhost-feature-enabler = { path = "host-feature-enabler", optional = true }',
+        1,
     ))
     for world in ([], ["--features", "export-http"], ["--features", "export-aws"]):
         shutil.copyfile(repo / "scripts/tests/provider-cause-test-api/wasm_export_forbid_unsafe.rs", fixture / "src/lib.rs")
@@ -172,4 +187,92 @@ with tempfile.TemporaryDirectory(prefix="carina-provider-cause-api-") as tempora
                 print(result.stderr, file=sys.stderr)
                 sys.exit(f"ERROR: flattened SDK encoding or native fixture check failed: {filename}, features={features}")
         print(f"OK: flattened wire encoding compiles and native fixtures remain unavailable; features={features}.")
+
+    # Host diagnostic plumbing stays private even with provider test features.
+    # Emission through the host-supplied session is the positive control.
+    for target in ([], ['--target', 'wasm32-wasip2']):
+        for features in ([], ['--features', 'unified-test-utils']):
+            for filename, forbidden in (('forbidden.rs', True), ('allowed.rs', False)):
+                shutil.copyfile(repo / 'scripts/tests/provider-diagnostic-host-api' / filename, fixture / 'src/lib.rs')
+                result = subprocess.run([
+                    'cargo', 'check', '--offline', '--lib', '--message-format=json',
+                    *target, *features, '--manifest-path', str(fixture / 'Cargo.toml'),
+                    '--target-dir', str(repo / 'target'),
+                ], env=environment, capture_output=True, text=True, timeout=600)
+                errors = []
+                for line in result.stdout.splitlines():
+                    try:
+                        message = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if message.get('reason') == 'compiler-message' and message['message']['level'] == 'error':
+                        errors.append(message['message'])
+                expected = {'session', 'session_builder', 'inherit_diagnostic_host', 'for_new_guest', 'for_diagnostic_call', 'install_event_schemas', 'provider_http_trace_enabled'}
+                rejected = {name for error in errors for name in expected if name in error['message']}
+                valid = (result.returncode == 101 and rejected == expected and len(errors) == len(expected)
+                         and all((error.get('code') or {}).get('code') == ('E0425' if 'provider_http_trace_enabled' in error['message'] else 'E0624') for error in errors)) if forbidden else result.returncode == 0
+                if not valid:
+                    for error in errors:
+                        print(error.get('rendered', error['message']), file=sys.stderr)
+                    print(result.stderr, file=sys.stderr)
+                    sys.exit(f'ERROR: host diagnostic plumbing visibility: {filename}, target={target}, features={features}')
+            print(f'OK: provider emission allowed; host session, presentation and call-budget plumbing private (E0624); target={target}, features={features}.')
+
+    # Initialization fixtures expose session construction only to native hosts;
+    # test-utils alone must not grant this extension trait through a glob import.
+    shutil.copyfile(repo / "scripts/tests/provider-diagnostic-host-api/initialize_fixture.rs", fixture / "src/lib.rs")
+    for features, should_compile in (("unified-test-utils", False), ("unified-test-utils,forbidden-provider-host", True)):
+        result = subprocess.run([
+            "cargo", "check", "--offline", "--lib", "--message-format=json",
+            "--features", features, "--manifest-path", str(manifest_path),
+            "--target-dir", str(repo / "target"),
+        ], env=environment, capture_output=True, text=True, timeout=600)
+        errors = []
+        for line in result.stdout.splitlines():
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("reason") == "compiler-message" and message["message"]["level"] == "error":
+                errors.append(message["message"])
+        rejected_trait = any(
+            (error.get("code") or {}).get("code") == "E0432" and "InitializeFixture" in error["message"]
+            for error in errors
+        )
+        if (should_compile and result.returncode != 0) or (not should_compile and (result.returncode != 101 or not rejected_trait)):
+            for error in errors:
+                print(error.get("rendered", error["message"]), file=sys.stderr)
+            print(result.stderr, file=sys.stderr)
+            sys.exit(f"ERROR: initialization fixture must require provider-host: features={features}")
+        print(f"OK: initialization fixture visibility follows provider-host; features={features}.")
+
+    for target, filename in (([], "forbidden.rs"), (["--target", "wasm32-wasip2"], "allowed.rs")):
+        shutil.copyfile(repo / "scripts/tests/provider-diagnostic-host-api" / filename, fixture / "src/lib.rs")
+        result = subprocess.run([
+            "cargo", "check", "--offline", "--lib", "--message-format=json",
+            *target, "--features", "forbidden-provider-host", "--manifest-path", str(manifest_path),
+            "--target-dir", str(repo / "target"),
+        ], env=environment, capture_output=True, text=True, timeout=600)
+        if not target:
+            if result.returncode != 0:
+                print(result.stdout, file=sys.stderr)
+                print(result.stderr, file=sys.stderr)
+                sys.exit("ERROR: trusted native hosts must retain host plumbing under feature unification")
+            print("OK: native host plumbing compiles with a transitively enabled provider-host feature.")
+            continue
+        expected = "carina-core host plumbing is not available to wasm32 guest providers; remove the `provider-host` feature from guest dependencies"
+        diagnostics = []
+        for line in result.stdout.splitlines():
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("reason") == "compiler-message" and message["message"]["level"] == "error":
+                diagnostics.append(message["message"])
+        if result.returncode != 101 or not any(error["message"] == expected for error in diagnostics):
+            for error in diagnostics:
+                print(error.get("rendered", error["message"]), file=sys.stderr)
+            print(result.stderr, file=sys.stderr)
+            sys.exit("ERROR: wasm32 must reject a transitively enabled provider-host feature with the core compile_error")
+        print("OK: wasm32 rejects transitively enabled host plumbing with the core compile_error.")
 PY

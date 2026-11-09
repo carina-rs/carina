@@ -9,20 +9,21 @@ A provider has two version numbers. Its own release version is yours to choose. 
 
 The host and the provider talk through a versioned protocol. `carina-provider-protocol` defines two numbers: `PROTOCOL_VERSION`, the version this build speaks, and `MIN_SUPPORTED_PROTOCOL_VERSION`, the oldest protocol version the host still loads from a provider. The SDK writes the version it was built with into the provider's `info` response; you never set it yourself.
 
-Every time Carina starts a provider, for `validate`, `plan`, `apply` or any other command that uses it, it checks that version first and refuses to go further if it is out of range. `carina init` only downloads and records the provider without starting it, so a mismatch shows up at the first command after `init`:
+Every time Carina starts a provider, for `validate`, `plan`, `apply` or any other command that uses it, it first rejects incompatible WIT packages before linking, then checks the declared protocol before binding provider exports. It refuses to go further if either is incompatible. `carina init` only downloads and records the provider without starting it, so a mismatch shows up at the first command after `init`:
 
 ```text
-provider 'hello' was built against protocol version 23 but this host requires at least version 24; rebuild the provider against the current carina protocol
+provider 'hello' was built against protocol version 24 but this host requires at least version 25; rebuild the provider against the current carina protocol
 ```
 
 ```text
-provider 'hello' was built against protocol version 25 but this host supports up to version 24; upgrade carina to load this provider
+provider 'hello' was built against protocol version 26 but this host supports up to version 25; upgrade carina to load this provider
 ```
 
 Since v0.5.0, the first release that checks the version, every release has set the minimum equal to the protocol version it speaks, so a provider has to be built for exactly the protocol version of the Carina that loads it:
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
+| Development snapshot after v0.13.1 (unreleased) | 25 | 25 |
 | v0.13.1 | 24 | 24 |
 | v0.13.0 | 24 | 24 |
 | v0.12.1 | 23 | 23 |
@@ -43,16 +44,19 @@ Since v0.5.0, the first release that checks the version, every release has set t
 | v0.6.0 | 10 | 10 |
 | v0.5.0 | 10 | 10 |
 
-Carina v0.13.0 and v0.13.1 use protocol 24; v0.12.0 and v0.12.1 use protocol 23, v0.11.0 uses protocol 21 and v0.10.0 uses protocol 19. Protocol 24 requires [explicit pattern match modes and reasons containing visible text for substring exceptions](/providers/writing/schemas/#attribute-types). Protocol 23 requires every resource schema to carry an `input_rules` array, `[]` when the resource declares no rules. Each rule names a scope (`create_only` or `every_write`), a typed target, a stable diagnostic code and a predicate, and Carina checks it on the inputs of the writes in that scope, never on read-back or state values. Protocol 22 added an optional entry-count bound to map attribute types, the same `length` shape that list types use. Providers built for protocol 23 or earlier must rebuild against the current SDK, including for metadata-only state migration checks.
+The current development SDK and minimum supported provider protocol are both 25 (WIT 0.2.0). Protocol 25 requires typed diagnostics, discards guest stdout/stderr, and registers credentials before adoption, including each AWS refresh through `AwsSdkParts`. `CARINA_WASI_HTTP_TRACE` is host-only, and legacy WIT packages are rejected before linking. Released Carina v0.13.0 and v0.13.1 use protocol 24; v0.12.0 and v0.12.1 use protocol 23, v0.11.0 uses protocol 21 and v0.10.0 uses protocol 19. Protocol 24 requires [explicit pattern match modes and reasons containing visible text for substring exceptions](/providers/writing/schemas/#attribute-types). Protocol 23 requires every resource schema to carry an `input_rules` array, `[]` when the resource declares no rules. Each rule names a scope (`create_only` or `every_write`), a typed target, a stable diagnostic code and a predicate, and Carina checks it on the inputs of the writes in that scope, never on read-back or state values. Protocol 22 added an optional entry-count bound to map attribute types, the same `length` shape that list types use. Providers built for protocol 24 or earlier must rebuild against the current SDK, including for metadata-only state migration checks.
+
+For protocol 25 AWS configuration, use `AwsSessionMaterial`, `AwsSessionSource`, `AwsSessionFuture` and `AwsSdkParts` (SDK feature `aws`). Sources return `AwsSessionMaterial::new(credentials)` with the complete SDK value; registration retains expiry, account ID, provider name and feature/custom properties. Registration and acknowledged snapshots remain internal; snapshots cannot provide credentials independently or prepare unsigned requests. The SDK installs the refreshing provider and HTTP client together and registers every returned generation; later AWS config changes remain under caller control.
 
 The protocol 21 schema envelope requires `assignability_edges`, even when empty, and SDK providers must implement `CarinaProvider::assignability_edges`. Both endpoints must be declared by that provider as scalar String, Int, or Float identities with the same scalar kind. Enum, Reference, and core built-in identities cannot be endpoints; self edges, duplicates, and cycles are rejected. Each provider's transitive closure is retained separately, so paths never combine different providers' declarations.
 
 Assignment first checks structural identity. When identities differ, a provider attribute uses its sink owner's edges. Type annotations and module boundaries require a path declared by every owner of the sink identity. The existing length and range checks still apply, and sink validators still run on values during validation, planning, and apply.
 
-Protocols 14 through 23 came before protocol 24, and their changes remain part of it:
+Protocols 14 through 24 came before protocol 25, and their changes remain part of it:
 
 | Protocol | Change |
 |----------------------|--------|
+| 24 | Required explicit pattern match modes and justified substring exceptions. |
 | 23 | Required scoped desired-input rules on resource schemas. |
 | 22 | Optional entry-count bound on map attribute types. |
 | 21 | Required provider-wide identity assignability declarations in the schema envelope. |

@@ -1716,7 +1716,7 @@ pub(crate) fn wit_to_wire_provider_error(err: wit::ProviderError) -> proto::Prov
 
 /// Rehydrate untrusted wire text only inside the native host decoder.
 /// Provider authoring has no entry point accepting this record.
-fn decode_provider_error(error: proto::ProviderError) -> CoreProviderError {
+pub(super) fn decode_provider_error(error: proto::ProviderError) -> CoreProviderError {
     use carina_core::provider::ProviderErrorKind;
     use carina_core::provider_text::{ProviderDiagnostic, ProviderErrorText, ProviderText};
     let kind = match error.kind {
@@ -5318,8 +5318,11 @@ mod tests {
         let error = check_protocol_version(
             r#"{"name":"old","display_name":"Old","version":"1.0.0","protocol_version":22}"#,
         )
-        .expect_err("current declarations require protocol 24");
-        assert!(error.contains("requires at least version 24"));
+        .expect_err("current declarations require the minimum supported protocol");
+        assert!(error.contains(&format!(
+            "requires at least version {}",
+            carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION
+        )));
     }
 
     #[test]
@@ -7503,11 +7506,14 @@ mod pattern_mode_tests {
 #[cfg(test)]
 mod removed_legacy_pattern_window_tests {
     #[test]
-    fn pattern_specs_require_protocol_24_including_schema_only_loading() {
-        for version in [12, 22, 23] {
+    fn pattern_specs_require_supported_protocol_including_schema_only_loading() {
+        for version in [12, 22, 23, 24] {
             let info = serde_json::json!({"name": "old", "display_name": "Old", "version": "1.0.0", "protocol_version": version});
             let error = super::check_protocol_version(&info.to_string()).unwrap_err();
-            assert!(error.contains("requires at least version 24"));
+            assert!(error.contains(&format!(
+                "requires at least version {}",
+                carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION
+            )));
         }
     }
 }

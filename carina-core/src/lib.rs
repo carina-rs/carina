@@ -2,6 +2,11 @@
 //!
 //! Core library for an infrastructure management tool that treats side effects as values
 
+#[cfg(all(feature = "provider-host", target_arch = "wasm32"))]
+compile_error!(
+    "carina-core host plumbing is not available to wasm32 guest providers; remove the `provider-host` feature from guest dependencies"
+);
+
 pub use carina_provider_protocol::{FiniteF64, NonFiniteFloatError};
 
 mod environment;

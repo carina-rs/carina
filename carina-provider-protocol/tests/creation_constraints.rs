@@ -27,9 +27,9 @@ fn empty_input_rules_survive_json_round_trip() {
 }
 
 #[test]
-fn input_rule_protocol_is_exactly_24() {
-    assert_eq!(PROTOCOL_VERSION, 24);
-    assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 24);
+fn input_rule_protocol_is_current() {
+    assert_eq!(PROTOCOL_VERSION, 25);
+    assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 25);
 }
 
 #[test]

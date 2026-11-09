@@ -14,7 +14,7 @@ pub fn decode_desired_resource(
 macro_rules! provider_world {
     ($world:ident, $bindings:ident) => {
         pub mod $world {
-            pub use $bindings::carina::provider::types::*;
+            pub use carina_plugin_bindings_diagnostics::carina::provider::types::*;
             pub use $bindings::export;
             pub use $bindings::exports::carina::provider::provider::{
                 DesiredResource, Guest, PlanOp,
@@ -25,4 +25,5 @@ macro_rules! provider_world {
 
 provider_world!(provider, carina_plugin_bindings_provider);
 provider_world!(http, carina_plugin_bindings_http);
+#[cfg(feature = "aws")]
 provider_world!(aws, carina_plugin_bindings_aws);

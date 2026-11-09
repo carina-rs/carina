@@ -49,7 +49,7 @@ calls, upstream-state reads, backend access, locks, network access, cache
 writes, or state writes. It loads schema metadata only from exact installed
 provider artifacts. Repeat `--provider-schema KIND=/absolute/provider.wasm`
 to select explicit artifacts. The check requires providers built for the
-current protocol (24), including on this metadata-only path. Older artifacts,
+current protocol (25), including on this metadata-only path. Older artifacts,
 including released protocol-v12 providers, are rejected with a protocol-version
 error because their schemas do not declare pattern match modes. Rebuild them
 against the current SDK before checking the migration. A successful run reports

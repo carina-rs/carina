@@ -6,7 +6,30 @@ use crate::resource::{ConcreteValue, DeferredValue, Resource, ResourceId, State,
 use crate::schema::{
     ValidatedConfigSchema, ValidatedProviderSchemaWitness, ValidatedResourceSchema,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+/// Initialize host fixtures through the real provider boundary and session.
+#[cfg(feature = "provider-host")]
+pub trait InitializeFixture: ProviderFactory + Sized {
+    fn initialize_fixture(
+        &self,
+        binding: Option<&str>,
+        config: &ProviderReadyConfig,
+    ) -> BoxFuture<'_, HostResult<InitializedProvider>> {
+        let session = ProviderPlan::state_only().session(self.name(), binding, Some(config));
+        Box::pin(async move { ProviderBoundary::initialize(self, &session).await })
+    }
+    fn initialize_normalizer_fixture(
+        &self,
+        binding: Option<&str>,
+        config: &ProviderReadyConfig,
+    ) -> BoxFuture<'_, HostResult<ConfiguredNormalizer>> {
+        let session = ProviderPlan::state_only().session(self.name(), binding, Some(config));
+        Box::pin(async move { ProviderBoundary::initialize_normalizer(self, &session).await })
+    }
+}
+#[cfg(feature = "provider-host")]
+impl<T: ProviderFactory> InitializeFixture for T {}
 
 pub fn plan_for_desired<S, D>(
     desired: &[Resource<
@@ -23,6 +46,18 @@ pub fn plan_for_desired<S, D>(
         input
     }));
     crate::validation::ResolvedFile::for_test(file).provider_plan()
+}
+
+/// Capture kernel-bound events from a session whose sink is chosen before sharing.
+pub fn captured_session(
+    builder: ProviderSessionBuilder,
+) -> (ProviderSession, Arc<Mutex<Vec<BoundProviderEvent>>>) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let session = builder
+        .with_diagnostic_sink(move |event| sink.lock().unwrap().push(event))
+        .build();
+    (session, events)
 }
 
 fn fixture_session<S, D>(
@@ -85,6 +120,14 @@ pub fn context(values: &[&str]) -> Context {
     Context { session, desired }
 }
 impl Context {
+    pub fn session_builder(&self) -> ProviderSessionBuilder {
+        plan_for_desired(std::slice::from_ref(&self.desired)).session_builder(
+            "text-fixture",
+            None,
+            None,
+        )
+    }
+
     pub fn session(&self) -> &ProviderSession {
         &self.session
     }
