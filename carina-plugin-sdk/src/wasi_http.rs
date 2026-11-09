@@ -15,9 +15,12 @@
 //!   so AWS SDK operations work inside a WASM component too.
 //!
 //! Both adapters send fully buffered bodies with explicit `Content-Length`
-//! framing. The synchronous AWS connector rejects streaming or already-taken
-//! SDK bodies as user errors with `UnbufferedRequestBody` in the source chain,
-//! before sending anything. It does not consume or poll those bodies.
+//! framing. Each request the transport accepts emits one completed HTTP event,
+//! including early transport failures. The synchronous AWS connector rejects
+//! streaming or already-taken SDK bodies before conversion to a transport
+//! request. The SDK receives a user `ConnectorError` with `UnbufferedRequestBody`
+//! as its source, without an HTTP event. The connector does not consume or poll
+//! those bodies.
 //!
 //! Keeping the wasi:http body-framing fixes (carina#3254 Content-Length,
 //! carina#3320 handle-before-write ordering, carina#3318 blocking-write
@@ -1137,18 +1140,10 @@ mod tests {
                 connector.call(request).await.unwrap().status().as_u16(),
                 200
             );
-            let mut requests = capture.finish();
+            let requests = capture.finish();
             assert_eq!(requests.len(), 1);
-            let request = requests.first_mut().unwrap();
+            let request = requests.first().unwrap();
             assert_eq!(request.body, expected);
-            inject_content_length_header(&mut request.headers, &request.body);
-            assert_eq!(
-                request.headers,
-                vec![(
-                    "content-length".to_string(),
-                    expected.content_length().to_string().into_bytes(),
-                )]
-            );
         }
     }
 

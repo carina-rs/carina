@@ -735,8 +735,10 @@ A struct type represents a nested object with typed fields.
   The generic HTTP path classifies its owned `Vec<u8>` infallibly.
   Per-request headers and query fields use the existing
   structural HTTP trace masking, followed by the session `RedactionSet`. Each
-  request emits one completed HTTP event, including early failures; signing
-  material and ordinary query values never enter the long-lived inventory.
+  request the transport accepts emits one completed HTTP event, including early
+  transport failures. A body rejected by `TryFrom<&SdkBody>` is returned to the
+  SDK as a user error without an HTTP event. Signing material and ordinary query
+  values never enter the long-lived inventory.
   Core owns all diagnostic budgets. Count/rate windows reset per WASM export
   and native dispatch through the same core call scope,
   with separate quotas for Error/Warn/Info and Debug/Trace. Only the first panic
