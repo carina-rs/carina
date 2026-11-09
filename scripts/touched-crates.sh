@@ -10,7 +10,7 @@
 # Diff mode includes committed, staged, unstaged and untracked changes.
 #
 # Output (stdout):
-#   "-p carina-core -p carina-cli"   # one or more touched crates
+#   "-p carina-cli -p carina-tui"    # touched crates and reverse dependents
 #   "--workspace"                    # cross-cutting change, fall back
 #   ""                               # nothing test-relevant changed
 #
@@ -18,12 +18,13 @@
 # `--workspace` rather than under-test the change.
 #
 # Heuristics (in order):
-#   1. A change to root `Cargo.toml`, `Cargo.lock`, or any
-#      `*/Cargo.toml` of a depended-upon crate ⇒ `--workspace`.
+#   1. A change to any `Cargo.toml` or `Cargo.lock` ⇒ `--workspace`.
 #   2. A change to `carina-core/**` ⇒ `--workspace` (everything depends
 #      on carina-core; running its tests alone is insufficient).
-#   3. Otherwise, collect the leading `carina-*/` segment from each
-#      changed file. If any changed file is outside a workspace crate
+#   3. Otherwise, find the workspace members owning the changed files
+#      using Cargo metadata. Include all transitive reverse dependencies,
+#      including dev, build, optional and target-specific dependencies.
+#      If any changed file is outside a workspace crate
 #      AND outside the "ignore" set (site/notes/CI/scripts/infra), emit
 #      `--workspace` to be safe.
 #   4. Files in the ignore set (CLAUDE.md, .github/**, scripts/**,
@@ -38,6 +39,10 @@ base_ref="origin/main"
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --base)
+            if [[ $# -lt 2 || -z "$2" || "$2" == -* ]]; then
+                echo 'touched-crates.sh: --base requires a ref' >&2
+                exit 2
+            fi
             base_ref="$2"
             shift 2
             ;;
@@ -80,93 +85,90 @@ if [[ ${#files[@]} -eq 0 ]]; then
     exit 0
 fi
 
-# Workspace crate dirs (matches Cargo.toml [workspace] members).
-crates=(
-    carina-cli
-    carina-credentials-aws
-    carina-core
-    carina-lsp
-    carina-plugin-host
-    carina-plugin-sdk
-    carina-provider-mock
-    carina-provider-mock-http
-    carina-provider-protocol
-    carina-provider-resolver
-    carina-state
-    carina-tui
-)
-
-is_crate_dir() {
-    local seg="$1"
-    for c in "${crates[@]}"; do
-        [[ "$c" == "$seg" ]] && return 0
-    done
-    return 1
-}
-
 is_ignorable() {
     local f="$1"
     case "$f" in
         CLAUDE.md|README.md|.gitignore|.gitmodules) return 0 ;;
         .github/*|scripts/*|site/*|notes/*|infra/*|examples/*) return 0 ;;
-        *.md) return 0 ;;  # other top-level docs
+        *.md) [[ "$f" != */* ]] && return 0 ;;  # other top-level docs
     esac
     return 1
 }
 
-declare -A touched
-touched_count=0
-fallback=0
-
+candidates=()
 for f in "${files[@]}"; do
     [[ -z "$f" ]] && continue
 
-    # Heuristic 1: workspace-level Cargo files
-    if [[ "$f" == "Cargo.toml" || "$f" == "Cargo.lock" ]]; then
-        fallback=1
-        break
-    fi
-
-    seg="${f%%/*}"
-
-    # Heuristic 2: carina-core touched ⇒ workspace
-    if [[ "$seg" == "carina-core" ]]; then
-        fallback=1
-        break
-    fi
-
-    # Workspace crate?
-    if is_crate_dir "$seg"; then
-        if [[ -z "${touched[$seg]:-}" ]]; then
-            touched["$seg"]=1
-            touched_count=$((touched_count + 1))
-        fi
-        continue
-    fi
+    case "$f" in
+        Cargo.toml|Cargo.lock|*/Cargo.toml|*/Cargo.lock|carina-core|carina-core/*)
+            echo '--workspace'
+            exit 0
+            ;;
+    esac
 
     # Ignorable site/notes/CI/script change?
     if is_ignorable "$f"; then
         continue
     fi
 
-    # Anything else (a path we do not recognize): be safe.
-    fallback=1
-    break
+    candidates+=("$f")
 done
 
-if [[ "$fallback" -eq 1 ]]; then
-    echo "--workspace"
-    exit 0
-fi
-
-if [[ "$touched_count" -eq 0 ]]; then
+if [[ ${#candidates[@]} -eq 0 ]]; then
     # Only ignorable changes — nothing to test.
     exit 0
 fi
 
-# Emit `-p <crate>` for each touched crate, sorted for determinism.
-out=""
-for c in $(printf '%s\n' "${!touched[@]}" | sort); do
-    out+=" -p $c"
-done
-echo "${out# }"
+# --no-deps still includes every member's declared dependencies, across all
+# kinds and targets. Match their paths rather than names (which can be renamed).
+if ! metadata=$(cargo metadata --format-version 1 --no-deps); then
+    echo 'touched-crates.sh: cargo metadata failed; using --workspace' >&2
+    echo '--workspace'
+    exit 0
+fi
+if ! selection=$(python3 -c '
+import json
+from pathlib import Path
+import sys
+
+metadata = json.load(sys.stdin)
+members = set(metadata["workspace_members"])
+packages = {
+    Path(package["manifest_path"]).resolve().parent: package
+    for package in metadata["packages"] if package["id"] in members
+}
+if not packages or len(packages) != len(members):
+    raise ValueError("incomplete workspace metadata")
+root = Path(metadata["workspace_root"]).resolve()
+touched = set()
+for filename in sys.argv[1:]:
+    path = (root / filename).resolve()
+    owner = next((parent for parent in (path, *path.parents) if parent in packages), None)
+    if owner is None:
+        print("--workspace")
+        sys.exit(0)
+    touched.add(owner)
+
+dependents = {directory: set() for directory in packages}
+for directory, package in packages.items():
+    for dependency in package["dependencies"]:
+        if dependency.get("path") is not None:
+            target = Path(dependency["path"]).resolve()
+            if target in dependents:
+                dependents[target].add(directory)
+
+pending = list(touched)
+while pending:
+    for dependent in dependents[pending.pop()] - touched:
+        touched.add(dependent)
+        pending.append(dependent)
+if len(touched) == len(packages):
+    print("--workspace")
+else:
+    print(" ".join("-p " + name for name in sorted(packages[path]["name"] for path in touched)))
+' "${candidates[@]}" <<< "$metadata"); then
+    echo 'touched-crates.sh: cannot derive crate scope; using --workspace' >&2
+    echo '--workspace'
+    exit 0
+fi
+echo "$selection"

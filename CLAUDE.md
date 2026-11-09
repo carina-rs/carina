@@ -313,9 +313,15 @@ aws-vault exec <profile> -- cargo run -- plan
 
 ## Verify Protocol
 
+`scripts/verify.sh` needs cargo-nextest, cargo-hack, and the `wasm32-wasip2`
+target (`rustup target add wasm32-wasip2`) for its full check set. When selecting
+kinds, only their required tools are checked before execution.
+
 1. Run `scripts/verify.sh --local` before `gh pr create` and before pushing
    follow-up commits to an open PR. It runs the same check definitions and
    feature flags as CI; only crate scope comes from `scripts/touched-crates.sh`.
+   Local scope includes touched crates and their transitive reverse dependents
+   in the workspace, including dependents through dev and build dependencies.
    Use `--base <ref>` to override the helper's default base of `origin/main`.
 2. PR CI must be green before merge.
 
@@ -337,24 +343,25 @@ require updating those repos.
 
 ### Crate-Scoped Verify Helper
 
-`scripts/touched-crates.sh` maps changed files to the cargo `-p <crate>`
-flags that exercise them, including uncommitted changes, so iteration can
-stay crate-scoped:
+`scripts/touched-crates.sh` maps changed files, including uncommitted changes,
+to cargo `-p <crate>` flags for touched crates and their transitive reverse
+dependents. It derives workspace membership and dependency paths from Cargo
+metadata, including all dependency kinds:
 
 ```bash
 # What crates does the current branch touch (vs origin/main)?
 scripts/touched-crates.sh
-# → "-p carina-core -p carina-cli"   (or "--workspace", or empty)
+# → "-p carina-cli -p carina-tui"   (or "--workspace", or empty)
 
-cargo nextest run $(scripts/touched-crates.sh)   # run only touched crates
+cargo nextest run $(scripts/touched-crates.sh)   # touched crates and reverse dependents
 scripts/touched-crates.sh --base main            # diff against a specific base
 git diff --name-only | scripts/touched-crates.sh --stdin   # custom file list
 ```
 
 | Output           | Meaning                                                   |
 | ---------------- | --------------------------------------------------------- |
-| `-p <crate> ...` | Run only those crates' tests; transitive consumers are not invalidated. |
-| `--workspace`    | Cross-cutting change (touched `carina-core`, root `Cargo.toml`/`Cargo.lock`, or an unrecognized path). Sweep the whole workspace. |
+| `-p <crate> ...` | Run touched crates and all transitive reverse dependents in the workspace. |
+| `--workspace`    | Cross-cutting change (touched `carina-core`, any `Cargo.toml`/`Cargo.lock`, or an unrecognized path), or the dependency closure covers every member. Sweep the whole workspace. |
 | (empty)          | No test-relevant files changed (only docs / CI / scripts / infra). Skip the test step. |
 
 The helper is intentionally pessimistic. Two "fall back to `--workspace`"

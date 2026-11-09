@@ -45,11 +45,13 @@ def run(args, fail_fast=True, **kwargs):
 
 if len(sys.argv) > 2 and sys.argv[1] == "--build":
     build_args = sys.argv[2:]
-elif len(sys.argv) == 2:
+elif len(sys.argv) == 2 and not sys.argv[1].startswith("-"):
     build_args = ["--archive-file", sys.argv[1], "--workspace-remap", ".",
                   "--extract-to", ".", "--extract-overwrite"]
 else:
-    raise SystemExit("usage: test-in-process-isolation.sh [nextest-archive.tar.zst]")
+    print("usage: test-in-process-isolation.sh [nextest-archive.tar.zst | --build <cargo-args>...]",
+          file=sys.stderr)
+    raise SystemExit(2)
 listing = run([
     os.environ.get("CARGO", "cargo"), "nextest", "list",
     *build_args,

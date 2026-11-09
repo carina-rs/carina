@@ -3,33 +3,63 @@
 #   bash scripts/test-verify-sh.sh /path/to/temporary/repo-copy
 set -euo pipefail
 repo_root=${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
-workflow="$repo_root/.github/workflows/ci.yml"
 verify="$repo_root/scripts/verify.sh"
 
 # Parse run scalars by indentation, including inline, literal and folded
 # forms. This deliberately needs only awk/Bash, not a YAML package.
-awk '
-function inspect(    i, line) {
+shopt -s globstar nullglob
+for workflow in "$repo_root"/.github/workflows/**/* "$repo_root"/.github/actions/**/action.yml; do
+    [[ -f "$workflow" ]] || continue
+    awk -v source="${workflow#"$repo_root"/}" '
+function allowed_script(script) {
+    if (script == "scripts/verify.sh") return 1 # The shared dispatcher.
+    # Diff classification selects jobs; it does not perform verification.
+    if (source == ".github/workflows/ci.yml" && job == "changes" &&
+        script == "scripts/classify-ci-diff.sh") return 1
+    # Archive consumers must require their downloaded WASM artifacts.
+    if (source == ".github/workflows/ci.yml" &&
+        (job == "test-partition" || job == "test-isolation") &&
+        script == "scripts/require-wasm-fixtures.sh") return 1
+    # Cache-key generation is setup for the local cache action.
+    if (source == ".github/actions/rust-cache/action.yml" &&
+        script == "scripts/rust-cache-key.sh") return 1
+    return 0
+}
+function allowed_cargo(line) {
+    # These commands produce distributable binaries, rather than run checks.
+    if (source == ".github/workflows/ci.yml" && job == "binary-build" &&
+        line ~ /^[[:space:]]*cargo build --release --bin carina[[:space:]]*$/) return 1
+    # The release workflow installs its cross builder and builds artifacts.
+    if (source == ".github/workflows/release.yml" && job == "build" &&
+        line ~ /^[[:space:]]*cargo (install cross --git https:\/\/github.com\/cross-rs\/cross|build --release --target .+ --bin carina --bin carina-lsp)[[:space:]]*$/) return 1
+    return 0
+}
+function violation(i, line) {
+    printf "ERROR: %s:%d (%s) bypasses verify.sh: %s\n", source, lines[i], job, line > "/dev/stderr"
+    failed = 1
+}
+function inspect(    i, line, rest, script) {
     for (i = 1; i <= count; i++) {
         line = body[i]
         sub(/^[[:space:]]*#[^\n]*/, "", line)
-        if (line !~ /(^|[^[:alnum:]_-])cargo([[:space:]]|$)/ &&
-            line !~ /scripts\/(check-[[:alnum:]_-]+|test-[[:alnum:]_-]+)\.sh/)
-            continue
-        # Explicit setup exceptions: the changes detector and test-result
-        # aggregator are orchestration; binary-build is the release artifact
-        # producer, not a verification job. All stay unchanged in CI.
-        if (job == "changes" || job == "test-result" || job == "binary-build")
-            continue
-        printf "ERROR: ci.yml:%d (%s) bypasses verify.sh: %s\n", lines[i], job, line > "/dev/stderr"
-        failed = 1
+        if (line ~ /(^|[^[:alnum:]_-])cargo([[:space:]]|$)/ && !allowed_cargo(line))
+            violation(i, line)
+        rest = line
+        while (match(rest, /scripts\/[[:alnum:]_.\/-]+\.sh/)) {
+            script = substr(rest, RSTART, RLENGTH)
+            if (!allowed_script(script)) violation(i, line)
+            rest = substr(rest, RSTART + RLENGTH)
+        }
     }
     count = 0
 }
+BEGIN { job = "composite" }
 /^  [[:alnum:]_-]+:/ {
     inspect()
-    job = $1
-    sub(/:$/, "", job)
+    if (source ~ /^\.github\/workflows\//) {
+        job = $1
+        sub(/:$/, "", job)
+    }
     in_run = 0
 }
 {
@@ -54,11 +84,8 @@ function inspect(    i, line) {
 }
 END { inspect(); exit failed }
 ' "$workflow"
+done
 
-# Other explicitly unchanged setup steps (rustc toolchain output,
-# require-wasm-fixtures.sh, safe.directory and check-examples echo) do not
-# match check/test script or cargo invocations. There are currently no
-# deliberately non-CI check-*.sh or test-check-*.sh exceptions.
 fixture=$(mktemp -d)
 trap 'rm -rf "$fixture"' EXIT
 mkdir -p "$fixture/scripts" "$fixture/bin"
@@ -72,8 +99,12 @@ for script in "$repo_root"/scripts/*.sh; do
 printf '%s\n' "${BASH_SOURCE[0]##*/}" >> "$VERIFY_GUARD_TRACE"
 SH
 done
-printf '#!/bin/sh\nexit 0\n' > "$fixture/bin/cargo"
-chmod +x "$fixture/bin/cargo"
+for tool in cargo cargo-nextest cargo-hack; do
+    printf '#!/bin/sh\nexit 0\n' > "$fixture/bin/$tool"
+    chmod +x "$fixture/bin/$tool"
+done
+printf '#!/bin/sh\nprintf "wasm32-wasip2\\n"\n' > "$fixture/bin/rustup"
+chmod +x "$fixture/bin/rustup"
 touch "$fixture/trace"
 if ! PATH="$fixture/bin:$PATH" VERIFY_GUARD_TRACE="$fixture/trace" \
     bash "$fixture/scripts/verify.sh" > "$fixture/output" 2>&1; then
@@ -82,7 +113,7 @@ if ! PATH="$fixture/bin:$PATH" VERIFY_GUARD_TRACE="$fixture/trace" \
     exit 1
 fi
 missing=0
-for script in "$repo_root"/scripts/check-*.sh "$repo_root"/scripts/test-check-*.sh; do
+for script in "$repo_root"/scripts/check-*.sh "$repo_root"/scripts/test-*.sh; do
     [[ -e "$script" ]] || continue
     name=${script##*/}
     if ! grep -Fxq "$name" "$fixture/trace"; then
@@ -91,4 +122,4 @@ for script in "$repo_root"/scripts/check-*.sh "$repo_root"/scripts/test-check-*.
     fi
 done
 if [[ $missing -ne 0 ]]; then exit 1; fi
-echo 'OK: CI checks route through verify.sh and every check script is included.'
+echo 'OK: workflow/action checks route through verify.sh and every check/test script is included.'
