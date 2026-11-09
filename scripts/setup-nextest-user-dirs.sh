@@ -26,6 +26,7 @@ test_root=$(mktemp -d "$runs_root/run.XXXXXX")
 test_home="$test_root/home"
 mkdir -p \
   "$test_home/tmp" \
+  "$test_home/shared-compiled-wasm" \
   "$test_home/.carina/trust" \
   "$test_home/.carina/plugin-cache" \
   "$test_home/.carina/cache" \
@@ -38,4 +39,7 @@ mkdir -p \
   printf 'CARINA_TRUST_RECORD_DIR=%s\n' "$test_home/.carina/trust"
   printf 'CARINA_PLUGIN_CACHE_DIR=%s\n' "$test_home/.carina/plugin-cache"
   printf 'CARINA_TEST_HOME=%s\n' "$test_home"
+  # Share only content/config-keyed compiled artifacts across test processes.
+  # Lock records and each test's other mutable state remain in private dirs.
+  printf 'CARINA_TEST_WASM_CACHE_DIR=%s\n' "$test_home/shared-compiled-wasm"
 } >> "$NEXTEST_ENV"
