@@ -365,9 +365,9 @@ git diff --name-only | scripts/touched-crates.sh --stdin   # custom file list
 
 | Output           | Meaning                                                   |
 | ---------------- | --------------------------------------------------------- |
-| `-p <crate> ...` | Run touched crates and all transitive reverse dependents in the workspace. |
-| `--workspace`    | Cross-cutting change (core, manifests, WASM fixture crates, Cargo execution scripts/configuration, CI/local actions, or an unrecognized path), or the dependency closure covers every member. Sweep the whole workspace. |
-| (empty)          | No test-relevant files changed (only docs, static-check scripts, other CI files, infra, or `examples/*`). `verify.sh --local` skips only crate-scoped kinds; static kinds still run. |
+| `-p <crate> ...` | Run touched crates and their transitive reverse dependents. Otherwise ignored files gain an owner only through a path string literal containing `/` outside comments in tracked Rust sources, resolving to the tracked file or a tracked ancestor directory relative to the source directory, crate root, or repo root. |
+| `--workspace`    | Cross-cutting change (core changes or ownership, manifests, WASM fixture crates, Cargo execution scripts/configuration, CI/local actions, or an unrecognized path), or the dependency closure covers every member. Sweep the whole workspace. |
+| (empty)          | Only ignored paths without an owner changed (any-depth Markdown, site/notes/infra/examples, static-check scripts, non-CI GitHub files, Makefile/LICENSE, release configuration, packaging/assets/editors/docs). `verify.sh --local` skips only crate-scoped kinds; static kinds still run. |
 
 The helper is intentionally pessimistic. Changes to `carina-core`, manifests,
 WASM fixture crates, or Cargo execution configuration require the full

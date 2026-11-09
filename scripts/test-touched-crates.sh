@@ -162,8 +162,22 @@ class TouchedCratesTests(unittest.TestCase):
         # may own otherwise-ignorable inputs. No Rust check/build is invoked.
         self.assertEqual(self.trace.read_text().splitlines(), ["metadata"] * 7)
 
+    def test_markdown_is_ignorable_at_any_depth(self):
+        for filename in ("CLAUDE.md", ".claude/skills/x/SKILL.md", "docs/a.md",
+                         "unknown/nested/document.md", "unknown/.md"):
+            with self.subTest(filename=filename):
+                self.assertEqual(self.scope(filename), "")
+
+    def test_known_non_code_paths_from_main_ci_remain_ignorable(self):
+        for filename in ("Makefile", "LICENSE", "LICENSE-APACHE", "release.toml", "clippy.toml",
+                         "packaging/homebrew/carina.rb.template", "assets/header.png",
+                         "editors/vscode/src/extension.ts", "docs/registry/example.json"):
+            with self.subTest(filename=filename):
+                self.assertEqual(self.scope(filename), "")
+
     def test_file_references_include_reverse_dependencies(self):
         filename = "site/src/content/providers/writing/schemas.md"
+        self.track(filename, "consumed documentation\n")
         self.track("carina-plugin-sdk/src/lib.rs",
                    f'#[doc = include_str!("../../{filename}")]\n')
         self.assertEqual(self.scope(filename),
@@ -171,14 +185,17 @@ class TouchedCratesTests(unittest.TestCase):
 
     def test_directory_references_include_every_owner_and_reverse_dependencies(self):
         directory = "site/src/content/reference/registry"
+        self.track(directory + "/nested/static-registry.md", "registry documentation\n")
         self.track("carina-provider-example/tests/examples.rs",
-                   f'let directory = root.join("../{directory}");\n')
+                   f'let directory = root.join("../{directory}");\n'
+                   'let entries = std::fs::read_dir(directory).unwrap();\n')
         self.track("carina-tui/src/examples.rs",
                    f'let directory = root.join("../../{directory}/");\n')
         self.assertEqual(self.scope(directory + "/nested/static-registry.md"),
                          "-p carina-cli -p carina-plugin-host -p carina-provider-example -p carina-tui")
 
     def test_unreferenced_docs_do_not_inherit_longer_file_path_references(self):
+        self.track("site/src/content/providers/writing/schemas.md", "consumed documentation\n")
         self.track("carina-plugin-sdk/src/lib.rs",
                    'include_str!("../../site/src/content/providers/writing/schemas.md");\n'
                    'let use_site = site;\n'
@@ -189,11 +206,13 @@ class TouchedCratesTests(unittest.TestCase):
                 self.assertEqual(self.scope(filename), "")
 
     def test_top_level_directory_reference_with_trailing_slash_is_owned(self):
+        self.track("site/astro.config.mjs", "export default {};\n")
         self.track("carina-tui/src/lib.rs", 'let directory = root.join("../../site/");\n')
         self.assertEqual(self.scope("site/astro.config.mjs"), "-p carina-tui")
 
     def test_references_use_only_tracked_rust_sources_of_workspace_members(self):
         filename = "notes/example.txt"
+        self.track(filename, "tracked input\n")
         self.track("vendor/helper/src/lib.rs", f'include_str!("../../../{filename}");\n')
         self.track("carina-tui/example.txt", filename)
         untracked = self.root / "carina-tui/src/lib.rs"
@@ -208,10 +227,108 @@ class TouchedCratesTests(unittest.TestCase):
             "id": "nested", "name": "nested", "dependencies": [],
             "manifest_path": str(self.root / "nested/member/Cargo.toml"),
         })
+        self.track("notes/example.txt", "tracked input\n")
         self.track("nested/member/src/lib.rs", 'include_str!("../../../notes/example.txt");\n')
         self.assertEqual(self.scope("notes/example.txt"), "-p nested")
 
-    def test_git_grep_failure_falls_back_to_workspace(self):
+    def test_comments_do_not_own_paths_and_nested_block_comments_are_skipped(self):
+        self.track("site/comment.md", "unconsumed\n")
+        self.track("site/consumed.md", "consumed\n")
+        self.track("CLAUDE.md", "instructions\n")
+        self.track("carina-tui/src/lib.rs", '''
+// Per CLAUDE.md, see "site/comment.md".
+/* "site/comment.md"
+   /* nested comment */
+   include_str!("../../site/comment.md");
+*/
+include_str!("../../site/consumed.md");
+''')
+        self.assertEqual(self.scope("CLAUDE.md", "site/comment.md"), "")
+        self.assertEqual(self.scope("site/consumed.md"), "-p carina-tui")
+
+    def test_temporary_and_untracked_paths_do_not_own_inputs(self):
+        self.track("infra/tracked.crn", "tracked sibling\n")
+        for filename in ("infra/foo/local.crn", "site/untracked.md"):
+            path = self.root / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("untracked input\n")
+        self.track("carina-tui/src/lib.rs",
+                   'let project = "infra/foo";\nlet document = "site/untracked.md";\n')
+        self.assertEqual(self.scope("infra/foo", "infra/foo/local.crn", "site/untracked.md"), "")
+        self.git("add", "infra/foo/local.crn", "site/untracked.md")
+        self.assertEqual(self.scope("infra/foo/local.crn", "site/untracked.md"), "-p carina-tui")
+
+    def test_bare_names_and_substrings_do_not_own_tracked_inputs(self):
+        for filename in ("README.md", "CLAUDE.md", "site/example.md"):
+            self.track(filename, "tracked input\n")
+        self.track("carina-tui/src/lib.rs", '''
+let names = ["README.md", "CLAUDE.md", "site"];
+let messages = ["see site/example.md", "site/example.md is a document"];
+let raw = r##"embedded "site/example.md" /* not a comment */"##;
+''')
+        self.assertEqual(self.scope("README.md", "CLAUDE.md", "site/example.md"), "")
+
+    def test_paths_resolve_from_source_crate_and_repo_without_stripping_prefixes(self):
+        filename = "site/consumed.md"
+        self.track(filename, "consumed\n")
+        source = "carina-tui/src/nested/example.rs"
+        for literal, expected in (
+            ("../../site/consumed.md", ""),
+            ("../../../site/consumed.md", "-p carina-tui"),
+            ("../site/consumed.md", "-p carina-tui"),
+            ("site/consumed.md", "-p carina-tui"),
+        ):
+            with self.subTest(literal=literal):
+                self.track(source, f'include_str!("{literal}");\n')
+                self.assertEqual(self.scope(filename), expected)
+
+    def test_raw_strings_escapes_and_character_literals_do_not_confuse_scanning(self):
+        for filename in ("site/raw.md", "site/escaped.md", "site/after-char.md",
+                         "site/after-byte-char.md", "site/after-lifetime.md"):
+            self.track(filename, "consumed\n")
+        self.track("carina-tui/src/lib.rs", r'''
+let raw = r##"site/raw.md"##;
+let escaped = "site/esc\u{0061}ped.md";
+let quote = '"';
+let after_quote = "site/after-char.md";
+let byte_quote = b'\"';
+let after_byte_quote = "site/after-byte-char.md";
+let lifetime: &'static str = "site/after-lifetime.md";
+''')
+        for filename in ("site/raw.md", "site/escaped.md", "site/after-char.md",
+                         "site/after-byte-char.md", "site/after-lifetime.md"):
+            with self.subTest(filename=filename):
+                self.assertEqual(self.scope(filename), "-p carina-tui")
+
+    def test_core_owner_requires_workspace_even_without_dependency_edges(self):
+        self.packages.append({
+            "id": "carina-core", "name": "carina-core", "dependencies": [],
+            "manifest_path": str(self.root / "carina-core/Cargo.toml"),
+        })
+        filename = "editors/vscode/syntaxes/carina.tmLanguage.json"
+        self.track(filename, "{}\n")
+        self.track("carina-core/tests/grammar.rs", f'const GRAMMAR: &str = "../{filename}";\n')
+        self.assertEqual(self.scope(filename), "--workspace")
+
+    def test_many_changed_files_use_one_tracked_file_query(self):
+        directory = "site/src/content/reference/registry"
+        self.track("carina-tui/src/lib.rs", f'let directory = "{directory}";\n')
+        filenames = [f"{directory}/doc-{number}.md" for number in range(400)]
+        for filename in filenames:
+            path = self.root / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("consumed\n")
+        self.git("add", "site")
+        # Git used to run once per changed file. Record every invocation so a
+        # per-file grep or discovery pass cannot silently return.
+        binary = self.root / "bin/git"
+        self.env.update(REAL_GIT=shutil.which("git"), GIT_TRACE_FILE=str(self.root / "git-trace"))
+        binary.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$GIT_TRACE_FILE"\nexec "$REAL_GIT" "$@"\n')
+        binary.chmod(0o755)
+        self.assertEqual(self.scope(*filenames), "-p carina-tui")
+        self.assertEqual((self.root / "git-trace").read_text().splitlines(), ["ls-files -z"])
+
+    def test_tracked_file_discovery_failure_falls_back_to_workspace(self):
         binary = self.root / "bin/git"
         binary.write_text("#!/bin/sh\nexit 74\n")
         binary.chmod(0o755)

@@ -34,8 +34,10 @@
 #      AND outside the "ignore" set (site/notes/other CI/scripts/infra), emit
 #      `--workspace` to be safe.
 #   5. Otherwise-ignorable files outside crates are owned by crates whose
-#      tracked Rust sources reference the file or one of its directories.
-#      Include their reverse dependencies too; unreferenced docs stay empty.
+#      tracked Rust sources contain a path string literal resolving to the
+#      tracked file or an ancestor directory. Ignore comments and bare names;
+#      resolve relative to the source directory, crate root and repo root.
+#      Include reverse dependencies; a carina-core owner means --workspace.
 
 set -euo pipefail
 
@@ -145,6 +147,7 @@ if ! metadata=$(cargo metadata --format-version 1 --no-deps); then
 fi
 if ! selection=$(python3 -c '
 import json
+import os.path
 from pathlib import Path
 import re
 import subprocess
@@ -165,45 +168,95 @@ def owner_of(path):
 
 def is_ignorable(filename):
     path = Path(filename)
+    # Preserve main touched-crates ignores (including any-depth *.md), plus
+    # known non-code paths excluded by main ci.yml changes regex. Unknown
+    # paths still require the workspace; verification plumbing is handled above.
     return (
-        filename in {"CLAUDE.md", "README.md", ".gitignore", ".gitmodules"}
-        or path.parts[0] in {".github", "scripts", "site", "notes", "infra", "examples"}
-        or (len(path.parts) == 1 and path.suffix == ".md")
+        filename in {".gitignore", ".gitmodules", "Makefile", "release.toml", "clippy.toml"}
+        or (len(path.parts) == 1 and filename.startswith("LICENSE"))
+        or path.parts[0] in {".github", "scripts", "site", "notes", "infra", "examples",
+                             "packaging", "assets", "editors", "docs"}
+        or filename.endswith(".md")
     )
 
-sources = []
-for directory in packages:
-    relative = directory.relative_to(root).as_posix()
-    sources.append(":(glob)" + (relative + "/" if relative != "." else "") + "**/*.rs")
+# Recognize whole strings before looking for comments within their contents.
+# Raw strings have a variable delimiter; character literals must also consume
+# quotes so e.g. a double-quote character cannot start a string token.
+rust_tokens = re.compile(
+    r"//[^\n]*|/\*|(?:br|cr|r)(?P<hashes>#{0,255})\x22"
+    r"|\x22(?P<quoted>(?:[^\x22\\]|\\.)*)\x22"
+    r"|\x27(?:\\(?:u\{[0-9a-fA-F_]+\}|x[0-9a-fA-F]{2}|.)|[^\\\x27\r\n])\x27",
+    re.DOTALL,
+)
+block_comments = re.compile(r"/\*|\*/")
+rust_escapes = re.compile(r"\\(?:\r?\n[ \t\r\n]*|x[0-9a-fA-F]{2}|u\{[0-9a-fA-F_]+\}|.)", re.DOTALL)
 
-def reference_owners(filename):
-    parents = [str(parent) for parent in Path(filename).parents if parent != Path(".")]
-    patterns = [filename, *parents]
-    command = ["git", "grep", "-l", "-z", "-F"]
-    for pattern in patterns:
-        command.extend(["-e", pattern])
-    matches = subprocess.run(command + ["--", *sources], cwd=root,
-                             stdout=subprocess.PIPE, check=False, timeout=30)
-    if matches.returncode not in (0, 1):
-        raise RuntimeError("git grep failed")
-    # Match directory paths at their end, not prefixes of longer file paths.
-    # A bare top-level name needs / to distinguish site/ from Rust identifiers
-    # and unrelated strings such as .field("site", ...).
-    directory_references = [re.compile(r"(?<![\w.-])" + re.escape(parent)
-                                      + (r"/?" if "/" in parent else "/")
-                                      + r"(?=[\s\x22\x27`)]|$)")
-                            for parent in parents]
-    owners = set()
-    for source in matches.stdout.decode().split("\0"):
-        if not source:
+def unescape(match):
+    value = match[0][1:]
+    if value.startswith(("\n", "\r")):
+        return ""
+    if value.startswith("x"):
+        return chr(int(value[1:], 16))
+    if value.startswith("u{"):
+        return chr(int(value[2:-1].replace("_", ""), 16))
+    return {"n": "\n", "r": "\r", "t": "\t", "0": "\0", "\\": "\\",
+            "\x22": "\x22", "\x27": "\x27"}[value]
+
+def string_literals(text):
+    position = 0
+    while match := rust_tokens.search(text, position):
+        position = match.end()
+        token = match[0]
+        if token.startswith("//") or token.startswith("\x27"):
             continue
-        path = root / source
-        text = path.read_text()
-        if filename in text or any(pattern.search(text) for pattern in directory_references):
-            owner = owner_of(path.resolve())
-            if owner is not None:
-                owners.add(owner)
+        if token == "/*":
+            depth = 1
+            while depth:
+                comment = block_comments.search(text, position)
+                if comment is None:
+                    return
+                depth += 1 if comment[0] == "/*" else -1
+                position = comment.end()
+        elif match["hashes"] is not None:
+            delimiter = "\x22" + match["hashes"]
+            end = text.find(delimiter, position)
+            if end == -1:
+                return
+            yield text[position:end]
+            position = end + len(delimiter)
+        else:
+            yield rust_escapes.sub(unescape, match["quoted"])
+
+def reference_owners():
+    # One index query and one scan, independent of the number of changed files.
+    tracked = subprocess.run(["git", "ls-files", "-z"], cwd=root,
+                             stdout=subprocess.PIPE, check=True, timeout=30)
+    files = {name for name in os.fsdecode(tracked.stdout).split("\0") if name}
+    paths = {str(root / name) for name in files}
+    for name in files:
+        paths.update(str(root / parent) for parent in Path(name).parents if parent != Path("."))
+
+    owners = {}
+    for name in sorted(name for name in files if name.endswith(".rs")):
+        source = root / name
+        owner = owner_of(source)
+        if owner is None:
+            continue
+        try:
+            text = source.read_text()
+        except FileNotFoundError:
+            # A tracked source may have been deleted in the working tree.
+            continue
+        for literal in set(string_literals(text)):
+            if "/" not in literal:
+                continue
+            for base in (source.parent, owner, root):
+                resolved = os.path.normpath(os.path.join(base, literal))
+                if resolved in paths:
+                    owners.setdefault(resolved, set()).add(owner)
     return owners
+
+references = reference_owners()
 
 touched = set()
 for filename in sys.argv[1:]:
@@ -212,7 +265,8 @@ for filename in sys.argv[1:]:
     if owner is not None:
         touched.add(owner)
     elif is_ignorable(filename):
-        touched.update(reference_owners(filename))
+        for referenced in (path, *path.parents):
+            touched.update(references.get(str(referenced), ()))
     else:
         print("--workspace")
         sys.exit(0)
@@ -230,7 +284,7 @@ while pending:
     for dependent in dependents[pending.pop()] - touched:
         touched.add(dependent)
         pending.append(dependent)
-if len(touched) == len(packages):
+if len(touched) == len(packages) or any(packages[path]["name"] == "carina-core" for path in touched):
     print("--workspace")
 else:
     print(" ".join("-p " + name for name in sorted(packages[path]["name"] for path in touched)))

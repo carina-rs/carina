@@ -163,6 +163,9 @@ class WorkflowConditionTests(unittest.TestCase):
             }))
             write("carina-cli/src/lib.rs", 'include_str!("../../README.md");\n')
             write("carina-core/src/lib.rs",
+                  '// Per CLAUDE.md "directory-scoped, never single-file".\n'
+                  'let temporary = "infra/foo";\n'
+                  'let bare_name = "README.md";\n'
                   'include_str!("../../site/src/content/reference/dsl/types-and-values.md");\n')
             write("carina-plugin-sdk/src/lib.rs",
                   'include_str!("../../site/src/content/providers/writing/schemas.md");\n')
@@ -175,6 +178,11 @@ class WorkflowConditionTests(unittest.TestCase):
                 "site/astro.config.mjs": False,
                 "site/src/content/providers/writing/unreferenced.md": False,
                 "README.md": True,
+                "CLAUDE.md": False,
+                ".claude/skills/x/SKILL.md": False,
+                "docs/a.md": False,
+                "Makefile": False,
+                "LICENSE": False,
                 "unreferenced.md": False,
                 "notes/unexpected.rs": True,  # Preserve the existing path regex.
             }
