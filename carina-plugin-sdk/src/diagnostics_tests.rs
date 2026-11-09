@@ -1,15 +1,54 @@
 use crate::{EventLevel, ProviderDiagnostics, ProviderEvent};
 use carina_core::provider::{ProviderError, ProviderPlan};
 use carina_core::provider_text::present_event;
-use std::sync::{Arc, Mutex};
+use carina_core::test_utils::provider_text::captured_session;
+
+#[test]
+fn ordinary_query_values_do_not_mask_later_diagnostics() {
+    let (session, events) =
+        captured_session(ProviderPlan::state_only().session_builder("native", None, None));
+    let diagnostics = ProviderDiagnostics::from_session(&session);
+    diagnostics.prepare_request(
+        http::Request::builder()
+            .uri("https://example.com/?list-type=2")
+            .body(Vec::new())
+            .unwrap(),
+    );
+    let error = ProviderError::internal("after 2 retries");
+    diagnostics.emit(ProviderEvent::failure(
+        EventLevel::Warn,
+        "retry".into(),
+        &error,
+    ));
+    assert!(
+        present_event(&events.lock().unwrap()[0])
+            .to_string()
+            .contains("after 2 retries")
+    );
+}
+
+#[test]
+fn repeated_credential_adoption_is_idempotent() {
+    let session = ProviderPlan::state_only().session("native", None, None);
+    let diagnostics = ProviderDiagnostics::from_session(&session);
+    for _ in 0..2000 {
+        diagnostics
+            .register_github_token(crate::protected_material::GithubTokenMaterial::new(
+                "same-generation".into(),
+            ))
+            .unwrap();
+    }
+    assert!(
+        !session
+            .guest_inventory()
+            .would_exceed_secret_limit(&session.guest_inputs(), 1)
+    );
+}
 
 #[test]
 fn native_sdk_handle_emits_borrowed_errors_before_success() {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    let session = ProviderPlan::state_only()
-        .session("native", None, None)
-        .with_diagnostic_sink(move |event| sink.lock().unwrap().push(event));
+    let (session, events) =
+        captured_session(ProviderPlan::state_only().session_builder("native", None, None));
     let diagnostics = ProviderDiagnostics::from_session(&session);
     let error = ProviderError::api_error_caused_by(
         "handled operation",
@@ -35,11 +74,8 @@ fn native_sdk_handle_emits_borrowed_errors_before_success() {
 
 #[test]
 fn registration_acknowledgement_precedes_operational_adoption() {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    let session = ProviderPlan::state_only()
-        .session("native", None, None)
-        .with_diagnostic_sink(move |event| sink.lock().unwrap().push(event));
+    let (session, events) =
+        captured_session(ProviderPlan::state_only().session_builder("native", None, None));
     let diagnostics = ProviderDiagnostics::from_session(&session);
     let token = diagnostics
         .register_github_token(crate::protected_material::GithubTokenMaterial::new(
@@ -73,72 +109,9 @@ fn failed_registration_returns_no_operational_wrapper() {
 }
 
 #[test]
-fn signing_registration_covers_signature_and_decoded_query_values() {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    let session = ProviderPlan::state_only()
-        .session("native", None, None)
-        .with_diagnostic_sink(move |event| sink.lock().unwrap().push(event));
-    let diagnostics = ProviderDiagnostics::from_session(&session);
-    let request = http::Request::builder()
-        .uri("https://example.com/?token=guest%2Fquery%2Bsecret")
-        .header(
-            "authorization",
-            "AWS4-HMAC-SHA256 Credential=guest-access-key/date, Signature=guest-signature",
-        )
-        .body(Vec::new())
-        .unwrap();
-    let _registered = diagnostics.prepare_request(request).unwrap();
-    let error =
-        ProviderError::internal("ordinary guest/query+secret guest-signature guest-access-key");
-    diagnostics.emit(ProviderEvent::failure(
-        EventLevel::Warn,
-        "signed".into(),
-        &error,
-    ));
-    let events = events.lock().unwrap();
-    let text = present_event(&events[0]).to_string();
-    for secret in ["guest/query+secret", "guest-signature", "guest-access-key"] {
-        assert!(!text.contains(secret), "leaked {secret}: {text}");
-    }
-    assert!(text.contains("ordinary"));
-}
-
-#[tokio::test]
-async fn signing_registration_failure_stops_the_connector_before_wasi_handoff() {
-    use crate::protected_material::{AwsSessionMaterial, GithubTokenMaterial};
-    use crate::wasi_http::{SendPhase, WasiHttpClient, send_phase_of};
-    use aws_smithy_runtime_api::client::http::{HttpClient, HttpConnector, HttpConnectorSettings};
-    use aws_smithy_runtime_api::client::runtime_components::RuntimeComponentsBuilder;
-    let session = ProviderPlan::state_only().session("native", None, None);
-    let diagnostics = ProviderDiagnostics::from_session(&session);
-    let registered = diagnostics
-        .register_aws_session(AwsSessionMaterial::new("key".into(), "secret".into(), None))
-        .unwrap();
-    diagnostics
-        .register_github_token(GithubTokenMaterial::new("x".repeat(250_000)))
-        .unwrap();
-    let components = RuntimeComponentsBuilder::for_tests().build().unwrap();
-    let connector = WasiHttpClient::new(registered)
-        .http_connector(&HttpConnectorSettings::builder().build(), &components);
-    let mut request =
-        aws_smithy_runtime_api::client::orchestrator::HttpRequest::get("https://example.com/")
-            .unwrap();
-    request
-        .headers_mut()
-        .try_insert("authorization", "y".repeat(20_000))
-        .unwrap();
-    let error = connector.call(request).await.unwrap_err();
-    assert_eq!(send_phase_of(&error), Some(SendPhase::NotSent));
-}
-
-#[test]
 fn native_registration_and_emission_stop_when_the_host_context_closes() {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    let session = ProviderPlan::state_only()
-        .session("native", None, None)
-        .with_diagnostic_sink(move |event| sink.lock().unwrap().push(event));
+    let (session, events) =
+        captured_session(ProviderPlan::state_only().session_builder("native", None, None));
     let diagnostics = ProviderDiagnostics::from_session(&session);
     drop(session);
     assert!(matches!(
@@ -168,4 +141,47 @@ fn invalid_authorization_is_a_preparation_error_without_a_credential_echo() {
     let error = token.authorize(http::Request::new(Vec::new())).unwrap_err();
     assert!(error.to_string().contains("header"));
     assert!(!error.to_string().contains("header-secret-canary"));
+}
+
+#[cfg(feature = "aws")]
+#[tokio::test]
+async fn apply_replaces_credentials_and_preserves_remaining_settings() {
+    use crate::protected_material::AwsSessionMaterial;
+    use crate::wasi_http::AwsSdkParts;
+    use aws_credential_types::{
+        Credentials,
+        provider::{ProvideCredentials, SharedCredentialsProvider},
+    };
+    use aws_types::{SdkConfig, region::Region};
+
+    let session = ProviderPlan::state_only().session("aws", None, None);
+    let source = super::aws_session_tests::StaticSource(AwsSessionMaterial::new(
+        "registered-access".into(),
+        "registered-secret".into(),
+        Some("registered-token".into()),
+        None,
+    ));
+    let builder = SdkConfig::builder()
+        .region(Region::new("us-west-2"))
+        .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
+            "unregistered-access",
+            "unregistered-secret",
+            None,
+            None,
+            "previous-builder-provider",
+        )));
+    let config = AwsSdkParts::new(source, ProviderDiagnostics::from_session(&session))
+        .apply(builder.build().into_builder())
+        .build();
+    let credentials = config
+        .credentials_provider()
+        .unwrap()
+        .provide_credentials()
+        .await
+        .unwrap();
+    assert_eq!(credentials.access_key_id(), "registered-access");
+    assert_eq!(credentials.secret_access_key(), "registered-secret");
+    assert_eq!(credentials.session_token(), Some("registered-token"));
+    assert_eq!(config.region().unwrap().as_ref(), "us-west-2");
+    assert!(config.http_client().is_some());
 }

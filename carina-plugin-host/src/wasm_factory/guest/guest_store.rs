@@ -118,30 +118,6 @@ pub(in crate::wasm_factory) struct HostRuntimeState {
     limits: StoreLimits,
     guest: GuestStoreState,
     stderr: super::guest_stderr::HostOutput,
-    provider_name: String,
-    diagnostic_imports: usize,
-    protected_bytes: usize,
-    protected_values: usize,
-}
-
-impl HostRuntimeState {
-    pub(super) fn accept_diagnostic_import(&mut self) -> bool {
-        if self.diagnostic_imports >= 256 {
-            return false;
-        }
-        self.diagnostic_imports += 1;
-        true
-    }
-    pub(super) fn accept_protected_material(&mut self, bytes: usize, values: usize) -> bool {
-        if bytes > (256usize * 1024).saturating_sub(self.protected_bytes)
-            || values > 1024usize.saturating_sub(self.protected_values)
-        {
-            return false;
-        }
-        self.protected_bytes += bytes;
-        self.protected_values += values;
-        true
-    }
 }
 
 impl WasiView for HostRuntimeState {
@@ -181,6 +157,7 @@ pub(in crate::wasm_factory) struct GuestStore {
     store: GuestInputStore<HostRuntimeState>,
     next_secrets: Option<ProviderValidationInputs>,
     config_secrets: Option<ProviderValidationInputs>,
+    diagnostic_inputs: ProviderValidationInputs,
 }
 
 impl GuestStore {
@@ -215,9 +192,10 @@ impl GuestStore {
     ) -> Self {
         let stderr = super::guest_stderr::HostOutput::new(super::host_stderr());
         let provider_name = label.name.clone();
-        let inputs = ProviderPlan::state_only()
+        let diagnostic_inputs = ProviderPlan::state_only()
             .session(&provider_name, None, None)
-            .guest_inventory();
+            .guest_inputs();
+        let inputs = diagnostic_inputs.guest_inventory();
         let capabilities = network.runtime_capabilities().cloned();
         let mut http_hooks = AllowListHttpHooks::with_test_route(label, network, http_test_route);
         http_hooks.stderr = stderr.clone();
@@ -229,10 +207,6 @@ impl GuestStore {
             limits,
             guest: GuestStoreState::new(budget),
             stderr: stderr.clone(),
-            provider_name,
-            diagnostic_imports: 0,
-            protected_bytes: 0,
-            protected_values: 0,
         };
         let mut store = GuestStoreData::new_store(engine, host_state, inputs);
         let wasi_ctx =
@@ -286,23 +260,34 @@ impl GuestStore {
             store,
             next_secrets: None,
             config_secrets: None,
+            diagnostic_inputs,
         }
     }
 
     pub(in crate::wasm_factory) fn set_input_inventory(&mut self, inputs: GuestInputInventory) {
-        self.store.data_mut().set_input_inventory(inputs);
+        self.diagnostic_inputs = inputs
+            .validation_inputs()
+            .inherit_diagnostic_host(&self.diagnostic_inputs);
+        self.store
+            .data_mut()
+            .set_input_inventory(self.diagnostic_inputs.guest_inventory());
+    }
+
+    pub(in crate::wasm_factory) fn diagnostic_inputs(&self) -> ProviderValidationInputs {
+        self.diagnostic_inputs.clone()
     }
 
     pub(in crate::wasm_factory) fn set_configuration_secrets(
         &mut self,
         secrets: ProviderValidationInputs,
     ) {
+        self.diagnostic_inputs = secrets.clone();
         self.config_secrets = Some(secrets.clone());
         self.set_secrets(secrets);
     }
 
     pub(in crate::wasm_factory) fn set_secrets(&mut self, secrets: ProviderValidationInputs) {
-        self.next_secrets = Some(secrets);
+        self.next_secrets = Some(secrets.inherit_diagnostic_host(&self.diagnostic_inputs));
     }
 
     /// Runtime cache identity is the supplied session, while the instance
@@ -335,22 +320,20 @@ impl GuestStore {
             .next_secrets
             .take()
             .or_else(|| self.config_secrets.clone());
-        let source = secrets.clone().unwrap_or_else(|| {
-            ProviderPlan::state_only()
-                .session(&self.store.data().provider_name, None, None)
-                .guest_inputs()
-        });
-        self.store
-            .data_mut()
-            .set_input_inventory(source.guest_inventory());
+        let source = secrets
+            .clone()
+            .unwrap_or_else(|| self.diagnostic_inputs.clone())
+            .inherit_diagnostic_host(&self.diagnostic_inputs);
+        self.diagnostic_inputs = source.clone();
+        let (inputs, _diagnostic_call) = source.guest_inventory().for_diagnostic_call();
+        self.store.data_mut().set_input_inventory(inputs);
         let inputs = self.store.data().input_inventory();
         let _input_call = inputs.observe(&source);
-        let _stderr_call = (secrets.is_some() || !inputs.is_empty()).then(|| {
-            self.store
-                .data()
-                .stderr
-                .begin_inventory_call(&source, inputs)
-        });
+        let _stderr_call = self
+            .store
+            .data()
+            .stderr
+            .begin_inventory_call(&source, inputs);
         self.call_with_start(tokio::time::Instant::now(), f).await
     }
 

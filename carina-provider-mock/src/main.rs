@@ -176,9 +176,6 @@ impl MockProcessProvider {
         mode: &str,
     ) -> Result<Option<ReadOutcome>, ProviderError> {
         use carina_core::provider_text::{ProviderDiagnostic, ProviderText};
-        use carina_plugin_sdk::protected_material::{
-            AwsSessionMaterial, GithubTokenMaterial, SigningMaterial,
-        };
         use carina_plugin_sdk::{EventLevel, ProviderDiagnostics, ProviderEvent};
         if !mode.starts_with("__mock_diag_") {
             return Ok(None);
@@ -224,39 +221,6 @@ impl MockProcessProvider {
                     &diagnostic,
                 ));
                 std::arch::wasm32::unreachable();
-            }
-            "__mock_diag_registered__" => {
-                diagnostics
-                    .register_aws_session(AwsSessionMaterial::new(
-                        "guest-access-canary".into(),
-                        "guest-key-canary".into(),
-                        Some("guest-token-canary".into()),
-                    ))
-                    .map_err(|error| {
-                        ProviderError::from_diagnostic(ProviderErrorKind::Internal, error)
-                    })?;
-                diagnostics
-                    .register_github_token(GithubTokenMaterial::new("guest-github-canary".into()))
-                    .map_err(|error| {
-                        ProviderError::from_diagnostic(ProviderErrorKind::Internal, error)
-                    })?;
-                diagnostics
-                    .register_signing_material(SigningMaterial::new(
-                        "guest-auth-canary".into(),
-                        Some("guest-signature-canary".into()),
-                        vec!["guest-query-canary".into()],
-                    ))
-                    .map_err(|error| {
-                        ProviderError::from_diagnostic(ProviderErrorKind::Internal, error)
-                    })?;
-                let diagnostic = ProviderDiagnostic::message(ProviderText::new(
-                    "ordinary registered context guest-access-canary guest-key-canary guest-token-canary guest-github-canary guest-auth-canary guest-signature-canary guest-query-canary",
-                ));
-                diagnostics.emit(ProviderEvent::diagnostic(
-                    EventLevel::Warn,
-                    "registered".into(),
-                    &diagnostic,
-                ));
             }
             "__mock_diag_budget__" | "__mock_diag_hook_failure__" => {
                 let diagnostic = ProviderDiagnostic::message("bounded ordinary warning".into());

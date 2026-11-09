@@ -1,6 +1,7 @@
 use super::*;
 use carina_core::provider::{ProviderBoundary, ReadOutcome};
 use carina_core::provider_text::{BoundProviderEvent, EventLevel, present_event};
+use carina_core::test_utils::provider_text::captured_session;
 
 async fn probe(
     mode: &str,
@@ -8,37 +9,65 @@ async fn probe(
     carina_core::provider::HostResult<ReadOutcome>,
     Vec<BoundProviderEvent>,
 ) {
-    let wasm = wasm_path().expect("mock WASM fixture is required");
-    let (factory, _cache) = load_factory(&wasm).await;
+    probe_calls(&[mode]).await
+}
+
+async fn probe_calls(
+    modes: &[&str],
+) -> (
+    carina_core::provider::HostResult<ReadOutcome>,
+    Vec<BoundProviderEvent>,
+) {
+    let credential_probe = modes.iter().any(|mode| {
+        matches!(
+            *mode,
+            "__mock_diag_registered__"
+                | "__mock_diag_register_only__"
+                | "__mock_diag_emit_registered_only__"
+        )
+    });
+    let (factory, _cache, provider, resource_type) = if credential_probe {
+        let wasm = http_wasm_path().expect("HTTP mock WASM fixture is required");
+        let (factory, cache) = load_http_factory(&wasm).await;
+        (factory, cache, "mock_http", "test.send_phase")
+    } else {
+        let wasm = wasm_path().expect("mock WASM fixture is required");
+        let (factory, cache) = load_factory(&wasm).await;
+        (factory, cache, "mock", "test")
+    };
     let config = ready_config(&factory, &indexmap::IndexMap::new());
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    let resource: Resource = Resource::with_provider("mock", "test", "diagnostic-address", None)
-        .with_attribute(
-            "password",
-            Value::Deferred(DeferredValue::Secret(
-                Box::new(Value::Concrete(ConcreteValue::String(
-                    "input-secret-canary".into(),
-                )))
-                .into(),
-            )),
-        );
+    let resource: Resource =
+        Resource::with_provider(provider, resource_type, "diagnostic-address", None)
+            .with_attribute(
+                "password",
+                Value::Deferred(DeferredValue::Secret(
+                    Box::new(Value::Concrete(ConcreteValue::String(
+                        "input-secret-canary".into(),
+                    )))
+                    .into(),
+                )),
+            );
     let plan = provider_text_fixtures::plan_for_desired(std::slice::from_ref(&resource));
-    let session = plan
-        .session("mock", None, Some(&config))
-        .with_diagnostic_sink(move |event| sink.lock().unwrap().push(event));
+    let (session, events) = captured_session(plan.session_builder(provider, None, Some(&config)));
     let initialized = ProviderBoundary::initialize(&factory, &session)
         .await
         .unwrap();
     events.lock().unwrap().clear();
-    let result = initialized
-        .provider()
-        .read(
-            &resource.id,
-            &AppliedIdentifier::new(mode).unwrap(),
-            ReadRequest,
-        )
-        .await;
+    let mut result = None;
+    for mode in modes {
+        let next = initialized
+            .provider()
+            .read(
+                &resource.id,
+                &AppliedIdentifier::new(*mode).unwrap(),
+                ReadRequest,
+            )
+            .await;
+        if let Some(previous) = result.replace(next) {
+            assert!(previous.is_ok(), "earlier fixture call must succeed");
+        }
+    }
+    let result = result.expect("at least one fixture call");
     drop(initialized);
     let events = std::mem::take(&mut *events.lock().unwrap());
     (result, events)
@@ -120,7 +149,7 @@ async fn emit_commits_before_a_subsequent_wasm_trap() {
     );
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn guest_derived_credentials_and_signatures_are_redacted_in_later_events() {
+async fn guest_derived_credentials_are_redacted_in_the_registering_call() {
     let (result, events) = probe("__mock_diag_registered__").await;
     assert!(result.is_ok());
     assert_eq!(events.len(), 1);
@@ -132,19 +161,42 @@ async fn guest_derived_credentials_and_signatures_are_redacted_in_later_events()
         "guest-key-canary",
         "guest-token-canary",
         "guest-github-canary",
-        "guest-auth-canary",
-        "guest-signature-canary",
-        "guest-query-canary",
     ] {
         assert!(!text.contains(secret), "leaked {secret}: {text}");
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guest_derived_credentials_are_redacted_in_the_next_export() {
+    let (result, events) = probe_calls(&[
+        "__mock_diag_register_only__",
+        "__mock_diag_emit_registered_only__",
+    ])
+    .await;
+    assert!(result.is_ok());
+    assert_eq!(
+        events.len(),
+        1,
+        "registration and emission must occur in separate calls"
+    );
+    let text = present_event(&events[0]).to_string();
+    assert!(text.contains("ordinary registered context"), "{text}");
+    assert_eq!(text.matches("(secret)").count(), 4, "{text}");
+    for secret in [
+        "guest-access-canary",
+        "guest-key-canary",
+        "guest-token-canary",
+        "guest-github-canary",
+    ] {
+        assert!(!text.contains(secret), "leaked {secret}: {text}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn wasm_event_flood_is_bounded_and_does_not_turn_success_into_a_trap() {
     let (result, events) = probe("__mock_diag_budget__").await;
     assert!(result.is_ok());
     assert!(!events.is_empty());
-    assert!(events.len() <= 256);
+    assert!(events.len() <= 257); // One host suppression notice beyond normal events.
 }
 
 #[test]
@@ -184,10 +236,11 @@ async fn exhausted_event_budget_never_falls_back_to_raw_panic_output() {
     let (result, events) = probe("__mock_diag_hook_failure__").await;
     assert!(result.is_err());
     assert!(!events.is_empty());
-    assert!(events.len() <= 256);
-    assert!(
-        events
-            .iter()
-            .all(|event| event.severity() == EventLevel::Warn)
-    );
+    assert!(events.len() <= 258); // Panic and host suppression notice bypass normal events.
+    assert!(events.iter().any(|event| {
+        event.severity() == EventLevel::Error
+            && present_event(event)
+                .to_string()
+                .contains("budget-panic-raw-fallback-canary")
+    }));
 }

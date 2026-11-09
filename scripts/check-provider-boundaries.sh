@@ -120,6 +120,50 @@ check_rust_files "carina-lsp/src" \
     "main.rs"
 echo "  Done."
 
+# ── Check 6: provider builds cannot acquire host diagnostic authority ───────
+echo "=== Check 6: provider diagnostic host features ==="
+if ! python3 - <<'CHECK_PROVIDER_FEATURES'
+from pathlib import Path
+import sys
+import tomllib
+
+violations = []
+workspace = tomllib.loads(Path('Cargo.toml').read_text()).get('workspace', {}).get('dependencies', {})
+for manifest in sorted(Path('.').glob('*/Cargo.toml')):
+    data = tomllib.loads(manifest.read_text())
+    name = data['package']['name']
+    if not (name == 'carina-plugin-sdk' or name.startswith('carina-provider-') and name not in {'carina-provider-protocol', 'carina-provider-resolver'}):
+        continue
+    tables = [data, *data.get('target', {}).values()]
+    core_aliases = {'carina-core'}
+    for table in tables:
+        for section in ('dependencies', 'build-dependencies'):
+            for alias, dependency in table.get(section, {}).items():
+                dependency = dependency if isinstance(dependency, dict) else {}
+                inherited = workspace.get(alias, {}) if dependency.get('workspace') else {}
+                inherited = inherited if isinstance(inherited, dict) else {}
+                package = dependency.get('package', inherited.get('package', alias))
+                if package == 'carina-plugin-host':
+                    violations.append(f'{manifest}: providers cannot depend on carina-plugin-host')
+                if package == 'carina-core':
+                    core_aliases.add(alias)
+                    forbidden = {'provider-host', 'guest-runtime'} & (set(dependency.get('features', [])) | set(inherited.get('features', [])))
+                    if forbidden:
+                        violations.append(f'{manifest}: provider enables host features {sorted(forbidden)}')
+    for feature, members in data.get('features', {}).items():
+        for member in members:
+            dependency, separator, enabled = member.partition('/')
+            if separator and dependency.rstrip('?') in core_aliases and enabled in {'provider-host', 'guest-runtime'}:
+                violations.append(f'{manifest}: feature {feature} enables host authority {member}')
+for violation in violations:
+    print('VIOLATION (provider diagnostic authority): ' + violation)
+sys.exit(bool(violations))
+CHECK_PROVIDER_FEATURES
+then
+    violations=$((violations + 1))
+fi
+echo "  Done."
+
 # ── Result ────────────────────────────────────────────────────────────────────
 echo ""
 if [ "$violations" -gt 0 ]; then

@@ -15,10 +15,10 @@ use std::time::SystemTime;
 
 use hmac::{Hmac, Mac};
 use indexmap::IndexMap;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 
 use sha2::{Digest, Sha256};
 
@@ -1637,7 +1637,8 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
             .call_egress
             .as_ref()
             .map(CallEgressRecorder::begin_request);
-        let trace_state = trace_http_enabled().then(|| {
+        // The host-only opt-in is cached once and shared with event admission.
+        let trace_state = carina_core::provider_text::provider_http_trace_enabled().then(|| {
             (
                 request.method().to_string(),
                 request.uri().to_string(),
@@ -1733,20 +1734,6 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
 
         Ok(wasmtime_wasi_http::p2::types::HostFutureIncomingResponse::pending(handle))
     }
-}
-
-/// Companion to carina-plugin-sdk's `CARINA_WASI_HTTP_TRACE` switch.
-///
-/// When set to "1", the host-side request handler emits its wall-clock
-/// breakdown to stderr with URI userinfo, fragment and query values removed.
-/// Off by default; the gate is a single atomic load per request when disabled.
-fn trace_http_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("CARINA_WASI_HTTP_TRACE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
 }
 
 fn http_resolution_warning(host: &str, error: Option<&dyn fmt::Display>) -> DiagnosticText {
@@ -2123,14 +2110,7 @@ async fn create_instance(
 /// These are provider-agnostic utilities, NOT credentials. Credentials
 /// live in per-provider-kind partitions below so that one provider's
 /// secret never reaches another provider's guest.
-const SHARED_ENV_ALLOWLIST: &[&str] = &[
-    "HOME",
-    "RUST_LOG",
-    // When set to "1", the WASM-side wasi:http bridge in carina-plugin-sdk
-    // emits a per-phase wall-clock breakdown of each request to stderr.
-    // Off by default; intended for diagnosing transport-level latency.
-    "CARINA_WASI_HTTP_TRACE",
-];
+const SHARED_ENV_ALLOWLIST: &[&str] = &["HOME", "RUST_LOG"];
 
 /// Region and endpoint variables exposed only to the AWS providers (`aws`,
 /// `awscc`). Credential discovery runs in the host and no credential-source
@@ -3175,9 +3155,7 @@ struct RebuildableState {
 impl RebuildableState {
     fn new(live: LiveInstance) -> Self {
         Self {
-            inputs: carina_core::provider::ProviderPlan::state_only()
-                .session("", None, None)
-                .guest_inventory(),
+            inputs: live.store.diagnostic_inputs().guest_inventory(),
             instance: ValidationInstanceState::Live(Box::new(live)),
             input_health: IndexMap::new(),
         }
@@ -3351,6 +3329,7 @@ struct RebuildContext {
     world: InstantiationWorld,
     budget: GuestCallBudget,
     http_test_route: Option<HttpTestRoute>,
+    diagnostic_inputs: carina_core::provider::ProviderValidationInputs,
 }
 
 impl RebuildContext {
@@ -3360,7 +3339,11 @@ impl RebuildContext {
         label: Arc<ProviderLabel>,
         budget: GuestCallBudget,
     ) -> Self {
+        let diagnostic_inputs = carina_core::provider::ProviderPlan::state_only()
+            .session(&label.name, None, None)
+            .guest_inputs();
         Self {
+            diagnostic_inputs,
             engine,
             component,
             label,
@@ -3380,7 +3363,7 @@ impl RebuildContext {
             self.world,
             self.budget,
             self.http_test_route.clone(),
-            None,
+            Some(self.diagnostic_inputs.for_new_guest()),
         )
         .await
     }

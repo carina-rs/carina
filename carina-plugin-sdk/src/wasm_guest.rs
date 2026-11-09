@@ -850,7 +850,6 @@ macro_rules! export_provider {
             fn get_provider() -> &'static ::std::sync::Mutex<$provider_type> {
                 static PROVIDER: ::std::sync::OnceLock<::std::sync::Mutex<$provider_type>> =
                     ::std::sync::OnceLock::new();
-                $crate::wasm_guest::enter_export();
                 PROVIDER.get_or_init(|| ::std::sync::Mutex::new(<$provider_type>::default()))
             }
 

@@ -14,14 +14,9 @@ pub(in crate::wasm_factory) fn add_diagnostic_imports(
 
 impl wit::Host for HostState {
     fn emit(&mut self, event: wit::Event) {
-        if !self.accept_diagnostic_import() {
-            return;
-        }
-        if let Some(event) = decode_event(event) {
-            self.input_inventory()
-                .diagnostics()
-                .receive_wire(event, wasm_convert::decode_provider_error);
-        }
+        self.input_inventory()
+            .diagnostics()
+            .receive_wire(decode_event(event), wasm_convert::decode_provider_error);
     }
 }
 impl protected::Host for HostState {
@@ -40,46 +35,7 @@ impl protected::Host for HostState {
                 session_token,
             }),
             protected::Material::GithubToken(token) => wire::ProtectedMaterial::GithubToken(token),
-            protected::Material::SignedMaterial(protected::SignedMaterial {
-                authorization,
-                signature,
-                query_secret_values,
-            }) => wire::ProtectedMaterial::SignedMaterial(wire::SignedMaterial {
-                authorization,
-                signature,
-                query_secret_values,
-            }),
         };
-        let values: Vec<&str> = match &material {
-            wire::ProtectedMaterial::AwsSession(wire::AwsSession {
-                access_key_id,
-                secret_access_key,
-                session_token,
-            }) => [
-                Some(access_key_id.as_str()),
-                Some(secret_access_key.as_str()),
-                session_token.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
-            wire::ProtectedMaterial::GithubToken(token) => vec![token.as_str()],
-            wire::ProtectedMaterial::SignedMaterial(wire::SignedMaterial {
-                authorization,
-                signature,
-                query_secret_values,
-            }) => std::iter::once(authorization.as_str())
-                .chain(signature.as_deref())
-                .chain(query_secret_values.iter().map(String::as_str))
-                .collect(),
-        };
-        let bytes = values
-            .iter()
-            .try_fold(0usize, |n, value| n.checked_add(value.len()))
-            .ok_or(protected::RegistrationError::LimitExceeded)?;
-        if !self.accept_protected_material(bytes, values.len()) {
-            return Err(protected::RegistrationError::LimitExceeded);
-        }
         self.input_inventory()
             .diagnostics()
             .register_protected(material)
@@ -93,7 +49,7 @@ impl protected::Host for HostState {
             })
     }
 }
-fn decode_event(event: wit::Event) -> Option<wire::Event> {
+fn decode_event(event: wit::Event) -> wire::Event {
     let wit::Event {
         severity,
         context,
@@ -132,7 +88,7 @@ fn decode_event(event: wit::Event) -> Option<wire::Event> {
         }) => {
             let (input, secret_hint) = match input {
                 wit::DiagnosticValue::Json(json) => (wire::DiagnosticValue::Json(json), false),
-                wit::DiagnosticValue::Typed(value) => decode_value(value)?,
+                wit::DiagnosticValue::Typed(value) => decode_value(value),
             };
             let origin = match origin {
                 wit::ValueOrigin::Desired => wire::ValueOrigin::Desired,
@@ -206,28 +162,179 @@ fn decode_event(event: wit::Event) -> Option<wire::Event> {
             })
         }
     };
-    Some(wire::Event {
+    wire::Event {
         severity,
         context: context.map(|wit::UnboundDiagnostic { text }| text),
         body,
-    })
+    }
 }
-fn decode_value(value: wit_types::Value) -> Option<(wire::DiagnosticValue, bool)> {
+fn decode_value(value: wit_types::Value) -> (wire::DiagnosticValue, bool) {
     let typed = match value {
         wit_types::Value::BoolVal(value) => proto::Value::Bool(value),
         wit_types::Value::IntVal(value) => proto::Value::Int(value),
         wit_types::Value::FloatVal(value) => {
-            proto::Value::Float(carina_provider_protocol::FiniteF64::new(value).ok()?)
+            match carina_provider_protocol::FiniteF64::new(value) {
+                Ok(value) => proto::Value::Float(value),
+                Err(_non_finite) => return (wire::DiagnosticValue::Masked, false),
+            }
         }
         wit_types::Value::StrVal(value) => proto::Value::String(value),
         wit_types::Value::StringListVal(json)
         | wit_types::Value::ListVal(json)
         | wit_types::Value::MapVal(json) => {
-            return Some((wire::DiagnosticValue::Json(json), false));
+            return (wire::DiagnosticValue::Json(json), false);
         }
         wit_types::Value::SecretVal(json) => {
-            return Some((wire::DiagnosticValue::Json(json), true));
+            return (wire::DiagnosticValue::Json(json), true);
         }
     };
-    Some((wire::DiagnosticValue::Typed(typed), false))
+    (wire::DiagnosticValue::Typed(typed), false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::diagnostic_tests::diagnostic_store;
+    use super::*;
+    use carina_core::test_utils::provider_text::captured_session;
+
+    #[tokio::test]
+    async fn rejected_registration_does_not_consume_a_second_host_budget() {
+        use carina_provider_protocol::diagnostics::ProtectedMaterial;
+        let (session, _events) = captured_session(
+            carina_core::provider::ProviderPlan::state_only().session_builder("mock", None, None),
+        );
+        let engine = Engine::default();
+        let mut store = diagnostic_store(&engine);
+        store.set_configuration_secrets(session.guest_inputs());
+        store
+            .call(|store| async move {
+                store
+                    .data()
+                    .input_inventory()
+                    .diagnostics()
+                    .register_protected(ProtectedMaterial::GithubToken("x".repeat(250_000)))
+                    .unwrap();
+                for _ in 0..13 {
+                    assert!(matches!(
+                        <HostState as protected::Host>::register(
+                            store.data_mut(),
+                            protected::Material::GithubToken("y".repeat(20_000))
+                        ),
+                        Err(protected::RegistrationError::LimitExceeded)
+                    ));
+                }
+                assert!(
+                    <HostState as protected::Host>::register(
+                        store.data_mut(),
+                        protected::Material::GithubToken("z".repeat(3_000))
+                    )
+                    .is_ok(),
+                    "rejected registrations charged a duplicate host budget"
+                );
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_finite_value_masks_its_leaf_and_keeps_the_event() {
+        let (session, events) = captured_session(
+            carina_core::provider::ProviderPlan::state_only().session_builder("mock", None, None),
+        );
+        let engine = Engine::default();
+        let event = wit::Event {
+            severity: wit::Level::Warn,
+            context: Some(wit::UnboundDiagnostic {
+                text: "float diagnostic".into(),
+            }),
+            body: wit::Payload::Value(wit::ValueDiagnostic {
+                id: None,
+                path: vec![],
+                origin: wit::ValueOrigin::Observed,
+                input: wit::DiagnosticValue::Typed(wit_types::Value::FloatVal(f64::NAN)),
+            }),
+        };
+        // Use an actual HostState so this exercises the confined WIT decoder.
+        let mut store = diagnostic_store(&engine);
+        store.set_configuration_secrets(session.guest_inputs());
+        store
+            .call(|state| {
+                <HostState as wit::Host>::emit(state.data_mut(), event);
+                std::future::ready(())
+            })
+            .await
+            .unwrap();
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let text = carina_core::provider_text::present_event(&events[0]).to_string();
+        assert!(text.contains("float diagnostic"));
+        assert!(text.contains("(secret)"));
+    }
+
+    #[tokio::test]
+    async fn registered_credentials_survive_call_and_set_secrets_swap() {
+        for swap in [false, true] {
+            let engine = Engine::default();
+            let (session, events) = captured_session(
+                carina_core::provider::ProviderPlan::state_only()
+                    .session_builder("mock", None, None),
+            );
+            let mut store = diagnostic_store(&engine);
+            store.set_configuration_secrets(session.guest_inputs());
+            store
+                .call(|store| async move {
+                    assert!(
+                        protected::Host::register(
+                            store.data_mut(),
+                            protected::Material::AwsSession(protected::AwsSession {
+                                access_key_id: "prior-call-access".into(),
+                                secret_access_key: "prior-call-key".into(),
+                                session_token: Some("prior-call-session".into()),
+                            })
+                        )
+                        .is_ok()
+                    );
+                    assert!(
+                        protected::Host::register(
+                            store.data_mut(),
+                            protected::Material::GithubToken("prior-call-github".into())
+                        )
+                        .is_ok()
+                    );
+                })
+                .await
+                .unwrap();
+            assert!(events.lock().unwrap().is_empty());
+            let replacement =
+                carina_core::provider::ProviderPlan::state_only().session("mock", None, None);
+            if swap {
+                store.set_secrets(replacement.guest_inputs());
+            }
+            store.call(|store| async move {
+                <HostState as wit::Host>::emit(store.data_mut(), wit::Event {
+                    severity: wit::Level::Warn,
+                    context: None,
+                    body: wit::Payload::Diagnostic(wit::UnboundDiagnostic {
+                        text: "later-call public=visible prior-call-access prior-call-key prior-call-session prior-call-github".into(),
+                    }),
+                });
+            }).await.unwrap();
+            let captured = events.lock().unwrap();
+            assert_eq!(captured.len(), 1, "swap={swap}");
+            let text = carina_core::provider_text::present_event(&captured[0]).to_string();
+            assert!(text.contains("later-call public=visible"), "{text}");
+            assert_eq!(text.matches("(secret)").count(), 4, "swap={swap}: {text}");
+            for secret in [
+                "prior-call-access",
+                "prior-call-key",
+                "prior-call-session",
+                "prior-call-github",
+            ] {
+                assert!(
+                    !text.contains(secret),
+                    "swap={swap}, leaked {secret}: {text}"
+                );
+            }
+        }
+    }
 }

@@ -51,6 +51,9 @@ pub(super) fn emit(event: wire::Event) {
                     wit::DiagnosticValue::Typed(value_to_wit(value))
                 }
                 wire::DiagnosticValue::Json(json) => wit::DiagnosticValue::Json(json),
+                wire::DiagnosticValue::Masked => {
+                    wit::DiagnosticValue::Typed(types::Value::FloatVal(f64::NAN))
+                }
             },
         }),
         wire::Payload::Http(wire::HttpDiagnostic {
@@ -178,15 +181,6 @@ pub(super) fn register(material: wire::ProtectedMaterial) -> Result<(), wire::Re
             session_token,
         }),
         wire::ProtectedMaterial::GithubToken(token) => protection::Material::GithubToken(token),
-        wire::ProtectedMaterial::SignedMaterial(wire::SignedMaterial {
-            authorization,
-            signature,
-            query_secret_values,
-        }) => protection::Material::SignedMaterial(protection::SignedMaterial {
-            authorization,
-            signature,
-            query_secret_values,
-        }),
     };
     protection::register(&material).map_err(|error| match error {
         protection::RegistrationError::LimitExceeded => wire::RegistrationError::LimitExceeded,

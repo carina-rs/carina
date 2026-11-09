@@ -515,12 +515,12 @@ async fn protocol_v2_is_rejected_before_current_world_binding() {
         "protocol rejection must not be classified as typed instantiation failure: {rendered}"
     );
     let expected = format!(
-        "provider 'old-v2' was built against protocol version 2 but this host requires at least version {}",
-        carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION,
+        "Incompatible provider WIT package carina:provider@0.1.0; host requires carina:provider@0.2.0 (protocol {}); rebuild the provider against the current carina protocol",
+        carina_provider_protocol::PROTOCOL_VERSION,
     );
     assert!(
         rendered.contains(&expected),
-        "the stable info preflight must report the protocol mismatch: {rendered}"
+        "component type preflight must reject legacy WIT before executing info: {rendered}"
     );
     assert!(
         !rendered.contains("failed to convert function to given type")

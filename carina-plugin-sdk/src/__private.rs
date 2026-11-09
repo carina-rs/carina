@@ -25,4 +25,5 @@ macro_rules! provider_world {
 
 provider_world!(provider, carina_plugin_bindings_provider);
 provider_world!(http, carina_plugin_bindings_http);
+#[cfg(feature = "aws")]
 provider_world!(aws, carina_plugin_bindings_aws);

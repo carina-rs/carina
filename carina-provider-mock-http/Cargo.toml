@@ -25,7 +25,7 @@ name = "carina-provider-mock-http-sdk-only"
 path = "src/sdk_only.rs"
 
 [dependencies]
-carina-plugin-sdk = { path = "../carina-plugin-sdk" }
+carina-plugin-sdk = { path = "../carina-plugin-sdk", features = ["aws"] }
 carina-provider-mock = { path = "../carina-provider-mock" }
 serde = { version = "1", features = ["derive"] }
 

@@ -1250,8 +1250,10 @@ name = "carina-plugin-sdk"
 version = "0.13.1"
 dependencies = [
  "aws-credential-types",
+ "aws-sigv4",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "aws-types",
  "carina-core",
  "carina-plugin-bindings-aws",
  "carina-plugin-bindings-aws-credentials",
@@ -1261,7 +1263,6 @@ dependencies = [
  "carina-provider-protocol",
  "http 1.4.0",
  "indexmap 2.13.0",
- "percent-encoding",
  "serde",
  "serde_json",
  "tokio",

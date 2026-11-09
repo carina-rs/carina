@@ -741,9 +741,11 @@ fn validate_canonical_provider_config(
         },
     )?;
     let canonical = CanonicalProviderConfigAttributes { attributes };
-    let session = crate::provider::ProviderValidationInputs::collect(canonical.values());
-    factory
-        .validate_config(&canonical, &session)
+    let session =
+        crate::provider::ProviderValidationInputs::collect(provider_name, canonical.values());
+    session
+        .diagnostics()
+        .dispatch_sync(|| factory.validate_config(&canonical, &session))
         .map_err(|error| {
             let error = if canonical.values().any(crate::value::contains_secret) {
                 error.with_redacted_message("configuration containing a secret failed validation")
@@ -868,7 +870,9 @@ fn validate_provider_config_attributes<P: PlaceholderKind, B: BindingAddress>(
     attributes: &IndexMap<String, Value<P, B>>,
     attr_types: &crate::schema::ValidatedConfigSchema,
 ) -> Result<(), ProviderConfigPreparationError> {
-    let lookup = crate::parser::custom_type_lookup_for_factory(factory);
+    let inputs =
+        crate::provider::ProviderValidationInputs::collect(provider_name, attributes.values());
+    let lookup = crate::parser::custom_type_lookup_for_factory(factory, &inputs);
     for (attribute, value) in attributes {
         if let Some(attr_type) = attr_types.rootless_type(attribute) {
             attr_type
@@ -2395,6 +2399,10 @@ mod provider_config_tests {
                 .unwrap()
                 .into_known()
                 .unwrap(),
+            &crate::provider::ProviderValidationInputs::collect(
+                factory.name(),
+                std::iter::empty::<&Value>(),
+            ),
         )
         .expect_err("an Int declaration must not accept bridge-shaped String input");
 
@@ -2535,7 +2543,9 @@ mod provider_config_tests {
                 vec![expected.clone().with_attribute("value")]
             );
         }
-        let lookup = crate::parser::custom_type_lookup_for_factory(factories[0].as_ref());
+        let inputs =
+            crate::provider::ProviderValidationInputs::collect(factories[0].name(), [&value]);
+        let lookup = crate::parser::custom_type_lookup_for_factory(factories[0].as_ref(), &inputs);
         assert_eq!(
             crate::schema::RootlessType::new(declaration)
                 .validate_with_lookup(&value, &lookup)

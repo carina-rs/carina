@@ -12,7 +12,12 @@ use std::time::{Duration, Instant};
 pub use wire::{Level as EventLevel, ValueOrigin};
 
 const MAX_EVENT_INPUT_BYTES: usize = 64 * 1024;
+// Panic context, message, and location share a finite 256 KiB input allowance.
+// Over-cap panic text is masked as a whole before binding or redaction work.
+#[cfg(feature = "guest-runtime")]
+const MAX_PANIC_INPUT_BYTES: usize = 256 * 1024;
 const MAX_EVENTS: usize = 256;
+const MAX_EVENTS_PER_SECOND: usize = 64;
 const MAX_EVENT_NODES: usize = 1024;
 const MAX_EVENT_DEPTH: usize = 32;
 const MAX_REGISTERED_BYTES: usize = 256 * 1024;
@@ -132,7 +137,13 @@ impl<'a> ProviderValueDiagnostic<'a> {
     }
 }
 
-type EventSink = Arc<dyn Fn(BoundProviderEvent) + Send + Sync>;
+type EventCallback = Arc<dyn Fn(BoundProviderEvent) + Send + Sync>;
+#[derive(Clone)]
+pub(super) enum EventSink {
+    Default,
+    Custom(EventCallback),
+}
+
 pub(super) type ProtectedAddresses = HashMap<ResourceId, AddressProtection>;
 #[derive(Clone, Debug)]
 pub(super) enum AddressProtection {
@@ -160,32 +171,181 @@ impl AddressProtection {
 
 struct ProviderTextScope {
     secrets: RedactionSet,
-    provider: String,
     addresses: RwLock<ProtectedAddresses>,
-    schemas: RwLock<SchemaRegistry>,
 }
-struct Budget {
+#[derive(Clone)]
+struct Presentation {
+    provider: String,
+    schemas: Arc<RwLock<Option<SchemaRegistry>>>,
+    sink: EventSink,
+    host: Arc<()>,
+}
+#[derive(Default)]
+struct RegistrationBudget {
+    bytes: usize,
+    values: usize,
+}
+struct EventQuota {
     count: usize,
     window: Instant,
     window_count: usize,
-    registered_bytes: usize,
-    registered_values: usize,
+}
+impl Default for EventQuota {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            window: Instant::now(),
+            window_count: 0,
+        }
+    }
+}
+impl EventQuota {
+    fn admit(&mut self) -> bool {
+        if self.window.elapsed() >= Duration::from_secs(1) {
+            self.window = Instant::now();
+            self.window_count = 0;
+        }
+        if self.count >= MAX_EVENTS || self.window_count >= MAX_EVENTS_PER_SECOND {
+            return false;
+        }
+        self.count += 1;
+        self.window_count += 1;
+        true
+    }
+}
+#[derive(Default)]
+enum PanicExemption {
+    #[default]
+    Available,
+    Used,
+}
+#[derive(Default)]
+struct EventBudget {
+    ordinary: EventQuota,
+    verbose: EventQuota,
+    panic_exemption: PanicExemption,
+    suppressed: Option<SuppressionNotice>,
+}
+// A pending count retains its host delivery context, including for a channel
+// that inherited presentation after its owner was created. No provider event
+// text is retained. Shared Channel has only a weak owner and no budget pointer,
+// so retaining it here cannot keep the diagnostic owner or budget alive.
+struct SuppressionNotice {
+    count: usize,
+    shared: Arc<Channel>,
+    presentation: Presentation,
+}
+impl EventBudget {
+    fn admit(&mut self, level: EventLevel, panic: bool) -> bool {
+        if panic && matches!(self.panic_exemption, PanicExemption::Available) {
+            self.panic_exemption = PanicExemption::Used;
+            return true;
+        }
+        let quota = match level {
+            EventLevel::Error | EventLevel::Warn | EventLevel::Info => &mut self.ordinary,
+            EventLevel::Debug | EventLevel::Trace => &mut self.verbose,
+        };
+        quota.admit()
+    }
+    fn suppress(&mut self, channel: &ProviderDiagnosticChannel) {
+        let count = self
+            .suppressed
+            .as_ref()
+            .map_or(1, |notice| notice.count.saturating_add(1));
+        self.suppressed = Some(SuppressionNotice {
+            count,
+            shared: channel.shared.clone(),
+            presentation: channel.presentation.clone(),
+        });
+    }
+}
+fn flush_suppressed(events: &Mutex<EventBudget>) {
+    let notice = events
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .suppressed
+        .take();
+    if let Some(SuppressionNotice {
+        count,
+        shared,
+        presentation,
+    }) = notice
+    {
+        deliver_event(
+            UnboundProviderEvent {
+                severity: EventLevel::Warn,
+                context: None,
+                body: UnboundBody::Suppressed(count),
+            },
+            &shared.scope,
+            &presentation,
+        );
+    }
+}
+struct DiagnosticLifetime {
+    events: Arc<Mutex<EventBudget>>,
+}
+impl Drop for DiagnosticLifetime {
+    fn drop(&mut self) {
+        // In-flight emissions hold this same lifetime through Weak::upgrade,
+        // so the final owner cannot drain the count before they finish.
+        flush_suppressed(&self.events);
+    }
+}
+impl fmt::Debug for DiagnosticOwner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_tuple("DiagnosticOwner").field(&()).finish()
+    }
 }
 struct Channel {
-    owner: std::sync::Weak<()>,
+    owner: std::sync::Weak<DiagnosticLifetime>,
     scope: ProviderTextScope,
-    sink: RwLock<EventSink>,
-    budget: Mutex<Budget>,
 }
 
-/// The host owns liveness; provider emission handles retain only a weak reference.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct DiagnosticOwner(Arc<()>);
-
-/// A host-minted emission capability. There is no writer or empty constructor.
-/// Neither emission nor registration returns displayable provider text.
+/// The host owns liveness; emission handles retain only a weak reference.
 #[derive(Clone)]
-pub struct ProviderDiagnosticChannel(Arc<Channel>);
+pub(crate) struct DiagnosticOwner(Arc<DiagnosticLifetime>);
+
+/// A host-minted emission capability, without a writer or empty constructor.
+#[derive(Clone)]
+pub struct ProviderDiagnosticChannel {
+    shared: Arc<Channel>,
+    presentation: Presentation,
+    registration: Arc<Mutex<RegistrationBudget>>,
+    events: EventBinding,
+}
+
+#[derive(Clone)]
+enum EventBinding {
+    Session(Arc<Mutex<EventBudget>>),
+    Call(Arc<Mutex<EventBudget>>),
+}
+struct ActiveCall {
+    host: Arc<()>,
+    events: Arc<Mutex<EventBudget>>,
+}
+tokio::task_local! { static ACTIVE_PROVIDER_CALL: ActiveCall; }
+
+/// Ends one provider call's event budget, including trap and cancellation paths.
+pub struct ProviderDiagnosticCall(Arc<Mutex<EventBudget>>);
+impl Drop for ProviderDiagnosticCall {
+    fn drop(&mut self) {
+        // Drain the retained call budget, never an ambient task-local budget.
+        flush_suppressed(&self.0);
+    }
+}
+host_api! {
+fn provider_http_trace_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CARINA_WASI_HTTP_TRACE").is_ok_and(|value| value == "1"))
+}
+}
+fn default_level_enabled(level: EventLevel) -> bool {
+    match level {
+        EventLevel::Error | EventLevel::Warn | EventLevel::Info => true,
+        EventLevel::Debug | EventLevel::Trace => provider_http_trace_enabled(),
+    }
+}
 impl fmt::Debug for ProviderDiagnosticChannel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ProviderDiagnosticChannel")
@@ -193,8 +353,8 @@ impl fmt::Debug for ProviderDiagnosticChannel {
 }
 impl PartialEq for ProviderDiagnosticChannel {
     fn eq(&self, other: &Self) -> bool {
-        self.0.scope.provider == other.0.scope.provider
-            && self.0.scope.secrets == other.0.scope.secrets
+        self.presentation.provider == other.presentation.provider
+            && self.shared.scope.secrets == other.shared.scope.secrets
     }
 }
 impl ProviderDiagnosticChannel {
@@ -203,50 +363,161 @@ impl ProviderDiagnosticChannel {
         provider: String,
         addresses: ProtectedAddresses,
     ) -> (Self, DiagnosticOwner) {
-        let output_secrets = secrets.clone();
-        let owner = DiagnosticOwner(Arc::new(()));
-        let channel = Self(Arc::new(Channel {
-            owner: Arc::downgrade(&owner.0),
-            scope: ProviderTextScope {
-                secrets,
-                provider,
-                addresses: RwLock::new(addresses),
-                schemas: RwLock::new(SchemaRegistry::new()),
-            },
-            sink: RwLock::new(Arc::new(move |event| {
-                let mut writer = RedactingLineWriter::new(&output_secrets, std::io::stderr());
-                if writer.push_str(&present_event(&event).to_string()).is_ok() {
-                    let _ = writer.push_str("\n");
-                    let _ = writer.finish();
-                }
-            })),
-            budget: Mutex::new(Budget {
-                count: 0,
-                window: Instant::now(),
-                window_count: 0,
-                registered_bytes: 0,
-                registered_values: 0,
-            }),
-        }));
-        (channel, owner)
+        Self::with_sink(secrets, provider, addresses, EventSink::Default)
     }
-    pub(super) fn set_sink(&self, sink: impl Fn(BoundProviderEvent) + Send + Sync + 'static) {
-        *self
-            .0
-            .sink
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(sink);
+    pub(super) fn with_sink(
+        secrets: RedactionSet,
+        provider: String,
+        addresses: ProtectedAddresses,
+        sink: EventSink,
+    ) -> (Self, DiagnosticOwner) {
+        let events = Arc::new(Mutex::new(EventBudget::default()));
+        let owner = DiagnosticOwner(Arc::new(DiagnosticLifetime {
+            events: events.clone(),
+        }));
+        let channel = Self {
+            shared: Arc::new(Channel {
+                owner: Arc::downgrade(&owner.0),
+                scope: ProviderTextScope {
+                    secrets,
+                    addresses: RwLock::new(addresses),
+                },
+            }),
+            presentation: Presentation {
+                provider,
+                schemas: Arc::new(RwLock::new(None)),
+                sink,
+                host: Arc::new(()),
+            },
+            registration: Arc::new(Mutex::new(RegistrationBudget::default())),
+            events: EventBinding::Session(events),
+        };
+        (channel, owner)
     }
     pub(crate) fn set_schemas(&self, schemas: SchemaRegistry) {
         *self
-            .0
-            .scope
+            .presentation
             .schemas
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = schemas;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(schemas);
+    }
+    pub(super) fn set_schema_witness(
+        &self,
+        witness: &crate::schema::ValidatedProviderSchemaWitness,
+    ) -> Result<(), crate::schema::SchemaRegistryError> {
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert_provider_witness(&self.presentation.provider, witness)?;
+        self.set_schemas(schemas);
+        Ok(())
+    }
+    pub(super) fn inherit_host(&self, owner: &Self) -> Self {
+        let presentation = owner.presentation.clone();
+        let owner_has_schemas = owner
+            .presentation
+            .schemas
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        if !owner_has_schemas {
+            let schemas = self
+                .presentation
+                .schemas
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            *presentation
+                .schemas
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = schemas;
+        }
+        let presentation = Presentation {
+            sink: match &self.presentation.sink {
+                EventSink::Custom(sink) => EventSink::Custom(sink.clone()),
+                EventSink::Default => presentation.sink,
+            },
+            ..presentation
+        };
+        Self {
+            shared: self.shared.clone(),
+            presentation,
+            registration: owner.registration.clone(),
+            events: self.events.clone(),
+        }
+    }
+    #[cfg_attr(
+        not(feature = "guest-runtime"),
+        allow(dead_code, reason = "Only the guest runtime replaces instances")
+    )]
+    pub(super) fn for_new_guest(&self, secrets: RedactionSet) -> (Self, DiagnosticOwner) {
+        let (mut channel, owner) = Self::new(
+            secrets,
+            self.presentation.provider.clone(),
+            ProtectedAddresses::default(),
+        );
+        channel.presentation = self.presentation.clone();
+        (channel, owner)
+    }
+    pub(super) fn for_call(&self) -> (Self, ProviderDiagnosticCall) {
+        let events = Arc::new(Mutex::new(EventBudget::default()));
+        let call = Self {
+            events: EventBinding::Call(events.clone()),
+            ..self.clone()
+        };
+        (call, ProviderDiagnosticCall(events))
+    }
+    fn event_budget(&self) -> Arc<Mutex<EventBudget>> {
+        match &self.events {
+            // Guest exports carry their explicit call budget. A surrounding native
+            // factory/dispatch scope must not combine separate guest exports.
+            EventBinding::Call(events) => events.clone(),
+            EventBinding::Session(fallback) => ACTIVE_PROVIDER_CALL
+                .try_with(|call| {
+                    Arc::ptr_eq(&call.host, &self.presentation.host).then(|| call.events.clone())
+                })
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| fallback.clone()),
+        }
+    }
+    fn call_context(&self) -> (ActiveCall, ProviderDiagnosticCall) {
+        let (channel, guard) = self.for_call();
+        (
+            ActiveCall {
+                host: self.presentation.host.clone(),
+                events: channel.event_budget(),
+            },
+            guard,
+        )
+    }
+    /// One native dispatch seam, including synchronous work before a future is
+    /// returned. Task-local scopes isolate concurrent calls without mutating the
+    /// session handles retained by a provider at construction.
+    pub(crate) fn dispatch<'a, F: std::future::Future + Send + 'a>(
+        &self,
+        invoke: impl FnOnce() -> F,
+    ) -> futures::future::BoxFuture<'a, F::Output> {
+        let (context, guard) = self.call_context();
+        let future = ACTIVE_PROVIDER_CALL.sync_scope(
+            ActiveCall {
+                host: context.host.clone(),
+                events: context.events.clone(),
+            },
+            invoke,
+        );
+        Box::pin(ACTIVE_PROVIDER_CALL.scope(context, async move {
+            let _guard = guard;
+            future.await
+        }))
+    }
+    pub(crate) fn dispatch_sync<T>(&self, invoke: impl FnOnce() -> T) -> T {
+        let (context, guard) = self.call_context();
+        ACTIVE_PROVIDER_CALL.sync_scope(context, || {
+            let _guard = guard;
+            invoke()
+        })
     }
     pub(crate) fn include_address(&self, id: &ResourceId) {
-        self.0
+        self.shared
             .scope
             .addresses
             .write()
@@ -268,18 +539,16 @@ impl ProviderDiagnosticChannel {
         id: &ResourceId,
         values: impl Iterator<Item = (&'a String, &'a Value)>,
     ) {
-        let mut additional = Vec::new();
-        for (name, value) in values {
-            protected_paths(value, &mut vec![name.clone()], &mut additional);
-        }
-        self.0
-            .scope
-            .addresses
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(id.clone())
-            .or_insert(AddressProtection::Unclassified)
-            .include_checked(additional);
+        include_protected_values(
+            &mut self
+                .shared
+                .scope
+                .addresses
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            id,
+            values,
+        );
     }
     pub fn emit(&self, event: ProviderEvent<'_>) {
         let ProviderEvent {
@@ -298,108 +567,112 @@ impl ProviderDiagnosticChannel {
             body,
         });
     }
-    /// Transport ingestion exists only on the host; all decoded fields remain Unbound.
+    /// Host transport ingestion; the decoder remains in host confinement.
     #[cfg(feature = "guest-runtime")]
     pub fn receive_wire(
         &self,
         event: wire::Event,
         decode_failure: fn(protocol::ProviderError) -> ProviderError,
     ) {
+        let panic = matches!(&event.body, wire::Payload::Panic(_));
         let wire::Event {
             severity,
             context,
             body,
         } = event;
-        let body = match body {
-            wire::Payload::Failure(error) => UnboundBody::Failure(decode_failure(error)),
-            wire::Payload::Diagnostic(text) => {
-                UnboundBody::Diagnostic(ProviderDiagnostic::message(ProviderText::new(text)))
-            }
-            wire::Payload::Panic(panic) => UnboundBody::Panic(panic),
-            wire::Payload::Value(value) => UnboundBody::Value(value),
-            wire::Payload::Http(http) => UnboundBody::Http(http),
-        };
-        self.accept(UnboundProviderEvent {
-            severity,
-            context: context.map(ProviderText::new),
-            body,
+        let severity = if panic { EventLevel::Error } else { severity };
+        self.accept_decoded(severity, panic, || {
+            let body = match body {
+                wire::Payload::Failure(error) => {
+                    if wire_error_bytes(&error)? > MAX_EVENT_INPUT_BYTES {
+                        return None;
+                    }
+                    UnboundBody::Failure(decode_failure(error))
+                }
+                wire::Payload::Diagnostic(text) => {
+                    UnboundBody::Diagnostic(ProviderDiagnostic::message(ProviderText::new(text)))
+                }
+                wire::Payload::Panic(panic) => UnboundBody::Panic(panic),
+                wire::Payload::Value(value) => UnboundBody::Value(value),
+                wire::Payload::Http(http) => UnboundBody::Http(http),
+            };
+            Some(UnboundProviderEvent {
+                severity,
+                context: context.map(ProviderText::new),
+                body,
+            })
         });
     }
     fn accept(&self, event: UnboundProviderEvent) {
-        let Some(_live_context) = self.0.owner.upgrade() else {
+        #[cfg(feature = "guest-runtime")]
+        let panic = matches!(&event.body, UnboundBody::Panic(_));
+        #[cfg(not(feature = "guest-runtime"))]
+        let panic = false;
+        self.accept_decoded(event.severity, panic, || Some(event));
+    }
+    fn accept_decoded(
+        &self,
+        level: EventLevel,
+        panic: bool,
+        decode: impl FnOnce() -> Option<UnboundProviderEvent>,
+    ) {
+        let Some(_live_context) = self.shared.owner.upgrade() else {
             return;
         };
+        // Custom sinks are explicit observers of every level, independent of
+        // stderr's trace opt-in. Filter default output before charging either
+        // quota; hidden events also contribute nothing to the suppression notice.
+        let enabled = match &self.presentation.sink {
+            EventSink::Default => default_level_enabled(level),
+            EventSink::Custom(_) => true,
+        };
+        if !enabled {
+            return;
+        }
+        let events = self.event_budget();
         {
-            let mut budget = self
-                .0
-                .budget
+            let mut budget = events
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if budget.count >= MAX_EVENTS {
+            if !budget.admit(level, panic) {
+                budget.suppress(self);
                 return;
             }
-            if budget.window.elapsed() >= Duration::from_secs(1) {
-                budget.window = Instant::now();
-                budget.window_count = 0;
-            }
-            if budget.window_count >= 64 {
-                return;
-            }
-            budget.count += 1;
-            budget.window_count += 1;
         }
-        if let Some(event) = bind_event(event, &self.0.scope) {
-            let sink = self
-                .0
-                .sink
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            sink(event);
+        if !decode().is_some_and(|event| self.deliver(event)) {
+            let mut budget = events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            budget.suppress(self);
         }
+    }
+    fn deliver(&self, event: UnboundProviderEvent) -> bool {
+        deliver_event(event, &self.shared.scope, &self.presentation)
     }
     pub fn register_protected(
         &self,
         material: wire::ProtectedMaterial,
     ) -> Result<(), wire::RegistrationError> {
         let _live_context = self
-            .0
+            .shared
             .owner
             .upgrade()
             .ok_or(wire::RegistrationError::ClosedContext)?;
-        let values = match material {
-            wire::ProtectedMaterial::AwsSession(wire::AwsSession {
-                access_key_id,
-                secret_access_key,
-                session_token,
-            }) => {
-                let mut values = vec![access_key_id, secret_access_key];
-                values.extend(session_token);
-                values
-            }
-            wire::ProtectedMaterial::GithubToken(token) => vec![token],
-            wire::ProtectedMaterial::SignedMaterial(wire::SignedMaterial {
-                authorization,
-                signature,
-                query_secret_values,
-            }) => {
-                let mut values = vec![authorization];
-                values.extend(signature);
-                values.extend(query_secret_values);
-                values
-            }
-        };
+        let mut budget = self
+            .registration
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let values = self
+            .shared
+            .scope
+            .secrets
+            .unregistered_values(material.values());
         let bytes = values
             .iter()
             .try_fold(0usize, |sum, value| sum.checked_add(value.len()))
             .ok_or(wire::RegistrationError::LimitExceeded)?;
-        let mut budget = self
-            .0
-            .budget
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if bytes > MAX_REGISTERED_BYTES.saturating_sub(budget.registered_bytes)
-            || values.len() > MAX_REGISTERED_VALUES.saturating_sub(budget.registered_values)
+        if bytes > MAX_REGISTERED_BYTES.saturating_sub(budget.bytes)
+            || values.len() > MAX_REGISTERED_VALUES.saturating_sub(budget.values)
         {
             return Err(wire::RegistrationError::LimitExceeded);
         }
@@ -408,10 +681,26 @@ impl ProviderDiagnosticChannel {
             added.insert(value);
         }
         added.sort();
-        self.0.scope.secrets.extend(&added);
-        budget.registered_bytes += bytes;
-        budget.registered_values += values.len();
+        self.shared.scope.secrets.extend(&added);
+        budget.bytes += bytes;
+        budget.values += values.len();
         Ok(())
+    }
+}
+
+fn deliver_event(
+    event: UnboundProviderEvent,
+    scope: &ProviderTextScope,
+    presentation: &Presentation,
+) -> bool {
+    if let Some(event) = bind_event(event, scope, presentation) {
+        match &presentation.sink {
+            EventSink::Default => write_default_event(event),
+            EventSink::Custom(sink) => sink(event),
+        }
+        true
+    } else {
+        false
     }
 }
 
@@ -422,6 +711,7 @@ struct UnboundProviderEvent {
 }
 enum UnboundBody {
     Failure(ProviderError),
+    Suppressed(usize),
     Diagnostic(ProviderDiagnostic),
     Value(wire::ValueDiagnostic),
     #[cfg(feature = "guest-runtime")]
@@ -434,7 +724,7 @@ enum UnboundBody {
 ///
 /// ```compile_fail,E0451
 /// use carina_core::provider_text::BoundProviderEvent;
-/// let _ = BoundProviderEvent { severity: todo!(), segments: vec![], failure: None, diagnostic: None, secrets: todo!() };
+/// let _ = BoundProviderEvent { severity: todo!(), segments: vec![], failure: None, diagnostic: None, secrets: todo!(), notice: None };
 /// ```
 /// ```compile_fail,E0603
 /// use carina_core::provider_text::events::bind_event;
@@ -445,6 +735,7 @@ pub struct BoundProviderEvent {
     failure: Option<HostError>,
     diagnostic: Option<HostDiagnostic>,
     secrets: RedactionSet,
+    notice: Option<usize>,
 }
 impl BoundProviderEvent {
     pub fn severity(&self) -> EventLevel {
@@ -461,12 +752,8 @@ impl BoundProviderEvent {
 /// Presentation accepts exactly a kernel-minted event, including for value diagnostics.
 ///
 /// ```compile_fail,E0308
-/// use carina_core::provider_text::present_event;
-/// let _ = present_event(&String::from("unbound provider output"));
-/// ```
-/// ```compile_fail,E0308
 /// use carina_core::provider_text::{present_event, ErrorText, Bound};
-/// let _ = present_event(&ErrorText::<Bound>::new("arbitrary"));
+/// fn reject(error: &ErrorText<Bound>) { let _ = present_event(error); }
 /// ```
 /// ```compile_fail,E0308
 /// use carina_core::provider_text::{present_event, ProviderText, ProviderDiagnostic};
@@ -482,6 +769,9 @@ pub fn present_event(event: &BoundProviderEvent) -> ProviderEventPresentation<'_
 pub struct ProviderEventPresentation<'a>(&'a BoundProviderEvent);
 impl fmt::Display for ProviderEventPresentation<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(count) = self.0.notice {
+            return write!(f, "{count} provider events suppressed");
+        }
         let mut inventories = RedactionContext::default();
         inventories.include(&self.0.secrets);
         for segment in &self.0.segments {
@@ -522,15 +812,52 @@ fn text_bytes(text: &ProviderText) -> usize {
     })
 }
 fn bind_event(
-    event: UnboundProviderEvent,
+    mut event: UnboundProviderEvent,
     scope: &ProviderTextScope,
+    presentation: &Presentation,
 ) -> Option<BoundProviderEvent> {
+    let mut remaining = match &mut event.body {
+        #[cfg(feature = "guest-runtime")]
+        UnboundBody::Panic(wire::PanicDiagnostic {
+            message,
+            file,
+            line,
+            column,
+        }) => {
+            let input_bytes = event
+                .context
+                .as_ref()
+                .map_or(0, text_bytes)
+                .saturating_add(message.as_ref().map_or(0, String::len))
+                .saturating_add(file.as_ref().map_or(0, String::len))
+                .saturating_add(usize::from(line.is_some()) * 11)
+                .saturating_add(usize::from(column.is_some()) * 11);
+            if input_bytes > MAX_PANIC_INPUT_BYTES {
+                event.context = event
+                    .context
+                    .take()
+                    .map(|_context| ProviderText::new(crate::schema::SECRET_VALUE_MASK));
+                for text in [message, file].into_iter().flatten() {
+                    *text = crate::schema::SECRET_VALUE_MASK.to_owned();
+                }
+            }
+            // Host scope and fixed framing do not consume the guest allowance.
+            MAX_PANIC_INPUT_BYTES
+                .checked_add(presentation.provider.len())?
+                .checked_add(64)?
+        }
+        UnboundBody::Suppressed(_) => usize::MAX,
+        UnboundBody::Failure(_) | UnboundBody::Diagnostic(_) | UnboundBody::Value(_) => {
+            MAX_EVENT_INPUT_BYTES
+        }
+        #[cfg(feature = "guest-runtime")]
+        UnboundBody::Http(_) => MAX_EVENT_INPUT_BYTES,
+    };
     let UnboundProviderEvent {
         severity,
         context,
         body,
     } = event;
-    let mut remaining = MAX_EVENT_INPUT_BYTES;
     let mut segments = Vec::new();
     let mut push = |text: ProviderText| -> Option<()> {
         remaining = remaining.checked_sub(text_bytes(&text))?;
@@ -544,7 +871,7 @@ fn bind_event(
         EventLevel::Debug => "debug",
         EventLevel::Trace => "trace",
     }))?;
-    push(ProviderText::new(format!(" [{}] ", scope.provider)))?;
+    push(ProviderText::new(format!(" [{}] ", presentation.provider)))?;
     if let Some(context) = context {
         push(context)?;
         push(ProviderText::new(": "))?;
@@ -552,6 +879,16 @@ fn bind_event(
     let mut failure = None;
     let mut captured_diagnostic = None;
     match body {
+        UnboundBody::Suppressed(count) => {
+            return Some(BoundProviderEvent {
+                severity,
+                segments: Vec::new(),
+                failure: None,
+                diagnostic: None,
+                secrets: scope.secrets.clone(),
+                notice: Some(count),
+            });
+        }
         UnboundBody::Failure(error) => {
             push(error.diagnostic_text())?;
             failure = Some(error.with_secrets(&scope.secrets));
@@ -582,15 +919,19 @@ fn bind_event(
                 return None;
             }
             let value = match input {
-                wire::DiagnosticValue::Typed(value) => value,
+                wire::DiagnosticValue::Typed(value) => Some(value),
+                wire::DiagnosticValue::Masked => None,
                 wire::DiagnosticValue::Json(json) => {
                     if json.len() > MAX_EVENT_INPUT_BYTES {
                         return None;
                     }
-                    protocol::Value::from_json(serde_json::from_str(&json).ok()?).ok()?
+                    json_decode_budget(&json)?;
+                    Some(protocol::Value::from_json(serde_json::from_str(&json).ok()?).ok()?)
                 }
             };
-            candidate_budget(&value)?;
+            if let Some(value) = &value {
+                candidate_budget(value)?;
+            }
             let addresses = scope
                 .addresses
                 .read()
@@ -602,16 +943,18 @@ fn bind_event(
                         && host.identity_str() == Some(guest.identity.as_str())
                 })
             });
-            let schemas = scope
+            let schemas = presentation
                 .schemas
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let schema = resolved.and_then(|(host, _paths)| {
-                schemas
-                    .get(&host.provider, &host.resource_type, SchemaKind::Resource)
-                    .or_else(|| {
-                        schemas.get(&host.provider, &host.resource_type, SchemaKind::DataSource)
-                    })
+                schemas.as_ref().and_then(|schemas| {
+                    schemas
+                        .get(&host.provider, &host.resource_type, SchemaKind::Resource)
+                        .or_else(|| {
+                            schemas.get(&host.provider, &host.resource_type, SchemaKind::DataSource)
+                        })
+                })
             });
             if let Some((host, _paths)) = resolved {
                 push(ProviderText::new(host.to_string()))?;
@@ -639,12 +982,16 @@ fn bind_event(
                 effective = schema.effective_type_at_attribute_path(&path).ok();
             }
             protection |= resolved.is_none() || effective.is_none();
-            ValueBinding {
-                protected: resolved.map_or(&[], |(_host, coverage)| coverage.paths()),
-                path,
-                push: &mut push,
+            if let Some(value) = value {
+                ValueBinding {
+                    protected: resolved.map_or(&[], |(_host, coverage)| coverage.paths()),
+                    path,
+                    push: &mut push,
+                }
+                .bind(&value, effective, protection)?;
+            } else {
+                push(ProviderText::new(crate::schema::SECRET_VALUE_MASK))?;
             }
-            .bind(&value, effective, protection)?;
         }
         #[cfg(feature = "guest-runtime")]
         UnboundBody::Panic(wire::PanicDiagnostic {
@@ -732,6 +1079,7 @@ fn bind_event(
         failure,
         diagnostic: captured_diagnostic,
         secrets: scope.secrets.clone(),
+        notice: None,
     })
 }
 
@@ -910,5 +1258,142 @@ pub(super) fn protected_paths<P: crate::resource::ValueKind>(
         Value::Concrete(ConcreteValue::Float(_value)) => {}
         Value::Concrete(ConcreteValue::Bool(_value)) => {}
         Value::Concrete(ConcreteValue::Duration(_value)) => {}
+    }
+}
+
+pub(super) fn include_protected_values<'a, P: crate::resource::ValueKind + 'a>(
+    addresses: &mut ProtectedAddresses,
+    id: &ResourceId,
+    values: impl IntoIterator<Item = (&'a String, &'a Value<P>)>,
+) {
+    let mut paths = Vec::new();
+    for (name, value) in values {
+        protected_paths(value, &mut vec![name.clone()], &mut paths);
+    }
+    addresses
+        .entry(id.clone())
+        .or_insert(AddressProtection::Unclassified)
+        .include_checked(paths);
+}
+
+#[cfg(feature = "guest-runtime")]
+fn wire_error_bytes(error: &protocol::ProviderError) -> Option<usize> {
+    let protocol::ProviderError {
+        kind: _kind,
+        message,
+        resource_id,
+        cause,
+        provider_name,
+        operation,
+        status: _status,
+        code,
+        request_id,
+    } = error;
+    let mut bytes = message.len();
+    for field in [cause, provider_name, operation, code, request_id]
+        .into_iter()
+        .flatten()
+    {
+        bytes = bytes.checked_add(field.len())?;
+    }
+    if let Some(protocol::ResourceId {
+        provider,
+        resource_type,
+        identity,
+    }) = resource_id
+    {
+        for field in [provider, resource_type, identity] {
+            bytes = bytes.checked_add(field.len())?;
+        }
+    }
+    Some(bytes)
+}
+fn json_decode_budget(json: &str) -> Option<()> {
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for byte in json.bytes() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else {
+            match byte {
+                b'"' => quoted = true,
+                b'[' | b'{' => {
+                    depth += 1;
+                    if depth > MAX_EVENT_DEPTH {
+                        return None;
+                    }
+                }
+                b']' | b'}' => depth = depth.checked_sub(1)?,
+                _ => {}
+            }
+        }
+    }
+    Some(())
+}
+
+fn write_default_event(event: BoundProviderEvent) {
+    let mut writer = if event.notice.is_some() {
+        RedactingLineWriter::for_metadata(std::io::stderr())
+    } else {
+        RedactingLineWriter::new(&event.secrets, std::io::stderr())
+    };
+    if writer.push_str(&present_event(&event).to_string()).is_ok() {
+        let _ = writer.push_str("\n");
+        let _ = writer.finish();
+    }
+}
+
+#[cfg(test)]
+mod writer_tests {
+    use super::*;
+
+    #[test]
+    fn writer_preserves_admission_and_warn_suppression_notice() {
+        const CHILD: &str = "CARINA_4334_FIX4_WRITER_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let session = crate::provider::ProviderPlan::state_only()
+                .session_builder("writer-test", None, None)
+                .with_diagnostic_sink(write_default_event)
+                .build();
+            let (inputs, call) = session.guest_inventory().for_diagnostic_call();
+            let channel = inputs.diagnostics();
+            let trace = ProviderDiagnostic::message(ProviderText::new("admitted-trace-canary"));
+            channel.emit(ProviderEvent::diagnostic(
+                EventLevel::Trace,
+                "writer".into(),
+                &trace,
+            ));
+            let warning = ProviderDiagnostic::message(ProviderText::new("admitted-warning-canary"));
+            for _ in 0..400 {
+                channel.emit(ProviderEvent::diagnostic(
+                    EventLevel::Warn,
+                    "writer".into(),
+                    &warning,
+                ));
+            }
+            drop(call);
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "provider_text::events::writer_tests::writer_preserves_admission_and_warn_suppression_notice", "--nocapture"])
+            .env(CHILD, "1")
+            .env_remove("CARINA_WASI_HTTP_TRACE")
+            .output().unwrap();
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("admitted-trace-canary"), "{text}");
+        assert!(text.contains("admitted-warning-canary"), "{text}");
+        assert_eq!(
+            text.matches("provider events suppressed").count(),
+            1,
+            "{text}"
+        );
     }
 }

@@ -67,6 +67,26 @@ impl GuestInputInventory {
     pub fn diagnostics(&self) -> super::ProviderDiagnosticChannel {
         self.diagnostics.clone()
     }
+    pub fn validation_inputs(&self) -> ProviderValidationInputs {
+        ProviderValidationInputs::from_parts(
+            self.secrets.clone(),
+            self.diagnostics.clone(),
+            self._diagnostic_owner.clone(),
+        )
+    }
+    host_api! {
+        fn for_diagnostic_call(&self) -> (Self, super::ProviderDiagnosticCall) {
+            let (diagnostics, call) = self.diagnostics.for_call();
+            (
+                Self {
+                    secrets: self.secrets.clone(),
+                    diagnostics,
+                    _diagnostic_owner: self._diagnostic_owner.clone(),
+                },
+                call,
+            )
+        }
+    }
     /// Preserve inputs handed to an earlier store when adopting its owner.
     pub fn join(&self, other: &Self) {
         self.secrets.extend(&other.secrets);

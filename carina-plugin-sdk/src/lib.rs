@@ -9,6 +9,8 @@ mod diagnostics;
 mod diagnostics_contract;
 pub use carina_core::provider_text::{EventLevel, ProviderValueDiagnostic, ValueOrigin};
 pub use diagnostics::{ProviderDiagnostics, ProviderEvent, expect_diagnostic, panic_diagnostic};
+#[cfg(all(test, feature = "aws"))]
+mod aws_session_tests;
 #[cfg(test)]
 mod diagnostics_tests;
 pub mod protected_material;
@@ -25,6 +27,7 @@ pub use carina_provider_protocol::{FiniteF64, NonFiniteFloatError};
 #[cfg(test)]
 use carina_core::test_utils::provider_text as provider_text_fixtures;
 
+#[cfg(feature = "aws")]
 pub mod aws_credentials;
 
 mod desired;
@@ -108,7 +111,7 @@ use carina_provider_protocol::types::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// Failure while projecting validated SDK schemas onto version-24 JSON.
+/// Failure while projecting validated SDK schemas onto the current protocol JSON.
 #[derive(Debug)]
 pub enum SchemaSerializationError {
     Convert(carina_core::protocol_convert::ProtocolConvertError),

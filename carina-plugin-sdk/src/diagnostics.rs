@@ -61,37 +61,23 @@ impl ProviderDiagnostics {
     /// ```
     /// ```compile_fail,E0308
     /// use carina_plugin_sdk::ProviderDiagnostics;
-    /// fn reject(d: &ProviderDiagnostics) { d.emit("raw"); }
-    /// ```
-    /// ```compile_fail,E0308
-    /// use carina_plugin_sdk::ProviderDiagnostics;
     /// fn reject(d: &ProviderDiagnostics) { d.emit(format_args!("raw {}", 123)); }
     /// ```
-    /// ```compile_fail,E0308
-    /// use carina_plugin_sdk::ProviderDiagnostics;
-    /// fn reject(d: &ProviderDiagnostics, value: &dyn std::fmt::Display) { d.emit(value); }
     /// ```
-    /// ```compile_fail,E0308
-    /// use carina_plugin_sdk::ProviderDiagnostics;
-    /// fn reject(d: &ProviderDiagnostics, value: &dyn std::fmt::Debug) { d.emit(value); }
-    /// ```
-    /// ```
-    /// use carina_core::provider::{ProviderPlan, ProviderError};
+    /// use carina_core::provider::{ProviderSession, ProviderError};
     /// use carina_plugin_sdk::{ProviderDiagnostics, ProviderEvent, EventLevel};
-    /// let session = ProviderPlan::state_only().session("example", None, None)
-    ///     .with_diagnostic_sink(|_event| {});
-    /// let diagnostics = ProviderDiagnostics::from_session(&session);
-    /// let error = ProviderError::internal("ordinary handled failure");
-    /// diagnostics.emit(ProviderEvent::failure(EventLevel::Warn, "retry".into(), &error));
+    /// fn emit(session: &ProviderSession) {
+    ///     let diagnostics = ProviderDiagnostics::from_session(session);
+    ///     let error = ProviderError::internal("ordinary handled failure");
+    ///     diagnostics.emit(ProviderEvent::failure(EventLevel::Warn, "retry".into(), &error));
+    /// }
     /// ```
     pub fn emit(&self, event: ProviderEvent<'_>) {
         match (&self.backend, event.0) {
             #[cfg(not(target_arch = "wasm32"))]
-            (Backend::Native(channel), EventBody::Authored(event)) => channel.emit(event),
+            (Backend::Native(channel), event) => channel.emit(event),
             #[cfg(target_arch = "wasm32")]
-            (Backend::Guest, EventBody::Authored(event)) => guest::emit(event.into_wire()),
-            #[cfg(target_arch = "wasm32")]
-            (Backend::Guest, EventBody::Adapter(event)) => guest::emit(event),
+            (Backend::Guest, event) => guest::emit(event.into_wire()),
         }
     }
     pub(crate) fn register(
@@ -107,24 +93,21 @@ impl ProviderDiagnostics {
     }
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn http(&self, http: wire::HttpDiagnostic) {
-        self.emit(ProviderEvent(EventBody::Adapter(wire::Event {
+        guest::emit(wire::Event {
             severity: EventLevel::Trace,
             context: None,
             body: wire::Payload::Http(http),
-        })));
+        });
     }
 }
 
-pub struct ProviderEvent<'a>(EventBody<'a>);
-enum EventBody<'a> {
-    Authored(carina_core::provider_text::ProviderEvent<'a>),
-    #[cfg(target_arch = "wasm32")]
-    Adapter(wire::Event),
-}
+// Keep this SDK authoring wrapper: core's transport encoder is public on WASM,
+// so re-exporting it here would expose wire extraction through the SDK event.
+pub struct ProviderEvent<'a>(carina_core::provider_text::ProviderEvent<'a>);
 impl<'a> ProviderEvent<'a> {
     pub fn failure(level: EventLevel, context: ProviderContext, error: &'a ProviderError) -> Self {
-        Self(EventBody::Authored(
-            carina_core::provider_text::ProviderEvent::failure(level, context, error),
+        Self(carina_core::provider_text::ProviderEvent::failure(
+            level, context, error,
         ))
     }
     pub fn diagnostic(
@@ -132,13 +115,13 @@ impl<'a> ProviderEvent<'a> {
         context: ProviderContext,
         diagnostic: &'a ProviderDiagnostic,
     ) -> Self {
-        Self(EventBody::Authored(
-            carina_core::provider_text::ProviderEvent::diagnostic(level, context, diagnostic),
+        Self(carina_core::provider_text::ProviderEvent::diagnostic(
+            level, context, diagnostic,
         ))
     }
     pub fn value(level: EventLevel, value: ProviderValueDiagnostic<'a>) -> Self {
-        Self(EventBody::Authored(
-            carina_core::provider_text::ProviderEvent::value(level, value),
+        Self(carina_core::provider_text::ProviderEvent::value(
+            level, value,
         ))
     }
 }

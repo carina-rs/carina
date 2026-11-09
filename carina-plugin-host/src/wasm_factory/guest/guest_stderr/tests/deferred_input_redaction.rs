@@ -79,8 +79,7 @@ impl Provider for LateProvider {
             .as_str()
             .unwrap()
             .to_owned();
-        let mut stream = self.0.p2_stream();
-        write_all(stream.as_mut(), format!("during {plaintext}\n").as_bytes());
+        self.0.write_line(&format!("during {plaintext}")).unwrap();
         Box::pin(
             async move { Err(attempt.not_created(ProviderError::api_error("expected failure"))) },
         )
@@ -175,8 +174,7 @@ async fn guest_stderr_round5_deferred_ref_grows_during_and_after_create() {
         panic!("execution cancelled")
     };
     assert_eq!(result.failure_count(), 1);
-    let mut stream = stderr.p2_stream();
-    write_all(stream.as_mut(), format!("after {SECRET}\n").as_bytes());
+    stderr.write_line(&format!("after {SECRET}")).unwrap();
     stderr.flush_pending().unwrap();
     let text = capture.text();
     assert!(

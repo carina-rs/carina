@@ -1,22 +1,229 @@
 use super::*;
 use crate::provider::{ProviderError, ProviderPlan};
+use crate::test_utils::provider_text::captured_session;
 use std::sync::{Arc, Mutex};
 
-fn captured_session() -> (
-    boundary::ProviderSession,
-    Arc<Mutex<Vec<BoundProviderEvent>>>,
-) {
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    let session = ProviderPlan::state_only()
-        .session("mock", None, None)
-        .with_diagnostic_sink(move |event| sink.lock().unwrap().push(event));
-    (session, events)
+#[test]
+fn inherited_detached_notice_retains_the_host_sink() {
+    let (session, events) =
+        captured_session(ProviderPlan::state_only().session_builder("host", None, None));
+    let value: crate::resource::Value =
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::String("ordinary".into()));
+    let inputs = boundary::ProviderValidationInputs::collect("validation", [&value])
+        .inherit_diagnostic_host(&session.guest_inputs());
+    let channel = inputs.diagnostics();
+    std::thread::spawn(move || {
+        let diagnostic = ProviderDiagnostic::message("inherited detached warning".into());
+        for _ in 0..512 {
+            channel.emit(ProviderEvent::diagnostic(
+                EventLevel::Warn,
+                "detached".into(),
+                &diagnostic,
+            ));
+        }
+    })
+    .join()
+    .unwrap();
+    let admitted = events.lock().unwrap().len();
+    assert!((1..=256).contains(&admitted));
+    drop(session);
+    assert_eq!(events.lock().unwrap().len(), admitted);
+    drop(inputs); // Its channel field drops before its last diagnostic owner.
+    let captured = events.lock().unwrap();
+    assert_eq!(captured.len(), admitted + 1);
+    assert_eq!(
+        present_event(captured.last().unwrap()).to_string(),
+        format!("{} provider events suppressed", 512 - admitted)
+    );
+}
+
+#[test]
+fn default_admission_filters_before_separate_level_budgets() {
+    const CHILD: &str = "CARINA_4334_FIX3_DEFAULT_BUDGET_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let session = ProviderPlan::state_only().session("trace-budget", None, None);
+        let (inputs, call) = session.guest_inventory().for_diagnostic_call();
+        let channel = inputs.diagnostics();
+        let diagnostic = ProviderDiagnostic::message(ProviderText::new("trace-storm-canary"));
+        for _ in 0..400 {
+            channel.emit(ProviderEvent::diagnostic(
+                EventLevel::Trace,
+                "storm".into(),
+                &diagnostic,
+            ));
+        }
+        for (level, message) in [
+            (EventLevel::Warn, "warning-after-trace"),
+            (EventLevel::Error, "error-after-trace"),
+        ] {
+            let error = ProviderError::internal(message);
+            channel.emit(ProviderEvent::failure(level, "after-storm".into(), &error));
+        }
+        drop(call);
+        return;
+    }
+    for enabled in [false, true] {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "provider_text::event_tests::default_admission_filters_before_separate_level_budgets",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("CARINA_WASI_HTTP_TRACE");
+        if enabled {
+            command.env("CARINA_WASI_HTTP_TRACE", "1");
+        }
+        let output = command.output().unwrap();
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("warning-after-trace"), "{text}");
+        assert!(text.contains("error-after-trace"), "{text}");
+        assert_eq!(text.contains("trace-storm-canary"), enabled, "{text}");
+        assert_eq!(
+            text.contains("provider events suppressed"),
+            enabled,
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn custom_sink_observes_trace_without_starving_warnings() {
+    let (session, events) = captured_session(ProviderPlan::state_only().session_builder(
+        "custom-trace-budget",
+        None,
+        None,
+    ));
+    let (inputs, call) = session.guest_inventory().for_diagnostic_call();
+    let channel = inputs.diagnostics();
+    let diagnostic = ProviderDiagnostic::message(ProviderText::new("custom trace"));
+    for _ in 0..400 {
+        channel.emit(ProviderEvent::diagnostic(
+            EventLevel::Trace,
+            "storm".into(),
+            &diagnostic,
+        ));
+    }
+    for (level, message) in [
+        (EventLevel::Warn, "custom warning after trace"),
+        (EventLevel::Error, "custom error after trace"),
+    ] {
+        let error = ProviderError::internal(message);
+        channel.emit(ProviderEvent::failure(level, "after-storm".into(), &error));
+    }
+    drop(call);
+    let text = events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|event| present_event(event).to_string())
+        .collect::<Vec<_>>();
+    let admitted = text
+        .iter()
+        .filter(|event| event.contains("custom trace"))
+        .count();
+    assert!(admitted > 0);
+    assert!(
+        text.iter()
+            .any(|event| event.contains("custom warning after trace"))
+    );
+    assert!(
+        text.iter()
+            .any(|event| event.contains("custom error after trace"))
+    );
+    assert_eq!(
+        text.iter()
+            .filter(|event| event.contains("provider events suppressed"))
+            .collect::<Vec<_>>(),
+        vec![&format!("{} provider events suppressed", 400 - admitted)],
+    );
+}
+
+#[test]
+fn default_sink_filters_trace_with_existing_opt_in() {
+    const CHILD: &str = "CARINA_4334_TRACE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let session = ProviderPlan::state_only().session("trace-provider", None, None);
+        for (level, message) in [
+            (EventLevel::Warn, "warn-canary"),
+            (EventLevel::Trace, "trace-canary"),
+        ] {
+            let error = ProviderError::internal(message);
+            session
+                .diagnostics()
+                .emit(ProviderEvent::failure(level, "filter".into(), &error));
+        }
+        return;
+    }
+    for enabled in [false, true] {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "provider_text::event_tests::default_sink_filters_trace_with_existing_opt_in",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("CARINA_WASI_HTTP_TRACE");
+        if enabled {
+            command.env("CARINA_WASI_HTTP_TRACE", "1");
+        }
+        let output = command.output().unwrap();
+        let text = String::from_utf8(output.stderr).unwrap();
+        assert!(output.status.success(), "{text}");
+        assert!(text.contains("warn-canary"), "{text}");
+        assert_eq!(text.contains("trace-canary"), enabled, "{text}");
+    }
+}
+
+#[test]
+fn validation_events_render_the_actual_provider_name() {
+    let value: crate::resource::Value =
+        crate::resource::Value::Concrete(crate::resource::ConcreteValue::String("ordinary".into()));
+    let (session, events) = captured_session(ProviderPlan::state_only().session_builder(
+        "validation-provider",
+        None,
+        None,
+    ));
+    let inputs = boundary::ProviderValidationInputs::collect("validation-provider", [&value])
+        .inherit_diagnostic_host(&session.guest_inputs());
+    let error = ProviderError::internal("validation event");
+    inputs.diagnostics().emit(ProviderEvent::failure(
+        EventLevel::Warn,
+        "validation".into(),
+        &error,
+    ));
+    let text = present_event(&events.lock().unwrap()[0]).to_string();
+    assert!(text.contains("[validation-provider]"), "{text}");
+}
+
+#[test]
+fn closed_context_registration_does_not_consume_inventory_budget() {
+    use carina_provider_protocol::diagnostics::{ProtectedMaterial, RegistrationError};
+    let session = ProviderPlan::state_only().session("closed", None, None);
+    let channel = session.diagnostics();
+    let inventory = session.redaction_set().clone();
+    drop(session);
+    for _ in 0..2000 {
+        assert_eq!(
+            channel.register_protected(ProtectedMaterial::GithubToken("closed-token".into())),
+            Err(RegistrationError::ClosedContext)
+        );
+    }
+    assert!(inventory.snapshot().is_empty());
+    let next = ProviderPlan::state_only().session("next", None, None);
+    next.diagnostics()
+        .inherit_host(&channel)
+        .register_protected(ProtectedMaterial::GithubToken("fresh".repeat(50_000)))
+        .unwrap();
 }
 
 #[test]
 fn handled_failure_then_success_retains_one_warning_and_native_cause() {
-    let (session, events) = captured_session();
+    let (session, events) =
+        captured_session(ProviderPlan::state_only().session_builder("mock", None, None));
     let error = ProviderError::api_error_caused_by(
         "retrying operation",
         std::io::Error::other("ordinary nested cause"),
@@ -61,12 +268,7 @@ fn handled_failure_then_success_retains_one_warning_and_native_cause() {
 #[test]
 fn configured_secrets_are_redacted_in_every_event_field() {
     let context = crate::test_utils::provider_text::context(&["event-input-canary"]);
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    let session = context
-        .session()
-        .clone()
-        .with_diagnostic_sink(move |event| sink.lock().unwrap().push(event));
+    let (session, events) = captured_session(context.session_builder());
     let error = ProviderError::api_error_caused_by(
         ProviderText::new("ordinary event-input-canary"),
         std::io::Error::other("cause event-input-canary"),
@@ -88,7 +290,8 @@ fn configured_secrets_are_redacted_in_every_event_field() {
 #[test]
 fn guest_registration_covers_events_returned_errors_and_old_generations() {
     use carina_provider_protocol::diagnostics::ProtectedMaterial;
-    let (session, events) = captured_session();
+    let (session, events) =
+        captured_session(ProviderPlan::state_only().session_builder("mock", None, None));
     for token in ["guest-token-first", "guest-token-refresh"] {
         session
             .diagnostics()
@@ -125,7 +328,8 @@ fn guest_registration_covers_events_returned_errors_and_old_generations() {
 #[test]
 fn unresolved_value_address_masks_the_whole_subtree() {
     use carina_provider_protocol::types::Value;
-    let (session, events) = captured_session();
+    let (session, events) =
+        captured_session(ProviderPlan::state_only().session_builder("mock", None, None));
     let value = Value::Map(std::collections::BTreeMap::from([(
         "unknown-key-canary".into(),
         Value::String("unknown-leaf-canary".into()),
@@ -143,7 +347,8 @@ fn unresolved_value_address_masks_the_whole_subtree() {
 
 #[test]
 fn event_count_is_bounded() {
-    let (session, events) = captured_session();
+    let (session, events) =
+        captured_session(ProviderPlan::state_only().session_builder("mock", None, None));
     let diagnostic = ProviderDiagnostic::message(ProviderText::new("ordinary warning"));
     for _ in 0..10_000 {
         session.diagnostics().emit(ProviderEvent::diagnostic(
@@ -160,12 +365,7 @@ fn event_count_is_bounded() {
 #[test]
 fn redaction_precedes_output_truncation() {
     let context = crate::test_utils::provider_text::context(&["secret-at-cutoff-canary"]);
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    let session = context
-        .session()
-        .clone()
-        .with_diagnostic_sink(move |event| sink.lock().unwrap().push(event));
+    let (session, events) = captured_session(context.session_builder());
     let text = format!(
         "{}secret-at-cutoff-canary{}",
         "x".repeat(MAX_PROVIDER_TEXT_BYTES - 30),
@@ -211,11 +411,7 @@ fn value_session(
         );
     }
     let plan = ProviderPlan::from_desired(&[resource], &[]);
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    let session = plan
-        .session("mock", None, None)
-        .with_diagnostic_sink(move |event| sink.lock().unwrap().push(event));
+    let (session, events) = captured_session(plan.session_builder("mock", None, None));
     let schema = ResourceSchema::new("Widget")
         .attribute(AttributeSchema::optional("public", AttributeType::string()).build())
         .attribute(
@@ -324,7 +520,8 @@ fn public_value_leaves_and_keys_use_the_session_redactor() {
 
 #[test]
 fn oversized_and_deep_masked_values_are_rejected_before_binding() {
-    let (session, events) = captured_session();
+    let (session, events) =
+        captured_session(ProviderPlan::state_only().session_builder("mock", None, None));
     let huge = carina_provider_protocol::types::Value::String("x".repeat(100_000));
     session.diagnostics().emit(ProviderEvent::value(
         EventLevel::Warn,
@@ -344,7 +541,8 @@ fn oversized_and_deep_masked_values_are_rejected_before_binding() {
 #[test]
 fn registration_limit_failure_is_atomic_and_does_not_echo_input() {
     use carina_provider_protocol::diagnostics::{AwsSession, ProtectedMaterial, RegistrationError};
-    let (session, _events) = captured_session();
+    let (session, _events) =
+        captured_session(ProviderPlan::state_only().session_builder("mock", None, None));
     let error = session
         .diagnostics()
         .register_protected(ProtectedMaterial::AwsSession(AwsSession {
@@ -384,7 +582,8 @@ fn unresolved_nested_member_masks_its_key_and_value() {
 #[test]
 fn a_runtime_address_without_checked_input_coverage_cannot_authorize_value_text() {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
-    let (session, events) = captured_session();
+    let (session, events) =
+        captured_session(ProviderPlan::state_only().session_builder("mock", None, None));
     let id =
         crate::resource::ResourceId::with_provider_identity("mock", "Widget", "runtime-only", None);
     let mut schemas = SchemaRegistry::new();
@@ -421,12 +620,7 @@ fn a_runtime_address_without_checked_input_coverage_cannot_authorize_value_text(
 #[test]
 fn presenter_redacts_a_secret_assembled_across_bound_segments() {
     let context = crate::test_utils::provider_text::context(&["cross-boundary: secret-value"]);
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let sink = events.clone();
-    let session = context
-        .session()
-        .clone()
-        .with_diagnostic_sink(move |event| sink.lock().unwrap().push(event));
+    let (session, events) = captured_session(context.session_builder());
     let diagnostic = ProviderDiagnostic::message("secret-value".into());
     session.diagnostics().emit(ProviderEvent::diagnostic(
         EventLevel::Warn,

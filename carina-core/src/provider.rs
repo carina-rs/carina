@@ -61,7 +61,8 @@ use crate::wait::predicate::AttrPath;
 #[cfg(test)]
 pub(crate) use crate::provider_text::boundary::prepare_provider_session;
 pub use crate::provider_text::boundary::{
-    ProviderBoundary, ProviderPlan, ProviderSession, ProviderValidationInputs,
+    ProviderBoundary, ProviderPlan, ProviderSession, ProviderSessionBuilder,
+    ProviderValidationInputs,
 };
 
 pub use crate::executor::provider_ready::{
@@ -415,7 +416,16 @@ impl std::fmt::Display for ProviderFailure<Bound> {
         DiagnosticText::new(self.host_diagnostic_text()).fmt(f)
     }
 }
-impl std::error::Error for ProviderFailure<Bound> {}
+impl std::error::Error for ProviderFailure<Bound> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // The schema-install boundary privately mints this host-owned cause.
+        // Arbitrary provider causes still require their opaque, bound projection.
+        self.detail()
+            .cause()
+            .and_then(Diagnostic::event_schema_source)
+            .map(|error| error as &(dyn std::error::Error + 'static))
+    }
+}
 
 impl<S: TextState> From<crate::value::EnumCanonicalizationError> for ProviderFailure<S> {
     fn from(error: crate::value::EnumCanonicalizationError) -> Self {
@@ -7157,7 +7167,7 @@ impl InitializedProvider {
 /// Normalizer-only loading returns this type. It deliberately has no API that
 /// can mint a [`crate::differ::ComparisonSchema`].
 pub struct ConfiguredNormalizer<N = Box<dyn ProviderNormalizer>> {
-    pub(crate) _diagnostic_owner: crate::provider_text::DiagnosticOwner,
+    pub(crate) diagnostic_inputs: ProviderValidationInputs,
     pub(crate) route: Option<ProviderInstanceKey>,
     pub(crate) provider_name: String,
     pub(crate) ext: N,
@@ -7192,14 +7202,13 @@ impl NormalizerRouter {
 #[cfg(test)]
 impl<N> ConfiguredNormalizer<N> {
     pub(crate) fn fixture(ext: N) -> Self {
+        let session = ProviderPlan::state_only().session("", None, None);
         Self {
-            _diagnostic_owner: ProviderPlan::state_only()
-                .session("", None, None)
-                .diagnostic_owner(),
+            diagnostic_inputs: session.guest_inputs(),
             route: None,
             provider_name: String::new(),
             ext,
-            config_secrets: RedactionSet::before_request(),
+            config_secrets: session.redaction_set().clone(),
             schemas: SchemaRegistry::new(),
         }
     }
@@ -7209,7 +7218,7 @@ impl<N> ConfiguredNormalizer<N> {
         schemas: &SchemaRegistry,
     ) -> Self {
         Self {
-            _diagnostic_owner: session.diagnostic_owner(),
+            diagnostic_inputs: session.guest_inputs(),
             route: None,
             provider_name: String::new(),
             ext,
@@ -7225,14 +7234,14 @@ impl NormalizerRouter {
         provider_name: impl Into<String>,
         ext: Box<dyn ProviderNormalizer>,
     ) {
+        let provider_name = provider_name.into();
+        let session = ProviderPlan::state_only().session(&provider_name, None, None);
         self.add_initialized_normalizer(ConfiguredNormalizer {
-            _diagnostic_owner: ProviderPlan::state_only()
-                .session("", None, None)
-                .diagnostic_owner(),
+            diagnostic_inputs: session.guest_inputs(),
             route: None,
-            provider_name: provider_name.into(),
+            provider_name,
             ext,
-            config_secrets: RedactionSet::before_request(),
+            config_secrets: session.redaction_set().clone(),
             schemas: SchemaRegistry::new(),
         });
     }
@@ -7248,6 +7257,12 @@ impl ProviderRouter {
     }
 }
 impl<N: ProviderNormalizer> ConfiguredNormalizer<N> {
+    fn dispatch<'a, F: std::future::Future + Send + 'a>(
+        &self,
+        invoke: impl FnOnce() -> F,
+    ) -> BoxFuture<'a, F::Output> {
+        self.diagnostic_inputs.diagnostics().dispatch(invoke)
+    }
     fn owns(&self, id: &ResourceId) -> bool {
         self.route.as_ref().is_none_or(|route| {
             route.provider() == id.provider
@@ -7279,13 +7294,11 @@ impl<N: ProviderNormalizer> ConfiguredNormalizer<N> {
                     .map(|(id, attrs)| (id.clone(), attrs.clone()))
                     .collect(),
             );
-            self.ext
-                .hydrate_read_state(&mut selected, &saved)
+            self.dispatch(|| self.ext.hydrate_read_state(&mut selected, &saved))
                 .await
                 .map_err(|error| self.bind_error(error))?;
         } else {
-            self.ext
-                .normalize_state(&mut selected)
+            self.dispatch(|| self.ext.normalize_state(&mut selected))
                 .await
                 .map_err(|error| self.bind_error(error))?;
         }
@@ -7318,8 +7331,7 @@ impl<N: ProviderNormalizer> ConfiguredNormalizer<N> {
             if dispatch {
                 crate::executor::normalized::unwrap_dispatch_desired(&mut selected);
             }
-            self.ext
-                .normalize_desired(&mut selected)
+            self.dispatch(|| self.ext.normalize_desired(&mut selected))
                 .await
                 .map_err(|error| self.bind_error(error))?;
             if ids
@@ -8891,10 +8903,11 @@ pub fn validate_custom_type_with_factory(
     factory: &dyn ProviderFactory,
     declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
     value: &crate::resource::knowledge::KnownValue<'_>,
+    host: &ProviderValidationInputs,
 ) -> Result<(), CustomTypeFactoryValidationError> {
     crate::schema::validate_custom_type_leaf(declaration, value, |proof| {
         proof.map_or(Ok(()), |proof| {
-            dispatch_validated_custom_type(factory, proof)
+            dispatch_validated_custom_type(factory, proof, host)
         })
     })
     .map_err(CustomTypeFactoryValidationError::InvalidValue)?
@@ -8903,10 +8916,19 @@ pub fn validate_custom_type_with_factory(
 fn dispatch_validated_custom_type(
     factory: &dyn ProviderFactory,
     proof: crate::schema::LocallyValidatedCustomType<'_>,
+    host: &ProviderValidationInputs,
 ) -> Result<(), CustomTypeFactoryValidationError> {
-    let session = ProviderValidationInputs::collect([proof.value()]);
-    factory
-        .validate_custom_type(proof.declaration().identity(), proof.canonical(), &session)
+    let session = ProviderValidationInputs::collect(factory.name(), [proof.value()])
+        .inherit_diagnostic_host(host);
+    session
+        .diagnostics()
+        .dispatch_sync(|| {
+            factory.validate_custom_type(
+                proof.declaration().identity(),
+                proof.canonical(),
+                &session,
+            )
+        })
         .map_err(|error| {
             CustomTypeFactoryValidationError::ProviderRejected(
                 error.with_secrets(session.redaction_set()),
@@ -8917,9 +8939,10 @@ fn dispatch_validated_custom_type(
 pub(crate) fn validate_validated_custom_type_with_factory(
     factory: &dyn ProviderFactory,
     proof: crate::schema::LocallyValidatedCustomType<'_>,
+    host: &ProviderValidationInputs,
 ) -> Result<(), crate::parser::CustomTypeValidationError> {
     let identity = proof.declaration().identity().clone();
-    dispatch_validated_custom_type(factory, proof)
+    dispatch_validated_custom_type(factory, proof, host)
         .map_err(|error| owner_validation_error(factory.name(), &identity, error))
 }
 
@@ -8970,8 +8993,13 @@ pub(crate) fn validate_custom_type_declaration_with_factory(
                 CustomTypeFactoryValidationError::InvalidValue(error.into()),
             )
         })?;
-    validate_custom_type_with_factory(factory, declaration, &known)
-        .map_err(|error| owner_validation_error(owner, declaration.identity(), error))
+    validate_custom_type_with_factory(
+        factory,
+        declaration,
+        &known,
+        &ProviderValidationInputs::collect(factory.name(), [value]),
+    )
+    .map_err(|error| owner_validation_error(owner, declaration.identity(), error))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9300,6 +9328,7 @@ impl ProviderFactorySource for &[Box<dyn ProviderFactory>] {
 pub(crate) struct FactoryCustomTypeResolver<F> {
     factories: F,
     index: BTreeMap<String, OwnerCustomTypeIndex>,
+    diagnostic_inputs: BTreeMap<String, ProviderValidationInputs>,
     assignability_closures:
         BTreeMap<crate::parser::SchemaTypeOwner, crate::schema::AssignabilityClosure>,
 }
@@ -9321,7 +9350,16 @@ where
         index: BTreeMap<String, OwnerCustomTypeIndex>,
         schemas: &SchemaRegistry,
     ) -> Self {
+        let diagnostic_inputs = index
+            .keys()
+            .map(|owner| {
+                let inputs = ProviderValidationInputs::collect(owner, std::iter::empty::<&Value>());
+                inputs.diagnostics().set_schemas(schemas.clone());
+                (owner.clone(), inputs)
+            })
+            .collect();
         Self {
+            diagnostic_inputs,
             factories,
             index,
             assignability_closures: schemas.assignability_closures().clone(),
@@ -9457,6 +9495,7 @@ where
         validate_validated_custom_type_with_factory(
             factories[owner_index.factory_index].as_ref(),
             proof,
+            &self.diagnostic_inputs[owner],
         )
     }
 
@@ -9975,6 +10014,7 @@ impl<P: Provider + ?Sized> Provider for &P {
 
 #[cfg(test)]
 mod tests {
+    use crate::test_utils::provider_text::captured_session;
     #[test]
     fn issue_4276_round1_external_canonicalization_cannot_bypass_local_validation() {
         // Compile as an external crate: unit tests themselves can access
@@ -10997,6 +11037,92 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
         ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
             Box::pin(async { Err(ProviderError::internal("not used")) })
         }
+    }
+
+    #[test]
+    fn native_custom_type_validation_inherits_host_sink() {
+        struct DiagnosticFactory;
+        impl ProviderFactory for DiagnosticFactory {
+            fn schema_witness(&self) -> ValidatedProviderSchemaWitness {
+                ConfigOnlyCustomTypeFactory.schema_witness()
+            }
+            fn name(&self) -> &str {
+                "config-owner"
+            }
+            fn display_name(&self) -> &str {
+                "Diagnostic validator"
+            }
+            fn schemas(&self) -> Vec<ValidatedResourceSchema> {
+                Vec::new()
+            }
+            fn provider_config_attribute_types(&self) -> ValidatedConfigSchema {
+                ConfigOnlyCustomTypeFactory.provider_config_attribute_types()
+            }
+            fn validate_config(
+                &self,
+                _: &CanonicalProviderConfigAttributes,
+                _: &ProviderValidationInputs,
+            ) -> ProviderResult<()> {
+                Ok(())
+            }
+            fn validate_custom_type(
+                &self,
+                _: &TypeIdentity,
+                _: &CanonicalCustomTypeValue,
+                inputs: &ProviderValidationInputs,
+            ) -> ProviderResult<()> {
+                let diagnostic = ProviderDiagnostic::message("native custom-type warning".into());
+                inputs
+                    .diagnostics()
+                    .emit(crate::provider_text::ProviderEvent::diagnostic(
+                        crate::provider_text::EventLevel::Warn,
+                        "validation".into(),
+                        &diagnostic,
+                    ));
+                Ok(())
+            }
+            fn create_provider(
+                &self,
+                _: &ProviderSession,
+                _: InitializeOutcomeMint,
+            ) -> BoxFuture<'_, ProviderResult<ProviderInitialization>> {
+                Box::pin(async { Err(ProviderError::internal("not used")) })
+            }
+        }
+        let (session, events) = captured_session(ProviderPlan::state_only().session_builder(
+            "config-owner",
+            None,
+            None,
+        ));
+        let schema = DiagnosticFactory.provider_config_attribute_types();
+        let declaration =
+            crate::parser::IdentifiedCustomTypeDeclaration::new(&schema.parts()["endpoint"])
+                .unwrap();
+        let value: Value = Value::Concrete(ConcreteValue::String("native-value".into()));
+        let known = value
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .unwrap()
+            .into_classification()
+            .into_known()
+            .unwrap();
+        validate_custom_type_with_factory(
+            &DiagnosticFactory,
+            declaration,
+            &known,
+            &session.guest_inputs(),
+        )
+        .unwrap();
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "the host-installed sink must observe native validation"
+        );
+        assert!(
+            crate::provider_text::present_event(&events[0])
+                .to_string()
+                .contains("warn [config-owner] validation: native custom-type warning")
+        );
     }
 
     #[test]
@@ -12735,6 +12861,330 @@ pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType
                     .expect("test data source should pass provider preparation")
             },
         )
+    }
+
+    enum DiagnosticEmission {
+        Task,
+        Blocking,
+        Thread,
+        Overlapping(Arc<tokio::sync::Barrier>),
+    }
+    struct AsyncDiagnosticFloodProvider {
+        diagnostics: crate::provider_text::ProviderDiagnosticChannel,
+        emission: DiagnosticEmission,
+        inner: MockProvider,
+    }
+    fn emit_native_flood(
+        diagnostics: &crate::provider_text::ProviderDiagnosticChannel,
+        count: usize,
+        context: &'static str,
+    ) {
+        let diagnostic = ProviderDiagnostic::message("detached native warning".into());
+        for _ in 0..count {
+            diagnostics.emit(crate::provider_text::ProviderEvent::diagnostic(
+                crate::provider_text::EventLevel::Warn,
+                context.into(),
+                &diagnostic,
+            ));
+        }
+    }
+    impl Provider for AsyncDiagnosticFloodProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn read(
+            &self,
+            id: &ResourceId,
+            identifier: &AppliedIdentifier,
+            _: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+            let id = id.clone();
+            let diagnostics = self.diagnostics.clone();
+            let (count, context) = if identifier.as_str() == "first" {
+                (300, "first-read")
+            } else {
+                (600, "second-read")
+            };
+            Box::pin(async move {
+                match &self.emission {
+                    DiagnosticEmission::Task => tokio::spawn(async move {
+                        emit_native_flood(&diagnostics, 2048, "detached-task");
+                    })
+                    .await
+                    .unwrap(),
+                    DiagnosticEmission::Blocking => tokio::task::spawn_blocking(move || {
+                        emit_native_flood(&diagnostics, 2048, "detached-blocking");
+                    })
+                    .await
+                    .unwrap(),
+                    DiagnosticEmission::Thread => std::thread::spawn(move || {
+                        emit_native_flood(&diagnostics, 2048, "detached-thread");
+                    })
+                    .join()
+                    .unwrap(),
+                    DiagnosticEmission::Overlapping(barrier) => {
+                        barrier.wait().await;
+                        let diagnostic =
+                            ProviderDiagnostic::message("overlapping native warning".into());
+                        for _ in 0..count {
+                            diagnostics.emit(crate::provider_text::ProviderEvent::diagnostic(
+                                crate::provider_text::EventLevel::Warn,
+                                context.into(),
+                                &diagnostic,
+                            ));
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                }
+                Ok(ReadOutcome::not_found(id))
+            })
+        }
+        fn read_data_source(
+            &self,
+            resource: &ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            self.inner.read_data_source(resource)
+        }
+        fn create(
+            &self,
+            id: &ResourceId,
+            request: CreateRequest,
+            attempt: CreateAttempt,
+        ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+            self.inner.create(id, request, attempt)
+        }
+        unexpected_resume_create!();
+        fn update(
+            &self,
+            id: &ResourceId,
+            identifier: &AppliedIdentifier,
+            request: UpdateRequest,
+            attempt: UpdateAttempt,
+        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+            self.inner.update(id, identifier, request, attempt)
+        }
+        fn delete(&self, attempt: DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
+            self.inner.delete(attempt)
+        }
+        fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
+            self.inner.required_permissions(id, op)
+        }
+    }
+    fn captured_async_flood(
+        emission: DiagnosticEmission,
+    ) -> (
+        ProviderBoundary<'static>,
+        Arc<std::sync::Mutex<Vec<crate::provider_text::BoundProviderEvent>>>,
+    ) {
+        let (session, events) =
+            captured_session(ProviderPlan::state_only().session_builder("mock", None, None));
+        let mut boundary = ProviderBoundary::fixture(AsyncDiagnosticFloodProvider {
+            diagnostics: session.diagnostics(),
+            emission,
+            inner: MockProvider,
+        });
+        boundary.set_fixture_session(session, &SchemaRegistry::new());
+        (boundary, events)
+    }
+
+    #[tokio::test]
+    async fn detached_native_flood_flushes_once_when_the_owner_drops() {
+        for emission in [
+            DiagnosticEmission::Task,
+            DiagnosticEmission::Blocking,
+            DiagnosticEmission::Thread,
+        ] {
+            let (boundary, events) = captured_async_flood(emission);
+            let id = ResourceId::with_provider_identity("mock", "test", "detached", None);
+            boundary
+                .read(&id, &fixture_applied_identifier("detached"), ReadRequest)
+                .await
+                .unwrap();
+            let admitted = {
+                let captured = events.lock().unwrap();
+                assert!(captured.iter().all(|event| {
+                    crate::provider_text::present_event(event)
+                        .to_string()
+                        .contains("detached native warning")
+                }));
+                assert!(
+                    (1..=256).contains(&captured.len()),
+                    "the spare budget must bound the flood"
+                );
+                captured.len()
+            };
+            drop(boundary); // Drops the last host-owned session/normalizer inputs.
+            let captured = events.lock().unwrap();
+            let text = captured
+                .iter()
+                .map(|event| crate::provider_text::present_event(event).to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                text.iter()
+                    .filter(|event| event.contains("detached native warning"))
+                    .count(),
+                admitted
+            );
+            assert_eq!(
+                text.iter()
+                    .filter(|event| event.contains("provider events suppressed"))
+                    .collect::<Vec<_>>(),
+                vec![&format!("{} provider events suppressed", 2048 - admitted)]
+            );
+            assert_eq!(captured.len(), admitted + 1);
+        }
+    }
+
+    #[test]
+    fn fixture_normalizer_owns_live_diagnostic_inputs() {
+        let normalizer = ConfiguredNormalizer::fixture(NoopNormalizer);
+        let inputs: &ProviderValidationInputs = &normalizer.diagnostic_inputs;
+        assert!(
+            inputs
+                .diagnostics()
+                .register_protected(
+                    carina_provider_protocol::diagnostics::ProtectedMaterial::GithubToken(
+                        "fixture-token".into()
+                    )
+                )
+                .is_ok(),
+            "fixture inputs must retain their diagnostic owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlapping_native_reads_have_independent_budgets_and_notices() {
+        let (boundary, events) = captured_async_flood(DiagnosticEmission::Overlapping(Arc::new(
+            tokio::sync::Barrier::new(2),
+        )));
+        let id = ResourceId::with_provider_identity("mock", "test", "overlapping", None);
+        let first = fixture_applied_identifier("first");
+        let second = fixture_applied_identifier("second");
+        let (first_result, second_result) = tokio::join!(
+            boundary.read(&id, &first, ReadRequest),
+            boundary.read(&id, &second, ReadRequest),
+        );
+        first_result.unwrap();
+        second_result.unwrap();
+        drop(boundary);
+        let captured = events.lock().unwrap();
+        let text = captured
+            .iter()
+            .map(|event| crate::provider_text::present_event(event).to_string())
+            .collect::<Vec<_>>();
+        let mut expected = Vec::new();
+        for (context, total) in [("first-read", 300), ("second-read", 600)] {
+            let admitted = text.iter().filter(|event| event.contains(context)).count();
+            assert!(
+                (64..=256).contains(&admitted),
+                "each call must admit its own quota: {context}: {admitted}"
+            );
+            expected.push(format!("{} provider events suppressed", total - admitted));
+        }
+        let mut notices = text
+            .into_iter()
+            .filter(|event| event.contains("provider events suppressed"))
+            .collect::<Vec<_>>();
+        notices.sort();
+        expected.sort();
+        assert_eq!(
+            notices, expected,
+            "one count-only notice for each overlapping call"
+        );
+    }
+
+    struct DiagnosticFloodProvider {
+        diagnostics: crate::provider_text::ProviderDiagnosticChannel,
+        inner: MockProvider,
+    }
+    impl Provider for DiagnosticFloodProvider {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn read(
+            &self,
+            id: &ResourceId,
+            identifier: &AppliedIdentifier,
+            request: ReadRequest,
+        ) -> BoxFuture<'_, ProviderResult<ReadOutcome>> {
+            // Emit before returning the future too: dispatch must scope invocation,
+            // not only the future's subsequent polls.
+            let diagnostic = ProviderDiagnostic::message("native flood warning".into());
+            for _ in 0..300 {
+                self.diagnostics
+                    .emit(crate::provider_text::ProviderEvent::diagnostic(
+                        crate::provider_text::EventLevel::Warn,
+                        "native-call".into(),
+                        &diagnostic,
+                    ));
+            }
+            self.inner.read(id, identifier, request)
+        }
+        fn read_data_source(
+            &self,
+            resource: &ProviderReadyDataSource,
+        ) -> BoxFuture<'_, ProviderResult<State>> {
+            self.inner.read_data_source(resource)
+        }
+        fn create(
+            &self,
+            id: &ResourceId,
+            request: CreateRequest,
+            attempt: CreateAttempt,
+        ) -> BoxFuture<'_, Result<CreateOutcome, CreateFailure>> {
+            self.inner.create(id, request, attempt)
+        }
+        unexpected_resume_create!();
+        fn update(
+            &self,
+            id: &ResourceId,
+            identifier: &AppliedIdentifier,
+            request: UpdateRequest,
+            attempt: UpdateAttempt,
+        ) -> BoxFuture<'_, ProviderResult<UpdateOutcome>> {
+            self.inner.update(id, identifier, request, attempt)
+        }
+        fn delete(&self, attempt: DeleteAttempt) -> BoxFuture<'_, ProviderResult<()>> {
+            self.inner.delete(attempt)
+        }
+        fn required_permissions(&self, id: &ResourceId, op: PlanOp) -> ProviderResult<Vec<String>> {
+            self.inner.required_permissions(id, op)
+        }
+    }
+
+    #[tokio::test]
+    async fn native_calls_have_independent_budgets_and_one_notice_each() {
+        let (session, events) =
+            captured_session(ProviderPlan::state_only().session_builder("mock", None, None));
+        let mut boundary = ProviderBoundary::fixture(DiagnosticFloodProvider {
+            diagnostics: session.diagnostics(),
+            inner: MockProvider,
+        });
+        boundary.set_fixture_session(session, &SchemaRegistry::new());
+        let id = ResourceId::with_provider_identity("mock", "test", "calls", None);
+        for _ in 0..2 {
+            boundary
+                .read(&id, &fixture_applied_identifier("calls"), ReadRequest)
+                .await
+                .unwrap();
+            let captured = std::mem::take(&mut *events.lock().unwrap());
+            let rendered = captured
+                .iter()
+                .map(|event| crate::provider_text::present_event(event).to_string())
+                .collect::<Vec<_>>();
+            let admitted = rendered
+                .iter()
+                .filter(|text| text.contains("native flood warning"))
+                .count();
+            assert!(admitted > 0, "each native call must receive a fresh budget");
+            assert_eq!(
+                rendered
+                    .iter()
+                    .filter(|text| text.contains("provider events suppressed"))
+                    .collect::<Vec<_>>(),
+                vec![&format!("{} provider events suppressed", 300 - admitted)]
+            );
+        }
     }
 
     // Mock Provider for testing

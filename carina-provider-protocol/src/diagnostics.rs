@@ -19,6 +19,7 @@ pub enum ValueOrigin {
 pub enum DiagnosticValue {
     Typed(Value),
     Json(String),
+    Masked,
 }
 pub struct ValueDiagnostic {
     pub id: Option<ResourceId>,
@@ -49,12 +50,6 @@ pub enum HttpTransportCode {
 ///     request_body_bytes: 0, response_body_bytes: Some(0), status: Some(200),
 ///     transport_code: None, phases_ms: [0; 7], response_body: "raw".into() };
 /// ```
-/// ```
-/// use carina_provider_protocol::diagnostics::HttpDiagnostic;
-/// let _ = HttpDiagnostic { method: "GET".into(), uri: "/".into(), headers: vec![],
-///     request_body_bytes: 0, response_body_bytes: Some(0), status: Some(200),
-///     transport_code: None, phases_ms: [0; 7] };
-/// ```
 pub struct HttpDiagnostic {
     pub method: String,
     pub uri: String,
@@ -78,20 +73,32 @@ pub struct Event {
     pub body: Payload,
 }
 
+#[derive(Clone)]
 pub struct AwsSession {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub session_token: Option<String>,
 }
-pub struct SignedMaterial {
-    pub authorization: String,
-    pub signature: Option<String>,
-    pub query_secret_values: Vec<String>,
-}
 pub enum ProtectedMaterial {
     AwsSession(AwsSession),
     GithubToken(String),
-    SignedMaterial(SignedMaterial),
+}
+impl ProtectedMaterial {
+    pub fn values(&self) -> impl Iterator<Item = &str> {
+        let values = match self {
+            Self::AwsSession(AwsSession {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            }) => [
+                Some(access_key_id.as_str()),
+                Some(secret_access_key.as_str()),
+                session_token.as_deref(),
+            ],
+            Self::GithubToken(token) => [Some(token.as_str()), None, None],
+        };
+        values.into_iter().flatten()
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RegistrationError {
