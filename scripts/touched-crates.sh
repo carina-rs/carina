@@ -16,7 +16,9 @@
 #
 # The script never fails on classification — when in doubt, it emits
 # `--workspace` rather than under-test the change.
-# Failure to discover changed files is fatal; it must not look like no changes.
+# A cargo metadata failure warns and deliberately widens to `--workspace`
+# to avoid missing tests. Git failures are errors; failure to discover changed
+# files must not look like no changes.
 #
 # Heuristics (in order):
 #   1. A change to any `Cargo.toml` or `Cargo.lock` ⇒ `--workspace`.

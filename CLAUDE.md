@@ -367,7 +367,7 @@ git diff --name-only | scripts/touched-crates.sh --stdin   # custom file list
 | ---------------- | --------------------------------------------------------- |
 | `-p <crate> ...` | Run touched crates and all transitive reverse dependents in the workspace. |
 | `--workspace`    | Cross-cutting change (core, manifests, WASM fixture crates, Cargo execution scripts/configuration, CI/local actions, or an unrecognized path), or the dependency closure covers every member. Sweep the whole workspace. |
-| (empty)          | No test-relevant files changed (only docs, static-check scripts, other CI files, or infra). Skip the test step. |
+| (empty)          | No test-relevant files changed (only docs, static-check scripts, other CI files, infra, or `examples/*`). `verify.sh --local` skips only crate-scoped kinds; static kinds still run. |
 
 The helper is intentionally pessimistic. Changes to `carina-core`, manifests,
 WASM fixture crates, or Cargo execution configuration require the full
@@ -375,6 +375,10 @@ workspace. Artifact consumers have no Cargo dependency edge to the fixture
 crates listed in `scripts/wasm-fixture-crates.txt`. A new top-level directory or
 unclassified file also requires the full workspace until the helper learns
 about it.
+
+A `cargo metadata` failure emits a warning and deliberately widens to
+`--workspace` to avoid missing tests. A git failure is an error because the
+helper cannot determine which files changed.
 
 ## Plan Display Testing
 

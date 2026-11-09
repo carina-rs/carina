@@ -24,8 +24,10 @@ No KIND runs all checks, with static checks first. --local only changes
 crate scope, using touched-crates.sh (including reverse dependents and
 uncommitted changes).
 --base <ref> is passed to touched-crates.sh; it requires --local.
---list-kinds prints the default kinds, one per line, without running checks.
---list-kinds=ci also lists CI mechanics (isolation-with-archive means isolation <archive>).
+Bare isolation always builds its fixed workspace-wide suites, even with
+--local; it only skips on an empty local scope.
+--list-kinds=ci prints all kinds and CI mechanics, one per line, without
+running checks (isolation-with-archive means isolation <archive>).
 
 Kinds:
   fmt provider-boundaries error-source-display no-wall-clock-test-assertions
@@ -49,7 +51,6 @@ base_args=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --local) local_mode=true; shift ;;
-        --list-kinds) printf '%s\n' "${default_kinds[@]}"; exit 0 ;;
         --list-kinds=ci)
             printf '%s\n' "${default_kinds[@]}" "${mechanic_kinds[@]}" isolation-with-archive
             exit 0

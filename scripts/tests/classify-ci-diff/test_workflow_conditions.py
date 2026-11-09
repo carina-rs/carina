@@ -362,19 +362,14 @@ class WorkflowConditionTests(unittest.TestCase):
         self.assertIn("nextest", ci_kinds)
         self.assertNotIn("nextest-archive", ci_kinds)
 
-    def test_list_kinds_matches_default_dispatch_without_prerequisites(self):
+    def test_list_ci_kinds_matches_default_dispatch_without_prerequisites(self):
         default, _ = self.verify_commands()
         result, commands = self.verify_commands(
-            "--list-kinds", missing=("cargo", "cargo-nextest", "cargo-hack", "rustup"))
+            "--list-kinds=ci", missing=("cargo", "cargo-nextest", "cargo-hack", "rustup"))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(commands, [])
         self.assertEqual(result.stdout.splitlines(),
-                         re.findall(r"^=== ([a-z-]+) ===$", default.stdout, re.MULTILINE))
-        ci, commands = self.verify_commands(
-            "--list-kinds=ci", missing=("cargo", "cargo-nextest", "cargo-hack", "rustup"))
-        self.assertEqual(ci.returncode, 0, ci.stderr)
-        self.assertEqual(commands, [])
-        self.assertEqual(ci.stdout.splitlines(), result.stdout.splitlines() + [
+                         re.findall(r"^=== ([a-z-]+) ===$", default.stdout, re.MULTILINE) + [
             "nextest-compile", "nextest-archive", "nextest-partition", "isolation-with-archive",
         ])
 
@@ -533,12 +528,12 @@ class WorkflowConditionTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 1, result.stdout)
                 self.assertIn("bypasses verify.sh", result.stderr)
 
-            # Every declared default must retain its CI execution, including
-            # partitioned nextest. Removing a mechanic must fail separately.
-            kinds = subprocess.check_output(["bash", str(scripts / "verify.sh"), "--list-kinds"],
+            # Every declared kind must retain its CI execution, including
+            # partitioned nextest and archive mechanics.
+            kinds = subprocess.check_output(["bash", str(scripts / "verify.sh"), "--list-kinds=ci"],
                                             text=True).splitlines()
-            for kind in kinds + ["nextest-compile", "nextest-archive", "nextest-partition"]:
-                ci_kind = "nextest-partition" if kind == "nextest" else kind
+            for kind in kinds:
+                ci_kind = {"nextest": "nextest-partition", "isolation-with-archive": "isolation"}.get(kind, kind)
                 source, removed = re.subn(
                     r"(?m)^([ \t]*(?:- )?run: )scripts/verify\.sh " + re.escape(ci_kind) + r"(?: [^\n]*)?\n",
                     r"\1echo omitted\n", original)
