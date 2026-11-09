@@ -16,6 +16,39 @@ use yoke::{Yoke, Yokeable};
 /// use carina_core::{input_rules::RuleInput, resource::Value};
 /// fn forge(transport: indexmap::IndexMap<String, Value>) -> RuleInput { transport.into() }
 /// ```
+///
+/// Crate-visible update boundaries must also reject mismatched checked inputs.
+/// The positive control compiles the same production modules in the doctest's
+/// crate, so these probes cannot pass merely because the methods are private.
+///
+/// ```no_run
+/// # include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/internal_rule_input_doctest.rs"));
+/// fn protected_source(ready: &crate::provider::ProviderReadyResource) {
+///     let _ = ready.protected_desired_tree();
+/// }
+/// fn main() {}
+/// ```
+/// ```compile_fail
+/// # include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/internal_rule_input_doctest.rs"));
+/// fn mismatch(
+///     a: &crate::provider::ProviderReadyResource,
+///     b: &crate::provider::ProviderReadyResource,
+///     request_b: &crate::provider::UpdateRequest,
+///     schema: &crate::schema::ValidatedResourceSchema,
+/// ) {
+///     let desired_a = a.protected_desired_tree();
+///     let patch_b = b.annotated_exact_patch(request_b);
+///     let _ = crate::input_rules::RuleInput::for_dispatch_update(&desired_a, &patch_b, schema);
+/// }
+/// fn main() {}
+/// ```
+/// ```compile_fail
+/// # include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/internal_rule_input_doctest.rs"));
+/// fn mismatch(a: &crate::provider::ProviderReadyResource, request_b: &crate::provider::UpdateRequest) {
+///     let _ = a.annotated_exact_patch(request_b);
+/// }
+/// fn main() {}
+/// ```
 pub struct RuleInput {
     graph: Yoke<EvidenceGraph<'static>, Box<InputStorage>>,
 }
@@ -90,7 +123,24 @@ pub enum WithheldReason {
 
 pub struct Withheld<'a> {
     reason: WithheldReason,
-    node: Option<NodeRef<'a>>,
+    location: WithheldLocation<'a>,
+}
+
+#[derive(Clone, Copy)]
+enum WithheldLocation<'a> {
+    Target(NodeRef<'a>),
+    Ancestor(EnclosingNode<'a>),
+    Missing,
+}
+
+/// Enclosing evidence carries protection but grants no target-node capability.
+#[derive(Clone, Copy)]
+struct EnclosingNode<'a>(NodeRef<'a>);
+
+impl EnclosingNode<'_> {
+    fn scope(self) -> DiagnosticScope {
+        self.0.scope()
+    }
 }
 pub struct FailureRef<'a> {
     node: NodeRef<'a>,
@@ -269,11 +319,17 @@ struct EvidenceNode<'a> {
 enum Children<'a> {
     Map {
         members: IndexMap<&'a str, NodeId>,
-        complete: bool,
-        tail: bool,
+        remainder: MapRemainder,
     },
     List(Vec<NodeId>),
     Scalar,
+}
+
+#[derive(Clone, Copy)]
+enum MapRemainder {
+    Complete,
+    Expression,
+    Unavailable,
 }
 
 #[derive(Clone, Copy)]
@@ -408,18 +464,14 @@ impl RuleInput {
     }
 
     pub(crate) fn for_dispatch_update(
-        desired: &crate::executor::provider_ready::ProtectedDesiredTree<'_>,
-        patch: &crate::executor::provider_ready::AnnotatedExactPatch,
+        input: &crate::provider::ProtectedUpdateInput,
         schema: &ValidatedResourceSchema,
     ) -> Arc<Self> {
         Self::construct(InputStorage {
-            desired: project_attributes(desired.attributes()),
-            update: Some(UpdateOverlay::new(
-                patch.as_patch(),
-                desired.ignored().clone(),
-            )),
+            desired: project_attributes(input.attributes()),
+            update: Some(UpdateOverlay::new(input.patch(), input.ignored().clone())),
             declarations: Arc::new(TypeFacts::default()),
-            id: desired.id().clone(),
+            id: input.id().clone(),
             accepts_defaults: accepts_defaults(schema),
             declaration: Default::default(),
         })
@@ -484,13 +536,19 @@ impl RuleInput {
     }
 
     pub(super) fn read(&self, owner: InstanceRef, path: &InputPath) -> InputRead<'_> {
-        let mut parts = path.segments().enumerate();
+        let mut parts = path.segments().enumerate().peekable();
         let mut node = match owner {
             InstanceRef::Resource => {
                 let (_, root) = parts.next().expect("admitted path");
                 match self.root(root) {
                     InputRead::Present(node) => node,
-                    other => return other,
+                    other => {
+                        return if parts.peek().is_some() {
+                            other.before_target()
+                        } else {
+                            other
+                        };
+                    }
                 }
             }
             InstanceRef::Node(id) => NodeRef { input: self, id },
@@ -505,15 +563,23 @@ impl RuleInput {
                 } else {
                     InputRead::Withheld(Withheld {
                         reason: WithheldReason::UnknownMembership,
-                        node: node.map(|id| NodeRef { input: self, id }),
+                        location: node.map_or(WithheldLocation::Missing, |id| {
+                            WithheldLocation::Ancestor(EnclosingNode(NodeRef { input: self, id }))
+                        }),
                     })
                 };
             }
         };
-        for (depth, name) in parts {
+        while let Some((depth, name)) = parts.next() {
             match self.field(node, name, depth) {
                 InputRead::Present(child) => node = child,
-                other => return other,
+                other => {
+                    return if parts.peek().is_some() {
+                        other.before_target()
+                    } else {
+                        other
+                    };
+                }
             }
         }
         self.finish(node)
@@ -535,7 +601,7 @@ impl RuleInput {
         } else {
             InputRead::Withheld(Withheld {
                 reason: WithheldReason::UnsentOmission,
-                node: None,
+                location: WithheldLocation::Missing,
             })
         }
     }
@@ -545,19 +611,19 @@ impl RuleInput {
         if raw.blocked {
             return InputRead::Withheld(Withheld {
                 reason: WithheldReason::Ignored,
-                node: Some(node),
+                location: WithheldLocation::Ancestor(EnclosingNode(node)),
             });
         }
         if node.computation_failed() {
             return InputRead::Failed(FailureRef { node });
         }
         let Children::Map {
-            members, complete, ..
+            members, remainder, ..
         } = &raw.children
         else {
             return InputRead::Withheld(Withheld {
                 reason: WithheldReason::UnknownMembership,
-                node: Some(node),
+                location: WithheldLocation::Ancestor(EnclosingNode(node)),
             });
         };
         if let Some(&id) = members.get(name) {
@@ -566,22 +632,24 @@ impl RuleInput {
         if raw.masked_children.contains(name) {
             return InputRead::Withheld(Withheld {
                 reason: WithheldReason::Ignored,
-                node: None,
+                location: WithheldLocation::Missing,
             });
         }
-        if *complete && matches!(raw.completeness, Completeness::Replacement) {
+        if matches!(remainder, MapRemainder::Complete)
+            && matches!(raw.completeness, Completeness::Replacement)
+        {
             InputRead::Absent(AbsenceProof {
                 depth,
                 _origin: AbsenceOrigin::CompleteNode,
             })
         } else {
             InputRead::Withheld(Withheld {
-                reason: if *complete {
+                reason: if matches!(remainder, MapRemainder::Complete) {
                     WithheldReason::UnsentOmission
                 } else {
                     WithheldReason::UnknownMembership
                 },
-                node: None,
+                location: WithheldLocation::Missing,
             })
         }
     }
@@ -590,7 +658,7 @@ impl RuleInput {
         if node.raw().blocked {
             return InputRead::Withheld(Withheld {
                 reason: WithheldReason::Ignored,
-                node: Some(node),
+                location: WithheldLocation::Target(node),
             });
         }
         if matches!(node.raw().membership, Membership::Possible) && node.failed() {
@@ -599,7 +667,7 @@ impl RuleInput {
         if matches!(node.raw().membership, Membership::Possible) {
             return InputRead::Withheld(Withheld {
                 reason: WithheldReason::UnknownMembership,
-                node: Some(node),
+                location: WithheldLocation::Target(node),
             });
         }
         if matches!(node.raw().children, Children::Scalar) && node.failed() {
@@ -741,8 +809,7 @@ impl<'a> EvidenceGraph<'a> {
             }
             Children::Map {
                 members,
-                complete: true,
-                tail: false,
+                remainder: MapRemainder::Complete,
             }
         } else if let Some(count) = ClassifiedRef::from(&proof).list_len() {
             let mut items = Vec::with_capacity(count);
@@ -781,11 +848,46 @@ impl<'a> EvidenceGraph<'a> {
         id
     }
 
+    fn default_root(&mut self, input: &'a InputStorage, ignore: IgnoreCursor<'_>) -> NodeId {
+        if let Some(&id) = self.roots.get("tags") {
+            if !matches!(self.nodes[id.0].children, Children::Map { .. }) {
+                self.nodes[id.0].children = Children::Map {
+                    members: IndexMap::new(),
+                    remainder: MapRemainder::Expression,
+                };
+            }
+            return id;
+        }
+        let id = NodeId(self.nodes.len());
+        self.nodes.push(EvidenceNode {
+            proof: None,
+            derived_failure: false,
+            children: Children::Map {
+                members: IndexMap::new(),
+                remainder: MapRemainder::Complete,
+            },
+            scope: DiagnosticScope::Public,
+            enclosing_failure: false,
+            blocked: ignore.blocked,
+            masked_children: ignore.masked_children(),
+            membership: Membership::Possible,
+            completeness: if input.update.is_some() {
+                Completeness::Unsent
+            } else {
+                Completeness::Replacement
+            },
+            correspondence: ExpressionCorrespondence::Erased,
+            full_proof: false,
+        });
+        self.roots.insert("tags".into(), id);
+        id
+    }
+
     fn default_nodes(&mut self, input: &'a InputStorage) {
-        for config in &input.declarations.defaults {
-            let route = crate::provider::ProviderInstanceKey::from(config);
-            if route.provider() != input.id.provider
-                || route.provider_instance() != input.id.provider_instance.as_deref()
+        for defaults in &input.declarations.defaults {
+            if defaults.route.provider() != input.id.provider
+                || defaults.route.provider_instance() != input.id.provider_instance.as_deref()
+                || (defaults.values.is_empty() && defaults.completeness.is_complete())
             {
                 continue;
             }
@@ -793,53 +895,28 @@ impl<'a> EvidenceGraph<'a> {
                 .update
                 .as_ref()
                 .map_or_else(IgnoreCursor::default, |update| update.ignored.root("tags"));
-            for (key, value) in &config.default_tags {
-                let proof = classify(value);
-                let encodable = crate::provider::assert_default_tag_value_encodable(&proof).is_ok();
-                let membership = if encodable {
-                    Membership::Present
-                } else {
-                    Membership::Possible
+            let root = self.default_root(input, ignore);
+            if !defaults.completeness.is_complete() {
+                let Children::Map { remainder, .. } = &mut self.nodes[root.0].children else {
+                    unreachable!("default map root")
                 };
-                let root = if let Some(&id) = self.roots.get("tags") {
-                    id
-                } else {
-                    let id = NodeId(self.nodes.len());
-                    self.nodes.push(EvidenceNode {
-                        proof: None,
-                        derived_failure: false,
-                        children: Children::Map {
-                            members: IndexMap::new(),
-                            complete: true,
-                            tail: false,
-                        },
-                        scope: DiagnosticScope::Public,
-                        enclosing_failure: false,
-                        blocked: ignore.blocked,
-                        masked_children: ignore.masked_children(),
-                        membership,
-                        completeness: if input.update.is_some() {
-                            Completeness::Unsent
-                        } else {
-                            Completeness::Replacement
-                        },
-                        correspondence: ExpressionCorrespondence::Erased,
-                        full_proof: false,
-                    });
-                    self.roots.insert("tags".into(), id);
-                    id
+                *remainder = MapRemainder::Unavailable;
+                self.nodes[root.0].full_proof = false;
+            }
+            for (key, value) in &defaults.values {
+                let Children::Map { members, .. } = &self.nodes[root.0].children else {
+                    unreachable!("default map root")
                 };
-                if let Children::Map { members, .. } = &self.nodes[root.0].children {
-                    if members.contains_key(key.as_str()) {
-                        continue;
-                    }
-                } else {
-                    self.nodes[root.0].children = Children::Map {
-                        members: IndexMap::new(),
-                        complete: false,
-                        tail: true,
-                    };
+                if members.contains_key(key.as_str()) {
+                    continue;
                 }
+                let proof = classify(value);
+                let membership =
+                    if crate::provider::assert_default_tag_value_encodable(&proof).is_ok() {
+                        Membership::Present
+                    } else {
+                        Membership::Possible
+                    };
                 let child = self.push(
                     ClassifiedRef::from(&proof),
                     self.nodes[root.0].scope,
@@ -958,7 +1035,7 @@ impl<'a> NodeRef<'a> {
     pub(super) fn shape_known(self) -> bool {
         !self.raw().blocked
             && match &self.raw().children {
-                Children::Map { complete, .. } => *complete,
+                Children::Map { remainder, .. } => matches!(remainder, MapRemainder::Complete),
                 Children::List(_) => true,
                 Children::Scalar => matches!(
                     self.raw().proof,
@@ -977,11 +1054,8 @@ impl<'a> NodeRef<'a> {
     pub(super) fn expression(self) -> Option<BoundExpression<'a>> {
         self.input.expression(self)
     }
-    pub(super) fn field(self, name: &str) -> InputRead<'a> {
-        self.input.read(
-            self.instance(),
-            &InputPath::new(name).expect("admitted canonical field"),
-        )
+    pub(super) fn field(self, declaration: &crate::schema::CompiledStructField) -> InputRead<'a> {
+        self.input.field(self, &declaration.name, 0)
     }
     pub(super) fn list_len(self) -> Option<usize> {
         match &self.raw().children {
@@ -1037,16 +1111,24 @@ impl<'a> NodeRef<'a> {
             Completeness::Unsent => KeyRemainder::Withheld,
             Completeness::Replacement => match &self.raw().children {
                 Children::Map {
-                    complete: true,
-                    tail: false,
+                    remainder: MapRemainder::Complete,
                     ..
                 } => KeyRemainder::Complete,
+                Children::Map {
+                    remainder: MapRemainder::Unavailable,
+                    ..
+                } => KeyRemainder::Withheld,
                 Children::Map { .. } | Children::Scalar
                     if !self.raw().masked_children.is_empty() || self.raw().blocked =>
                 {
                     KeyRemainder::Withheld
                 }
-                Children::Map { .. } | Children::Scalar | Children::List(_) => self
+                Children::Map {
+                    remainder: MapRemainder::Expression,
+                    ..
+                }
+                | Children::Scalar
+                | Children::List(_) => self
                     .expression()
                     .map_or(KeyRemainder::Withheld, |expression| {
                         KeyRemainder::Expression(BoundKeyExpression(expression))
@@ -1065,14 +1147,30 @@ impl<'a> NodeRef<'a> {
 }
 
 impl InputRead<'_> {
+    fn before_target(mut self) -> Self {
+        if let Self::Withheld(value) = &mut self
+            && let WithheldLocation::Target(node) = value.location
+        {
+            value.location = WithheldLocation::Ancestor(EnclosingNode(node));
+        }
+        self
+    }
+
     pub(super) fn instance(&self) -> InstanceRef {
         match self {
             Self::Present(node) => node.instance(),
             Self::Failed(failure) => failure.node.instance(),
             Self::Withheld(value) => InstanceRef::Deferred {
-                node: value.node.map(|node| node.id),
+                node: match value.location {
+                    WithheldLocation::Target(node) => Some(node.id),
+                    WithheldLocation::Ancestor(_) | WithheldLocation::Missing => None,
+                },
                 failed: false,
-                scope: value.node.map_or(DiagnosticScope::Public, NodeRef::scope),
+                scope: match value.location {
+                    WithheldLocation::Target(node) => node.scope(),
+                    WithheldLocation::Ancestor(enclosing) => enclosing.scope(),
+                    WithheldLocation::Missing => DiagnosticScope::Public,
+                },
             },
             Self::Absent(_) => unreachable!("absence has no instance"),
         }
@@ -1080,10 +1178,12 @@ impl InputRead<'_> {
 }
 
 impl<'a> Withheld<'a> {
-    pub(super) fn possible_node(&self) -> Option<NodeRef<'a>> {
-        matches!(self.reason, WithheldReason::UnknownMembership)
-            .then_some(self.node)
-            .flatten()
+    pub(super) fn target(&self) -> Option<NodeRef<'a>> {
+        match (self.reason, self.location) {
+            (WithheldReason::UnknownMembership, WithheldLocation::Target(node)) => Some(node),
+            (WithheldReason::Ignored | WithheldReason::UnsentOmission, _)
+            | (_, WithheldLocation::Ancestor(_) | WithheldLocation::Missing) => None,
+        }
     }
 }
 

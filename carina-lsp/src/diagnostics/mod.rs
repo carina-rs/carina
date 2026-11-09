@@ -1278,7 +1278,7 @@ impl DiagnosticRun<'_> {
                 graph.authored_inputs().cloned()
             } else {
                 match directory.as_ref() {
-                    Some(directory) => Some(
+                    Some(directory) => Ok(
                         carina_core::input_rules::AuthoredInputs::for_directory_in_session(
                             &directory.parsed,
                             self.provider_context,
@@ -1286,14 +1286,16 @@ impl DiagnosticRun<'_> {
                     ),
                     None => doc
                         .parsed()
+                        .ok_or(carina_core::input_rules::AuthoredInputUnavailable)
                         .and_then(|parsed| parsed.authored_inputs())
                         .map(|inputs| inputs.resolved_in_session(self.provider_context)),
                 }
             };
-            let input_findings = authored_inputs.map_or_else(
-                || Ok(carina_core::input_rules::AuthoredInputReport::default()),
-                |inputs| carina_core::input_rules::check_authored_inputs(&inputs, &self.schemas),
-            );
+            let input_findings = authored_inputs
+                .map_err(carina_core::provider::HostError::from)
+                .and_then(|inputs| {
+                    carina_core::input_rules::check_authored_inputs(&inputs, &self.schemas)
+                });
             match input_findings {
                 Ok(findings) => {
                     for finding in findings {

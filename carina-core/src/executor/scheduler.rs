@@ -117,7 +117,7 @@ pub fn update_permit_with_schemas_for_test(
         &attributes,
     );
     let write = check
-        .prepare_update_fixture(&desired, request, writeback, schemas)
+        .prepare_update_fixture(request, writeback, schemas)
         .expect("fixture input discharge");
     let ScheduledBasicEffect::Update { update, .. } = ready else {
         unreachable!("fixture update slot")

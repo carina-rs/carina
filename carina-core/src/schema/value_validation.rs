@@ -364,7 +364,7 @@ impl<F> LocalOutcome<F> {
 #[derive(Default)]
 struct CheckedFindings {
     local: Vec<(FieldPath, TypeError)>,
-    pub(super) located: Vec<(LeafPath, TypeError)>,
+    pub(super) located: Vec<(FieldPath, TypeError)>,
     assignment: AssignmentFindings,
     // Other undecided branches have independent primary local errors. Ordinary
     // containers still retain their established first-error CLI precedence.
@@ -374,7 +374,7 @@ struct CheckedFindings {
 
 impl CheckedFindings {
     fn push_local(&mut self, path: FieldPath, error: TypeError) {
-        self.located.push((path.canonical(), error.clone()));
+        self.located.push((path.clone(), error.clone()));
         self.local.push((path, error));
     }
 }
@@ -443,7 +443,7 @@ impl<'a> CheckedValue<'a> {
                 primary: primary.clone(),
             },
             findings: CheckedFindings {
-                located: vec![(path.canonical(), primary.1.clone())],
+                located: vec![(path.clone(), primary.1.clone())],
                 local: vec![primary],
                 ..Default::default()
             },
@@ -494,7 +494,7 @@ impl<'a> CheckedValue<'a> {
         {
             self.findings
                 .located
-                .push((primary.0.canonical(), primary.1.clone()));
+                .push((primary.0.clone(), primary.1.clone()));
         }
     }
 
@@ -515,7 +515,12 @@ impl<'a> CheckedValue<'a> {
                 } => Some(error),
             },
             local: self.findings.local,
-            located: self.findings.located,
+            located: self
+                .findings
+                .located
+                .into_iter()
+                .map(|(path, error)| (path.canonical(), error))
+                .collect(),
             assignment: self.findings.assignment,
             symbolic: Vec::new(),
             additional_local_errors: self.findings.additional_local_errors,
@@ -1028,7 +1033,12 @@ impl<'a> ValueValidator<'a> {
                     checked
                         .findings
                         .located
-                        .extend(findings.errors.iter().cloned());
+                        .extend(findings.errors.iter().map(|(path, error)| {
+                            (
+                                FieldPath::from_canonical_segments(path.segments().iter().cloned()),
+                                error.clone(),
+                            )
+                        }));
                     checked.findings.assignment = findings;
                     return checked;
                 }

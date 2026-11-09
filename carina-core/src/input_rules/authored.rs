@@ -2,15 +2,25 @@
 //! read-only snapshot of the source boundary; mutating the AST cannot reseal it.
 use super::*;
 
+/// The file has not crossed a parser/admission boundary that grants authored
+/// input authority. This cannot be interpreted as a successful empty check.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("authored input authority is unavailable")]
+pub struct AuthoredInputUnavailable;
+
+impl From<AuthoredInputUnavailable> for crate::provider::HostError {
+    fn from(source: AuthoredInputUnavailable) -> Self {
+        Self::invalid_input_caused_by("authored input authority is unavailable", source)
+    }
+}
+
 /// Immutable authored evidence. Parser and admission owners mint this snapshot;
 /// public AST edits cannot change it or manufacture another complete input.
 #[derive(Clone)]
 pub struct AuthoredInputs {
     parser_source: Option<Arc<crate::parser::ParsedFile>>,
     resources: Vec<crate::resource::Resource<ModuleSource, ParserPlaceholder>>,
-    configs: Vec<
-        crate::parser::ProviderConfig<ParserPlaceholder, crate::resource::AbsoluteBindingAddress>,
-    >,
+    defaults: Vec<type_context::DefaultTagEvidence>,
 }
 impl std::fmt::Debug for AuthoredInputs {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,23 +70,14 @@ impl AuthoredInputs {
                 Some(projected)
             })
             .collect();
-        let configs = file
+        let defaults = file
             .providers
             .iter()
-            .map(|config| crate::parser::ProviderConfig {
-                name: config.name.clone(),
-                attributes: project_attributes(&config.attributes),
-                default_tags: project_attributes(&config.default_tags),
-                source: config.source.clone(),
-                version: config.version.clone(),
-                revision: config.revision.clone(),
-                unresolved_attributes: project_attributes(&config.unresolved_attributes),
-                binding: config.binding.clone(),
-            })
+            .map(type_context::DefaultTagEvidence::for_config)
             .collect();
         Self {
             resources,
-            configs,
+            defaults,
             parser_source: None,
         }
     }
@@ -125,39 +126,34 @@ impl AuthoredInputs {
     pub(crate) fn for_module_admission<E>(
         source: &crate::module_resolver::AuthoredModuleGraph<'_, E>,
         config: &crate::parser::ProviderContext,
-    ) -> crate::provider::HostResult<Self>
+    ) -> Self
     where
         E: crate::parser::ExportParamLike<
                 ParserPlaceholder,
                 crate::resource::AbsoluteBindingAddress,
             > + Clone,
     {
+        let mut inputs = Self::snapshot(source.file());
         if source
             .file()
             .providers
             .iter()
-            .all(|config| config.unresolved_attributes.is_empty())
+            .any(|provider| !provider.unresolved_attributes.is_empty())
         {
-            return Ok(Self::snapshot(source.file()));
+            inputs.defaults =
+                crate::parser::preview_expanded_provider_inputs(source.file(), config)
+                    .iter()
+                    .map(type_context::DefaultTagEvidence::for_preview)
+                    .collect();
         }
-        let mut file = source.file().clone();
-        crate::parser::resolve_expanded_provider_unresolved_attributes(&mut file, config)
-            .map_err(|error| crate::provider::HostError::invalid_input(error.to_string()))?;
-        crate::parser::finalize_provider_configs(&mut file)
-            .map_err(|error| crate::provider::HostError::invalid_input(error.to_string()))?;
-        Ok(Self::snapshot(&file))
+        inputs
     }
 
     pub(super) fn resources(&self) -> impl Iterator<Item = AuthoredResource<'_>> {
         self.resources.iter().map(AuthoredResource)
     }
-    pub(super) fn configs(
-        &self,
-    ) -> &[crate::parser::ProviderConfig<
-        ParserPlaceholder,
-        crate::resource::AbsoluteBindingAddress,
-    >] {
-        &self.configs
+    pub(super) fn defaults(&self) -> &[type_context::DefaultTagEvidence] {
+        &self.defaults
     }
 
     #[cfg(test)]
@@ -185,7 +181,7 @@ impl AuthoredInputs {
         projected.declaration = resource.declaration.clone();
         Self {
             resources: vec![projected],
-            configs: Vec::new(),
+            defaults: Vec::new(),
             parser_source: None,
         }
     }

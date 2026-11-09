@@ -11,7 +11,7 @@ use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
 mod authored;
-pub use authored::AuthoredInputs;
+pub use authored::{AuthoredInputUnavailable, AuthoredInputs};
 mod declarations;
 mod estimator;
 mod instances;
@@ -1108,11 +1108,9 @@ fn target_verdict(applicable: &BoundInputRule<'_, '_>) -> InputVerdict {
         }
         InputRead::Withheld(value) => {
             if matches!(rule.target(), InputRuleTarget::MapKeys(_)) {
-                value
-                    .possible_node()
-                    .map_or(InputVerdict::Undecided, |node| {
-                        map_keys_verdict(applicable, &node)
-                    })
+                value.target().map_or(InputVerdict::Undecided, |node| {
+                    map_keys_verdict(applicable, &node)
+                })
             } else {
                 InputVerdict::Undecided
             }
@@ -1347,11 +1345,8 @@ pub fn check_authored_inputs(
     parsed: &AuthoredInputs,
     schemas: &SchemaRegistry,
 ) -> crate::provider::HostResult<AuthoredInputReport> {
-    let types = InputTypeContext::<ModuleSource>::empty().with_default_tag_projection(
-        parsed.configs(),
-        schemas,
-        parsed.resources().map(|resource| &resource.resource().id),
-    )?;
+    let mut types = InputTypeContext::<ModuleSource>::empty();
+    types.facts.defaults = parsed.defaults().to_vec();
     let mut report = AuthoredInputReport::default();
     let declarations = Arc::new(types.facts);
     for source in parsed.resources() {

@@ -331,40 +331,37 @@ impl WriteCheck {
             .map_err(EffectFailureKind::execution)?;
         if let Some(admission) = &self.admission {
             let input = crate::input_rules::RuleInput::for_dispatch_update(
-                &desired.protected_desired_tree(),
-                &desired.annotated_exact_patch(&request),
+                request.protected_input(),
                 &admission.schema,
             );
             self.discharge(input, schemas)?;
         }
-        Ok(self.seal_update(desired.as_resource().id.clone(), request, writeback))
+        Ok(self.seal_update(request, writeback))
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(super) fn prepare_update_fixture(
         self,
-        desired: &ProviderReadyResource,
         request: UpdateRequest,
         writeback: SecretPreservingAttributes,
         schemas: &SchemaRegistry,
     ) -> Result<PreparedWrite<UpdateRequest>, EffectFailureKind> {
         if let Some(admission) = &self.admission {
             let input = crate::input_rules::RuleInput::for_dispatch_update(
-                &desired.protected_desired_tree(),
-                &desired.annotated_exact_patch(&request),
+                request.protected_input(),
                 &admission.schema,
             );
             self.discharge(input, schemas)?;
         }
-        Ok(self.seal_update(desired.id.clone(), request, writeback))
+        Ok(self.seal_update(request, writeback))
     }
 
     fn seal_update(
         self,
-        resource_id: ResourceId,
         request: UpdateRequest,
         writeback: SecretPreservingAttributes,
     ) -> PreparedWrite<UpdateRequest> {
+        let resource_id = request.protected_input().id().clone();
         PreparedWrite {
             request: Arc::new(request),
             resource_id,

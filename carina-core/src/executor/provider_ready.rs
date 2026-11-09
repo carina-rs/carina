@@ -199,12 +199,6 @@ pub(crate) struct ProtectedDesiredTree<'a> {
     ignored: &'a crate::resource::ResolvedIgnoreChanges,
 }
 
-/// Exact checked patch annotated from the same full desired tree. This is
-/// deliberately distinct from both a transport patch and desired input.
-pub(crate) struct AnnotatedExactPatch {
-    patch: crate::provider::UpdatePatch,
-}
-
 impl ProtectedDesiredTree<'_> {
     pub(crate) fn id(&self) -> &ResourceId {
         self.resource_id
@@ -216,11 +210,6 @@ impl ProtectedDesiredTree<'_> {
         self.ignored
     }
 }
-impl AnnotatedExactPatch {
-    pub(crate) fn as_patch(&self) -> &crate::provider::UpdatePatch {
-        &self.patch
-    }
-}
 impl ProviderReadyResource {
     pub(crate) fn protected_desired_tree(&self) -> ProtectedDesiredTree<'_> {
         ProtectedDesiredTree {
@@ -228,32 +217,6 @@ impl ProviderReadyResource {
             attributes: &self.diagnostic_attributes,
             ignored: self.ignore_changes(),
         }
-    }
-    pub(crate) fn annotated_exact_patch(&self, request: &UpdateRequest) -> AnnotatedExactPatch {
-        use crate::provider::PatchOp;
-        let patch = crate::provider::UpdatePatch {
-            ops: request
-                .patch()
-                .ops
-                .iter()
-                .map(|op| match op {
-                    PatchOp::Add { key, value } => PatchOp::Add {
-                        key: key.clone(),
-                        value: self.diagnostic_value(key, value),
-                    },
-                    PatchOp::Replace { key, value } => PatchOp::Replace {
-                        key: key.clone(),
-                        value: self.diagnostic_value(key, value),
-                    },
-                    PatchOp::Reassert { key, value } => PatchOp::Reassert {
-                        key: key.clone(),
-                        value: self.diagnostic_value(key, value),
-                    },
-                    PatchOp::Remove { key } => PatchOp::Remove { key: key.clone() },
-                })
-                .collect(),
-        };
-        AnnotatedExactPatch { patch }
     }
 }
 

@@ -1186,6 +1186,38 @@ impl CreateRequest {
 #[derive(Debug, Clone, Default)]
 pub struct ReadRequest;
 
+/// Protected desired evidence and its exact checked patch, minted together
+/// only by UpdateRequest::checked. No constructor accepts an existing request
+/// alongside a different desired resource.
+#[derive(Clone)]
+pub(crate) struct ProtectedUpdateInput {
+    id: ResourceId,
+    attributes: IndexMap<String, Value>,
+    ignored: crate::resource::ResolvedIgnoreChanges,
+    patch: UpdatePatch,
+}
+
+impl fmt::Debug for ProtectedUpdateInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProtectedUpdateInput(<protected>)")
+    }
+}
+
+impl ProtectedUpdateInput {
+    pub(crate) fn id(&self) -> &ResourceId {
+        &self.id
+    }
+    pub(crate) fn attributes(&self) -> &IndexMap<String, Value> {
+        &self.attributes
+    }
+    pub(crate) fn ignored(&self) -> &crate::resource::ResolvedIgnoreChanges {
+        &self.ignored
+    }
+    pub(crate) fn patch(&self) -> &UpdatePatch {
+        &self.patch
+    }
+}
+
 /// Per-operation request record for [`Provider::update`].
 ///
 /// Mirrors `update-request` in `wit/types.wit`. `from` is the current
@@ -1239,7 +1271,7 @@ pub struct UpdateRequest {
     patch: WireReady<UpdatePatch>,
     /// Effective directives resolved from the managed resource schema.
     directives: ProviderDirectives,
-    diagnostic_values: Vec<Value>,
+    input: Arc<ProtectedUpdateInput>,
     #[cfg(any(test, feature = "test-utils"))]
     desired_for_fixture: ProviderReadyResource,
 }
@@ -1253,24 +1285,42 @@ impl UpdateRequest {
     ) -> Result<Self, crate::executor::ProviderPreparationError> {
         let patch = build_update_patch(changed_attributes, resource, &from, schema)?;
         let patch = WireReady::try_new(patch, ProviderWireTarget::Resource(resource.id.clone()))?;
-        let diagnostic_values = patch
-            .as_inner()
-            .ops
-            .iter()
-            .filter_map(|op| match op {
-                PatchOp::Add { key, value }
-                | PatchOp::Replace { key, value }
-                | PatchOp::Reassert { key, value } => Some(resource.diagnostic_value(key, value)),
-                PatchOp::Remove { .. } => None,
-            })
-            .collect();
+        let protected = resource.protected_desired_tree();
+        let annotated_patch = UpdatePatch {
+            ops: patch
+                .as_inner()
+                .ops
+                .iter()
+                .map(|op| match op {
+                    PatchOp::Add { key, value } => PatchOp::Add {
+                        key: key.clone(),
+                        value: resource.diagnostic_value(key, value),
+                    },
+                    PatchOp::Replace { key, value } => PatchOp::Replace {
+                        key: key.clone(),
+                        value: resource.diagnostic_value(key, value),
+                    },
+                    PatchOp::Reassert { key, value } => PatchOp::Reassert {
+                        key: key.clone(),
+                        value: resource.diagnostic_value(key, value),
+                    },
+                    PatchOp::Remove { key } => PatchOp::Remove { key: key.clone() },
+                })
+                .collect(),
+        };
+        let input = Arc::new(ProtectedUpdateInput {
+            id: protected.id().clone(),
+            attributes: protected.attributes().clone(),
+            ignored: protected.ignored().clone(),
+            patch: annotated_patch,
+        });
         Ok(Self {
             #[cfg(any(test, feature = "test-utils"))]
             desired_for_fixture: resource.clone(),
             from,
             patch,
             directives: *resource.directives(),
-            diagnostic_values,
+            input,
         })
     }
 
@@ -1290,7 +1340,11 @@ impl UpdateRequest {
     }
 
     pub(crate) fn diagnostic_values(&self) -> impl Iterator<Item = &Value> {
-        self.diagnostic_values.iter()
+        self.input.patch.ops.iter().filter_map(PatchOp::sent_value)
+    }
+
+    pub(crate) fn protected_input(&self) -> &ProtectedUpdateInput {
+        &self.input
     }
 
     /// The checked projection consumed by provider transport adapters.

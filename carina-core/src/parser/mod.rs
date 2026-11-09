@@ -167,7 +167,8 @@ pub use resolve::{
     resolve_resource_refs_in_session, resolve_resource_refs_with_config,
 };
 pub(crate) use resolve::{
-    RootInputFailure, collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,
+    ProviderInputPreview, ProviderInputStatus, RootInputFailure, collect_seed_bindings_from_parts,
+    preview_expanded_provider_inputs, reject_cyclic_let_bindings_in_variables,
     resolve_resource_refs_for_diagnostics, resolve_resource_refs_in_context,
     resolve_resource_refs_with_backend_failure, resolve_snapshot_function_calls_in_context,
 };

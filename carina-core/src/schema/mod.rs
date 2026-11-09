@@ -2409,20 +2409,82 @@ impl fmt::Display for FieldPathStep {
 /// a particular [`TypeError`]. Used by [`AttrTypeKind::validate_collect`]
 /// so the LSP can map errors back to source positions without
 /// re-running validation itself (#2214).
-#[derive(Debug, Default)]
+#[derive(Clone, Default)]
 pub struct FieldPath {
+    tail: Option<Arc<FieldPathNode>>,
+}
+
+struct FieldPathNode {
+    parent: Option<Arc<FieldPathNode>>,
+    step: FieldPathStep,
+    canonical: LeafPathSegment,
+    direction: FieldPathDirection,
+    len: usize,
+    materialized: OnceLock<FieldPathSegments>,
+}
+
+#[derive(Clone, Copy)]
+enum FieldPathDirection {
+    Before,
+    After,
+}
+
+struct FieldPathSegments {
     steps: Vec<FieldPathStep>,
     canonical: Vec<LeafPathSegment>,
 }
 
-impl Clone for FieldPath {
-    fn clone(&self) -> Self {
-        #[cfg(test)]
-        record_field_path_work(self.steps.len() + self.canonical.len());
-        Self {
-            steps: self.steps.clone(),
-            canonical: self.canonical.clone(),
+/// Published diagnostic metadata has immutable storage, independent of the
+/// traversal prefix's lazy rendering cache.
+#[derive(Clone)]
+pub(crate) struct ConcreteFieldPath {
+    steps: Vec<FieldPathStep>,
+    canonical: Vec<LeafPathSegment>,
+}
+
+impl ConcreteFieldPath {
+    pub(crate) fn as_field_path(&self) -> FieldPath {
+        FieldPath::from_canonical_segments(self.canonical.iter().cloned())
+    }
+}
+
+impl PartialEq for ConcreteFieldPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.steps == other.steps
+    }
+}
+impl Eq for ConcreteFieldPath {}
+
+impl fmt::Debug for ConcreteFieldPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FieldPath")
+            .field("steps", &self.steps)
+            .field("canonical", &self.canonical)
+            .finish()
+    }
+}
+
+impl Drop for FieldPath {
+    fn drop(&mut self) {
+        // Release a uniquely owned prefix iteratively, including very deep
+        // paths whose other owners have already gone away.
+        let mut tail = self.tail.take();
+        while let Some(node) = tail {
+            let Ok(mut node) = Arc::try_unwrap(node) else {
+                break;
+            };
+            tail = node.parent.take();
         }
+    }
+}
+
+impl fmt::Debug for FieldPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let materialized = self.materialized();
+        f.debug_struct("FieldPath")
+            .field("steps", &materialized.steps)
+            .field("canonical", &materialized.canonical)
+            .finish()
     }
 }
 
@@ -2453,108 +2515,159 @@ pub(crate) fn with_field_path_work<R>(operation: impl FnOnce() -> R) -> (R, usiz
 }
 impl PartialEq for FieldPath {
     fn eq(&self, other: &Self) -> bool {
-        self.steps == other.steps
+        self.steps() == other.steps()
     }
 }
 impl Eq for FieldPath {}
 
 impl FieldPath {
     pub fn new() -> Self {
-        Self {
-            steps: Vec::new(),
-            canonical: Vec::new(),
+        Self::default()
+    }
+
+    pub(crate) fn into_concrete(self) -> ConcreteFieldPath {
+        let parts = self.materialized();
+        #[cfg(test)]
+        record_field_path_work(parts.steps.len() + parts.canonical.len());
+        ConcreteFieldPath {
+            steps: parts.steps.clone(),
+            canonical: parts.canonical.clone(),
         }
     }
 
-    /// Build both diagnostic and canonical paths in one linear pass.
+    fn pushed(
+        &self,
+        step: FieldPathStep,
+        canonical: LeafPathSegment,
+        direction: FieldPathDirection,
+    ) -> Self {
+        #[cfg(test)]
+        record_field_path_work(2);
+        Self {
+            tail: Some(Arc::new(FieldPathNode {
+                parent: self.tail.clone(),
+                step,
+                canonical,
+                direction,
+                len: self.tail.as_ref().map_or(1, |node| node.len + 1),
+                materialized: OnceLock::new(),
+            })),
+        }
+    }
+
+    fn materialized(&self) -> &FieldPathSegments {
+        static EMPTY: FieldPathSegments = FieldPathSegments {
+            steps: Vec::new(),
+            canonical: Vec::new(),
+        };
+        let Some(tail) = &self.tail else {
+            return &EMPTY;
+        };
+        tail.materialized.get_or_init(|| {
+            let mut before = Vec::new();
+            let mut after = Vec::new();
+            let mut node = Some(tail.as_ref());
+            while let Some(current) = node {
+                match current.direction {
+                    FieldPathDirection::Before => before.push(current),
+                    FieldPathDirection::After => after.push(current),
+                }
+                node = current.parent.as_deref();
+            }
+            let mut steps = Vec::with_capacity(tail.len);
+            let mut canonical = Vec::with_capacity(tail.len);
+            for node in before.into_iter().chain(after.into_iter().rev()) {
+                steps.push(node.step.clone());
+                canonical.push(node.canonical.clone());
+            }
+            #[cfg(test)]
+            record_field_path_work(tail.len * 2);
+            FieldPathSegments { steps, canonical }
+        })
+    }
+
+    /// Build a path without copying any accumulated prefix.
     pub(crate) fn from_canonical_segments(
         segments: impl IntoIterator<Item = LeafPathSegment>,
     ) -> Self {
-        let canonical: Vec<_> = segments.into_iter().collect();
-        #[cfg(test)]
-        record_field_path_work(canonical.len() * 2);
-        let steps = canonical
-            .iter()
-            .map(|segment| match segment {
+        let mut path = Self::new();
+        for canonical in segments {
+            let step = match &canonical {
                 LeafPathSegment::StructField(name) => FieldPathStep::Field(name.clone()),
                 LeafPathSegment::ListIndex(index) => FieldPathStep::Index(*index),
                 LeafPathSegment::MapKey(key) => {
                     FieldPathStep::Field(key.diagnostic_literal().unwrap_or("<secret>").to_owned())
                 }
-            })
-            .collect();
-        Self { steps, canonical }
+            };
+            path = path.pushed(step, canonical, FieldPathDirection::After);
+        }
+        path
     }
 
     pub fn steps(&self) -> &[FieldPathStep] {
-        &self.steps
+        &self.materialized().steps
     }
 
     pub fn is_empty(&self) -> bool {
-        self.steps.is_empty()
+        self.tail.is_none()
     }
 
-    /// Append a struct-field step and return a new path. Cheap clone
-    /// because validation paths are tiny (depth-of-struct, typically
-    /// < 5).
+    /// Append a literal struct field while sharing the existing prefix.
     pub fn push_field(&self, name: impl Into<String>) -> Self {
-        let mut next = self.clone();
-        #[cfg(test)]
-        record_field_path_work(2);
         let name = name.into();
-        next.steps.push(FieldPathStep::Field(name.clone()));
-        next.canonical.push(LeafPathSegment::StructField(name));
-        next
+        self.pushed(
+            FieldPathStep::Field(name.clone()),
+            LeafPathSegment::StructField(name),
+            FieldPathDirection::After,
+        )
     }
 
-    /// Append a list-index step and return a new path.
     pub fn push_index(&self, index: usize) -> Self {
-        let mut next = self.clone();
-        #[cfg(test)]
-        record_field_path_work(2);
-        next.steps.push(FieldPathStep::Index(index));
-        next.canonical.push(LeafPathSegment::ListIndex(index));
-        next
+        self.pushed(
+            FieldPathStep::Index(index),
+            LeafPathSegment::ListIndex(index),
+            FieldPathDirection::After,
+        )
     }
 
     pub fn canonical(&self) -> LeafPath {
-        LeafPath::from_segments(self.canonical.iter().cloned())
+        let canonical = &self.materialized().canonical;
+        #[cfg(test)]
+        record_field_path_work(canonical.len());
+        LeafPath::from_segments(canonical.iter().cloned())
     }
 
     pub(crate) fn push_map_key(&self, key: impl Into<String>) -> Self {
         let key = key.into();
-        let mut next = self.clone();
-        #[cfg(test)]
-        record_field_path_work(2);
-        next.steps.push(FieldPathStep::Field(key.clone()));
-        next.canonical.push(LeafPathSegment::MapKey(key.into()));
-        next
+        self.pushed(
+            FieldPathStep::Field(key.clone()),
+            LeafPathSegment::MapKey(key.into()),
+            FieldPathDirection::After,
+        )
     }
 
     fn prepend_field(&self, name: impl Into<String>) -> Self {
         let name = name.into();
-        let mut canonical = vec![LeafPathSegment::StructField(name.clone())];
-        canonical.extend(self.canonical.iter().cloned());
-        let mut steps = Vec::with_capacity(self.steps.len() + 1);
-        steps.push(FieldPathStep::Field(name));
-        steps.extend(self.steps.iter().cloned());
-        Self { steps, canonical }
+        self.pushed(
+            FieldPathStep::Field(name.clone()),
+            LeafPathSegment::StructField(name),
+            FieldPathDirection::Before,
+        )
     }
 
     fn prepend_index(&self, index: usize) -> Self {
-        let mut canonical = vec![LeafPathSegment::ListIndex(index)];
-        canonical.extend(self.canonical.iter().cloned());
-        let mut steps = Vec::with_capacity(self.steps.len() + 1);
-        steps.push(FieldPathStep::Index(index));
-        steps.extend(self.steps.iter().cloned());
-        Self { steps, canonical }
+        self.pushed(
+            FieldPathStep::Index(index),
+            LeafPathSegment::ListIndex(index),
+            FieldPathDirection::Before,
+        )
     }
 }
 
 impl fmt::Display for FieldPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut first = true;
-        for step in &self.steps {
+        for step in self.steps() {
             match step {
                 FieldPathStep::Field(name) => {
                     if !first {
@@ -15710,17 +15823,23 @@ impl crate::resource::InsideSecret for LeafPath {
 
 impl crate::resource::InsideSecret for FieldPath {
     fn inside_secret(self) -> Self {
-        Self {
-            canonical: LeafPath::from_segments(self.canonical).inside_secret().0,
-            steps: self
-                .steps
-                .into_iter()
-                .map(|step| match step {
-                    FieldPathStep::Field(_) => FieldPathStep::Field(SECRET_VALUE_MASK.to_string()),
-                    FieldPathStep::Index(index) => FieldPathStep::Index(index),
-                })
-                .collect(),
+        let segments = self.materialized();
+        let mut path = Self::new();
+        for (step, canonical) in segments.steps.iter().zip(&segments.canonical) {
+            let step = match step {
+                FieldPathStep::Field(_) => FieldPathStep::Field(SECRET_VALUE_MASK.to_string()),
+                FieldPathStep::Index(index) => FieldPathStep::Index(*index),
+            };
+            let canonical = match canonical {
+                LeafPathSegment::StructField(_) => {
+                    LeafPathSegment::StructField(SECRET_VALUE_MASK.to_string())
+                }
+                LeafPathSegment::MapKey(_) => LeafPathSegment::MapKey(SECRET_VALUE_MASK.into()),
+                LeafPathSegment::ListIndex(index) => LeafPathSegment::ListIndex(*index),
+            };
+            path = path.pushed(step, canonical, FieldPathDirection::After);
         }
+        path
     }
 }
 

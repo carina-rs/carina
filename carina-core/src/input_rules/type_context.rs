@@ -13,7 +13,71 @@ use crate::{
 pub(super) struct TypeFacts {
     pub bindings: HashMap<AbsoluteBindingAddress, Declaration>,
     pub aliases: HashMap<AbsoluteBindingAddress, AbsoluteBindingAddress>,
-    pub defaults: Vec<crate::parser::ProviderConfig<ParserPlaceholder, AbsoluteBindingAddress>>,
+    pub defaults: Vec<DefaultTagEvidence>,
+}
+
+#[derive(Clone)]
+pub(super) struct DefaultTagEvidence {
+    pub route: crate::provider::ProviderInstanceKey,
+    pub values: InputAttributes,
+    pub completeness: DefaultTagCompleteness,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DefaultTagCompleteness {
+    Complete,
+    Unavailable(DefaultTagUnavailable),
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum DefaultTagUnavailable {
+    Unresolved,
+    ProviderConfigurationFailed,
+}
+
+impl DefaultTagCompleteness {
+    pub fn is_complete(self) -> bool {
+        match self {
+            Self::Complete => true,
+            Self::Unavailable(reason) => match reason {
+                DefaultTagUnavailable::Unresolved
+                | DefaultTagUnavailable::ProviderConfigurationFailed => false,
+            },
+        }
+    }
+}
+
+impl DefaultTagEvidence {
+    pub fn for_config<P: crate::resource::PlaceholderKind, B: crate::resource::BindingAddress>(
+        config: &crate::parser::ProviderConfig<P, B>,
+    ) -> Self {
+        Self {
+            route: crate::provider::ProviderInstanceKey::from(config),
+            values: project_attributes(&config.default_tags),
+            completeness: if config.unresolved_attributes.contains_key("default_tags") {
+                DefaultTagCompleteness::Unavailable(DefaultTagUnavailable::Unresolved)
+            } else {
+                DefaultTagCompleteness::Complete
+            },
+        }
+    }
+
+    pub fn for_preview(preview: &crate::parser::ProviderInputPreview) -> Self {
+        let evidence = Self::for_config(preview.config());
+        match preview.status() {
+            crate::parser::ProviderInputStatus::Complete => evidence,
+            crate::parser::ProviderInputStatus::Failed => evidence.after_config_failure(),
+        }
+    }
+
+    pub fn after_config_failure(mut self) -> Self {
+        if let DefaultTagCompleteness::Unavailable(_) = self.completeness {
+            self.completeness = DefaultTagCompleteness::Unavailable(
+                DefaultTagUnavailable::ProviderConfigurationFailed,
+            );
+        }
+        self
+    }
 }
 
 #[derive(Clone)]
@@ -186,19 +250,7 @@ impl<S> InputTypeContext<S> {
         write_ids: impl IntoIterator<Item = &'a ResourceId>,
     ) -> crate::provider::HostResult<Self> {
         let _ = (schemas, write_ids);
-        self.facts.defaults = configs
-            .iter()
-            .map(|config| crate::parser::ProviderConfig {
-                name: config.name.clone(),
-                attributes: project_attributes(&config.attributes),
-                default_tags: project_attributes(&config.default_tags),
-                source: config.source.clone(),
-                version: config.version.clone(),
-                revision: config.revision.clone(),
-                unresolved_attributes: project_attributes(&config.unresolved_attributes),
-                binding: config.binding.clone(),
-            })
-            .collect();
+        self.facts.defaults = configs.iter().map(DefaultTagEvidence::for_config).collect();
         Ok(self)
     }
 }

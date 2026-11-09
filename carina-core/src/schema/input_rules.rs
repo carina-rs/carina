@@ -281,14 +281,14 @@ pub struct InputDiagnosticPath(Box<InputDiagnosticPathData>);
 struct InputDiagnosticPathData {
     rendered: String,
     root: String,
-    relative: super::FieldPath,
+    relative: super::ConcreteFieldPath,
 }
 impl InputDiagnosticPath {
     pub(crate) fn new(rendered: String, root: String, relative: super::FieldPath) -> Self {
         Self(Box::new(InputDiagnosticPathData {
             rendered,
             root,
-            relative,
+            relative: relative.into_concrete(),
         }))
     }
     pub fn as_str(&self) -> &str {
@@ -297,8 +297,8 @@ impl InputDiagnosticPath {
     pub fn root(&self) -> &str {
         &self.0.root
     }
-    pub fn relative(&self) -> &super::FieldPath {
-        &self.0.relative
+    pub fn relative(&self) -> super::FieldPath {
+        self.0.relative.as_field_path()
     }
     pub fn segments(&self) -> impl Iterator<Item = &str> {
         self.0

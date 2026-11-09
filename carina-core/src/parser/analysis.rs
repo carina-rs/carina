@@ -289,7 +289,7 @@ impl DeclarationProvenance {
                 attribute_values: &elements.attribute_values,
                 root: root.location(),
             }
-            .attribute_value_location(path.root(), path.relative()),
+            .attribute_value_location(path.root(), &path.relative()),
         )
     }
 

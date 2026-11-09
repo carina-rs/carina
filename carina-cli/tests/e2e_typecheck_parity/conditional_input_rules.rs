@@ -7,6 +7,123 @@ use carina_core::schema::{
 };
 
 #[test]
+fn invalid_module_default_tags_preserve_independent_cli_lsp_input_findings() {
+    let schema = ResourceSchema::new("test.Conditional")
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("fallback", AttributeType::string()).build())
+        .attribute(AttributeSchema::optional("marker", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional("tags", AttributeType::map(AttributeType::string())).build(),
+        )
+        .input_rule(InputRule::value(
+            InputRuleScope::CreateOnly,
+            InputPath::new("name").unwrap(),
+            InputRuleCode::new("test.creation_name").unwrap(),
+            InputPredicate::NoSuffix(carina_core::schema::NonEmptyString::new("-an").unwrap()),
+        ))
+        .input_rule(InputRule::value(
+            InputRuleScope::EveryWrite,
+            InputPath::new("target").unwrap(),
+            InputRuleCode::new("test.required_target").unwrap(),
+            InputPredicate::Present,
+        ))
+        .input_rule(
+            InputRule::value(
+                InputRuleScope::EveryWrite,
+                InputPath::new("marker").unwrap(),
+                InputRuleCode::new("test.tagged_marker").unwrap(),
+                InputPredicate::Present,
+            )
+            .with_condition(InputCondition::Present(InputPath::new("tags").unwrap())),
+        )
+        .input_rule(
+            InputRule::value(
+                InputRuleScope::EveryWrite,
+                InputPath::new("fallback").unwrap(),
+                InputRuleCode::new("test.absent_tags_fallback").unwrap(),
+                InputPredicate::Present,
+            )
+            .with_condition(InputCondition::Not(Box::new(InputCondition::Present(
+                InputPath::new("tags").unwrap(),
+            )))),
+        );
+    let fixture = write_fixture(&[
+        (
+            "providers.crn",
+            "provider test { default_tags = m.tags }\nprovider later { default_tags = m.good_tags }\n",
+        ),
+        (
+            "main.crn",
+            "let module = use { source = './module' }\nlet m = module {}\nlet example = test.test.Conditional { name = 'bucket-an' }\nlet after = later.test.Conditional { name = 'valid' target = 'provided' }\n",
+        ),
+    ]);
+    std::fs::create_dir(fixture.path().join("module")).unwrap();
+    std::fs::write(
+        fixture.path().join("module/main.crn"),
+        "attributes { tags = 'not-a-map' good_tags = { owner = 'known' } }\n",
+    )
+    .unwrap();
+    let mut schemas = single_schema_map(schema.clone());
+    schemas.insert("later", schema.validate().unwrap());
+    let cli = carina_cli::commands::validate::validate_diagnostics_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        carina_cli::wiring::LoadedProviderFactory::for_test(factories_for(&schemas)),
+        Default::default(),
+    );
+    let errors = cli
+        .errors
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    assert!(
+        errors.iter().any(|error| error.contains("default_tags")),
+        "{errors:#?}"
+    );
+    assert_eq!(cli.input_warnings.len(), 1, "{errors:#?}");
+    let target = errors
+        .iter()
+        .flat_map(|error| error.lines())
+        .find(|error| error.contains("[test.required_target]"))
+        .expect("independent EveryWrite finding");
+    let markers = errors
+        .iter()
+        .flat_map(|error| error.lines())
+        .filter(|error| error.contains("[test.tagged_marker]"))
+        .collect::<Vec<_>>();
+    assert_eq!(markers.len(), 1, "{errors:#?}");
+    assert!(markers[0].contains("later.test.Conditional.after"));
+    let diagnostics = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    for (message, severity) in [
+        (target.to_owned(), DiagnosticSeverity::ERROR),
+        (markers[0].to_owned(), DiagnosticSeverity::ERROR),
+        (
+            cli.input_warnings[0].to_string(),
+            DiagnosticSeverity::WARNING,
+        ),
+    ] {
+        let findings = diagnostics
+            .iter()
+            .filter(|finding| finding.message == message)
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 1, "{diagnostics:#?}");
+        assert_eq!(findings[0].severity, Some(severity));
+    }
+    assert!(
+        !errors
+            .iter()
+            .any(|error| error.contains("[test.absent_tags_fallback]")),
+        "{errors:#?}"
+    );
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|finding| finding.message.contains("[test.absent_tags_fallback]")),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
 fn module_default_tags_have_cli_lsp_conditional_rule_parity() {
     let schema = ResourceSchema::new("test.Conditional")
         .attribute(

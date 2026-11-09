@@ -842,9 +842,12 @@ fn validate_and_resolve_configuration(
     );
     let mut parsed = match module_resolution {
         module_resolver::ModuleResolutionDiagnosticResult::Expanded { graph } => {
-            if let Some(inputs) = graph.authored_inputs() {
-                *authored_inputs = inputs.clone();
-            }
+            *authored_inputs = graph
+                .authored_inputs()
+                .map_err(|error| {
+                    non_empty_validation_failure(vec![AppError::Provider(error.into())])
+                })?
+                .clone();
             extend_module_call_errors(&mut errors, authored_module_call_findings);
             if !errors.is_empty() {
                 return Err(non_empty_validation_failure(errors));

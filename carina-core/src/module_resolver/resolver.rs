@@ -90,6 +90,23 @@ impl<E> AuthoredModuleGraph<'_, E> {
     }
 }
 
+/// Every successful module publication advances resource authority together;
+/// unavailable provider defaults remain a separate fact in that snapshot.
+fn publish_authored_module_graph<E>(
+    mut graph: ModuleResolvedFile<E>,
+    config: &ProviderContext,
+) -> ModuleResolvedFile<E>
+where
+    E: crate::parser::ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress> + Clone,
+{
+    let inputs = crate::input_rules::AuthoredInputs::for_module_admission(
+        &AuthoredModuleGraph { file: &graph },
+        config,
+    );
+    graph.attach_authored_inputs(inputs);
+    graph
+}
+
 pub type ModuleCallConstraintReports = Vec<ModuleCallConstraintReport>;
 
 /// Diagnostic module-resolution outcome.
@@ -1893,6 +1910,7 @@ pub fn resolve_modules_with_config<E: ResolveExportBindingPhase<ParserPlaceholde
             .expand()?;
     ensure_expanded_root_graph(&expanded)?;
     finalize_deferred_for_bodies(expanded)
+        .map(|graph| publish_authored_module_graph(graph, config.catalog()))
 }
 
 /// Resolve modules in a bootstrap/editor context. Every value check is
@@ -1922,6 +1940,7 @@ pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase<Par
         .expand()?;
         ensure_expanded_root_graph(&expanded)?;
         finalize_deferred_for_bodies(expanded)
+            .map(|graph| publish_authored_module_graph(graph, config.catalog()))
     })()
     .map_err(|error: ModuleError| error.with_provider_type_warnings(warnings))
 }
@@ -1940,6 +1959,7 @@ pub fn resolve_module_template_with_config<E: ResolveExportBindingPhase<ParserPl
         RefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas, resolution)?
             .expand()?;
     finalize_deferred_for_bodies(expanded)
+        .map(|graph| publish_authored_module_graph(graph, config.catalog()))
 }
 
 /// Providerless/editor form of [`resolve_module_template_with_config`].
@@ -1969,6 +1989,7 @@ pub fn resolve_module_template_with_providerless_config<
         )?
         .expand()?;
         finalize_deferred_for_bodies(expanded)
+            .map(|graph| publish_authored_module_graph(graph, config.catalog()))
     })()
     .map_err(|error: ModuleError| error.with_provider_type_warnings(warnings))
 }
@@ -1998,6 +2019,7 @@ pub(crate) fn resolve_upstream_modules_with_providerless_config<
     )?
     .expand()?;
     finalize_deferred_for_bodies(expanded)
+        .map(|graph| publish_authored_module_graph(graph, config.catalog()))
 }
 
 pub(crate) fn resolve_upstream_modules_with_config<
@@ -2021,6 +2043,7 @@ pub(crate) fn resolve_upstream_modules_with_config<
     )?
     .expand()?;
     finalize_deferred_for_bodies(expanded)
+        .map(|graph| publish_authored_module_graph(graph, config.catalog()))
 }
 
 /// Resolve modules while retaining the expander's own per-call constraint
@@ -2113,7 +2136,7 @@ fn resolve_modules_with_diagnostics_and_resolver<
     graph.warnings.extend(resolver.provider_type_warnings());
     let mut graph = finish_root_expansion(graph, contributions, &root);
     crate::parser::retained::judge_configuration(&mut graph, resolver.schemas, resolver.config());
-    let (mut graph, deferred_for_errors) = finalize_deferred_for_bodies_collecting(graph);
+    let (graph, deferred_for_errors) = finalize_deferred_for_bodies_collecting(graph);
     errors.extend(deferred_for_errors);
     let constraint_reports = resolver
         .constraint_reports
@@ -2134,13 +2157,7 @@ fn resolve_modules_with_diagnostics_and_resolver<
     if !findings.is_empty() {
         ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors }
     } else if !resolution_failed {
-        graph.authored_inputs = None;
-        if let Ok(inputs) = crate::input_rules::AuthoredInputs::for_module_admission(
-            &AuthoredModuleGraph { file: &graph },
-            resolver.session.catalog(),
-        ) {
-            graph.attach_authored_inputs(inputs);
-        }
+        let graph = publish_authored_module_graph(graph, resolver.session.catalog());
         ModuleResolutionDiagnosticResult::Expanded {
             graph: Box::new(graph),
         }

@@ -698,18 +698,28 @@ A struct type represents a nested object with typed fields.
   including under negation. Each write site owns one immutable `RuleInput`,
   constructed only at authored, plan or protected dispatch stage boundaries.
   Authored checks require immutable parser/admission-minted `AuthoredInputs`;
-  mutating public AST fields cannot reseal their snapshot. Guards, targets,
+  mutating public AST fields cannot reseal their snapshot. Every successful module
+  publication retains resource authority even if provider configuration fails;
+  unavailable default-map membership remains pending. Missing authority is an
+  explicit error, never an empty successful report. Schema fields are read literally
+  through compiled declarations; only declared rule paths use `InputPath` parsing.
+  Guards, targets,
   instance enumeration and bound-expression estimation share the graph and
   ignore policy. Classification and diagnostic protection travel together on
   every graph edge. Key cursors preserve withheld completeness and masked
   membership; the estimator never recovers proof from an unsent map expression.
+  Withheld ancestors carry protection without granting a target-node capability.
   Owner prefixes are shared, and diagnostic paths are materialized only for
-  findings or pending results, which are then sorted. Only complete replacement nodes and
+  findings or pending results, which are then sorted. The shared validator also
+  shares path prefixes; published diagnostic keys have immutable concrete storage.
+  Only complete replacement nodes and
   explicit removals prove absence; unsent omissions remain withheld at every
   depth. Default membership belongs to that graph and is recomputed at dispatch.
   An erased normalized expression has no authored fallback without carried
   correspondence. Update inputs overlay the exact annotated patch on the full
-  protected desired tree, never observed state. Both owners use
+  protected desired tree, never observed state. `UpdateRequest::checked` mints
+  their sealed `ProtectedUpdateInput` together; dispatch cannot accept a desired
+  tree and a patch independently. Both owners use
   the same write-scope classifier; `AuthoredDesired` evaluates `CreateOnly` as
   warnings with core-rendered rejected-if-created wording, while `EveryWrite`
   remains an error. The core finding derives severity from rule scope and write

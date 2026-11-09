@@ -282,7 +282,7 @@ fn walk<'s, 'a>(
                 {
                     continue;
                 }
-                let child = match value.node(&site.input).map(|node| node.field(&field.name)) {
+                let child = match value.node(&site.input).map(|node| node.field(field)) {
                     Some(InputRead::Absent(_)) => continue,
                     Some(read) => read.instance(),
                     None => value.deferred(&site.input),

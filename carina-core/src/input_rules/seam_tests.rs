@@ -450,7 +450,7 @@ fn public_ast_mutations_cannot_reseal_authored_input() {
     let after = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas).unwrap();
     assert_eq!(before.findings, after.findings);
     let fabricated = crate::parser::ExpandedParsedFile::default();
-    assert!(fabricated.authored_inputs().is_none());
+    assert!(fabricated.authored_inputs().is_err());
 }
 
 #[test]
@@ -492,6 +492,280 @@ fn admitted_literal_attribute_names_do_not_panic_input_validation() {
         let findings = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas).unwrap();
         assert_eq!(findings.len(), usize::from(rules_elsewhere));
     }
+    for name in ["x-y", "a.b"] {
+        for supplied in [false, true] {
+            check_nested_literal_field(name, supplied);
+        }
+    }
+}
+
+fn check_nested_literal_field(name: &'static str, supplied: bool) {
+    let leaf = AttributeType::struct_with_rules(
+        "Leaf",
+        vec![StructField::optional("target", AttributeType::string()).build()],
+        vec![],
+        vec![InputRule::value(
+            InputRuleScope::EveryWrite,
+            InputPath::new("target").unwrap(),
+            InputRuleCode::new("leaf.target").unwrap(),
+            InputPredicate::Present,
+        )],
+    );
+    let schemas = registry(
+        ResourceSchema::new("Review").attribute(
+            AttributeSchema::optional(
+                "settings",
+                AttributeType::struct_("Settings", vec![StructField::optional(name, leaf).build()]),
+            )
+            .build(),
+        ),
+    );
+    let settings = if supplied {
+        format!("{{ '{name}' = {{}} }}")
+    } else {
+        "{}".into()
+    };
+    let parsed = crate::parser::parse_file(
+        &format!("let example = mock.Review {{ settings = {settings} }}"),
+        std::path::Path::new("main.crn"),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let findings = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas).unwrap();
+    assert_eq!(findings.len(), usize::from(supplied), "field {name}");
+}
+
+#[test]
+fn dotted_nested_schema_field_is_one_literal_lookup() {
+    check_nested_literal_field("a.b", false);
+    check_nested_literal_field("a.b", true);
+}
+
+#[test]
+fn all_module_publication_paths_retain_authored_rule_authority() {
+    use crate::module_resolver::*;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::create_dir(directory.path().join("child")).unwrap();
+    std::fs::write(
+        directory.path().join("providers.crn"),
+        "provider mock { default_tags = m.tags }\n",
+    )
+    .unwrap();
+    std::fs::write(directory.path().join("main.crn"), "let module = use { source = './child' }\nlet m = module {}\nlet example = mock.Review {}\n").unwrap();
+    std::fs::write(
+        directory.path().join("child/main.crn"),
+        "attributes { tags = { owner = 'known' } }\n",
+    )
+    .unwrap();
+    let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let base = crate::paths::ResolvedPath::new(directory.path()).unwrap();
+    let parsed = crate::config_loader::parse_directory(&base, &context).unwrap();
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .input_rule(
+                InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("target").unwrap(),
+                    InputRuleCode::new("tagged.target").unwrap(),
+                    InputPredicate::Present,
+                )
+                .with_condition(InputCondition::Present(InputPath::new("tags").unwrap())),
+            ),
+    );
+    let results = (0..6)
+        .map(|entry| {
+            let graph =
+                crate::validation::deferred_types::with_session_for_test(&context, |session| {
+                    match entry {
+                        0 => resolve_modules_with_config(parsed.clone(), &base, session, &schemas),
+                        1 => resolve_modules_with_providerless_config(
+                            parsed.clone(),
+                            &base,
+                            session,
+                            &schemas,
+                        ),
+                        2 => resolve_module_template_with_config(
+                            parsed.clone(),
+                            &base,
+                            session,
+                            &schemas,
+                        ),
+                        3 => resolve_module_template_with_providerless_config(
+                            parsed.clone(),
+                            &base,
+                            session,
+                            &schemas,
+                        ),
+                        4 => resolve_upstream_modules_with_config(
+                            parsed.clone(),
+                            &base,
+                            session,
+                            &schemas,
+                            &Default::default(),
+                        ),
+                        5 => resolve_upstream_modules_with_providerless_config(
+                            parsed.clone(),
+                            &base,
+                            session,
+                            &schemas,
+                            &Default::default(),
+                        ),
+                        _ => unreachable!(),
+                    }
+                })
+                .unwrap();
+            graph
+                .authored_inputs()
+                .map(|inputs| check_authored_inputs(inputs, &schemas).unwrap().len())
+        })
+        .collect::<Vec<_>>();
+    assert!(results.iter().all(Result::is_ok), "{results:?}");
+    for result in results {
+        assert_eq!(result.unwrap(), 1);
+    }
+}
+
+#[test]
+fn withheld_nested_map_keys_cannot_inspect_the_ancestor_expression() {
+    let reference = |binding: &str, attribute: &str| {
+        Value::Deferred(DeferredValue::ResourceRef {
+            path: crate::resource::AccessPath::from_binding(
+                crate::resource::absolute_binding_address_for_test(binding),
+                attribute,
+                vec![],
+            ),
+        })
+    };
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![
+                            StructField::optional(
+                                "labels",
+                                AttributeType::map(AttributeType::string()),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .input_rule(InputRule::new(
+                InputRuleScope::EveryWrite,
+                InputRuleTarget::MapKeys(InputPath::new("settings.labels").unwrap()),
+                InputRuleCode::new("labels.prefix").unwrap(),
+                InputPredicate::NoPrefix(crate::schema::NonEmptyString::new("labels").unwrap()),
+            )),
+    );
+    let output = object([("labels", object([("safe", reference("producer", "name"))]))]);
+    let types = InputTypeContext::<ModuleSource>::from_sources(
+        &[],
+        &[],
+        [(
+            crate::resource::absolute_binding_address_for_test("m"),
+            IndexMap::from([("settings".into(), output.clone())]),
+        )],
+        &[],
+        &schemas,
+    );
+    for (settings, expected) in [
+        (reference("m", "settings"), InputVerdict::Undecided),
+        (output, InputVerdict::Proven),
+    ] {
+        let resource = Resource::with_provider("mock", "Review", "example", None)
+            .with_attribute("settings", settings);
+        let authored = AuthoredInputs::resource_for_test(&resource);
+        let schema = schemas.get_for(&resource).unwrap().schema();
+        let input = RuleInput::for_authored(
+            &authored.resources().next().unwrap(),
+            schema,
+            Arc::new(types.facts.clone()),
+            &schemas,
+        )
+        .unwrap();
+        let site = classify_write_site::<ModuleSource>(
+            WriteSiteSource::Preview {
+                resource_id: resource.id,
+                input,
+            },
+            &schemas,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(site.applicable_rules().next().unwrap().evaluate(), expected);
+    }
+}
+
+#[test]
+fn recursive_union_binding_has_linear_path_work_for_every_container() {
+    // Leave room for the ordinary validator's recursive container frames;
+    // the budget measures copied path segments independently of stack size.
+    std::thread::Builder::new().stack_size(16 * 1024 * 1024).spawn(|| {
+    const COUNT: usize = 24;
+    for bool_first in [false, true] {
+        for container in ["field", "list", "map"] {
+            let child = match container {
+                "field" => AttributeType::ref_("Node"),
+                "list" => AttributeType::list(AttributeType::ref_("Node")),
+                "map" => AttributeType::map(AttributeType::ref_("Node")),
+                _ => unreachable!(),
+            };
+            let object_type = AttributeType::struct_with_rules(
+                "NodeObject",
+                vec![
+                    StructField::optional("target", AttributeType::bool()).build(),
+                    StructField::optional("child", child).build(),
+                ],
+                vec![],
+                vec![InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("target").unwrap(),
+                    InputRuleCode::new("node.target").unwrap(),
+                    InputPredicate::Present,
+                )],
+            );
+            let members = if bool_first {
+                vec![AttributeType::bool(), object_type]
+            } else {
+                vec![object_type, AttributeType::bool()]
+            };
+            let schemas = registry(
+                ResourceSchema::new("Review")
+                    .with_def("Node", AttributeType::union(members))
+                    .attribute(AttributeSchema::optional("node", AttributeType::ref_("Node")).build()),
+            );
+            let mut value = object([("target", Value::Concrete(ConcreteValue::Bool(true)))]);
+            for _ in 1..COUNT {
+                let child = match container {
+                    "field" => value,
+                    "list" => Value::Concrete(ConcreteValue::List(vec![value])),
+                    "map" => object([("entry", value)]),
+                    _ => unreachable!(),
+                };
+                value = object([("target", Value::Concrete(ConcreteValue::Bool(true))), ("child", child)]);
+            }
+            let resource = Resource::with_provider("mock", "Review", "example", None)
+                .with_attribute("node", value);
+            let site = classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+                .unwrap().unwrap();
+            let (_, segments) = crate::schema::with_field_path_work(|| {
+                let results = site.applicable_rules().map(|rule| rule.evaluate()).collect::<Vec<_>>();
+                assert_eq!(results, vec![InputVerdict::Proven; COUNT]);
+            });
+            assert!(segments <= COUNT * 16,
+                "{container}, bool_first={bool_first}: {segments} path segments for {COUNT} satisfied nodes");
+        }
+    }
+    }).unwrap().join().unwrap();
 }
 
 #[test]

@@ -11123,8 +11123,13 @@ where
     B: BindingAddress,
 {
     /// Immutable parser/admission evidence, independent of public AST mutations.
-    pub fn authored_inputs(&self) -> Option<&crate::input_rules::AuthoredInputs> {
-        self.authored_inputs.as_deref()
+    pub fn authored_inputs(
+        &self,
+    ) -> Result<&crate::input_rules::AuthoredInputs, crate::input_rules::AuthoredInputUnavailable>
+    {
+        self.authored_inputs
+            .as_deref()
+            .ok_or(crate::input_rules::AuthoredInputUnavailable)
     }
     pub(crate) fn attach_authored_inputs(&mut self, inputs: crate::input_rules::AuthoredInputs) {
         self.authored_inputs = Some(std::sync::Arc::new(inputs));
