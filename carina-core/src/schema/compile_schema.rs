@@ -128,14 +128,26 @@ impl PatternAttributeType<Draft> {
                 name,
                 fields,
                 field_groups,
-            } => AttrTypeKind::Struct {
-                name,
-                fields: compile_all(fields, |field| {
+                input_rules,
+            } => {
+                let fields = compile_all(fields, |field| {
                     let field_location = location.with_suffix(format_args!(".{}", field.name));
                     field.compile_patterns(field_location, issues)
-                })?,
-                field_groups,
-            },
+                });
+                let input_rules =
+                    compile_all(input_rules.into_iter().enumerate(), |(index, rule)| {
+                        rule.compile_patterns(
+                            location.with_suffix(format_args!(".input_rules[{index}]")),
+                            issues,
+                        )
+                    });
+                AttrTypeKind::Struct {
+                    name,
+                    fields: fields?,
+                    field_groups,
+                    input_rules: input_rules?,
+                }
+            }
             AttrTypeKind::Union(members) => {
                 AttrTypeKind::Union(UnionMemberTypes::new(compile_all(
                     members.into_raw_vec().into_iter().enumerate(),
@@ -259,7 +271,7 @@ impl PatternResourceSchema<Draft> {
             ty.compile_patterns(location, issues).map(|ty| (name, ty))
         });
         let input_rules = compile_all(input_rules.into_iter().enumerate(), |(index, rule)| {
-            rule.compile_patterns(index, issues)
+            rule.compile_patterns(SchemaValidationIssueLocation::InputRule(index), issues)
         });
         Some(PatternResourceSchema {
             resource_type,

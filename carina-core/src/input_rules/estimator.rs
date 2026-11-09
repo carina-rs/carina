@@ -943,7 +943,7 @@ fn decide(summary: Summary, rule: &InputRule<Compiled>, query: &Query<'_>) -> In
                 .iter()
                 .any(|window| window_can_be_ipv4(window)))
             .then_some(true),
-            Matches(_) | NotMatches(_) => None,
+            Present | Absent | Equals(_) | Matches(_) | NotMatches(_) => None,
         }
     };
     match result {
@@ -1035,9 +1035,5 @@ fn window_can_be_ipv4(window: &[Characters]) -> bool {
 }
 
 fn violation(rule: &InputRule<Compiled>) -> InputViolation {
-    InputViolation {
-        path: rule.path().clone(),
-        code: rule.code().clone(),
-        reason: rule.predicate().violation_reason(),
-    }
+    rule_violation(rule)
 }

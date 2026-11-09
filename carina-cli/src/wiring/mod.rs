@@ -984,6 +984,27 @@ pub(crate) struct ValidationReport<'a, T = carina_core::parser::ModuleResolvedIn
     schemas: &'a SchemaRegistry,
 }
 
+impl ValidationReport<'_> {
+    /// Explicit validate/editor preview only. Execution-oriented validation
+    /// retains the effect-specific input gate instead.
+    pub(crate) fn check_authored_inputs(mut self) -> Self {
+        self.result = self.result.and_then(|parsed| {
+            let report = carina_core::input_rules::check_authored_inputs(&parsed, self.schemas)
+                .map_err(|error| NonEmptyValidationErrors(vec![AppError::Provider(error)]))?;
+            let errors = report
+                .into_iter()
+                .map(|finding| AppError::Validation(finding.to_string()))
+                .collect::<Vec<_>>();
+            if errors.is_empty() {
+                Ok(parsed)
+            } else {
+                Err(NonEmptyValidationErrors(errors))
+            }
+        });
+        self
+    }
+}
+
 struct ValidationReportSink {
     warnings: Vec<carina_core::parser::ParseWarning>,
     errors: Vec<AppError>,

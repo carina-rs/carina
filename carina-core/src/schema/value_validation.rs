@@ -1185,6 +1185,7 @@ impl<'a> ValueValidator<'a> {
                     name,
                     fields,
                     field_groups,
+                    input_rules: _,
                 },
                 ConcreteValueRef::Map(map),
             ) => {

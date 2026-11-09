@@ -1810,3 +1810,111 @@ async fn input_discharge_identifierless_conflicting_resume_checks_before_old_del
         }
     }
 }
+
+struct ActivatingConditionalNormalizer;
+impl crate::provider::ProviderNormalizer for ActivatingConditionalNormalizer {
+    fn normalize_desired<'a>(
+        &'a self,
+        resources: &'a mut [crate::resource::ProviderResource],
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async move {
+            for resource in resources {
+                resource.set_attr("enabled", Value::Concrete(ConcreteValue::Bool(true)));
+                resource.set_attr("name", string("192.168.1.1"));
+            }
+            Ok(())
+        })
+    }
+    fn normalize_state<'a>(
+        &'a self,
+        _: &'a mut crate::provider::StateTransformMap,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn hydrate_read_state<'a>(
+        &'a self,
+        _: &'a mut crate::provider::StateTransformMap,
+        _: &'a crate::provider::SavedAttrs,
+    ) -> BoxFuture<'a, ProviderResult<()>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+#[tokio::test]
+async fn conditional_rules_recheck_normalized_guards_at_create_and_update_dispatch() {
+    use crate::schema::{InputCondition, InputLiteral};
+    for scope in [InputRuleScope::CreateOnly, InputRuleScope::EveryWrite] {
+        for update in [false, true] {
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert(
+                "",
+                PatternResourceSchema::new("test")
+                    .attribute(
+                        PatternAttributeSchema::optional("name", PatternAttributeType::string())
+                            .build(),
+                    )
+                    .attribute(
+                        PatternAttributeSchema::optional("enabled", PatternAttributeType::bool())
+                            .build(),
+                    )
+                    .input_rule(
+                        InputRule::value(
+                            scope,
+                            InputPath::new("name").unwrap(),
+                            InputRuleCode::new("test.conditional_name").unwrap(),
+                            InputPredicate::NotIpv4,
+                        )
+                        .with_condition(InputCondition::Equals {
+                            path: InputPath::new("enabled").unwrap(),
+                            literal: InputLiteral::Bool(true),
+                        }),
+                    )
+                    .validate()
+                    .unwrap(),
+            );
+            let resource = resolved_fixture_resources(vec![
+                Resource::new("test", "conditional")
+                    .with_attribute("name", string("valid-name"))
+                    .with_attribute("enabled", Value::Concrete(ConcreteValue::Bool(false))),
+            ])
+            .remove(0);
+            let provider = MockProvider::new();
+            let mut plan = Plan::new();
+            if update {
+                provider.push_update(Ok(ok_state(&resource.id)));
+                plan.add(Effect::Update {
+                    from: Box::new(ok_state(&resource.id)),
+                    identifier: AppliedIdentifier::new("existing").unwrap(),
+                    to: resource,
+                    changed_attributes: vec!["name".into(), "enabled".into()],
+                });
+            } else {
+                provider.push_create(Ok(ok_state(&resource.id)));
+                plan.add(Effect::Create(resource));
+            }
+            let (result, events) = run(
+                &provider,
+                plan,
+                &schemas,
+                HashMap::new(),
+                Default::default(),
+                &ActivatingConditionalNormalizer,
+            )
+            .await;
+            let rejected = !update || scope == InputRuleScope::EveryWrite;
+            assert_eq!(
+                result.failure_count(),
+                usize::from(rejected),
+                "{scope:?}, update={update}: {events:?}"
+            );
+            if rejected {
+                assert!(provider.calls().is_empty());
+                assert!(
+                    matches!(result.failures()[0].kind(),EffectFailureKind::InputRule { violation } if violation.code().as_str() == "test.conditional_name")
+                );
+            } else {
+                assert_eq!(result.success_count, 1, "{events:?}");
+            }
+        }
+    }
+}

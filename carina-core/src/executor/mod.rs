@@ -1266,7 +1266,7 @@ pub enum EffectFailureKind {
         violation: crate::schema::InputViolation,
     },
     UnresolvedInputRule {
-        path: crate::schema::InputPath,
+        path: crate::schema::InputDiagnosticPath,
         code: crate::schema::InputRuleCode,
     },
     Provider {

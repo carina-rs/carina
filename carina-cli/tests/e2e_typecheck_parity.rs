@@ -34,6 +34,9 @@ use carina_lsp::document::Document;
 use tempfile::TempDir;
 use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
 
+#[path = "e2e_typecheck_parity/conditional_input_rules.rs"]
+mod conditional_input_rules;
+
 #[path = "e2e_typecheck_parity/round4.rs"]
 mod round4;
 

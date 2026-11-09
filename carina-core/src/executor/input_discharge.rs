@@ -265,13 +265,14 @@ impl WriteCheck {
         &self,
         id: &ResourceId,
         attributes: &IndexMap<String, Value>,
+        patch: Option<&crate::provider::UpdatePatch>,
         schemas: &SchemaRegistry,
     ) -> Result<(), EffectFailureKind> {
         let Some(admission) = &self.admission else {
             return Ok(());
         };
         let token = DischargeToken(());
-        let site = executor_write_site(&token, admission, id, attributes, schemas)
+        let site = executor_write_site(&token, admission, id, attributes, patch, schemas)
             .map_err(EffectFailureKind::execution)?
             .ok_or_else(|| {
                 EffectFailureKind::message("input rule schema unavailable at dispatch")
@@ -302,6 +303,7 @@ impl WriteCheck {
         self.discharge(
             &request.resource().id,
             &request.resource().attributes,
+            None,
             schemas,
         )?;
         let resource_id = request.resource().id.clone();
@@ -328,7 +330,7 @@ impl WriteCheck {
         schemas: &SchemaRegistry,
     ) -> Result<PreparedWrite<UpdateRequest>, EffectFailureKind> {
         let attributes = request.patch().sent_projection();
-        self.discharge(id, &attributes, schemas)?;
+        self.discharge(id, &attributes, Some(request.patch()), schemas)?;
         Ok(PreparedWrite {
             request: Arc::new(request),
             resource_id: id.clone(),

@@ -110,6 +110,7 @@ pub fn validate_diagnostics_with_factories(
 
     let (errors, warnings) = providers
         .validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations)
+        .check_authored_inputs()
         .into_test_diagnostics();
     ValidateDiagnostics { errors, warnings }
 }
@@ -329,8 +330,9 @@ pub fn run_validate(
     let (providers, provider_load_error) =
         ProviderLoad::load_reporting(runtime, &parsed.providers, base_dir)?;
     error_reports.extend(provider_load_error.iter().map(ToString::to_string));
-    let validation_report =
-        providers.validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations);
+    let validation_report = providers
+        .validation_report(&parsed, base_dir, false, &loaded.duplicate_declarations)
+        .check_authored_inputs();
     // Publish unresolved provider checks even if another validation/load error
     // prevents a resolved file from being returned.
     let (validation_result, schemas) = validation_report.into_parts();
@@ -352,21 +354,6 @@ pub fn run_validate(
 
     if !error_reports.is_empty() {
         return Err(AppError::Validation(error_reports.join("\n")));
-    }
-
-    // Only explicit authoring validation checks effect-independent rules here.
-    // Plan/apply use finalized write sites, so Import, adoption and other
-    // non-writing effects never inherit an early desired-input check.
-    let input_findings = carina_core::input_rules::check_authored_inputs(&parsed, schemas)
-        .map_err(AppError::Provider)?;
-    if !input_findings.is_empty() {
-        return Err(AppError::Validation(
-            input_findings
-                .into_iter()
-                .map(|finding| finding.to_string())
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ));
     }
 
     // Check for unused let bindings (warnings, not errors)

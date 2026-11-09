@@ -1296,14 +1296,11 @@ impl DiagnosticRun<'_> {
                         else {
                             continue;
                         };
-                        let attribute = finding
-                            .violation
-                            .path()
-                            .segments()
-                            .next()
-                            .expect("admitted path is nonempty");
+                        let path = finding.violation.path();
+                        let attribute = path.root();
                         let location = if resource.attribute_keys().iter().any(|key| matches!(key.path().first(), Some(carina_core::parser::AttributePathSegment::Attribute(name)) if name == attribute)) {
-                            resource.attribute_key_location(attribute)
+                            if path.relative().is_empty() { resource.attribute_key_location(attribute) }
+                            else { resource.attribute_value_location(attribute, path.relative()) }
                         } else { resource.type_location() };
                         diagnostics.extend(render_merged(
                             doc,

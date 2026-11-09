@@ -208,9 +208,11 @@ mod input_rules;
 pub use compiled_pattern::{
     Compiled, CompiledPattern, Draft, PatternCompileError, PatternCompileErrorSource, PatternForm,
 };
+pub(crate) use input_rules::MAX_INPUT_CONDITION_DEPTH;
 pub use input_rules::{
-    CharSet, InputPath, InputPredicate, InputRule, InputRuleCode, InputRuleError, InputRuleParts,
-    InputRuleScope, InputRuleTarget, InputViolation, InputViolationReason, NonEmptyString,
+    CharSet, InputCondition, InputDiagnosticPath, InputLiteral, InputPath, InputPredicate,
+    InputRule, InputRuleCode, InputRuleError, InputRuleParts, InputRuleScope, InputRuleTarget,
+    InputViolation, InputViolationMessage, InputViolationReason, NonEmptyString,
 };
 
 use crate::provider_text::{DiagnosticText, DiagnosticTextBuilder, ProviderKey};
@@ -1450,6 +1452,7 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
         name: String,
         fields: Vec<PatternStructField<R>>,
         field_groups: Vec<FieldGroup>,
+        input_rules: Vec<InputRule<R>>,
     },
     /// Union of multiple types (value is valid if it matches any member)
     Union(UnionMemberTypes<R>),
@@ -1745,6 +1748,7 @@ pub enum RawShape<'a, R: PatternForm = Draft> {
         name: &'a str,
         fields: &'a [PatternStructField<R>],
         field_groups: &'a [FieldGroup],
+        input_rules: &'a [InputRule<R>],
     },
     /// Union of types — see [`AttrTypeKind::Union`].
     Union(&'a [PatternAttributeType<R>]),
@@ -1841,11 +1845,13 @@ impl<R: PatternForm> fmt::Debug for RawShape<'_, R> {
                 name,
                 fields,
                 field_groups,
+                input_rules,
             } => f
                 .debug_struct("RawShape::Struct")
                 .field("name", name)
                 .field("fields", fields)
                 .field("field_groups", field_groups)
+                .field("input_rules", input_rules)
                 .finish(),
             RawShape::Union(members) => f.debug_tuple("RawShape::Union").field(members).finish(),
             RawShape::Ref(name) => f.debug_tuple("RawShape::Ref").field(name).finish(),
@@ -2367,11 +2373,13 @@ impl<R: PatternForm> fmt::Debug for PatternAttributeType<R> {
                 name,
                 fields,
                 field_groups,
+                input_rules,
             } => f
                 .debug_struct("Struct")
                 .field("name", name)
                 .field("fields", fields)
                 .field("field_groups", field_groups)
+                .field("input_rules", input_rules)
                 .finish(),
             AttrTypeKind::Union(types) => f.debug_tuple("Union").field(types).finish(),
             AttrTypeKind::Ref(name) => f.debug_tuple("Ref").field(name).finish(),
@@ -2886,10 +2894,12 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 name,
                 fields,
                 field_groups,
+                input_rules,
             } => RawShape::Struct {
                 name: name.as_str(),
                 fields: fields.as_slice(),
                 field_groups: field_groups.as_slice(),
+                input_rules: input_rules.as_slice(),
             },
             AttrTypeKind::Union(members) => RawShape::Union(members.as_raw_slice()),
             AttrTypeKind::Ref(name) => RawShape::Ref(name.as_str()),
@@ -3200,11 +3210,22 @@ impl<R: PatternForm> PatternAttributeType<R> {
         fields: Vec<PatternStructField<R>>,
         field_groups: Vec<FieldGroup>,
     ) -> Self {
+        Self::struct_with_rules(name, fields, field_groups, Vec::new())
+    }
+
+    /// Construct a Struct with sibling rules relative to each object instance.
+    pub fn struct_with_rules(
+        name: impl Into<String>,
+        fields: Vec<PatternStructField<R>>,
+        field_groups: Vec<FieldGroup>,
+        input_rules: Vec<InputRule<R>>,
+    ) -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::Struct {
                 name: name.into(),
                 fields,
                 field_groups,
+                input_rules,
             },
         }
     }
@@ -4313,6 +4334,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4358,6 +4380,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4407,6 +4430,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4438,6 +4462,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4485,6 +4510,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4539,6 +4565,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4589,6 +4616,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -4636,6 +4664,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     name: _,
                     fields: _,
                     field_groups: _,
+                    input_rules: _,
                 }
                 | UnloadedSchemaType(_)
                 | Bool
@@ -10433,6 +10462,7 @@ fn identified_declaration_kind(
             name: _name,
             fields: _fields,
             field_groups: _field_groups,
+            input_rules: _input_rules,
         } => None,
         RawShape::Union(_members) => None,
         RawShape::Ref(_name) => None,
@@ -10506,6 +10536,7 @@ fn identified_declaration_scalar_kind(
             name: _name,
             fields: _fields,
             field_groups: _field_groups,
+            input_rules: _input_rules,
         } => None,
         RawShape::Union(_members) => None,
         RawShape::Ref(_name) => None,
@@ -11164,8 +11195,24 @@ fn validate_type_definition(
         AttrTypeKind::Struct {
             fields,
             field_groups,
+            input_rules,
             ..
         } => {
+            input_rules::validate_rule_collection(
+                input_rules,
+                |name| {
+                    fields.iter().find(|field| field.name == name).map(|field| {
+                        (
+                            &field.field_type,
+                            provider_populated_ancestor.unwrap_or(false)
+                                || field.declared_input_mode.is_provider_populated(),
+                        )
+                    })
+                },
+                defs,
+                |index| location.with_suffix(format_args!(".input_rules[{index}]")),
+                issues,
+            );
             let mut names = HashSet::new();
             for field in fields {
                 let field_location = location.with_suffix(format_args!(".{}", field.name));

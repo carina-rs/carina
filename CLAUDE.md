@@ -683,7 +683,20 @@ A struct type represents a nested object with typed fields.
   24 also requires a typed pattern spec (regex plus explicit mode, and a reason
   containing visible text for Substring); convert the complete spec
   exhaustively, including its reason. Never supply a default mode or admit a bare
-  string, including on the schema-only migration path. Adding
+  string, including on the schema-only migration path. Protocol 25 requires
+  `InputRule.condition` and Struct `input_rules` even when the condition is
+  `Always` or the collection is empty; neither field has a serde default.
+  Conditions and Struct rules travel once in the existing schema JSON, with no
+  WIT change. Resource and Struct declarations use the same admitted rule type,
+  with Struct paths relative to each object instance (including recursive defs).
+  The shared input-rule admission gate checks writable canonical paths, typed
+  scalar literals, enum identity and canonical membership, predicate compatibility,
+  duplicate target/code pairs, and a condition depth limit of 16. The one evaluator
+  uses runtime knowledge for presence and equality; unknown guards remain pending,
+  including under negation. Update guards use admitted desired context overlaid
+  with the exact patch, including removals, never observed state. Both owners use
+  the same write-scope classifier; `AuthoredDesired` still excludes `CreateOnly`.
+  Semantic fingerprints encode conditions and nested rules in encoding v13. Adding
   a protocol field must break compilation until it is consciously carried
   across or explicitly bound and documented as unavailable on the destination
   side. Never use a catch-all `_` or `..` at this seam; a silently dropped field

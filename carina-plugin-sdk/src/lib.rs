@@ -101,7 +101,7 @@ use carina_provider_protocol::types::{
 };
 use std::collections::{BTreeMap, HashMap};
 
-/// Failure while projecting validated SDK schemas onto version-24 JSON.
+/// Failure while projecting validated SDK schemas onto version-25 JSON.
 #[derive(Debug)]
 pub enum SchemaSerializationError {
     Convert(carina_core::protocol_convert::ProtocolConvertError),
@@ -2941,6 +2941,66 @@ mod error_composition_tests {
                 .unwrap()
                 .as_cause()
                 .matches_for_test::<std::io::Error>(|_| true)
+        );
+    }
+}
+
+#[cfg(test)]
+mod conditional_input_rule_tests {
+    use super::*;
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, InputCondition, InputLiteral, InputPath, InputPredicate,
+        InputRule, InputRuleCode, InputRuleScope, ResourceSchema, StructField,
+        ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+    };
+
+    #[test]
+    fn schema_json_carries_conditions_on_root_and_struct_in_defs() {
+        let rule = InputRule::value(
+            InputRuleScope::EveryWrite,
+            InputPath::new("target").unwrap(),
+            InputRuleCode::new("test.conditional").unwrap(),
+            InputPredicate::Present,
+        )
+        .with_condition(InputCondition::Not(Box::new(InputCondition::Equals {
+            path: InputPath::new("guard").unwrap(),
+            literal: InputLiteral::Bool(false),
+        })));
+        let nested = AttributeType::struct_with_rules(
+            "Nested",
+            vec![
+                StructField::optional("guard", AttributeType::bool()).build(),
+                StructField::optional("target", AttributeType::string()).build(),
+            ],
+            vec![],
+            vec![rule.clone()],
+        );
+        let schema = ResourceSchema::new("test.Conditional")
+            .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("nested", AttributeType::ref_("Nested")).build())
+            .with_def("Nested", nested)
+            .input_rule(rule)
+            .validate()
+            .unwrap();
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![schema],
+            ValidatedConfigSchema::default(),
+            Default::default(),
+            vec![],
+        )
+        .unwrap();
+        let json = provider_schema_to_json(&witness).unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let root = &payload["resources"][0]["input_rules"][0]["condition"];
+        assert_eq!(root["kind"], "not");
+        assert_eq!(
+            root["value"]["value"]["literal"],
+            serde_json::json!({"kind":"bool","value":false})
+        );
+        assert_eq!(
+            root,
+            &payload["resources"][0]["defs"]["Nested"]["input_rules"][0]["condition"]
         );
     }
 }
