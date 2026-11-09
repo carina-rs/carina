@@ -9,4 +9,5 @@ license = "MIT"
 workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+carina-plugin-bindings-diagnostics = { path = "../carina-plugin-bindings-diagnostics" }
 wit-bindgen = { workspace = true }

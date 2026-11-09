@@ -4,9 +4,13 @@ use super::diagnostics::{
 };
 use super::*;
 mod desired_normalization;
+mod diagnostic_imports;
 pub(super) mod guest_stderr;
 pub(super) mod guest_store;
 mod wasm_convert;
+pub(super) use diagnostic_imports::add_diagnostic_imports;
+#[cfg(test)]
+mod diagnostic_tests;
 use version_checked_bindings::wit_types;
 pub(super) use version_checked_bindings::{SchemaOnlyBindings, WasmBindings};
 
@@ -33,6 +37,8 @@ mod version_checked_bindings {
             exports: { default: async },
             with: {
                 "carina:provider/types": super::basic::carina::provider::types,
+                "carina:provider/diagnostics": super::basic::carina::provider::diagnostics,
+                "carina:provider/protected-material": super::basic::carina::provider::protected_material,
                 "carina:provider/provider": super::basic::exports::carina::provider::provider,
                 "wasi:http": wasmtime_wasi_http::p2::bindings::http,
                 "wasi:io": wasmtime_wasi::p2::bindings::io,
@@ -49,6 +55,8 @@ mod version_checked_bindings {
             exports: { default: async },
             with: {
                 "carina:provider/types": super::basic::carina::provider::types,
+                "carina:provider/diagnostics": super::basic::carina::provider::diagnostics,
+                "carina:provider/protected-material": super::basic::carina::provider::protected_material,
                 "carina:provider/provider": super::basic::exports::carina::provider::provider,
                 "wasi:http": wasmtime_wasi_http::p2::bindings::http,
                 "wasi:io": wasmtime_wasi::p2::bindings::io,
@@ -58,6 +66,9 @@ mod version_checked_bindings {
 
     pub(crate) use aws::carina::provider::aws_credentials;
     pub(crate) use basic::carina::provider::types as wit_types;
+    pub(super) use basic::carina::provider::{
+        diagnostics as wit_diagnostics, protected_material as wit_protected_material,
+    };
     pub(crate) use basic::exports::carina::provider::provider::{
         DesiredResource as WitDesiredResource, PlanOp as WitPlanOp,
     };
@@ -65,7 +76,14 @@ mod version_checked_bindings {
     use basic::CarinaProvider;
     use http::CarinaProviderWithHttp;
 
-    const PROVIDER_INTERFACE_EXPORT: &str = "carina:provider/provider@0.1.0";
+    const WIT_PACKAGE_VERSION: semver::Version = semver::Version::new(0, 2, 0);
+    fn provider_interface_export() -> String {
+        [
+            "carina:provider/provider@",
+            WIT_PACKAGE_VERSION.to_string().as_str(),
+        ]
+        .concat()
+    }
 
     // Wasmtime 43 generates types owned by an exported interface separately
     // for each world, even when `with` shares that interface for referenced
@@ -116,6 +134,19 @@ mod version_checked_bindings {
             component: &Component,
             linker: &Linker<HostState>,
         ) -> Result<Self, WasmBindingCreationError> {
+            let component_type = component.component_type();
+            // Reject the package before linking: legacy imports cannot be resolved,
+            // and even an otherwise linkable component must execute no guest code.
+            let required_wit = WIT_PACKAGE_VERSION.to_string();
+            let legacy_version = component_type
+                .imports(linker.engine())
+                .chain(component_type.exports(linker.engine()))
+                .filter_map(|(name, _item)| name.strip_prefix("carina:provider/"))
+                .filter_map(|interface| interface.rsplit_once('@').map(|(_name, version)| version))
+                .find(|version| *version != required_wit);
+            if let Some(version) = legacy_version {
+                return Err(legacy_wit_error(version));
+            }
             let pre = linker
                 .instantiate_pre(component)
                 .map_err(WasmBindingCreationError::Instantiation)?;
@@ -128,7 +159,14 @@ mod version_checked_bindings {
                 })?
                 .map_err(WasmBindingCreationError::Instantiation)?;
             let info = store
-                .call(|store| std::future::ready(untyped_info_func(store, &instance)))
+                .call(|store| {
+                    std::future::ready(untyped_string_func_in(
+                        store,
+                        &instance,
+                        &provider_interface_export(),
+                        "info",
+                    ))
+                })
                 .await
                 .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
                     operation: "info",
@@ -152,11 +190,27 @@ mod version_checked_bindings {
         }
     }
 
-    fn untyped_info_func(
-        store: &mut Store<HostState>,
-        instance: &wasmtime::component::Instance,
-    ) -> wasmtime::Result<wasmtime::component::TypedFunc<(), (String,)>> {
-        untyped_string_func(store, instance, "info")
+    fn legacy_wit_error(found: &str) -> WasmBindingCreationError {
+        let remedy = match semver::Version::parse(found) {
+            Ok(version) if version > WIT_PACKAGE_VERSION => "upgrade Carina",
+            Ok(_version) => "rebuild the provider against the current carina protocol",
+            Err(_error) => "rebuild the provider against the current carina protocol",
+        };
+        let required_wit = WIT_PACKAGE_VERSION.to_string();
+        let required_protocol = carina_provider_protocol::PROTOCOL_VERSION.to_string();
+        WasmBindingCreationError::ProtocolVersion(DiagnosticText::new(
+            [
+                "Incompatible provider WIT package carina:provider@",
+                found,
+                "; host requires carina:provider@",
+                required_wit.as_str(),
+                " (protocol ",
+                required_protocol.as_str(),
+                "); ",
+                remedy,
+            ]
+            .concat(),
+        ))
     }
 
     fn untyped_string_func(
@@ -164,16 +218,20 @@ mod version_checked_bindings {
         instance: &wasmtime::component::Instance,
         export: &str,
     ) -> wasmtime::Result<wasmtime::component::TypedFunc<(), (String,)>> {
+        untyped_string_func_in(store, instance, &provider_interface_export(), export)
+    }
+
+    fn untyped_string_func_in(
+        store: &mut Store<HostState>,
+        instance: &wasmtime::component::Instance,
+        provider_export: &str,
+        export: &str,
+    ) -> wasmtime::Result<wasmtime::component::TypedFunc<(), (String,)>> {
         let provider = instance
-            .get_export_index(&mut *store, None, PROVIDER_INTERFACE_EXPORT)
+            .get_export_index(&mut *store, None, provider_export)
             .ok_or_else(|| {
                 wasmtime::Error::msg(
-                    [
-                        "no exported instance named `",
-                        PROVIDER_INTERFACE_EXPORT,
-                        "`",
-                    ]
-                    .concat(),
+                    ["no exported instance named `", provider_export, "`"].concat(),
                 )
             })?;
         let function = instance
@@ -182,7 +240,7 @@ mod version_checked_bindings {
                 wasmtime::Error::msg(
                     [
                         "instance export `",
-                        PROVIDER_INTERFACE_EXPORT,
+                        provider_export,
                         "` does not have export `",
                         export,
                         "`",
@@ -198,12 +256,12 @@ mod version_checked_bindings {
         instance: &wasmtime::component::Instance,
     ) -> wasmtime::Result<wasmtime::component::TypedFunc<(), (Vec<String>,)>> {
         let provider = instance
-            .get_export_index(&mut *store, None, PROVIDER_INTERFACE_EXPORT)
+            .get_export_index(&mut *store, None, &provider_interface_export())
             .ok_or_else(|| {
                 wasmtime::Error::msg(
                     [
                         "no exported instance named `",
-                        PROVIDER_INTERFACE_EXPORT,
+                        &provider_interface_export(),
                         "`",
                     ]
                     .concat(),
@@ -215,7 +273,7 @@ mod version_checked_bindings {
                 wasmtime::Error::msg(
                     [
                         "instance export `",
-                        PROVIDER_INTERFACE_EXPORT,
+                        &provider_interface_export(),
                         "` does not have export `identity-attributes`",
                     ]
                     .concat(),
@@ -230,38 +288,10 @@ mod version_checked_bindings {
             component: &Component,
             linker: &Linker<HostState>,
         ) -> Result<Self, WasmBindingCreationError> {
-            let pre = linker
-                .instantiate_pre(component)
-                .map_err(WasmBindingCreationError::Instantiation)?;
-            let instance = store
-                .call(|store| pre.instantiate_async(store))
-                .await
-                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
-                    operation: "instantiate",
-                    source,
-                })?
-                .map_err(WasmBindingCreationError::Instantiation)?;
-            let info = store
-                .call(|store| std::future::ready(untyped_info_func(store, &instance)))
-                .await
-                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
-                    operation: "info",
-                    source,
-                })?
-                .map_err(WasmBindingCreationError::Instantiation)?;
-            let (info_json,) = store
-                .call(|store| info.call_async(store, ()))
-                .await
-                .map_err(|source| WasmBindingCreationError::WallBudgetExceeded {
-                    operation: "info",
-                    source,
-                })?
-                .map_err(WasmBindingCreationError::InfoCall)?;
-            wasm_convert::check_protocol_version(&info_json)
-                .map_err(WasmBindingCreationError::ProtocolVersion)?;
+            let checked = ProtocolCheckedInstance::instantiate(store, component, linker).await?;
             Ok(Self {
-                instance,
-                info_json,
+                instance: checked.instance,
+                info_json: checked.info_json,
             })
         }
 
@@ -1265,6 +1295,18 @@ impl WasmProviderFactory {
         let schema_witness =
             wasm_convert::json_to_provider_schema(&schemas_json, provider_config_types)
                 .map_err(|error| provider_schema_decode_error(name, &version.to_string(), error))?;
+        rebuild
+            .diagnostic_inputs
+            .install_event_schemas(&schema_witness)
+            .map_err(|error| {
+                WasmProviderLoadError::metadata("Failed to install diagnostic schemas", error)
+            })?;
+        live.store
+            .diagnostic_inputs()
+            .install_event_schemas(&schema_witness)
+            .map_err(|error| {
+                WasmProviderLoadError::metadata("Failed to install diagnostic schemas", error)
+            })?;
         let init_instance = RebuildableInstance::new(live, rebuild);
 
         Ok(Self {
@@ -4010,6 +4052,7 @@ pub(super) mod tests {
     #[cfg(test)]
     mod round6 {
         use super::*;
+        use carina_core::provider_text::{EventLevel, ProviderEvent};
         #[tokio::test]
         async fn validation_failed_capacity_rebuild_does_not_retain_unsent_inputs() {
             let mut factory = rebuildable_state_test_factory()
@@ -4210,6 +4253,12 @@ pub(super) mod tests {
                 assert!(stderr.check_write().unwrap() >= line.len());
                 stderr.write(hyper::body::Bytes::from(line)).unwrap();
                 stderr.flush().unwrap();
+                let diagnostic = ProviderError::api_error(format!("credential={token}; public=visible"));
+                store.data().input_inventory().diagnostics().emit(ProviderEvent::failure(
+                    EventLevel::Warn,
+                    "guest typed credential".into(),
+                    &diagnostic,
+                ));
                 ProviderError::api_error(format!("guest error credential={token}; public=visible"))
             }).await.unwrap();
             let error = error.with_secrets_for_test(&context);
@@ -4248,7 +4297,11 @@ pub(super) mod tests {
                 "host credential leaked through guest store: {stderr}"
             );
             assert!(
-                stderr.contains("guest stderr credential=(secret); public=visible"),
+                !stderr.contains("guest stderr credential="),
+                "raw guest stderr was forwarded: {stderr}"
+            );
+            assert!(
+                stderr.contains("guest typed credential: credential=(secret); public=visible"),
                 "{stderr}"
             );
             assert!(
@@ -4257,11 +4310,11 @@ pub(super) mod tests {
             );
         }
         #[test]
-        fn review_round6_guest_stderr_masks_session_token() {
+        fn review_round6_guest_store_never_leaks_session_token() {
             round6_credential_parent(false);
         }
         #[test]
-        fn review_round6_guest_stderr_masks_github_token() {
+        fn review_round6_guest_store_never_leaks_github_token() {
             round6_credential_parent(true);
         }
 
@@ -4274,7 +4327,7 @@ pub(super) mod tests {
                 "round6%2fpath%2bprivate%3dvalue",
             ] {
                 let capture = tempfile::NamedTempFile::new().unwrap();
-                let stderr = guest_stderr::GuestStderr::new(capture.reopen().unwrap());
+                let stderr = guest_stderr::HostOutput::new(capture.reopen().unwrap());
                 let _call = stderr.begin_call(&context.session().guest_inputs());
                 let uri = format!("https://example.com/{encoded}/public");
                 stderr
@@ -4316,6 +4369,10 @@ pub(super) mod tests {
                     "{text}\n{}",
                     String::from_utf8_lossy(&output.stdout)
                 );
+                assert!(
+                    !text.contains("raw guest stderr: remembered "),
+                    "raw validation stderr was forwarded: {text}"
+                );
                 for secret in [
                     "round6-validation-first",
                     "round6-validation-second",
@@ -4356,10 +4413,23 @@ pub(super) mod tests {
                         let mut cli = store.data_mut().cli();
                         let handle = cli.get_stderr().unwrap();
                         let stderr = cli.table.get_mut(&handle).unwrap();
-                        let line = format!("remembered {message}; public=visible\n");
+                        let line =
+                            format!("raw guest stderr: remembered {message}; public=visible\n");
                         assert!(stderr.check_write().unwrap() >= line.len());
                         stderr.write(hyper::body::Bytes::from(line)).unwrap();
                         stderr.flush().unwrap();
+                        let diagnostic = ProviderError::api_error(format!(
+                            "remembered {message}; public=visible"
+                        ));
+                        store
+                            .data()
+                            .input_inventory()
+                            .diagnostics()
+                            .emit(ProviderEvent::failure(
+                                EventLevel::Warn,
+                                "validation".into(),
+                                &diagnostic,
+                            ));
                         Ok::<_, wasmtime::Error>(result)
                     })
                     .await
@@ -6864,7 +6934,7 @@ pub(super) mod tests {
             let session = crate::provider_text_fixtures::context(&[SECRET])
                 .session()
                 .guest_inputs();
-            let stderr = guest_stderr::GuestStderr::new(std::io::stderr());
+            let stderr = guest_stderr::HostOutput::new(std::io::stderr());
             let _call = stderr.begin_call(&session);
             let mut hooks = AllowListHttpHooks::with_resolver(
                 local_provider_label("mock_http"),
@@ -6919,7 +6989,7 @@ pub(super) mod tests {
             .guest_inputs();
         for phases in [false, true] {
             let capture = tempfile::NamedTempFile::new().unwrap();
-            let stderr = guest_stderr::GuestStderr::new(capture.reopen().unwrap());
+            let stderr = guest_stderr::HostOutput::new(capture.reopen().unwrap());
             let _call = stderr.begin_call(&session);
             let uri = format!("https://example.com/{}/{secret}/public", "x".repeat(8000));
             let line = if phases {
@@ -7195,7 +7265,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn test_shared_vars_reach_every_kind() {
+    fn test_shared_vars_reach_every_kind_without_host_trace_configuration() {
         // Provider-agnostic utility vars reach every guest, including
         // the kind-less (info/schemas) instance.
         for capabilities in [
@@ -7211,8 +7281,8 @@ pub(super) mod tests {
                 "RUST_LOG missing for {capabilities:?}"
             );
             assert!(
-                keys.contains(&"CARINA_WASI_HTTP_TRACE"),
-                "CARINA_WASI_HTTP_TRACE missing for {capabilities:?}"
+                !keys.contains(&"CARINA_WASI_HTTP_TRACE"),
+                "host-only CARINA_WASI_HTTP_TRACE reached {capabilities:?}"
             );
         }
     }
@@ -10067,9 +10137,11 @@ pub(super) mod tests {
             Err(_) => panic!("the mock provider must support the basic world"),
         };
         assert_eq!(initial.instantiation_world(), InstantiationWorld::Basic);
+        let diagnostic_inputs = initial.store.diagnostic_inputs();
         let instance = RebuildableInstance::new(
             initial,
             RebuildContext {
+                diagnostic_inputs,
                 engine,
                 component,
                 label: local_provider_label("mock"),
@@ -10109,11 +10181,12 @@ pub(super) mod tests {
             Component::new(&engine, "(component)").expect("empty test component should compile");
         let fingerprint_key = [9_u8; 32];
         let context = ValidationContextFingerprint::validate_config(&fingerprint_key, &[]);
+        let diagnostic_inputs = carina_core::provider::ProviderPlan::state_only()
+            .session("rebuild-test", None, None)
+            .guest_inputs();
         let instance = RebuildableInstance {
             state: Mutex::new(RebuildableState {
-                inputs: carina_core::provider::ProviderPlan::state_only()
-                    .session("", None, None)
-                    .guest_inventory(),
+                inputs: diagnostic_inputs.guest_inventory(),
                 instance: ValidationInstanceState::Poisoned {
                     reason: PoisonReason::WallClockTimeout {
                         operation: "validate_config",
@@ -10122,6 +10195,7 @@ pub(super) mod tests {
                 input_health: IndexMap::new(),
             }),
             rebuild: RebuildContext {
+                diagnostic_inputs,
                 engine,
                 component,
                 label: local_provider_label("rebuild-test"),

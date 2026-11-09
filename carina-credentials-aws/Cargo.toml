@@ -18,7 +18,7 @@ rustls-native-certs = "0.8"
 tokio = { version = "1", features = ["sync", "time"] }
 
 [dev-dependencies]
-carina-core = { path = "../carina-core", features = ["test-utils"] }
+carina-core = { path = "../carina-core", features = ["test-utils", "provider-host"] }
 carina-provider-protocol = { path = "../carina-provider-protocol" }
 sha1 = "0.10"
 tempfile = "3"

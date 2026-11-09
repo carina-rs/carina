@@ -1,9 +1,10 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **24**.
+The current protocol and minimum supported provider protocol are both **25**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 25 | 25 | WIT 0.2.0 typed diagnostics and credential registration; guest stdout/stderr discarded. |
 | 24 | 24 | Required typed pattern specifications with explicit Full or justified Substring matching. |
 | 23 | 23 | Required scoped desired-input rules on every resource schema. |
 | 22 | 22 | Optional entry-count bound on `Map` attribute types. |
@@ -15,6 +16,49 @@ The current protocol and minimum supported provider protocol are both **24**.
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 25
+
+WIT package `carina:provider@0.2.0` requires the `diagnostics` and
+`protected-material` imports in every provider world. The host discards guest
+stdout and stderr from metadata loading through teardown. Provider errors,
+warnings, panic payloads, value diagnostics and HTTP traces use typed events
+bound by the same host redaction kernel as returned provider errors.
+
+Only long-lived AWS session credentials and GitHub tokens are registered.
+Registration is idempotent by credential value and keeps older generations for
+later redaction. Per-request signing fields are masked structurally by the host;
+ordinary query values do not enter the credential inventory. Value origin is
+advisory and cannot weaken host schema or secret classification.
+
+AWS providers enable the SDK's `aws` feature and implement `AwsSessionSource`.
+Each source returns `AwsSessionMaterial::new(credentials)` with the complete AWS
+SDK `Credentials` value. Registration reads its key, secret and token; the same
+credentials are returned after acknowledgement, preserving expiry, account ID,
+provider name and all feature/custom properties. Material Debug is opaque.
+The public AWS credential/configuration entry points are `AwsSessionMaterial`,
+`AwsSessionSource`, `AwsSessionFuture` and `AwsSdkParts`. Credential registration
+and acknowledged snapshots stay internal; snapshots cannot be installed as
+credentials providers or used to prepare unsigned requests.
+`AwsSdkParts::new(source, diagnostics).apply(builder)` installs the HTTP client
+and its registering credentials provider together on one AWS SDK config builder.
+Each credentials lookup fetches the current generation, registers it before
+returning signing credentials, and preserves its optional expiry. Registration
+failure returns a typed credentials error. Later changes through AWS config APIs
+remain under caller control; the SDK exposes neither paired component alone.
+
+`CARINA_WASI_HTTP_TRACE=1` is a host-only option and is never forwarded to guests.
+The SDK emits one completed typed HTTP event per request, including early failures.
+The default sink admits Debug/Trace only with that option; Error/Warn/Info remain
+visible. Native calls and WASM exports share per-call event budgets, separate trace
+quotas and a fixed host-authored suppression notice. Only the first panic per call
+is exempt from count/rate limits, with a finite 256 KiB input cap.
+
+Legacy `0.1.0` WIT providers are rejected with a typed incompatibility before
+linking or executing guest code. Older packages require rebuilding the provider
+against the current Carina protocol; newer packages require upgrading Carina.
+Both the current and minimum supported protocol are 25. Providers built for
+protocol 24 or earlier must rebuild against the current SDK.
 
 ## Version 24
 
@@ -117,11 +161,11 @@ are not serialized. Saved-plan input re-admission under the apply lock remains
 an explicitly typed TODO for phase 5.
 
 Version 23 introduced the required `input_rules`, `scope` and `target` fields.
-The current host requires protocol 24, including explicit pattern modes, and
+The current host requires protocol 25, including explicit pattern modes, and
 rejects older providers before schema decoding. The v12 migration adapter has
 been removed. The SDK's schema JSON export carries these rules; no WIT function
 or CRUD request field is added. AWS, AWSCC, and GitHub providers must rebuild
-against protocol 24.
+against protocol 25.
 
 ## Version 22
 
@@ -173,7 +217,7 @@ identity conversion; the existing length and range checks still apply, and sink
 validators still run on values during validation, planning, and apply.
 
 Version 21 introduced this required edge array. Hosts and providers must rebuild
-together; the current minimum is 24. Protocol-12 metadata is rejected, including
+together; the current minimum is 25. Protocol-12 metadata is rejected, including
 on read-only schema loading paths.
 
 ## Version 20

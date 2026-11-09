@@ -11,9 +11,12 @@ use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass, Verifie
 /// basic linker is independently incapable of satisfying the wasi:http import.
 const HTTP_AND_BOGUS_COMPONENT_WAT: &str = r#"
 (component
-  (type $i (instance))
-  (import "wasi:http/types@0.2.9" (instance (type $i)))
-  (import "bogus:fake-3688/iface@99.0.0" (instance (type $i)))
+  (type $http (instance))
+  (import "wasi:http/types@0.2.9" (instance (type $http)))
+  (type $bogus (instance (export "missing-function" (func))))
+  (import "bogus:fake-3688/iface@99.0.0" (instance (type $bogus)))
+  (instance $provider)
+  (export "carina:provider/provider@0.2.0" (instance $provider))
 )
 "#;
 
@@ -22,8 +25,10 @@ const HTTP_AND_BOGUS_COMPONENT_WAT: &str = r#"
 /// structurally predetermined, its failure must remain subordinate context.
 const NON_WASI_BOGUS_COMPONENT_WAT: &str = r#"
 (component
-  (type $i (instance))
-  (import "bogus:fake-1681/iface@99.0.0" (instance (type $i)))
+  (type $bogus (instance (export "missing-function" (func))))
+  (import "bogus:fake-1681/iface@99.0.0" (instance (type $bogus)))
+  (instance $provider)
+  (export "carina:provider/provider@0.2.0" (instance $provider))
 )
 "#;
 
@@ -95,7 +100,7 @@ async fn instantiation_failure_is_typed_and_demotes_basic_fallback() {
         "HTTP failure did not lead error: {rendered}"
     );
     assert!(
-        rendered.contains("no exported instance named `carina:provider/provider@0.1.0`"),
+        rendered.contains("bogus:fake-3688/iface@99.0.0") && rendered.contains("missing-function"),
         "full HTTP cause chain missing real linker detail: {rendered}"
     );
     assert!(rendered.contains("Component wasi:http imports: wasi:http/types@0.2.9"));
@@ -108,7 +113,7 @@ async fn instantiation_failure_is_typed_and_demotes_basic_fallback() {
 #[tokio::test(flavor = "multi_thread")]
 async fn non_wasi_import_preserves_informative_basic_fallback_as_subordinate_context() {
     let rendered = render_instantiation_error(NON_WASI_BOGUS_COMPONENT_WAT).await;
-    let missing_provider_export = "no exported instance named `carina:provider/provider@0.1.0`";
+    let missing_import = "bogus:fake-1681/iface@99.0.0";
     let subordinate_marker = "Subordinate basic fallback attempt also failed (not the root cause):";
 
     assert!(
@@ -120,7 +125,7 @@ async fn non_wasi_import_preserves_informative_basic_fallback_as_subordinate_con
         .find(subordinate_marker)
         .unwrap_or_else(|| panic!("basic failure was not subordinate context: {rendered}"));
     assert!(
-        rendered[subordinate_at + subordinate_marker.len()..].contains(missing_provider_export),
+        rendered[subordinate_at + subordinate_marker.len()..].contains(missing_import),
         "the subordinate basic failure chain was dropped: {rendered}"
     );
     assert!(

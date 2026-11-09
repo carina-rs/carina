@@ -657,6 +657,83 @@ A struct type represents a nested object with typed fields.
   across or explicitly bound and documented as unavailable on the destination
   side. Never use a catch-all `_` or `..` at this seam; a silently dropped field
   is invisible in production and cost carina#3034 its effect (carina#3772).
+- **Provider diagnostics** (carina#4334): protocol 25 and WIT package 0.2.0
+  require `diagnostics` and `protected-material` imports in every provider
+  world. Component type scanning rejects a legacy package before linking or
+  executing any start/info code, naming the found package and the required
+  `carina:provider@0.2.0` / protocol 25. `ProviderDiagnostics::emit` accepts only typed events borrowing
+  provider errors/diagnostics or carrying structured value candidates. The
+  host binds them through the same private text kernel as returned errors.
+  Only that kernel mints `BoundProviderEvent`; its presenter consumes Bound
+  segments and never constructs `HostText` or uses generic Bound error or
+  partial-reason constructors. Closing those older constructors remains #4301.
+  Value origin is advisory: host-resolved addresses, protected desired-input
+  paths, schema write-only fields and the existing `RedactionSet` decide
+  masking. An unresolved address masks the subtree. Every string leaf and key
+  uses that same redactor; decoded guest values acquire no protection marks.
+  Raw WASI stdout/stderr have discard-only capabilities from metadata through
+  teardown. Host-owned HTTP traces keep the redacting stream. The SDK panic
+  hook precedes construction and exports, preserves string payloads and typed
+  locations, and never invokes the default hook or formats unknown payloads.
+  Only long-lived AWS session credentials and GitHub tokens are registered;
+  adoption requires acknowledgement before operational wrappers reach transport.
+  Registration is idempotent by value, retains old generations, and charges only
+  new credentials. AWS providers enable the SDK `aws` feature and implement
+  `AwsSessionSource`, returning each current generation as
+  `AwsSessionMaterial::new(credentials)`. Material privately retains the complete
+  AWS SDK `Credentials`; registration reads only its key/secret/token. After
+  acknowledgement the same credentials are returned unchanged, preserving expiry,
+  account ID, provider name and feature/custom properties. Material Debug is opaque.
+  The public AWS credential/configuration entry points are `AwsSessionMaterial`,
+  `AwsSessionSource`, `AwsSessionFuture` and `AwsSdkParts`. Registration and its
+  consuming snapshot conversion are internal; snapshots implement no public
+  credentials-provider or unsigned request-preparation API.
+  `AwsSdkParts::new(source, diagnostics)` keeps its registering credentials provider and
+  HTTP client private. Its consuming `apply` installs both together on one AWS
+  SDK config builder; the SDK exposes neither component alone. Every credentials
+  lookup fetches the source, registers the generation before handing it to the
+  signer, and preserves expiry. Registration failure returns a typed credentials
+  error with its source chain. Direct WASI AWS
+  client constructors remain private. This guarantees paired installation on
+  that builder; later changes through AWS APIs remain under caller control.
+  Per-request headers and query fields use the existing
+  structural HTTP trace masking, followed by the session `RedactionSet`. Each
+  request emits one completed HTTP event, including early failures; signing
+  material and ordinary query values never enter the long-lived inventory.
+  Core owns all diagnostic budgets. Count/rate windows reset per WASM export
+  and native dispatch through the same core call scope,
+  with separate quotas for Error/Warn/Info and Debug/Trace. Only the first panic
+  per call bypasses count/rate limits; later panics consume the ordinary quota.
+  Panic context, message and location share a 256 KiB input cap; over-cap guest
+  text is masked before binding while numeric location fields remain available.
+  Call completion emits one fixed host-authored suppression notice containing
+  only the total count. Rejection has no plaintext fallback. Admission filters
+  invisible levels before budgeting or counting suppression. The default sink
+  shows Error/Warn/Info; Debug/Trace require `CARINA_WASI_HTTP_TRACE=1`, read once
+  by the host and never forwarded to guests. Custom sinks explicitly observe
+  all levels, with the same separate quotas. Call fallback inputs inherit the
+  store's sink and validated schemas.
+  The host chooses the sink on a consumed `ProviderSessionBuilder` before
+  constructing a shared session; cloned sessions have no sink setter. Session
+  construction and budget/presentation plumbing are exposed by `provider-host`
+  (`guest-runtime` includes it for the native plugin host). WASM SDK guests use
+  core without either feature. Enabling `provider-host` on wasm32, directly or
+  transitively, is a compile error: host plumbing is unavailable to guest
+  providers. The in-repo provider manifest check remains an additional lint;
+  it does not resolve transitive features or police external provider repos.
+  Native in-process providers are trusted code linked into the host binary,
+  where host feature unification is accepted.
+  Native factories receive the same typed channel through `ProviderSession`;
+  native calls also finish with one count-only suppression notice when needed.
+  Native `tokio::spawn`, `spawn_blocking` and other threads do not inherit a call
+  scope. Their events share a bounded session budget; the last diagnostic owner
+  flushes its total suppressed count as one fixed host-authored notice on drop.
+  Retained emission handles are weak and cannot keep that owner alive. Every
+  configured normalizer owns live diagnostic inputs and dispatches in a call
+  scope, including fixtures. Custom-type validation inherits the host sink and
+  schemas. Native OS output
+  remains outside this channel. Diagnostics are not persisted and do
+  not change the state format.
 - **Desired normalization is per leaf** (carina#4194). The normalization opacity policy,
   `carina_core::resource::is_deferred_desired_leaf`, marks every
   `Value::Deferred` leaf (references, unknowns, secrets, other unresolved

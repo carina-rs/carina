@@ -16,10 +16,10 @@ use std::time::SystemTime;
 
 use hmac::{Hmac, Mac};
 use indexmap::IndexMap;
+use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
 
 use sha2::{Digest, Sha256};
 
@@ -1568,7 +1568,7 @@ struct AllowListHttpHooks {
     resolver: Arc<dyn DestinationResolver>,
     test_route: Option<HttpTestRoute>,
     call_egress: Option<CallEgressRecorder>,
-    stderr: guest_stderr::GuestStderr,
+    stderr: guest_stderr::HostOutput,
 }
 
 impl AllowListHttpHooks {
@@ -1583,7 +1583,7 @@ impl AllowListHttpHooks {
             resolver,
             test_route: None,
             call_egress: None,
-            stderr: guest_stderr::GuestStderr::new(std::io::stderr()),
+            stderr: guest_stderr::HostOutput::new(std::io::stderr()),
         }
     }
 
@@ -1638,7 +1638,8 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
             .call_egress
             .as_ref()
             .map(CallEgressRecorder::begin_request);
-        let trace_state = trace_http_enabled().then(|| {
+        // The host-only opt-in is cached once and shared with event admission.
+        let trace_state = carina_core::provider_text::provider_http_trace_enabled().then(|| {
             (
                 request.method().to_string(),
                 request.uri().to_string(),
@@ -1736,20 +1737,6 @@ impl wasmtime_wasi_http::p2::WasiHttpHooks for AllowListHttpHooks {
     }
 }
 
-/// Companion to carina-plugin-sdk's `CARINA_WASI_HTTP_TRACE` switch.
-///
-/// When set to "1", the host-side request handler emits its wall-clock
-/// breakdown to stderr with URI userinfo, fragment and query values removed.
-/// Off by default; the gate is a single atomic load per request when disabled.
-fn trace_http_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("CARINA_WASI_HTTP_TRACE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
-}
-
 fn http_resolution_warning(host: &str, error: Option<&dyn fmt::Display>) -> DiagnosticText {
     DiagnosticText::new(match error {
         Some(error) => format!("WASM plugin HTTP request failed to resolve host {host:?}: {error}"),
@@ -1799,7 +1786,7 @@ async fn send_request_handler(
     mut request: hyper::Request<wasmtime_wasi_http::p2::body::HyperOutgoingBody>,
     config: wasmtime_wasi_http::p2::types::OutgoingRequestConfig,
     destination: VettedDestination,
-    trace: Option<guest_stderr::GuestStderr>,
+    trace: Option<guest_stderr::HostOutput>,
 ) -> Result<
     wasmtime_wasi_http::p2::types::IncomingResponse,
     wasmtime_wasi_http::p2::bindings::http::types::ErrorCode,
@@ -2072,6 +2059,11 @@ fn create_linker(
     add_wasi_sans_sockets_to_linker(&mut linker).map_err(|error| {
         WasmBindingCreationError::Instantiation(error.context("Failed to add WASI to linker"))
     })?;
+    guest::add_diagnostic_imports(&mut linker).map_err(|error| {
+        WasmBindingCreationError::Instantiation(
+            error.context("Failed to add typed provider imports"),
+        )
+    })?;
     match world {
         InstantiationWorld::Basic => {}
         InstantiationWorld::HttpEnabled => {
@@ -2119,14 +2111,7 @@ async fn create_instance(
 /// These are provider-agnostic utilities, NOT credentials. Credentials
 /// live in per-provider-kind partitions below so that one provider's
 /// secret never reaches another provider's guest.
-const SHARED_ENV_ALLOWLIST: &[&str] = &[
-    "HOME",
-    "RUST_LOG",
-    // When set to "1", the WASM-side wasi:http bridge in carina-plugin-sdk
-    // emits a per-phase wall-clock breakdown of each request to stderr.
-    // Off by default; intended for diagnosing transport-level latency.
-    "CARINA_WASI_HTTP_TRACE",
-];
+const SHARED_ENV_ALLOWLIST: &[&str] = &["HOME", "RUST_LOG"];
 
 /// Region and endpoint variables exposed only to the AWS providers (`aws`,
 /// `awscc`). Credential discovery runs in the host and no credential-source
@@ -2323,12 +2308,7 @@ fn build_sandboxed_wasi_ctx_with(
         .session("", None, None)
         .guest_inventory();
     let store = carina_core::provider_text::GuestStoreData::new_store(&engine, (), inputs);
-    build_sandboxed_wasi_ctx_with_stderr(
-        store.data(),
-        capabilities,
-        env_value,
-        guest_stderr::GuestStderr::new(std::io::stderr()),
-    )
+    build_sandboxed_wasi_ctx_for_store(store.data(), capabilities, env_value)
 }
 
 struct GuestEnvironmentPartition {
@@ -2352,14 +2332,14 @@ fn handoff_credential<T>(
         _ => unreachable!("host credentials are constructed as strings"),
     }
 }
-fn build_sandboxed_wasi_ctx_with_stderr<T>(
+fn build_sandboxed_wasi_ctx_for_store<T>(
     store: &carina_core::provider_text::GuestStoreData<T>,
     capabilities: Option<&RuntimeCapabilities>,
     mut env_value: impl FnMut(&str) -> Option<String>,
-    stderr: guest_stderr::GuestStderr,
 ) -> WasiCtx {
     let mut builder = WasiCtxBuilder::new();
-    builder.stderr(stderr);
+    builder.stdout(wasmtime_wasi::p2::pipe::SinkOutputStream);
+    builder.stderr(wasmtime_wasi::p2::pipe::SinkOutputStream);
     let partition = capabilities
         .map(RuntimeCapabilities::environment_partition)
         .unwrap_or(GuestEnvironmentPartition {
@@ -3176,9 +3156,7 @@ struct RebuildableState {
 impl RebuildableState {
     fn new(live: LiveInstance) -> Self {
         Self {
-            inputs: carina_core::provider::ProviderPlan::state_only()
-                .session("", None, None)
-                .guest_inventory(),
+            inputs: live.store.diagnostic_inputs().guest_inventory(),
             instance: ValidationInstanceState::Live(Box::new(live)),
             input_health: IndexMap::new(),
         }
@@ -3352,6 +3330,7 @@ struct RebuildContext {
     world: InstantiationWorld,
     budget: GuestCallBudget,
     http_test_route: Option<HttpTestRoute>,
+    diagnostic_inputs: carina_core::provider::ProviderValidationInputs,
 }
 
 impl RebuildContext {
@@ -3361,7 +3340,11 @@ impl RebuildContext {
         label: Arc<ProviderLabel>,
         budget: GuestCallBudget,
     ) -> Self {
+        let diagnostic_inputs = carina_core::provider::ProviderPlan::state_only()
+            .session(&label.name, None, None)
+            .guest_inputs();
         Self {
+            diagnostic_inputs,
             engine,
             component,
             label,
@@ -3381,7 +3364,7 @@ impl RebuildContext {
             self.world,
             self.budget,
             self.http_test_route.clone(),
-            None,
+            Some(self.diagnostic_inputs.for_new_guest()),
         )
         .await
     }

@@ -9,7 +9,8 @@
 //!   use to issue a plain HTTP request with only the `http` crate's
 //!   types (no AWS SDK dependency). This is how non-AWS providers (e.g.
 //!   the GitHub provider) talk to their REST APIs.
-//! - [`WasiHttpClient`] — implements the AWS SDK's `HttpClient` trait by
+//! - `AwsSdkParts` (with feature `aws`) — installs the registered AWS credentials provider and its
+//!   `WasiHttpClient` on one config builder. The client implements `HttpClient` by
 //!   translating its `HttpRequest`/`SdkBody` into the same neutral core,
 //!   so AWS SDK operations work inside a WASM component too.
 //!
@@ -23,19 +24,34 @@
 //! native test builds compile it as well to exercise connector classification.
 
 use std::fmt;
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+#[cfg(feature = "aws")]
+use std::time::Duration;
+use std::time::Instant;
 
+#[cfg(feature = "aws")]
+use crate::protected_material::AwsSessionSource;
+use crate::protected_material::RegisteredRequest;
+#[cfg(feature = "aws")]
+use aws_credential_types::provider::{
+    ProvideCredentials, SharedCredentialsProvider, error::CredentialsError, future,
+};
+#[cfg(feature = "aws")]
 use aws_smithy_runtime_api::client::http::{
     HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpClient,
     SharedHttpConnector,
 };
+#[cfg(feature = "aws")]
 use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
+#[cfg(feature = "aws")]
 use aws_smithy_runtime_api::client::result::ConnectorError;
+#[cfg(feature = "aws")]
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
+#[cfg(feature = "aws")]
 use aws_smithy_runtime_api::http::Response;
+#[cfg(feature = "aws")]
 use aws_smithy_types::body::SdkBody;
-use carina_provider_protocol::http_trace::{TraceHeaders, TraceUri};
+#[cfg(feature = "aws")]
+use std::sync::Arc;
 
 use wasi::http::outgoing_handler;
 use wasi::http::types::{
@@ -165,7 +181,6 @@ pub struct TransportFailure {
     code: Option<ErrorCode>,
     message: String,
 }
-
 impl TransportFailure {
     fn maybe_sent(message: impl Into<String>, code: Option<ErrorCode>) -> Self {
         Self {
@@ -174,7 +189,6 @@ impl TransportFailure {
             message: message.into(),
         }
     }
-
     fn from_code(message: impl Into<String>, code: ErrorCode) -> Self {
         Self {
             phase: send_phase(&code),
@@ -182,18 +196,13 @@ impl TransportFailure {
             message: message.into(),
         }
     }
-
-    /// Return whether request bytes could have been sent.
     pub fn phase(&self) -> SendPhase {
         self.phase
     }
-
-    /// Return the wasi:http error code when the failing API supplied one.
     pub fn code(&self) -> Option<&ErrorCode> {
         self.code.as_ref()
     }
 }
-
 impl From<PreSendError> for TransportFailure {
     fn from(error: PreSendError) -> Self {
         Self {
@@ -203,10 +212,8 @@ impl From<PreSendError> for TransportFailure {
         }
     }
 }
-
 impl From<ResponseBodyError> for TransportFailure {
     fn from(error: ResponseBodyError) -> Self {
-        // A response proves the request was sent, regardless of its error code.
         Self {
             phase: SendPhase::MaybeSent,
             code: error.code,
@@ -214,13 +221,11 @@ impl From<ResponseBodyError> for TransportFailure {
         }
     }
 }
-
 impl fmt::Display for TransportFailure {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.message)
     }
 }
-
 impl std::error::Error for TransportFailure {}
 
 /// Return the send phase carried by a connector error from this transport.
@@ -228,75 +233,147 @@ impl std::error::Error for TransportFailure {}
 /// Only a [`TransportFailure`] that is the direct source of the connector error
 /// counts. A transport failure nested deeper under another error returns
 /// `None`, which callers must treat as unknown or [`SendPhase::MaybeSent`].
+#[cfg(feature = "aws")]
 pub fn send_phase_of(error: &ConnectorError) -> Option<SendPhase> {
     std::error::Error::source(error)
         .and_then(|source| source.downcast_ref::<TransportFailure>())
         .map(TransportFailure::phase)
 }
 
-/// When `CARINA_WASI_HTTP_TRACE=1` is set in the host environment, emit a
-/// per-phase wall-clock breakdown of each request to stderr, with header values
-/// redacted unless allowlisted, and URI userinfo, fragment and query values removed.
+#[cfg(feature = "aws")]
+struct RegisteredAwsCredentials {
+    source: Arc<dyn AwsSessionSource>,
+    diagnostics: crate::ProviderDiagnostics,
+}
+#[cfg(feature = "aws")]
+impl RegisteredAwsCredentials {
+    fn new(source: impl AwsSessionSource, diagnostics: crate::ProviderDiagnostics) -> Self {
+        Self {
+            source: Arc::new(source),
+            diagnostics,
+        }
+    }
+}
+#[cfg(feature = "aws")]
+impl std::fmt::Debug for RegisteredAwsCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<registered AWS credential source>")
+    }
+}
+#[cfg(feature = "aws")]
+impl ProvideCredentials for RegisteredAwsCredentials {
+    fn provide_credentials<'a>(&'a self) -> future::ProvideCredentials<'a>
+    where
+        Self: 'a,
+    {
+        future::ProvideCredentials::new(async move {
+            let material = self.source.current_session().await?;
+            let registered = self
+                .diagnostics
+                .register_aws_session(material)
+                .map_err(CredentialsError::provider_error)?;
+            Ok(registered.into_credentials())
+        })
+    }
+}
+
+/// Installs an HTTP client paired with its registered credentials provider on
+/// one AWS config builder. Neither component is exposed independently by this API.
+/// Subsequent changes through the AWS builder remain the caller's responsibility.
 ///
-/// The env var is read once on first use and cached; flipping it
-/// mid-process has no effect. Off by default — the gate is a single atomic
-/// load per phase when disabled, so leaving the instrumentation in place
-/// costs essentially nothing.
-fn trace_enabled() -> bool {
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("CARINA_WASI_HTTP_TRACE")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    })
+/// A fixed registered snapshot cannot be installed as a credentials provider.
+///
+/// ```compile_fail,E0277
+/// use aws_credential_types::provider::SharedCredentialsProvider;
+/// use carina_plugin_sdk::{ProviderDiagnostics, protected_material::AwsSessionMaterial};
+/// fn snapshot_provider(diagnostics: &ProviderDiagnostics, material: AwsSessionMaterial) {
+///     let snapshot = diagnostics.register_aws_session(material).unwrap();
+///     let _ = SharedCredentialsProvider::new(snapshot);
+/// }
+/// ```
+/// AWS registration is internal to the refreshing credentials provider.
+///
+/// ```compile_fail,E0624
+/// use carina_plugin_sdk::{ProviderDiagnostics, protected_material::AwsSessionMaterial};
+/// fn register_snapshot(diagnostics: &ProviderDiagnostics, material: AwsSessionMaterial) {
+///     let _ = diagnostics.register_aws_session(material);
+/// }
+/// ```
+/// The acknowledged snapshot type is not part of the public API.
+///
+/// ```compile_fail,E0432
+/// use carina_plugin_sdk::protected_material::RegisteredAwsSession;
+/// fn snapshot(_: RegisteredAwsSession) {}
+/// ```
+/// A snapshot cannot prepare an unsigned AWS request.
+///
+/// ```compile_fail,E0599
+/// use carina_plugin_sdk::{ProviderDiagnostics, protected_material::AwsSessionMaterial};
+/// fn unsigned_request(diagnostics: &ProviderDiagnostics, material: AwsSessionMaterial) {
+///     let snapshot = diagnostics.register_aws_session(material).unwrap();
+///     let _ = snapshot.prepare_request(http::Request::new(Vec::new()));
+/// }
+/// ```
+///
+/// ```compile_fail,E0616
+/// use carina_plugin_sdk::wasi_http::AwsSdkParts;
+/// fn extract_credentials(parts: AwsSdkParts) { let _ = parts.credentials; }
+/// ```
+/// ```compile_fail,E0616
+/// use carina_plugin_sdk::wasi_http::AwsSdkParts;
+/// use aws_smithy_runtime_api::client::http::SharedHttpClient;
+/// fn extract_client(parts: AwsSdkParts) -> SharedHttpClient { parts.http_client }
+/// ```
+///
+/// ```
+/// use carina_core::provider::ProviderPlan;
+/// use carina_plugin_sdk::{ProviderDiagnostics, protected_material::{AwsSessionFuture, AwsSessionMaterial, AwsSessionSource}};
+/// use carina_plugin_sdk::wasi_http::AwsSdkParts;
+/// use aws_types::{SdkConfig, region::Region};
+/// struct Current;
+/// impl AwsSessionSource for Current {
+///     fn current_session(&self) -> AwsSessionFuture<'_> {
+///         Box::pin(async {
+///             let credentials = aws_credential_types::Credentials::new(
+///                 "access", "secret", None, None, "example-source",
+///             );
+///             Ok(AwsSessionMaterial::new(credentials))
+///         })
+///     }
+/// }
+/// let session = ProviderPlan::state_only().session("aws", None, None);
+/// let loaded = SdkConfig::builder().region(Region::new("us-east-1")).build();
+/// let config = AwsSdkParts::new(Current, ProviderDiagnostics::from_session(&session))
+///     .apply(loaded.into_builder()).build();
+/// assert_eq!(config.region().unwrap().as_ref(), "us-east-1");
+/// assert!(config.credentials_provider().is_some());
+/// assert!(config.http_client().is_some());
+/// ```
+#[cfg(feature = "aws")]
+pub struct AwsSdkParts {
+    credentials: SharedCredentialsProvider,
+    http_client: SharedHttpClient,
 }
+#[cfg(feature = "aws")]
+impl AwsSdkParts {
+    pub fn new(source: impl AwsSessionSource, diagnostics: crate::ProviderDiagnostics) -> Self {
+        let credentials = SharedCredentialsProvider::new(RegisteredAwsCredentials::new(
+            source,
+            diagnostics.clone(),
+        ));
+        let http_client = WasiHttpClient::shared(diagnostics);
+        Self {
+            credentials,
+            http_client,
+        }
+    }
 
-fn http_trace_headers_line(
-    method: &str,
-    uri: TraceUri<'_>,
-    body_len: usize,
-    headers: TraceHeaders<'_>,
-) -> String {
-    format!(
-        "carina-wasi-http-trace-headers method={} uri={} body_in={} headers=[{}]",
-        method, uri, body_len, headers,
-    )
-}
-
-fn http_trace_timing_line(
-    method: &str,
-    uri: TraceUri<'_>,
-    status: u16,
-    body_in: usize,
-    body_out: usize,
-    phases_ms: [u128; 7],
-) -> String {
-    let [
-        setup,
-        handle,
-        write_body,
-        body_finish,
-        pollable_block,
-        get_response,
-        read_body,
-    ] = phases_ms;
-    format!(
-        "carina-wasi-http-trace method={} uri={} status={} body_in={} body_out={} \
-         setup_ms={} handle_ms={} write_body_ms={} body_finish_ms={} \
-         pollable_block_ms={} get_response_ms={} read_body_ms={}",
-        method,
-        uri,
-        status,
-        body_in,
-        body_out,
-        setup,
-        handle,
-        write_body,
-        body_finish,
-        pollable_block,
-        get_response,
-        read_body,
-    )
+    /// Consume the pair, replacing both components on the same builder.
+    pub fn apply(self, builder: aws_types::sdk_config::Builder) -> aws_types::sdk_config::Builder {
+        builder
+            .credentials_provider(self.credentials)
+            .http_client(self.http_client)
+    }
 }
 
 /// An HTTP client that uses wasi:http/outgoing-handler for making requests.
@@ -304,33 +381,43 @@ fn http_trace_timing_line(
 /// This is intended to be used as the HTTP client for the AWS SDK when running
 /// inside a WASM component. The host (via wasmtime-wasi-http) provides the
 /// actual HTTP implementation.
+/// Clients are obtained together with their registered signing credentials.
+///
+/// ```compile_fail,E0624
+/// use carina_plugin_sdk::{ProviderDiagnostics, wasi_http::WasiHttpClient};
+/// fn bypass(diagnostics: ProviderDiagnostics) { let _ = WasiHttpClient::new(diagnostics); }
+/// ```
+/// ```compile_fail,E0624
+/// use carina_plugin_sdk::{ProviderDiagnostics, wasi_http::WasiHttpClient};
+/// fn bypass(diagnostics: ProviderDiagnostics) { let _ = WasiHttpClient::shared(diagnostics); }
+/// ```
 #[derive(Clone)]
-pub struct WasiHttpClient;
+#[cfg(feature = "aws")]
+pub struct WasiHttpClient {
+    diagnostics: crate::ProviderDiagnostics,
+}
 
+#[cfg(feature = "aws")]
 impl fmt::Debug for WasiHttpClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WasiHttpClient").finish()
     }
 }
 
+#[cfg(feature = "aws")]
 impl WasiHttpClient {
     /// Create a new WasiHttpClient.
-    pub fn new() -> Self {
-        Self
+    fn new(diagnostics: crate::ProviderDiagnostics) -> Self {
+        Self { diagnostics }
     }
 
     /// Create a SharedHttpClient for use with aws-config.
-    pub fn shared() -> SharedHttpClient {
-        SharedHttpClient::new(Self::new())
+    fn shared(diagnostics: crate::ProviderDiagnostics) -> SharedHttpClient {
+        SharedHttpClient::new(Self::new(diagnostics))
     }
 }
 
-impl Default for WasiHttpClient {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
+#[cfg(feature = "aws")]
 impl HttpClient for WasiHttpClient {
     fn http_connector(
         &self,
@@ -340,17 +427,21 @@ impl HttpClient for WasiHttpClient {
         SharedHttpConnector::new(WasiHttpConnector {
             connect_timeout: settings.connect_timeout(),
             read_timeout: settings.read_timeout(),
+            diagnostics: self.diagnostics.clone(),
         })
     }
 }
 
 /// An HTTP connector that carries SDK-supplied timeouts into wasi:http requests.
 #[derive(Clone)]
+#[cfg(feature = "aws")]
 struct WasiHttpConnector {
+    diagnostics: crate::ProviderDiagnostics,
     connect_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
 }
 
+#[cfg(feature = "aws")]
 impl fmt::Debug for WasiHttpConnector {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WasiHttpConnector")
@@ -360,16 +451,18 @@ impl fmt::Debug for WasiHttpConnector {
     }
 }
 
+#[cfg(feature = "aws")]
 impl HttpConnector for WasiHttpConnector {
     fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
         let options = build_request_options(self.connect_timeout, self.read_timeout);
-        HttpConnectorFuture::ready(make_request(request, options))
+        HttpConnectorFuture::ready(make_request(request, options, &self.diagnostics))
     }
 }
 
 /// Build wasi:http RequestOptions from SDK-supplied timeouts.
 ///
 /// wasi:http Duration is nanoseconds (u64), so we convert from std::time::Duration.
+#[cfg(feature = "aws")]
 fn build_request_options(
     connect_timeout: Option<Duration>,
     read_timeout: Option<Duration>,
@@ -391,7 +484,7 @@ fn build_request_options(
 /// A provider-agnostic HTTP request for the wasi:http transport core.
 ///
 /// Internal to this module — callers go through [`send_request`] (generic)
-/// or [`WasiHttpClient`] (AWS SDK), never construct this directly, so they
+/// or `WasiHttpClient` (AWS SDK, feature `aws`), never construct this directly, so they
 /// cannot bypass the body-framing fixes in [`execute`].
 struct WasiRequest {
     /// HTTP method, uppercase (`GET`, `PUT`, ...).
@@ -414,6 +507,7 @@ struct WasiResponse {
     body: Vec<u8>,
 }
 
+#[cfg(feature = "aws")]
 fn connector_error(error: TransportFailure) -> ConnectorError {
     let phase = error.phase();
     let source = Box::new(error);
@@ -521,49 +615,131 @@ fn prepare_request(request: WasiRequest) -> Result<PreparedRequest, PreSendError
 }
 
 /// The single wasi:http transport core. Both the generic
-/// [`send_request`] and the AWS SDK [`WasiHttpClient`] funnel through
+/// [`send_request`] and the AWS SDK `WasiHttpClient` (feature `aws`) funnel through
 /// here, so the body-framing fixes (carina#3254 / #3320 / #3318) apply
 /// to every caller.
-fn execute(
+struct WasiTransportRequest {
     request: WasiRequest,
+    #[cfg(target_arch = "wasm32")]
+    diagnostics: crate::ProviderDiagnostics,
+}
+fn phase_ms(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+fn execute(
+    transport: WasiTransportRequest,
     options: Option<RequestOptions>,
 ) -> Result<WasiResponse, TransportFailure> {
-    let trace = trace_enabled();
-    let req_start = if trace { Some(Instant::now()) } else { None };
-    let trace_method = if trace {
-        request.method.clone()
-    } else {
-        String::new()
-    };
-    let trace_uri = if trace {
-        request.uri.clone()
-    } else {
-        String::new()
-    };
+    let WasiTransportRequest {
+        request,
+        #[cfg(target_arch = "wasm32")]
+        diagnostics,
+    } = transport;
+    execute_observed(
+        request,
+        |request, phases| execute_request(request, options, phases),
+        |event| {
+            #[cfg(target_arch = "wasm32")]
+            diagnostics.http(event);
+            #[cfg(not(target_arch = "wasm32"))]
+            let _ = event;
+        },
+    )
+}
+fn execute_observed(
+    request: WasiRequest,
+    send: impl FnOnce(WasiRequest, &mut [u64; 7]) -> Result<WasiResponse, TransportFailure>,
+    mut emit: impl FnMut(carina_provider_protocol::diagnostics::HttpDiagnostic),
+) -> Result<WasiResponse, TransportFailure> {
+    let (method, uri, request_body_bytes) = (
+        request.method.clone(),
+        request.uri.clone(),
+        request.body.len() as u64,
+    );
+    let headers = request.headers.clone();
+    let mut phases_ms = [0; 7];
+    let result = send(request, &mut phases_ms);
+    emit(carina_provider_protocol::diagnostics::HttpDiagnostic {
+        method,
+        uri,
+        headers,
+        request_body_bytes,
+        response_body_bytes: result
+            .as_ref()
+            .ok()
+            .map(|response| response.body.len() as u64),
+        status: result.as_ref().ok().map(|response| response.status),
+        transport_code: result
+            .as_ref()
+            .err()
+            .and_then(|error| error.code().map(trace_transport_code)),
+        phases_ms,
+    });
+    result
+}
 
-    if trace {
-        // Dump request headers before any wasi:http translation. Used to
-        // confirm whether body-less requests carry `content-length: 0` /
-        // `transfer-encoding: chunked` / `expect: 100-continue` (the
-        // body-framing hypotheses narrowed for the ~20 s S3 latency).
-        eprintln!(
-            "{}",
-            http_trace_headers_line(
-                &trace_method,
-                TraceUri::new(&trace_uri),
-                request.body.len(),
-                TraceHeaders::new(&request.headers),
-            )
-        );
+fn trace_transport_code(
+    code: &ErrorCode,
+) -> carina_provider_protocol::diagnostics::HttpTransportCode {
+    use carina_provider_protocol::diagnostics::HttpTransportCode as Code;
+    match code {
+        ErrorCode::DnsTimeout | ErrorCode::DnsError(_) => Code::Dns,
+        ErrorCode::DestinationNotFound
+        | ErrorCode::DestinationUnavailable
+        | ErrorCode::DestinationIpProhibited
+        | ErrorCode::DestinationIpUnroutable
+        | ErrorCode::ConnectionRefused
+        | ErrorCode::ConnectionTerminated
+        | ErrorCode::ConnectionLimitReached => Code::Connect,
+        ErrorCode::ConnectionTimeout
+        | ErrorCode::ConnectionReadTimeout
+        | ErrorCode::ConnectionWriteTimeout
+        | ErrorCode::HttpResponseTimeout => Code::Timeout,
+        ErrorCode::TlsProtocolError
+        | ErrorCode::TlsCertificateError
+        | ErrorCode::TlsAlertReceived(_) => Code::Tls,
+        ErrorCode::HttpRequestBodySize(_)
+        | ErrorCode::HttpResponseBodySize(_)
+        | ErrorCode::HttpResponseIncomplete => Code::Body,
+        ErrorCode::HttpRequestDenied
+        | ErrorCode::HttpRequestLengthRequired
+        | ErrorCode::HttpRequestMethodInvalid
+        | ErrorCode::HttpRequestUriInvalid
+        | ErrorCode::HttpRequestUriTooLong
+        | ErrorCode::HttpRequestHeaderSectionSize(_)
+        | ErrorCode::HttpRequestHeaderSize(_)
+        | ErrorCode::HttpRequestTrailerSectionSize(_)
+        | ErrorCode::HttpRequestTrailerSize(_)
+        | ErrorCode::HttpResponseHeaderSectionSize(_)
+        | ErrorCode::HttpResponseHeaderSize(_)
+        | ErrorCode::HttpResponseTrailerSectionSize(_)
+        | ErrorCode::HttpResponseTrailerSize(_)
+        | ErrorCode::HttpResponseTransferCoding(_)
+        | ErrorCode::HttpResponseContentCoding(_)
+        | ErrorCode::HttpUpgradeFailed
+        | ErrorCode::HttpProtocolError
+        | ErrorCode::LoopDetected
+        | ErrorCode::ConfigurationError
+        | ErrorCode::InternalError(_) => Code::Protocol,
     }
+}
 
+fn execute_request(
+    request: WasiRequest,
+    options: Option<RequestOptions>,
+    phases_ms: &mut [u64; 7],
+) -> Result<WasiResponse, TransportFailure> {
+    #[cfg(all(test, feature = "aws", not(target_arch = "wasm32")))]
+    if let Some(response) = tests::capture_native_request(&request) {
+        return response;
+    }
+    let req_start = Instant::now();
     let PreparedRequest {
         outgoing_request,
         outgoing_body,
         body,
     } = prepare_request(request)?;
-    let body_len = body.content_length();
-    let t_setup_done = req_start.map(|s| s.elapsed());
+    phases_ms[0] = phase_ms(req_start);
 
     // Hand the request off to the host *first* so the hyper task that
     // consumes the body channel is spawned before we start writing.
@@ -575,57 +751,29 @@ fn execute(
     // host I/O hang.
     let future_response = outgoing_handler::handle(outgoing_request, options)
         .map_err(|e| TransportFailure::from_code(format!("outgoing-handler error: {e:?}"), e))?;
-    let t_handle_done = req_start.map(|s| s.elapsed());
+    phases_ms[1] = phase_ms(req_start);
 
     // Now ship the body. The hyper consumer is live, so each
     // `blocking_write_and_flush` chunk drains as it goes and the
     // channel stays well below its capacity bound.
     let write_error = write_body(&outgoing_body, body.as_bytes()).err();
-    let t_write_body_done = req_start.map(|s| s.elapsed());
+    phases_ms[2] = phase_ms(req_start);
     // Close the producer even after a failed write, before waiting for the
     // response, so the host cannot remain blocked on an open request body.
     let finish_error = OutgoingBody::finish(outgoing_body, None)
         .err()
         .map(|e| TransportFailure::from_code(format!("Failed to finish body: {e:?}"), e));
-    let t_body_finish_done = req_start.map(|s| s.elapsed());
+    phases_ms[3] = phase_ms(req_start);
     // Wait for the response by polling
     let pollable = future_response.subscribe();
     pollable.block();
-    let t_pollable_block_done = req_start.map(|s| s.elapsed());
+    phases_ms[4] = phase_ms(req_start);
 
     let response = resolve_response(future_response.get(), write_error.or(finish_error))?;
-    let t_get_response_done = req_start.map(|s| s.elapsed());
+    phases_ms[5] = phase_ms(req_start);
 
     let response = read_response(response)?;
-    let t_read_body_done = req_start.map(|s| s.elapsed());
-
-    if trace {
-        // Emit a single-line breakdown so it can be greped from log files.
-        // Cumulative milliseconds since execute() entry, one column per
-        // phase. Phases that should be ~instant on the WASM side
-        // (everything except pollable.block) flag a host-side stall when
-        // they grow.
-        let ms = |d: Option<Duration>| d.map(|x| x.as_millis()).unwrap_or(0);
-        eprintln!(
-            "{}",
-            http_trace_timing_line(
-                &trace_method,
-                TraceUri::new(&trace_uri),
-                response.status,
-                body_len,
-                response.body.len(),
-                [
-                    ms(t_setup_done),
-                    ms(t_handle_done),
-                    ms(t_write_body_done),
-                    ms(t_body_finish_done),
-                    ms(t_pollable_block_done),
-                    ms(t_get_response_done),
-                    ms(t_read_body_done),
-                ],
-            )
-        );
-    }
+    phases_ms[6] = phase_ms(req_start);
 
     Ok(response)
 }
@@ -642,8 +790,13 @@ fn execute(
 /// same resend-safety decision as the AWS SDK path. The body-framing fixes in
 /// [`execute`] (carina#3254 / #3320 / #3318) apply to both paths.
 pub fn send_request(
-    request: http::Request<Vec<u8>>,
+    registered: RegisteredRequest,
 ) -> Result<http::Response<Vec<u8>>, TransportFailure> {
+    let RegisteredRequest {
+        request,
+        #[cfg(target_arch = "wasm32")]
+        diagnostics,
+    } = registered;
     let (parts, body) = request.into_parts();
     let headers = parts
         .headers
@@ -657,7 +810,15 @@ pub fn send_request(
         body,
     };
 
-    build_http_response(execute(wasi_req, None)?).map_err(Into::into)
+    build_http_response(execute(
+        WasiTransportRequest {
+            request: wasi_req,
+            #[cfg(target_arch = "wasm32")]
+            diagnostics,
+        },
+        None,
+    )?)
+    .map_err(Into::into)
 }
 
 fn build_http_response(
@@ -675,9 +836,11 @@ fn build_http_response(
 /// Convert an AWS SDK HttpRequest to a [`WasiRequest`], run it through the
 /// wasi:http transport core, and convert the response back to the SDK's
 /// `Response<SdkBody>`.
+#[cfg(feature = "aws")]
 fn make_request(
     request: HttpRequest,
     options: Option<RequestOptions>,
+    _diagnostics: &crate::ProviderDiagnostics,
 ) -> Result<Response<SdkBody>, ConnectorError> {
     let headers = request
         .headers()
@@ -691,10 +854,19 @@ fn make_request(
         body: request.body().bytes().unwrap_or(&[]).to_vec(),
     };
 
-    let wasi_resp = execute(wasi_req, options).map_err(connector_error)?;
+    let wasi_resp = execute(
+        WasiTransportRequest {
+            request: wasi_req,
+            #[cfg(target_arch = "wasm32")]
+            diagnostics: _diagnostics.clone(),
+        },
+        options,
+    )
+    .map_err(connector_error)?;
     build_sdk_response(wasi_resp).map_err(|error| connector_error(error.into()))
 }
 
+#[cfg(feature = "aws")]
 fn build_sdk_response(wasi_resp: WasiResponse) -> Result<Response<SdkBody>, ResponseBodyError> {
     // Build the AWS SDK Response
     let mut sdk_response = Response::new(
@@ -836,115 +1008,267 @@ fn read_body(body: &IncomingBody) -> Result<Vec<u8>, ResponseBodyError> {
 
 #[cfg(test)]
 mod tests {
+    // The request still crosses the paired provider and real WASI connector;
+    // only the final WASI host I/O is replaced in this native test harness.
+    #[cfg(all(feature = "aws", not(target_arch = "wasm32")))]
+    thread_local! {
+        static NATIVE_REQUESTS: std::cell::RefCell<Option<Vec<super::WasiRequest>>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+    #[cfg(all(feature = "aws", not(target_arch = "wasm32")))]
+    pub(super) fn capture_native_request(
+        request: &super::WasiRequest,
+    ) -> Option<Result<super::WasiResponse, super::TransportFailure>> {
+        NATIVE_REQUESTS.with_borrow_mut(|requests| {
+            let requests = requests.as_mut()?;
+            requests.push(super::WasiRequest {
+                method: request.method.clone(),
+                uri: request.uri.clone(),
+                headers: request.headers.clone(),
+                body: request.body.clone(),
+            });
+            Some(Ok(super::WasiResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: Vec::new(),
+            }))
+        })
+    }
+    #[cfg(all(feature = "aws", not(target_arch = "wasm32")))]
+    struct NativeRequestCapture;
+    #[cfg(all(feature = "aws", not(target_arch = "wasm32")))]
+    impl NativeRequestCapture {
+        fn start() -> Self {
+            NATIVE_REQUESTS.with_borrow_mut(|slot| {
+                assert!(slot.replace(Vec::new()).is_none());
+            });
+            Self
+        }
+        fn finish(self) -> Vec<super::WasiRequest> {
+            NATIVE_REQUESTS.with_borrow_mut(|slot| slot.take().unwrap())
+        }
+    }
+    #[cfg(all(feature = "aws", not(target_arch = "wasm32")))]
+    impl Drop for NativeRequestCapture {
+        fn drop(&mut self) {
+            NATIVE_REQUESTS.with_borrow_mut(|slot| {
+                slot.take();
+            });
+        }
+    }
+
+    #[cfg(all(feature = "aws", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn two_thousand_signed_requests_do_not_grow_the_inventory() {
+        use crate::protected_material::{AwsSessionMaterial, GithubTokenMaterial};
+        use crate::{ProviderDiagnostics, aws_session_tests::StaticSource};
+        use aws_credential_types::provider::ProvideCredentials;
+        use aws_sigv4::{
+            http_request::{SignableBody, SignableRequest, SigningSettings, sign},
+            sign::v4,
+        };
+        use aws_smithy_runtime_api::client::{
+            http::{HttpClient, HttpConnector, HttpConnectorSettings},
+            orchestrator::HttpRequest,
+            runtime_components::RuntimeComponentsBuilder,
+        };
+        use aws_smithy_types::body::SdkBody;
+        use carina_core::provider::ProviderPlan;
+        use std::time::{Duration, UNIX_EPOCH};
+
+        let session = ProviderPlan::state_only().session("native", None, None);
+        let diagnostics = ProviderDiagnostics::from_session(&session);
+        let config = super::AwsSdkParts::new(
+            StaticSource(AwsSessionMaterial::new(
+                aws_credential_types::Credentials::new(
+                    "long-lived-access",
+                    "long-lived-key",
+                    Some("long-lived-session".into()),
+                    None,
+                    "example-source",
+                ),
+            )),
+            diagnostics.clone(),
+        )
+        .apply(Default::default())
+        .build();
+        let components = RuntimeComponentsBuilder::for_tests().build().unwrap();
+        let connector = config
+            .http_client()
+            .unwrap()
+            .http_connector(&HttpConnectorSettings::default(), &components);
+        let github = diagnostics
+            .register_github_token(GithubTokenMaterial::new("long-lived-github".into()))
+            .unwrap();
+        let capture = NativeRequestCapture::start();
+        for index in 0..2000 {
+            let mut request = http::Request::builder()
+                .uri(format!("https://example.com/?Action=DescribeVpcs&list-type=2&X-Amz-Signature=sig{index}"))
+                .body(Vec::new()).unwrap();
+            let identity = config
+                .credentials_provider()
+                .unwrap()
+                .provide_credentials()
+                .await
+                .unwrap()
+                .into();
+            let parameters = v4::SigningParams::builder()
+                .identity(&identity)
+                .region("us-east-1")
+                .name("ec2")
+                .time(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+                .settings(SigningSettings::default())
+                .build()
+                .unwrap()
+                .into();
+            let uri = request.uri().to_string();
+            let signable = SignableRequest::new(
+                request.method().as_str(),
+                &uri,
+                std::iter::empty(),
+                SignableBody::Bytes(request.body()),
+            )
+            .unwrap();
+            let (instructions, _signature) = sign(signable, &parameters).unwrap().into_parts();
+            instructions.apply_to_request_http1x(&mut request);
+            let request = HttpRequest::try_from(request.map(SdkBody::from)).unwrap();
+            let response = connector.call(request).await.unwrap();
+            assert_eq!(response.status().as_u16(), 200, "AWS request {index}");
+            assert!(
+                github.authorize(http::Request::new(Vec::new())).is_ok(),
+                "GitHub request {index}"
+            );
+        }
+        let requests = capture.finish();
+        assert_eq!(requests.len(), 2000);
+        for (index, request) in requests.iter().enumerate() {
+            assert_eq!(request.method, "GET");
+            assert!(
+                request
+                    .uri
+                    .ends_with(&format!("X-Amz-Signature=sig{index}"))
+            );
+            let authorization = request
+                .headers
+                .iter()
+                .find(|(name, _)| name == "authorization")
+                .unwrap();
+            let authorization = std::str::from_utf8(&authorization.1).unwrap();
+            assert!(authorization.starts_with("AWS4-HMAC-SHA256 Credential=long-lived-access/"));
+            assert!(authorization.contains("Signature="));
+            assert!(
+                request
+                    .headers
+                    .iter()
+                    .any(|(name, value)| name == "x-amz-security-token"
+                        && value == b"long-lived-session")
+            );
+        }
+        assert!(
+            !session
+                .guest_inventory()
+                .would_exceed_secret_limit(&session.guest_inputs(), 4)
+        );
+        assert!(
+            session
+                .guest_inventory()
+                .would_exceed_secret_limit(&session.guest_inputs(), 3)
+        );
+    }
+    #[test]
+    fn completed_http_trace_contains_headers_and_timings_once() {
+        let request = super::WasiRequest {
+            method: "POST".into(),
+            uri: "https://example.com/".into(),
+            headers: vec![("x-request-id".into(), b"request-123".to_vec())],
+            body: b"request".to_vec(),
+        };
+        let mut events = Vec::new();
+        let response = super::execute_observed(
+            request,
+            |_request, phases| {
+                *phases = [1, 2, 3, 4, 5, 6, 7];
+                Ok(super::WasiResponse {
+                    status: 201,
+                    headers: vec![],
+                    body: b"response".to_vec(),
+                })
+            },
+            |event| events.push(event),
+        )
+        .unwrap();
+        assert_eq!(response.status, 201);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].headers,
+            vec![("x-request-id".into(), b"request-123".to_vec())]
+        );
+        assert_eq!(events[0].phases_ms, [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(events[0].status, Some(201));
+        assert_eq!(events[0].request_body_bytes, 7);
+        assert_eq!(events[0].response_body_bytes, Some(8));
+        assert_eq!(events[0].transport_code, None);
+    }
+    #[test]
+    fn completed_http_trace_reports_early_failures_once() {
+        for code in [None, Some(super::ErrorCode::ConnectionRefused)] {
+            let request = super::WasiRequest {
+                method: "GET".into(),
+                uri: "https://example.com/".into(),
+                headers: vec![("x-request-id".into(), b"early".to_vec())],
+                body: vec![],
+            };
+            let expected = code.as_ref().map(super::trace_transport_code);
+            let mut events = Vec::new();
+            let result = super::execute_observed(
+                request,
+                |_request, _phases| {
+                    Err(super::TransportFailure::maybe_sent(
+                        "early transport failure",
+                        code,
+                    ))
+                },
+                |event| events.push(event),
+            );
+            assert!(result.is_err());
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0].headers,
+                vec![("x-request-id".into(), b"early".to_vec())]
+            );
+            assert_eq!(events[0].status, None);
+            assert_eq!(events[0].transport_code, expected);
+            assert_eq!(events[0].phases_ms, [0; 7]);
+        }
+    }
+    #[cfg(feature = "aws")]
     use std::error::Error as _;
 
+    #[cfg(feature = "aws")]
     use wasi::http::types::{DnsErrorPayload, FieldSizePayload, TlsAlertReceivedPayload};
 
     use super::*;
 
-    const HTTP_TRACE_SECRET_URI: &str = "https://user:PASSSECRET@bucket.s3.amazonaws.com/key?X-Amz-Credential=AKIDSECRET%2F...&X-Amz-Signature=SIGSECRET&X-Amz-Security-Token=TOKSECRET#FRAGSECRET";
-    const HTTP_TRACE_SAFE_URI: &str = "https://bucket.s3.amazonaws.com/key?X-Amz-Credential=<redacted>&X-Amz-Signature=<redacted>&X-Amz-Security-Token=<redacted>";
-
-    fn assert_http_trace_has_no_secrets(line: &str) {
-        for secret in [
-            "AKIDSECRET",
-            "deadbeefsig",
-            "SESSIONTOKENSECRET",
-            "COOKIESECRET",
-            "PROXYSECRET",
-            "ARBITRARYSECRET",
-            "PASSSECRET",
-            "SIGSECRET",
-            "TOKSECRET",
-            "FRAGSECRET",
-        ] {
-            assert!(!line.contains(secret), "trace leaked {secret}: {line}");
-        }
-    }
-
-    #[test]
-    fn http_trace_headers_line_redacts_every_unlisted_header() {
-        let headers = [
-            (
-                "authorization",
-                "AWS4-HMAC-SHA256 Credential=AKIDSECRET/...,Signature=deadbeefsig",
-            ),
-            ("x-amz-security-token", "SESSIONTOKENSECRET"),
-            ("cookie", "c=COOKIESECRET"),
-            ("proxy-authorization", "Basic PROXYSECRET"),
-            ("x-github-token-ish", "ARBITRARYSECRET"),
-            ("content-length", "0"),
-            ("host", "bucket.s3.amazonaws.com"),
-            ("x-amz-date", "20261101T120000Z"),
-        ]
-        .map(|(name, value)| (name.to_string(), value.as_bytes().to_vec()));
-        let line = http_trace_headers_line(
-            "GET",
-            TraceUri::new("https://bucket.s3.amazonaws.com/key"),
-            0,
-            TraceHeaders::new(&headers),
-        );
-
-        assert_http_trace_has_no_secrets(&line);
-        assert_eq!(
-            line,
-            "carina-wasi-http-trace-headers method=GET uri=https://bucket.s3.amazonaws.com/key body_in=0 headers=[authorization=<redacted>; x-amz-security-token=<redacted>; cookie=<redacted>; proxy-authorization=<redacted>; x-github-token-ish=<redacted>; content-length=0; host=bucket.s3.amazonaws.com; x-amz-date=20261101T120000Z]"
-        );
-    }
-
-    #[test]
-    fn http_trace_headers_line_redacts_uri_credentials() {
-        let line = http_trace_headers_line(
-            "GET",
-            TraceUri::new(HTTP_TRACE_SECRET_URI),
-            0,
-            TraceHeaders::new(&[]),
-        );
-
-        assert_http_trace_has_no_secrets(&line);
-        assert_eq!(
-            line,
-            format!(
-                "carina-wasi-http-trace-headers method=GET uri={HTTP_TRACE_SAFE_URI} body_in=0 headers=[]"
-            )
-        );
-    }
-
-    #[test]
-    fn http_trace_timing_line_redacts_uri_credentials_and_keeps_metrics() {
-        let line = http_trace_timing_line(
-            "GET",
-            TraceUri::new(HTTP_TRACE_SECRET_URI),
-            200,
-            0,
-            42,
-            [1, 2, 3, 4, 5, 6, 7],
-        );
-
-        assert_http_trace_has_no_secrets(&line);
-        assert_eq!(
-            line,
-            format!(
-                "carina-wasi-http-trace method=GET uri={HTTP_TRACE_SAFE_URI} status=200 body_in=0 body_out=42 setup_ms=1 handle_ms=2 write_body_ms=3 body_finish_ms=4 pollable_block_ms=5 get_response_ms=6 read_body_ms=7"
-            )
-        );
-    }
-
+    #[cfg(feature = "aws")]
     #[derive(Debug)]
     struct WrappedTransportFailure(TransportFailure);
 
+    #[cfg(feature = "aws")]
     impl fmt::Display for WrappedTransportFailure {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
             f.write_str("wrapped transport failure")
         }
     }
 
+    #[cfg(feature = "aws")]
     impl std::error::Error for WrappedTransportFailure {
         fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
             Some(&self.0)
         }
     }
 
+    #[cfg(feature = "aws")]
     #[test]
     fn every_error_code_maps_to_the_expected_connector_category_and_source() {
         let field_size = || FieldSizePayload {
@@ -1069,6 +1393,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "aws")]
     #[test]
     fn send_phase_of_accepts_direct_transport_failures_and_rejects_wrapped_or_foreign_sources() {
         let not_sent = connector_error(PreSendError::new("request was not sent").into());

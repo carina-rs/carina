@@ -23,7 +23,7 @@ path = "examples/plan-fixture.rs"
 test-utils = ["carina-core/test-utils", "carina-provider-resolver/test-utils", "carina-state/test-utils"]
 
 [dependencies]
-carina-core = { path = "../carina-core" }
+carina-core = { path = "../carina-core", features = ["provider-host"] }
 carina-credentials-aws = { path = "../carina-credentials-aws" }
 carina-plugin-host = { path = "../carina-plugin-host" }
 carina-provider-mock = { path = "../carina-provider-mock" }

@@ -588,16 +588,20 @@ pub(crate) fn custom_type_lookup_for_owner<'resolver, 'owner>(
 
 /// Bind a provider-config value validator to its selected factory. Dispatch
 /// consumes the proof produced by the combined walk, never a raw value.
-pub fn custom_type_lookup_for_factory(
-    factory: &dyn crate::provider::ProviderFactory,
-) -> impl crate::schema::ValidatedCustomTypeLookup + '_ {
-    struct Lookup<'a>(&'a dyn crate::provider::ProviderFactory);
+pub fn custom_type_lookup_for_factory<'a>(
+    factory: &'a dyn crate::provider::ProviderFactory,
+    host: &'a crate::provider::ProviderValidationInputs,
+) -> impl crate::schema::ValidatedCustomTypeLookup + 'a {
+    struct Lookup<'a>(
+        &'a dyn crate::provider::ProviderFactory,
+        &'a crate::provider::ProviderValidationInputs,
+    );
     impl crate::schema::ValidatedCustomTypeLookup for Lookup<'_> {
         fn validate(
             &self,
             value: crate::schema::LocallyValidatedCustomType<'_>,
         ) -> Result<(), crate::schema::TypeError> {
-            crate::provider::validate_validated_custom_type_with_factory(self.0, value)
+            crate::provider::validate_validated_custom_type_with_factory(self.0, value, self.1)
                 .map_err(Into::into)
         }
 
@@ -609,7 +613,7 @@ pub fn custom_type_lookup_for_factory(
             custom_type_canonicalization_error(self.0.name(), declaration, error)
         }
     }
-    Lookup(factory)
+    Lookup(factory, host)
 }
 
 pub(crate) fn custom_type_canonicalization_error(
@@ -651,7 +655,11 @@ pub fn validate_custom_type<P: PlaceholderKind, B: BindingAddress>(
             error,
         )
         .with_secrets(
-            crate::provider::ProviderValidationInputs::collect([&value.to_value()]).redaction_set(),
+            crate::provider::ProviderValidationInputs::collect(
+                identity.provider.as_deref().unwrap_or("builtin"),
+                [&value.to_value()],
+            )
+            .redaction_set(),
         )
     })
 }
