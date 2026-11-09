@@ -2105,7 +2105,7 @@ pub struct IntMemberConstraints {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", deny_unknown_fields)]
+#[serde(tag = "type")]
 pub enum AttributeType {
     /// String-valued reference whose equality is resolved by the initialized guest.
     #[serde(rename = "reference")]

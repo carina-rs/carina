@@ -13,7 +13,7 @@
 //! `RuntimeTypeInput`, which state readers provide. It cannot accept authored
 //! or expanded configuration projections.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::builtins::{Builtin, BuiltinResultTyping};
 use crate::parser::{ExportParamLike, TypeExpr};
@@ -301,56 +301,84 @@ pub(crate) fn join_inferred_types(
     right: &TypeExpr,
     context: &crate::parser::ProviderContext,
 ) -> Option<TypeExpr> {
-    if left == right {
-        return Some(left.clone());
-    }
-    match (left, right) {
-        (TypeExpr::List(left), TypeExpr::List(right)) => {
-            return join_inferred_types(left, right, context)
-                .map(|ty| TypeExpr::List(Box::new(ty)));
+    InferredTypeJoiner::new(context).join(left, right)
+}
+
+/// A collection fold resolves each canonical identity at most once, even
+/// after its accumulator has widened away from exact member declarations.
+pub(crate) struct InferredTypeJoiner<'a> {
+    context: &'a crate::parser::ProviderContext,
+    canonical: BTreeMap<crate::schema::TypeIdentity, TypeExpr>,
+}
+
+impl<'a> InferredTypeJoiner<'a> {
+    pub(crate) fn new(context: &'a crate::parser::ProviderContext) -> Self {
+        Self {
+            context,
+            canonical: BTreeMap::new(),
         }
-        (TypeExpr::Map(left), TypeExpr::Map(right)) => {
-            return join_inferred_types(left, right, context).map(|ty| TypeExpr::Map(Box::new(ty)));
-        }
-        _ => {}
     }
-    let scalar_identity = |ty: &TypeExpr| match ty {
-        TypeExpr::SchemaType { owned } => {
-            // Enum bases remain part of the enum declaration; they are not
-            // scalar member layers and cannot be erased by a collection join.
-            if owned
-                .resolve_projection(context)
-                .ok()?
-                .is_some_and(|declaration| declaration.scalar_identity_parts().is_none())
-            {
-                return None;
+
+    pub(crate) fn join(&mut self, left: &TypeExpr, right: &TypeExpr) -> Option<TypeExpr> {
+        if left == right {
+            return Some(left.clone());
+        }
+        match (left, right) {
+            (TypeExpr::List(left), TypeExpr::List(right)) => {
+                return self
+                    .join(left, right)
+                    .map(|ty| TypeExpr::List(Box::new(ty)));
             }
-            Some(owned.identity().clone())
+            (TypeExpr::Map(left), TypeExpr::Map(right)) => {
+                return self.join(left, right).map(|ty| TypeExpr::Map(Box::new(ty)));
+            }
+            _ => {}
         }
-        TypeExpr::Simple(name) => {
-            crate::provider::identified_custom_type_identity(name.declaration()).cloned()
+        let scalar_identity = |ty: &TypeExpr| match ty {
+            TypeExpr::SchemaType { owned } => {
+                // Enum bases remain part of the enum declaration; they are not
+                // scalar member layers and cannot be erased by a collection join.
+                if owned
+                    .resolve_projection(self.context)
+                    .ok()?
+                    .is_some_and(|declaration| declaration.scalar_identity_parts().is_none())
+                {
+                    return None;
+                }
+                Some(owned.identity().clone())
+            }
+            TypeExpr::Simple(name) => {
+                crate::provider::identified_custom_type_identity(name.declaration()).cloned()
+            }
+            _ => None,
+        };
+        let left_identity = scalar_identity(left)?;
+        let right_identity = scalar_identity(right)?;
+        for identity in [left_identity, right_identity] {
+            let canonical = match self.canonical.entry(identity.clone()) {
+                std::collections::btree_map::Entry::Occupied(cached) => cached.get().clone(),
+                std::collections::btree_map::Entry::Vacant(cached) => {
+                    let canonical =
+                        super::resolve_type_expr(&TypeExpr::try_from(identity).ok()?, self.context)
+                            .ok()?;
+                    cached.insert(canonical).clone()
+                }
+            };
+            if [left, right].into_iter().all(|source| {
+                matches!(
+                    super::typecheck::inferred_type_assignment(
+                        &canonical,
+                        source,
+                        &self.context.custom_types
+                    ),
+                    crate::schema::TypeAssignability::Assignable,
+                )
+            }) {
+                return Some(canonical);
+            }
         }
-        _ => None,
-    };
-    let left_identity = scalar_identity(left)?;
-    let right_identity = scalar_identity(right)?;
-    for identity in [left_identity, right_identity] {
-        let canonical =
-            super::resolve_type_expr(&TypeExpr::try_from(identity).ok()?, context).ok()?;
-        if [left, right].into_iter().all(|source| {
-            matches!(
-                super::typecheck::inferred_type_assignment(
-                    &canonical,
-                    source,
-                    &context.custom_types
-                ),
-                crate::schema::TypeAssignability::Assignable,
-            )
-        }) {
-            return Some(canonical);
-        }
+        None
     }
-    None
 }
 
 fn heterogeneous_collection_error(first: &TypeExpr, next: &TypeExpr) -> InferenceError {
@@ -699,9 +727,11 @@ where
             .into());
         }
     };
+    let mut joiner = InferredTypeJoiner::new(context.provider_context);
     for next in iter {
         let next_type = infer_projected_type_with_visiting(next, bindings, context, visiting)?;
-        first = join_inferred_types(&first, &next_type, context.provider_context)
+        first = joiner
+            .join(&first, &next_type)
             .ok_or_else(|| heterogeneous_collection_error(&first, &next_type))?;
     }
     Ok(wrap(Box::new(first)))

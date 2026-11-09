@@ -19,6 +19,17 @@ impl PatternAttributeType<Draft> {
         location: SchemaValidationIssueLocation,
         issues: &mut Vec<SchemaDefinitionIssue>,
     ) -> Option<CompiledAttributeType> {
+        if self.has_empty_refinement_bounds() {
+            push_schema_issue(
+                issues,
+                &location,
+                format!(
+                    "{} has an empty intersection of scalar constraints",
+                    self.type_name()
+                ),
+            );
+            return None;
+        }
         let kind = match self.kind {
             AttrTypeKind::UnloadedSchemaType(unloaded) => {
                 AttrTypeKind::UnloadedSchemaType(unloaded)

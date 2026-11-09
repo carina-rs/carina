@@ -9340,6 +9340,7 @@ fn enum_definition_signature(attribute_type: &AttributeType) -> Option<EnumDefin
 struct OwnerCustomTypeIndex {
     factory_index: usize,
     declarations: BTreeMap<TypeIdentity, Vec<AttributeType>>,
+    identity_declarations: BTreeMap<TypeIdentity, crate::parser::ResolvedSchemaType>,
 }
 
 struct ProviderFactorySchemaSnapshot {
@@ -9493,7 +9494,6 @@ where
     ) -> Result<crate::parser::ResolvedSchemaType, crate::parser::CustomTypeValidationError> {
         use crate::parser::{CustomTypeValidationError, ResolvedSchemaType, SchemaTypeOwner};
         let mut resolved: Option<ResolvedSchemaType> = None;
-        let mut identity_signature: Option<String> = None;
         for owner in owned.owners().iter() {
             let SchemaTypeOwner::Provider(owner) = owner;
             let missing = || CustomTypeValidationError::MissingDeclaration {
@@ -9506,23 +9506,21 @@ where
                 .and_then(|index| index.declarations.get(owned.identity()))
                 .filter(|declarations| !declarations.is_empty())
                 .ok_or_else(missing)?;
+            if let Some(declaration) = self.index[owner]
+                .identity_declarations
+                .get(owned.identity())
+            {
+                if declaration.scalar_kind() != owned.scalar_kind() {
+                    return Err(missing());
+                }
+                resolved = Some(match resolved {
+                    Some(existing) => existing.conjoin(declaration)?,
+                    None => declaration.clone(),
+                });
+                continue;
+            }
             for declaration in declarations {
                 let identity_declaration = declaration.scalar_identity_parts();
-                if let Some(parts) = identity_declaration {
-                    let signature = parts.agreement_signature();
-                    if identity_signature
-                        .as_ref()
-                        .is_some_and(|first| first != &signature)
-                    {
-                        return Err(CustomTypeValidationError::Rejected {
-                            owner: owner.clone(),
-                            identity: owned.identity().clone(),
-                            message: "conflicting identity-layer declarations across schema owners"
-                                .into(),
-                        });
-                    }
-                    identity_signature.get_or_insert(signature);
-                }
                 let declaration = if identity_declaration.is_some() {
                     ResolvedSchemaType::from_identity_declaration(owner, declaration)
                 } else {
@@ -9676,11 +9674,38 @@ fn build_owner_custom_type_index(
             for (identity, declaration) in factory.witness.identified_declarations() {
                 declarations.entry(identity).or_default().push(declaration);
             }
+            // Aggregate witness admission already proved agreement within
+            // this owner, once. Different owners are conjoined at resolution.
+            let identity_declarations = declarations
+                .iter()
+                .filter_map(|(identity, declarations)| {
+                    let mut layers = declarations
+                        .iter()
+                        .map(|declaration| {
+                            crate::parser::ResolvedSchemaType::from_identity_declaration(
+                                &factory.name,
+                                declaration,
+                            )
+                        })
+                        .collect::<Option<Vec<_>>>()?
+                        .into_iter();
+                    let mut resolved = layers.next()?;
+                    for layer in layers {
+                        // Float retains its within-owner range conjunction;
+                        // String/Int identities already agree at admission.
+                        resolved = resolved
+                            .conjoin(&layer)
+                            .expect("admitted scalar kinds agree");
+                    }
+                    Some((identity.clone(), resolved))
+                })
+                .collect();
             (
                 factory.name.clone(),
                 OwnerCustomTypeIndex {
                     factory_index,
                     declarations,
+                    identity_declarations,
                 },
             )
         })
@@ -11189,6 +11214,7 @@ mod tests {
             "config-owner".into(),
             OwnerCustomTypeIndex {
                 factory_index: 0,
+                identity_declarations: BTreeMap::new(),
                 declarations: BTreeMap::from([(identity.clone(), vec![declaration])]),
             },
         )]);
@@ -11237,6 +11263,7 @@ mod tests {
             "config-owner".into(),
             OwnerCustomTypeIndex {
                 factory_index: 0,
+                identity_declarations: BTreeMap::new(),
                 declarations: BTreeMap::from([(identity.clone(), vec![AttributeType::string()])]),
             },
         )]);

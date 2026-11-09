@@ -196,8 +196,7 @@ impl<'a> ScalarIdentityParts<'a> {
                 range: None,
             }
             .signature(),
-            Self::String(parts) => Self::String(parts).signature(),
-            Self::Int(parts) => Self::Int(parts).signature(),
+            other => other.signature(),
         }
     }
 
@@ -269,10 +268,20 @@ impl<R: PatternForm> PatternAttributeType<R> {
         }
     }
 
-    pub fn int_identity_layer(&self) -> Option<&IntIdentityLayer> {
+    pub(crate) fn has_empty_refinement_bounds(&self) -> bool {
+        fn empty<T: Copy + Ord>(bounds: Option<(Option<T>, Option<T>)>) -> bool {
+            matches!(bounds, Some((Some(min), Some(max))) if min > max)
+        }
         match &self.kind {
-            AttrTypeKind::Int { identity_layer, .. } => Some(identity_layer),
-            _ => None,
+            AttrTypeKind::String {
+                identity_layer,
+                member_layer,
+            } => empty(intersect_bounds(identity_layer.length, member_layer.length)),
+            AttrTypeKind::Int {
+                identity_layer,
+                member_layer,
+            } => empty(intersect_bounds(identity_layer.range, member_layer.range)),
+            _ => false,
         }
     }
 

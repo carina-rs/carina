@@ -430,11 +430,10 @@ impl ResolvedSchemaType {
         owner: impl Into<String>,
         declaration: &AttributeType,
     ) -> Option<Self> {
+        declaration.scalar_identity_parts()?;
         Some(Self(std::sync::Arc::new(ResolvedScalarDeclaration {
             owned: OwnedTypeIdentity::from_schema_declaration(owner, declaration)?,
-            constraints: super::scalar_constraints::ScalarConstraints::from_identity(
-                declaration.scalar_identity_parts()?,
-            ),
+            constraints: super::scalar_constraints::ScalarConstraints::from_identity(declaration),
             projection: None,
             projection_fingerprint: None,
         })))
@@ -471,8 +470,11 @@ impl ResolvedSchemaType {
     }
 
     pub(crate) fn into_annotation(mut self) -> Self {
-        std::sync::Arc::make_mut(&mut self.0).projection = None;
-        std::sync::Arc::make_mut(&mut self.0).projection_fingerprint = None;
+        if self.0.projection.is_some() || self.0.projection_fingerprint.is_some() {
+            let declaration = std::sync::Arc::make_mut(&mut self.0);
+            declaration.projection = None;
+            declaration.projection_fingerprint = None;
+        }
         self
     }
 
@@ -502,6 +504,13 @@ impl ResolvedSchemaType {
     pub(crate) fn materialize(&self) -> AttributeType {
         self.0.constraints.materialize(self)
     }
+    pub(crate) fn owner_patterns(
+        &self,
+        member: bool,
+    ) -> impl Iterator<Item = &crate::schema::CompiledPattern> {
+        self.0.constraints.owner_patterns(member)
+    }
+
     pub(crate) fn has_empty_intersection(&self) -> bool {
         self.0.constraints.is_empty()
     }

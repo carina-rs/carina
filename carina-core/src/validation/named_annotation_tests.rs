@@ -447,13 +447,13 @@ fn nominal_pattern_policy_is_preserved_and_diagnostics_show_each_pattern() {
 
 #[test]
 fn empty_intersections_are_explicit_and_reject_values_and_assignments() {
-    for declarations in [
-        vec![string(8, 4, None)],
-        vec![DraftType::refined_int(
-            Some(identity()),
-            Some((Some(8), Some(4))),
-        )],
-        vec![
+    for (first, second) in [
+        (string(1, 4, None), string(8, 12, None)),
+        (
+            DraftType::refined_int(Some(identity()), Some((Some(1), Some(4)))),
+            DraftType::refined_int(Some(identity()), Some((Some(8), Some(12)))),
+        ),
+        (
             DraftType::refined_float(
                 Some(identity()),
                 Some((Some(crate::finite(1.0)), Some(crate::finite(4.0)))),
@@ -462,9 +462,9 @@ fn empty_intersections_are_explicit_and_reject_values_and_assignments() {
                 Some(identity()),
                 Some((Some(crate::finite(8.0)), Some(crate::finite(12.0)))),
             ),
-        ],
+        ),
     ] {
-        let snapshot = snapshot(vec![("p", declarations)]);
+        let snapshot = snapshot(vec![("p", vec![first]), ("q", vec![second])]);
         let ty = annotation(&snapshot);
         let lifted = lift_type_expr(&ty).unwrap();
         assert!(!assign(
@@ -1100,8 +1100,14 @@ fn review_bare_enum_module_argument_rejects_empty_witness() {
         None,
         None,
     );
-    let caller = snapshot(vec![("p", vec![enumeration.clone()])]);
-    let callee = snapshot(vec![("p", vec![enumeration, string(8, 4, None)])]);
+    let caller = snapshot(vec![
+        ("p", vec![enumeration.clone()]),
+        ("q", vec![string(1, 128, None)]),
+    ]);
+    let callee = snapshot(vec![
+        ("p", vec![enumeration, string(1, 4, None)]),
+        ("q", vec![string(8, 12, None)]),
+    ]);
     for (argument, sink) in [
         ("choice", annotation(&callee)),
         ("[choice]", TypeExpr::List(Box::new(annotation(&callee)))),
@@ -2208,16 +2214,73 @@ fn member_constraints_do_not_enter_multi_owner_identity_annotations() {
 }
 
 #[test]
-fn owner_set_rejects_conflicting_identity_layer_definitions() {
+fn owners_conjoin_differing_identity_layers_without_member_constraints() {
+    use crate::schema::{PatternMatch, PatternSpec};
     let loaded = snapshot(vec![
-        ("a", vec![string(1, 16, None)]),
-        ("b", vec![string(1, 32, None)]),
+        (
+            "a",
+            vec![string(
+                1,
+                16,
+                Some(PatternSpec::new("a.*", PatternMatch::Full)),
+            )],
+        ),
+        (
+            "b",
+            vec![string(
+                3,
+                32,
+                Some(PatternSpec::new(".*z", PatternMatch::Full)),
+            )],
+        ),
     ]);
-    let context = loaded.provider_context().as_provider_context();
-    let ty = crate::parser::parse_type_expr_str(&identity().to_string(), context).unwrap();
-    let error = resolve_type_expr(&ty, context).unwrap_err();
+    let ty = annotation(&loaded);
+    let lifted = lift_type_expr(&ty).unwrap();
+    for (value, valid) in [("abz", true), ("az", false), ("xbz", false), ("abc", false)] {
+        assert_eq!(lifted.validate(&text(value)).is_ok(), valid, "{value}");
+    }
+    let restored: TypeExpr = serde_json::from_value(serde_json::to_value(&ty).unwrap()).unwrap();
+    assert_eq!(restored, ty);
+    let restored = lift_type_expr(&restored).unwrap();
+    assert!(restored.validate(&text("abz")).is_ok());
+    assert!(restored.validate(&text("abc")).is_err());
+    let mut tampered = serde_json::to_value(&ty).unwrap();
+    tampered["SchemaType"]["owned"]["constraints"]["scalar"]["String"]["identity_layer"]["length"]
+        ["min"] = serde_json::json!({"Inclusive": 0});
     assert!(
-        error.to_string().contains("conflicting identity-layer"),
+        serde_json::from_value::<TypeExpr>(tampered).is_err(),
+        "owner bounds cannot disappear from retained evidence"
+    );
+
+    let integers = snapshot(vec![
+        (
+            "a",
+            vec![DraftType::refined_int(
+                Some(identity()),
+                Some((Some(1), Some(20))),
+            )],
+        ),
+        (
+            "b",
+            vec![DraftType::refined_int(
+                Some(identity()),
+                Some((Some(5), Some(30))),
+            )],
+        ),
+    ]);
+    let integers = lift_type_expr(&annotation(&integers)).unwrap();
+    for (value, valid) in [(3, false), (5, true), (20, true), (21, false)] {
+        assert_eq!(integers.validate(&integer(value)).is_ok(), valid, "{value}");
+    }
+
+    let disjoint = snapshot(vec![
+        ("a", vec![string(1, 2, None)]),
+        ("b", vec![string(4, 6, None)]),
+    ]);
+    let disjoint = lift_type_expr(&annotation(&disjoint)).unwrap();
+    let error = disjoint.validate(&text("abc")).unwrap_err().to_string();
+    assert!(
+        error.contains("empty intersection of scalar constraints"),
         "{error}"
     );
 }

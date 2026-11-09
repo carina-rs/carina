@@ -200,3 +200,67 @@ fn protocol_round_trip_preserves_both_layers_and_builtin_semantics() {
         RawShape::String { .. }
     ));
 }
+
+#[test]
+fn admission_rejects_empty_member_bounds_and_identity_intersections() {
+    for (identity, member) in [
+        (None, (Some(8), Some(2))),
+        (Some((Some(1), Some(4))), (Some(8), Some(12))),
+    ] {
+        let string = AttributeType::string_member(
+            StringIdentityLayer::new(None, None, identity, None),
+            StringMemberConstraints::new(None, Some(member)),
+        );
+        let error = ValidatedConfigSchema::validate(BTreeMap::from([("name".into(), string)]))
+            .expect_err("empty String member bounds must fail schema admission")
+            .to_string();
+        assert!(
+            error.contains("empty intersection of scalar constraints"),
+            "{error}"
+        );
+        assert!(error.contains("name"), "{error}");
+    }
+    for (identity, member) in [
+        (None, (Some(8), Some(2))),
+        (Some((Some(-4), Some(4))), (Some(8), Some(12))),
+    ] {
+        let int = AttributeType::int_member(
+            IntIdentityLayer::new(None, identity),
+            IntMemberConstraints::new(Some(member)),
+        );
+        let error = ResourceSchema::new("test.Count")
+            .attribute(AttributeSchema::optional("count", int).build())
+            .validate()
+            .expect_err("empty Int member bounds must fail schema admission")
+            .to_string();
+        assert!(
+            error.contains("empty intersection of scalar constraints"),
+            "{error}"
+        );
+        assert!(error.contains("count"), "{error}");
+    }
+}
+
+#[test]
+fn anonymous_member_strings_are_custom_and_display_their_constraints() {
+    for (pattern, length, expected) in [
+        (
+            Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+            None,
+            "String(pattern)",
+        ),
+        (None, Some((Some(2), Some(4))), "String(len: 2..=4)"),
+    ] {
+        let ty = AttributeType::string_member(
+            StringIdentityLayer::new(None, None, None, None),
+            StringMemberConstraints::new(pattern, length),
+        );
+        assert!(ty.is_string_based_custom());
+        assert_eq!(ty.type_name(), expected);
+        let schema =
+            ValidatedConfigSchema::validate(BTreeMap::from([("value".into(), ty)])).unwrap();
+        let ty = schema.rootless_type("value").unwrap();
+        assert!(ty.validate_collect(&text("abc")).is_empty());
+        assert_eq!(ty.validate_collect(&text("X")).len(), 1);
+    }
+}

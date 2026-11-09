@@ -666,6 +666,35 @@ impl Estimator<'_> {
         }
     }
 
+    fn string_constraints<'a>(
+        &self,
+        bounds: impl IntoIterator<Item = Option<(Option<u64>, Option<u64>)>>,
+        patterns: impl IntoIterator<Item = Option<&'a crate::schema::CompiledPattern>>,
+    ) -> Summary {
+        let mut length = LengthInterval::from_bounds(None);
+        for bounds in bounds {
+            let Some(intersection) = length.intersect(LengthInterval::from_bounds(bounds.as_ref()))
+            else {
+                return Summary::unknown(&self.query);
+            };
+            length = intersection;
+        }
+        let mut alphabet = Characters::all();
+        for pattern in patterns.into_iter().flatten() {
+            if let Some((set, pattern_length)) = pattern.whole_string_class() {
+                let Some(intersection) = length.intersect(pattern_length) else {
+                    return Summary::unknown(&self.query);
+                };
+                length = intersection;
+                alphabet = alphabet.intersect(&Characters::from_set(&set));
+                if alphabet.0.is_empty() {
+                    return Summary::unknown(&self.query);
+                }
+            }
+        }
+        Summary::homogeneous(length, alphabet, &self.query)
+    }
+
     fn declared(
         &mut self,
         ty: &CompiledAttributeType,
@@ -734,47 +763,13 @@ impl Estimator<'_> {
                         pattern: member_pattern,
                         length: member_length,
                     },
-            } => {
-                let Some(mut length) = LengthInterval::from_bounds(length.as_ref())
-                    .intersect(LengthInterval::from_bounds(member_length.as_ref()))
-                else {
-                    return Summary::unknown(&self.query);
-                };
-                let mut alphabet = Characters::all();
-                for pattern in [pattern.as_ref(), member_pattern.as_ref()]
-                    .into_iter()
-                    .flatten()
-                {
-                    if let Some((set, pattern_length)) = pattern.whole_string_class() {
-                        let Some(intersection) = length.intersect(pattern_length) else {
-                            return Summary::unknown(&self.query);
-                        };
-                        length = intersection;
-                        alphabet = alphabet.intersect(&Characters::from_set(&set));
-                        if alphabet.0.is_empty() {
-                            return Summary::unknown(&self.query);
-                        }
-                    }
-                }
-                Summary::homogeneous(length, alphabet, &self.query)
-            }
+            } => self.string_constraints(
+                [*length, *member_length],
+                [pattern.as_ref(), member_pattern.as_ref()],
+            ),
             AttrTypeKind::Reference {
                 pattern, length, ..
-            } => {
-                let mut length = LengthInterval::from_bounds(length.as_ref());
-                let mut alphabet = Characters::all();
-                if let Some((set, pattern_length)) = pattern
-                    .as_ref()
-                    .and_then(|pattern| pattern.whole_string_class())
-                {
-                    let Some(intersection) = length.intersect(pattern_length) else {
-                        return Summary::unknown(&self.query);
-                    };
-                    length = intersection;
-                    alphabet = Characters::from_set(&set);
-                }
-                Summary::homogeneous(length, alphabet, &self.query)
-            }
+            } => self.string_constraints([*length], [pattern.as_ref()]),
             AttrTypeKind::Enum {
                 values: Some(values),
                 ..

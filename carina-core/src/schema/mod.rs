@@ -2991,17 +2991,10 @@ impl<R: PatternForm> PatternAttributeType<R> {
         length: Option<(Option<u64>, Option<u64>)>,
         to_dsl: Option<DslTransform>,
     ) -> Self {
-        PatternAttributeType {
-            kind: AttrTypeKind::String {
-                identity_layer: StringIdentityLayer {
-                    binding: RefinementBinding::MetadataOnly(identity),
-                    pattern,
-                    length,
-                    to_dsl,
-                },
-                member_layer: Default::default(),
-            },
-        }
+        Self::string_member(
+            StringIdentityLayer::new(identity, pattern, length, to_dsl),
+            Default::default(),
+        )
     }
 
     /// Create a String type with refinement metadata and a custom validator.
@@ -3012,20 +3005,10 @@ impl<R: PatternForm> PatternAttributeType<R> {
         validate: CustomValidator,
         to_dsl: Option<DslTransform>,
     ) -> Self {
-        PatternAttributeType {
-            kind: AttrTypeKind::String {
-                identity_layer: StringIdentityLayer {
-                    binding: RefinementBinding::Validator {
-                        identity,
-                        callback: validate,
-                    },
-                    pattern,
-                    length,
-                    to_dsl,
-                },
-                member_layer: Default::default(),
-            },
-        }
+        Self::string_member(
+            StringIdentityLayer::with_validator(identity, pattern, length, validate, to_dsl),
+            Default::default(),
+        )
     }
 
     /// Create the primitive `Int` type.
@@ -3046,15 +3029,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
         identity: Option<TypeIdentity>,
         range: Option<(Option<i64>, Option<i64>)>,
     ) -> Self {
-        PatternAttributeType {
-            kind: AttrTypeKind::Int {
-                identity_layer: IntIdentityLayer {
-                    binding: RefinementBinding::MetadataOnly(identity),
-                    range,
-                },
-                member_layer: Default::default(),
-            },
-        }
+        Self::int_member(IntIdentityLayer::new(identity, range), Default::default())
     }
 
     /// Create an Int type with refinement metadata and a custom validator.
@@ -3063,18 +3038,10 @@ impl<R: PatternForm> PatternAttributeType<R> {
         range: Option<(Option<i64>, Option<i64>)>,
         validate: CustomValidator,
     ) -> Self {
-        PatternAttributeType {
-            kind: AttrTypeKind::Int {
-                identity_layer: IntIdentityLayer {
-                    binding: RefinementBinding::Validator {
-                        identity,
-                        callback: validate,
-                    },
-                    range,
-                },
-                member_layer: Default::default(),
-            },
-        }
+        Self::int_member(
+            IntIdentityLayer::with_validator(identity, range, validate),
+            Default::default(),
+        )
     }
 
     /// Create the primitive `Float` type.
@@ -3364,18 +3331,12 @@ impl<R: PatternForm> PatternAttributeType<R> {
             AttrTypeKind::Duration => "Duration".to_string(),
             AttrTypeKind::Enum { identity, .. } => identity.to_string(),
             AttrTypeKind::String {
-                identity_layer:
-                    StringIdentityLayer {
-                        binding,
-                        pattern,
-                        length,
-                        ..
-                    },
-                ..
+                identity_layer,
+                member_layer,
             } => custom_display_name(
-                binding.identity(),
-                pattern.as_ref().map(AsRef::as_ref),
-                length.as_ref(),
+                identity_layer.binding.identity(),
+                identity_layer.pattern.is_some() || member_layer.pattern.is_some(),
+                intersect_bounds(identity_layer.length, member_layer.length),
             ),
             AttrTypeKind::ResourceHandle {
                 provider,
@@ -3421,15 +3382,15 @@ impl<R: PatternForm> PatternAttributeType<R> {
             AttrTypeKind::UnloadedSchemaType(_) => false,
             AttrTypeKind::Reference { .. } => true,
             AttrTypeKind::String {
-                identity_layer:
-                    StringIdentityLayer {
-                        binding,
-                        pattern,
-                        length,
-                        ..
-                    },
-                ..
-            } => binding.identity().is_some() || pattern.is_some() || length.is_some(),
+                identity_layer,
+                member_layer,
+            } => {
+                identity_layer.binding.identity().is_some()
+                    || identity_layer.pattern.is_some()
+                    || identity_layer.length.is_some()
+                    || member_layer.pattern.is_some()
+                    || member_layer.length.is_some()
+            }
             _ => false,
         }
     }
@@ -3571,12 +3532,7 @@ impl PatternAttributeType<Compiled> {
         &self,
         value: ConcreteValueRef<'_, P, B>,
     ) -> Result<(), TypeError> {
-        if self.has_empty_scalar_intersection()
-            && !matches!(
-                self.kind,
-                AttrTypeKind::String { .. } | AttrTypeKind::Int { .. }
-            )
-        {
+        if self.has_empty_scalar_intersection() {
             return Err(TypeError::ValidationFailed {
                 message: format!(
                     "{} has an empty intersection of scalar constraints",
@@ -3602,13 +3558,40 @@ impl PatternAttributeType<Compiled> {
                     length,
                     to_dsl: _to_dsl,
                 } = identity_layer;
-                validate_string_refinement(binding.identity(), pattern.as_ref(), *length, s)?;
+                validate_string_refinement(binding.identity(), pattern.as_ref(), None, s)?;
+                if let Some(annotation) = binding.annotation() {
+                    for owner_pattern in annotation
+                        .owner_patterns(false)
+                        .filter(|owner_pattern| Some(*owner_pattern) != pattern.as_ref())
+                    {
+                        validate_string_refinement(
+                            binding.identity(),
+                            Some(owner_pattern),
+                            None,
+                            s,
+                        )?;
+                    }
+                }
+                validate_string_refinement(binding.identity(), None, *length, s)?;
                 validate_string_refinement(
                     binding.identity(),
                     member_layer.pattern.as_ref(),
-                    member_layer.length,
+                    None,
                     s,
                 )?;
+                if let Some(annotation) = binding.annotation() {
+                    for owner_pattern in annotation.owner_patterns(true).filter(|owner_pattern| {
+                        Some(*owner_pattern) != member_layer.pattern.as_ref()
+                    }) {
+                        validate_string_refinement(
+                            binding.identity(),
+                            Some(owner_pattern),
+                            None,
+                            s,
+                        )?;
+                    }
+                }
+                validate_string_refinement(binding.identity(), None, member_layer.length, s)?;
                 binding
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
@@ -6636,14 +6619,13 @@ impl<R: PatternForm> fmt::Display for PatternAttributeType<R> {
 
 fn custom_display_name(
     identity: Option<&TypeIdentity>,
-    pattern: Option<&PatternSpec>,
-    length: Option<&(Option<u64>, Option<u64>)>,
+    has_pattern: bool,
+    length: Option<(Option<u64>, Option<u64>)>,
 ) -> String {
     if let Some(id) = identity {
         return id.to_string();
     }
     let mut s = String::from("String");
-    let has_pattern = pattern.is_some();
     let has_length = length.is_some();
     if has_pattern || has_length {
         s.push('(');
@@ -13927,8 +13909,26 @@ impl<R: PatternForm> PatternAttributeType<R> {
             AttrTypeKind::Float { range, .. } => {
                 constraints.push(format!("range {}", bounds(*range)))
             }
-            AttrTypeKind::Enum { base, .. } => {
-                return format!("{} ({})", self.type_name(), base.scalar_diagnostic_name());
+            AttrTypeKind::Enum { base, values, .. } => {
+                let values = values.as_ref().map_or_else(
+                    || "any".into(),
+                    |values| {
+                        format!(
+                            "[{}]",
+                            values
+                                .iter()
+                                .map(|value| display_string_literal(value))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    },
+                );
+                return format!(
+                    "{} ({}, values: {})",
+                    self.type_name(),
+                    base.scalar_diagnostic_name(),
+                    values
+                );
             }
             _ => return self.type_name(),
         }

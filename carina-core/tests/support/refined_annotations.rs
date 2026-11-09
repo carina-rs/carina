@@ -177,14 +177,14 @@ pub const CASES: &[(&str, &str)] = &[
     ),
     (
         "",
-        "exports { accounts: map(aws.AccountId) = { x = registry_prod.account_id, y = registry_prod.looser_account_id } }\n",
+        "exports { accounts: map(aws.AccountId) = { x = registry_prod.account_id, y = registry_prod.looser_account_id, z = registry_prod.account_id, w = registry_prod.looser_account_id } }\n",
     ),
     (
-        "let ids = [registry_prod.account_id, registry_prod.looser_account_id]",
+        "let ids = [registry_prod.account_id, registry_prod.looser_account_id, registry_prod.account_id, registry_prod.looser_account_id]",
         "exports { accounts: list(aws.AccountId) = ids }\n",
     ),
     (
-        "fn keep(ids: list(aws.AccountId)): list(aws.AccountId) { ids }\nlet ids = keep([registry_prod.account_id, registry_prod.looser_account_id])",
+        "fn keep(ids: list(aws.AccountId)): list(aws.AccountId) { ids }\nlet ids = keep([registry_prod.account_id, registry_prod.looser_account_id, registry_prod.account_id, registry_prod.looser_account_id])",
         "exports { accounts: list(aws.AccountId) = ids }\n",
     ),
     (

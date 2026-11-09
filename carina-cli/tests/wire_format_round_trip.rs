@@ -87,7 +87,7 @@ fn current_state_binding_addresses_and_resolved_dependencies_round_trip() {
 #[test]
 fn current_saved_plan_binding_addresses_and_resolved_dependencies_round_trip() {
     let fixture = current_plan_fixture(include_str!(
-        "fixtures/module_binding_wire_compat/carina.v43.plan.json"
+        "fixtures/module_binding_wire_compat/carina.v44.plan.json"
     ));
     assert_json_value_round_trip::<PlanFile>(&fixture);
 
@@ -158,10 +158,18 @@ fn older_saved_plans_require_regeneration_before_payload_decode() {
             "carina.update-delete.v42.plan.json",
             include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v42.plan.json"),
         ),
+        (
+            "carina.v43.plan.json",
+            include_str!("fixtures/module_binding_wire_compat/carina.v43.plan.json"),
+        ),
+        (
+            "carina.update-delete.v43.plan.json",
+            include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v43.plan.json"),
+        ),
     ] {
         let wire: Value = serde_json::from_str(fixture).unwrap();
         let version = wire["version"].as_u64().unwrap();
-        assert!(matches!(version, 37..=42));
+        assert!(matches!(version, 37..=43));
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(name);
         std::fs::write(&path, fixture).unwrap();
@@ -185,9 +193,9 @@ fn older_saved_plans_require_regeneration_before_payload_decode() {
 }
 
 #[test]
-fn v43_deferred_replacement_admission_requests_round_trip() {
+fn v44_deferred_replacement_admission_requests_round_trip() {
     let fixture = current_plan_fixture(include_str!(
-        "fixtures/module_binding_wire_compat/carina.update-delete.v43.plan.json"
+        "fixtures/module_binding_wire_compat/carina.update-delete.v44.plan.json"
     ));
     let wire = assert_json_value_round_trip::<PlanFile>(&fixture);
     let snapshots = wire["plan"]["replacement_inputs"]["old_instances"]
@@ -236,15 +244,15 @@ fn v43_deferred_replacement_admission_requests_round_trip() {
 }
 
 #[test]
-fn v43_plans_accept_resolved_scalar_template_directives() {
+fn v44_plans_accept_resolved_scalar_template_directives() {
     use carina_core::resource::LoopDirective;
 
-    assert_eq!(PlanFile::CURRENT_VERSION, 43);
+    assert_eq!(PlanFile::CURRENT_VERSION, 44);
     for fixture in [
-        include_str!("fixtures/module_binding_wire_compat/carina.v43.plan.json"),
-        include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v43.plan.json"),
+        include_str!("fixtures/module_binding_wire_compat/carina.v44.plan.json"),
+        include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v44.plan.json"),
     ] {
-        // Format 43 retains the scalar loop-directive encoding accepted by
+        // Format 44 retains the scalar loop-directive encoding accepted by
         // main format 38 alongside complete dependency addresses.
         let wire: Value = serde_json::from_str(&current_plan_fixture(fixture)).unwrap();
         let plan: PlanFile = serde_json::from_value(wire.clone()).unwrap();
@@ -285,7 +293,7 @@ fn v43_plans_accept_resolved_scalar_template_directives() {
 #[test]
 fn current_saved_plan_dependency_addresses_keep_module_prefixes() {
     let fixture = current_plan_fixture(include_str!(
-        "fixtures/module_binding_wire_compat/carina.v43.plan.json"
+        "fixtures/module_binding_wire_compat/carina.v44.plan.json"
     ));
     assert_json_value_round_trip::<PlanFile>(&fixture);
 
@@ -345,11 +353,11 @@ fn json_dependency_identities(value: &Value) -> BTreeSet<String> {
 fn current_deferred_effects_keep_bound_wire_ids_and_typed_template_addresses() {
     for (fixture, variant) in [
         (
-            include_str!("fixtures/module_binding_wire_compat/carina.v43.plan.json"),
+            include_str!("fixtures/module_binding_wire_compat/carina.v44.plan.json"),
             "DeferredCreate",
         ),
         (
-            include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v43.plan.json"),
+            include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v44.plan.json"),
             "DeferredReplace",
         ),
     ] {
@@ -395,7 +403,7 @@ fn current_deferred_effects_keep_bound_wire_ids_and_typed_template_addresses() {
 #[test]
 fn current_update_delete_plan_keeps_prefixed_wait_and_dependency_slots() {
     let fixture =
-        include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v43.plan.json");
+        include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v44.plan.json");
     let round_tripped = assert_json_value_round_trip::<PlanFile>(&current_plan_fixture(fixture));
 
     let wait_bindings = round_tripped["wait_bindings"]
@@ -554,7 +562,7 @@ fn current_update_delete_plan_keeps_prefixed_wait_and_dependency_slots() {
 }
 
 #[test]
-fn v43_plan_fixtures_record_current_schema_fingerprints() {
+fn v44_plan_fixtures_record_current_schema_fingerprints() {
     use carina_cli::commands::plan::TypeSchemaFingerprint;
     use carina_core::schema::SchemaRegistry;
     let mut registry = SchemaRegistry::new();
@@ -562,8 +570,8 @@ fn v43_plan_fixtures_record_current_schema_fingerprints() {
         .insert_provider_witness("mock", &carina_provider_mock::builtin_schema_witness())
         .unwrap();
     for fixture in [
-        include_str!("fixtures/module_binding_wire_compat/carina.v43.plan.json"),
-        include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v43.plan.json"),
+        include_str!("fixtures/module_binding_wire_compat/carina.v44.plan.json"),
+        include_str!("fixtures/module_binding_wire_compat/carina.update-delete.v44.plan.json"),
     ] {
         let plan: PlanFile = serde_json::from_str(fixture).unwrap();
         let mut expected = std::collections::BTreeMap::new();
@@ -586,7 +594,7 @@ fn v43_plan_fixtures_record_current_schema_fingerprints() {
         }
         assert_eq!(
             actual, expected,
-            "format 43 fixtures must carry v12 fingerprints"
+            "format 44 fixtures must carry v13 fingerprints"
         );
     }
 }

@@ -37,6 +37,20 @@ typed identity projection; full declaration fingerprints include both layers.
 A core Email identity with a member length is valid, while changing Email's
 identity definition remains a built-in collision.
 
+Provider migration requirement: within one provider's aggregate resource and
+configuration schemas, an identity has one reusable identity-layer definition.
+Different definitions fail with `ConflictingIdentityDeclarations`; move
+resource-specific restrictions into the member layer. Across different schema
+owners, such as AWS and AWSCC, annotations conjoin the owners' identity
+constraints, so a value must satisfy every owner. Different identity constraints
+across owners are allowed. Enum definition and canonical-spelling disagreement
+remain typed errors.
+
+Schema fingerprint encoding is v13. Saved-plan format 44 supersedes 43 because
+both the fingerprint encoding and retained identity/member constraint records
+reach saved plans. Format-43 plans must be regenerated; their version gate fails
+before payload decoding or fingerprint verification.
+
 Every typed destination uses one nominal scalar identity rule: same identity
 or an allowed structural/provider widening. This includes binding/export
 annotations, map/list element annotations, module arguments, and user-function
@@ -121,7 +135,8 @@ and substring reasons without visible text are rejected. Providers must rebuild
 against protocol 24; the protocol-12 schema-only migration admission window is
 removed. WIT is unchanged: schema specifications travel inside JSON exports.
 
-Schema fingerprint encoding is v12. Saved-plan format is 43 so older plans fail
+Version 24 introduced schema fingerprint encoding v12 and saved-plan format 43,
+so older plans fail
 with the typed unsupported-format error before schema-fingerprint verification.
 
 ## Version 23
@@ -194,7 +209,7 @@ validation reuses that same merge before checking desired inputs. Diagnostics
 name only the attribute, code and reason, including for secret values.
 
 The semantic schema fingerprint includes each rule's scope, target and complete
-predicate payload; the current encoding is v12. Checked plans and pending obligations
+predicate payload; the current encoding is v13. Checked plans and pending obligations
 are not serialized. Saved-plan input re-admission under the apply lock remains
 an explicitly typed TODO for phase 5.
 

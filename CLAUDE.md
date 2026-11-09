@@ -619,10 +619,19 @@ A struct type represents a nested object with typed fields.
   one optional length interval; each Int layer has one optional range. Float
   is unchanged. Validate the identity pattern then bounds, member pattern then
   bounds, and finally the semantic callback; retain first-failure diagnostics.
-  Never repeat structural checks in callbacks. Built-ins, aggregate admission
-  and owner-set signatures accept identity-only typed projections. Exact
+  Never repeat structural checks in callbacks. Within one provider, every
+  occurrence of an identity must have the same identity-layer definition;
+  aggregate admission rejects `ConflictingIdentityDeclarations`. Provider
+  migrations must move resource-specific bounds into the member layer rather
+  than redeclaring an identity with different constraints. Across different
+  owners (for example AWS and AWSCC), annotation constraints are conjoined:
+  values must satisfy every owner's identity layer. Enum definition and
+  canonical-spelling disagreements remain typed errors. Built-in and aggregate
+  comparisons accept identity-only typed projections. Exact
   declarations and their fingerprints preserve both layers. Hover renders
   both layers; shared provider docgen must do the same. WIT stays 0.2.0.
+  Schema fingerprints use v13 and saved plans use format 44; format 43 plans
+  must fail the version gate before decoding retained constraint evidence.
   Every typed sink uses the same nominal scalar identity-admission rule for
   equal identities and allowed widenings (#4349), including annotations,
   exports, module arguments, and function parameters/returns. All destination

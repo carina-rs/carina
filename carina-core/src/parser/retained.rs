@@ -3625,15 +3625,16 @@ mod judgement {
                     } else {
                         match children.first() {
                             Some(first) => first.static_type().cloned().and_then(|mut first| {
+                                let mut joiner = inference::InferredTypeJoiner::new(self.config);
                                 for child in &children[1..] {
                                     let next = child.static_type()?;
-                                    first =
-                                        inference::join_inferred_types(&first, next, self.config)
-                                            .ok_or_else(|| InferenceError::HeterogeneousCollection {
+                                    first = joiner.join(&first, next).ok_or_else(|| {
+                                        InferenceError::HeterogeneousCollection {
                                             types: crate::schema::MismatchTypeNames::for_type_exprs(
                                                 &first, next,
                                             ),
-                                        })?;
+                                        }
+                                    })?;
                                 }
                                 Ok(if matches!(root.kind, ExprKind::List) {
                                     TypeExpr::List(Box::new(first))
