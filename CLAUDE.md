@@ -277,9 +277,9 @@ example-based tests already provide sufficient coverage.
 
 Tests run under nextest (`cargo nextest run`, install once with
 `cargo install cargo-nextest --locked`; version 0.9.133 or newer, which
-`.config/nextest.toml` requires). Two things nextest does *not*
-give you: doctests need a separate `cargo test --workspace --doc` before
-opening a PR, and it is process-per-test.
+`.config/nextest.toml` requires). Nextest does not run doctests and uses one
+process per test. `scripts/verify.sh` also runs doctests and checks in-process
+isolation.
 
 Run tests through nextest, not plain `cargo test`. The setup script in
 `.config/nextest.toml` points `HOME`, `TMPDIR` and `CARINA_*` at a per-run
@@ -311,83 +311,35 @@ cargo run -- plan
 aws-vault exec <profile> -- cargo run -- plan
 ```
 
-## Verify Protocol — Do Not Run Redundant Builds
+## Verify Protocol
 
-The verify cycle is the slowest thing about working on this repo. The
-single biggest waste is running `cargo build` immediately before
-`cargo test`: the test step compiles the same artifacts the build step
-just produced.
+1. Run `scripts/verify.sh --local` before `gh pr create` and before pushing
+   follow-up commits to an open PR. It runs the same check definitions and
+   feature flags as CI; only crate scope comes from `scripts/touched-crates.sh`.
+   Use `--base <ref>` to override the helper's default base of `origin/main`.
+2. PR CI must be green before merge.
 
-**Rules:**
+CI keeps its parallel jobs by selecting kinds from `scripts/verify.sh`.
+The archive job builds the WASM mock fixtures and host test archive once;
+partitions and in-process isolation consume those artifacts. Provider-cause
+API checks and doctests run in separate jobs, and the required `Test` job
+aggregates their results. On main pushes, the archive job compiles tests to
+warm its cache. Local verify builds the same WASM fixtures before its tests.
 
-- **Do not run `cargo build`** as a separate verification step.
-  `cargo nextest run` (or `cargo test`) already compiles everything it needs.
-- For a faster compile-only sanity check during iteration, use
-  `cargo check -p <crate>` (skips linking, ~30–50% faster than `cargo build`).
-- The only legitimate use of `cargo build` in the verify cycle is
-  `cargo build --release` immediately before opening a PR, to catch
-  release-only issues that debug builds miss. Skip it for refactors,
-  bug fixes, or anything that has not changed `Cargo.toml` / unsafe code /
-  the `release` profile config.
+## While Working
 
-**Verify cycle order** (from #2289 / #2291):
-
-```bash
-# 1. Compile-only sanity (crate-scoped during iteration)
-cargo check -p <crate>
-
-# 2. Tests, scoped to what changed (see touched-crates.sh below)
-SCOPE=$(scripts/touched-crates.sh)
-if [[ -n "$SCOPE" ]]; then
-    cargo nextest run $SCOPE
-fi
-
-# 3. Doctests (cheap; nextest does not run them)
-cargo test --workspace --doc
-
-# 4. Lints
-cargo clippy --workspace --all-targets -- -D warnings
-
-# 5. Repo invariants
-bash scripts/check-*.sh
-```
-
-Broaden step 2 to `cargo nextest run --workspace` only when the change
-spans crates. Steps 3–5 stay workspace-scoped: they are fast and catch
-cross-crate doctest references, workspace-level lint config, and repo-wide
-invariants that a crate-scoped run misses. The `cargo test --doc` step is
-cheap once nextest has compiled the crates — public API doctests in
-`carina-core/src/utils.rs` and elsewhere are not covered by nextest, so
-always run it before declaring verify done.
-
-> CI's archive build job runs `cargo build -p carina-provider-mock -p
-> carina-provider-mock-http --target wasm32-wasip2` and archives the host test
-> binaries. These target different platforms: the WASM build produces fixtures
-> loaded by `carina-plugin-host` integration tests, including the wasi:http guest
-> used by send-phase tests (carina#4057). Partitions and the separate isolation
-> job download both artifacts; provider-cause checks and doctests run in their
-> own jobs, and the required `Test` job aggregates the results. On main pushes,
-> the archive build job only compiles to warm its cache. Do not generalize the
-> fixture build to local builds.
-
-## Incremental Build Strategy
-
-When working on a specific crate, use crate-specific commands to avoid
-unnecessary compilation:
-
-- After modifying a single crate, test only that crate with
-  `cargo nextest run -p <crate-name>`. Do **not** run
-  `cargo build -p <crate-name>` first — the test command does the build.
-- Use full workspace `cargo nextest run` only when changes affect multiple
-  crates or before creating a PR; follow it with `cargo test --workspace --doc`.
-- For the fastest iteration loop, `cargo check -p <crate-name>` skips linking.
-- Provider crates (aws, awscc) are in separate repositories — changes here
-  may require updating those repos.
+Use `cargo check -p <crate>` for a quick compile-only check and
+`cargo nextest run -p <crate>` for tests during iteration. Nextest already
+compiles its test binaries, so a separate `cargo build` is unnecessary.
+`scripts/touched-crates.sh` can select crate scope for these iteration runs.
+Provider crates (aws, awscc) are in separate repositories; changes here may
+require updating those repos.
 
 ### Crate-Scoped Verify Helper
 
 `scripts/touched-crates.sh` maps changed files to the cargo `-p <crate>`
-flags that exercise them, so iteration verify can stay crate-scoped:
+flags that exercise them, including uncommitted changes, so iteration can
+stay crate-scoped:
 
 ```bash
 # What crates does the current branch touch (vs origin/main)?

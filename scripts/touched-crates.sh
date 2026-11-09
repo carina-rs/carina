@@ -7,6 +7,7 @@
 #   scripts/touched-crates.sh --base <ref>     # diff against <ref>
 #   scripts/touched-crates.sh --diff           # short for --base origin/main
 #   git diff --name-only main | scripts/touched-crates.sh --stdin
+# Diff mode includes committed, staged, unstaged and untracked changes.
 #
 # Output (stdout):
 #   "-p carina-core -p carina-cli"   # one or more touched crates
@@ -66,7 +67,13 @@ else
         echo "touched-crates.sh: base ref $base_ref does not exist" >&2
         exit 2
     fi
-    mapfile -t files < <(git diff --name-only "$base_ref"...HEAD)
+    mapfile -t files < <(
+        {
+            git diff --name-only "$base_ref"...HEAD
+            git diff --name-only HEAD
+            git ls-files --others --exclude-standard
+        } | sort -u
+    )
 fi
 
 if [[ ${#files[@]} -eq 0 ]]; then

@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import subprocess
 import tempfile
@@ -12,7 +13,7 @@ import textwrap
 from types import SimpleNamespace
 import unittest
 
-WORKFLOW = Path(sys.argv.pop(1))
+WORKFLOW = Path(sys.argv.pop(1)).resolve()
 CODE_JOBS = {
     "check", "feature-isolation", "fmt", "clippy", "check-examples",
     "validate-crn", "check-example-warnings", "test", "binary-build",
@@ -134,6 +135,34 @@ class WorkflowConditionTests(unittest.TestCase):
             result.append(run)
         return result
 
+    def verify_commands(self, *arguments, scope="--workspace", fail=""):
+        """Observe the real dispatcher with recording substitutes, never Cargo."""
+        repo = WORKFLOW.parent.parent.parent
+        with tempfile.TemporaryDirectory(prefix="carina-verify-") as temporary:
+            root = Path(temporary)
+            (root / "scripts").mkdir()
+            (root / "bin").mkdir()
+            shutil.copyfile(repo / "scripts/verify.sh", root / "scripts/verify.sh")
+            recorder = root / "bin/cargo"
+            recorder.write_text('#!/usr/bin/env bash\nprintf "cargo %s\\n" "$*" >> "$TRACE"\n'
+                                '[[ "$1" != "$FAIL_COMMAND" ]]\n')
+            recorder.chmod(0o755)
+            (root / "scripts/touched-crates.sh").write_text(
+                'printf "base %s\\n" "$*" >> "$TRACE"\nprintf "%s\\n" "$TOUCHED_SCOPE"\n')
+            for script in (repo / "scripts").glob("*.sh"):
+                name = script.name
+                if name in ("verify.sh", "touched-crates.sh"):
+                    continue
+                (root / "scripts" / name).write_text(
+                    f'printf "{name} %s\\n" "$*" >> "$TRACE"\n')
+            trace = root / "trace"
+            environment = dict(os.environ, PATH=f"{root / 'bin'}:{os.environ['PATH']}",
+                               TRACE=str(trace), TOUCHED_SCOPE=scope, FAIL_COMMAND=fail)
+            result = subprocess.run(["bash", str(root / "scripts/verify.sh"), *arguments],
+                                    env=environment, capture_output=True, text=True)
+            commands = trace.read_text().splitlines() if trace.exists() else []
+            return result, [command.rstrip() for command in commands]
+
     def test_ci_debug_overrides_are_global_and_shared_by_cache_jobs(self):
         source = WORKFLOW.read_text()
         environment = source.split("\nenv:\n", 1)[1].split("\njobs:\n", 1)[0]
@@ -148,13 +177,20 @@ class WorkflowConditionTests(unittest.TestCase):
         self.assertNotIn("add-rust-environment-hash-key: false", action)
 
     def test_push_only_compiles_test_artifacts(self):
-        build = "cargo build -p carina-provider-mock -p carina-provider-mock-http --target wasm32-wasip2"
-        archive = "cargo nextest archive --workspace --all-features --archive-file nextest-archive.tar.zst --zstd-level 1"
+        build = "scripts/verify.sh wasm-fixtures"
+        archive = "scripts/verify.sh nextest-archive nextest-archive.tar.zst"
         version = "rustc --version | awk '{print \"version=\" $2}' >> \"$GITHUB_OUTPUT\""
-        self.assertEqual(self.commands("test", "push"), [version, build, "cargo nextest run --workspace --all-features --no-run"])
+        self.assertEqual(self.commands("test", "push"), [version, build, "scripts/verify.sh nextest-compile"])
         for event in ("merge_group", "pull_request"):
             self.assertEqual(self.commands("test", event), [version, build, archive])
-        self.assertEqual(self.commands("test-doctests", "pull_request"), ["cargo test --workspace --doc --all-features"])
+        self.assertEqual(self.commands("test-doctests", "pull_request"), ["scripts/verify.sh doctests"])
+        result, commands = self.verify_commands("wasm-fixtures", "nextest-compile", "doctests")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, [
+            "cargo build -p carina-provider-mock -p carina-provider-mock-http --target wasm32-wasip2",
+            "cargo nextest run --workspace --all-features --no-run",
+            "cargo test --workspace --doc --all-features",
+        ])
         self.assertNotIn("shared-key:", self.jobs["test"])
         self.assertNotIn("cache-job:", self.jobs["test"])
         for name in AUX_CACHE_JOBS:
@@ -164,7 +200,10 @@ class WorkflowConditionTests(unittest.TestCase):
 
     def test_provider_cause_fetches_before_offline_checks(self):
         self.assertEqual(self.commands("test-provider-cause", "pull_request"),
-                         ["cargo fetch --locked", "bash scripts/check-provider-cause-test-api.sh"])
+                         ["scripts/verify.sh provider-cause"])
+        result, commands = self.verify_commands("provider-cause")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, ["cargo fetch --locked", "check-provider-cause-test-api.sh"])
 
     def test_archive_consumers_install_the_build_rustc_release(self):
         build = self.jobs["test"]
@@ -198,18 +237,26 @@ class WorkflowConditionTests(unittest.TestCase):
         repo = WORKFLOW.parent.parent.parent
         source = (repo / "scripts/test-in-process-isolation.sh").read_text()
         program = source.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-        assignment = next(node for node in ast.parse(program).body
-                          if isinstance(node, ast.Assign)
-                          and any(isinstance(target, ast.Name) and target.id == "build_args"
-                                  for target in node.targets))
+        selection = next(node for node in ast.parse(program).body
+                         if isinstance(node, ast.If)
+                         and any(isinstance(child, ast.Assign)
+                                 and any(isinstance(target, ast.Name) and target.id == "build_args"
+                                         for target in child.targets)
+                                 for child in ast.walk(node)))
         # Inspect only argument selection. Never execute isolation, Cargo or
         # native test binaries from this workflow self-check.
-        expression = compile(ast.Expression(assignment.value), "isolation build_args", "eval")
-        local = eval(expression, {"sys": SimpleNamespace(argv=["isolation"])})
-        archived = eval(expression, {"sys": SimpleNamespace(argv=["isolation", "fixtures.tar.zst"])})
-        self.assertEqual(local, ["--workspace", "--all-features"])
-        self.assertEqual(archived, ["--archive-file", "fixtures.tar.zst", "--workspace-remap", ".",
-                                    "--extract-to", ".", "--extract-overwrite"])
+        selection_code = compile(ast.Module(body=[selection], type_ignores=[]), "isolation build_args", "exec")
+        for args, expected in [
+            (["--build", "--workspace", "--all-features"], ["--workspace", "--all-features"]),
+            (["fixtures.tar.zst"], ["--archive-file", "fixtures.tar.zst", "--workspace-remap", ".",
+                                    "--extract-to", ".", "--extract-overwrite"]),
+        ]:
+            namespace = {"sys": SimpleNamespace(argv=["isolation", *args])}
+            exec(selection_code, namespace)
+            self.assertEqual(namespace["build_args"], expected)
+        result, commands = self.verify_commands("--local", "isolation", scope="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, ["base", "test-in-process-isolation.sh --build --workspace --all-features"])
 
     def test_archive_and_fixtures_are_used_by_every_consumer(self):
         self.assertIn("partition: [1, 2, 3, 4, 5, 6]", self.jobs["test-partition"])
@@ -223,8 +270,129 @@ class WorkflowConditionTests(unittest.TestCase):
             self.assertEqual(self.commands(job, "pull_request")[0], "bash scripts/require-wasm-fixtures.sh")
             self.assertNotIn("cargo build", block)
         command = self.commands("test-partition", "pull_request")[1]
-        self.assertEqual(command, "cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite --partition count:${{ matrix.partition }}/6 --no-fail-fast")
-        self.assertEqual(self.commands("test-isolation", "pull_request")[1], "scripts/test-in-process-isolation.sh nextest-archive.tar.zst")
+        self.assertEqual(command, "scripts/verify.sh nextest-partition nextest-archive.tar.zst ${{ matrix.partition }}/6")
+        self.assertEqual(self.commands("test-isolation", "pull_request")[1], "scripts/verify.sh isolation nextest-archive.tar.zst")
+        result, commands = self.verify_commands("nextest-archive", "fixtures.tar.zst",
+                                               "nextest-partition", "fixtures.tar.zst", "2/6",
+                                               "isolation", "fixtures.tar.zst", "nextest")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, [
+            "cargo nextest archive --workspace --all-features --archive-file fixtures.tar.zst --zstd-level 1",
+            "cargo nextest run --archive-file fixtures.tar.zst --workspace-remap . --extract-to . --extract-overwrite --partition count:2/6 --no-fail-fast",
+            "test-in-process-isolation.sh fixtures.tar.zst",
+            "cargo nextest run --workspace --all-features --no-fail-fast",
+        ])
+
+    def test_local_only_changes_crate_scope_and_preserves_failures(self):
+        for scope, cargo_scope in [("-p carina-lsp -p carina-cli", "-p carina-lsp -p carina-cli"),
+                                   ("--workspace", "--workspace")]:
+            result, commands = self.verify_commands("--local", "--base", "main", "check", "feature-isolation",
+                                                   "clippy", "nextest", "doctests", scope=scope)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(commands, [
+                "base --base main",
+                f"cargo check {cargo_scope} --all-targets --all-features",
+                f"cargo hack check {cargo_scope} --each-feature --no-dev-deps",
+                f"cargo clippy {cargo_scope} --all-targets --all-features -- -D warnings",
+                f"cargo nextest run {cargo_scope} --all-features --no-fail-fast",
+                f"cargo test {cargo_scope} --doc --all-features",
+            ])
+        result, commands = self.verify_commands("--local", "check", "feature-isolation", "clippy",
+                                               "nextest", "doctests", "fmt", scope="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, ["base", "cargo fmt --all -- --check"])
+        self.assertEqual(result.stdout.count("skipped: no touched crates"), 5)
+        result, commands = self.verify_commands("check", "fmt", "clippy", fail="check")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(len(commands), 3, commands)
+        self.assertIn("check (exit 1)", result.stdout)
+        self.assertIn("=== total:", result.stdout)
+
+    def test_default_local_and_ci_runs_have_identical_check_kinds(self):
+        ci, ci_commands = self.verify_commands()
+        local, local_commands = self.verify_commands("--local", scope="-p carina-cli")
+        self.assertEqual(ci.returncode, 0, ci.stdout + ci.stderr)
+        self.assertEqual(local.returncode, 0, local.stdout + local.stderr)
+        self.assertEqual(local_commands[0], "base")
+        self.assertEqual(local_commands[1:], [
+            command.replace("--workspace", "-p carina-cli") if command.startswith("cargo ") else command
+            for command in ci_commands
+        ])
+        ci_kinds = re.findall(r"^=== ([a-z-]+) ===$", ci.stdout, re.MULTILINE)
+        local_kinds = re.findall(r"^=== ([a-z-]+) ===$", local.stdout, re.MULTILINE)
+        self.assertEqual(ci_kinds, local_kinds)
+        self.assertIn("nextest", ci_kinds)
+        self.assertNotIn("nextest-archive", ci_kinds)
+
+    def test_verify_guard_rejects_synthetic_workflow_and_script_drift(self):
+        repo = WORKFLOW.parent.parent.parent
+        guard = repo / "scripts/test-verify-sh.sh"
+        with tempfile.TemporaryDirectory(prefix="carina-verify-drift-") as temporary:
+            root = Path(temporary)
+            workflow = root / ".github/workflows/ci.yml"
+            workflow.parent.mkdir(parents=True)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            shutil.copyfile(repo / "scripts/verify.sh", scripts / "verify.sh")
+            for script in (repo / "scripts").glob("*.sh"):
+                if script.name != "verify.sh":
+                    (scripts / script.name).touch()
+
+            def audit(source):
+                workflow.write_text(source)
+                return subprocess.run(["bash", str(guard), str(root)], capture_output=True, text=True)
+
+            original = WORKFLOW.read_text()
+            self.assertEqual(audit(original).returncode, 0)
+            for command in (
+                "cargo check --all-features",
+                "bash scripts/check-plan-fixtures.sh",
+                "bash scripts/test-check-docs-spellings.sh",
+                "|\n          scripts/verify.sh check\n          env CARGO_BUILD_JOBS=2 cargo check",
+                ">-\n          cargo\n          nextest run --workspace",
+            ):
+                with self.subTest(command=command):
+                    result = audit(original.replace("run: scripts/verify.sh check\n", f"run: {command}\n", 1))
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn("bypasses verify.sh", result.stderr)
+            for filename in ("check-synthetic.sh", "test-check-synthetic.sh"):
+                with self.subTest(filename=filename):
+                    added = scripts / filename
+                    added.touch()
+                    result = audit(original)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(f"{filename} is not run by verify.sh", result.stderr)
+                    added.unlink()
+
+    def test_touched_crates_includes_uncommitted_changes(self):
+        helper = WORKFLOW.parent.parent.parent / "scripts/touched-crates.sh"
+        with tempfile.TemporaryDirectory(prefix="carina-touched-crates-") as temporary:
+            root = Path(temporary)
+
+            def git(*args):
+                subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
+            git("init", "--quiet")
+            tracked = root / "carina-cli/src/lib.rs"
+            tracked.parent.mkdir(parents=True)
+            tracked.write_text("// initial\n")
+            git("add", ".")
+            git("-c", "user.name=Verify Test", "-c", "user.email=verify@example.invalid",
+                "commit", "--quiet", "-m", "Fixture baseline")
+
+            def scope():
+                return subprocess.check_output(["bash", str(helper), "--base", "HEAD"],
+                                               cwd=root, text=True).strip()
+
+            self.assertEqual(scope(), "")
+            tracked.write_text("// unstaged\n")
+            self.assertEqual(scope(), "-p carina-cli")
+            git("add", ".")
+            self.assertEqual(scope(), "-p carina-cli")
+            untracked = root / "carina-core/src/untracked.rs"
+            untracked.parent.mkdir(parents=True)
+            untracked.touch()
+            self.assertEqual(scope(), "--workspace")
 
     def test_only_the_aggregate_is_named_test(self):
         self.assertEqual({job for job, block in self.jobs.items() if field(block, "name") == "Test"}, {"test-result"})

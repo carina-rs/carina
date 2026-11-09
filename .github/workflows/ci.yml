@@ -64,7 +64,7 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/rust-cache
-      - run: cargo check --all-targets --all-features
+      - run: scripts/verify.sh check
 
   feature-isolation:
     name: Feature Isolation
@@ -78,7 +78,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/rust-cache
       - uses: taiki-e/install-action@cargo-hack
-      - run: cargo hack check --workspace --each-feature --no-dev-deps
+      - run: scripts/verify.sh feature-isolation
 
   fmt:
     name: Format
@@ -90,7 +90,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - run: scripts/verify.sh fmt
 
   clippy:
     name: Clippy
@@ -105,7 +105,7 @@ jobs:
         with:
           components: clippy
       - uses: ./.github/actions/rust-cache
-      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: scripts/verify.sh clippy
 
   provider-boundaries:
     name: Provider Boundary Check
@@ -113,8 +113,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/check-provider-boundaries.sh
-      - run: bash scripts/check-wit-guest-text-confinement.sh
+      - run: scripts/verify.sh provider-boundaries
 
   error-source-display:
     name: Error Source Display Check
@@ -122,8 +121,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/check-error-source-not-in-display.sh
-      - run: bash scripts/test-check-error-source-not-in-display.sh
+      - run: scripts/verify.sh error-source-display
 
   no-wall-clock-test-assertions:
     name: Check Wall Clock Test Assertions
@@ -131,8 +129,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/test-check-no-wall-clock-test-assertions.sh
-      - run: bash scripts/check-no-wall-clock-test-assertions.sh
+      - run: scripts/verify.sh no-wall-clock-test-assertions
 
   docs-spellings:
     name: Docs Spelling Check
@@ -140,8 +137,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/test-check-docs-spellings.sh
-      - run: bash scripts/check-docs-use-new-spellings.sh
+      - run: scripts/verify.sh docs-spellings
 
   check-resources-access:
     name: Check Direct parsed.resources Access
@@ -149,7 +145,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/check-no-direct-resources-access.sh
+      - run: scripts/verify.sh resources-access
 
   check-cli-hints:
     name: Check CLI Project Hint Rendering
@@ -157,7 +153,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/check-cli-hints-use-project-command.sh
+      - run: scripts/verify.sh cli-hints
 
   check-no-home-env-reads:
     name: Check Home Environment Reads
@@ -165,7 +161,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/check-no-home-env-reads.sh
+      - run: scripts/verify.sh no-home-env-reads
 
   check-crates-not-publishable:
     name: Check Crates Not Publishable
@@ -173,7 +169,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/check-crates-not-publishable.sh
+      - run: scripts/verify.sh crates-not-publishable
 
   check-wit-bindgen-workspace:
     name: Check wit-bindgen Workspace Dependency
@@ -182,11 +178,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: bash scripts/check-wit-bindgen-workspace.sh
-      - run: bash scripts/check-provider-sdk-bindings.sh
-      - run: bash scripts/test-check-provider-sdk-bindings.sh
-      - run: bash scripts/check-test-utils-dev-only.sh
-      - run: bash scripts/test-check-test-utils-dev-only.sh
+      - run: scripts/verify.sh wit-bindgen-workspace
 
   check-plan-fixtures:
     name: Check Plan Fixtures
@@ -194,7 +186,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/check-plan-fixtures.sh
+      - run: scripts/verify.sh plan-fixtures
 
   check-rust-cache-via-local-action:
     name: Check Rust Cache Usage
@@ -202,9 +194,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/check-rust-cache-via-local-action.sh
-      - run: bash scripts/test-classify-ci-diff.sh
-      - run: bash scripts/test-rust-cache-key.sh
+      - run: scripts/verify.sh rust-cache
 
   check-vendored-patches-used:
     name: Check Vendored Patches Used
@@ -215,7 +205,7 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - run: bash scripts/check-vendored-patches-used.sh
+      - run: scripts/verify.sh vendored-patches
 
   check-examples:
     name: Check Example Files
@@ -239,7 +229,7 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/rust-cache
-      - run: bash scripts/validate-crn-files.sh
+      - run: scripts/verify.sh validate-crn
 
   check-example-warnings:
     name: Check Example Warnings
@@ -252,7 +242,7 @@ jobs:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/rust-cache
-      - run: bash scripts/check-example-warnings.sh
+      - run: scripts/verify.sh example-warnings
 
   test:
     # Keep the main cache writer's job id and existing cache key. Auxiliary
@@ -277,19 +267,15 @@ jobs:
         timeout-minutes: 3
         with:
           version: ${{ env.NEXTEST_VERSION }}
-      - run: >-
-          cargo build
-          -p carina-provider-mock
-          -p carina-provider-mock-http
-          --target wasm32-wasip2
+      - run: scripts/verify.sh wasm-fixtures
       - name: Compile workspace tests for the main cache
         if: github.event_name == 'push'
-        run: cargo nextest run --workspace --all-features --no-run
+        run: scripts/verify.sh nextest-compile
       - name: Archive workspace tests
         if: github.event_name != 'push'
         # Level 1 favors packing speed without the large ratio loss of fast
         # negative levels; the artifact is already compressed before upload.
-        run: cargo nextest archive --workspace --all-features --archive-file nextest-archive.tar.zst --zstd-level 1
+        run: scripts/verify.sh nextest-archive nextest-archive.tar.zst
       - uses: actions/upload-artifact@v4
         if: github.event_name != 'push'
         with:
@@ -341,10 +327,7 @@ jobs:
       # Each fresh runner unpacks once. Overwrite permits target/ created by
       # the fixture download. The checkout location preserves Cargo's
       # compile-time binary paths; a temporary extraction would break them.
-      - run: >-
-          cargo nextest run --archive-file nextest-archive.tar.zst
-          --workspace-remap . --extract-to . --extract-overwrite
-          --partition count:${{ matrix.partition }}/6 --no-fail-fast
+      - run: scripts/verify.sh nextest-partition nextest-archive.tar.zst ${{ matrix.partition }}/6
 
   test-isolation:
     name: In-process isolation
@@ -370,7 +353,7 @@ jobs:
           name: wasm-fixtures
           path: target/wasm32-wasip2/debug
       - run: bash scripts/require-wasm-fixtures.sh
-      - run: scripts/test-in-process-isolation.sh nextest-archive.tar.zst
+      - run: scripts/verify.sh isolation nextest-archive.tar.zst
 
   test-provider-cause:
     name: Provider cause API
@@ -389,8 +372,7 @@ jobs:
           cache-job: test
       # The downstream compile-fail script is deliberately offline. Populate
       # every workspace registry dependency independently of cache contents.
-      - run: cargo fetch --locked
-      - run: bash scripts/check-provider-cause-test-api.sh
+      - run: scripts/verify.sh provider-cause
 
   test-doctests:
     name: Doctests
@@ -406,7 +388,7 @@ jobs:
         with:
           cache-job: test
       # nextest archives do not contain doctests.
-      - run: cargo test --workspace --doc --all-features
+      - run: scripts/verify.sh doctests
 
   test-result:
     name: Test

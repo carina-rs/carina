@@ -5,8 +5,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# With an archive, discover and extract already-built test executables. The
-# no-argument form remains useful for standalone local verification.
+# Standalone discovery uses verify's shared feature selection as well.
+if [[ $# -eq 0 ]]; then
+    exec bash scripts/verify.sh isolation
+fi
+
+# With an archive, discover and extract already-built test executables.
+# --build is internal to verify.sh and supplies the shared compilation flags.
 python3 - "$@" <<'PY'
 import json
 import os
@@ -38,15 +43,13 @@ def run(args, fail_fast=True, **kwargs):
         raise SystemExit(child.returncode)
     return stdout if fail_fast else child.returncode
 
-if len(sys.argv) > 2:
+if len(sys.argv) > 2 and sys.argv[1] == "--build":
+    build_args = sys.argv[2:]
+elif len(sys.argv) == 2:
+    build_args = ["--archive-file", sys.argv[1], "--workspace-remap", ".",
+                  "--extract-to", ".", "--extract-overwrite"]
+else:
     raise SystemExit("usage: test-in-process-isolation.sh [nextest-archive.tar.zst]")
-build_args = (
-    ["--archive-file", sys.argv[1], "--workspace-remap", ".",
-     "--extract-to", ".", "--extract-overwrite"]
-    # Match CI's archive feature unification before selecting the same three
-    # suites below. Package-scoped builds can produce different executables.
-    if len(sys.argv) == 2 else ["--workspace", "--all-features"]
-)
 listing = run([
     os.environ.get("CARGO", "cargo"), "nextest", "list",
     *build_args,
