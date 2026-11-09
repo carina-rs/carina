@@ -11,6 +11,19 @@ pub(super) enum Membership {
     Possible,
 }
 
+#[derive(Clone, Copy)]
+enum Omissions {
+    Absent,
+    Withheld,
+}
+
+pub(super) enum FieldEvidence<'s> {
+    Member(InputEvidence<'s>),
+    Absent,
+    Withheld,
+    Pending,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct MapMember {
     pub key: String,
@@ -33,10 +46,12 @@ pub(super) struct InputEvidence<'s> {
     value: EvidenceValue<'s>,
     scope: DiagnosticScope,
     enclosing_failure: bool,
+    omissions: Omissions,
 }
 
 pub(super) struct SiteEvidence<'s> {
     attributes: Option<HashMap<String, InputEvidence<'s>>>,
+    update: Option<&'s UpdateInputContext>,
 }
 
 #[derive(Clone)]
@@ -55,10 +70,16 @@ impl<'s> SiteEvidence<'s> {
             )
             .into_iter()
             .map(|(key, proof)| {
-                (
-                    key,
-                    InputEvidence::from_ref(ClassifiedRef::from(&proof), DiagnosticScope::Public),
-                )
+                let mut value =
+                    InputEvidence::from_ref(ClassifiedRef::from(&proof), DiagnosticScope::Public);
+                if site
+                    .update
+                    .as_ref()
+                    .is_some_and(|update| !update.changed.contains(&key))
+                {
+                    value.omissions = Omissions::Withheld;
+                }
+                (key, value)
             })
             .collect()
         });
@@ -88,13 +109,38 @@ impl<'s> SiteEvidence<'s> {
                     },
                     scope,
                     enclosing_failure,
+                    omissions: if site
+                        .update
+                        .as_ref()
+                        .is_some_and(|update| !update.changed.contains("tags"))
+                    {
+                        Omissions::Withheld
+                    } else {
+                        Omissions::Absent
+                    },
                 },
             );
         }
-        Self { attributes }
+        Self {
+            attributes,
+            update: site.update.as_ref(),
+        }
     }
-    pub(super) fn field(&self, name: &str) -> Option<InputEvidence<'s>> {
-        self.attributes.as_ref()?.get(name).cloned()
+    pub(super) fn field(&self, name: &str) -> FieldEvidence<'s> {
+        let Some(attributes) = &self.attributes else {
+            return FieldEvidence::Pending;
+        };
+        if let Some(value) = attributes.get(name) {
+            return FieldEvidence::Member(value.clone());
+        }
+        if self
+            .update
+            .is_some_and(|update| !update.removed.contains(name))
+        {
+            FieldEvidence::Withheld
+        } else {
+            FieldEvidence::Absent
+        }
     }
     pub(super) fn membership_known(&self) -> bool {
         self.attributes.is_some()
@@ -111,6 +157,7 @@ impl<'s> InputEvidence<'s> {
             value: EvidenceValue::Classified(proof),
             scope: if scope.is_secret() { scope } else { protection },
             enclosing_failure: false,
+            omissions: Omissions::Absent,
         }
     }
     fn child(
@@ -119,6 +166,7 @@ impl<'s> InputEvidence<'s> {
     ) -> Self {
         let mut child = Self::from_ref(proof, self.scope);
         child.enclosing_failure = self.computation_failed();
+        child.omissions = self.omissions;
         child
     }
     pub(super) fn unselected(&self) -> Self {
@@ -126,6 +174,15 @@ impl<'s> InputEvidence<'s> {
             value: EvidenceValue::Unselected,
             scope: self.scope,
             enclosing_failure: self.failed(),
+            omissions: Omissions::Withheld,
+        }
+    }
+    pub(super) fn unknown() -> Self {
+        Self {
+            value: EvidenceValue::Unselected,
+            scope: DiagnosticScope::Public,
+            enclosing_failure: false,
+            omissions: Omissions::Withheld,
         }
     }
     pub(super) fn source(&self) -> Option<&'s InputValue> {
@@ -185,10 +242,20 @@ impl<'s> InputEvidence<'s> {
     pub(super) fn list_len(&self) -> Option<usize> {
         ClassifiedRef::from(self.proof()?).list_len()
     }
-    pub(super) fn field(&self, name: &str) -> Option<Self> {
-        ClassifiedRef::from(self.proof()?)
-            .map_field(name)
-            .map(|child| self.child(child))
+    pub(super) fn field(&self, name: &str) -> FieldEvidence<'s> {
+        let Some(proof) = self.proof() else {
+            return FieldEvidence::Pending;
+        };
+        if let Some(child) = ClassifiedRef::from(proof).map_field(name) {
+            return FieldEvidence::Member(self.child(child));
+        }
+        if !self.map_known() {
+            return FieldEvidence::Pending;
+        }
+        match self.omissions {
+            Omissions::Absent => FieldEvidence::Absent,
+            Omissions::Withheld => FieldEvidence::Withheld,
+        }
     }
     pub(super) fn index(&self, index: usize) -> Option<Self> {
         ClassifiedRef::from(self.proof()?)

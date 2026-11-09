@@ -38,6 +38,9 @@ fn create_only_verdict_yields_authored_warning_and_create_error() {
             .unwrap()
             .unwrap();
     let authored_rule = authored.applicable_rules().next().unwrap();
+    let InputRuleBinding::Instance(authored_rule) = authored_rule.binding else {
+        panic!("concrete resource rule");
+    };
     assert_eq!(authored_rule.kind, InputFindingKind::CreateOnlyPreview);
     let authored_verdict = authored_rule.evaluate();
     let InputVerdict::Violation(violation) = authored_verdict.clone() else {
@@ -62,6 +65,9 @@ fn create_only_verdict_yields_authored_warning_and_create_error() {
         .unwrap()
         .unwrap();
     let create_rule = site.applicable_rules().next().unwrap();
+    let InputRuleBinding::Instance(create_rule) = create_rule.binding else {
+        panic!("concrete resource rule");
+    };
     assert_eq!(create_rule.kind, InputFindingKind::Violation);
     let create_verdict = create_rule.evaluate();
     assert_eq!(create_verdict, authored_verdict);

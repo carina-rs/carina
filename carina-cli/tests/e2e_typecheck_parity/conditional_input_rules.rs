@@ -7,6 +7,65 @@ use carina_core::schema::{
 };
 
 #[test]
+fn renamed_blocks_have_multifile_cli_lsp_conditional_rule_parity() {
+    let schema = ResourceSchema::new("test.Conditional").attribute(
+        AttributeSchema::optional(
+            "entries",
+            AttributeType::list(AttributeType::struct_with_rules(
+                "Entry",
+                vec![
+                    StructField::optional("guard", AttributeType::bool()).build(),
+                    StructField::optional("target", AttributeType::string()).build(),
+                ],
+                vec![],
+                vec![
+                    InputRule::value(
+                        InputRuleScope::EveryWrite,
+                        InputPath::new("target").unwrap(),
+                        InputRuleCode::new("test.entry_target").unwrap(),
+                        InputPredicate::Present,
+                    )
+                    .with_condition(InputCondition::Equals {
+                        path: InputPath::new("guard").unwrap(),
+                        literal: InputLiteral::Bool(true),
+                    }),
+                ],
+            )),
+        )
+        .with_block_name("entry")
+        .build(),
+    );
+    let fixture = write_fixture(&[
+        (
+            "main.crn",
+            "let example = test.test.Conditional {\n  entry {\n    guard = trigger\n  }\n}\n",
+        ),
+        ("providers.crn", "provider test {}\nlet trigger = true\n"),
+    ]);
+    let schemas = single_schema_map(schema);
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    let cli_findings = cli
+        .iter()
+        .flat_map(|message| message.lines())
+        .filter(|message| message.contains("[test.entry_target]"))
+        .collect::<Vec<_>>();
+    assert_eq!(cli_findings.len(), 1, "{cli:#?}");
+    let lsp_findings = lsp
+        .iter()
+        .filter(|d| d.message.contains("[test.entry_target]"))
+        .collect::<Vec<_>>();
+    assert_eq!(lsp_findings.len(), 1, "{lsp:#?}");
+    assert_eq!(cli_findings[0], lsp_findings[0].message);
+    assert!(lsp_findings[0].message.contains("entries[0].target"));
+    assert_eq!(lsp_findings[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        lsp_findings[0].range.start.line, 1,
+        "anchor at the authored entry block"
+    );
+}
+
+#[test]
 fn create_only_s3_rules_have_multifile_cli_lsp_warning_and_pending_parity() {
     let identity =
         carina_core::schema::TypeIdentity::new(Some("test"), ["s3", "Bucket"], "Namespace");

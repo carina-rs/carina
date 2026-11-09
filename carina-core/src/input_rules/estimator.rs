@@ -759,7 +759,7 @@ impl Estimator<'_> {
 
 /// Every owner enters through its bound, admitted rule and concrete instance.
 pub(super) fn estimate(
-    applicable: &ApplicableInputRule<'_, '_>,
+    applicable: &BoundInputRule<'_, '_>,
     value: Option<&InputValue>,
 ) -> InputVerdict {
     let site = applicable.site;

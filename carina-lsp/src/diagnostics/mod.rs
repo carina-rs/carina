@@ -1296,12 +1296,9 @@ impl DiagnosticRun<'_> {
                         else {
                             continue;
                         };
-                        let path = finding.violation().path();
-                        let attribute = path.root();
-                        let location = if resource.attribute_keys().iter().any(|key| matches!(key.path().first(), Some(carina_core::parser::AttributePathSegment::Attribute(name)) if name == attribute)) {
-                            if path.relative().is_empty() { resource.attribute_key_location(attribute) }
-                            else { resource.attribute_value_location(attribute, path.relative()) }
-                        } else { resource.type_location() };
+                        let location = finding
+                            .authored_location()
+                            .unwrap_or_else(|| resource.type_location());
                         diagnostics.extend(render_merged(
                             doc,
                             &carina_core::parser::Located::new(location.clone(), ()),

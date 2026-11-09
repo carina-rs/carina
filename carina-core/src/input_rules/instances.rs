@@ -1,7 +1,6 @@
 //! Bind admitted declarations to existing object instances. No predicates are
 //! evaluated here; every instance goes through ApplicableInputRule::evaluate.
 use super::*;
-use crate::resource::knowledge::Classification;
 use crate::resource::{DiagnosticScope, ValueString};
 use crate::schema::AttrTypeKind;
 
@@ -47,31 +46,43 @@ pub(super) fn diagnostic_path(owner: &[Step], path: &InputPath) -> InputDiagnost
     let Some(Step::Field(root)) = steps.next() else {
         unreachable!("instance starts at a resource attribute");
     };
-    let relative = steps.fold(crate::schema::FieldPath::new(), |path, step| match step {
-        Step::Field(name) => path.push_field(name),
-        Step::Index(index) => path.push_index(index),
-        Step::Key(key) => path.push_map_key(key.diagnostic_literal().unwrap_or("<secret>")),
-    });
+    let relative =
+        crate::schema::FieldPath::from_canonical_segments(steps.map(|step| match step {
+            Step::Field(name) => crate::schema::LeafPathSegment::StructField(name),
+            Step::Index(index) => crate::schema::LeafPathSegment::ListIndex(index),
+            Step::Key(key) => crate::schema::LeafPathSegment::MapKey(ValueString::plain(
+                key.diagnostic_literal().unwrap_or("<secret>"),
+            )),
+        }));
     InputDiagnosticPath::new(rendered, root, relative)
 }
 
-/// Comparison identity stays typed and protected, independently of rendering.
-pub(super) fn canonical_path(owner: &[Step], path: &InputPath) -> crate::schema::LeafPath {
-    use crate::schema::{LeafPath, LeafPathSegment};
-    LeafPath::from_segments(
-        owner
-            .iter()
-            .map(|step| match step {
-                Step::Field(name) => LeafPathSegment::StructField(name.clone()),
-                Step::Index(index) => LeafPathSegment::ListIndex(*index),
-                Step::Key(key) => LeafPathSegment::MapKey(key.clone()),
-            })
-            .chain(
-                path.segments()
-                    .map(|name| LeafPathSegment::StructField(name.to_owned())),
-            )
-            .skip(1),
-    )
+/// Compare the bound instance address directly; guard/target lookups never
+/// reconstruct diagnostic paths or clone protected map keys.
+pub(super) fn is_ignored(
+    owner: &[Step],
+    target: &InputDiagnosticPath,
+    path: &InputPath,
+    ignored: &crate::resource::ResolvedIgnoreChanges,
+) -> bool {
+    use crate::schema::LeafPathSegment;
+    let resource_owned = owner.is_empty();
+    let root = if resource_owned {
+        path.root()
+    } else {
+        target.root()
+    };
+    ignored.for_attribute(root).any(|ignored| {
+        let mut owner = owner.iter().skip(1);
+        let mut fields = path.segments();
+        if resource_owned { fields.next(); }
+        ignored.leaf().segments().iter().all(|segment| match owner.next() {
+            Some(Step::Field(name)) => matches!(segment, LeafPathSegment::StructField(other) if name == other),
+            Some(Step::Index(index)) => matches!(segment, LeafPathSegment::ListIndex(other) if index == other),
+            Some(Step::Key(key)) => matches!(segment, LeafPathSegment::MapKey(other) if key == other),
+            None => matches!((fields.next(), segment), (Some(name), LeafPathSegment::StructField(other)) if name == other),
+        })
+    })
 }
 
 fn active(site: &WriteSite<'_>, owner: &[Step], rule: &InputRule<Compiled>) -> bool {
@@ -110,12 +121,12 @@ fn bind<'s, 'a>(
     owner: &[Step],
     pending_instance: bool,
     evidence: RuleEvidence<'s>,
-) -> Option<ApplicableInputRule<'s, 'a>> {
+) -> Option<BoundInputRule<'s, 'a>> {
     let kind = scope_classification(rule.scope(), site.context)?;
     if !active(site, owner, rule) {
         return None;
     }
-    Some(ApplicableInputRule {
+    Some(BoundInputRule {
         site,
         rule,
         kind,
@@ -132,25 +143,31 @@ pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRu
     let mut fits = super::union_fits::UnionFits::default();
     let evidence = Arc::new(SiteEvidence::new(site));
     for &rule in &site.rules {
-        instances.extend(bind(
-            site,
-            rule,
-            None,
-            &[],
-            false,
-            RuleEvidence::Resource(Arc::clone(&evidence)),
-        ));
+        instances.extend(
+            bind(
+                site,
+                rule,
+                None,
+                &[],
+                false,
+                RuleEvidence::Resource(Arc::clone(&evidence)),
+            )
+            .map(ApplicableInputRule::instance),
+        );
     }
     for (name, attribute) in &site.schema.as_schema().attributes {
         if attribute.input_mode.is_provider_populated() {
             continue;
         }
-        let value = evidence.field(name);
-        // Omitted objects have no instances. A deferred whole resource has
-        // unknown membership, so its nested declarations retain obligations.
-        if value.is_none() && evidence.membership_known() {
-            continue;
-        }
+        let value = match evidence.field(name) {
+            evidence::FieldEvidence::Member(value) => Some(value),
+            evidence::FieldEvidence::Absent => continue,
+            evidence::FieldEvidence::Withheld | evidence::FieldEvidence::Pending => {
+                Some(InputEvidence::unknown())
+            }
+        };
+        // Only proven omissions have no instances. Missing update evidence
+        // and deferred resources retain a subtree obligation.
         let mut owner = vec![Step::Field(name.clone())];
         walk(
             site,
@@ -163,7 +180,7 @@ pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRu
             &mut fits,
         );
     }
-    instances.sort_by(|a, b| (&a.path, a.rule.code()).cmp(&(&b.path, b.rule.code())));
+    instances.sort_by(|a, b| (a.path(), a.code()).cmp(&(b.path(), b.code())));
     instances
 }
 
@@ -191,7 +208,21 @@ fn walk<'s, 'a>(
     } else {
         scope
     };
-    let pending = !value.is_some_and(InputEvidence::shape_known);
+    let unresolved_union =
+        matches!(ty.kind(), AttrTypeKind::Union(_)) && !value.is_some_and(InputEvidence::known);
+    if !value.is_some_and(InputEvidence::shape_known) || unresolved_union {
+        let mut declarations = Vec::new();
+        collect_deferred(
+            site,
+            ty,
+            value,
+            owner,
+            &mut HashSet::new(),
+            &mut declarations,
+        );
+        out.extend(ApplicableInputRule::deferred(declarations));
+        return;
+    }
     match &ty.kind {
         AttrTypeKind::Ref(name) => {
             if !visited_refs.insert(name.clone()) {
@@ -217,31 +248,34 @@ fn walk<'s, 'a>(
             ..
         } => {
             for rule in input_rules {
-                out.extend(bind(
-                    site,
-                    rule,
-                    Some(ty),
-                    owner,
-                    pending,
-                    RuleEvidence::Instance(value.cloned()),
-                ));
+                out.extend(
+                    bind(
+                        site,
+                        rule,
+                        Some(ty),
+                        owner,
+                        false,
+                        RuleEvidence::Instance(value.cloned()),
+                    )
+                    .map(ApplicableInputRule::instance),
+                );
             }
             for field in declarations {
                 if field.parts().declared_input_mode.is_provider_populated() {
                     continue;
                 }
-                let child = value.and_then(|value| value.field(&field.name));
-                if child.is_none() && !pending {
-                    continue;
-                }
-                let consumes_value = child.is_some();
-                let unselected = value.filter(|_| pending).map(InputEvidence::unselected);
+                let (child, consumes_value) = match value.map(|value| value.field(&field.name)) {
+                    Some(evidence::FieldEvidence::Member(value)) => (Some(value), true),
+                    Some(evidence::FieldEvidence::Absent) => continue,
+                    Some(evidence::FieldEvidence::Withheld | evidence::FieldEvidence::Pending)
+                    | None => (value.map(InputEvidence::unselected), false),
+                };
                 owner.push(Step::Field(field.name.clone()));
                 let mut child_refs = HashSet::new();
                 walk(
                     site,
                     &field.field_type,
-                    child.as_ref().or(unselected.as_ref()),
+                    child.as_ref(),
                     owner,
                     if consumes_value {
                         &mut child_refs
@@ -272,18 +306,6 @@ fn walk<'s, 'a>(
                     );
                     owner.pop();
                 }
-            } else if pending {
-                let unselected = value.map(InputEvidence::unselected);
-                walk(
-                    site,
-                    element_type,
-                    unselected.as_ref(),
-                    owner,
-                    visited_refs,
-                    out,
-                    scope,
-                    fits,
-                );
             }
         }
         AttrTypeKind::Map {
@@ -308,58 +330,105 @@ fn walk<'s, 'a>(
                     );
                     owner.pop();
                 }
-            } else if pending {
-                let unselected = value.map(InputEvidence::unselected);
-                walk(
+            }
+        }
+        AttrTypeKind::Union(_) => {
+            let mut ref_path = visited_refs
+                .iter()
+                .filter_map(|name| defs.get_key_value(name).map(|(name, _)| name.as_str()))
+                .collect();
+            if let Some(member) =
+                value.and_then(|value| fits.select(ty, value, defs, &mut ref_path))
+            {
+                walk(site, member, value, owner, visited_refs, out, scope, fits);
+            }
+        }
+        AttrTypeKind::UnloadedSchemaType(_)
+        | AttrTypeKind::ResourceHandle { .. }
+        | AttrTypeKind::String { .. }
+        | AttrTypeKind::Reference { .. }
+        | AttrTypeKind::StringLiteralSet { .. }
+        | AttrTypeKind::Int { .. }
+        | AttrTypeKind::Float { .. }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Enum { .. } => {}
+    }
+}
+
+fn collect_deferred<'s, 'a>(
+    site: &'s WriteSite<'a>,
+    ty: &'a CompiledAttributeType,
+    value: Option<&InputEvidence<'s>>,
+    owner: &mut Vec<Step>,
+    visited: &mut HashSet<declarations::DeclarationNode>,
+    out: &mut Vec<BoundInputRule<'s, 'a>>,
+) {
+    if !site
+        .schema
+        .input_rule_declarations()
+        .reachable(ty, site.context)
+        || !visited.insert(declarations::DeclarationNode::of(ty))
+    {
+        return;
+    }
+    let defs = site.schema.as_schema().defs();
+    match ty.kind() {
+        AttrTypeKind::Ref(name) => {
+            if let Some(ty) = defs.get(name) {
+                collect_deferred(site, ty, value, owner, visited, out);
+            }
+        }
+        AttrTypeKind::Struct {
+            fields,
+            input_rules,
+            ..
+        } => {
+            for rule in input_rules {
+                out.extend(bind(
                     site,
-                    value_type,
+                    rule,
+                    Some(ty),
+                    owner,
+                    true,
+                    RuleEvidence::Instance(value.cloned()),
+                ));
+            }
+            let unselected = value.map(InputEvidence::unselected);
+            for field in fields {
+                if field.parts().declared_input_mode.is_provider_populated() {
+                    continue;
+                }
+                owner.push(Step::Field(field.name.clone()));
+                collect_deferred(
+                    site,
+                    &field.field_type,
                     unselected.as_ref(),
                     owner,
-                    visited_refs,
+                    visited,
                     out,
-                    scope,
-                    fits,
                 );
+                owner.pop();
             }
+        }
+        AttrTypeKind::List { element_type, .. } => {
+            let unselected = value.map(InputEvidence::unselected);
+            collect_deferred(site, element_type, unselected.as_ref(), owner, visited, out);
+        }
+        AttrTypeKind::Map {
+            value: element_type,
+            ..
+        } => {
+            let unselected = value.map(InputEvidence::unselected);
+            collect_deferred(site, element_type, unselected.as_ref(), owner, visited, out);
         }
         AttrTypeKind::Union(_) => {
             let crate::schema::RawShape::Union(members) = ty.raw_shape() else {
                 unreachable!("union declaration");
             };
-            match value.and_then(InputEvidence::proof) {
-                Some(Classification::Known(_)) => {
-                    let mut ref_path = visited_refs
-                        .iter()
-                        .filter_map(|name| defs.get_key_value(name).map(|(name, _)| name.as_str()))
-                        .collect();
-                    if let Some(member) =
-                        value.and_then(|value| fits.select(ty, value, defs, &mut ref_path))
-                    {
-                        walk(site, member, value, owner, visited_refs, out, scope, fits);
-                    }
-                }
-                // Branch membership remains unknown; an attempted failure
-                // enclosing those possible branches remains a failure.
-                Some(
-                    Classification::ShapeKnown(_)
-                    | Classification::Pending(_)
-                    | Classification::Failed(_),
-                )
-                | None => {
-                    let unselected = value.map(InputEvidence::unselected);
-                    for member in members {
-                        walk(
-                            site,
-                            member,
-                            unselected.as_ref(),
-                            owner,
-                            visited_refs,
-                            out,
-                            scope,
-                            fits,
-                        );
-                    }
-                }
+            let unselected = value.map(InputEvidence::unselected);
+            for member in members {
+                collect_deferred(site, member, unselected.as_ref(), owner, visited, out);
             }
         }
         AttrTypeKind::UnloadedSchemaType(_)

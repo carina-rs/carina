@@ -10,7 +10,7 @@ use super::provider_ready::{CheckInput, ProviderPreparationContext};
 use crate::{
     binding_index::SecretPreservingAttributes,
     effect::{DeletedInstanceKey, Effect, EffectGeneration},
-    input_rules::{InputVerdict, PendingInputObligation, executor_write_site},
+    input_rules::{PendingInputObligation, executor_write_site},
     provider::{
         AppliedIdentifier, CreateRequest, HostProvider, ProviderReadyResource, UpdateRequest,
     },
@@ -276,17 +276,14 @@ impl WriteCheck {
                 EffectFailureKind::message("input rule schema unavailable at dispatch")
             })?;
         for applicable in site.applicable_rules() {
-            match applicable.evaluate() {
-                InputVerdict::Proven => {}
-                InputVerdict::Violation(violation) => {
-                    return Err(EffectFailureKind::InputRule { violation });
-                }
-                InputVerdict::Undecided => {
-                    return Err(EffectFailureKind::UnresolvedInputRule {
-                        path: applicable.path().clone(),
-                        code: applicable.code().clone(),
-                    });
-                }
+            let evaluation = applicable.evaluation();
+            if let Some(finding) = evaluation.findings.into_iter().next() {
+                return Err(EffectFailureKind::InputRule {
+                    violation: finding.violation().clone(),
+                });
+            }
+            if let Some((path, code)) = evaluation.pending {
+                return Err(EffectFailureKind::UnresolvedInputRule { path, code });
             }
         }
         Ok(())

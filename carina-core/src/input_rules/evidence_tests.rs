@@ -74,6 +74,309 @@ fn assert_failed(verdict: &InputVerdict) {
 }
 
 #[test]
+fn unsent_nested_omissions_remain_withheld_at_plan_and_dispatch() {
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_(
+                        "Settings",
+                        vec![StructField::optional("enabled", AttributeType::bool()).build()],
+                    ),
+                )
+                .build(),
+            )
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .input_rule(rule(
+                "target",
+                InputPredicate::Equals(InputLiteral::String("allowed".into())),
+                InputCondition::Equals {
+                    path: path("settings.enabled"),
+                    literal: InputLiteral::Bool(true),
+                },
+            )),
+    );
+    let desired = Resource::with_provider("mock", "Review", "example", None)
+        .with_attribute("settings", object([]))
+        .with_attribute(
+            "target",
+            Value::Concrete(ConcreteValue::String("bad".into())),
+        );
+    let previous = crate::resource::State::existing(
+        desired.id.clone(),
+        crate::test_support::snapshot_attributes::<crate::resource::NoPlaceholder>(HashMap::from(
+            [
+                (
+                    "settings".into(),
+                    object([("enabled", Value::Concrete(ConcreteValue::Bool(true)))]),
+                ),
+                (
+                    "target".into(),
+                    Value::Concrete(ConcreteValue::String("allowed".into())),
+                ),
+            ],
+        )),
+    )
+    .with_identifier("existing");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(previous),
+        identifier: crate::provider::AppliedIdentifier::new("existing").unwrap(),
+        to: resolved_input_fixture(desired.clone(), &schemas),
+        changed_attributes: vec!["target".into()],
+    });
+    let finalized = FinalizedPlan::new(plan);
+    let current = HashMap::new();
+    let checked = finalized.check_inputs(&schemas, &current).unwrap();
+    assert_eq!(
+        checked.pending_rows(0).len(),
+        1,
+        "an unsent child omission cannot disable its guard"
+    );
+    let patch = crate::provider::UpdatePatch {
+        ops: vec![crate::provider::PatchOp::Replace {
+            key: "target".into(),
+            value: Value::Concrete(ConcreteValue::String("bad".into())),
+        }],
+    };
+    let mut site =
+        classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&desired), &schemas)
+            .unwrap()
+            .unwrap();
+    site.context = InputWriteContext::Update;
+    let mut update = UpdateInputContext {
+        desired: project_attributes(&desired.attributes),
+        changed: HashSet::new(),
+        removed: HashSet::new(),
+        ignored: Default::default(),
+    };
+    site.attributes = Some(Cow::Owned(update.overlay(&patch)));
+    site.update = Some(update);
+    assert_eq!(
+        site.applicable_rules().next().unwrap().evaluate(),
+        InputVerdict::Undecided,
+        "dispatch must use the same unsent-descendant boundary"
+    );
+    for op in [
+        crate::provider::PatchOp::Replace {
+            key: "settings".into(),
+            value: object([]),
+        },
+        crate::provider::PatchOp::Remove {
+            key: "settings".into(),
+        },
+    ] {
+        let patch = crate::provider::UpdatePatch {
+            ops: vec![
+                crate::provider::PatchOp::Replace {
+                    key: "target".into(),
+                    value: Value::Concrete(ConcreteValue::String("bad".into())),
+                },
+                op,
+            ],
+        };
+        let update = site.update.as_mut().unwrap();
+        site.attributes = Some(Cow::Owned(update.overlay(&patch)));
+        assert_eq!(
+            site.applicable_rules().next().unwrap().evaluate(),
+            InputVerdict::Proven,
+            "an exact patch omission or removal supplies absence evidence"
+        );
+    }
+}
+
+#[test]
+fn false_conditions_skip_pending_and_failed_struct_instances() {
+    let schemas = registry(
+        ResourceSchema::new("Review").attribute(
+            AttributeSchema::optional(
+                "settings",
+                AttributeType::struct_with_rules(
+                    "Settings",
+                    vec![StructField::optional("target", AttributeType::string()).build()],
+                    vec![],
+                    vec![rule(
+                        "target",
+                        InputPredicate::Present,
+                        InputCondition::Not(Box::new(InputCondition::Always)),
+                    )],
+                ),
+            )
+            .build(),
+        ),
+    );
+    for value in [pending(), failed_value()] {
+        assert_eq!(
+            evaluate(&schemas, [("settings", value)]),
+            vec![InputVerdict::Proven]
+        );
+    }
+}
+
+#[test]
+fn unknown_reused_definitions_produce_one_deferred_subtree_obligation() {
+    const DEPTH: usize = 12;
+    let mut schema = ResourceSchema::new("Review").with_def(
+        "Node12",
+        AttributeType::struct_with_rules(
+            "Leaf",
+            vec![StructField::optional("target", AttributeType::string()).build()],
+            vec![],
+            vec![rule(
+                "target",
+                InputPredicate::Present,
+                InputCondition::Always,
+            )],
+        ),
+    );
+    for depth in (0..DEPTH).rev() {
+        schema = schema.with_def(
+            format!("Node{depth}"),
+            AttributeType::struct_(
+                "Branch",
+                vec![
+                    StructField::optional(
+                        "left",
+                        AttributeType::ref_(format!("Node{}", depth + 1)),
+                    )
+                    .build(),
+                    StructField::optional(
+                        "right",
+                        AttributeType::ref_(format!("Node{}", depth + 1)),
+                    )
+                    .build(),
+                ],
+            ),
+        );
+    }
+    let schemas = registry(
+        schema
+            .clone()
+            .attribute(AttributeSchema::optional("root", AttributeType::ref_("Node0")).build()),
+    );
+    let verdicts = evaluate(&schemas, [("root", pending())]);
+    assert_eq!(
+        verdicts.len(),
+        1,
+        "unknown child membership must not expand the declaration DAG"
+    );
+    assert_eq!(verdicts[0], InputVerdict::Undecided);
+    let lists = registry(
+        schema.attribute(
+            AttributeSchema::optional("root", AttributeType::list(AttributeType::ref_("Node0")))
+                .build(),
+        ),
+    );
+    let verdicts = evaluate(
+        &lists,
+        [(
+            "root",
+            Value::Concrete(ConcreteValue::List(vec![pending(); 1_000])),
+        )],
+    );
+    assert_eq!(
+        verdicts.len(),
+        1_000,
+        "one obligation per existing unknown member"
+    );
+    assert!(verdicts.iter().all(|v| *v == InputVerdict::Undecided));
+    let mut branch = object([(
+        "target",
+        Value::Concrete(ConcreteValue::String("valid".into())),
+    )]);
+    for _ in 1..DEPTH {
+        branch = object([("left", branch)]);
+    }
+    assert_eq!(
+        evaluate(
+            &schemas,
+            [(
+                "root",
+                object([("left", branch.clone()), ("right", branch)])
+            )]
+        ),
+        vec![InputVerdict::Proven; 2],
+        "known membership instantiates each concrete descendant again"
+    );
+}
+
+#[test]
+fn recursive_rule_paths_have_quadratic_total_segment_work() {
+    fn work(depth: usize, update: bool) -> usize {
+        let schemas = registry(
+            ResourceSchema::new("Review")
+                .with_def(
+                    "Node",
+                    AttributeType::struct_with_rules(
+                        "Node",
+                        vec![
+                            StructField::optional("guard", AttributeType::bool()).build(),
+                            StructField::optional("target", AttributeType::string()).build(),
+                            StructField::optional("child", AttributeType::ref_("Node")).build(),
+                        ],
+                        vec![],
+                        vec![rule(
+                            "target",
+                            InputPredicate::Present,
+                            InputCondition::Present(path("guard")),
+                        )],
+                    ),
+                )
+                .attribute(AttributeSchema::optional("root", AttributeType::ref_("Node")).build()),
+        );
+        let mut value = object([
+            ("guard", Value::Concrete(ConcreteValue::Bool(true))),
+            (
+                "target",
+                Value::Concrete(ConcreteValue::String("valid".into())),
+            ),
+        ]);
+        for _ in 1..depth {
+            value = object([
+                ("guard", Value::Concrete(ConcreteValue::Bool(true))),
+                (
+                    "target",
+                    Value::Concrete(ConcreteValue::String("valid".into())),
+                ),
+                ("child", value),
+            ]);
+        }
+        let resource = Resource::with_provider("mock", "Review", "example", None)
+            .with_attribute("root", value);
+        let mut site =
+            classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+                .unwrap()
+                .unwrap();
+        if update {
+            site.context = InputWriteContext::Update;
+            site.update = Some(UpdateInputContext {
+                desired: project_attributes(&resource.attributes),
+                changed: HashSet::from(["root".into()]),
+                removed: HashSet::new(),
+                ignored: Default::default(),
+            });
+        }
+        let (_, segments) = crate::schema::with_field_path_work(|| {
+            let verdicts = site
+                .applicable_rules()
+                .map(|rule| rule.evaluate())
+                .collect::<Vec<_>>();
+            assert_eq!(verdicts, vec![InputVerdict::Proven; depth]);
+        });
+        segments
+    }
+    for update in [false, true] {
+        let small = work(16, update);
+        let large = work(32, update);
+        assert!(
+            large <= small * 5,
+            "update={update}: doubling depth cost {small} -> {large} path segments; expected at most quadratic work"
+        );
+    }
+}
+
+#[test]
 fn recursive_union_does_not_revisit_same_value() {
     let node = AttributeType::struct_with_rules(
         "NodeObject",
@@ -1625,4 +1928,85 @@ fn deep_rule_reachability_is_shared_with_a_linear_schema_visit_budget() {
             );
         }
     });
+}
+
+#[test]
+fn deferred_subtree_preserves_each_scope_specific_finding() {
+    let declaration = |scope, target, code| {
+        InputRule::value(
+            scope,
+            path(target),
+            InputRuleCode::new(code).unwrap(),
+            InputPredicate::Present,
+        )
+    };
+    let schemas = registry(
+        ResourceSchema::new("Review").attribute(
+            AttributeSchema::optional(
+                "settings",
+                AttributeType::struct_with_rules(
+                    "Settings",
+                    vec![
+                        StructField::optional("preview", AttributeType::string()).build(),
+                        StructField::optional("write", AttributeType::string()).build(),
+                    ],
+                    vec![],
+                    vec![
+                        declaration(InputRuleScope::CreateOnly, "preview", "review.preview"),
+                        declaration(InputRuleScope::EveryWrite, "write", "review.write"),
+                    ],
+                ),
+            )
+            .build(),
+        ),
+    );
+    for failed in [true, false] {
+        let mut file = crate::parser::parse_file(
+            "provider mock {}\nlet example = mock.Review { settings = {} }",
+            std::path::Path::new("main.crn"),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        for source in file.iter_all_resources_mut() {
+            if let crate::parser::ResourceMut::Resource(resource) = source {
+                resource.attributes.insert(
+                    "settings".into(),
+                    if failed {
+                        failed_value()
+                    } else {
+                        Value::Deferred(DeferredValue::Unknown(
+                            crate::resource::ApplyTimeUnknown::PendingReRead(
+                                crate::resource::PendingReRead::not_found(),
+                            ),
+                        ))
+                    },
+                );
+            }
+        }
+        let report = check_authored_inputs(&file, &schemas).unwrap();
+        if failed {
+            assert_eq!(
+                report.len(),
+                2,
+                "grouping must retain each independent rule verdict"
+            );
+            for severity in [InputFindingSeverity::Warning, InputFindingSeverity::Error] {
+                assert_eq!(
+                    report
+                        .iter()
+                        .filter(|finding| finding.severity() == severity)
+                        .count(),
+                    1
+                );
+            }
+            assert!(report.pending().is_empty());
+        } else {
+            assert!(report.is_empty());
+            assert_eq!(
+                report.pending().len(),
+                1,
+                "the unknown subtree has only one pending obligation"
+            );
+        }
+    }
 }

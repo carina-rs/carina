@@ -2409,10 +2409,47 @@ impl fmt::Display for FieldPathStep {
 /// a particular [`TypeError`]. Used by [`AttrTypeKind::validate_collect`]
 /// so the LSP can map errors back to source positions without
 /// re-running validation itself (#2214).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct FieldPath {
     steps: Vec<FieldPathStep>,
     canonical: Vec<LeafPathSegment>,
+}
+
+impl Clone for FieldPath {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        record_field_path_work(self.steps.len() + self.canonical.len());
+        Self {
+            steps: self.steps.clone(),
+            canonical: self.canonical.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! { static FIELD_PATH_WORK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+fn record_field_path_work(segments: usize) {
+    FIELD_PATH_WORK.with(|work| {
+        if let Some(count) = work.get() {
+            work.set(Some(count + segments));
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn with_field_path_work<R>(operation: impl FnOnce() -> R) -> (R, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FIELD_PATH_WORK.set(None);
+        }
+    }
+    FIELD_PATH_WORK.set(Some(0));
+    let _reset = Reset;
+    let result = operation();
+    (result, FIELD_PATH_WORK.get().unwrap())
 }
 impl PartialEq for FieldPath {
     fn eq(&self, other: &Self) -> bool {
@@ -2429,6 +2466,26 @@ impl FieldPath {
         }
     }
 
+    /// Build both diagnostic and canonical paths in one linear pass.
+    pub(crate) fn from_canonical_segments(
+        segments: impl IntoIterator<Item = LeafPathSegment>,
+    ) -> Self {
+        let canonical: Vec<_> = segments.into_iter().collect();
+        #[cfg(test)]
+        record_field_path_work(canonical.len() * 2);
+        let steps = canonical
+            .iter()
+            .map(|segment| match segment {
+                LeafPathSegment::StructField(name) => FieldPathStep::Field(name.clone()),
+                LeafPathSegment::ListIndex(index) => FieldPathStep::Index(*index),
+                LeafPathSegment::MapKey(key) => {
+                    FieldPathStep::Field(key.diagnostic_literal().unwrap_or("<secret>").to_owned())
+                }
+            })
+            .collect();
+        Self { steps, canonical }
+    }
+
     pub fn steps(&self) -> &[FieldPathStep] {
         &self.steps
     }
@@ -2442,6 +2499,8 @@ impl FieldPath {
     /// < 5).
     pub fn push_field(&self, name: impl Into<String>) -> Self {
         let mut next = self.clone();
+        #[cfg(test)]
+        record_field_path_work(2);
         let name = name.into();
         next.steps.push(FieldPathStep::Field(name.clone()));
         next.canonical.push(LeafPathSegment::StructField(name));
@@ -2451,6 +2510,8 @@ impl FieldPath {
     /// Append a list-index step and return a new path.
     pub fn push_index(&self, index: usize) -> Self {
         let mut next = self.clone();
+        #[cfg(test)]
+        record_field_path_work(2);
         next.steps.push(FieldPathStep::Index(index));
         next.canonical.push(LeafPathSegment::ListIndex(index));
         next
@@ -2463,6 +2524,8 @@ impl FieldPath {
     pub(crate) fn push_map_key(&self, key: impl Into<String>) -> Self {
         let key = key.into();
         let mut next = self.clone();
+        #[cfg(test)]
+        record_field_path_work(2);
         next.steps.push(FieldPathStep::Field(key.clone()));
         next.canonical.push(LeafPathSegment::MapKey(key.into()));
         next
@@ -12994,7 +13057,7 @@ pub(crate) fn find_resource_block_name_alias<S, P: PlaceholderKind, B: BindingAd
     )
 }
 
-fn resolve_block_names_detailed<S, P: PlaceholderKind, B: BindingAddress>(
+pub(crate) fn resolve_block_names_detailed<S, P: PlaceholderKind, B: BindingAddress>(
     resources: &mut [Resource<S, P, B>],
     registry: &SchemaRegistry,
 ) -> Vec<BlockNameConflict> {
