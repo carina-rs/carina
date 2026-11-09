@@ -9514,7 +9514,7 @@ where
                     return Err(missing());
                 }
                 resolved = Some(match resolved {
-                    Some(existing) => existing.conjoin(declaration)?,
+                    Some(existing) => existing.conjoin(declaration),
                     None => declaration.clone(),
                 });
                 continue;
@@ -9529,7 +9529,7 @@ where
                 .filter(|declaration| declaration.scalar_kind() == owned.scalar_kind())
                 .ok_or_else(missing)?;
                 resolved = Some(match resolved {
-                    Some(existing) => existing.conjoin(&declaration)?,
+                    Some(existing) => existing.conjoin(&declaration),
                     None => declaration,
                 });
             }
@@ -9693,9 +9693,7 @@ fn build_owner_custom_type_index(
                     for layer in layers {
                         // Float retains its within-owner range conjunction;
                         // String/Int identities already agree at admission.
-                        resolved = resolved
-                            .conjoin(&layer)
-                            .expect("admitted scalar kinds agree");
+                        resolved = resolved.conjoin(&layer);
                     }
                     Some((identity.clone(), resolved))
                 })

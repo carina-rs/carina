@@ -631,13 +631,16 @@ A struct type represents a nested object with typed fields.
   declarations and their fingerprints preserve both layers. Hover renders
   both layers; shared provider docgen must do the same. WIT stays 0.2.0.
   Schema fingerprints use v13 and saved plans use format 44; format 43 plans
-  must fail the version gate before decoding retained constraint evidence.
-  Every typed sink uses the same nominal scalar identity-admission rule for
+  must fail the version gate before decoding the payload. Saved module
+  `pending_constraints` contain `ValidateExpr` values, not retained types;
+  replay reloads refinement layers from fingerprint-checked provider schemas.
+  Every typed sink uses the same String/Int identity-admission rule for
   equal identities and allowed widenings (#4349), including annotations,
   exports, module arguments, and function parameters/returns. All destination
   kinds can retain the existing `NeedsLocal` resolved-value obligation; reject
-  only proven disjoint bounds. Unproven regex containment defers to the value
-  check. Collection/coalesce inference joins compatible nominal declarations
+  only proven disjoint String/Int bounds. Float sinks retain range containment,
+  including the effective identity/member range of an Int source. Unproven
+  regex containment defers to the value check. Collection/coalesce inference joins compatible nominal declarations
   through their canonical identity while retaining child evidence. Never use
   full declaration equality or display-name equality to reject identity-compatible
   flows; mismatch names expose differing constraints or scalar kinds.

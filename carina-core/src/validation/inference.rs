@@ -358,9 +358,12 @@ impl<'a> InferredTypeJoiner<'a> {
             let canonical = match self.canonical.entry(identity.clone()) {
                 std::collections::btree_map::Entry::Occupied(cached) => cached.get().clone(),
                 std::collections::btree_map::Entry::Vacant(cached) => {
-                    let canonical =
-                        super::resolve_type_expr(&TypeExpr::try_from(identity).ok()?, self.context)
-                            .ok()?;
+                    let Ok(candidate) = TypeExpr::try_from(identity) else {
+                        continue;
+                    };
+                    let Ok(canonical) = super::resolve_type_expr(&candidate, self.context) else {
+                        continue;
+                    };
                     cached.insert(canonical).clone()
                 }
             };

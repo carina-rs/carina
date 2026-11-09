@@ -56,6 +56,104 @@ fn find_use_import_path(
     None
 }
 
+fn refinement_hover(
+    ty: &carina_core::schema::EffectiveType<'_>,
+    budget: &mut carina_core::schema::ShapeWalkBudget,
+    depth: usize,
+) -> String {
+    if depth >= 64 {
+        return String::new();
+    }
+    let mut content = String::new();
+    use carina_core::schema::{PatternSpecDisplay, Shape};
+    let mut pattern = |label: &str, spec: Option<&carina_core::schema::PatternSpec>| {
+        if let Some(spec) = spec {
+            content.push_str(&format!(
+                "\n- **{label} pattern**: {}",
+                PatternSpecDisplay::new(spec)
+            ));
+        }
+    };
+    match ty.shape() {
+        Shape::String {
+            identity_layer,
+            member_layer,
+        } => {
+            pattern("Identity", identity_layer.pattern);
+            pattern("Member", member_layer.pattern);
+            if let Some(bounds) = hover_bounds(identity_layer.length) {
+                content.push_str(&format!("\n- **Identity length**: {bounds}"));
+            }
+            if let Some(bounds) = hover_bounds(member_layer.length) {
+                content.push_str(&format!("\n- **Member length**: {bounds}"));
+            }
+        }
+        Shape::Int {
+            identity_layer,
+            member_layer,
+        } => {
+            if let Some(bounds) = hover_bounds(identity_layer.range) {
+                content.push_str(&format!("\n- **Identity range**: {bounds}"));
+            }
+            if let Some(bounds) = hover_bounds(member_layer.range) {
+                content.push_str(&format!("\n- **Member range**: {bounds}"));
+            }
+        }
+        Shape::List { .. } => {
+            if let Some(element) = ty.list_element() {
+                append_nested_refinement_hover(
+                    &mut content,
+                    "List element",
+                    &element,
+                    budget,
+                    depth + 1,
+                );
+            }
+        }
+        Shape::Map { .. } => {
+            if let Some(element) = ty.map_value() {
+                append_nested_refinement_hover(
+                    &mut content,
+                    "Map value",
+                    &element,
+                    budget,
+                    depth + 1,
+                );
+            }
+        }
+        Shape::Struct { .. } => {
+            for field in ty.field_candidates_with_budget(budget) {
+                append_nested_refinement_hover(
+                    &mut content,
+                    &format!("Field `{}`", field.name()),
+                    &field.value_type(),
+                    budget,
+                    depth + 1,
+                );
+            }
+        }
+        _ => {}
+    }
+
+    content
+}
+
+fn append_nested_refinement_hover(
+    content: &mut String,
+    label: &str,
+    ty: &carina_core::schema::EffectiveType<'_>,
+    budget: &mut carina_core::schema::ShapeWalkBudget,
+    depth: usize,
+) {
+    let refinements = refinement_hover(ty, budget, depth);
+    if !refinements.is_empty() {
+        content.push_str(&format!(
+            "\n\n**{label}** (`{}`):{refinements}",
+            ty.as_type()
+        ));
+    }
+}
+
 fn hover_bounds<T: std::fmt::Display>(bounds: Option<(Option<T>, Option<T>)>) -> Option<String> {
     bounds.map(|(min, max)| match (min, max) {
         (Some(min), Some(max)) => format!("{min}..={max}"),
@@ -563,42 +661,11 @@ impl HoverProvider {
             required
         );
 
-        use carina_core::schema::{PatternSpecDisplay, Shape};
-        let mut pattern = |label: &str, spec: Option<&carina_core::schema::PatternSpec>| {
-            if let Some(spec) = spec {
-                content.push_str(&format!(
-                    "\n- **{label} pattern**: {}",
-                    PatternSpecDisplay::new(spec)
-                ));
-            }
-        };
-        match attr.value_type().shape() {
-            Shape::String {
-                identity_layer,
-                member_layer,
-            } => {
-                pattern("Identity", identity_layer.pattern);
-                pattern("Member", member_layer.pattern);
-                if let Some(bounds) = hover_bounds(identity_layer.length) {
-                    content.push_str(&format!("\n- **Identity length**: {bounds}"));
-                }
-                if let Some(bounds) = hover_bounds(member_layer.length) {
-                    content.push_str(&format!("\n- **Member length**: {bounds}"));
-                }
-            }
-            Shape::Int {
-                identity_layer,
-                member_layer,
-            } => {
-                if let Some(bounds) = hover_bounds(identity_layer.range) {
-                    content.push_str(&format!("\n- **Identity range**: {bounds}"));
-                }
-                if let Some(bounds) = hover_bounds(member_layer.range) {
-                    content.push_str(&format!("\n- **Member range**: {bounds}"));
-                }
-            }
-            _ => {}
-        }
+        content.push_str(&refinement_hover(
+            &attr.value_type(),
+            &mut carina_core::schema::ShapeWalkBudget::new(64),
+            0,
+        ));
 
         Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -2774,6 +2841,71 @@ EOT
             "hover should survive an unrelated sibling parse error"
         );
     }
+    #[test]
+    fn hover_preserves_nested_refinement_layers() {
+        use carina_core::schema::{
+            PatternMatch, PatternSpec, StringIdentityLayer, StringMemberConstraints, StructField,
+            TypeIdentity,
+        };
+        let name = || {
+            AttributeType::string_member(
+                StringIdentityLayer::new(
+                    Some(TypeIdentity::bare("Name")),
+                    Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                    Some((Some(1), Some(32))),
+                    None,
+                ),
+                StringMemberConstraints::new(
+                    Some(PatternSpec::new("a.*", PatternMatch::Full)),
+                    Some((Some(2), Some(16))),
+                ),
+            )
+        };
+        let nested = AttributeType::struct_(
+            "Details",
+            vec![StructField::optional("name", name()).build()],
+        );
+        let schema = ResourceSchema::new("contact")
+            .attribute(AttributeSchema::optional("names", AttributeType::list(name())).build())
+            .attribute(AttributeSchema::optional("by_key", AttributeType::map(name())).build())
+            .attribute(AttributeSchema::optional("details", nested).build())
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", schema);
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+        let text =
+            "test.contact {\n names = []\n by_key = {}\n details = {\n  name = 'abc'\n }\n}\n";
+        let doc = Document::new(
+            text.into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        for line in [1, 2, 3, 4] {
+            let hover = provider.hover(&doc, Position::new(line, 3)).unwrap();
+            let HoverContents::Markup(content) = hover.contents else {
+                panic!("Markdown hover")
+            };
+            for fragment in [
+                "Identity pattern",
+                "[a-z]+",
+                "Member pattern",
+                "a.*",
+                "Identity length",
+                "1..=32",
+                "Member length",
+                "2..=16",
+            ] {
+                assert!(
+                    content.value.contains(fragment),
+                    "line {line}: missing {fragment}: {}",
+                    content.value
+                );
+            }
+        }
+    }
+
     #[test]
     fn hover_preserves_identity_and_member_constraints() {
         use carina_core::schema::{

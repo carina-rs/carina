@@ -47,17 +47,20 @@ across owners are allowed. Enum definition and canonical-spelling disagreement
 remain typed errors.
 
 Schema fingerprint encoding is v13. Saved-plan format 44 supersedes 43 because
-both the fingerprint encoding and retained identity/member constraint records
-reach saved plans. Format-43 plans must be regenerated; their version gate fails
+the schema fingerprint encoding changed. Saved module `pending_constraints`
+contain value expressions (`ValidateExpr`), not retained type records. Saved-plan
+replay reloads identity/member constraints from fingerprint-checked provider
+schemas. Format-43 plans must be regenerated; their version gate fails
 before payload decoding or fingerprint verification.
 
-Every typed destination uses one nominal scalar identity rule: same identity
+Every typed destination uses one String/Int identity rule: same identity
 or an allowed structural/provider widening. This includes binding/export
 annotations, map/list element annotations, module arguments, and user-function
 parameters and returns. Destination member constraints remain resolved-value
 obligations; every destination kind supports the existing `NeedsLocal` path.
-Provably disjoint length intervals or numeric ranges reject statically;
-unproven pattern containment defers to the destination value check (#4349).
+Provably disjoint String lengths or Int ranges reject statically; unproven
+pattern containment defers to the destination value check (#4349). Float sinks
+retain range containment, using both identity and member ranges for Int sources.
 Collection and coalesce inference use the same identity admission to join
 compatible declarations with different member restrictions, retaining child
 value evidence. Mismatches render the differing constraints or scalar kinds

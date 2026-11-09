@@ -269,18 +269,15 @@ impl<R: PatternForm> PatternAttributeType<R> {
     }
 
     pub(crate) fn has_empty_refinement_bounds(&self) -> bool {
-        fn empty<T: Copy + Ord>(bounds: Option<(Option<T>, Option<T>)>) -> bool {
-            matches!(bounds, Some((Some(min), Some(max))) if min > max)
-        }
         match &self.kind {
             AttrTypeKind::String {
                 identity_layer,
                 member_layer,
-            } => empty(intersect_bounds(identity_layer.length, member_layer.length)),
+            } => bounds_are_empty(intersect_bounds(identity_layer.length, member_layer.length)),
             AttrTypeKind::Int {
                 identity_layer,
                 member_layer,
-            } => empty(intersect_bounds(identity_layer.range, member_layer.range)),
+            } => bounds_are_empty(intersect_bounds(identity_layer.range, member_layer.range)),
             _ => false,
         }
     }
@@ -313,6 +310,10 @@ impl<R: PatternForm> PatternAttributeType<R> {
             _ => None,
         }
     }
+}
+
+pub(crate) fn bounds_are_empty<T: Copy + Ord>(bounds: Option<(Option<T>, Option<T>)>) -> bool {
+    matches!(bounds, Some((Some(min), Some(max))) if min > max)
 }
 
 pub(crate) fn intersect_bounds<T: Copy + Ord>(

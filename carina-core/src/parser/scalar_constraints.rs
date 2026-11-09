@@ -50,20 +50,11 @@ impl<T: Copy + Ord> Bounds<T> {
     }
 
     fn intersect(&mut self, other: &Self) {
-        self.min = match (self.min.value(), other.min.value()) {
-            (Some(a), Some(b)) => Some(a.max(b)),
-            (a, b) => a.or(b),
-        }
-        .into();
-        self.max = match (self.max.value(), other.max.value()) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
-        .into();
+        *self = Self::new(crate::schema::intersect_bounds(self.pair(), other.pair()));
     }
 
     fn is_empty(self) -> bool {
-        matches!((self.min.value(), self.max.value()), (Some(min), Some(max)) if min > max)
+        crate::schema::bounds_are_empty(self.pair())
     }
 }
 
@@ -110,10 +101,10 @@ fn required_pattern<'de, D: serde::Deserializer<'de>>(
 pub(super) struct ScalarConstraints {
     scalar: ScalarConstraintKind,
     empty_intersection: bool,
-    // A conjunction across owners keeps each owner's two single-pattern
-    // layers. This is annotation evidence, not extra slots on a declaration.
+    // A conjunction across owners keeps each owner's single-pattern
+    // identity layer. This is annotation evidence, not extra slots on a declaration.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    owner_layers: Vec<StringConstraintLayers>,
+    owner_layers: Vec<StringIdentityConstraints>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -123,17 +114,23 @@ struct StringIdentityConstraints {
     pattern: Option<DeclarationPattern>,
 }
 
+impl StringIdentityConstraints {
+    fn intersect(&mut self, other: &Self) {
+        self.pattern = self
+            .pattern
+            .iter()
+            .chain(other.pattern.iter())
+            .min()
+            .cloned();
+        self.length.intersect(&other.length);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 struct StringMemberConstraints {
     length: Bounds<u64>,
     #[serde(deserialize_with = "required_pattern")]
     pattern: Option<DeclarationPattern>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-struct StringConstraintLayers {
-    identity_layer: StringIdentityConstraints,
-    member_layer: StringMemberConstraints,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -273,45 +270,33 @@ impl ScalarConstraints {
         if let ScalarConstraintKind::Float { range } = &mut self.scalar {
             *range = normalize_float_bounds(*range);
         }
-        if !self.owner_layers.is_empty() {
-            let mut expected: Option<Self> = None;
-            for layers in &self.owner_layers {
-                let owner = Self::new(ScalarConstraintKind::String {
-                    identity_layer: layers.identity_layer.clone(),
-                    member_layer: layers.member_layer.clone(),
-                });
-                match &mut expected {
-                    Some(expected) => expected.intersect(&owner)?,
-                    None => expected = Some(owner),
-                }
+        if let Some(first) = self.owner_layers.first() {
+            let mut expected = first.clone();
+            for owner in &self.owner_layers[1..] {
+                expected.intersect(owner);
             }
-            if expected.expect("nonempty owner layers").scalar != self.scalar {
+            if !matches!(&self.scalar, ScalarConstraintKind::String { identity_layer, .. } if *identity_layer == expected)
+            {
                 return Err("owner layer conjunction does not match scalar constraints");
             }
         }
         Ok(())
     }
 
-    pub(super) fn intersect(&mut self, other: &Self) -> Result<(), &'static str> {
+    pub(super) fn intersect(&mut self, other: &Self) {
         if let (
             ScalarConstraintKind::String {
                 identity_layer,
-                member_layer,
+                member_layer: _,
             },
             ScalarConstraintKind::String {
                 identity_layer: other_identity,
-                member_layer: other_member,
+                member_layer: _,
             },
         ) = (&self.scalar, &other.scalar)
         {
-            let own = StringConstraintLayers {
-                identity_layer: identity_layer.clone(),
-                member_layer: member_layer.clone(),
-            };
-            let incoming = StringConstraintLayers {
-                identity_layer: other_identity.clone(),
-                member_layer: other_member.clone(),
-            };
+            let own = identity_layer.clone();
+            let incoming = other_identity.clone();
             if own != incoming || !self.owner_layers.is_empty() || !other.owner_layers.is_empty() {
                 if self.owner_layers.is_empty() {
                     self.owner_layers.push(own);
@@ -338,19 +323,13 @@ impl ScalarConstraints {
             ) => {
                 // The representative is stable; the binding retains and
                 // structurally checks every owner's single-pattern layers.
-                identity_layer.pattern = identity_layer
-                    .pattern
-                    .iter()
-                    .chain(other_identity.pattern.iter())
-                    .min()
-                    .cloned();
+                identity_layer.intersect(other_identity);
                 member_layer.pattern = member_layer
                     .pattern
                     .iter()
                     .chain(other_member.pattern.iter())
                     .min()
                     .cloned();
-                identity_layer.length.intersect(&other_identity.length);
                 member_layer.length.intersect(&other_member.length);
             }
             (
@@ -373,19 +352,12 @@ impl ScalarConstraints {
             _ => unreachable!("annotation resolution checks scalar kinds before intersecting"),
         }
         self.empty_intersection = self.bounds_are_empty();
-        Ok(())
     }
 
-    pub(super) fn owner_patterns(&self, member: bool) -> impl Iterator<Item = &CompiledPattern> {
+    pub(super) fn owner_patterns(&self) -> impl Iterator<Item = &CompiledPattern> {
         self.owner_layers
             .iter()
-            .filter_map(move |layers| {
-                if member {
-                    layers.member_layer.pattern.as_ref()
-                } else {
-                    layers.identity_layer.pattern.as_ref()
-                }
-            })
+            .filter_map(|layer| layer.pattern.as_ref())
             .map(|pattern| &pattern.0)
     }
 
@@ -488,7 +460,7 @@ mod pattern_mode_tests {
                     pattern: Some(member_pattern),
                 },
             });
-            retained.intersect(&retained.clone()).unwrap();
+            retained.intersect(&retained.clone());
             let json = serde_json::to_string(&retained).unwrap();
             let decoded: ScalarConstraints = serde_json::from_str(&json).unwrap();
             assert_eq!(decoded, retained);

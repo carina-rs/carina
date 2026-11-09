@@ -447,18 +447,12 @@ impl ResolvedSchemaType {
             .expect("admitted scalar declaration")
     }
 
-    pub(crate) fn conjoin(&self, other: &Self) -> Result<Self, CustomTypeValidationError> {
+    pub(crate) fn conjoin(&self, other: &Self) -> Self {
         assert_eq!(self.identity(), other.identity());
         assert_eq!(self.scalar_kind(), other.scalar_kind());
         let mut constraints = self.0.constraints.clone();
-        constraints
-            .intersect(&other.0.constraints)
-            .map_err(|message| CustomTypeValidationError::Rejected {
-                owner: self.provider_names().next().expect("owner").into(),
-                identity: self.identity().clone(),
-                message: message.into(),
-            })?;
-        Ok(Self(std::sync::Arc::new(ResolvedScalarDeclaration {
+        constraints.intersect(&other.0.constraints);
+        Self(std::sync::Arc::new(ResolvedScalarDeclaration {
             owned: self
                 .0
                 .owned
@@ -466,7 +460,7 @@ impl ResolvedSchemaType {
             constraints,
             projection: None,
             projection_fingerprint: None,
-        })))
+        }))
     }
 
     pub(crate) fn into_annotation(mut self) -> Self {
@@ -504,11 +498,8 @@ impl ResolvedSchemaType {
     pub(crate) fn materialize(&self) -> AttributeType {
         self.0.constraints.materialize(self)
     }
-    pub(crate) fn owner_patterns(
-        &self,
-        member: bool,
-    ) -> impl Iterator<Item = &crate::schema::CompiledPattern> {
-        self.0.constraints.owner_patterns(member)
+    pub(crate) fn owner_patterns(&self) -> impl Iterator<Item = &crate::schema::CompiledPattern> {
+        self.0.constraints.owner_patterns()
     }
 
     pub(crate) fn has_empty_intersection(&self) -> bool {

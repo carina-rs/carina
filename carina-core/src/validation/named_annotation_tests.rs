@@ -2396,3 +2396,168 @@ fn retained_annotation_mismatch_names_the_disjoint_member_bounds() {
         "{message}"
     );
 }
+
+#[test]
+fn collection_join_tries_right_canonical_when_left_is_not_authorable() {
+    let left_id = TypeIdentity::from_dotted("aws.service.Resource.Name");
+    let right_id = TypeIdentity::from_dotted("aws.Name");
+    let source = snapshot(vec![(
+        "p",
+        vec![DraftType::refined_string(
+            Some(left_id.clone()),
+            None,
+            None,
+            None,
+        )],
+    )]);
+    let target = snapshot(vec![(
+        "p",
+        vec![DraftType::refined_string(
+            Some(right_id.clone()),
+            None,
+            None,
+            None,
+        )],
+    )]);
+    let context = target.provider_context().as_provider_context();
+    assert!(resolve_type_expr(&TypeExpr::try_from(left_id).unwrap(), context).is_err());
+    let left = inference::attribute_type_to_type_expr(declaration(&source, "p", 0), "p");
+    let right = inference::attribute_type_to_type_expr(declaration(&target, "p", 0), "p");
+    let expected = resolve_type_expr(&TypeExpr::try_from(right_id).unwrap(), context).unwrap();
+    let mut joiner = inference::InferredTypeJoiner::new(context);
+    let mut joined = left.clone();
+    for item in [&right, &left, &right] {
+        joined = joiner
+            .join(&joined, item)
+            .expect("the right identity admits the collection");
+    }
+    assert_eq!(joined, expected);
+    assert_eq!(
+        joiner.join(
+            &TypeExpr::List(Box::new(left)),
+            &TypeExpr::List(Box::new(right))
+        ),
+        Some(TypeExpr::List(Box::new(expected)))
+    );
+}
+
+#[test]
+fn owner_conjunction_wire_contains_only_identity_records() {
+    let loaded = snapshot(vec![
+        ("p", vec![string(1, 16, None)]),
+        ("q", vec![string(3, 32, None)]),
+    ]);
+    let ty = annotation(&loaded);
+    let wire = serde_json::to_value(&ty).unwrap();
+    let owners = wire["SchemaType"]["owned"]["constraints"]["owner_layers"]
+        .as_array()
+        .unwrap();
+    assert_eq!(owners.len(), 2);
+    for owner in owners {
+        assert!(owner.get("member_layer").is_none(), "{owner}");
+        assert!(
+            owner.get("pattern").is_some() && owner.get("length").is_some(),
+            "{owner}"
+        );
+    }
+    let restored: TypeExpr = serde_json::from_value(wire).unwrap();
+    assert_eq!(restored, ty);
+}
+
+#[test]
+fn layered_scalar_evidence_fixture_round_trips_and_rebinds() {
+    use crate::schema::{
+        IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+        StringMemberConstraints,
+    };
+    let declarations = snapshot(vec![(
+        "p",
+        vec![
+            DraftType::string_member(
+                StringIdentityLayer::new(
+                    Some(identity()),
+                    Some(PatternSpec::new("[A-Z]+", PatternMatch::Full)),
+                    Some((Some(1), Some(32))),
+                    None,
+                ),
+                StringMemberConstraints::new(None, Some((Some(2), Some(4)))),
+            ),
+            DraftType::int_member(
+                IntIdentityLayer::new(
+                    Some(TypeIdentity::from_dotted("aws.Count")),
+                    Some((Some(0), Some(100))),
+                ),
+                IntMemberConstraints::new(Some((Some(1), Some(10)))),
+            ),
+        ],
+    )]);
+    let owners = snapshot(vec![
+        (
+            "p",
+            vec![string(
+                1,
+                16,
+                Some(PatternSpec::new("[A-Z]+", PatternMatch::Full)),
+            )],
+        ),
+        (
+            "q",
+            vec![string(
+                3,
+                32,
+                Some(PatternSpec::new("A.*", PatternMatch::Full)),
+            )],
+        ),
+    ]);
+    let fixture = BTreeMap::from([
+        (
+            "string".to_owned(),
+            inference::attribute_type_to_type_expr(declaration(&declarations, "p", 0), "p"),
+        ),
+        (
+            "int".to_owned(),
+            inference::attribute_type_to_type_expr(declaration(&declarations, "p", 1), "p"),
+        ),
+        ("owners".to_owned(), annotation(&owners)),
+    ]);
+    let json = include_str!("fixtures/layered_scalar_evidence.json");
+    assert_eq!(crate::utils::pretty_with_newline(&fixture).unwrap(), json);
+    let restored: BTreeMap<String, TypeExpr> = serde_json::from_str(json).unwrap();
+    assert_eq!(fixture, restored);
+    for (key, snapshot, values) in [
+        (
+            "string",
+            &declarations,
+            vec![(text("AB"), true), (text("ab"), false), (text("A"), false)],
+        ),
+        (
+            "int",
+            &declarations,
+            vec![
+                (integer(5), true),
+                (integer(-1), false),
+                (integer(11), false),
+            ],
+        ),
+        (
+            "owners",
+            &owners,
+            vec![
+                (text("ABC"), true),
+                (text("ZZZ"), false),
+                (text("Abc"), false),
+            ],
+        ),
+    ] {
+        for (value, valid) in values {
+            let result = typecheck::check_type_expr_value(
+                &restored[key],
+                &value,
+                snapshot.provider_context(),
+                &crate::parser::retained::value_dependent_judgement_for_test(),
+            )
+            .require_provider_schemas();
+            assert_eq!(result.is_ok(), valid, "{key}: {result:?}");
+        }
+    }
+}

@@ -1,0 +1,216 @@
+{
+  "int": {
+    "SchemaType": {
+      "owned": {
+        "owners": [
+          {
+            "Provider": "p"
+          }
+        ],
+        "identity": {
+          "provider": "aws",
+          "segments": [],
+          "kind": "Count"
+        },
+        "scalar_kind": "Int",
+        "declaration": {
+          "Int": {
+            "provider": "aws",
+            "segments": [],
+            "kind": "Count"
+          }
+        },
+        "constraints": {
+          "scalar": {
+            "Int": {
+              "identity_range": {
+                "min": {
+                  "Inclusive": 0
+                },
+                "max": {
+                  "Inclusive": 100
+                }
+              },
+              "member_range": {
+                "min": {
+                  "Inclusive": 1
+                },
+                "max": {
+                  "Inclusive": 10
+                }
+              }
+            }
+          },
+          "empty_intersection": false
+        },
+        "origin": "Projection",
+        "projection_fingerprint": "9374930cd4ae37a425be15392960f1f1b595c8c25f7043dee829ee50baacd1c9"
+      }
+    }
+  },
+  "owners": {
+    "SchemaType": {
+      "owned": {
+        "owners": [
+          {
+            "Provider": "p"
+          },
+          {
+            "Provider": "q"
+          }
+        ],
+        "identity": {
+          "provider": "aws",
+          "segments": [
+            "iam",
+            "Role"
+          ],
+          "kind": "Name"
+        },
+        "scalar_kind": "String",
+        "declaration": {
+          "String": {
+            "provider": "aws",
+            "segments": [
+              "iam",
+              "Role"
+            ],
+            "kind": "Name"
+          }
+        },
+        "constraints": {
+          "scalar": {
+            "String": {
+              "identity_layer": {
+                "length": {
+                  "min": {
+                    "Inclusive": 3
+                  },
+                  "max": {
+                    "Inclusive": 16
+                  }
+                },
+                "pattern": {
+                  "regex": "A.*",
+                  "mode": {
+                    "kind": "full"
+                  }
+                }
+              },
+              "member_layer": {
+                "length": {
+                  "min": "Unbounded",
+                  "max": "Unbounded"
+                },
+                "pattern": null
+              }
+            }
+          },
+          "empty_intersection": false,
+          "owner_layers": [
+            {
+              "length": {
+                "min": {
+                  "Inclusive": 1
+                },
+                "max": {
+                  "Inclusive": 16
+                }
+              },
+              "pattern": {
+                "regex": "[A-Z]+",
+                "mode": {
+                  "kind": "full"
+                }
+              }
+            },
+            {
+              "length": {
+                "min": {
+                  "Inclusive": 3
+                },
+                "max": {
+                  "Inclusive": 32
+                }
+              },
+              "pattern": {
+                "regex": "A.*",
+                "mode": {
+                  "kind": "full"
+                }
+              }
+            }
+          ]
+        },
+        "origin": "Annotation",
+        "projection_fingerprint": null
+      }
+    }
+  },
+  "string": {
+    "SchemaType": {
+      "owned": {
+        "owners": [
+          {
+            "Provider": "p"
+          }
+        ],
+        "identity": {
+          "provider": "aws",
+          "segments": [
+            "iam",
+            "Role"
+          ],
+          "kind": "Name"
+        },
+        "scalar_kind": "String",
+        "declaration": {
+          "String": {
+            "provider": "aws",
+            "segments": [
+              "iam",
+              "Role"
+            ],
+            "kind": "Name"
+          }
+        },
+        "constraints": {
+          "scalar": {
+            "String": {
+              "identity_layer": {
+                "length": {
+                  "min": {
+                    "Inclusive": 1
+                  },
+                  "max": {
+                    "Inclusive": 32
+                  }
+                },
+                "pattern": {
+                  "regex": "[A-Z]+",
+                  "mode": {
+                    "kind": "full"
+                  }
+                }
+              },
+              "member_layer": {
+                "length": {
+                  "min": {
+                    "Inclusive": 2
+                  },
+                  "max": {
+                    "Inclusive": 4
+                  }
+                },
+                "pattern": null
+              }
+            }
+          },
+          "empty_intersection": false
+        },
+        "origin": "Projection",
+        "projection_fingerprint": "89d04fe7a71298399dacb5c232aa0839fdbf084580f81f3a0f6746328c391fbe"
+      }
+    }
+  }
+}

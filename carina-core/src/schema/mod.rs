@@ -204,7 +204,7 @@ pub use refinement_layers::{
     IntIdentityLayer, IntIdentityParts, IntMemberConstraints, IntMemberParts, StringIdentityLayer,
     StringIdentityParts, StringMemberConstraints, StringMemberParts,
 };
-pub(crate) use refinement_layers::{ScalarIdentityParts, intersect_bounds};
+pub(crate) use refinement_layers::{ScalarIdentityParts, bounds_are_empty, intersect_bounds};
 pub(crate) mod length_interval;
 use crate::resource::knowledge::{
     Classification, ClassifiedRef, KnownValue, PendingFit, StructuralPending,
@@ -3561,7 +3561,7 @@ impl PatternAttributeType<Compiled> {
                 validate_string_refinement(binding.identity(), pattern.as_ref(), None, s)?;
                 if let Some(annotation) = binding.annotation() {
                     for owner_pattern in annotation
-                        .owner_patterns(false)
+                        .owner_patterns()
                         .filter(|owner_pattern| Some(*owner_pattern) != pattern.as_ref())
                     {
                         validate_string_refinement(
@@ -3579,18 +3579,6 @@ impl PatternAttributeType<Compiled> {
                     None,
                     s,
                 )?;
-                if let Some(annotation) = binding.annotation() {
-                    for owner_pattern in annotation.owner_patterns(true).filter(|owner_pattern| {
-                        Some(*owner_pattern) != member_layer.pattern.as_ref()
-                    }) {
-                        validate_string_refinement(
-                            binding.identity(),
-                            Some(owner_pattern),
-                            None,
-                            s,
-                        )?;
-                    }
-                }
                 validate_string_refinement(binding.identity(), None, member_layer.length, s)?;
                 binding
                     .callback()
