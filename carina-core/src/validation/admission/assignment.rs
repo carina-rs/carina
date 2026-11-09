@@ -490,11 +490,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
             findings: Default::default(),
         });
     };
-    let lookup = ContractLookup {
-        owner: &contract.owner,
-        resolver: context.provider.catalog().custom_type_resolver(),
-    };
-    let lookup = context.lookup.unwrap_or(&lookup);
+    let lookup = contract.lookup(context.provider.catalog());
     let mut checked = match &context.proof {
         AdmissionProof::Validation(proof) => {
             let reference_context = ReferenceContext::from(context);
@@ -522,7 +518,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 proof,
                 contract.defs(),
                 contract.ancestry,
-                lookup,
+                &lookup,
                 Some(&check),
             )
         }
@@ -531,7 +527,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
             proof.knowledge(),
             contract.defs(),
             contract.ancestry,
-            lookup,
+            &lookup,
         ),
         AdmissionProof::Apply(proof) => {
             crate::schema::value_validation::validate_value_with_lookup(
@@ -539,7 +535,7 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
                 &crate::resource::knowledge::Classification::<P, B>::Known(proof.clone()),
                 contract.defs(),
                 contract.ancestry,
-                lookup,
+                &lookup,
             )
         }
     };
@@ -582,36 +578,6 @@ pub(super) fn judge_with_findings<K: DestinationKind, P: PlaceholderKind, B: Bin
         verdict: verdict(destination, assignment),
         findings: checked,
     })
-}
-
-/// Owner authority comes from the descriptor; a caller cannot replace it.
-struct ContractLookup<'a> {
-    owner: &'a crate::parser::SchemaTypeOwner,
-    resolver: &'a dyn crate::parser::CustomTypeResolver,
-}
-impl crate::schema::ValidatedCustomTypeLookup for ContractLookup<'_> {
-    fn canonicalization_error(
-        &self,
-        declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
-        error: TypeError,
-    ) -> TypeError {
-        match self.owner {
-            crate::parser::SchemaTypeOwner::Provider(owner) => {
-                crate::parser::custom_type_canonicalization_error(owner, declaration, error)
-            }
-        }
-    }
-    fn validate(
-        &self,
-        value: crate::schema::LocallyValidatedCustomType<'_>,
-    ) -> Result<(), TypeError> {
-        match self.owner {
-            crate::parser::SchemaTypeOwner::Provider(owner) => self
-                .resolver
-                .validate_validated(owner, value)
-                .map_err(Into::into),
-        }
-    }
 }
 
 #[cfg(test)]
@@ -659,12 +625,7 @@ mod discharge_tests {
             BindingValueSource::Local,
         );
         assert_eq!(
-            pending
-                .discharge(&resolved, session)
-                .unwrap()
-                .ready()
-                .unwrap()
-                .value(),
+            pending.discharge(&resolved, session).unwrap().value(),
             &text("fits")
         );
     }

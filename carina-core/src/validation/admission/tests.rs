@@ -506,8 +506,6 @@ fn needs_local_without_pending_sites_remains_pending() {
                     pending
                         .discharge(&ResolvedBindings::default(), session)
                         .unwrap()
-                        .ready()
-                        .unwrap()
                         .value(),
                     &value
                 );
@@ -790,11 +788,7 @@ fn plan_retains_apply_sites_and_discharge_places_fitting_value() {
                     HashMap::from([("output".into(), text("fits"))]),
                     BindingValueSource::Local,
                 );
-                let placed = pending
-                    .discharge(&resolved, session)
-                    .unwrap()
-                    .ready()
-                    .unwrap();
+                let placed = pending.discharge(&resolved, session).unwrap();
                 assert_eq!(placed.value(), &text("fits"));
                 let mut slot = TypedSlot::new(destination.clone());
                 slot.place(placed).unwrap();
@@ -1074,11 +1068,7 @@ fn infra_case(binding: &str, nested: bool, uuid: bool) {
                     &wrap(text(&output)),
                     "{binding}"
                 );
-                assert_eq!(
-                    apply.unwrap().ready().unwrap().value(),
-                    &wrap(text(&output)),
-                    "{binding}"
-                );
+                assert_eq!(apply.unwrap().value(), &wrap(text(&output)), "{binding}");
                 literal.unwrap().ready().unwrap();
             } else {
                 let literal = literal.unwrap_err();
@@ -1204,12 +1194,7 @@ fn pending_is_holdable_and_discharged_for_every_unmigrated_kind() {
             BindingValueSource::Local,
         );
         assert_eq!(
-            pending
-                .discharge(&resolved, session)
-                .unwrap()
-                .ready()
-                .unwrap()
-                .value(),
+            pending.discharge(&resolved, session).unwrap().value(),
             &text("ok")
         );
     }
@@ -1567,6 +1552,203 @@ fn partial_catalog_custom_type_error_on_discharge() {
 }
 
 #[test]
+fn provider_apply_and_discharge_use_catalog_when_factory_arguments_differ() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let identity = TypeIdentity::bare("RemoteId");
+    let mut catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    catalog.custom_types = crate::parser::ProviderCustomTypes::loaded(
+        Default::default(),
+        Box::new(move |_, _| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Err(crate::parser::CustomTypeValidationError::Rejected {
+                owner: "test".into(),
+                identity: TypeIdentity::bare("RemoteId"),
+                message: "catalog rejection".into(),
+            })
+        }),
+    );
+    fixture_in(
+        &catalog,
+        string_type("RemoteId", None),
+        string_type("RemoteId", None),
+        |catalog, schemas, bindings, destination| {
+            with_session_for_test(catalog, |session| {
+                let pending = validate(destination, &reference(), bindings, session)
+                    .unwrap()
+                    .ready()
+                    .unwrap_err();
+                let mut resolved = ResolvedBindings::default();
+                resolved.set(
+                    "producer",
+                    HashMap::from([("output".into(), text("rejected"))]),
+                    BindingValueSource::Local,
+                );
+                let expected =
+                    TypeError::from(crate::parser::CustomTypeValidationError::Rejected {
+                        owner: "test".into(),
+                        identity,
+                        message: "catalog rejection".into(),
+                    })
+                    .with_attribute("target");
+                assert_eq!(
+                    pending.discharge(&resolved, session).unwrap_err(),
+                    constraints(vec![AdmissionFinding {
+                        path: destination.contract.as_deref().unwrap().path.clone(),
+                        error: expected.clone(),
+                    }])
+                );
+
+                let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
+                // The retained catalog owns validation even when a caller's
+                // compatibility factory argument is empty or from elsewhere.
+                let context = crate::executor::ProviderPreparationContext::new(
+                    &resolved,
+                    &gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    schemas,
+                    session,
+                );
+                let resource =
+                    crate::resource::Resource::with_provider("test", "Sink", "sink", None)
+                        .with_attribute("target", text("rejected"));
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let error = runtime
+                    .block_on(crate::executor::prepare_provider_ready_resource(
+                        resource, &context,
+                    ))
+                    .unwrap_err();
+                let crate::executor::ProviderPreparationError::ValueConstraint { errors, .. } =
+                    error
+                else {
+                    panic!("expected catalog rejection, got {error:?}")
+                };
+                assert_eq!(errors.errors(), &[expected]);
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            });
+        },
+    );
+}
+
+#[test]
+fn schema_and_contract_lookups_agree_at_apply_and_discharge() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let mut catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    catalog.custom_types = crate::parser::ProviderCustomTypes::loaded(
+        Default::default(),
+        Box::new(move |target, value| {
+            let crate::parser::CustomTypeValidationTarget::Annotation(identity) = target else {
+                panic!("fixture annotation")
+            };
+            assert_eq!(identity.provider_names().collect::<Vec<_>>(), vec!["test"]);
+            counter.fetch_add(1, Ordering::SeqCst);
+            if value == &text("rejected") {
+                Err(crate::parser::CustomTypeValidationError::Rejected {
+                    owner: "test".into(),
+                    identity: identity.identity().clone(),
+                    message: "provider rejection".into(),
+                })
+            } else {
+                Ok(())
+            }
+        }),
+    );
+    for (target, output, accepted, dispatches) in [
+        (string_type("RemoteId", None), text("fits"), true, 1),
+        (string_type("RemoteId", None), text("rejected"), false, 1),
+        (
+            AttributeType::refined_float(Some(TypeIdentity::bare("Amount")), None),
+            Value::Concrete(crate::resource::ConcreteValue::Int(9_007_199_254_740_993)),
+            false,
+            0,
+        ),
+    ] {
+        fixture_in(
+            &catalog,
+            target.clone(),
+            target,
+            |catalog, schemas, bindings, destination| {
+                with_session_for_test(catalog, |session| {
+                    let schema = schemas
+                        .get("test", "Sink", crate::schema::SchemaKind::Resource)
+                        .unwrap();
+                    let lookup = crate::parser::custom_type_lookup_for_schema(
+                        catalog.custom_type_resolver(),
+                        schema,
+                    );
+                    let contract = destination.contract.as_deref().unwrap();
+                    calls.store(0, Ordering::SeqCst);
+                    let findings = crate::schema::value_validation::validate_value_with_lookup(
+                        contract.attr(),
+                        &output
+                            .knowledge(&KnowledgeContext::validation())
+                            .unwrap()
+                            .into_classification(),
+                        contract.defs(),
+                        contract.ancestry,
+                        &lookup,
+                    );
+                    let expected = findings
+                        .into_located()
+                        .into_iter()
+                        .map(|(path, error)| AdmissionFinding {
+                            path: join(&contract.path, &path),
+                            error: error.with_attribute("target"),
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(expected.is_empty(), accepted);
+                    assert_eq!(calls.load(Ordering::SeqCst), dispatches);
+
+                    let pending = validate(destination, &reference(), bindings, session)
+                        .unwrap()
+                        .ready()
+                        .unwrap_err();
+                    let mut resolved = ResolvedBindings::default();
+                    resolved.set(
+                        "producer",
+                        HashMap::from([("output".into(), output.clone())]),
+                        BindingValueSource::Local,
+                    );
+                    let (candidate, boundary) = Candidate::apply(
+                        output
+                            .knowledge(&KnowledgeContext::apply(&resolved))
+                            .unwrap(),
+                        session,
+                    )
+                    .unwrap();
+                    let applied: Result<PlacedValue<kind::ResourceAttribute>, AdmissionErrors> =
+                        admit_apply(destination, candidate, &boundary);
+                    let discharged: Result<PlacedValue<kind::ResourceAttribute>, AdmissionErrors> =
+                        pending.discharge(&resolved, session);
+                    for result in [applied, discharged] {
+                        if accepted {
+                            assert_eq!(result.unwrap().value(), &output);
+                        } else {
+                            assert_eq!(result.unwrap_err(), constraints(expected.clone()));
+                        }
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), 3 * dispatches);
+                })
+            },
+        );
+    }
+}
+
+#[test]
 fn data_source_attributes_use_the_same_local_obligation_and_discharge() {
     let catalog = crate::parser::LoadedProviderContext::empty_for_test()
         .as_provider_context()
@@ -1618,8 +1800,6 @@ fn data_source_attributes_use_the_same_local_obligation_and_discharge() {
             pending
                 .clone()
                 .discharge(&resolved, session)
-                .unwrap()
-                .ready()
                 .unwrap()
                 .value(),
             &text("fits")

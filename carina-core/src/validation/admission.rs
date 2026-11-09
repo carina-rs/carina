@@ -273,6 +273,8 @@ pub(crate) struct DeclarationId(u64);
 impl Default for DeclarationId {
     fn default() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        // Exhausting u64 would require over 584 years at a billion declarations
+        // per second in one process, so exhaustion is unreachable in practice.
         Self(
             NEXT.fetch_update(
                 std::sync::atomic::Ordering::Relaxed,
@@ -330,6 +332,14 @@ impl DestinationContract {
 
     fn defs(&self) -> &std::collections::BTreeMap<String, CompiledAttributeType> {
         self.schema.defs()
+    }
+
+    fn lookup<'a>(
+        &'a self,
+        catalog: &'a ProviderContext,
+    ) -> impl crate::schema::ValidatedCustomTypeLookup + 'a {
+        let crate::parser::SchemaTypeOwner::Provider(owner) = &self.owner;
+        crate::parser::custom_type_lookup_for_owner(catalog.custom_type_resolver(), owner)
     }
 }
 
@@ -406,7 +416,6 @@ pub struct AdmissionContext<
     proof: AdmissionProof<'a, P, B>,
     bindings: Option<&'a BindingIndex<'a, B>>,
     provider: &'a dyn ProviderTypeCheckContext,
-    lookup: Option<crate::schema::CustomTypeLookup<'a>>,
     assignment: crate::schema::value_validation::AssignmentCheck<'a, P, B>,
     untyped: Option<&'a dyn Fn() -> Vec<TypeError>>,
     declaration: Option<(&'a str, &'a crate::binding_index::DeclaredValueSource)>,
@@ -481,7 +490,6 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
             proof: AdmissionProof::Apply(proof.clone()),
             bindings: None,
             provider,
-            lookup: None,
             assignment: None,
             untyped: None,
             declaration: None,
@@ -517,7 +525,6 @@ impl<P: PlaceholderKind, B: BindingAddress> Candidate<P, B> {
                 proof,
                 bindings,
                 provider,
-                lookup: None,
                 assignment: None,
                 untyped: None,
                 declaration: None,
@@ -578,6 +585,24 @@ impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> PartialEq for Pl
     }
 }
 impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> PlacedValue<K, P, B> {
+    fn admitted(
+        destination: &Destination<K>,
+        value: Value<P, B>,
+        findings: crate::schema::ValueValidationFindings,
+    ) -> Self {
+        Self {
+            inner: Box::new(PlacedInner {
+                findings,
+                destination: destination.clone(),
+                value,
+            }),
+        }
+    }
+
+    pub(crate) fn take_findings(&mut self) -> crate::schema::ValueValidationFindings {
+        std::mem::take(&mut self.inner.findings)
+    }
+
     pub fn value(&self) -> &Value<P, B> {
         &self.inner.value
     }
@@ -811,25 +836,21 @@ pub fn admit<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
     candidate: Candidate<P, B>,
     context: &AdmissionContext<'_, P, B>,
 ) -> Result<Admission<K, P, B>, AdmissionErrors> {
+    if context.is_apply() {
+        return admit_apply(destination, candidate, context).map(Admission::Ready);
+    }
     let assignment::AssignmentJudgement { verdict, findings } =
         assignment::judge_with_findings(destination, &candidate, context)?;
     let sites = context.sites();
     match verdict {
-        AssignmentVerdict::Proven(_) if sites.is_empty() => Ok(Admission::Ready(PlacedValue {
-            inner: Box::new(PlacedInner {
-                findings,
-                destination: destination.clone(),
-                value: candidate.value,
-            }),
-        })),
+        AssignmentVerdict::Proven(_) if sites.is_empty() => Ok(Admission::Ready(
+            PlacedValue::admitted(destination, candidate.value, findings),
+        )),
         assignment @ (AssignmentVerdict::Proven(_)
         | AssignmentVerdict::NeedsLocal(_)
         | AssignmentVerdict::NeedsSchema(_)) => {
             // Every unproven verdict remains owned work, even with no pending
             // sites. Apply must prove assignment after checking the known value.
-            if context.is_apply() {
-                return Err(KnowledgeError::<B>::UnresolvedAtBoundary { sites }.into());
-            }
             Ok(Admission::Pending(PendingAdmission {
                 destination: destination.clone(),
                 inner: Box::new(PendingCandidate {
@@ -842,14 +863,59 @@ pub fn admit<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
         }
     }
 }
+
+/// Apply can only produce placement or an error; pending work cannot escape.
+fn admit_apply<K: DestinationKind, P: PlaceholderKind, B: BindingAddress>(
+    destination: &Destination<K>,
+    candidate: Candidate<P, B>,
+    context: &AdmissionContext<'_, P, B>,
+) -> Result<PlacedValue<K, P, B>, AdmissionErrors> {
+    if !context.is_apply() {
+        return Err(KnowledgeError::<B>::InvalidStage {
+            operation: "apply admission",
+        }
+        .into());
+    }
+    let assignment::AssignmentJudgement { verdict, findings } =
+        assignment::judge_with_findings(destination, &candidate, context)?;
+    match verdict {
+        AssignmentVerdict::Proven(_) => Ok(PlacedValue::admitted(
+            destination,
+            candidate.value,
+            findings,
+        )),
+        AssignmentVerdict::NeedsLocal(_) | AssignmentVerdict::NeedsSchema(_) => {
+            Err(KnowledgeError::<B>::UnresolvedAtBoundary {
+                sites: context.sites(),
+            }
+            .into())
+        }
+    }
+}
+
 impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> PendingAdmission<K, P, B> {
+    /// Resolve and prove pending work at apply. Success is ready for placement.
+    ///
+    /// ```
+    /// use carina_core::{binding_index::ResolvedBindings, validation::{
+    ///     admission::{AdmissionErrors, DestinationKind, PendingAdmission, PlacedValue},
+    ///     deferred_types::ProviderTypeCheckContext,
+    /// }};
+    /// fn discharge<K: DestinationKind>(
+    ///     pending: PendingAdmission<K>,
+    ///     resolved: &ResolvedBindings,
+    ///     context: &dyn ProviderTypeCheckContext,
+    /// ) -> Result<PlacedValue<K>, AdmissionErrors> {
+    ///     pending.discharge(resolved, context)
+    /// }
+    /// ```
     pub fn discharge(
         self,
         resolved: &ResolvedBindings<P, B>,
         context: &dyn ProviderTypeCheckContext,
-    ) -> Result<Admission<K, P, B>, AdmissionErrors> {
+    ) -> Result<PlacedValue<K, P, B>, AdmissionErrors> {
         // Ordinary resolution changes the projection, so it cannot retain a
-        // previous placement receipt. The sole apply proof then re-enters admit.
+        // previous placement receipt. The sole apply proof re-enters admission.
         let value =
             crate::resolver::resolve_ref_value(&self.inner.candidate.value, resolved, context)?;
         let mut candidate = self.inner.candidate;
@@ -865,7 +931,7 @@ impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> PendingAdmission
             value.knowledge(&KnowledgeContext::apply(resolved))?,
             context,
         )?;
-        admit(&self.destination, candidate, &boundary)
+        admit_apply(&self.destination, candidate, &boundary)
     }
     pub fn sites(&self) -> &[PendingSite<B>] {
         &self.inner.sites
@@ -934,7 +1000,7 @@ impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> TypedSlot<K, P, 
 impl<K: DestinationKind, P: PlaceholderKind, B: BindingAddress> Admission<K, P, B> {
     pub(crate) fn take_findings(&mut self) -> crate::schema::ValueValidationFindings {
         match self {
-            Self::Ready(placed) => std::mem::take(&mut placed.inner.findings),
+            Self::Ready(placed) => placed.take_findings(),
             Self::Pending(pending) => std::mem::take(&mut pending.inner.findings),
         }
     }

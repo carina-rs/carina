@@ -9891,13 +9891,29 @@ impl ValidatedResourceSchema {
         is_string_literal: &dyn Fn(&str) -> bool,
         lookup: CustomTypeLookup<'_>,
     ) -> Result<(), Vec<TypeError>> {
-        crate::validation::admission::attributes::admit_resource_attribute_fixture(
-            self,
-            attributes,
-            is_string_literal,
-            lookup,
-        )
-        .into_result()
+        // Legacy schema fixtures inject a leaf callback into the shared value
+        // walk. Production admission derives its lookup from the contract.
+        self.as_schema()
+            .validate_admission_report(
+                attributes,
+                is_string_literal,
+                &value_validation::AttributeAdmission {
+                    known: &|_, selected, proof| {
+                        value_validation::validate_value_for_admission(
+                            selected.effective.field_type(),
+                            proof,
+                            self.as_schema().defs(),
+                            FieldAncestry::from_input_mode(
+                                selected.effective.effective_input_mode(),
+                            ),
+                            lookup,
+                            None,
+                        )
+                    },
+                    unknown: None,
+                },
+            )
+            .into_result()
     }
 }
 

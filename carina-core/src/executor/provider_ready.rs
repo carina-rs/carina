@@ -283,8 +283,6 @@ pub struct ProviderPreparationContext<'a> {
         crate::resource::AbsoluteBindingAddress,
     >],
     normalizer: &'a dyn HostNormalizer,
-    custom_type_resolver:
-        crate::provider::FactoryCustomTypeResolver<&'a [Box<dyn ProviderFactory>]>,
     type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     schemas: &'a SchemaRegistry,
 }
@@ -298,17 +296,17 @@ impl<'a> ProviderPreparationContext<'a> {
             crate::resource::AbsoluteBindingAddress,
         >],
         normalizer: &'a dyn HostNormalizer,
-        factories: &'a [Box<dyn ProviderFactory>],
+        _factories: &'a [Box<dyn ProviderFactory>],
         schemas: &'a SchemaRegistry,
         type_checks: &'a dyn crate::validation::deferred_types::ProviderTypeCheckContext,
     ) -> Self {
-        let custom_type_resolver = crate::provider::FactoryCustomTypeResolver::new(factories);
+        // Keep the public constructor's factory argument for compatibility.
+        // Admission uses the resolver retained by the session's catalog.
         Self {
             bindings,
             module_gate,
             provider_configs,
             normalizer,
-            custom_type_resolver,
             schemas,
             type_checks,
         }
@@ -326,10 +324,6 @@ impl<'a> ProviderPreparationContext<'a> {
 
     pub(super) fn schemas(&self) -> &SchemaRegistry {
         self.schemas
-    }
-
-    fn custom_type_resolver(&self) -> &dyn crate::parser::CustomTypeResolver {
-        &self.custom_type_resolver
     }
 }
 
@@ -1048,7 +1042,6 @@ async fn prepare_provider_ready_resource_with_value_check<S: Clone, D: Clone + D
                 schema,
                 context.bindings,
                 context.type_checks,
-                context.custom_type_resolver(),
             ),
         )?
     };
@@ -1155,7 +1148,6 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
                 schema,
                 context.bindings,
                 context.type_checks,
-                context.custom_type_resolver(),
             ),
         )?
     };
@@ -1756,24 +1748,29 @@ mod provider_config_tests {
             }
         }
         let calls = Arc::new(AtomicUsize::new(0));
-        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(RoutingFactory {
-            name: "owner",
-            declaration: PatternAttributeType::list(PatternAttributeType::refined_string(
-                Some(TypeIdentity::bare("VpcId")),
-                None,
-                None,
-                None,
-            )),
-            sibling_declaration: None,
-            accepted: Some("vpc-good"),
-            validate_calls: Arc::clone(&calls),
-            seen_values: None,
-        })];
-        let schemas = test_schema_registry(&factories);
+        let factories: Arc<Vec<Box<dyn ProviderFactory>>> =
+            Arc::new(vec![Box::new(RoutingFactory {
+                name: "owner",
+                declaration: PatternAttributeType::list(PatternAttributeType::refined_string(
+                    Some(TypeIdentity::bare("VpcId")),
+                    None,
+                    None,
+                    None,
+                )),
+                sibling_declaration: None,
+                accepted: Some("vpc-good"),
+                validate_calls: Arc::clone(&calls),
+                seen_values: None,
+            })]);
+        let snapshot = crate::provider::loaded_provider_snapshot_from_factories(
+            Arc::clone(&factories),
+            SchemaRegistry::new(),
+            crate::EnvironmentSnapshot::empty(),
+        );
         let bindings = ResolvedBindings::default();
         let module_gate = ModuleConstraintGate::from_live_compositions(&[]);
         crate::validation::deferred_types::with_session_for_test_async(
-            &crate::parser::LoadedProviderContext::empty_for_test(),
+            snapshot.provider_context(),
             async |type_checks| {
                 let normalizer_boundary =
                     crate::provider::ConfiguredNormalizer::fixture(&DefaultingNormalizer);
@@ -1783,7 +1780,7 @@ mod provider_config_tests {
                     &[],
                     &normalizer_boundary,
                     &factories,
-                    &schemas,
+                    snapshot.schemas().schemas(),
                     type_checks,
                 );
                 let resource = Resource::with_provider("owner", "test.owner", "example", None);

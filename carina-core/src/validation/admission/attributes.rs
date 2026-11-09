@@ -223,7 +223,6 @@ pub(crate) fn admit_apply_resource<S, D>(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     bindings: &ResolvedBindings,
     session: &dyn ProviderTypeCheckContext,
-    resolver: &dyn crate::parser::CustomTypeResolver,
 ) -> Result<AdmittedAttributes<kind::ResourceAttribute>, ApplyAdmissionErrors> {
     admit_apply_attributes::<kind::ResourceAttribute>(
         &resource.id,
@@ -233,7 +232,6 @@ pub(crate) fn admit_apply_resource<S, D>(
         schema,
         bindings,
         session,
-        resolver,
     )
 }
 
@@ -246,7 +244,6 @@ pub(crate) fn admit_apply_data_source<S, D>(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     bindings: &ResolvedBindings,
     session: &dyn ProviderTypeCheckContext,
-    resolver: &dyn crate::parser::CustomTypeResolver,
 ) -> Result<AdmittedAttributes<kind::DataSourceAttribute>, ApplyAdmissionErrors> {
     admit_apply_attributes::<kind::DataSourceAttribute>(
         &resource.id,
@@ -256,7 +253,6 @@ pub(crate) fn admit_apply_data_source<S, D>(
         schema,
         bindings,
         session,
-        resolver,
     )
 }
 
@@ -272,7 +268,6 @@ fn admit_apply_attributes<K: RechecksResolved>(
     schema: crate::schema::OwnerBoundResourceSchema<'_>,
     bindings: &ResolvedBindings,
     session: &dyn ProviderTypeCheckContext,
-    resolver: &dyn crate::parser::CustomTypeResolver,
 ) -> Result<AdmittedAttributes<K>, ApplyAdmissionErrors> {
     use std::cell::RefCell;
     let mut projected = std::collections::HashMap::new();
@@ -308,7 +303,6 @@ fn admit_apply_attributes<K: RechecksResolved>(
         .map(|(name, proof)| (name.clone(), (**proof).clone()))
         .collect();
     let failures = RefCell::new(Vec::new());
-    let lookup = crate::parser::custom_type_lookup_for_schema(resolver, schema);
     let mut report = schema
         .schema()
         .as_schema()
@@ -320,32 +314,10 @@ fn admit_apply_attributes<K: RechecksResolved>(
                 let destination =
                     schema.admission_selected_attribute::<K>(id, name, selected, session.catalog());
                 let result = Candidate::apply(projected[name].clone(), session).and_then(
-                    |(candidate, mut boundary)| {
-                        boundary.lookup = Some(&lookup);
-                        admit(&destination, candidate, &boundary)
-                    },
+                    |(candidate, boundary)| admit_apply(&destination, candidate, &boundary),
                 );
                 match result {
-                    Ok(mut admission) => {
-                        let findings = admission.take_findings();
-                        match admission {
-                            Admission::Ready(_placed) => {}
-                            Admission::Pending(pending) => {
-                                let error = AdmissionErrors::from(KnowledgeError::<
-                                    AbsoluteBindingAddress,
-                                >::UnresolvedAtBoundary {
-                                    sites: pending.sites().to_vec(),
-                                });
-                                let findings =
-                                    admission_findings::<K, NoPlaceholder, AbsoluteBindingAddress>(
-                                        &mut Err(error.clone()),
-                                    );
-                                failures.borrow_mut().push(error);
-                                return findings;
-                            }
-                        }
-                        findings
-                    }
+                    Ok(mut placed) => placed.take_findings(),
                     Err(mut error) => match error.take_findings() {
                         Some(findings) => findings,
                         None => {
@@ -492,51 +464,6 @@ pub(crate) fn admit_validation_attributes<
             }),
         },
     )
-}
-
-/// Keep schema unit-test lookups inside the production admission boundary.
-#[cfg(test)]
-pub(crate) fn admit_resource_attribute_fixture<P: PlaceholderKind, B: BindingAddress>(
-    schema: &crate::schema::ValidatedResourceSchema,
-    attributes: &std::collections::HashMap<
-        String,
-        crate::resource::knowledge::Classification<'_, P, B>,
-    >,
-    is_string_literal: &dyn Fn(&str) -> bool,
-    lookup: crate::schema::CustomTypeLookup<'_>,
-) -> crate::schema::ResourceValueValidation {
-    let mut schemas = SchemaRegistry::new();
-    schemas.insert("test", schema.clone());
-    let schema = schemas
-        .get("test", schema.parts().resource_type, schema.parts().kind)
-        .expect("fixture schema must be registered");
-    let catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
-    let id = ResourceId::pending_with_provider("test", schema.schema().parts().resource_type, None);
-    crate::validation::deferred_types::with_session_for_test(&catalog, |session| {
-        let admit_attribute =
-            |proof: &crate::resource::knowledge::Classification<'_, P, B>,
-             destination: &Destination<kind::ResourceAttribute>| {
-                let (candidate, mut boundary) =
-                    Candidate::validation_classified(proof.clone(), None, session);
-                boundary.lookup = Some(lookup);
-                admission_findings(&mut admit(destination, candidate, &boundary))
-            };
-        schema.schema().as_schema().validate_admission_report(
-            attributes,
-            is_string_literal,
-            &crate::schema::value_validation::AttributeAdmission {
-                known: &|name, selected, proof| {
-                    let destination =
-                        schema.admission_selected_attribute(&id, name, selected, session.catalog());
-                    admit_attribute(proof, &destination)
-                },
-                unknown: Some(&|name, proof| {
-                    let destination = schema.untyped_attribute(&id, name, session.catalog());
-                    admit_attribute(proof, &destination)
-                }),
-            },
-        )
-    })
 }
 
 /// Exhaustive resource/data-source policy shared by all analysis adapters.
@@ -949,7 +876,6 @@ mod review_tests {
                     schemas.get_for(&resource).unwrap(),
                     &ResolvedBindings::default(),
                     session,
-                    catalog.as_provider_context().custom_type_resolver(),
                 );
                 let errors = match result {
                     Err(ApplyAdmissionErrors::Constraints(report)) => report

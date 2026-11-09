@@ -146,14 +146,15 @@ pub(crate) use expressions::string_literal::{
     display_double_quoted_literal_part, escape_double_quoted_character, unescape_string,
 };
 pub use expressions::string_literal::{display_string_literal, encode_string_literal};
+#[cfg(test)]
+pub(crate) use functions::custom_type_lookup_for_schema;
 pub use functions::{
     contains_function_call, custom_type_lookup_for_factory, validate_custom_type,
     validate_schema_custom_type,
 };
 pub(crate) use functions::{
-    contains_module_argument_matching, custom_type_canonicalization_error,
-    custom_type_lookup_for_schema, function_argument_as_eval, substitute_fn_params,
-    validate_builtin_custom_type, validate_schema_custom_type_with_context,
+    contains_module_argument_matching, custom_type_lookup_for_owner, function_argument_as_eval,
+    substitute_fn_params, validate_builtin_custom_type, validate_schema_custom_type_with_context,
 };
 pub use resolve::{
     ProviderConfigInvariantError, ProviderConfigResolutionError, ResolvedProviderConfig,
