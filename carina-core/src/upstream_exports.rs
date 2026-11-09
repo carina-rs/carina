@@ -5132,16 +5132,15 @@ mod tests {
 
         assert!(errors.is_empty(), "unexpected resolve errors: {errors:?}");
         for name in ["out", "reversed"] {
-            assert!(matches!(
-                &exports["ups"][name].static_type,
-                UpstreamExportType::Static(ExportStaticType::Inferred(
-                    crate::static_type::StaticType::Unchecked(
-                        crate::static_type::ConsumerInferredUncheckedReason::InferenceFailed(
-                            crate::static_type::InferenceError::HeterogeneousCollection { .. }
-                        )
-                    )
-                ))
-            ));
+            assert_eq!(
+                exports["ups"][name].static_type,
+                UpstreamExportType::Static(ExportStaticType::Inferred(consumer_inferred_type(
+                    TypeExpr::List(Box::new(TypeExpr::SchemaType {
+                        owned: owned.clone().unbounded_witness_for_test(),
+                    })),
+                ))),
+                "annotation and attribute reads share one identity-level value type"
+            );
         }
     }
 

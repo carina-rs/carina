@@ -78,6 +78,29 @@ impl ValueTypeDeclaration {
         })
     }
 
+    /// Structural scalars have the same value evidence as an authored
+    /// identity annotation. Exact dispatch/kind metadata still needs provenance.
+    pub(super) fn requires_exact_provenance(&self) -> bool {
+        match self {
+            Self::String(layer) => layer.binding.callback().is_some() || layer.to_dsl.is_some(),
+            Self::Int(layer) => layer.binding.callback().is_some(),
+            Self::Float { binding, range: _ } => binding.callback().is_some(),
+            Self::Reference {
+                identity: _,
+                pattern: _,
+                length: _,
+            }
+            | Self::Enum {
+                identity: _,
+                base: _,
+                values: _,
+                dsl_aliases: _,
+                validate: _,
+                to_dsl: _,
+            } => true,
+        }
+    }
+
     pub(super) fn materialize(&self) -> CompiledAttributeType {
         let kind = match self {
             Self::String(identity_layer) => AttrTypeKind::String {

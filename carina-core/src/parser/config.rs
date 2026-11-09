@@ -519,6 +519,9 @@ impl ResolvedSchemaType {
     ) -> Option<Self> {
         let owner = owner.into();
         let projection = super::value_type::ValueTypeDeclaration::from_declaration(declaration)?;
+        if !projection.requires_exact_provenance() {
+            return Self::from_annotation_declaration(owner, declaration);
+        }
         let fingerprint = projection.fingerprint();
         Some(Self(std::sync::Arc::new(ResolvedScalarDeclaration {
             owned: OwnedTypeIdentity::from_schema_declaration(owner.clone(), declaration)?,
@@ -531,14 +534,6 @@ impl ResolvedSchemaType {
             projection: Some(projection),
             projection_fingerprint: Some(fingerprint),
         })))
-    }
-
-    pub(crate) fn from_identity_declaration(
-        owner: impl Into<String>,
-        declaration: &AttributeType,
-    ) -> Option<Self> {
-        declaration.scalar_identity_parts()?;
-        Self::from_annotation_declaration(owner, declaration)
     }
 
     pub(crate) fn from_annotation_declaration(
@@ -650,16 +645,21 @@ impl ResolvedSchemaType {
         self.0.evidence.materialize(self)
     }
     pub(crate) fn owner_patterns(&self) -> impl Iterator<Item = &crate::schema::CompiledPattern> {
-        let annotation = match &self.0.evidence {
-            ResolvedConstraintEvidence::Annotation(constraints) => Some(constraints),
+        let (annotation, projection) = match &self.0.evidence {
+            ResolvedConstraintEvidence::Annotation(constraints) => (Some(constraints), None),
             ResolvedConstraintEvidence::Projection {
                 owner: _,
-                constraints: _,
-            } => None,
+                constraints,
+            } => (None, Some(constraints)),
         };
         annotation
             .into_iter()
             .flat_map(super::scalar_constraints::IdentityConstraints::owner_patterns)
+            .chain(
+                projection
+                    .into_iter()
+                    .flat_map(super::scalar_constraints::ValueConstraints::patterns),
+            )
     }
 
     pub(crate) fn has_empty_intersection(&self) -> bool {

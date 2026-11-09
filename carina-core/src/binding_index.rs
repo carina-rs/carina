@@ -3421,6 +3421,74 @@ mod tests {
 
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
     #[test]
+    fn round11_declared_widening_checks_identity_bound_containment() {
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::ParsedFile::default();
+        let schemas = SchemaRegistry::new();
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
+        for id in ["aws.iam.Role.Arn", "aws.Arn"] {
+            let wide = AttributeType::refined_string(
+                Some(TypeIdentity::from_dotted(id)),
+                None,
+                Some((Some(1), Some(2048))),
+                None,
+            );
+            let exact = TypeExpr::SchemaType {
+                owned: crate::parser::ResolvedSchemaType::from_schema_declaration("test", &wide)
+                    .unwrap(),
+            };
+            let source = ResolvedRefType::new(wide, BTreeMap::new())
+                .with_value_declaration(&exact, &bindings)
+                .unwrap();
+            let narrow = AttributeType::refined_string(
+                Some(TypeIdentity::from_dotted("aws.Arn")),
+                None,
+                Some((Some(1), Some(10))),
+                None,
+            );
+            let sink = TypeInSchema::schemaless(&narrow).with_authority(
+                &context.custom_types,
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+            );
+            assert!(
+                matches!(
+                    source.assignment_to_sink(sink, &bindings),
+                    DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(_))
+                ),
+                "{id} identity bounds cannot widen into 1..=10"
+            );
+        }
+        for id in ["aws.Count", "aws.service.Counter.Count"] {
+            let wide = AttributeType::refined_int(
+                Some(TypeIdentity::from_dotted(id)),
+                Some((Some(0), Some(2048))),
+            );
+            let exact = TypeExpr::SchemaType {
+                owned: crate::parser::ResolvedSchemaType::from_schema_declaration("test", &wide)
+                    .unwrap(),
+            };
+            let source = ResolvedRefType::new(wide, BTreeMap::new())
+                .with_value_declaration(&exact, &bindings)
+                .unwrap();
+            let narrow = AttributeType::refined_int(
+                Some(TypeIdentity::from_dotted("aws.Count")),
+                Some((Some(0), Some(10))),
+            );
+            let sink = TypeInSchema::schemaless(&narrow).with_authority(
+                &context.custom_types,
+                crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+            );
+            assert!(
+                matches!(
+                    source.assignment_to_sink(sink, &bindings),
+                    DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(_))
+                ),
+                "{id} identity ranges cannot widen into 0..=10"
+            );
+        }
+    }
+
+    #[test]
     fn inferred_evidence_mismatch_keeps_constraints_after_the_declaration_passes() {
         let identity = TypeIdentity::from_dotted("aws.iam.Role.Name");
         let wide = AttributeType::refined_string(

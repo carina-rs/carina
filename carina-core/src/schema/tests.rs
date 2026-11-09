@@ -11776,11 +11776,20 @@ fn typed_ref_anonymous_refined_string_preserves_named_identity_rules() {
     let narrow = named(&[], Some((Some(10), Some(40))));
     let wide = named(&[], Some((Some(1), Some(1024))));
     assert!(
-        assignable(&wide, &narrow),
-        "matching identity retains the destination value check"
+        !assignable(&wide, &narrow),
+        "matching identities still require identity-bound containment"
     );
-    assert!(assignable(&arn, &narrow));
+    assert!(!assignable(&arn, &narrow));
     assert!(assignable(&narrow, &wide));
+    let slot = AttributeType::string_member(
+        StringIdentityLayer::new(Some(TypeIdentity::from_dotted("aws.Arn")), None, None, None),
+        StringMemberConstraints::new(None, Some((Some(10), Some(40)))),
+    );
+    assert!(assignable(&arn, &slot));
+    assert!(
+        assignable(&wide, &slot),
+        "member bounds retain the resolved-value obligation"
+    );
 }
 
 #[test]
@@ -18541,4 +18550,29 @@ fn secret_validation_keeps_opaque_causes_until_the_provider_boundary() {
         "validation-private",
     ]));
     assert_eq!(error.to_string(), "invalid reference: (secret)");
+}
+
+#[test]
+fn round11_builtin_matching_requires_a_shared_callback() {
+    let declaration = super::AttributeType::refined_string(
+        Some(TypeIdentity::bare("TestBuiltin")),
+        None,
+        None,
+        None,
+    );
+    assert!(
+        !same_builtin_declaration(
+            declaration.scalar_identity_parts(),
+            declaration.scalar_identity_parts().unwrap()
+        ),
+        "absence of both callbacks is not pointer identity"
+    );
+    for builtin in builtin_type_registry().values() {
+        let parts = builtin.scalar_identity_parts().unwrap();
+        assert!(
+            parts.callback().is_some(),
+            "all canonical builtins retain their semantic validator"
+        );
+        assert!(same_builtin_declaration(Some(parts), parts));
+    }
 }

@@ -50,13 +50,18 @@ fn text(value: &str) -> Value {
 fn reference() -> Value {
     Value::root_resource_ref("producer", "output", vec![])
 }
-fn string_type(name: &str, max: Option<u64>) -> AttributeType {
-    AttributeType::refined_string(
-        Some(TypeIdentity::bare(name)),
-        None,
-        max.map(|max| (None, Some(max))),
-        None,
+fn string_slot(
+    name: &str,
+    pattern: Option<crate::schema::PatternSpec>,
+    length: Option<(Option<u64>, Option<u64>)>,
+) -> AttributeType {
+    AttributeType::string_member(
+        crate::schema::StringIdentityLayer::new(Some(TypeIdentity::bare(name)), None, None, None),
+        crate::schema::StringMemberConstraints::new(pattern, length),
     )
+}
+fn string_type(name: &str, max: Option<u64>) -> AttributeType {
+    string_slot(name, None, max.map(|max| (None, Some(max))))
 }
 
 pub(super) fn fixture<R>(
@@ -601,13 +606,13 @@ fn declared_reference_defers_same_identity_local_constraints_at_resource_sink() 
 #[test]
 fn wider_same_identity_range_records_destination_obligation() {
     fixture(
-        AttributeType::refined_int(
-            Some(TypeIdentity::bare("Port")),
-            Some((Some(0), Some(65535))),
+        AttributeType::int_member(
+            crate::schema::IntIdentityLayer::new(Some(TypeIdentity::bare("Port")), None),
+            crate::schema::IntMemberConstraints::new(Some((Some(0), Some(65535)))),
         ),
-        AttributeType::refined_int(
-            Some(TypeIdentity::bare("Port")),
-            Some((Some(1), Some(1024))),
+        AttributeType::int_member(
+            crate::schema::IntIdentityLayer::new(Some(TypeIdentity::bare("Port")), None),
+            crate::schema::IntMemberConstraints::new(Some((Some(1), Some(1024)))),
         ),
         |catalog, _, bindings, destination| {
             with_session_for_test(catalog, |session| {
@@ -698,12 +703,7 @@ fn discharge_checks_target_role_arn_and_preserves_error_and_path_once() {
         vec![
             StructField::required(
                 "role_arn",
-                AttributeType::refined_string(
-                    Some(TypeIdentity::bare("Arn")),
-                    None,
-                    Some((Some(1), Some(1600))),
-                    None,
-                ),
+                string_slot("Arn", None, Some((Some(1), Some(1600)))),
             )
             .build(),
         ],
@@ -920,8 +920,8 @@ fn slot_identity_mismatches_do_not_mutate() {
 fn infra_case(binding: &str, nested: bool, uuid: bool) {
     let identity = if uuid { "GroupId" } else { "Arn" };
     let source = string_type(identity, uuid.then_some(64));
-    let scalar = AttributeType::refined_string(
-        Some(TypeIdentity::bare(identity)),
+    let scalar = string_slot(
+        identity,
         uuid.then(|| {
             crate::schema::PatternSpec::new(
                 "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -929,7 +929,6 @@ fn infra_case(binding: &str, nested: bool, uuid: bool) {
             )
         }),
         Some((Some(1), Some(if uuid { 36 } else { 1600 }))),
-        None,
     );
     let target = if nested {
         AttributeType::struct_(

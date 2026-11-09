@@ -225,7 +225,7 @@ use crate::provider_text::{DiagnosticText, DiagnosticTextBuilder, ProviderKey};
 use crate::resource::InsideSecret;
 use std::borrow::Cow;
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
@@ -13825,34 +13825,43 @@ impl RefinedScalarKind {
     }
 }
 
+/// Shared inclusive interval spelling for schema diagnostics and hover metadata.
+pub fn format_refinement_bounds<T: fmt::Display>((min, max): (Option<T>, Option<T>)) -> String {
+    match (min, max) {
+        (Some(min), Some(max)) => format!("{min}..={max}"),
+        (Some(min), None) => format!("{min}..unbounded"),
+        (None, Some(max)) => format!("unbounded..={max}"),
+        (None, None) => "unbounded".into(),
+    }
+}
+
 impl<R: PatternForm> PatternAttributeType<R> {
     fn scalar_diagnostic_name(&self) -> String {
-        fn bounds<T: fmt::Display>(bounds: Option<(Option<T>, Option<T>)>) -> String {
-            let (min, max) = bounds.unwrap_or((None, None));
-            match (min, max) {
-                (Some(min), Some(max)) => format!("{min}..={max}"),
-                (Some(min), None) => format!("{min}..unbounded"),
-                (None, Some(max)) => format!("unbounded..={max}"),
-                (None, None) => "unbounded".into(),
-            }
-        }
         let mut constraints = Vec::new();
         match &self.kind {
             AttrTypeKind::String {
                 identity_layer:
                     StringIdentityLayer {
-                        binding: _binding,
+                        binding,
                         pattern,
                         length,
                         ..
                     },
                 member_layer,
             } => {
-                constraints.push(format!("length {}", bounds(*length)));
-                if let Some(pattern) = pattern {
+                constraints.push(format!(
+                    "length {}",
+                    format_refinement_bounds(length.unwrap_or_default())
+                ));
+                let mut patterns: BTreeSet<&PatternSpec> =
+                    pattern.as_ref().map(AsRef::as_ref).into_iter().collect();
+                if let Some(annotation) = binding.annotation() {
+                    patterns.extend(annotation.owner_patterns().map(AsRef::as_ref));
+                }
+                for pattern in patterns {
                     constraints.push(format!(
                         "pattern {}",
-                        PatternSpecDisplay::new(pattern.as_ref()).quoted()
+                        PatternSpecDisplay::new(pattern).quoted()
                     ));
                 }
                 if let Some(pattern) = &member_layer.pattern {
@@ -13862,13 +13871,19 @@ impl<R: PatternForm> PatternAttributeType<R> {
                     ));
                 }
                 if member_layer.length.is_some() {
-                    constraints.push(format!("member length {}", bounds(member_layer.length)));
+                    constraints.push(format!(
+                        "member length {}",
+                        format_refinement_bounds(member_layer.length.unwrap_or_default())
+                    ));
                 }
             }
             AttrTypeKind::Reference {
                 pattern, length, ..
             } => {
-                constraints.push(format!("length {}", bounds(*length)));
+                constraints.push(format!(
+                    "length {}",
+                    format_refinement_bounds(length.unwrap_or_default())
+                ));
                 if let Some(pattern) = pattern {
                     constraints.push(format!(
                         "pattern {}",
@@ -13883,14 +13898,21 @@ impl<R: PatternForm> PatternAttributeType<R> {
                         range: member_range,
                     },
             } => {
-                constraints.push(format!("range {}", bounds(*range)));
+                constraints.push(format!(
+                    "range {}",
+                    format_refinement_bounds(range.unwrap_or_default())
+                ));
                 if member_range.is_some() {
-                    constraints.push(format!("member range {}", bounds(*member_range)));
+                    constraints.push(format!(
+                        "member range {}",
+                        format_refinement_bounds(member_range.unwrap_or_default())
+                    ));
                 }
             }
-            AttrTypeKind::Float { range, .. } => {
-                constraints.push(format!("range {}", bounds(*range)))
-            }
+            AttrTypeKind::Float { range, .. } => constraints.push(format!(
+                "range {}",
+                format_refinement_bounds(range.unwrap_or_default())
+            )),
             AttrTypeKind::Enum { base, values, .. } => {
                 let values = values.as_ref().map_or_else(
                     || "any".into(),
@@ -13990,8 +14012,7 @@ fn same_builtin_declaration(
     }
     match (declaration.callback(), builtin.callback()) {
         (Some(actual), Some(expected)) => Arc::ptr_eq(actual, expected),
-        (None, None) => true,
-        _ => false,
+        (None, None) | (Some(_), None) | (None, Some(_)) => false,
     }
 }
 

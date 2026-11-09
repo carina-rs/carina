@@ -9340,7 +9340,10 @@ fn enum_definition_signature(attribute_type: &AttributeType) -> Option<EnumDefin
 struct OwnerCustomTypeIndex {
     factory_index: usize,
     declarations: BTreeMap<TypeIdentity, Vec<AttributeType>>,
-    identity_declarations: BTreeMap<TypeIdentity, crate::parser::ResolvedSchemaType>,
+    identity_declarations: BTreeMap<
+        TypeIdentity,
+        Result<crate::parser::ResolvedSchemaType, crate::parser::CustomTypeValidationError>,
+    >,
 }
 
 struct ProviderFactorySchemaSnapshot {
@@ -9509,6 +9512,7 @@ where
                 .identity_declarations
                 .get(owned.identity())
             {
+                let declaration = declaration.as_ref().map_err(Clone::clone)?;
                 if declaration.scalar_kind() != owned.scalar_kind() {
                     return Err(missing());
                 }
@@ -9676,24 +9680,31 @@ fn build_owner_custom_type_index(
             // this owner, once. Different owners are conjoined at resolution.
             let identity_declarations = declarations
                 .iter()
-                .filter_map(|(identity, declarations)| {
-                    let mut layers = declarations
-                        .iter()
-                        .map(|declaration| {
-                            crate::parser::ResolvedSchemaType::from_identity_declaration(
-                                &factory.name,
-                                declaration,
-                            )
+                .map(|(identity, declarations)| {
+                    let mut layers = declarations.iter().map(|declaration| {
+                        crate::parser::ResolvedSchemaType::from_annotation_declaration(
+                            &factory.name,
+                            declaration,
+                        )
+                        .ok_or_else(|| {
+                            crate::parser::CustomTypeValidationError::MissingDeclaration {
+                                owner: factory.name.clone(),
+                                identity: identity.clone(),
+                            }
                         })
-                        .collect::<Option<Vec<_>>>()?
-                        .into_iter();
-                    let mut resolved = layers.next()?;
-                    for layer in layers {
-                        // Float retains its within-owner range conjunction;
-                        // String/Int identities already agree at admission.
-                        resolved = resolved.conjoin(&layer);
-                    }
-                    Some((identity.clone(), resolved))
+                    });
+                    // Every grouped identity has a declaration. Enum/Reference
+                    // bases contribute constraints too; unsupported bases keep
+                    // a typed failure in the index instead of dropping its key.
+                    let resolved = layers
+                        .next()
+                        .expect("nonempty identity declaration group")
+                        .and_then(|first| {
+                            layers.try_fold(first, |resolved, layer| {
+                                layer.map(|layer| resolved.conjoin(&layer))
+                            })
+                        });
+                    (identity.clone(), resolved)
                 })
                 .collect();
             (
@@ -10236,6 +10247,47 @@ mod tests {
                 SchemaRegistry::new(),
                 crate::EnvironmentSnapshot::empty(),
             )
+        }
+
+        #[test]
+        fn round11_owner_index_is_total_for_scalar_and_enum_declarations() {
+            use crate::provider::{ProviderFactorySchemaSnapshot, build_owner_custom_type_index};
+            use crate::schema::PatternAttributeType;
+            use std::collections::BTreeMap;
+            let id = TypeIdentity::from_dotted("test.X");
+            let scalar = PatternAttributeType::refined_string(Some(id.clone()), None, None, None);
+            let enumeration = PatternAttributeType::enum_with_base(
+                id.clone(),
+                PatternAttributeType::string(),
+                Some(vec!["yes".into()]),
+                Vec::new(),
+                None,
+                None,
+            );
+            let witness = ValidatedProviderSchemaWitness::new(
+                Vec::new(),
+                ValidatedConfigSchema::validate(BTreeMap::from([
+                    ("scalar".into(), scalar),
+                    ("enum".into(), enumeration),
+                ]))
+                .unwrap(),
+                Default::default(),
+                Vec::new(),
+            )
+            .unwrap();
+            let snapshots = [ProviderFactorySchemaSnapshot {
+                name: "test".into(),
+                witness,
+            }];
+            let index = build_owner_custom_type_index(&snapshots);
+            assert!(
+                index["test"]
+                    .identity_declarations
+                    .get(&id)
+                    .is_some_and(Result::is_ok),
+                "an enum base must not drop the identity's scalar index"
+            );
+            assert_eq!(index["test"].declarations[&id].len(), 2);
         }
 
         #[test]

@@ -10,11 +10,14 @@ use crate::schema::assignability::AssignmentRelation;
 fn reference_judgement_uses_the_contract_already_found() {
     use crate::schema::{AttributeType, TypeIdentity};
     let string = |max| {
-        AttributeType::refined_string(
-            Some(TypeIdentity::bare("Id")),
-            None,
-            Some((None, Some(max))),
-            None,
+        AttributeType::string_member(
+            crate::schema::StringIdentityLayer::new(
+                Some(TypeIdentity::bare("Id")),
+                None,
+                None,
+                None,
+            ),
+            crate::schema::StringMemberConstraints::new(None, Some((None, Some(max)))),
         )
     };
     super::tests::fixture(

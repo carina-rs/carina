@@ -59,13 +59,18 @@ are invalid. Owner sets derive from layer keys. Retained records accept empty
 same-owner bounds as well as empty cross-owner intersections: after normalizing
 Float bounds, decoding verifies the exact conjunction of the owner layers and
 recomputes the `empty_intersection` marker. Exact projection records reject
-unknown constraint fields. Portable type equality includes origin and projection
-fingerprint, which excludes declaration-local member constraints.
+unknown constraint fields. Annotation pattern conjunctions retain a sorted,
+deduplicated set of every pattern, including same-owner repeats. Structural
+scalar reads use the same canonical evidence as identity annotations: equal
+identity-level types compare and serialize equally. Callbacks, transforms, enums
+and references retain exact projection provenance, excluding slot members.
 
 Member constraints belong to the destination slot, and are enforced when writing
 resource/config attributes, nested fields and annotated sinks through identity
-admission and the existing deferred destination obligation. Static disjointness
-uses the source's identity bounds and the destination's effective bounds.
+admission and the existing deferred destination obligation. Source identity
+bounds must be contained by destination identity bounds. Member constraints defer
+unless source identity bounds are provably disjoint from effective destination
+bounds.
 Unannotated collections, conditionals and coalesce retain main's equality-only
 rule: all alternatives must infer identical `TypeExpr`s. Slot reads differing
 only in member layers therefore compare equal. An explicit compatible annotation
@@ -83,10 +88,11 @@ or an allowed structural/provider widening. This includes binding/export
 annotations, map/list element annotations, module arguments, and user-function
 parameters and returns. Destination member constraints remain resolved-value
 obligations; every destination kind supports the existing `NeedsLocal` path.
-Provably disjoint String lengths or Int ranges reject statically; unproven
-pattern containment defers to the destination value check (#4349). Int-to-Float
-widening uses source identity bounds and defers overlapping values to the
-destination check. Float-to-Float retains main's range containment. Annotated
+Identity bounds retain String length / Int range containment checks for both
+same-identity and widening admission. Destination member constraints retain the
+existing `NeedsLocal` check, with only proven disjointness rejecting statically;
+unproven pattern containment defers (#4349). Int-to-Float widening uses identity
+bound containment too. Float-to-Float retains main's range containment. Annotated
 sink mismatches render the differing constraints or scalar kinds when the nominal
 names alone would be identical.
 

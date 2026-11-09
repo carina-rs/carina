@@ -916,7 +916,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         use TypeAssignability::*;
         // Same identity is the zero-edge case of nominal admission. Reference
         // destinations retain their existing resolved-value obligation for any
-        // admitted identity; unproven member containment is never a mismatch.
+        // admitted identity. Identity bounds must fit the destination identity;
+        // only member bounds use disjointness and the resolved-value obligation.
         let scalar = matches!(&source.attr.kind, String { .. } | Int { .. })
             && matches!(&target.attr.kind, String { .. } | Int { .. } | Float { .. });
         if let Some(obligation) = check.destination_obligation(scalar)
@@ -924,6 +925,9 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 identity_leaf(&source.attr.kind).and_then(|leaf| leaf.identity())
             && let Some(target_identity) = identity_leaf(&target.attr.kind)
         {
+            let identity_fits = identity_scalar_constraints(left, source_refs)
+                .zip(identity_scalar_constraints(right.ty, sink_refs))
+                .is_some_and(|(source, target)| source.contained_by(target));
             let disjoint = target.attr.has_empty_scalar_intersection()
                 || identity_scalar_constraints(left, source_refs)
                     .zip(sink_scalar_constraints(right.ty, sink_refs))
@@ -932,7 +936,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 right
                     .identity_assignment(source_identity, target_identity)
                     .into(),
-                if disjoint {
+                if !identity_fits || disjoint {
                     Mismatch.into()
                 } else {
                     obligation
@@ -1900,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn nominal_int_to_float_admission_uses_identity_bounds_and_defers_overlap() {
+    fn nominal_int_to_float_admission_uses_identity_bound_containment() {
         use crate::schema::{AttributeType, IntIdentityLayer, IntMemberConstraints};
         let catalog = crate::parser::ProviderCustomTypes::default();
         let owner = crate::parser::SchemaTypeOwner::Provider("test".into());
@@ -1908,7 +1912,7 @@ mod tests {
             Some(TypeIdentity::from_dotted("aws.Count")),
             Some((
                 Some(crate::FiniteF64::new(0.0).unwrap()),
-                Some(crate::FiniteF64::new(10.0).unwrap()),
+                Some(crate::FiniteF64::new(100.0).unwrap()),
             )),
         );
         let sink =
@@ -1949,7 +1953,7 @@ mod tests {
         }
         let disjoint = AttributeType::refined_int(
             Some(TypeIdentity::from_dotted("aws.service.Counter.Count")),
-            Some((Some(20), Some(30))),
+            Some((Some(200), Some(300))),
         );
         assert!(matches!(
             TypeInSchema::schemaless(&disjoint).assignment_on_paths(
@@ -1960,6 +1964,14 @@ mod tests {
             ),
             AssignmentRelation::Mismatch
         ));
+        let overlapping = AttributeType::refined_int(
+            Some(TypeIdentity::from_dotted("aws.service.Counter.Count")),
+            Some((Some(0), Some(2048))),
+        );
+        assert_eq!(
+            TypeInSchema::schemaless(&overlapping).assignment_to(sink),
+            TypeAssignability::Mismatch
+        );
         // With no source identity, the deleted nominal arm's rejection still
         // belongs to ordinary scalar compatibility, never the nominal seam.
         assert_eq!(

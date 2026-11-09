@@ -637,8 +637,11 @@ A struct type represents a nested object with typed fields.
   `owner_layers`; multi-owner annotations retain exactly one identity layer per
   owner. Decoding verifies the exact conjunction of owner layers, including
   empty bounds from same-owner repeats, and recomputes the empty-intersection
-  marker after Float normalization. Owner sets derive from layer keys. Portable
-  equality includes origin and identity-only projection fingerprint.
+  marker after Float normalization. Owner sets derive from layer keys. Annotation
+  pattern conjunctions are sorted, deduplicated sets, including same-owner repeats.
+  Structural scalar reads use the same canonical evidence as identity annotations,
+  so equal identity-level types compare and serialize equally. Callbacks,
+  transforms, enums and references retain exact projection provenance.
   A member layer belongs to its destination slot. Enforce it on writes through
   identity admission and the deferred destination check; source bounds are
   identity-layer bounds only. Unannotated collections, conditionals and coalesce
@@ -650,8 +653,8 @@ A struct type represents a nested object with typed fields.
   declarations and their fingerprints preserve both layers. Hover renders
   both layers through the core's read-only bounded refinement walk, which counts
   refined String/Int/Reference leaves and structural nodes, including Refs and
-  nested unions. Plain scalar leaves cost no budget; only actual omissions mark
-  truncation. Shared provider docgen must render both layers too. WIT stays 0.2.0.
+  nested unions. Identity-only leaves expose their names without consuming budget;
+  plain scalar leaves cost no budget, and only actual omissions mark truncation. Shared provider docgen must render both layers too. WIT stays 0.2.0.
   Schema fingerprints use v13 and saved plans use format 44; format 43 plans
   must fail the version gate before decoding the payload. Saved module
   `pending_constraints` contain `ValidateExpr` values, not retained types;
@@ -659,10 +662,11 @@ A struct type represents a nested object with typed fields.
   Every typed sink uses the same String/Int identity-admission rule for
   equal identities and allowed widenings (#4349), including annotations,
   exports, module arguments, and function parameters/returns. All destination
-  kinds can retain the existing `NeedsLocal` resolved-value obligation; reject
-  only proven disjoint identity bounds against the destination's effective
-  bounds. Int-to-Float widening also uses source identity bounds and retains
-  the destination value check; Float-to-Float keeps main's range containment.
+  kinds can retain the existing `NeedsLocal` resolved-value obligation. Source
+  identity bounds must be contained by destination identity bounds. Member
+  constraints defer unless source identity bounds are provably disjoint from
+  the effective destination bounds. Int-to-Float widening uses identity-bound
+  containment too; Float-to-Float keeps main's range containment.
   Unproven regex containment defers to the value check. At annotated sinks,
   declaration equality and display-name equality do not replace identity
   admission; mismatch names expose differing constraints or scalar kinds.

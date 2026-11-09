@@ -20,7 +20,7 @@
             "kind": "Count"
           }
         },
-        "origin": "Projection",
+        "origin": "Annotation",
         "constraints": {
           "scalar": {
             "Int": {
@@ -36,7 +36,7 @@
           },
           "empty_intersection": false
         },
-        "projection_fingerprint": "3f78fa93b0dc477f97c01e172cd36acbfcfe8b90174876e478280bf8d1fbfd26"
+        "projection_fingerprint": null
       }
     }
   },
@@ -83,12 +83,20 @@
                     "Inclusive": 16
                   }
                 },
-                "pattern": {
-                  "regex": "A.*",
-                  "mode": {
-                    "kind": "full"
+                "patterns": [
+                  {
+                    "regex": "A.*",
+                    "mode": {
+                      "kind": "full"
+                    }
+                  },
+                  {
+                    "regex": "[A-Z]+",
+                    "mode": {
+                      "kind": "full"
+                    }
                   }
-                }
+                ]
               }
             }
           },
@@ -105,12 +113,14 @@
                       "Inclusive": 16
                     }
                   },
-                  "pattern": {
-                    "regex": "[A-Z]+",
-                    "mode": {
-                      "kind": "full"
+                  "patterns": [
+                    {
+                      "regex": "[A-Z]+",
+                      "mode": {
+                        "kind": "full"
+                      }
                     }
-                  }
+                  ]
                 }
               }
             },
@@ -125,12 +135,14 @@
                       "Inclusive": 32
                     }
                   },
-                  "pattern": {
-                    "regex": "A.*",
-                    "mode": {
-                      "kind": "full"
+                  "patterns": [
+                    {
+                      "regex": "A.*",
+                      "mode": {
+                        "kind": "full"
+                      }
                     }
-                  }
+                  ]
                 }
               }
             }
@@ -167,7 +179,7 @@
             "kind": "Name"
           }
         },
-        "origin": "Projection",
+        "origin": "Annotation",
         "constraints": {
           "scalar": {
             "String": {
@@ -180,18 +192,20 @@
                     "Inclusive": 32
                   }
                 },
-                "pattern": {
-                  "regex": "[A-Z]+",
-                  "mode": {
-                    "kind": "full"
+                "patterns": [
+                  {
+                    "regex": "[A-Z]+",
+                    "mode": {
+                      "kind": "full"
+                    }
                   }
-                }
+                ]
               }
             }
           },
           "empty_intersection": false
         },
-        "projection_fingerprint": "a5046742e473c0929b1f7c3eceaf18428264f0440e97e66b3dceed754381505c"
+        "projection_fingerprint": null
       }
     }
   }

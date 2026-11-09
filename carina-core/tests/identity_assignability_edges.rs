@@ -297,11 +297,9 @@ fn identity_edges_defer_member_containment_but_reject_disjointness() {
         Some((Some(1), Some(20))),
         None,
     );
-    let sink = AttributeType::refined_string(
-        Some(identity("Name")),
-        None,
-        Some((Some(1), Some(10))),
-        None,
+    let sink = AttributeType::string_member(
+        carina_core::schema::StringIdentityLayer::new(Some(identity("Name")), None, None, None),
+        carina_core::schema::StringMemberConstraints::new(None, Some((Some(1), Some(10)))),
     );
     assert_eq!(
         assignment(

@@ -1,11 +1,13 @@
 //! Scalar declaration evidence retained by resolved schema annotations.
 
-use std::{cmp::Ordering, collections::BTreeMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use super::{NonEmptySchemaTypeOwners, SchemaTypeOwner};
-use crate::schema::{AttrTypeKind, CompiledAttributeType, CompiledPattern, RefinedScalarKind};
+use crate::schema::{
+    AttrTypeKind, CompiledAttributeType, CompiledPattern, PatternSpec, RefinedScalarKind,
+};
 
 /// Unlike an Option field, an endpoint cannot silently default to unbounded
 /// when a wire record omits it.
@@ -60,42 +62,56 @@ impl<T: Copy + Ord> Bounds<T> {
     }
 }
 
-#[derive(Debug, Clone)]
-struct DeclarationPattern(CompiledPattern);
+/// A sorted pattern set keyed by immutable specifications. Compiled regex
+/// caches are values, so cache mutation cannot affect ordering or deduplication.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DeclarationPatterns(BTreeMap<PatternSpec, CompiledPattern>);
 
-impl PartialEq for DeclarationPattern {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
+impl DeclarationPatterns {
+    fn from_pattern(pattern: Option<&CompiledPattern>) -> Self {
+        Self(
+            pattern
+                .into_iter()
+                .map(|pattern| (pattern.as_ref().clone(), pattern.clone()))
+                .collect(),
+        )
+    }
+
+    fn intersect(&mut self, other: &Self) {
+        self.0.extend(
+            other
+                .0
+                .iter()
+                .map(|(spec, pattern)| (spec.clone(), pattern.clone())),
+        );
+    }
+
+    fn first(&self) -> Option<&CompiledPattern> {
+        self.0.values().next()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &CompiledPattern> {
+        self.0.values()
     }
 }
-impl Eq for DeclarationPattern {}
-impl PartialOrd for DeclarationPattern {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for DeclarationPattern {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.cmp(&other.0)
-    }
-}
-impl Serialize for DeclarationPattern {
+
+impl Serialize for DeclarationPatterns {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.as_ref().serialize(serializer)
+        serializer.collect_seq(self.0.keys())
     }
 }
-impl<'de> Deserialize<'de> for DeclarationPattern {
+impl<'de> Deserialize<'de> for DeclarationPatterns {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        CompiledPattern::try_new(&crate::schema::PatternSpec::deserialize(deserializer)?)
+        let specs = BTreeSet::<PatternSpec>::deserialize(deserializer)?;
+        specs
+            .into_iter()
+            .map(|spec| {
+                let compiled = CompiledPattern::try_new(&spec).map_err(serde::de::Error::custom)?;
+                Ok((spec, compiled))
+            })
+            .collect::<Result<_, D::Error>>()
             .map(Self)
-            .map_err(serde::de::Error::custom)
     }
-}
-
-fn required_pattern<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<DeclarationPattern>, D::Error> {
-    Option::deserialize(deserializer)
 }
 
 /// Value-side scalar evidence has identity constraints only, by construction.
@@ -158,18 +174,12 @@ pub(super) struct IdentityConstraintsWire {
 #[serde(deny_unknown_fields)]
 struct StringIdentityConstraints {
     length: Bounds<u64>,
-    #[serde(deserialize_with = "required_pattern")]
-    pattern: Option<DeclarationPattern>,
+    patterns: DeclarationPatterns,
 }
 
 impl StringIdentityConstraints {
     fn intersect(&mut self, other: &Self) {
-        self.pattern = self
-            .pattern
-            .iter()
-            .chain(other.pattern.iter())
-            .min()
-            .cloned();
+        self.patterns.intersect(&other.patterns);
         self.length.intersect(&other.length);
     }
 }
@@ -240,10 +250,7 @@ impl IdentityConstraintKind {
                 identity_layer: crate::schema::StringIdentityLayer {
                     binding,
                     length: identity_layer.length.pair(),
-                    pattern: identity_layer
-                        .pattern
-                        .as_ref()
-                        .map(|pattern| pattern.0.clone()),
+                    pattern: identity_layer.patterns.first().cloned(),
                     to_dsl: None,
                 },
                 member_layer: Default::default(),
@@ -271,7 +278,7 @@ impl IdentityConstraintKind {
             } => IdentityConstraintKind::String {
                 identity_layer: StringIdentityConstraints {
                     length: Bounds::new(identity_layer.length),
-                    pattern: identity_layer.pattern.clone().map(DeclarationPattern),
+                    patterns: DeclarationPatterns::from_pattern(identity_layer.pattern.as_ref()),
                 },
             },
             AttrTypeKind::Reference {
@@ -279,7 +286,7 @@ impl IdentityConstraintKind {
             } => IdentityConstraintKind::String {
                 identity_layer: StringIdentityConstraints {
                     length: Bounds::new(*length),
-                    pattern: pattern.clone().map(DeclarationPattern),
+                    patterns: DeclarationPatterns::from_pattern(pattern.as_ref()),
                 },
             },
             AttrTypeKind::Int {
@@ -294,6 +301,14 @@ impl IdentityConstraintKind {
             AttrTypeKind::Enum { base, .. } => return Self::from_declaration(base),
             _ => return None,
         })
+    }
+
+    fn patterns(&self) -> impl Iterator<Item = &CompiledPattern> {
+        let patterns = match self {
+            Self::String { identity_layer } => Some(&identity_layer.patterns),
+            Self::Int { identity_range: _ } | Self::Float { range: _ } => None,
+        };
+        patterns.into_iter().flat_map(DeclarationPatterns::iter)
     }
 
     fn kind(&self) -> RefinedScalarKind {
@@ -389,6 +404,10 @@ impl ValueConstraints {
 
     pub(super) fn identity_constraints(&self, owner: SchemaTypeOwner) -> IdentityConstraints {
         IdentityConstraints::single(owner, self.scalar.clone())
+    }
+
+    pub(super) fn patterns(&self) -> impl Iterator<Item = &CompiledPattern> {
+        self.scalar.patterns()
     }
 
     pub(super) fn materialize(&self, owned: &super::ResolvedSchemaType) -> CompiledAttributeType {
@@ -489,20 +508,7 @@ impl IdentityConstraints {
     }
 
     pub(super) fn owner_patterns(&self) -> impl Iterator<Item = &CompiledPattern> {
-        let layers = match self {
-            Self::Single(_) => None,
-            Self::Multi(multi) => Some(&multi.layers.layers),
-        };
-        layers
-            .into_iter()
-            .flat_map(|layers| layers.values())
-            .filter_map(|layer| match layer {
-                IdentityConstraintKind::String { identity_layer } => {
-                    identity_layer.pattern.as_ref().map(|pattern| &pattern.0)
-                }
-                IdentityConstraintKind::Int { identity_range: _ }
-                | IdentityConstraintKind::Float { range: _ } => None,
-            })
+        self.scalar().patterns()
     }
 
     pub(super) fn materialize(&self, owned: &super::ResolvedSchemaType) -> CompiledAttributeType {
@@ -704,7 +710,7 @@ mod pattern_mode_tests {
             let retained = ValueConstraints::new(IdentityConstraintKind::String {
                 identity_layer: StringIdentityConstraints {
                     length: Bounds::new(None),
-                    pattern: Some(DeclarationPattern(pattern)),
+                    patterns: DeclarationPatterns::from_pattern(Some(&pattern)),
                 },
             });
             let json = serde_json::to_string(&retained).unwrap();
@@ -714,9 +720,81 @@ mod pattern_mode_tests {
                 panic!("String identity")
             };
             assert_eq!(
-                identity_layer.pattern.unwrap().0.is_match("xabcx"),
+                identity_layer.patterns.first().unwrap().is_match("xabcx"),
                 matches!(mode, PatternMatch::Substring { .. })
             );
         }
+    }
+
+    fn round11_pattern_annotation(owner: &str, regex: &str) -> super::super::ResolvedSchemaType {
+        use crate::schema::{
+            AttributeType, PatternMatch, PatternSpec, TypeIdentity, ValidatedConfigSchema,
+        };
+        let schema = ValidatedConfigSchema::validate(BTreeMap::from([(
+            "x".into(),
+            AttributeType::refined_string(
+                Some(TypeIdentity::from_dotted("test.X")),
+                Some(PatternSpec::new(regex, PatternMatch::Full)),
+                None,
+                None,
+            ),
+        )]))
+        .unwrap();
+        super::super::ResolvedSchemaType::from_annotation_declaration(owner, &schema.parts()["x"])
+            .unwrap()
+    }
+
+    #[test]
+    fn round11_repeated_single_owner_patterns_remain_a_conjunction() {
+        use crate::resource::{ExpandedConcreteValue as ConcreteValue, ExpandedValue as Value};
+        let a = round11_pattern_annotation("same", "^a.*$");
+        let b = round11_pattern_annotation("same", "^.*z$");
+        let joined = a.conjoin(&b).conjoin(&a);
+        let patterns: Vec<_> = joined.owner_patterns().collect();
+        assert_eq!(
+            patterns.len(),
+            2,
+            "retain and deduplicate every owner pattern"
+        );
+        assert!(patterns.windows(2).all(|pair| pair[0] < pair[1]));
+        let declaration = joined.materialize();
+        assert!(
+            declaration
+                .validate(&Value::Concrete(ConcreteValue::String("az".into())))
+                .is_ok()
+        );
+        for bad in ["aa", "zz"] {
+            assert!(
+                declaration
+                    .validate(&Value::Concrete(ConcreteValue::String(bad.into())))
+                    .is_err(),
+                "{bad}"
+            );
+        }
+        let wire = serde_json::to_value(&joined).unwrap();
+        let decoded: super::super::ResolvedSchemaType = serde_json::from_value(wire).unwrap();
+        assert_eq!(joined, decoded);
+        assert_eq!(joined, b.conjoin(&a));
+    }
+
+    #[test]
+    fn round11_annotation_names_render_every_owner_pattern() {
+        use crate::schema::TypeInSchema;
+        let a = round11_pattern_annotation("a", "^a.*$");
+        let b = round11_pattern_annotation("b", "^z.*$");
+        let c = round11_pattern_annotation("b", "^y.*$");
+        let ab = a.conjoin(&b).materialize();
+        let ac = a.conjoin(&c).materialize();
+        let (expected, actual) =
+            TypeInSchema::schemaless(&ab).mismatch_type_names(TypeInSchema::schemaless(&ac));
+        assert_ne!(expected, actual, "different owner patterns must be visible");
+        assert!(
+            actual.contains("^a.*$") && actual.contains("^z.*$"),
+            "{actual}"
+        );
+        assert!(
+            expected.contains("^a.*$") && expected.contains("^y.*$"),
+            "{expected}"
+        );
     }
 }

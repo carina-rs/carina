@@ -62,7 +62,8 @@ impl<'a> RefinementPositions<'a> {
 impl<'a> EffectiveType<'a> {
     /// Visit at most `max_nodes` refined String/Int/Reference leaves and
     /// structural nodes, including every Ref and nested Union. Plain scalar
-    /// leaves are omitted and cost no budget. Exactly-fitting walks are complete.
+    /// leaves are omitted. Identity-only leaves are reported without charging
+    /// the budget. Exactly-fitting walks are complete.
     pub fn refinement_positions(&self, max_nodes: usize) -> RefinementPositions<'a> {
         let mut positions = Vec::new();
         let complete = visit(
@@ -84,10 +85,27 @@ fn visit<'a>(
     budget: &mut ShapeWalkBudget,
     positions: &mut Vec<RefinedScalarPosition<'a>>,
 ) -> bool {
-    if !counts_for_refinements(&ty.attr_type.kind) {
+    let counted = counts_for_refinements(&ty.attr_type.kind);
+    let identified = match &ty.attr_type.kind {
+        AttrTypeKind::String {
+            identity_layer,
+            member_layer: _,
+        } => identity_layer.binding.identity().is_some(),
+        AttrTypeKind::Int {
+            identity_layer,
+            member_layer: _,
+        } => identity_layer.binding.identity().is_some(),
+        AttrTypeKind::Reference {
+            identity: _,
+            pattern: _,
+            length: _,
+        } => true,
+        _ => false,
+    };
+    if !counted && !identified {
         return true;
     }
-    if !budget.take() {
+    if counted && !budget.take() {
         return false;
     }
     let mut descend = |attr_type, segment, field_ancestry, field_name: Option<&str>| {
@@ -293,7 +311,11 @@ mod tests {
         let ty = schema.effective_attribute("value").unwrap().value_type();
         let report = ty.refinement_positions(0);
         assert!(!report.is_truncated());
-        assert!(report.positions().is_empty());
+        assert_eq!(
+            report.positions().len(),
+            1,
+            "identity is visible without consuming budget"
+        );
     }
 
     #[test]

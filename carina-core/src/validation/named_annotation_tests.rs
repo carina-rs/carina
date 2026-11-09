@@ -561,7 +561,7 @@ fn read_projections_keep_identity_constraints_without_slot_members() {
             ..
         }
     ));
-    assert_ne!(exact, annotation(&snapshot));
+    assert_eq!(exact, annotation(&snapshot));
     assert!(assign(
         &lifted,
         declaration(&snapshot, "p", 1),
@@ -584,7 +584,7 @@ fn read_projections_keep_identity_constraints_without_slot_members() {
     );
     assert_eq!(actual, "aws.iam.Role.Name (length unbounded)");
     let wire = serde_json::to_value(&exact).unwrap();
-    assert_eq!(wire["SchemaType"]["owned"]["origin"], "Projection");
+    assert_eq!(wire["SchemaType"]["owned"]["origin"], "Annotation");
     let restored: TypeExpr = serde_json::from_value(wire).unwrap();
     assert_eq!(restored, exact);
     typecheck::check_type_expr_value(
@@ -1107,8 +1107,9 @@ fn module_call_boundaries_check_schema_sources_and_forwarded_caller_arguments() 
             "arguments { x: aws.iam.Role.Name }\nlet child = use { source = './child' }\nlet instance = child { x = x }\n",
         ] {
             let findings = call_findings(source, &caller, annotation(&callee));
-            assert!(
+            assert_eq!(
                 findings.is_empty(),
+                width <= 64,
                 "identity admission at width {width}: {findings:#?}"
             );
         }
@@ -2454,7 +2455,7 @@ fn owner_conjunction_wire_contains_only_identity_records() {
         let owner = &layer["String"]["identity_layer"];
         assert!(owner.get("member_layer").is_none(), "{owner}");
         assert!(
-            owner.get("pattern").is_some() && owner.get("length").is_some(),
+            owner.get("patterns").is_some() && owner.get("length").is_some(),
             "{owner}"
         );
     }
@@ -2569,9 +2570,16 @@ fn value_type_records_reject_member_constraints_in_both_origins() {
             let mut tampered = fixture[key].clone();
             let owned = &mut tampered["SchemaType"]["owned"];
             owned["origin"] = serde_json::json!(origin);
-            if origin == "Annotation" {
-                owned["projection_fingerprint"] = serde_json::Value::Null;
-            }
+            owned["projection_fingerprint"] = if origin == "Annotation" {
+                serde_json::Value::Null
+            } else {
+                serde_json::json!("0".repeat(64))
+            };
+            assert!(
+                serde_json::from_value::<TypeExpr>(tampered.clone()).is_ok(),
+                "valid {origin} evidence before tampering"
+            );
+            let owned = &mut tampered["SchemaType"]["owned"];
             if key == "string" {
                 owned["constraints"]["scalar"]["String"]["member_layer"] = serde_json::json!({"pattern":null,"length":{"min":"Unbounded","max":"Unbounded"}});
             } else {
@@ -2591,10 +2599,16 @@ fn annotation_projection_equality_matches_wire_equality() {
     let loaded = snapshot(vec![("p", vec![string(1, 32, None)])]);
     let annotation = annotation(&loaded);
     let projection = inference::attribute_type_to_type_expr(declaration(&loaded, "p", 0), "p");
+    assert_eq!(annotation, projection);
     assert_eq!(
         annotation == projection,
         serde_json::to_value(&annotation).unwrap() == serde_json::to_value(&projection).unwrap()
     );
+    let references = snapshot(vec![(
+        "p",
+        vec![DraftType::reference(identity(), None, None)],
+    )]);
+    let projection = inference::attribute_type_to_type_expr(declaration(&references, "p", 0), "p");
     let mut changed = serde_json::to_value(&projection).unwrap();
     changed["SchemaType"]["owned"]["projection_fingerprint"] = serde_json::json!("0".repeat(64));
     let changed: TypeExpr = serde_json::from_value(changed).unwrap();
@@ -2665,6 +2679,10 @@ fn projection_constraint_records_reject_unknown_fields() {
     for key in ["string", "int"] {
         for extra in ["owner_layers", "future_constraint"] {
             let mut tampered = fixture[key].clone();
+            tampered["SchemaType"]["owned"]["origin"] = serde_json::json!("Projection");
+            tampered["SchemaType"]["owned"]["projection_fingerprint"] =
+                serde_json::json!("0".repeat(64));
+            assert!(serde_json::from_value::<TypeExpr>(tampered.clone()).is_ok());
             tampered["SchemaType"]["owned"]["constraints"][extra] = serde_json::json!([]);
             assert!(
                 serde_json::from_value::<TypeExpr>(tampered).is_err(),

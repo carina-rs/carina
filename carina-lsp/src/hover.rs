@@ -57,7 +57,9 @@ fn find_use_import_path(
 }
 
 fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> String {
-    use carina_core::schema::{PatternSpecDisplay, RefinementPathSegment, Shape};
+    use carina_core::schema::{
+        PatternSpecDisplay, RefinementPathSegment, Shape, format_refinement_bounds,
+    };
     let mut content = String::new();
     for position in walk.positions() {
         let mut refinements = String::new();
@@ -78,9 +80,7 @@ fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> Strin
             } => identity_layer.identity,
             _ => None,
         };
-        if position.path().is_empty()
-            && let Some(identity) = identity
-        {
+        if let Some(identity) = identity {
             refinements.push_str(&format!("\n- **Identity**: `{identity}`"));
         }
         match shape {
@@ -95,7 +95,7 @@ fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> Strin
                         PatternSpecDisplay::new(spec)
                     ));
                 }
-                if let Some(bounds) = hover_bounds(length) {
+                if let Some(bounds) = length.map(format_refinement_bounds) {
                     refinements.push_str(&format!("\n- **Identity length**: {bounds}"));
                 }
             }
@@ -114,10 +114,10 @@ fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> Strin
                         ));
                     }
                 }
-                if let Some(bounds) = hover_bounds(identity_layer.length) {
+                if let Some(bounds) = identity_layer.length.map(format_refinement_bounds) {
                     refinements.push_str(&format!("\n- **Identity length**: {bounds}"));
                 }
-                if let Some(bounds) = hover_bounds(member_layer.length) {
+                if let Some(bounds) = member_layer.length.map(format_refinement_bounds) {
                     refinements.push_str(&format!("\n- **Member length**: {bounds}"));
                 }
             }
@@ -125,10 +125,10 @@ fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> Strin
                 identity_layer,
                 member_layer,
             } => {
-                if let Some(bounds) = hover_bounds(identity_layer.range) {
+                if let Some(bounds) = identity_layer.range.map(format_refinement_bounds) {
                     refinements.push_str(&format!("\n- **Identity range**: {bounds}"));
                 }
-                if let Some(bounds) = hover_bounds(member_layer.range) {
+                if let Some(bounds) = member_layer.range.map(format_refinement_bounds) {
                     refinements.push_str(&format!("\n- **Member range**: {bounds}"));
                 }
             }
@@ -162,15 +162,6 @@ fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> Strin
         content.push_str("\n\n… further nested constraints omitted");
     }
     content
-}
-
-fn hover_bounds<T: std::fmt::Display>(bounds: Option<(Option<T>, Option<T>)>) -> Option<String> {
-    bounds.map(|(min, max)| match (min, max) {
-        (Some(min), Some(max)) => format!("{min}..={max}"),
-        (Some(min), None) => format!("{min}.."),
-        (None, Some(max)) => format!("..={max}"),
-        (None, None) => "..".into(),
-    })
 }
 
 /// Format a Value for hover display
@@ -3175,6 +3166,69 @@ EOT
             panic!("Markdown hover")
         };
         content.value
+    }
+
+    #[test]
+    fn round11_hover_nested_and_unbounded_leaves_name_their_identity() {
+        use carina_core::schema::{PatternMatch, PatternSpec, TypeIdentity};
+        for leaf in [
+            AttributeType::refined_string(
+                Some(TypeIdentity::from_dotted("test.X")),
+                Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                None,
+                None,
+            ),
+            AttributeType::refined_string(
+                Some(TypeIdentity::from_dotted("test.X")),
+                None,
+                None,
+                None,
+            ),
+            AttributeType::refined_int(Some(TypeIdentity::from_dotted("test.X")), None),
+            AttributeType::reference(TypeIdentity::from_dotted("test.X"), None, None),
+        ] {
+            for nested in [
+                leaf.clone(),
+                AttributeType::list(leaf.clone()),
+                AttributeType::union(vec![leaf.clone(), AttributeType::bool()]),
+            ] {
+                let content = hover_for_refinement_fields(vec![
+                    StructField::optional("nested", nested).build(),
+                ]);
+                assert!(content.contains("**Identity**: `test.X`"), "{content}");
+                assert!(
+                    !content.contains("further nested constraints omitted"),
+                    "{content}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn round11_hover_bounds_use_the_core_diagnostic_spelling() {
+        use carina_core::schema::TypeIdentity;
+        for (length, expected) in [
+            ((Some(1), None), "1..unbounded"),
+            ((None, Some(8)), "unbounded..=8"),
+            ((None, None), "unbounded"),
+        ] {
+            let content = hover_for_refinement_fields(vec![
+                StructField::optional(
+                    "x",
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::from_dotted("test.X")),
+                        None,
+                        Some(length),
+                        None,
+                    ),
+                )
+                .build(),
+            ]);
+            assert!(
+                content.contains(&format!("**Identity length**: {expected}")),
+                "{content}"
+            );
+        }
     }
 
     #[test]
