@@ -16,6 +16,7 @@
 #
 # The script never fails on classification — when in doubt, it emits
 # `--workspace` rather than under-test the change.
+# Failure to discover changed files is fatal; it must not look like no changes.
 #
 # Heuristics (in order):
 #   1. A change to any `Cargo.toml` or `Cargo.lock` ⇒ `--workspace`.
@@ -75,13 +76,21 @@ else
         echo "touched-crates.sh: base ref $base_ref does not exist" >&2
         exit 2
     fi
-    mapfile -t files < <(
-        {
-            git diff --name-only "$base_ref"...HEAD
-            git diff --name-only HEAD
-            git ls-files --others --exclude-standard
-        } | sort -u
-    )
+    # Process substitution hides command failures from mapfile and errexit.
+    # Check each discovery command before classifying any of its output.
+    if ! committed_files=$(git diff --name-only "$base_ref"...HEAD); then
+        echo "touched-crates.sh: git diff $base_ref...HEAD failed; cannot determine touched crates" >&2
+        exit 1
+    fi
+    if ! working_files=$(git diff --name-only HEAD); then
+        echo 'touched-crates.sh: git diff HEAD failed; cannot determine touched crates' >&2
+        exit 1
+    fi
+    if ! untracked_files=$(git ls-files --others --exclude-standard); then
+        echo 'touched-crates.sh: git ls-files failed; cannot determine touched crates' >&2
+        exit 1
+    fi
+    mapfile -t files < <(printf '%s\n' "$committed_files" "$working_files" "$untracked_files" | sort -u)
 fi
 
 if [[ ${#files[@]} -eq 0 ]]; then

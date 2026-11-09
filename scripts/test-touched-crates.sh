@@ -6,6 +6,7 @@ python3 - "$repo_root/scripts/touched-crates.sh" <<'PY'
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,7 +34,8 @@ class TouchedCratesTests(unittest.TestCase):
         self.trace = self.root / "trace"
         self.env = dict(os.environ, PATH=f"{binary.parent}:{os.environ['PATH']}",
                         METADATA_FIXTURE=str(self.metadata_file), METADATA_FAIL="0",
-                        METADATA_TRACE=str(self.trace))
+                        METADATA_TRACE=str(self.trace), GIT_CONFIG_NOSYSTEM="1",
+                        GIT_CONFIG_GLOBAL=os.devnull)
         self.packages = []
         for name, dependencies in [
             ("carina-plugin-sdk", []),
@@ -148,6 +150,70 @@ class TouchedCratesTests(unittest.TestCase):
     def test_incomplete_metadata_falls_back_to_workspace(self):
         self.packages = []
         self.assertEqual(self.scope("carina-tui/src/lib.rs"), "--workspace")
+
+    def test_each_git_discovery_failure_is_fatal(self):
+        binary = self.root / "bin/git"
+        binary.write_text(
+            '#!/bin/sh\n'
+            'if [ "$*" = "$GIT_FAIL_COMMAND" ]; then\n'
+            '  echo "synthetic git failure" >&2\n'
+            '  exit 74\n'
+            'fi\n'
+        )
+        binary.chmod(0o755)
+        for command, message in (
+            ("diff --name-only base...HEAD", "git diff base...HEAD failed"),
+            ("diff --name-only HEAD", "git diff HEAD failed"),
+            ("ls-files --others --exclude-standard", "git ls-files failed"),
+        ):
+            with self.subTest(command=command):
+                result = subprocess.run(
+                    ["bash", str(HELPER), "--base", "base"], cwd=self.root,
+                    env=dict(self.env, GIT_FAIL_COMMAND=command),
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(message, result.stderr)
+        self.assertFalse(self.trace.exists())
+
+    def test_no_merge_base_fails_scope_and_local_verify(self):
+        def git(*args):
+            return subprocess.check_output(
+                ["git", "-c", "user.name=Scope fixture", "-c",
+                 "user.email=scope@example.invalid", *args], cwd=self.root,
+                env=self.env, stderr=subprocess.PIPE, text=True, timeout=10,
+            ).strip()
+
+        git("init", "-q", "--template=")
+        # Keep the synthetic tools and copied scripts out of the changed files.
+        (self.root / ".git/info").mkdir(exist_ok=True)
+        (self.root / ".git/info/exclude").write_text("/bin/\n/scripts/\n/metadata.json\n/trace\n")
+        git("commit", "-qm", "base", "--allow-empty")
+        base = git("rev-parse", "HEAD")
+        git("checkout", "-q", "--orphan", "unrelated")
+        git("commit", "-qm", "unrelated", "--allow-empty")
+        self.assertEqual(git("status", "--porcelain"), "")
+
+        scripts = self.root / "scripts"
+        scripts.mkdir()
+        for name in ("touched-crates.sh", "verify.sh"):
+            shutil.copyfile(HELPER.parent / name, scripts / name)
+        for command in (
+            ["bash", str(HELPER), "--base", base],
+            ["bash", str(scripts / "verify.sh"), "--local", "--base", base,
+             "check", "nextest", "clippy", "doctests"],
+        ):
+            with self.subTest(command=command):
+                result = subprocess.run(
+                    command, cwd=self.root, env=self.env,
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("no merge base", result.stderr)
+                self.assertIn(f"touched-crates.sh: git diff {base}...HEAD failed", result.stderr)
+        self.assertFalse(self.trace.exists())
 
 
 unittest.main()

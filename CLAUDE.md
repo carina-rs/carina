@@ -358,7 +358,7 @@ metadata, including all dependency kinds:
 scripts/touched-crates.sh
 # → "-p carina-cli -p carina-tui"   (or "--workspace", or empty)
 
-cargo nextest run $(scripts/touched-crates.sh)   # touched crates and reverse dependents
+scripts/verify.sh --local                      # shared checks with local crate scope
 scripts/touched-crates.sh --base main            # diff against a specific base
 git diff --name-only | scripts/touched-crates.sh --stdin   # custom file list
 ```
@@ -892,10 +892,9 @@ High-value patterns in this repo:
 
 Constraints specific to this repo:
 
-- A workflow does NOT relax any gate. Each agent still runs the
-  crate-scoped verify cycle (`cargo check -p` → `cargo nextest run` →
-  doctests → clippy → `scripts/check-*.sh`), and findings still need a
-  reproducing test before a fix lands.
+- A workflow does NOT relax any gate. Each agent still runs
+  `scripts/verify.sh --local` as described in the Verify Protocol. Findings
+  still need a reproducing test before a fix lands.
 - Agents that mutate files in parallel must use `isolation: 'worktree'`
   to avoid clobbering each other; read-only finders do not need it.
 - Have agents return structured output (the `schema` option) rather

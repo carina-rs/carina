@@ -15,7 +15,8 @@ fi
 # Parse run scalars by indentation, including inline, literal and folded
 # forms. This deliberately needs only awk/Bash, not a YAML package.
 shopt -s globstar nullglob
-for workflow in "$repo_root"/.github/workflows/**/* "$repo_root"/.github/actions/**/action.yml; do
+for workflow in "$repo_root"/.github/workflows/**/* \
+    "$repo_root"/.github/actions/**/action.yml "$repo_root"/.github/actions/**/action.yaml; do
     [[ -f "$workflow" ]] || continue
     awk -v source="${workflow#"$repo_root"/}" -v required_kinds="$required_kinds" '
 function allowed_script(script) {
@@ -92,6 +93,10 @@ BEGIN {
     job = "composite"
     n = split(required_kinds, kinds, /[[:space:]]+/)
     for (i = 1; i <= n; i++) required[kinds[i]] = 1
+}
+source == ".github/workflows/ci.yml" && /continue-on-error/ {
+    printf "ERROR: %s:%d must not use continue-on-error; verify failures must fail the job\n", source, NR > "/dev/stderr"
+    failed = 1
 }
 /^  [[:alnum:]_-]+:/ {
     inspect()
@@ -176,3 +181,80 @@ for script in "$repo_root"/scripts/check-*.sh "$repo_root"/scripts/test-*.sh; do
 done
 if [[ $missing -ne 0 ]]; then exit 1; fi
 echo 'OK: workflow/action checks route through verify.sh, CI covers every kind, and every check/test script is included.'
+
+# An explicit root is a fixture invocation. Only the outer invocation runs the
+# synthetic cases, so each case can exercise this guard without recursion.
+if [[ $# -eq 0 ]]; then
+    python3 - "$repo_root" <<'PY'
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+
+REPO = Path(sys.argv.pop(1)).resolve()
+
+
+class VerifyGuardTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="carina-verify-guard-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        for directory in ("scripts", ".github"):
+            shutil.copytree(REPO / directory, self.root / directory)
+        self.ci = self.root / ".github/workflows/ci.yml"
+        self.original_ci = self.ci.read_text()
+
+    def guard(self, expected_error=None):
+        result = subprocess.run(
+            ["bash", str(REPO / "scripts/test-verify-sh.sh"), str(self.root)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if expected_error is None:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        else:
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn(expected_error, result.stderr)
+
+    def test_valid_workflows_and_both_action_suffixes_pass(self):
+        for suffix in ("yml", "yaml"):
+            action = self.root / f".github/actions/nested/valid/action.{suffix}"
+            action.parent.mkdir(parents=True, exist_ok=True)
+            action.write_text("runs:\n  using: composite\n  steps:\n"
+                              "    - shell: bash\n      run: scripts/verify.sh fmt\n")
+        self.guard()
+
+    def test_both_action_suffixes_reject_direct_checks(self):
+        for suffix in ("yml", "yaml"):
+            action = self.root / f".github/actions/nested/bypass/action.{suffix}"
+            action.parent.mkdir(parents=True, exist_ok=True)
+            for run in ("cargo check --workspace", "bash scripts/check-plan-fixtures.sh"):
+                with self.subTest(suffix=suffix, run=run):
+                    action.write_text("runs:\n  using: composite\n  steps:\n"
+                                      f"    - shell: bash\n      run: {run}\n")
+                    self.guard(f".github/actions/nested/bypass/action.{suffix}:")
+            action.unlink()
+
+    def test_continue_on_error_is_rejected_at_job_and_step_scope(self):
+        for value in ("true", "false", "${{ always() }}"):
+            for before, after in (
+                ("  check:\n", f"  check:\n    continue-on-error: {value}\n"),
+                ("      - run: scripts/verify.sh check\n",
+                 f"      - run: scripts/verify.sh check\n        continue-on-error: {value}\n"),
+                ("      - run: scripts/verify.sh check\n",
+                 f"      - continue-on-error: {value}\n        run: scripts/verify.sh check\n"),
+            ):
+                with self.subTest(value=value, placement=after):
+                    self.assertIn(before, self.original_ci)
+                    self.ci.write_text(self.original_ci.replace(before, after, 1))
+                    self.guard("must not use continue-on-error; verify failures must fail the job")
+
+    def test_missing_ci_kind_is_rejected(self):
+        self.ci.write_text(self.original_ci.replace("      - run: scripts/verify.sh fmt\n", ""))
+        self.guard("verify.sh kind fmt is not run by ci.yml")
+
+
+unittest.main()
+PY
+fi
