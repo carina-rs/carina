@@ -426,7 +426,15 @@ fn fixture_schemas() -> carina_core::schema::SchemaRegistry {
 async fn create_request_for_test(resource: Resource) -> CreateRequest {
     let bindings = carina_core::binding_index::ResolvedBindings::default();
     let module_gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-    let schemas = fixture_schemas();
+    let mut schemas = fixture_schemas();
+    if schemas.get_for(&resource).is_none() {
+        schemas
+            .extend(carina_core::test_utils::preparation_schemas(
+                &resource.id,
+                carina_core::schema::SchemaKind::Resource,
+            ))
+            .expect("test preparation schema should extend the fixture registry");
+    }
     let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
         Arc::new(Vec::new()),
         schemas.clone(),

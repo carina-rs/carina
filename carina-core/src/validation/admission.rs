@@ -274,15 +274,8 @@ impl Default for DeclarationId {
     fn default() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         // Exhausting u64 would require over 584 years at a billion declarations
-        // per second in one process, so exhaustion is unreachable in practice.
-        Self(
-            NEXT.fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |value| value.checked_add(1),
-            )
-            .expect("declaration identity space exhausted"),
-        )
+        // per second in one process, so wrapping is unreachable in practice.
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
     }
 }
 
