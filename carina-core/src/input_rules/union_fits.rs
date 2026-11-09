@@ -10,7 +10,7 @@ struct SelectionNode {
 }
 
 impl SelectionNode {
-    fn of(ty: &CompiledAttributeType, value: &InputEvidence<'_>) -> Option<Self> {
+    fn of(ty: &CompiledAttributeType, value: &NodeRef<'_>) -> Option<Self> {
         Some(Self {
             declaration: DeclarationNode::of(ty),
             evidence: value.proof()?.known_node_id()?,
@@ -27,7 +27,7 @@ impl<'a> UnionFits<'a> {
     pub(super) fn select(
         &mut self,
         ty: &'a CompiledAttributeType,
-        value: &InputEvidence<'_>,
+        value: &NodeRef<'_>,
         defs: &'a BTreeMap<String, CompiledAttributeType>,
         visited: &mut Vec<&'a str>,
     ) -> Option<&'a CompiledAttributeType> {
@@ -54,7 +54,7 @@ impl<'a> UnionFits<'a> {
         }
     }
 
-    fn retain(&mut self, value: &InputEvidence<'_>, fit: &Fit<'a>) {
+    fn retain(&mut self, value: &NodeRef<'_>, fit: &Fit<'a>) {
         match &fit.kind {
             FitKind::Union {
                 member,

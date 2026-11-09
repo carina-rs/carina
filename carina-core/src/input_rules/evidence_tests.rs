@@ -134,54 +134,53 @@ fn unsent_nested_omissions_remain_withheld_at_plan_and_dispatch() {
         1,
         "an unsent child omission cannot disable its guard"
     );
-    let patch = crate::provider::UpdatePatch {
-        ops: vec![crate::provider::PatchOp::Replace {
-            key: "target".into(),
-            value: Value::Concrete(ConcreteValue::String("bad".into())),
-        }],
-    };
-    let mut site =
-        classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&desired), &schemas)
+    for (changed, remove) in [
+        (vec!["target"], false),
+        (vec!["target", "settings"], false),
+        (vec!["target", "settings"], true),
+    ] {
+        let mut supplied = desired.clone();
+        if remove {
+            supplied.attributes.shift_remove("settings");
+        }
+        let previous = crate::resource::State::existing(
+            desired.id.clone(),
+            crate::test_support::snapshot_attributes::<crate::resource::NoPlaceholder>(
+                HashMap::from([
+                    (
+                        "settings".into(),
+                        object([("enabled", Value::Concrete(ConcreteValue::Bool(true)))]),
+                    ),
+                    (
+                        "target".into(),
+                        Value::Concrete(ConcreteValue::String("allowed".into())),
+                    ),
+                ]),
+            ),
+        )
+        .with_identifier("old");
+        let mut plan = Plan::new();
+        plan.add(Effect::Update {
+            from: Box::new(previous),
+            identifier: crate::provider::AppliedIdentifier::new("old").unwrap(),
+            to: resolved_input_fixture(supplied, &schemas),
+            changed_attributes: changed.iter().map(|name| (*name).into()).collect(),
+        });
+        let finalized = FinalizedPlan::new(plan);
+        let current = HashMap::new();
+        let site = finalized
+            .write_sites(&schemas, &current)
+            .next()
             .unwrap()
             .unwrap();
-    site.context = InputWriteContext::Update;
-    let mut update = UpdateInputContext {
-        desired: project_attributes(&desired.attributes),
-        changed: HashSet::new(),
-        removed: HashSet::new(),
-        ignored: Default::default(),
-    };
-    site.attributes = Some(Cow::Owned(update.overlay(&patch)));
-    site.update = Some(update);
-    assert_eq!(
-        site.applicable_rules().next().unwrap().evaluate(),
-        InputVerdict::Undecided,
-        "dispatch must use the same unsent-descendant boundary"
-    );
-    for op in [
-        crate::provider::PatchOp::Replace {
-            key: "settings".into(),
-            value: object([]),
-        },
-        crate::provider::PatchOp::Remove {
-            key: "settings".into(),
-        },
-    ] {
-        let patch = crate::provider::UpdatePatch {
-            ops: vec![
-                crate::provider::PatchOp::Replace {
-                    key: "target".into(),
-                    value: Value::Concrete(ConcreteValue::String("bad".into())),
-                },
-                op,
-            ],
-        };
-        let update = site.update.as_mut().unwrap();
-        site.attributes = Some(Cow::Owned(update.overlay(&patch)));
         assert_eq!(
             site.applicable_rules().next().unwrap().evaluate(),
-            InputVerdict::Proven,
-            "an exact patch omission or removal supplies absence evidence"
+            if changed.len() == 1 {
+                InputVerdict::Undecided
+            } else {
+                InputVerdict::Proven
+            },
+            "only a complete patch value supplies child absence"
         );
     }
 }
@@ -344,19 +343,26 @@ fn recursive_rule_paths_have_quadratic_total_segment_work() {
         }
         let resource = Resource::with_provider("mock", "Review", "example", None)
             .with_attribute("root", value);
-        let mut site =
-            classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
-                .unwrap()
-                .unwrap();
+        let mut plan = Plan::new();
         if update {
-            site.context = InputWriteContext::Update;
-            site.update = Some(UpdateInputContext {
-                desired: project_attributes(&resource.attributes),
-                changed: HashSet::from(["root".into()]),
-                removed: HashSet::new(),
-                ignored: Default::default(),
+            plan.add(Effect::Update {
+                from: Box::new(crate::resource::SnapshotState::not_found(
+                    resource.id.clone(),
+                )),
+                identifier: crate::provider::AppliedIdentifier::new("old").unwrap(),
+                to: resolved_input_fixture(resource, &schemas),
+                changed_attributes: vec!["root".into()],
             });
+        } else {
+            plan.add(Effect::Create(resolved_input_fixture(resource, &schemas)));
         }
+        let finalized = FinalizedPlan::new(plan);
+        let current = HashMap::new();
+        let site = finalized
+            .write_sites(&schemas, &current)
+            .next()
+            .unwrap()
+            .unwrap();
         let (_, segments) = crate::schema::with_field_path_work(|| {
             let verdicts = site
                 .applicable_rules()
@@ -780,7 +786,7 @@ fn deferred_template_retains_literal_guard_evidence() {
 
 #[test]
 fn ignored_unsent_guard_does_not_use_unapplied_authored_evidence() {
-    use crate::resource::{ParsedIgnorePath, ParsedIgnorePathSegment, ResolvedIgnoreChanges};
+    use crate::resource::{ParsedIgnorePath, ParsedIgnorePathSegment};
     let schemas = registry(
         ResourceSchema::new("Review")
             .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
@@ -800,28 +806,37 @@ fn ignored_unsent_guard_does_not_use_unapplied_authored_evidence() {
             "target",
             Value::Concrete(ConcreteValue::String("bad.fifo".into())),
         );
-    let mut site =
-        classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
-            .unwrap()
-            .unwrap();
-    site.context = InputWriteContext::Update;
-    let mut update = UpdateInputContext {
-        desired: project_attributes(&resource.attributes),
-        changed: HashSet::new(),
-        removed: HashSet::new(),
-        ignored: ResolvedIgnoreChanges::indexed_for_test(
-            "guard",
-            crate::schema::LeafPath::from_segments([]),
-            ParsedIgnorePath::new(vec![ParsedIgnorePathSegment::Attribute("guard".into())]),
-        ),
-    };
-    site.attributes = Some(Cow::Owned(update.overlay(&crate::provider::UpdatePatch {
-        ops: vec![crate::provider::PatchOp::Replace {
-            key: "target".into(),
-            value: resource.attributes["target"].clone(),
-        }],
-    })));
-    site.update = Some(update);
+    let mut resource = resource;
+    resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
+        ParsedIgnorePathSegment::Attribute("guard".into()),
+    ])];
+    let previous = crate::resource::State::existing(
+        resource.id.clone(),
+        crate::test_support::snapshot_attributes::<crate::resource::NoPlaceholder>(HashMap::from(
+            [
+                ("guard".into(), Value::Concrete(ConcreteValue::Bool(true))),
+                (
+                    "target".into(),
+                    Value::Concrete(ConcreteValue::String("old".into())),
+                ),
+            ],
+        )),
+    )
+    .with_identifier("old");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(previous),
+        identifier: crate::provider::AppliedIdentifier::new("old").unwrap(),
+        to: resolved_input_fixture(resource, &schemas),
+        changed_attributes: vec!["target".into()],
+    });
+    let finalized = FinalizedPlan::new(plan);
+    let current = HashMap::new();
+    let site = finalized
+        .write_sites(&schemas, &current)
+        .next()
+        .unwrap()
+        .unwrap();
     assert_eq!(
         site.applicable_rules().next().unwrap().evaluate(),
         InputVerdict::Undecided,
@@ -1713,7 +1728,7 @@ fn default_tag_membership_is_shared_by_presence_predicates_and_conditions() {
                 .attribute(AttributeSchema::optional("fallback", AttributeType::string()).build())
                 .input_rule(rule(target, predicate, condition)),
         );
-        let resource = Resource::with_provider("mock", "Review", "example", None);
+        let resource: Resource = Resource::with_provider("mock", "Review", "example", None);
         let config = crate::parser::ProviderConfig {
             name: "mock".into(),
             attributes: Default::default(),
@@ -1730,11 +1745,7 @@ fn default_tag_membership_is_shared_by_presence_predicates_and_conditions() {
         let types = InputTypeContext::<ModuleSource>::empty()
             .with_default_tags(&[config], &schemas, [&resource.id])
             .unwrap();
-        let mut site =
-            classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
-                .unwrap()
-                .unwrap();
-        site.types = Some(&types.facts);
+        let site = authored_fixture_with_types(&resource, &schemas, &types);
         assert_eq!(
             site.applicable_rules()
                 .map(|r| r.evaluate())

@@ -1240,6 +1240,8 @@ pub struct UpdateRequest {
     /// Effective directives resolved from the managed resource schema.
     directives: ProviderDirectives,
     diagnostic_values: Vec<Value>,
+    #[cfg(any(test, feature = "test-utils"))]
+    desired_for_fixture: ProviderReadyResource,
 }
 
 impl UpdateRequest {
@@ -1263,11 +1265,18 @@ impl UpdateRequest {
             })
             .collect();
         Ok(Self {
+            #[cfg(any(test, feature = "test-utils"))]
+            desired_for_fixture: resource.clone(),
             from,
             patch,
             directives: *resource.directives(),
             diagnostic_values,
         })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn desired_for_fixture(&self) -> &ProviderReadyResource {
+        &self.desired_for_fixture
     }
 
     /// Current provider-side state.
@@ -1535,17 +1544,6 @@ impl PatchOp {
 }
 
 impl UpdatePatch {
-    /// Desired values actually sent by this patch, including reasserted inputs.
-    pub(crate) fn sent_projection(&self) -> IndexMap<String, Value> {
-        self.ops
-            .iter()
-            .filter_map(|op| {
-                op.sent_value()
-                    .map(|value| (op.key().to_owned(), value.clone()))
-            })
-            .collect()
-    }
-
     pub(crate) fn sent_attributes(&self) -> SentAttributes {
         SentAttributes::from_update_patch(self)
     }
@@ -6780,7 +6778,7 @@ impl From<&ResourceId> for ProviderInstanceKey {
 
 /// Check a default-tag value before host-owned merging. Unresolved values are
 /// skippable; redacted secrets are fatal.
-fn assert_default_tag_value_encodable<P: crate::resource::PlaceholderKind>(
+pub(crate) fn assert_default_tag_value_encodable<P: crate::resource::PlaceholderKind>(
     value: &crate::resource::knowledge::Classification<'_, P>,
 ) -> Result<(), SerializationError> {
     use crate::resource::knowledge::{Classification, KnownValue, KnownView, ShapeView};

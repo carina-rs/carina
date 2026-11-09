@@ -251,16 +251,7 @@ fn typed_target_estimate(
     );
     let resource =
         Resource::with_provider("mock", "Target", "target", None).with_attribute("name", value);
-    let mut site =
-        classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
-            .unwrap()
-            .unwrap();
-    site.types = Some(&types.facts);
-    // Exercise the estimator for map literals too (a template effect has no
-    // evaluated attributes). The classifier still owns the authored projection.
-    if keys {
-        site.attributes = None;
-    }
+    let site = authored_fixture_with_types(&resource, &schemas, &types);
     site.applicable_rules().next().unwrap().evaluate()
 }
 
@@ -1131,11 +1122,7 @@ fn estimate_in_context<S>(
 ) -> InputVerdict {
     let resource =
         Resource::with_provider("mock", "Target", "target", None).with_attribute("name", value);
-    let mut site =
-        classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), schemas)
-            .unwrap()
-            .unwrap();
-    site.types = Some(&types.facts);
+    let site = authored_fixture_with_types(&resource, schemas, types);
     site.applicable_rules().next().unwrap().evaluate()
 }
 
@@ -1445,11 +1432,7 @@ fn estimator_default_tags_are_checked_through_the_host_merge_for_unknown_maps() 
             InputTypeContext::from_sources(&unresolved, &[], std::iter::empty(), &[], &schemas)
                 .with_default_tags(&[config], &schemas, [&target.id])
                 .unwrap();
-        let mut site =
-            classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&target), &schemas)
-                .unwrap()
-                .unwrap();
-        site.types = Some(&types.facts);
+        let site = authored_fixture_with_types(&target, &schemas, &types);
         assert_eq!(
             outcome(site.applicable_rules().next().unwrap().evaluate()),
             expected
@@ -1627,11 +1610,9 @@ fn estimator_literal_map_keys_use_the_provider_api_spelling() {
         outcome(concrete.applicable_rules().next().unwrap().evaluate()),
         "violation"
     );
-    let mut site =
-        classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
-            .unwrap()
-            .unwrap();
-    site.attributes = None;
+    let site = classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+        .unwrap()
+        .unwrap();
     assert_eq!(
         outcome(site.applicable_rules().next().unwrap().evaluate()),
         "violation"
@@ -1675,11 +1656,7 @@ fn estimator_literal_map_keys_use_the_provider_api_spelling() {
         );
         let target = Resource::with_provider("mock", "Tagged", "target", None)
             .with_attribute("tags", reference());
-        let mut site =
-            classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&target), &schemas)
-                .unwrap()
-                .unwrap();
-        site.types = Some(&types.facts);
+        let site = authored_fixture_with_types(&target, &schemas, &types);
         assert_eq!(
             outcome(site.applicable_rules().next().unwrap().evaluate()),
             expected

@@ -263,14 +263,14 @@ impl WriteCheck {
 
     fn discharge(
         &self,
-        inputs: &super::provider_ready::ProtectedInputProjection<'_>,
+        input: Arc<crate::input_rules::RuleInput>,
         schemas: &SchemaRegistry,
     ) -> Result<(), EffectFailureKind> {
         let Some(admission) = &self.admission else {
             return Ok(());
         };
         let token = DischargeToken(());
-        let site = executor_write_site(&token, admission, inputs, schemas)
+        let site = executor_write_site(&token, admission, input, schemas)
             .map_err(EffectFailureKind::execution)?
             .ok_or_else(|| {
                 EffectFailureKind::message("input rule schema unavailable at dispatch")
@@ -295,7 +295,13 @@ impl WriteCheck {
         writeback: SecretPreservingAttributes,
         schemas: &SchemaRegistry,
     ) -> Result<PreparedWrite<CreateRequest>, EffectFailureKind> {
-        self.discharge(&request.resource().protected_input_projection(), schemas)?;
+        if let Some(admission) = &self.admission {
+            let input = crate::input_rules::RuleInput::for_dispatch_create(
+                &request.resource().protected_desired_tree(),
+                &admission.schema,
+            );
+            self.discharge(input, schemas)?;
+        }
         let resource_id = request.resource().id.clone();
         let request = Arc::new(request);
         let retained_request = Arc::clone(&request);
@@ -324,28 +330,33 @@ impl WriteCheck {
             .map_err(EffectFailureKind::execution)?;
         let request = UpdateRequest::checked(from, changed, &desired, schema)
             .map_err(EffectFailureKind::execution)?;
-        self.discharge(
-            &desired.protected_update_projection(request.patch()),
-            schemas,
-        )?;
+        if let Some(admission) = &self.admission {
+            let input = crate::input_rules::RuleInput::for_dispatch_update(
+                &desired.protected_desired_tree(),
+                &desired.annotated_exact_patch(&request),
+                &admission.schema,
+            );
+            self.discharge(input, schemas)?;
+        }
         Ok(self.seal_update(desired.as_resource().id.clone(), request, writeback))
     }
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(super) fn prepare_update_fixture(
         self,
-        desired: &crate::resource::Resource,
+        desired: &ProviderReadyResource,
         request: UpdateRequest,
         writeback: SecretPreservingAttributes,
         schemas: &SchemaRegistry,
     ) -> Result<PreparedWrite<UpdateRequest>, EffectFailureKind> {
-        self.discharge(
-            &super::provider_ready::ProtectedInputProjection::fixture_update(
-                desired,
-                request.patch(),
-            ),
-            schemas,
-        )?;
+        if let Some(admission) = &self.admission {
+            let input = crate::input_rules::RuleInput::for_dispatch_update(
+                &desired.protected_desired_tree(),
+                &desired.annotated_exact_patch(&request),
+                &admission.schema,
+            );
+            self.discharge(input, schemas)?;
+        }
         Ok(self.seal_update(desired.id.clone(), request, writeback))
     }
 
@@ -897,18 +908,20 @@ mod tests {
                             .unwrap(),
                         )
                         .unwrap();
-                        let id = update.from().id.clone();
-                        let mut planned = crate::resource::Resource::from_id(id.clone());
-                        planned.attributes = update.patch().sent_projection();
+                        let planned = desired.as_resource().clone();
                         match admit(Effect::Update {
                             from: Box::new(update.from().clone()),
                             identifier: AppliedIdentifier::new("old-id").unwrap(),
-                            to: crate::resource::ResolvedResource::new(planned.into()),
+                            to: crate::resource::ResolvedResource::new(planned),
                             changed_attributes: vec!["name".into()],
                         }) {
                             Ok((ready, check)) => {
-                                let attributes =
-                                    update.patch().sent_projection().into_iter().collect();
+                                let attributes = desired
+                                    .as_resource()
+                                    .attributes
+                                    .clone()
+                                    .into_iter()
+                                    .collect();
                                 let writeback = SecretPreservingAttributes::from_provider_values(
                                     &attributes,
                                     &attributes,

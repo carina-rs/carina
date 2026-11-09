@@ -9,14 +9,14 @@ use crate::{
     resource::{AbsoluteBindingAddress, DataSource},
 };
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct TypeFacts {
-    pub authored: HashMap<ResourceId, IndexMap<String, Value>>,
     pub bindings: HashMap<AbsoluteBindingAddress, Declaration>,
     pub aliases: HashMap<AbsoluteBindingAddress, AbsoluteBindingAddress>,
-    pub default_keys: HashMap<ResourceId, Vec<evidence::MapMember>>,
+    pub defaults: Vec<crate::parser::ProviderConfig<ParserPlaceholder, AbsoluteBindingAddress>>,
 }
 
+#[derive(Clone)]
 pub(super) enum Declaration {
     Schema(Arc<ValidatedResourceSchema>),
     Outputs(IndexMap<String, Value>),
@@ -121,10 +121,6 @@ impl<S> InputTypeContext<S> {
         let mut context = Self::empty();
         for source in resources {
             let resource = source.as_resource();
-            context
-                .facts
-                .authored
-                .insert(resource.id.clone(), resource.attributes.clone());
             if let Some((binding, schema)) =
                 resource.binding.as_ref().zip(schemas.get_for(resource))
             {
@@ -189,44 +185,20 @@ impl<S> InputTypeContext<S> {
         schemas: &SchemaRegistry,
         write_ids: impl IntoIterator<Item = &'a ResourceId>,
     ) -> crate::provider::HostResult<Self> {
-        let mut mandatory = write_ids
-            .into_iter()
-            .map(|id| {
-                crate::resource::Resource::<ModuleSource, P>::from_id(id.clone())
-                    .with_attribute("tags", Value::Concrete(ConcreteValue::Map(IndexMap::new())))
+        let _ = (schemas, write_ids);
+        self.facts.defaults = configs
+            .iter()
+            .map(|config| crate::parser::ProviderConfig {
+                name: config.name.clone(),
+                attributes: project_attributes(&config.attributes),
+                default_tags: project_attributes(&config.default_tags),
+                source: config.source.clone(),
+                version: config.version.clone(),
+                revision: config.revision.clone(),
+                unresolved_attributes: project_attributes(&config.unresolved_attributes),
+                binding: config.binding.clone(),
             })
-            .collect::<Vec<_>>();
-        let mut possible = mandatory.clone();
-        for config in configs {
-            crate::provider::merge_default_tags_with_placeholders(config, &mut mandatory, schemas)?;
-            let mut all_keys = config.clone();
-            for value in all_keys.default_tags.values_mut() {
-                *value = Value::Concrete(ConcreteValue::String("".into()));
-            }
-            crate::provider::merge_default_tags_with_placeholders(
-                &all_keys,
-                &mut possible,
-                schemas,
-            )?;
-        }
-        for (possible, mandatory) in possible.iter().zip(&mandatory) {
-            if let Some(Value::Concrete(ConcreteValue::Map(keys))) = possible.attributes.get("tags")
-            {
-                self.facts.default_keys.insert(
-                    possible.id.clone(),
-                    keys.keys()
-                        .map(|key| evidence::MapMember {
-                            key: key.clone(),
-                            membership: if mandatory.default_tag_keys.contains(key) {
-                                evidence::Membership::Present
-                            } else {
-                                evidence::Membership::Possible
-                            },
-                        })
-                        .collect(),
-                );
-            }
-        }
+            .collect();
         Ok(self)
     }
 }

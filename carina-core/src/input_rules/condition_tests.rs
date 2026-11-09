@@ -254,10 +254,21 @@ fn failed_guard_is_a_failure_even_under_negation_and_after_authored_projection()
         let resource =
             crate::resource::Resource::with_provider("mock", "test.Conditional", "example", None)
                 .with_attribute("guard", projected);
-        let site =
-            classify_write_site::<ModuleSource>(WriteSiteSource::Preview(&resource), &schemas)
-                .unwrap()
-                .unwrap();
+        let site = classify_write_site::<ModuleSource>(
+            WriteSiteSource::Preview {
+                resource_id: resource.id.clone(),
+                input: RuleInput::for_authored(
+                    &resource,
+                    schemas.get_for(&resource).unwrap().schema(),
+                    Arc::new(TypeFacts::default()),
+                    &schemas,
+                )
+                .unwrap(),
+            },
+            &schemas,
+        )
+        .unwrap()
+        .unwrap();
         let verdict = site.applicable_rules().next().unwrap().evaluate();
         assert!(
             matches!(&verdict,InputVerdict::Violation(v) if v.reason() == crate::schema::InputViolationReason::EvaluationFailed)
@@ -268,8 +279,8 @@ fn failed_guard_is_a_failure_even_under_negation_and_after_authored_projection()
 
 #[test]
 fn update_guard_cannot_use_an_ignored_leaf_copied_from_observation() {
-    use crate::resource::{ParsedIgnorePath, ParsedIgnorePathSegment, ResolvedIgnoreChanges};
-    use crate::schema::{LeafPath, LeafPathSegment, StructField};
+    use crate::resource::{ParsedIgnorePath, ParsedIgnorePathSegment};
+    use crate::schema::StructField;
     let rule = InputRule::value(
         InputRuleScope::EveryWrite,
         InputPath::new("target").unwrap(),
@@ -312,31 +323,35 @@ fn update_guard_cannot_use_an_ignored_leaf_copied_from_observation() {
                 Value::Concrete(ConcreteValue::String("queue.fifo".into())),
             )
             .with_attribute("settings", object(true));
-    let mut site =
-        classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
-            .unwrap()
-            .unwrap();
-    site.context = InputWriteContext::Update;
-    let mut update = UpdateInputContext {
-        desired: project_attributes(&resource.attributes),
-        changed: HashSet::new(),
-        removed: HashSet::new(),
-        ignored: ResolvedIgnoreChanges::indexed_for_test(
-            "settings",
-            LeafPath::from_segments([LeafPathSegment::StructField("guard".into())]),
-            ParsedIgnorePath::new(vec![
-                ParsedIgnorePathSegment::Attribute("settings".into()),
-                ParsedIgnorePathSegment::Attribute("guard".into()),
-            ]),
-        ),
-    };
-    site.attributes = Some(Cow::Owned(update.overlay(&crate::provider::UpdatePatch {
-        ops: vec![crate::provider::PatchOp::Replace {
-            key: "settings".into(),
-            value: object(false),
-        }],
-    })));
-    site.update = Some(update);
+    let mut resource = resource;
+    resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
+        ParsedIgnorePathSegment::Attribute("settings".into()),
+        ParsedIgnorePathSegment::Attribute("guard".into()),
+    ])];
+    let previous = crate::resource::State::existing(
+        resource.id.clone(),
+        crate::test_support::snapshot_attributes::<crate::resource::NoPlaceholder>(HashMap::from(
+            [
+                ("settings".into(), object(false)),
+                ("target".into(), resource.attributes["target"].clone()),
+            ],
+        )),
+    )
+    .with_identifier("old");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(previous),
+        identifier: crate::provider::AppliedIdentifier::new("old").unwrap(),
+        to: crate::resource::ResolvedResource::resolve_raw_fixture(resource, &schemas).unwrap(),
+        changed_attributes: vec!["settings".into()],
+    });
+    let finalized = FinalizedPlan::new(plan);
+    let current = HashMap::new();
+    let site = finalized
+        .write_sites(&schemas, &current)
+        .next()
+        .unwrap()
+        .unwrap();
     assert_eq!(
         site.applicable_rules().next().unwrap().evaluate(),
         InputVerdict::Undecided

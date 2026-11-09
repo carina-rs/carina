@@ -760,9 +760,8 @@ impl Estimator<'_> {
 /// Every owner enters through its bound, admitted rule and concrete instance.
 pub(super) fn estimate(
     applicable: &BoundInputRule<'_, '_>,
-    value: Option<&InputValue>,
+    expression: BoundExpression<'_>,
 ) -> InputVerdict {
-    let site = applicable.site;
     let rule = applicable.rule;
     if matches!(
         rule.predicate(),
@@ -770,9 +769,9 @@ pub(super) fn estimate(
     ) {
         return InputVerdict::Undecided;
     }
-    let defs = site.schema.as_schema().defs();
+    let defs = applicable.site.schema.as_schema().defs();
     let mut estimator = Estimator {
-        types: site.types,
+        types: Some(expression.declarations()),
         literal_key_type: literal_type(applicable, rule.path()).and_then(|ty| {
             match ty.shape_with_defs(defs) {
                 crate::schema::Shape::Map { key, .. } => Some((key, defs)),
@@ -782,112 +781,13 @@ pub(super) fn estimate(
         query: Query::new(rule.predicate()),
         steps: 0,
     };
-    // A retained expression already bound to this instance is authoritative,
-    // including after normalization reorders collections. Consult authored
-    // source only when the erased expression retains correspondence to a
-    // top-level attribute. Collection positions do not establish identity.
-    if let Some(value) = value.filter(|value| {
-        !matches!(
-            peel_secret(value),
-            Value::Deferred(DeferredValue::Unknown(_))
-        )
-    }) {
-        let summary = estimator.at_path(
-            value,
-            &[],
-            matches!(rule.target(), InputRuleTarget::MapKeys(_)),
-            0,
-        );
-        return decide(summary, rule, &estimator.query);
-    }
-    let mut steps = applicable.owner.iter().cloned().chain(
-        rule.path()
-            .segments()
-            .map(|name| instances::Step::Field(name.to_owned())),
-    );
-    let Some(instances::Step::Field(root)) = steps.next() else {
-        return InputVerdict::Undecided;
-    };
-    let tail = steps
-        .map(|step| match step {
-            instances::Step::Field(name) => Some(PathSegment::Field { name }),
-            instances::Step::Index(index) => {
-                i64::try_from(index)
-                    .ok()
-                    .map(|index| PathSegment::Subscript {
-                        index: Subscript::Int { index },
-                    })
-            }
-            instances::Step::Key(key) => Some(PathSegment::Subscript {
-                index: Subscript::Str { key },
-            }),
-        })
-        .collect::<Option<Vec<_>>>();
-    let Some(tail) = tail else {
-        return InputVerdict::Undecided;
-    };
-    if let Some(attributes) = site.attributes.as_deref() {
-        let Some(current_root) = attributes.get(&root) else {
-            return InputVerdict::Undecided;
-        };
-        if !tail.is_empty()
-            && matches!(
-                peel_secret(current_root),
-                Value::Deferred(DeferredValue::Unknown(_))
-            )
-        {
-            return InputVerdict::Undecided;
-        }
-        if !matches!(
-            peel_secret(current_root),
-            Value::Deferred(DeferredValue::Unknown(_))
-        ) {
-            // Normalization preserves top-level attribute identity, but can
-            // reorder/move values within it. An erased child has no proven
-            // correspondence to the authored child at the same position.
-            if value.is_some() {
-                return InputVerdict::Undecided;
-            }
-            return from_attributes(attributes, &root, &tail, &mut estimator, rule)
-                .unwrap_or(InputVerdict::Undecided);
-        }
-    }
-    let retained = match &site.authored {
-        Some(AuthoredAttributes::Resource(attributes)) => {
-            from_attributes(attributes, &root, &tail, &mut estimator, rule)
-        }
-        Some(AuthoredAttributes::Preview(attributes)) => {
-            from_attributes(attributes, &root, &tail, &mut estimator, rule)
-        }
-        Some(AuthoredAttributes::Template(attributes)) => {
-            from_attributes(attributes, &root, &tail, &mut estimator, rule)
-        }
-        None => None,
-    };
-    retained
-        .or_else(|| {
-            site.attributes.as_deref().and_then(|attributes| {
-                from_attributes(attributes, &root, &tail, &mut estimator, rule)
-            })
-        })
-        .unwrap_or(InputVerdict::Undecided)
-}
-
-fn from_attributes<P: ValueKind>(
-    attributes: &IndexMap<String, Value<P>>,
-    root: &str,
-    tail: &[PathSegment],
-    estimator: &mut Estimator<'_>,
-    rule: &InputRule<Compiled>,
-) -> Option<InputVerdict> {
-    let value = attributes.get(root)?;
     let summary = estimator.at_path(
-        value,
-        tail,
+        expression.value(),
+        &[],
         matches!(rule.target(), InputRuleTarget::MapKeys(_)),
         0,
     );
-    Some(decide(summary, rule, &estimator.query))
+    decide(summary, rule, &estimator.query)
 }
 
 fn key_spelling_is_stable(

@@ -244,6 +244,15 @@ pub(super) struct RestoredSecrets {
 
 impl RestoredSecrets {
     fn restore(&mut self, source: &Value, target: &mut Value, path: &mut Vec<SecretSlot>) {
+        // Positional/field identity is available only when the complete
+        // plaintext value is unchanged. A transformed subtree carries no
+        // correspondence; protect all of it rather than guessing its origin.
+        if crate::value::contains_secret(source)
+            && unwrap_secret(source.clone()) != unwrap_secret(target.clone())
+        {
+            self.protect(target, path);
+            return;
+        }
         match (source, target) {
             (Value::Deferred(DeferredValue::Secret(_)), target)
                 if !matches!(target, Value::Deferred(DeferredValue::Secret(_))) =>
@@ -274,6 +283,35 @@ impl RestoredSecrets {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn protect(&mut self, target: &mut Value, path: &[SecretSlot]) {
+        if !matches!(target, Value::Deferred(DeferredValue::Secret(_))) {
+            *target = target.clone().into_secret();
+            self.paths.push(path.to_vec());
+        }
+    }
+
+    fn restore_attributes(
+        &mut self,
+        source: &indexmap::IndexMap<String, Value>,
+        target: &mut indexmap::IndexMap<String, Value>,
+    ) {
+        let source_tree = Value::Concrete(ConcreteValue::Map(source.clone()));
+        let target_tree = Value::Concrete(ConcreteValue::Map(target.clone()));
+        if crate::value::contains_secret(&source_tree)
+            && unwrap_secret(source_tree) != unwrap_secret(target_tree)
+        {
+            for (key, value) in target {
+                self.protect(value, &[SecretSlot::Key(key.clone())]);
+            }
+        } else {
+            for (key, value) in target {
+                if let Some(source) = source.get(key) {
+                    self.restore(source, value, &mut vec![SecretSlot::Key(key.clone())]);
+                }
+            }
         }
     }
 
@@ -461,11 +499,7 @@ async fn apply_desired_normalization_slice_unprojected<
     if let (Some(restored), Some(inputs)) = (restored.as_deref_mut(), protected_inputs) {
         for ((resource, input), restored) in provider_resources.iter_mut().zip(inputs).zip(restored)
         {
-            for (key, source) in input {
-                if let Some(target) = resource.attributes.get_mut(&key) {
-                    restored.restore(&source, target, &mut vec![SecretSlot::Key(key)]);
-                }
-            }
+            restored.restore_attributes(&input, &mut resource.attributes);
         }
     }
     for (resource, provider_resource) in resources.iter_mut().zip(provider_resources) {
@@ -535,4 +569,31 @@ pub fn states_contain_unknown<P: crate::resource::StateValueLeaf>(
     states
         .values()
         .any(|state| state.attributes.values().any(value_contains_unknown))
+}
+
+#[cfg(test)]
+mod correspondence_tests {
+    use super::*;
+
+    #[test]
+    fn changed_collection_cannot_restore_secrets_by_position() {
+        let secret = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+            "private-key".into(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        )])))
+        .into_secret();
+        let public = Value::Concrete(ConcreteValue::Bool(false));
+        let source = Value::Concrete(ConcreteValue::List(vec![secret.clone(), public.clone()]));
+        let mut target = Value::Concrete(ConcreteValue::List(vec![public, unwrap_secret(secret)]));
+        let mut restored = RestoredSecrets::default();
+        restored.restore(
+            &source,
+            &mut target,
+            &mut vec![SecretSlot::Key("objects".into())],
+        );
+        assert!(
+            matches!(target, Value::Deferred(DeferredValue::Secret(_))),
+            "without carried correspondence the complete changed collection must remain protected"
+        );
+    }
 }

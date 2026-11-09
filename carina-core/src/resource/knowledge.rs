@@ -1721,34 +1721,6 @@ impl<'s, 'a, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'a, P, 
             Self::Pending(_) | Self::Failed(_) => None,
         }
     }
-    pub(crate) fn map_field(self, name: &str) -> Option<Self> {
-        match self {
-            Self::Known(value) => match value.node.as_ref() {
-                kernel::KnownNode::Map(items) => items.entries.get(name).map(Self::Known),
-                _ => None,
-            },
-            Self::Shape(value) => match value.node.as_ref() {
-                kernel::ShapeNode::Map(items) => items.get(name).map(Self::from),
-                kernel::ShapeNode::Coalesce(pending) => Self::Shape(&pending.value).map_field(name),
-                kernel::ShapeNode::List(_) => None,
-            },
-            Self::Pending(_) | Self::Failed(_) => None,
-        }
-    }
-    pub(crate) fn map_len(self) -> Option<usize> {
-        match self {
-            Self::Known(value) => match value.node.as_ref() {
-                kernel::KnownNode::Map(items) => Some(items.len()),
-                _ => None,
-            },
-            Self::Shape(value) => match value.node.as_ref() {
-                kernel::ShapeNode::Map(items) => Some(items.len()),
-                kernel::ShapeNode::Coalesce(pending) => Self::Shape(&pending.value).map_len(),
-                kernel::ShapeNode::List(_) => None,
-            },
-            Self::Pending(_) | Self::Failed(_) => None,
-        }
-    }
     pub(crate) fn map(self) -> Option<IndexMap<&'a str, Self>> {
         match self {
             Self::Known(value) => match value.node.as_ref() {
