@@ -21,6 +21,8 @@ pub use type_context::{InputCompositions, InputTypeContext};
 mod condition_tests;
 #[cfg(test)]
 mod estimator_tests;
+#[cfg(test)]
+mod review1_tests;
 
 use crate::{
     effect::{Effect, EffectGeneration, EffectInstanceKey},
@@ -503,6 +505,15 @@ fn classify_write_site<'a, S>(
     // Discharge consumes the declarations admitted for this slot. Update
     // applicability is decided from the same sent projection at both phases.
     // Scope is classified when root and Struct declarations bind to instances.
+    // Deferred templates share authored knowledge projection: literals and
+    // membership survive, while loop slots and unresolved expressions stay
+    // unknown. Every rule consumer uses this same desired-input evidence.
+    let attributes = attributes.or_else(|| match &authored {
+        Some(AuthoredAttributes::Template(attributes)) => {
+            Some(Cow::Owned(project_attributes(attributes)))
+        }
+        Some(AuthoredAttributes::Resource(_)) | None => None,
+    });
     let mut rules = declarations.iter().collect::<Vec<_>>();
     rules.sort_by(|a, b| (a.target(), a.code()).cmp(&(b.target(), b.code())));
     Ok(Some(WriteSite {
@@ -926,7 +937,8 @@ fn path_evidence<'a>(
     };
     for step in &steps[1..] {
         let knowledge = match peel_secret(value).knowledge(&KnowledgeContext::validation()) {
-            Ok(k) => k.into_classification(),
+            Ok(k) if k.failure().is_none() => k.into_classification(),
+            Ok(_) => return PathEvidence::Failed,
             Err(_) => return PathEvidence::Failed,
         };
         let next = match &knowledge {
@@ -1054,29 +1066,39 @@ fn scalar_equals(
     let resolver =
         ty.map(|ty| EnumValueResolver::with_defs(ty, applicable.site.schema.as_schema().defs()));
     let scalar = match value.as_concrete() {
-        Some(ConcreteValueRef::Bool(v)) => Some(InputLiteral::Bool(v)),
-        Some(ConcreteValueRef::Int(v)) => Some(InputLiteral::Int(v)),
-        Some(ConcreteValueRef::Float(v)) => Some(InputLiteral::Float(v)),
-        Some(ConcreteValueRef::CanonicalEnum(v)) => Some(InputLiteral::Enum {
+        Some(ConcreteValueRef::Bool(v)) => InputLiteral::Bool(v),
+        Some(ConcreteValueRef::Int(v)) => InputLiteral::Int(v),
+        Some(ConcreteValueRef::Float(v)) => InputLiteral::Float(v),
+        Some(ConcreteValueRef::CanonicalEnum(v)) => InputLiteral::Enum {
             identity: v.identity().clone(),
             api_value: v.api_value().to_owned(),
-        }),
-        Some(ConcreteValueRef::EnumIdentifier(v)) => resolver
-            .and_then(|r| r.resolve_raw(v).ok())
-            .map(|v| InputLiteral::Enum {
+        },
+        Some(ConcreteValueRef::EnumIdentifier(v)) => {
+            let Some(resolver) = resolver else {
+                return Truth::Failed;
+            };
+            let Ok(v) = resolver.resolve_raw(v) else {
+                return Truth::Failed;
+            };
+            InputLiteral::Enum {
                 identity: v.identity().clone(),
                 api_value: v.api_value().to_owned(),
-            }),
+            }
+        }
         Some(ConcreteValueRef::String(v)) => {
             if ty.is_some_and(|ty| ty.enum_parts().is_some()) {
-                resolver
-                    .and_then(|r| r.resolve_state_text(v.expose_plaintext()).ok())
-                    .map(|v| InputLiteral::Enum {
-                        identity: v.identity().clone(),
-                        api_value: v.api_value().to_owned(),
-                    })
+                let Some(resolver) = resolver else {
+                    return Truth::Failed;
+                };
+                let Ok(v) = resolver.resolve_state_text(v.expose_plaintext()) else {
+                    return Truth::Failed;
+                };
+                InputLiteral::Enum {
+                    identity: v.identity().clone(),
+                    api_value: v.api_value().to_owned(),
+                }
             } else {
-                Some(InputLiteral::String(v.expose_plaintext().to_owned()))
+                InputLiteral::String(v.expose_plaintext().to_owned())
             }
         }
         Some(
@@ -1085,12 +1107,19 @@ fn scalar_equals(
             | ConcreteValueRef::StringList(_)
             | ConcreteValueRef::Map(_),
         )
-        | None => None,
+        | None => return Truth::Failed,
     };
-    match scalar {
-        Some(value) if &value == literal => Truth::True,
-        Some(_) => Truth::False,
-        None => Truth::Pending,
+    match (&scalar, literal) {
+        (InputLiteral::Int(integer), InputLiteral::Float(float))
+        | (InputLiteral::Float(float), InputLiteral::Int(integer)) => {
+            if crate::numeric::compare_int_float(*integer, *float).is_eq() {
+                Truth::True
+            } else {
+                Truth::False
+            }
+        }
+        (value, literal) if value == literal => Truth::True,
+        (_, _) => Truth::False,
     }
 }
 

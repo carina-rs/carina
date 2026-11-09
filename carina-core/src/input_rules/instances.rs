@@ -165,7 +165,7 @@ fn walk<'s, 'a>(
     ty: &'a CompiledAttributeType,
     value: Option<&Value>,
     owner: &mut Vec<Step>,
-    pending_refs: &mut HashSet<String>,
+    visited_refs: &mut HashSet<String>,
     out: &mut Vec<ApplicableInputRule<'s, 'a>>,
     scope: DiagnosticScope,
 ) {
@@ -206,15 +206,13 @@ fn walk<'s, 'a>(
     );
     match &ty.kind {
         AttrTypeKind::Ref(name) => {
-            if pending && !pending_refs.insert(name.clone()) {
+            if !visited_refs.insert(name.clone()) {
                 return;
             }
             if let Some(definition) = defs.get(name) {
-                walk(site, definition, value, owner, pending_refs, out, scope);
+                walk(site, definition, value, owner, visited_refs, out, scope);
             }
-            if pending {
-                pending_refs.remove(name);
-            }
+            visited_refs.remove(name);
         }
         AttrTypeKind::Struct {
             fields: declarations,
@@ -236,12 +234,17 @@ fn walk<'s, 'a>(
                     continue;
                 }
                 owner.push(Step::Field(field.name.clone()));
+                let mut child_refs = HashSet::new();
                 walk(
                     site,
                     &field.field_type,
                     child,
                     owner,
-                    pending_refs,
+                    if child.is_some() {
+                        &mut child_refs
+                    } else {
+                        visited_refs
+                    },
                     out,
                     scope,
                 );
@@ -257,14 +260,14 @@ fn walk<'s, 'a>(
                         element_type,
                         Some(item.diagnostic_value()),
                         owner,
-                        pending_refs,
+                        &mut HashSet::new(),
                         out,
                         scope,
                     );
                     owner.pop();
                 }
             } else if pending {
-                walk(site, element_type, None, owner, pending_refs, out, scope);
+                walk(site, element_type, None, owner, visited_refs, out, scope);
             }
         }
         AttrTypeKind::Map {
@@ -282,35 +285,49 @@ fn walk<'s, 'a>(
                         value_type,
                         Some(value.diagnostic_value()),
                         owner,
-                        pending_refs,
+                        &mut HashSet::new(),
                         out,
                         scope,
                     );
                     owner.pop();
                 }
             } else if pending {
-                walk(site, value_type, None, owner, pending_refs, out, scope);
+                walk(site, value_type, None, owner, visited_refs, out, scope);
             }
         }
         AttrTypeKind::Union(_) => {
             let crate::schema::RawShape::Union(members) = ty.raw_shape() else {
                 unreachable!("union declaration");
             };
-            // A pending union cannot select an object branch yet. Preserve all
-            // branch obligations; known branches use the existing fit judgement.
-            for member in members {
-                if pending
-                    || value.is_some_and(|value| {
-                        crate::schema::validate_attr_with_defs(
-                            member,
-                            value,
+            match &evidence {
+                Some(known @ Classification::Known(_)) => {
+                    let mut ref_path = visited_refs
+                        .iter()
+                        .filter_map(|name| defs.get_key_value(name).map(|(name, _)| name.as_str()))
+                        .collect();
+                    if let Some(member) =
+                        crate::schema::value_validation::select_union_member_from_knowledge_on_path(
+                            members,
+                            known,
                             defs,
-                            crate::schema::FieldAncestry::WRITABLE,
+                            &mut ref_path,
                         )
-                        .is_ok()
-                    })
-                {
-                    walk(site, member, value, owner, pending_refs, out, scope);
+                    {
+                        walk(site, member, value, owner, visited_refs, out, scope);
+                    }
+                }
+                // These are possible branches, not selected instances. Erase
+                // branch evidence so their rules remain pending until a fit
+                // can be established from the complete value.
+                Some(
+                    Classification::ShapeKnown(_)
+                    | Classification::Pending(_)
+                    | Classification::Failed(_),
+                )
+                | None => {
+                    for member in members {
+                        walk(site, member, None, owner, visited_refs, out, scope);
+                    }
                 }
             }
         }

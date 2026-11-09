@@ -575,6 +575,33 @@ pub(super) fn validate_value_locally<
     findings
 }
 
+/// Consume the ordinary validator's selected fit, retaining the caller's
+/// non-consuming reference path while comparing declaration-ordered members.
+pub(crate) fn select_union_member_from_knowledge_on_path<
+    'a,
+    'v,
+    P: PlaceholderKind,
+    B: BindingAddress,
+    T: StructuralPending<'v, P, B>,
+>(
+    members: &'a [CompiledAttributeType],
+    value: &Classification<'v, P, B, T>,
+    defs: &'a BTreeMap<String, CompiledAttributeType>,
+    visited: &mut Vec<&'a str>,
+) -> Option<&'a CompiledAttributeType> {
+    ValueValidator { defs, lookup: None }
+        .union_with_assignment(
+            members,
+            value.into(),
+            &FieldPath::new(),
+            FieldAncestry::WRITABLE,
+            visited,
+            None,
+        )
+        .ok()
+        .map(|admitted| admitted.selected.member)
+}
+
 #[cfg(test)]
 pub(super) fn select_union_member_on_path<'a>(
     members: &'a [CompiledAttributeType],
@@ -586,16 +613,7 @@ pub(super) fn select_union_member_on_path<'a>(
         .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
         .map(|proof| proof.into_classification())
         .expect("evaluable union fixture");
-    ValueValidator { defs, lookup: None }
-        .union(
-            members,
-            (&knowledge).into(),
-            &FieldPath::new(),
-            FieldAncestry::WRITABLE,
-            visited,
-        )
-        .ok()
-        .map(|selected| selected.member)
+    select_union_member_from_knowledge_on_path(members, &knowledge, defs, visited)
 }
 
 pub(crate) fn validate_value_with_lookup<
@@ -782,19 +800,6 @@ impl<'a> ValueValidator<'a> {
         visited: &mut Vec<&'a str>,
     ) -> CheckedValue<'a> {
         self.walk_with_assignment(attr, value, path, ancestry, visited, None)
-    }
-
-    #[cfg(test)]
-    fn union<'v, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'v, P, B>>(
-        &self,
-        members: &'a [CompiledAttributeType],
-        value: ClassifiedRef<'_, 'v, P, B, T>,
-        path: &FieldPath,
-        ancestry: FieldAncestry,
-        visited: &mut Vec<&'a str>,
-    ) -> Result<UnionFit<'a>, Box<UnionFailure<'a>>> {
-        self.union_with_assignment(members, value, path, ancestry, visited, None)
-            .map(|admitted| admitted.selected)
     }
 
     fn walk_with_assignment<
