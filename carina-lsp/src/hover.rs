@@ -62,6 +62,21 @@ fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> Strin
     for position in walk.positions() {
         let mut refinements = String::new();
         match position.value_type().shape() {
+            Shape::Reference {
+                identity: _,
+                pattern,
+                length,
+            } => {
+                if let Some(spec) = pattern {
+                    refinements.push_str(&format!(
+                        "\n- **Identity pattern**: {}",
+                        PatternSpecDisplay::new(spec)
+                    ));
+                }
+                if let Some(bounds) = hover_bounds(length) {
+                    refinements.push_str(&format!("\n- **Identity length**: {bounds}"));
+                }
+            }
             Shape::String {
                 identity_layer,
                 member_layer,
@@ -3138,6 +3153,37 @@ EOT
             panic!("Markdown hover")
         };
         content.value
+    }
+
+    #[test]
+    fn hover_reference_leaf_shows_identity_pattern_and_length() {
+        let content = hover_for_refinement_fields(vec![
+            StructField::optional(
+                "reference",
+                AttributeType::reference(
+                    carina_core::schema::TypeIdentity::from_dotted("test.WidgetName"),
+                    Some(carina_core::schema::PatternSpec::new(
+                        "[a-z]+",
+                        carina_core::schema::PatternMatch::Full,
+                    )),
+                    Some((Some(1), Some(8))),
+                ),
+            )
+            .build(),
+        ]);
+        for expected in [
+            "Field `reference`",
+            "test.WidgetName",
+            "**Identity pattern**",
+            "[a-z]+",
+            "**Identity length**: 1..=8",
+        ] {
+            assert!(content.contains(expected), "missing {expected}: {content}");
+        }
+        assert!(
+            !content.contains("further nested constraints omitted"),
+            "{content}"
+        );
     }
 
     #[test]

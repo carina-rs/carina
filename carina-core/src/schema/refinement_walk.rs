@@ -60,8 +60,8 @@ impl<'a> RefinementPositions<'a> {
 }
 
 impl<'a> EffectiveType<'a> {
-    /// Visit at most `max_nodes` named/structurally refined String/Int leaves
-    /// and structural nodes, including every Ref and nested Union. Plain scalar
+    /// Visit at most `max_nodes` refined String/Int/Reference leaves and
+    /// structural nodes, including every Ref and nested Union. Plain scalar
     /// leaves are omitted and cost no budget. Exactly-fitting walks are complete.
     pub fn refinement_positions(&self, max_nodes: usize) -> RefinementPositions<'a> {
         let mut positions = Vec::new();
@@ -113,6 +113,11 @@ fn visit<'a>(
         | AttrTypeKind::Int {
             identity_layer: _,
             member_layer: _,
+        }
+        | AttrTypeKind::Reference {
+            identity: _,
+            pattern: _,
+            length: _,
         } => {
             positions.push(RefinedScalarPosition {
                 path: path.clone(),
@@ -192,11 +197,6 @@ fn visit<'a>(
         }
         | AttrTypeKind::Bool
         | AttrTypeKind::Duration
-        | AttrTypeKind::Reference {
-            identity: _,
-            pattern: _,
-            length: _,
-        }
         | AttrTypeKind::UnloadedSchemaType(_)
         | AttrTypeKind::ResourceHandle {
             provider: _,
@@ -226,7 +226,14 @@ fn counts_for_refinements(kind: &AttrTypeKind<super::Compiled>) -> bool {
                 || identity_layer.range.is_some()
                 || member_layer.range.is_some()
         }
-        AttrTypeKind::Ref(_)
+        // A Reference always carries a nominal String identity, even when its
+        // optional pattern and bounds are absent.
+        AttrTypeKind::Reference {
+            identity: _,
+            pattern: _,
+            length: _,
+        }
+        | AttrTypeKind::Ref(_)
         | AttrTypeKind::Struct {
             fields: _,
             name: _,
@@ -257,11 +264,6 @@ fn counts_for_refinements(kind: &AttrTypeKind<super::Compiled>) -> bool {
         }
         | AttrTypeKind::Bool
         | AttrTypeKind::Duration
-        | AttrTypeKind::Reference {
-            identity: _,
-            pattern: _,
-            length: _,
-        }
         | AttrTypeKind::UnloadedSchemaType(_)
         | AttrTypeKind::ResourceHandle {
             provider: _,
@@ -277,6 +279,38 @@ mod tests {
 
     fn refined_string() -> AttributeType {
         AttributeType::refined_string(None, None, Some((Some(1), Some(8))), None)
+    }
+
+    #[test]
+    fn refinement_walk_counts_reference_metadata() {
+        let schema = ResourceSchema::new("Test")
+            .attribute(
+                AttributeSchema::optional(
+                    "value",
+                    AttributeType::reference(
+                        crate::schema::TypeIdentity::from_dotted("test.Name"),
+                        Some(crate::schema::PatternSpec::new(
+                            "[a-z]+",
+                            crate::schema::PatternMatch::Full,
+                        )),
+                        Some((Some(1), Some(8))),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let ty = schema.effective_attribute("value").unwrap().value_type();
+        let short = ty.refinement_positions(0);
+        assert!(short.is_truncated());
+        assert!(short.positions().is_empty());
+        let exact = ty.refinement_positions(1);
+        assert!(!exact.is_truncated());
+        assert_eq!(exact.positions().len(), 1);
+        assert!(matches!(
+            exact.positions()[0].value_type().shape(),
+            super::super::Shape::Reference { .. }
+        ));
     }
 
     #[test]

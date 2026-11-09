@@ -52,14 +52,17 @@ distinct single-owner and checked multi-owner forms; the latter maps at least
 two `SchemaTypeOwner`s to their identity constraints. Single-owner retained
 annotations omit `owner_layers`. Multi-owner records key exactly one identity
 layer by each schema owner's provider name; missing, extra, or duplicate owners
-are invalid. Each owner's own bounds must be nonempty, even when their combined
-intersection is empty. Exact projection records reject unknown constraint fields.
-Portable type equality includes origin and projection fingerprint. Equal
-constraints in the same identity/owner scope join without resolution: the
-lexicographically least tuple (origin rank, routing key, evidence, fingerprint)
-wins, ranking Projection before Annotation to retain exact rebinding provenance.
-Other collection joins try canonical identities lazily in sorted order. Both
-paths are independent of operand order.
+are invalid. Owner sets derive from layer keys. Retained records accept empty
+same-owner bounds as well as empty cross-owner intersections: after normalizing
+Float bounds, decoding verifies the exact conjunction of the owner layers and
+recomputes the `empty_intersection` marker. Exact projection records reject
+unknown constraint fields. Portable type equality includes origin and projection
+fingerprint. Same-identity joins keep identical full evidence; otherwise they
+widen to identity-only annotations built locally by conjoining the operands'
+owner identity layers. They never promote an element to an exact Enum/Reference
+projection or re-resolve a canonical declaration. Different-identity collection
+joins try canonical candidates lazily in sorted order. Both paths are independent
+of operand order.
 
 Schema fingerprint encoding is v13. Saved-plan format 44 supersedes 43 because
 the schema fingerprint encoding changed. Saved module `pending_constraints`

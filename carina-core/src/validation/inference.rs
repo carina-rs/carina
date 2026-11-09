@@ -322,9 +322,11 @@ impl<'a> InferredTypeJoiner<'a> {
     pub(crate) fn join(&mut self, left: &TypeExpr, right: &TypeExpr) -> Option<TypeExpr> {
         if let (TypeExpr::SchemaType { owned: left }, TypeExpr::SchemaType { owned: right }) =
             (left, right)
-            && let Some(owned) = left.join_identical_constraints(right)
+            && left.identity() == right.identity()
         {
-            return Some(TypeExpr::SchemaType { owned });
+            return left
+                .join_same_identity(right)
+                .map(|owned| TypeExpr::SchemaType { owned });
         }
         if left == right {
             return Some(left.clone());
@@ -342,8 +344,8 @@ impl<'a> InferredTypeJoiner<'a> {
         }
         let scalar_identity = |ty: &TypeExpr| match ty {
             TypeExpr::SchemaType { owned } => {
-                // Enum bases remain part of the enum declaration; they are not
-                // scalar member layers and cannot be erased by a collection join.
+                // Different-identity widening keeps the existing scalar rule:
+                // an exact Enum cannot be widened by substituting its base.
                 if owned
                     .resolve_projection(self.context)
                     .ok()?
@@ -1568,7 +1570,7 @@ mod tests {
         };
         struct CountingSource {
             known: BTreeSet<OwnedTypeIdentity>,
-            unresolved: TypeIdentity,
+            unresolved: BTreeSet<TypeIdentity>,
             calls: Arc<Mutex<BTreeMap<TypeIdentity, usize>>>,
         }
         impl CustomTypeResolver for CountingSource {
@@ -1589,7 +1591,7 @@ mod tests {
                     .unwrap()
                     .entry(owned.identity().clone())
                     .or_default() += 1;
-                if owned.identity() == &self.unresolved {
+                if self.unresolved.contains(owned.identity()) {
                     Err(CustomTypeValidationError::MissingDeclaration {
                         owner: "p".into(),
                         identity: owned.identity().clone(),
@@ -1611,16 +1613,17 @@ mod tests {
         }
         let left_id = TypeIdentity::from_dotted("aws.service.Resource.Name");
         let right_id = TypeIdentity::from_dotted("aws.Name");
+        let other_id = TypeIdentity::from_dotted("aws.other.Resource.Name");
         let calls = Arc::new(Mutex::new(BTreeMap::new()));
         let mut context = ProviderContext::new(crate::EnvironmentSnapshot::empty());
         context.custom_types = ProviderCustomTypes::from_source(CountingSource {
-            known: [left_id.clone(), right_id.clone()]
+            known: [left_id.clone(), right_id.clone(), other_id.clone()]
                 .into_iter()
                 .map(|identity| {
                     OwnedTypeIdentity::provider("p", identity, RefinedScalarKind::String)
                 })
                 .collect(),
-            unresolved: left_id.clone(),
+            unresolved: BTreeSet::from([left_id.clone(), other_id.clone()]),
             calls: calls.clone(),
         });
         let schema = ValidatedConfigSchema::validate(BTreeMap::from([
@@ -1651,21 +1654,22 @@ mod tests {
             0,
             "do not resolve the later candidate after the first admits both"
         );
-        let narrow = ValidatedConfigSchema::validate(BTreeMap::from([(
-            "narrow".into(),
+        let other = ValidatedConfigSchema::validate(BTreeMap::from([(
+            "other".into(),
             DraftType::string_member(
-                crate::schema::StringIdentityLayer::new(Some(left_id.clone()), None, None, None),
+                crate::schema::StringIdentityLayer::new(Some(other_id.clone()), None, None, None),
                 crate::schema::StringMemberConstraints::new(None, Some((Some(8), Some(16)))),
             ),
         )]))
         .unwrap();
-        let narrow = attribute_type_to_type_expr(&narrow.parts()["narrow"], "p");
+        let other = attribute_type_to_type_expr(&other.parts()["other"], "p");
         for _ in 0..3 {
-            assert!(joiner.join(&left, &narrow).is_none());
+            assert!(joiner.join(&left, &other).is_none());
         }
         let calls = calls.lock().unwrap();
         assert_eq!(calls[&right_id], 1, "positive canonical cache");
         assert_eq!(calls[&left_id], 1, "negative canonical cache");
+        assert_eq!(calls[&other_id], 1, "second negative canonical cache");
     }
 
     #[test]

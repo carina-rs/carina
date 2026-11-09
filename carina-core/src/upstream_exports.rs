@@ -5117,7 +5117,7 @@ mod tests {
             )
             .validate()
             .expect("schema fixture must be valid");
-        let projection = crate::parser::ResolvedSchemaType::from_schema_declaration(
+        let annotation = crate::parser::ResolvedSchemaType::from_annotation_declaration(
             "test",
             &schema.as_schema().attributes["identifier"].attr_type,
         )
@@ -5136,10 +5136,10 @@ mod tests {
             });
 
         assert!(errors.is_empty(), "unexpected resolve errors: {errors:?}");
-        // Equal constraints retain the exact projection in either operand order.
+        // Different evidence widens to an identity-only annotation in either order.
         let expected =
             UpstreamExportType::Static(ExportStaticType::Inferred(consumer_inferred_type(
-                TypeExpr::List(Box::new(TypeExpr::SchemaType { owned: projection })),
+                TypeExpr::List(Box::new(TypeExpr::SchemaType { owned: annotation })),
             )));
         for name in ["out", "reversed"] {
             assert_eq!(exports["ups"][name].static_type, expected);

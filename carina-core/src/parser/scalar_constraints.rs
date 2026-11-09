@@ -130,7 +130,6 @@ pub(super) struct MultiOwnerConstraints {
 // either promotes distinct single owners or validates a complete wire owner set.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct MultipleOwnerLayers {
-    owners: NonEmptySchemaTypeOwners,
     layers: BTreeMap<SchemaTypeOwner, IdentityConstraintKind>,
 }
 
@@ -438,38 +437,6 @@ impl ScalarConstraints {
         )
     }
 
-    fn matches_identity(&self, identity: &IdentityConstraintKind) -> bool {
-        match (&self.scalar, identity) {
-            (
-                ScalarConstraintKind::String {
-                    identity_layer,
-                    member_layer,
-                },
-                IdentityConstraintKind::String {
-                    identity_layer: other,
-                },
-            ) => {
-                identity_layer == other
-                    && member_layer.pattern.is_none()
-                    && member_layer.length.pair().is_none()
-            }
-            (
-                ScalarConstraintKind::Int {
-                    identity_range,
-                    member_range,
-                },
-                IdentityConstraintKind::Int {
-                    identity_range: other,
-                },
-            ) => identity_range == other && member_range.pair().is_none(),
-            (
-                ScalarConstraintKind::Float { range },
-                IdentityConstraintKind::Float { range: other },
-            ) => range == other,
-            _ => false,
-        }
-    }
-
     pub(super) fn materialize(&self, owned: &super::ResolvedSchemaType) -> CompiledAttributeType {
         let binding = crate::schema::RefinementBinding::Annotation(owned.clone());
         let kind = match &self.scalar {
@@ -574,7 +541,10 @@ impl IdentityConstraints {
     pub(super) fn owners(&self) -> NonEmptySchemaTypeOwners {
         match self {
             Self::Single(single) => NonEmptySchemaTypeOwners::singleton(single.owner.clone()),
-            Self::Multi(multi) => multi.layers.owners.clone(),
+            Self::Multi(multi) => {
+                NonEmptySchemaTypeOwners::try_from_iter(multi.layers.layers.keys().cloned())
+                    .expect("multi-owner layers have at least two keys by construction")
+            }
         }
     }
 
@@ -587,14 +557,6 @@ impl IdentityConstraints {
                 Self::Multi(multi) => multi.layers.layers.clone(),
             }),
         }
-    }
-
-    pub(super) fn matches_projection(
-        &self,
-        owner: &SchemaTypeOwner,
-        constraints: &ScalarConstraints,
-    ) -> bool {
-        matches!(self, Self::Single(single) if &single.owner == owner && constraints.matches_identity(&single.scalar))
     }
 
     pub(super) fn conjoin(&self, other: &Self) -> Self {
@@ -614,8 +576,6 @@ impl IdentityConstraints {
         match self {
             Self::Single(single) if single.owner == owner => single.scalar.intersect(&incoming),
             Self::Single(single) => {
-                let owners = NonEmptySchemaTypeOwners::singleton(single.owner.clone())
-                    .union(&NonEmptySchemaTypeOwners::singleton(owner.clone()));
                 let mut scalar = single.scalar.clone();
                 scalar.intersect(&incoming);
                 let layers = BTreeMap::from([
@@ -626,15 +586,11 @@ impl IdentityConstraints {
                 // conjoins can insert or intersect entries, never remove them.
                 *self = Self::Multi(MultiOwnerConstraints {
                     scalar,
-                    layers: MultipleOwnerLayers { owners, layers },
+                    layers: MultipleOwnerLayers { layers },
                 });
             }
             Self::Multi(multi) => {
                 multi.scalar.intersect(&incoming);
-                multi.layers.owners = multi
-                    .layers
-                    .owners
-                    .union(&NonEmptySchemaTypeOwners::singleton(owner.clone()));
                 multi
                     .layers
                     .layers
@@ -698,56 +654,155 @@ impl IdentityConstraintsWire {
         mut self,
         owners: &NonEmptySchemaTypeOwners,
     ) -> Result<IdentityConstraints, &'static str> {
-        if self.empty_intersection != self.scalar.bounds_are_empty() {
-            return Err("scalar bounds and empty-intersection marker disagree");
-        }
         self.scalar.normalize_float_bounds();
-        if let Some(owner) = owners.single_owner() {
+        let constraints = if let Some(owner) = owners.single_owner() {
             if !self.owner_layers.is_empty() {
                 return Err("single-owner annotations must omit owner layers");
             }
-            if self.scalar.bounds_are_empty() {
-                return Err("owner identity bounds must be nonempty");
+            IdentityConstraints::single(owner.clone(), self.scalar)
+        } else {
+            let mut layers = self.owner_layers.0;
+            if !layers.keys().eq(owners.iter()) {
+                return Err("owner layers must match the annotation owner set exactly");
             }
-            return Ok(IdentityConstraints::single(owner.clone(), self.scalar));
-        }
-        let mut layers = self.owner_layers.0;
-        if !layers.keys().eq(owners.iter()) {
-            return Err("owner layers must match the annotation owner set exactly");
-        }
-        let kind = self.scalar.kind();
-        let mut expected: Option<IdentityConstraintKind> = None;
-        for layer in layers.values_mut() {
-            if layer.bounds_are_empty() {
-                return Err("owner identity bounds must be nonempty");
+            let kind = self.scalar.kind();
+            let mut expected: Option<IdentityConstraintKind> = None;
+            for layer in layers.values_mut() {
+                layer.normalize_float_bounds();
+                if layer.kind() != kind {
+                    return Err("owner layer scalar kind does not match annotation");
+                }
+                match &mut expected {
+                    Some(expected) => expected.intersect(layer),
+                    None => expected = Some(layer.clone()),
+                }
             }
-            layer.normalize_float_bounds();
-            if layer.kind() != kind {
-                return Err("owner layer scalar kind does not match annotation");
+            if expected.as_ref() != Some(&self.scalar) {
+                return Err("owner layer conjunction does not match scalar constraints");
             }
-            match &mut expected {
-                Some(expected) => expected.intersect(layer),
-                None => expected = Some(layer.clone()),
-            }
+            // The nonempty owner set was not a singleton, and the keys agree
+            // exactly. The private map therefore contains at least two owners.
+            IdentityConstraints::Multi(MultiOwnerConstraints {
+                scalar: self.scalar,
+                layers: MultipleOwnerLayers { layers },
+            })
+        };
+        if self.empty_intersection != constraints.is_empty() {
+            return Err("scalar bounds and empty-intersection marker disagree");
         }
-        if expected.as_ref() != Some(&self.scalar) {
-            return Err("owner layer conjunction does not match scalar constraints");
-        }
-        // NonEmptySchemaTypeOwners excludes zero; the single-owner arm is
-        // handled above. Exact key agreement therefore proves at least two.
-        Ok(IdentityConstraints::Multi(MultiOwnerConstraints {
-            scalar: self.scalar,
-            layers: MultipleOwnerLayers {
-                owners: owners.clone(),
-                layers,
-            },
-        }))
+        Ok(constraints)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_owner_conjunctions_round_trip() {
+        use crate::parser::ResolvedSchemaType;
+        use crate::schema::{AttributeType, TypeIdentity, ValidatedConfigSchema};
+
+        let id = TypeIdentity::from_dotted("test.Generated");
+        let intervals: [(Option<u32>, Option<u32>); 5] = [
+            (None, None),
+            (None, Some(0)),
+            (Some(1), Some(4)),
+            (Some(8), Some(12)),
+            (Some(16), None),
+        ];
+        for kind in [
+            RefinedScalarKind::String,
+            RefinedScalarKind::Int,
+            RefinedScalarKind::Float,
+        ] {
+            let mut drafts: Vec<_> = intervals
+                .into_iter()
+                .map(|(min, max)| match kind {
+                    RefinedScalarKind::String => AttributeType::refined_string(
+                        Some(id.clone()),
+                        None,
+                        Some((min.map(u64::from), max.map(u64::from))),
+                        None,
+                    ),
+                    RefinedScalarKind::Int => AttributeType::refined_int(
+                        Some(id.clone()),
+                        Some((min.map(i64::from), max.map(i64::from))),
+                    ),
+                    RefinedScalarKind::Float => AttributeType::refined_float(
+                        Some(id.clone()),
+                        Some((
+                            min.map(|n| crate::finite(f64::from(n))),
+                            max.map(|n| crate::finite(f64::from(n))),
+                        )),
+                    ),
+                })
+                .collect();
+            if kind == RefinedScalarKind::Float {
+                for (min, max) in [(-0.0, 0.0), (0.0, -0.0), (-4.0, -1.0)] {
+                    drafts.push(AttributeType::refined_float(
+                        Some(id.clone()),
+                        Some((Some(crate::finite(min)), Some(crate::finite(max)))),
+                    ));
+                }
+            }
+            // Compile separately: differing String/Int identity definitions
+            // are intentionally not admissible in one provider schema.
+            let declarations: Vec<_> = drafts
+                .into_iter()
+                .map(|draft| {
+                    let schema =
+                        ValidatedConfigSchema::validate(BTreeMap::from([("value".into(), draft)]))
+                            .unwrap();
+                    schema.parts()["value"].clone()
+                })
+                .collect();
+            for first in &declarations {
+                for second in &declarations {
+                    for second_owner in ["a", "b"] {
+                        let a =
+                            ResolvedSchemaType::from_annotation_declaration("a", first).unwrap();
+                        let b =
+                            ResolvedSchemaType::from_annotation_declaration(second_owner, second)
+                                .unwrap();
+                        let c =
+                            ResolvedSchemaType::from_annotation_declaration("c", first).unwrap();
+                        let ab = a.conjoin(&b);
+                        for joined in [
+                            a.clone(),
+                            ab.clone(),
+                            ab.conjoin(&a),
+                            ab.conjoin(&c),
+                            a.conjoin(&c).conjoin(&b),
+                        ] {
+                            let wire = serde_json::to_value(&joined).unwrap();
+                            let restored: ResolvedSchemaType = serde_json::from_value(wire.clone())
+                                .unwrap_or_else(|error| panic!("{kind:?}: {error}: {wire}"));
+                            assert_eq!(restored, joined);
+                            assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+                            if kind == RefinedScalarKind::Float {
+                                let canonical = serde_json::to_string(&joined).unwrap();
+                                let signed =
+                                    canonical.replace("\"Inclusive\":0.0", "\"Inclusive\":-0.0");
+                                let normalized: ResolvedSchemaType =
+                                    serde_json::from_str(&signed).unwrap();
+                                assert_eq!(serde_json::to_string(&normalized).unwrap(), canonical);
+                            }
+                            let mut tampered = wire;
+                            let marker = tampered["constraints"]["empty_intersection"]
+                                .as_bool()
+                                .unwrap();
+                            tampered["constraints"]["empty_intersection"] =
+                                serde_json::json!(!marker);
+                            assert!(
+                                serde_json::from_value::<ResolvedSchemaType>(tampered).is_err()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn deserialized_declaration_bounds_normalize_both_zero_signs() {

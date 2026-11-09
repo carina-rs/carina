@@ -349,7 +349,7 @@ impl Eq for ResolvedScalarDeclaration {}
 
 /// Origins carry distinct typed payloads. A projection owns one schema owner;
 /// annotation constraints own either a single owner or a checked owner map.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ResolvedConstraintEvidence {
     Annotation(super::scalar_constraints::IdentityConstraints),
     Projection {
@@ -413,16 +413,6 @@ impl ResolvedConstraintEvidence {
             Self::Projection { owner, constraints } => {
                 constraints.identity_constraints(owner.clone())
             }
-        }
-    }
-
-    fn compatible_constraints(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Annotation(a), Self::Projection { owner, constraints })
-            | (Self::Projection { owner, constraints }, Self::Annotation(a)) => {
-                a.matches_projection(owner, constraints)
-            }
-            _ => self == other,
         }
     }
 
@@ -610,32 +600,18 @@ impl ResolvedSchemaType {
         self
     }
 
-    /// Equal declaration constraints need no catalog lookup. Pick the
-    /// lexicographically least (origin rank, routing key, evidence, fingerprint).
-    /// Projection ranks before Annotation so exact rebinding provenance survives.
-    pub(crate) fn join_identical_constraints(&self, other: &Self) -> Option<Self> {
-        if self.0.owned != other.0.owned
-            || !self.0.evidence.compatible_constraints(&other.0.evidence)
-        {
+    /// Identical evidence keeps its exact declaration. Every other join of the
+    /// same identity widens to a local identity-only annotation: member bounds,
+    /// Enum/Reference capabilities and projection provenance belong to children.
+    /// Conjoining owner identity layers is commutative and requires no catalog.
+    pub(crate) fn join_same_identity(&self, other: &Self) -> Option<Self> {
+        if self.identity() != other.identity() || self.scalar_kind() != other.scalar_kind() {
             return None;
         }
-        let order_key = |value: &Self| match &value.0.evidence {
-            ResolvedConstraintEvidence::Projection { .. } => 0,
-            ResolvedConstraintEvidence::Annotation(_) => 1,
-        };
-        let order = order_key(self)
-            .cmp(&order_key(other))
-            .then_with(|| self.0.owned.cmp(&other.0.owned))
-            .then_with(|| self.0.evidence.cmp(&other.0.evidence))
-            .then_with(|| {
-                self.0
-                    .projection_fingerprint
-                    .cmp(&other.0.projection_fingerprint)
-            });
-        Some(if order.is_gt() {
-            other.clone()
-        } else {
+        Some(if self == other {
             self.clone()
+        } else {
+            self.conjoin(other)
         })
     }
 
