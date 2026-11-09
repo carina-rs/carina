@@ -97,33 +97,12 @@ impl<B: BindingAddress> ParserRewrite<B> for FunctionParameterRewrite<'_, B> {
                 let Some(base) = self.substitutions.get(path.binding()) else {
                     return Ok(None);
                 };
-                let mut substituted = crate::resource::apply_value_path_segment(
-                    base.walker_value().clone(),
-                    crate::resource::PathSegment::Field {
-                        name: path.attribute().to_string(),
-                    },
-                    source_line,
-                    crate::resource::AccessMissPolicy::Error,
-                )
-                .and_then(crate::resource::ValuePathSegmentResult::into_value)
-                .map_err(|error| ParseError::InvalidExpression {
-                    line: source_line,
-                    message: error.to_string(),
-                })?;
-                for segment in path.segments() {
-                    substituted = crate::resource::apply_value_path_segment(
-                        substituted,
-                        segment.clone(),
-                        source_line,
-                        crate::resource::AccessMissPolicy::Error,
-                    )
-                    .and_then(crate::resource::ValuePathSegmentResult::into_value)
+                substitute_reference_path(base.walker_value().clone(), path, source_line)
+                    .map(Some)
                     .map_err(|error| ParseError::InvalidExpression {
                         line: source_line,
                         message: error.to_string(),
-                    })?;
-                }
-                Ok(Some(substituted))
+                    })
             }
             LeafInput::BindingRef(_)
             | LeafInput::Unknown(_)
@@ -144,7 +123,7 @@ impl<B: BindingAddress> ParserRewrite<B> for FunctionParameterRewrite<'_, B> {
         _source_line: crate::resource::DiagnosticSourceLine,
     ) -> Result<Option<ParserStageFunctionArgument<B>>, ParseError> {
         let Some(value) = argument.value() else {
-            return Ok(Some(argument.clone()));
+            return Ok(None);
         };
         if let GenericValue::Deferred(DeferredValue::Placeholder(
             ParserPlaceholder::FnParam { name } | ParserPlaceholder::FnLocal { name },
@@ -184,7 +163,15 @@ mod tests {
         let value = AuthoredValue::Deferred(DeferredValue::ResolvedFunctionCall {
             function: function.clone(),
             functions: functions.clone(),
-            args: vec![FunctionArgument::from_value(unchanged_expression)],
+            args: vec![
+                FunctionArgument::from_value(unchanged_expression),
+                FunctionArgument::from_handle(
+                    crate::eval_value::UnexpandedStructuralHandle::module_parameter(
+                        "unchanged_handle",
+                        crate::parser::ResourceTypePath::new("mock", "test.resource"),
+                    ),
+                ),
+            ],
             source_line: 3.into(),
         });
         let substitutions = HashMap::new();

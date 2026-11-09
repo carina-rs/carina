@@ -3762,20 +3762,22 @@ async fn run_apply_from_plan_with_observer_factory(
     );
     let (inspected_plan, parsed_backend) = match inspected_plan {
         InspectedPlanFile::Verified(plan) => {
-            let current_config = loaded_current_config.map_err(AppError::Config)?;
-            let parsed_backend = current_config
-                .into_root_expanded()
-                .backend
-                .map(carina_core::parser::BackendConfig::into_expanded)
-                .transpose()?;
+            let parsed_backend = match loaded_current_config {
+                Ok(config) => Some(config.into_root_expanded().backend.map(carina_core::parser::BackendConfig::into_expanded).transpose()?),
+                Err(error) if error.kind() == carina_core::config_loader::ConfigurationLoadFailureKind::BackendInput => return Err(AppError::Config(error.to_string())),
+                Err(_) => None,
+            };
             (
                 ProviderBoundPlanFile::verified(plan, providers),
-                Some(parsed_backend),
+                parsed_backend,
             )
         }
         InspectedPlanFile::NeedsSecretVerification(plan) => {
             let current_config = loaded_current_config.map_err(|source| {
-                saved_plan_secret_evaluation_error(AppError::Config(source), apply_target)
+                saved_plan_secret_evaluation_error(
+                    AppError::Config(source.to_string()),
+                    apply_target,
+                )
             })?;
             let parsed = current_config.parsed;
             let unresolved = current_config.unresolved_parsed;

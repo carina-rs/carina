@@ -212,3 +212,33 @@ fn saved_apply_rejects_unavailable_current_backend_before_drift() {
     assert!(!message.to_lowercase().contains("drift"), "{message}");
     assert!(!message.to_lowercase().contains("migration"), "{message}");
 }
+
+#[test]
+fn r5_saved_apply_uses_saved_backend_after_unrelated_resolution_error() {
+    let project = Project::new("provider mock {}\nmock.test.resource { name = 'saved' }\n");
+    fs::write(
+        project.0.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    for arguments in [
+        vec!["init", "."],
+        vec!["plan", "--refresh=false", "--out", "plan.json", "."],
+    ] {
+        let output = project.run(&arguments);
+        assert!(output.status.success(), "{}", rendered(&output));
+    }
+    fs::write(
+        project.0.path().join("values.crn"),
+        "let values = ['safe']\n",
+    )
+    .unwrap();
+    fs::write(
+        project.0.path().join("unrelated.crn"),
+        "let unrelated = values[7]\n",
+    )
+    .unwrap();
+    let output = project.run(&["apply", "--auto-approve", "--lock=false", "plan.json"]);
+    assert!(output.status.success(), "{}", rendered(&output));
+    assert!(project.0.path().join("state.json").exists());
+}

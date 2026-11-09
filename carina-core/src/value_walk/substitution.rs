@@ -43,6 +43,9 @@ pub(super) trait ParserRewrite<B: BindingAddress> {
     fn error(&mut self, error: ParseError) -> Self::Error;
     fn source_line(&self) -> usize;
     fn set_source_line(&mut self, _: usize) {}
+    fn branches_inherit_position(&self) -> bool {
+        false
+    }
 
     fn leaf(
         &mut self,
@@ -162,14 +165,6 @@ impl<R, E: InsideSecret, B: BindingAddress> ParserTransform<'_, R, E, B> {
             })
     }
 
-    fn position(&self, at: &At<'_>) -> RewritePosition {
-        match at.expression_edges()[self.position_start..].last() {
-            Some(ExpressionEdge::AccessBase) => RewritePosition::AccessBase,
-            Some(_) => RewritePosition::Value,
-            None => self.position,
-        }
-    }
-
     fn value_scope<T>(&mut self, at: &At<'_>, run: impl FnOnce(&mut Self) -> T) -> T {
         let previous = (self.position, self.position_start);
         self.position = RewritePosition::Value;
@@ -191,6 +186,23 @@ impl<'a, B: BindingAddress, R: ParserRewrite<B>> ParserTransform<'a, R, R::Error
             argument_line: DiagnosticSourceLine::synthetic(),
             replacements: 0,
             binding: PhantomData,
+        }
+    }
+
+    fn position(&self, at: &At<'_>) -> RewritePosition {
+        let edges = &at.expression_edges()[self.position_start..];
+        let edge = if self.policy.branches_inherit_position() {
+            edges
+                .iter()
+                .rev()
+                .find(|edge| !matches!(edge, ExpressionEdge::Then | ExpressionEdge::Else))
+        } else {
+            edges.last()
+        };
+        match edge {
+            Some(ExpressionEdge::AccessBase) => RewritePosition::AccessBase,
+            Some(_) => RewritePosition::Value,
+            None => self.position,
         }
     }
 
@@ -562,6 +574,32 @@ impl<B: BindingAddress, R: ParserRewrite<B>> BoundTransform<ParserPlaceholder, B
         let result = self.policy.argument(argument, self.argument_line);
         self.record(result)
     }
+}
+
+/// Apply the authored reference suffix once for both substitution policies.
+/// Locations belong to this use site even when a supplied value has its own references.
+fn substitute_reference_path<B: BindingAddress>(
+    mut value: Value<ParserPlaceholder, B>,
+    path: &crate::resource::AccessPath<B>,
+    source_line: usize,
+) -> Result<Value<ParserPlaceholder, B>, crate::resource::ValueAccessError> {
+    for segment in std::iter::once(crate::resource::PathSegment::Field {
+        name: path.attribute().to_owned(),
+    })
+    .chain(path.segments().iter().cloned())
+    {
+        value = crate::resource::apply_value_path_segment(
+            value,
+            segment,
+            source_line,
+            crate::resource::AccessMissPolicy::Error,
+        )?
+        .into_value()?;
+    }
+    Ok(match path.reference_locations() {
+        Some(locations) => value.with_reference_locations(locations),
+        None => value,
+    })
 }
 
 #[cfg(test)]

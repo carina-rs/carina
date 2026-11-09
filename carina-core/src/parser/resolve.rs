@@ -7,9 +7,10 @@ use super::ast::{ExportParamLike, File, ParsedFile, ProviderConfig};
 use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
 use super::{ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value};
+#[cfg(test)]
+use crate::config_loader::analysis_resolution_context;
 use crate::config_loader::{
-    ResolutionContext, analysis_resolution_context, diagnostics_resolution_context,
-    strict_resolution_context,
+    ResolutionContext, diagnostics_resolution_context, strict_resolution_context,
 };
 use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue,
@@ -797,11 +798,17 @@ pub(crate) fn resolve_snapshot_function_calls_in_context(
 /// Unknown function names are preserved for the directory-wide pass, where
 /// the complete function table can distinguish a sibling function from a
 /// genuinely unknown call.
+#[cfg(test)]
 pub(crate) fn resolve_resource_refs_defer_unknown_functions(
     parsed: &mut ParsedFile,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
-    resolve_resource_refs_in_context(parsed, config, None, analysis_resolution_context())
+    resolve_resource_refs_in_context(
+        parsed,
+        config,
+        None,
+        crate::config_loader::analysis_resolution_context(),
+    )
 }
 
 /// Resolve the directory-wide semantic view used by diagnostics.
@@ -824,6 +831,37 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
     resolution: ResolutionContext,
 ) -> Result<(), ParseError> {
+    resolve_resource_refs_with_backend_failure(parsed, config, session, resolution)
+        .map_err(RootInputFailure::into_parse_error)
+}
+
+#[derive(Debug)]
+pub(crate) enum RootInputFailure {
+    Backend(ParseError),
+    Value(ParseError),
+}
+impl RootInputFailure {
+    pub(crate) fn is_backend(&self) -> bool {
+        matches!(self, Self::Backend(_))
+    }
+    pub(crate) fn into_parse_error(self) -> ParseError {
+        match self {
+            Self::Backend(error) | Self::Value(error) => error,
+        }
+    }
+}
+impl From<ParseError> for RootInputFailure {
+    fn from(error: ParseError) -> Self {
+        Self::Value(error)
+    }
+}
+
+pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
+    parsed: &mut File<E>,
+    config: &ProviderContext,
+    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    resolution: ResolutionContext,
+) -> Result<(), RootInputFailure> {
     let syntax = parsed.parser_binding_metadata.syntax().clone();
     let locate_named = |kind, name: &str, error: ParseError| match syntax
         .declarations()
@@ -960,8 +998,9 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
                     Some(record) => error.at(record.location()),
                     None => error,
                 }
-            })?;
-            if crate::value::contains_secret(&evaluated) {
+            })
+            .map_err(RootInputFailure::Backend)?;
+            if resolution.backend_is_demanded() && crate::value::contains_secret(&evaluated) {
                 let span = backend.attribute_spans.get(key).copied().ok_or_else(|| {
                     ParseError::InternalError {
                         expected: format!("source span for backend attribute '{key}'"),
@@ -975,7 +1014,7 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
                     start_column: span.start_column(),
                     end_column: span.end_column(),
                 };
-                return Err(
+                return Err(RootInputFailure::Backend(
                     match syntax
                         .backend_keys()
                         .iter()
@@ -985,7 +1024,7 @@ pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
                         Some(record) => error.at(record.location()),
                         None => error,
                     },
-                );
+                ));
             }
             *value = evaluated;
         }

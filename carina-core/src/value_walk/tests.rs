@@ -2933,3 +2933,43 @@ fn substitution_if_branches_inside_access_bases_remain_value_positions() {
         "Invalid expression at line 7: 'p' is a resource handle, not a value; reference one of its attributes, e.g. 'p.<attribute>'"
     );
 }
+
+#[test]
+fn r5_function_path_substitution_preserves_authored_reference_locations() {
+    use crate::resource::{AuthoredValue, FunctionArgument};
+    let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::parser::parse_file(
+        "let source = mock.test.resource {}\nlet input = source.field\n",
+        std::path::Path::new("reference.crn"),
+        &context,
+    )
+    .unwrap();
+    let input = &parsed.variables["input"];
+    assert!(
+        matches!(
+            input,
+            AuthoredValue::Deferred(DeferredValue::ResourceRef { .. })
+        ),
+        "expected reference: {input:?}"
+    );
+    if let AuthoredValue::Deferred(DeferredValue::ResourceRef { path }) = input {
+        let locations = path.reference_locations().cloned().unwrap();
+        let replacement = AuthoredValue::resource_ref("target", "name", vec![]);
+        let substitutions = HashMap::from([(
+            "source".into(),
+            FunctionArgument::from_value(AuthoredValue::Concrete(ConcreteValue::Map(
+                indexmap::IndexMap::from([("field".into(), replacement)]),
+            ))),
+        )]);
+        let rewritten = crate::value_walk::substitute_function_parameters(
+            input,
+            &substitutions,
+            2,
+            crate::value_walk::RewritePosition::Value,
+        )
+        .unwrap();
+        assert!(
+            matches!(rewritten, AuthoredValue::Deferred(DeferredValue::ResourceRef { path }) if path.binding() == "target" && path.reference_locations() == Some(&locations))
+        );
+    }
+}

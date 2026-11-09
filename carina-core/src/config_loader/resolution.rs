@@ -33,16 +33,29 @@ enum Demand {
 pub(crate) struct ResolutionContext {
     phase: ResolutionPhase,
     demand: Demand,
+    backend_demand: Demand,
 }
 
 impl ResolutionContext {
     pub(super) const fn issue(phase: ResolutionPhase) -> Self {
         Self {
             phase,
+            backend_demand: Demand::Active,
             demand: match phase {
                 ResolutionPhase::Bootstrap | ResolutionPhase::SavedRehydration => Demand::Retained,
                 ResolutionPhase::Analysis(_) | ResolutionPhase::Strict => Demand::Active,
             },
+        }
+    }
+
+    /// Module expansion rechecks editor semantics, while discovery still
+    /// retains unconsumed values. It does not enter full validation.
+    pub(super) fn module_recheck(self) -> Self {
+        match self.phase {
+            ResolutionPhase::Analysis(_) => Self::issue(ResolutionPhase::Strict),
+            ResolutionPhase::Bootstrap
+            | ResolutionPhase::SavedRehydration
+            | ResolutionPhase::Strict => self,
         }
     }
 
@@ -58,10 +71,29 @@ impl ResolutionContext {
         }
     }
 
-    /// Only the loader raises demand for a root consumed as current metadata.
-    pub(super) fn demanded(self) -> Self {
+    /// Metadata discovery consumes typed declarations, not current backend values.
+    pub(super) fn metadata_only(self) -> Self {
+        Self {
+            backend_demand: Demand::Retained,
+            ..self
+        }
+    }
+
+    pub(crate) fn backend_is_demanded(self) -> bool {
+        self.backend_demand == Demand::Active
+    }
+
+    pub(super) fn backend(self) -> Self {
+        Self {
+            demand: self.backend_demand,
+            ..self
+        }
+    }
+
+    fn demanded(self) -> Self {
         Self {
             demand: Demand::Active,
+            backend_demand: Demand::Active,
             ..self
         }
     }

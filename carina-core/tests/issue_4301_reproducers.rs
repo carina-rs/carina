@@ -343,7 +343,7 @@ fn bootstrap_and_saved_loading_only_demand_consumed_backend_values() {
     let context = ProviderContext::new(EnvironmentSnapshot::empty());
     for loader in [
         carina_core::config_loader::load_configuration_for_bootstrap,
-        carina_core::config_loader::load_configuration_for_saved_rehydration,
+        saved_load_with_rendered_error,
     ] {
         let loaded = loader(&path, &context, &SchemaRegistry::new()).unwrap();
         assert!(matches!(
@@ -375,6 +375,7 @@ fn saved_loading_rejects_unavailable_backend_values_with_location() {
     )
     .err()
     .unwrap();
+    let error = error.to_string();
     assert!(error.contains("backend.crn:1:"), "{error}");
     assert!(
         error.contains("environment variable 'MISSING' is not set"),
@@ -398,7 +399,7 @@ fn metadata_backend_demands_its_let_dependency_but_not_unrelated_lets() {
     let context = ProviderContext::new(EnvironmentSnapshot::empty());
     for loader in [
         carina_core::config_loader::load_configuration_for_bootstrap,
-        carina_core::config_loader::load_configuration_for_saved_rehydration,
+        saved_load_with_rendered_error,
     ] {
         let error = loader(
             &ResolvedPath::new(directory.path()).unwrap(),
@@ -414,4 +415,132 @@ fn metadata_backend_demands_its_let_dependency_but_not_unrelated_lets() {
         );
         assert!(!error.contains("UNSET_Y"), "{error}");
     }
+}
+
+#[test]
+fn r5_bootstrap_phase_survives_providerless_module_resolution() {
+    let dir = fixture(&[
+        (
+            "main.crn",
+            "let child = use { source = './child' }\nlet instance = child {}\n",
+        ),
+        (
+            "child/main.crn",
+            "arguments { name: String = 'safe' }\nlet unused = secret(env('R5_MODULE_UNSET'))\nlet item = mock.test.resource { name = name }\n",
+        ),
+    ]);
+    let context = ProviderContext::new(EnvironmentSnapshot::empty());
+    let path = ResolvedPath::new(dir.path()).unwrap();
+    let loaded =
+        carina_core::config_loader::parse_directory_for_bootstrap(&path, &context).unwrap();
+    let expanded =
+        carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+            resolve_modules_with_providerless_config(loaded, &path, session, &SchemaRegistry::new())
+        })
+        .unwrap();
+    assert_eq!(expanded.resources.len(), 1);
+}
+
+#[test]
+fn r5_saved_loader_classifies_failed_backend_roots() {
+    use carina_core::config_loader::ConfigurationLoadFailureKind;
+    let context = ProviderContext::new(EnvironmentSnapshot::empty());
+    for expression in [
+        "env('R5_BACKEND_UNSET')",
+        "['safe'][7]",
+        "secret(env('R5_BACKEND_UNSET'))",
+    ] {
+        let dir = fixture(&[(
+            "backend.crn",
+            &format!("backend local {{ path = {expression} }}\n"),
+        )]);
+        let error = load_configuration_for_saved_rehydration(
+            &ResolvedPath::new(dir.path()).unwrap(),
+            &context,
+            &SchemaRegistry::new(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.kind(),
+            ConfigurationLoadFailureKind::BackendInput,
+            "{expression}: {error}"
+        );
+        assert!(error.to_string().contains("backend.crn"), "{error}");
+    }
+}
+
+fn saved_load_with_rendered_error(
+    path: &ResolvedPath,
+    context: &ProviderContext,
+    schemas: &SchemaRegistry,
+) -> Result<carina_core::config_loader::LoadedConfig, String> {
+    load_configuration_for_saved_rehydration(path, context, schemas)
+        .map_err(|error| error.to_string())
+}
+
+#[test]
+fn r5_metadata_discovery_leaves_unconsumed_secret_backend_deferred() {
+    let directory = fixture(&[(
+        "backend.crn",
+        "backend local { path = secret(env('R5_UNUSED_BACKEND')) }\n",
+    )]);
+    let path = ResolvedPath::new(directory.path()).unwrap();
+    let context = ProviderContext::new(EnvironmentSnapshot::empty());
+    let schemas = SchemaRegistry::new();
+    assert!(
+        carina_core::config_loader::load_configuration_for_metadata(&path, &context, &schemas)
+            .unwrap()
+            .parsed
+            .backend
+            .is_some()
+    );
+    assert!(
+        carina_core::config_loader::parse_directory_for_metadata(
+            &path,
+            &context,
+            &std::collections::HashMap::new(),
+            &schemas
+        )
+        .unwrap()
+        .backend
+        .is_some()
+    );
+    let error =
+        carina_core::config_loader::load_configuration_for_bootstrap(&path, &context, &schemas)
+            .err()
+            .unwrap();
+    assert!(error.contains("secret()- and decrypt()-derived values are not allowed"));
+    assert!(!error.contains("R5_UNUSED_BACKEND"));
+}
+
+#[test]
+fn r5_upstream_export_discovery_retains_unrelated_failed_inputs() {
+    let directory = fixture(&[
+        ("main.crn", "// downstream\n"),
+        (
+            "upstream/main.crn",
+            "let unused = secret(env('R5_EXPORT_UNSET'))\nexports { label: String = 'visible' }\n",
+        ),
+    ]);
+    let context = ProviderContext::new(EnvironmentSnapshot::empty());
+    let source = carina_core::parser::UpstreamState {
+        binding: carina_core::resource::RelativeBindingName::new("upstream"),
+        source: "./upstream".into(),
+    };
+    let exports =
+        carina_core::validation::deferred_types::with_session_for_test(&context, |session| {
+            carina_core::upstream_exports::discover_upstream_exports(
+                &ResolvedPath::new(directory.path()).unwrap(),
+                &[source],
+                session,
+                Some(&SchemaRegistry::new()),
+            )
+        });
+    assert!(
+        exports
+            .get(&carina_core::resource::RelativeBindingName::new("upstream"))
+            .is_some_and(|entries| entries.contains_key("label")),
+        "{exports:?}"
+    );
 }

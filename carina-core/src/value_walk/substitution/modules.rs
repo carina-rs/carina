@@ -10,10 +10,7 @@ use crate::{
         ArgumentSubstitutionError, ArgumentSubstitutions, append_reference_path,
         decide_expanded_if_condition, function_substitution_error, module_parameter_postfix,
     },
-    resource::{
-        AccessMissPolicy, LoopSlot, PathSegment, StructuralOperandRef, ValuePathSegmentResult,
-        apply_value_path_segment,
-    },
+    resource::{AccessMissPolicy, LoopSlot, StructuralOperandRef},
 };
 type ArgumentSubstitutionPosition = RewritePosition;
 type ModuleResolvedValue = Value<ParserPlaceholder, AbsoluteBindingAddress>;
@@ -27,11 +24,13 @@ pub(crate) fn substitute_module_arguments<B: BindingAddress>(
 pub(crate) fn select_expanded_module_ifs(
     value: &ModuleResolvedValue,
 ) -> Result<ModuleResolvedValue, ArgumentSubstitutionError> {
-    rewrite_parser_value(
+    let mut selected = rewrite_parser_value(
         value,
         RewritePosition::Value,
         &mut ExpandedModuleRewrite { config: None },
-    )
+    )?;
+    selected.canonicalize_in_place();
+    Ok(selected)
 }
 pub(crate) fn evaluate_expanded_module_functions(
     value: &ModuleResolvedValue,
@@ -255,6 +254,10 @@ impl<B: BindingAddress> ParserRewrite<B> for ModuleArgumentRewrite<'_, B> {
         self.arguments.default_line
     }
 
+    fn branches_inherit_position(&self) -> bool {
+        true
+    }
+
     fn condition_error(&mut self, error: Self::Error, file: &std::path::Path) -> Self::Error {
         error.with_source_file(file)
     }
@@ -266,7 +269,6 @@ impl<B: BindingAddress> ParserRewrite<B> for ModuleArgumentRewrite<'_, B> {
     ) -> Result<Option<crate::resource::Value<ParserPlaceholder, B>>, Self::Error> {
         use crate::resource::{DeferredValue, Value};
         let arguments = self.arguments;
-        let value = input.cloned_value();
         let mut error_location = (None, arguments.default_line);
         let substituted = match input {
             LeafInput::Placeholder(ParserPlaceholder::ModuleArgument { name, diagnostic }) => {
@@ -356,46 +358,24 @@ impl<B: BindingAddress> ParserRewrite<B> for ModuleArgumentRewrite<'_, B> {
                         message: message.into(),
                         parse_error: None,
                     })?;
-                let mut substituted = apply_value_path_segment(
-                    substitution.value().clone(),
-                    PathSegment::Field {
-                        name: path.attribute().to_string(),
+                substitute_reference_path(substitution.value().clone(), path, source_line).map_err(
+                    |error| ArgumentSubstitutionError::Evaluation {
+                        source_file: None,
+                        line: source_line,
+                        message: error.to_string().into(),
+                        parse_error: None,
                     },
-                    source_line,
-                    AccessMissPolicy::Error,
-                )
-                .and_then(ValuePathSegmentResult::into_value)
-                .map_err(|error| ArgumentSubstitutionError::Evaluation {
-                    source_file: None,
-                    line: source_line,
-                    message: error.to_string().into(),
-                    parse_error: None,
-                })?;
-                for segment in path.segments() {
-                    substituted = apply_value_path_segment(
-                        substituted,
-                        segment.clone(),
-                        source_line,
-                        AccessMissPolicy::Error,
-                    )
-                    .and_then(ValuePathSegmentResult::into_value)
-                    .map_err(|error| {
-                        ArgumentSubstitutionError::Evaluation {
-                            source_file: None,
-                            line: source_line,
-                            message: error.to_string().into(),
-                            parse_error: None,
-                        }
-                    })?;
-                }
-                if let Some(locations) = path.reference_locations() {
-                    substituted = substituted.with_reference_locations(locations);
-                }
-                substituted
+                )?
             }
             LeafInput::Unknown(_) => return Ok(None),
         };
-        validate_substituted_argument(&value, substituted, arguments, error_location).map(Some)
+        validate_substituted_argument(
+            &input.cloned_value(),
+            substituted,
+            arguments,
+            error_location,
+        )
+        .map(Some)
     }
 
     fn argument(

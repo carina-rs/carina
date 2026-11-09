@@ -39,6 +39,11 @@ type ExpandedValue = Value<ParserPlaceholder, AbsoluteBindingAddress>;
 type ExpandedConcreteValue = ConcreteValue<ParserPlaceholder, AbsoluteBindingAddress>;
 type ExpandedDeferredValue = DeferredValue<ParserPlaceholder, AbsoluteBindingAddress>;
 
+fn resolver_context() -> crate::config_loader::ModuleResolutionContext {
+    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(ParsedFile::default())
+        .module_resolution_context()
+}
+
 fn known(type_expr: TypeExpr) -> TypeExpr {
     type_expr
 }
@@ -182,7 +187,7 @@ impl ModuleResolutionFixture {
             .expect("fixture caller parses");
         crate::validation::deferred_types::with_session_for_test(&config, |session| {
             resolve_upstream_modules_with_providerless_config(
-                parsed,
+                crate::config_loader::ParsedRootDirectory::from_parsed_for_test(parsed),
                 &crate::paths::ResolvedPath::new(
                     caller_file.parent().expect("caller file has a directory"),
                 )
@@ -2655,8 +2660,11 @@ fn test_expand_anonymous_resource_in_named_module_keeps_identity_absent() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test(
                     "policy_module".to_string(),
                     create_test_module_with_anonymous_resource(),
@@ -2701,8 +2709,11 @@ fn anonymous_module_resource_instantiated_twice_has_distinct_pending_ids() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut resolver =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut resolver = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 resolver.insert_module_for_test(
                     "policy_module".to_string(),
                     create_test_module_with_anonymous_resource(),
@@ -2745,8 +2756,11 @@ fn test_expand_module_call() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("test_module".to_string(), create_test_module());
                 r
             };
@@ -2866,8 +2880,11 @@ fn test_expand_module_call_preserves_provider_instance_on_id() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test(
                     "registry".to_string(),
                     create_module_with_named_provider_instance(),
@@ -3073,8 +3090,11 @@ fn test_multiple_module_instances_no_collision() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("net".to_string(), create_module_with_intra_refs());
                 r
             };
@@ -3238,8 +3258,11 @@ fn test_expand_module_call_creates_composition() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("web_tier".to_string(), create_module_with_attributes());
                 r
             };
@@ -3305,8 +3328,11 @@ fn test_expand_module_call_populates_compositions_slice() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("web_tier".to_string(), create_module_with_attributes());
                 r
             };
@@ -3349,8 +3375,11 @@ fn test_expand_module_call_populates_expansion_trace_single_level() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("web_tier".to_string(), create_module_with_attributes());
                 r
             };
@@ -3400,8 +3429,11 @@ fn test_expand_module_call_records_use_source_path_on_call_site() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("web_tier".to_string(), create_module_with_attributes());
                 // Simulates what `process_imports` records for
                 // `use { source = "./modules/web_tier", alias = "web_tier" }`.
@@ -3444,8 +3476,11 @@ fn test_expand_module_call_call_site_source_path_none_when_unmapped() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("web_tier".to_string(), create_module_with_attributes());
                 // Deliberately no `module_paths` entry.
                 r
@@ -3588,8 +3623,11 @@ fn test_expand_module_call_preserves_arguments_on_composition_signature() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("svc".to_string(), module);
                 r
             };
@@ -3672,8 +3710,11 @@ fn test_expand_module_call_without_binding_still_records_boundary_composition() 
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("web_tier".to_string(), create_module_with_attributes());
                 r
             };
@@ -3894,8 +3935,11 @@ fn unavailable_builtin_handle_arguments_are_prefixed_per_module_instance() {
             .expect("permissive resolution must retain the failed built-in");
 
             let resolver = {
-                let mut resolver =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut resolver = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 resolver.insert_module_for_test("m".to_string(), module);
                 resolver
             };
@@ -4526,8 +4570,11 @@ fn test_missing_required_argument() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("test_module".to_string(), create_test_module());
                 r
             };
@@ -4553,8 +4600,11 @@ fn test_expand_module_call_uses_dot_path_addressing() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("test_module".to_string(), create_test_module());
                 r
             };
@@ -4594,8 +4644,11 @@ fn test_module_dot_path_bindings_and_refs() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("net".to_string(), create_module_with_intra_refs());
                 r
             };
@@ -4712,8 +4765,11 @@ fn test_expand_module_call_propagates_and_prefixes_wait_bindings() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("net".to_string(), module);
                 r
             };
@@ -4781,8 +4837,11 @@ fn test_module_composition_dot_path_refs() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("web_tier".to_string(), create_module_with_attributes());
                 r
             };
@@ -4855,8 +4914,11 @@ fn test_unknown_argument_rejected() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("test_module".to_string(), create_test_module());
                 r
             };
@@ -5060,8 +5122,11 @@ fn test_expand_module_call_with_interpolation() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("vpc_mod".to_string(), create_module_with_interpolation());
                 r
             };
@@ -5370,8 +5435,11 @@ fn expand_module_call_with_cidr_function_argument(cidr: Value) -> ExpandedValue 
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("vpc_mod".to_string(), create_module_with_interpolation());
                 r
             };
@@ -5455,8 +5523,11 @@ fn test_load_module_missing_path_cleans_resolving_set() {
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
-            let mut resolver =
-                ModuleResolver::new(&crate::paths::ResolvedPath::new(&tmp_dir).unwrap(), session);
+            let mut resolver = ModuleResolver::new(
+                &crate::paths::ResolvedPath::new(&tmp_dir).unwrap(),
+                session,
+                resolver_context(),
+            );
 
             let err = resolver
                 .load_module("nonexistent")
@@ -5497,6 +5568,7 @@ fn test_load_module_parse_error_cleans_resolving_set() {
             let mut resolver = ModuleResolver::new(
                 &crate::paths::ResolvedPath::new(&tmp_root).unwrap(),
                 session,
+                resolver_context(),
             );
 
             // First attempt: parse error on a directory module with a bad .crn file.
@@ -5572,6 +5644,7 @@ fn test_load_module_rejects_state_blocks() {
                 let mut resolver = ModuleResolver::new(
                     &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
                     session,
+                    resolver_context(),
                 );
                 let err = resolver
                     .load_module("module")
@@ -5613,6 +5686,7 @@ fn test_load_module_rejects_backend_and_cleans_resolving_set() {
             let mut resolver = ModuleResolver::new(
                 &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
                 session,
+                resolver_context(),
             );
             for attempt in 1..=2 {
                 let err = resolver
@@ -5654,6 +5728,7 @@ fn test_load_module_rejects_upstream_state_and_cleans_resolving_set() {
             let mut resolver = ModuleResolver::new(
                 &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
                 session,
+                resolver_context(),
             );
             for attempt in 1..=2 {
                 let err = resolver
@@ -5695,6 +5770,7 @@ fn test_load_module_rejects_exports_and_cleans_resolving_set() {
             let mut resolver = ModuleResolver::new(
                 &crate::paths::ResolvedPath::new(tmp.path()).unwrap(),
                 session,
+                resolver_context(),
             );
             for attempt in 1..=2 {
                 let err = resolver
@@ -5730,6 +5806,7 @@ fn test_load_module_rejects_file_path() {
             let mut resolver = ModuleResolver::new(
                 &crate::paths::ResolvedPath::new(&tmp_root).unwrap(),
                 session,
+                resolver_context(),
             );
             let err = resolver
                 .load_module("single.crn")
@@ -5801,8 +5878,11 @@ fn test_argument_validation_passes_with_valid_value() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test(
                     "web_server".to_string(),
                     create_module_with_port_validation(),
@@ -5849,8 +5929,11 @@ fn test_argument_validation_with_resource_reference_is_pending() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut resolver =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut resolver = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 resolver.insert_module_for_test("web_server".to_string(), module);
                 resolver
             };
@@ -5988,8 +6071,11 @@ let root = outer { outer_port = producer.port }
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut resolver =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut resolver = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 resolver.insert_module_for_test("outer".to_string(), outer);
                 resolver
             };
@@ -6037,8 +6123,11 @@ fn test_argument_validation_passes_with_default_value() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test(
                     "web_server".to_string(),
                     create_module_with_port_validation(),
@@ -6064,8 +6153,11 @@ fn test_argument_validation_fails_with_invalid_value() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test(
                     "web_server".to_string(),
                     create_module_with_port_validation(),
@@ -6110,8 +6202,11 @@ fn test_argument_validation_fails_with_negative_value() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test(
                     "web_server".to_string(),
                     create_module_with_port_validation(),
@@ -6137,8 +6232,11 @@ fn test_argument_validation_fails_too_large() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test(
                     "web_server".to_string(),
                     create_module_with_port_validation(),
@@ -6208,8 +6306,11 @@ fn test_argument_validation_no_message_uses_default() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("counter".to_string(), module);
                 r
             };
@@ -6283,8 +6384,11 @@ fn test_argument_validation_len_with_list() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("tagged".to_string(), module);
                 r
             };
@@ -6388,8 +6492,11 @@ fn test_require_block_passes() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("web".to_string(), module);
                 r
             };
@@ -6472,8 +6579,11 @@ fn test_require_block_fails_with_not_expr() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("web".to_string(), module);
                 r
             };
@@ -6555,8 +6665,11 @@ fn test_require_block_len_function() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("alb".to_string(), module);
                 r
             };
@@ -6656,8 +6769,11 @@ fn test_require_block_multiple_constraints() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("asg".to_string(), module);
                 r
             };
@@ -6720,8 +6836,11 @@ fn test_argument_type_mismatch_int_for_string() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("test_module".to_string(), create_test_module());
                 r
             };
@@ -6759,8 +6878,11 @@ fn test_argument_type_mismatch_string_for_bool() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("test_module".to_string(), create_test_module());
                 r
             };
@@ -6855,6 +6977,7 @@ fn test_argument_type_custom_validator() {
                 &crate::paths::ResolvedPath::new(".").unwrap(),
                 session,
                 &schemas,
+                resolver_context(),
             );
             r.insert_module_for_test("test_module".to_string(), module);
             r
@@ -6954,6 +7077,7 @@ fn test_argument_type_list_of_custom_type() {
                 &crate::paths::ResolvedPath::new(".").unwrap(),
                 session,
                 &schemas,
+                resolver_context(),
             );
             r.insert_module_for_test("test_module".to_string(), module);
             r
@@ -8733,8 +8857,11 @@ fn caller_side_typo_against_string_literal_union_is_rejected() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test(
                     "env_module".to_string(),
                     create_module_with_environment_union(),
@@ -8772,8 +8899,11 @@ fn caller_side_value_in_string_literal_union_is_accepted() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test(
                     "env_module".to_string(),
                     create_module_with_environment_union(),
@@ -8814,8 +8944,11 @@ arguments {
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
-            let mut resolver =
-                ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+            let mut resolver = ModuleResolver::new(
+                &crate::paths::ResolvedPath::new(".").unwrap(),
+                session,
+                resolver_context(),
+            );
             resolver.insert_module_for_test("env_module".to_string(), module);
 
             let parse_value = |literal: &str| {
@@ -9065,8 +9198,11 @@ fn test_expand_module_call_propagates_deferred_for_expressions() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("registry".to_string(), module);
                 r
             };
@@ -9185,8 +9321,11 @@ fn module_deferred_template_instantiated_twice_has_distinct_materialized_ids() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut resolver =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut resolver = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 resolver.insert_module_for_test("assignments".to_string(), module);
                 resolver
             };
@@ -9274,8 +9413,11 @@ fn deferred_for_iterable_binding_not_prefixed_when_not_module_internal() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("net".to_string(), module);
                 r
             };
@@ -9870,8 +10012,11 @@ fn argument_type_list_accepts_resource_ref() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("test_module".to_string(), module);
                 r
             };
@@ -9915,8 +10060,11 @@ fn argument_type_map_accepts_resource_ref() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("test_module".to_string(), module);
                 r
             };
@@ -9961,8 +10109,11 @@ fn argument_type_struct_accepts_resource_ref() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut r =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut r = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 r.insert_module_for_test("test_module".to_string(), module);
                 r
             };
@@ -10002,8 +10153,11 @@ fn argument_type_int_accepts_resource_ref_for_later_ref_type_validation() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
             let resolver = {
-                let mut resolver =
-                    ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+                let mut resolver = ModuleResolver::new(
+                    &crate::paths::ResolvedPath::new(".").unwrap(),
+                    session,
+                    resolver_context(),
+                );
                 resolver.insert_module_for_test("test_module".to_string(), module);
                 resolver
             };
@@ -10158,6 +10312,7 @@ fn module_argument_type_error_with_config(
             let mut resolver = ModuleResolver::with_config(
                 &crate::paths::ResolvedPath::new(".").unwrap(),
                 session,
+                resolver_context(),
             );
             resolver.insert_module_for_test("web_tier".to_string(), module);
             resolver
@@ -10329,8 +10484,11 @@ fn binding_ref_argument_defers_to_binding_index() {
     crate::validation::deferred_types::with_session_for_test(
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         |session| {
-            let mut resolver =
-                ModuleResolver::new(&crate::paths::ResolvedPath::new(".").unwrap(), session);
+            let mut resolver = ModuleResolver::new(
+                &crate::paths::ResolvedPath::new(".").unwrap(),
+                session,
+                resolver_context(),
+            );
             resolver.insert_module_for_test("inner".to_string(), module);
             let call = ModuleCall::test(
                 "inner".to_string(),

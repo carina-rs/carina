@@ -154,6 +154,8 @@ pub(crate) use functions::{
     contains_module_argument_matching, custom_type_lookup_for_schema, function_argument_as_eval,
     validate_builtin_custom_type, validate_schema_custom_type_with_context,
 };
+#[cfg(test)]
+pub(crate) use resolve::resolve_resource_refs_defer_unknown_functions;
 pub use resolve::{
     ProviderConfigInvariantError, ProviderConfigResolutionError, ResolvedProviderConfig,
     ResolvedProviderConfigs, SavedProviderConfigs, check_identifier_scope,
@@ -163,9 +165,9 @@ pub use resolve::{
     resolve_resource_refs_in_session, resolve_resource_refs_with_config,
 };
 pub(crate) use resolve::{
-    collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,
-    resolve_resource_refs_defer_unknown_functions, resolve_resource_refs_for_diagnostics,
-    resolve_resource_refs_in_context, resolve_snapshot_function_calls_in_context,
+    RootInputFailure, collect_seed_bindings_from_parts, reject_cyclic_let_bindings_in_variables,
+    resolve_resource_refs_for_diagnostics, resolve_resource_refs_in_context,
+    resolve_resource_refs_with_backend_failure, resolve_snapshot_function_calls_in_context,
 };
 pub use static_eval::evaluate_static_value_for_validation;
 pub use types::{

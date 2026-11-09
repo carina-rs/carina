@@ -4290,6 +4290,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn r5_selected_if_canonicalizes_enclosing_interpolation() {
+        let value = Value::Deferred(crate::resource::DeferredValue::Interpolation(vec![
+            crate::resource::InterpolationPart::Literal("prefix-".into()),
+            crate::resource::InterpolationPart::Expr(Value::Deferred(
+                crate::resource::DeferredValue::ModuleIf(Box::new(
+                    crate::parser::DeferredValueIf::new(
+                        DeferredIfCondition::new(
+                            Value::Concrete(ConcreteValue::Bool(true)),
+                            "module.crn".into(),
+                            1,
+                        ),
+                        Value::Concrete(ConcreteValue::String("a".into())),
+                        Value::Concrete(ConcreteValue::String("b".into())),
+                    ),
+                )),
+            )),
+        ]));
+        let value = value.resolve_root(&crate::resource::RootScope::new());
+        assert_eq!(
+            select_expanded_module_ifs(&value).unwrap(),
+            ModuleResolvedValue::Concrete(ConcreteValue::String("prefix-a".into()))
+        );
+    }
+
+    #[test]
+    fn r5_module_if_access_branches_inherit_handle_position() {
+        let config = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        crate::validation::deferred_types::with_session_for_test(&config, |session| {
+            let parameter = Value::Deferred(DeferredValue::Placeholder(
+                ParserPlaceholder::ModuleArgument {
+                    name: "p".into(),
+                    diagnostic: Default::default(),
+                },
+            ));
+            let value = crate::resource::apply_postfix_access(
+                Value::Deferred(DeferredValue::ModuleIf(Box::new(
+                    crate::parser::DeferredValueIf::new(
+                        DeferredIfCondition::new(
+                            Value::Concrete(ConcreteValue::Bool(true)),
+                            "module.crn".into(),
+                            7,
+                        ),
+                        parameter,
+                        Value::Concrete(ConcreteValue::Map(IndexMap::from([(
+                            "field".into(),
+                            Value::Concrete(ConcreteValue::String("other".into())),
+                        )]))),
+                    ),
+                ))),
+                PathSegment::Field {
+                    name: "field".into(),
+                },
+                7,
+                AccessMissPolicy::Error,
+            )
+            .unwrap();
+            let arguments = HashMap::from([(
+                "p".into(),
+                ResolvedArgument {
+                    argument: ModuleArgument::from_handle(
+                        crate::eval_value::UnexpandedStructuralHandle::new(
+                            crate::eval_value::UnexpandedStructuralHandleKind::Resource(
+                                crate::parser::ResourceTypePath::new("mock", "test.resource"),
+                            ),
+                            "source",
+                        ),
+                    ),
+                    origin: ArgumentOrigin::Defaulted,
+                    caller_reference: None,
+                    forwarded_from_enclosing_parameter: false,
+                },
+            )]);
+            let substituted = substitute_arguments_with_position(
+                &value,
+                ArgumentSubstitutions {
+                    arguments: &arguments,
+                    default_line: 7,
+                    caller_source_file: std::path::Path::new("caller.crn"),
+                    binding_index: None,
+                    config: session,
+                },
+                ArgumentSubstitutionPosition::Value,
+            )
+            .unwrap();
+            let selected = select_expanded_module_ifs(
+                &substituted.resolve_root(&crate::resource::RootScope::new()),
+            )
+            .unwrap();
+            assert!(
+                matches!(&selected, crate::resource::Value::Deferred(crate::resource::DeferredValue::ResourceRef { path }) if path.binding() == "source" && path.attribute() == "field"),
+                "{selected:?}"
+            );
+        });
+    }
+
+    #[test]
     fn secret_origin_4275_module_walkers_normalize_secret_depth() {
         use crate::resource::{DeferredValue, Value};
         let value: ModuleResolvedValue =
@@ -4377,6 +4473,10 @@ mod tests {
                 let mut resolver = ModuleResolver::new(
                     &crate::paths::ResolvedPath::new(std::path::Path::new(".")).unwrap(),
                     session,
+                    crate::config_loader::ParsedRootDirectory::from_parsed_for_test(
+                        crate::parser::ParsedFile::default(),
+                    )
+                    .module_resolution_context(),
                 );
                 resolver.insert_module_for_test("outer".to_string(), module);
                 resolver
