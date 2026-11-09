@@ -320,6 +320,12 @@ impl<'a> InferredTypeJoiner<'a> {
     }
 
     pub(crate) fn join(&mut self, left: &TypeExpr, right: &TypeExpr) -> Option<TypeExpr> {
+        if let (TypeExpr::SchemaType { owned: left }, TypeExpr::SchemaType { owned: right }) =
+            (left, right)
+            && let Some(owned) = left.join_identical_constraints(right)
+        {
+            return Some(TypeExpr::SchemaType { owned });
+        }
         if left == right {
             return Some(left.clone());
         }
@@ -356,29 +362,32 @@ impl<'a> InferredTypeJoiner<'a> {
         let right_identity = scalar_identity(right)?;
         let mut identities = [left_identity, right_identity];
         identities.sort();
-        // Resolve both candidates through the cache before selecting the first
-        // admitting canonical identity. Selection never depends on operand order.
-        let candidates = identities.map(|identity| {
-            self.canonical
-                .entry(identity.clone())
-                .or_insert_with(|| {
-                    let candidate = TypeExpr::try_from(identity).ok()?;
-                    super::resolve_type_expr(&candidate, self.context).ok()
-                })
-                .clone()
-        });
-        candidates.into_iter().flatten().find(|canonical| {
-            [left, right].into_iter().all(|source| {
-                matches!(
-                    super::typecheck::inferred_type_assignment(
-                        canonical,
-                        source,
-                        &self.context.custom_types
-                    ),
-                    crate::schema::TypeAssignability::Assignable,
-                )
+        // Resolve candidates in sorted identity order, stopping at the first
+        // canonical declaration that admits both. Failed lookups stay cached.
+        let context = self.context;
+        identities
+            .into_iter()
+            .filter_map(|identity| {
+                self.canonical
+                    .entry(identity.clone())
+                    .or_insert_with(|| {
+                        let candidate = TypeExpr::try_from(identity).ok()?;
+                        super::resolve_type_expr(&candidate, context).ok()
+                    })
+                    .clone()
             })
-        })
+            .find(|canonical| {
+                [left, right].into_iter().all(|source| {
+                    matches!(
+                        super::typecheck::inferred_type_assignment(
+                            canonical,
+                            source,
+                            &context.custom_types
+                        ),
+                        crate::schema::TypeAssignability::Assignable,
+                    )
+                })
+            })
     }
 }
 
@@ -1636,6 +1645,23 @@ mod tests {
                 panic!("canonical schema type")
             };
             assert_eq!(owned.identity(), &right_id);
+        }
+        assert_eq!(
+            calls.lock().unwrap().get(&left_id).copied().unwrap_or(0),
+            0,
+            "do not resolve the later candidate after the first admits both"
+        );
+        let narrow = ValidatedConfigSchema::validate(BTreeMap::from([(
+            "narrow".into(),
+            DraftType::string_member(
+                crate::schema::StringIdentityLayer::new(Some(left_id.clone()), None, None, None),
+                crate::schema::StringMemberConstraints::new(None, Some((Some(8), Some(16)))),
+            ),
+        )]))
+        .unwrap();
+        let narrow = attribute_type_to_type_expr(&narrow.parts()["narrow"], "p");
+        for _ in 0..3 {
+            assert!(joiner.join(&left, &narrow).is_none());
         }
         let calls = calls.lock().unwrap();
         assert_eq!(calls[&right_id], 1, "positive canonical cache");

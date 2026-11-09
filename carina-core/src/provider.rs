@@ -9446,8 +9446,7 @@ where
                 declarations_by_identity
                     .entry((identity.clone(), owned.scalar_kind()))
                     .and_modify(|existing| {
-                        *existing =
-                            existing.with_merged_owners(existing.owners().union(owned.owners()));
+                        *existing = existing.conjoin(&owned);
                     })
                     .or_insert(owned);
             }

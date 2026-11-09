@@ -2436,7 +2436,8 @@ fn collection_join_tries_right_canonical_when_left_is_not_authorable() {
             .join(&joined, item)
             .expect("the right identity admits the collection");
     }
-    assert_eq!(joined, expected);
+    // The final same-constraint pair preserves the exact right projection.
+    assert_eq!(joined, right);
     assert_eq!(
         joiner.join(
             &TypeExpr::List(Box::new(left)),
@@ -2761,4 +2762,197 @@ fn enum_identity_annotations_reject_nonmembers_matching_the_base() {
             assert_eq!(result.is_ok(), valid, "{value:?}: {result:?}");
         }
     }
+}
+
+#[test]
+fn identical_annotation_projection_join_needs_no_resolution() {
+    let region_id = TypeIdentity::from_dotted("aws.Region");
+    let loaded = snapshot(vec![(
+        "p",
+        vec![DraftType::enum_with_base(
+            region_id.clone(),
+            DraftType::refined_string(
+                None,
+                Some(crate::schema::PatternSpec::new(
+                    "[a-z0-9-]+",
+                    crate::schema::PatternMatch::Full,
+                )),
+                Some((Some(1), Some(32))),
+                None,
+            ),
+            None,
+            vec![],
+            None,
+            Some(crate::schema::DslTransform::HyphenToUnderscore),
+        )],
+    )]);
+    let source = loaded.provider_context().as_provider_context();
+    let annotation = resolve_type_expr(&TypeExpr::try_from(region_id).unwrap(), source).unwrap();
+    let projection = inference::attribute_type_to_type_expr(declaration(&loaded, "p", 0), "p");
+    let annotation: TypeExpr =
+        serde_json::from_value(serde_json::to_value(annotation).unwrap()).unwrap();
+    let projection: TypeExpr =
+        serde_json::from_value(serde_json::to_value(projection).unwrap()).unwrap();
+    let missing = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let TypeExpr::SchemaType { owned } = &projection else {
+        panic!("projection")
+    };
+    assert!(owned.resolve_projection(&missing).is_err());
+    assert_ne!(
+        annotation, projection,
+        "portable origin remains part of equality"
+    );
+    for (left, right) in [(&annotation, &projection), (&projection, &annotation)] {
+        let joined = inference::join_inferred_types(left, right, &missing)
+            .expect("identical nominal constraints need no owner lookup");
+        assert_eq!(
+            joined, projection,
+            "projection provenance wins the total order"
+        );
+        assert_eq!(
+            serde_json::to_value(joined).unwrap(),
+            serde_json::to_value(&projection).unwrap()
+        );
+        assert_eq!(
+            inference::join_inferred_types(
+                &TypeExpr::List(Box::new(left.clone())),
+                &TypeExpr::List(Box::new(right.clone())),
+                &missing
+            ),
+            Some(TypeExpr::List(Box::new(projection.clone())))
+        );
+    }
+
+    // Equal constraint evidence can retain different portable declaration
+    // provenance. Joining it must not require a catalog to rebind either key.
+    let mut wire = serde_json::to_value(&projection).unwrap();
+    wire["SchemaType"]["owned"]["projection_fingerprint"] = serde_json::json!("0".repeat(64));
+    let earlier: TypeExpr = serde_json::from_value(wire).unwrap();
+    assert_ne!(earlier, projection, "fingerprints remain part of equality");
+    for (left, right) in [(&earlier, &projection), (&projection, &earlier)] {
+        assert_eq!(
+            inference::join_inferred_types(left, right, &missing),
+            Some(earlier.clone()),
+            "the fingerprint breaks equal-origin ties without resolution"
+        );
+    }
+}
+
+#[test]
+fn annotation_records_reject_empty_per_owner_bounds() {
+    for (first, second, kind, bounds) in [
+        (string(1, 4, None), string(8, 12, None), "String", "length"),
+        (
+            DraftType::refined_int(Some(identity()), Some((Some(1), Some(4)))),
+            DraftType::refined_int(Some(identity()), Some((Some(8), Some(12)))),
+            "Int",
+            "identity_range",
+        ),
+        (
+            DraftType::refined_float(
+                Some(identity()),
+                Some((Some(crate::finite(1.0)), Some(crate::finite(4.0)))),
+            ),
+            DraftType::refined_float(
+                Some(identity()),
+                Some((Some(crate::finite(8.0)), Some(crate::finite(12.0)))),
+            ),
+            "Float",
+            "range",
+        ),
+    ] {
+        let single = snapshot(vec![("a", vec![first.clone()])]);
+        let mut wire = serde_json::to_value(annotation(&single)).unwrap();
+        let scalar = &mut wire["SchemaType"]["owned"]["constraints"]["scalar"][kind];
+        let scalar = if kind == "String" {
+            &mut scalar["identity_layer"]
+        } else {
+            scalar
+        };
+        scalar[bounds]["min"] = serde_json::json!({"Inclusive":5});
+        wire["SchemaType"]["owned"]["constraints"]["empty_intersection"] = serde_json::json!(true);
+        assert!(
+            serde_json::from_value::<TypeExpr>(wire).is_err(),
+            "{kind}: a single owner's own interval must be nonempty"
+        );
+
+        let loaded = snapshot(vec![("a", vec![first]), ("b", vec![second])]);
+        let annotation = annotation(&loaded);
+        let mut wire = serde_json::to_value(&annotation).unwrap();
+        assert!(
+            serde_json::from_value::<TypeExpr>(wire.clone()).is_ok(),
+            "nonempty owners may have an empty aggregate"
+        );
+        let scalar = &mut wire["SchemaType"]["owned"]["constraints"]["owner_layers"]["a"][kind];
+        let scalar = if kind == "String" {
+            &mut scalar["identity_layer"]
+        } else {
+            scalar
+        };
+        scalar[bounds]["min"] = serde_json::json!({"Inclusive":5});
+        assert!(
+            serde_json::from_value::<TypeExpr>(wire).is_err(),
+            "{kind}: each owner's own interval must be nonempty"
+        );
+    }
+}
+
+#[test]
+fn decoded_annotation_checks_current_owner_declarations() {
+    let old = snapshot(vec![("p", vec![string(1, 128, None)])]);
+    let current = snapshot(vec![(
+        "p",
+        vec![string(
+            1,
+            32,
+            Some(crate::schema::PatternSpec::new(
+                "[a-z]+",
+                crate::schema::PatternMatch::Full,
+            )),
+        )],
+    )]);
+    let decoded: TypeExpr =
+        serde_json::from_value(serde_json::to_value(annotation(&old)).unwrap()).unwrap();
+    for (value, valid) in [("valid", true), ("UPPER", false)] {
+        let checked = typecheck::check_type_expr_value(
+            &decoded,
+            &text(value),
+            current.provider_context(),
+            &crate::parser::retained::value_dependent_judgement_for_test(),
+        )
+        .require_provider_schemas();
+        assert_eq!(checked.is_ok(), valid, "{value}: {checked:?}");
+    }
+}
+
+#[test]
+fn owner_constraint_conjoin_promotes_and_preserves_typed_owner_maps() {
+    let a = snapshot(vec![("a", vec![string(1, 32, None)])]);
+    let b = snapshot(vec![("b", vec![string(3, 64, None)])]);
+    let c = snapshot(vec![("c", vec![string(5, 128, None)])]);
+    let annotation_owned = |loaded: &LoadedProviderSnapshot| match annotation(loaded) {
+        TypeExpr::SchemaType { owned } => owned,
+        _ => panic!("annotation"),
+    };
+    let a = annotation_owned(&a);
+    let b = annotation_owned(&b);
+    let c = annotation_owned(&c);
+    let ab = a.conjoin(&b);
+    let abc = ab.conjoin(&c);
+    for joined in [&ab, &abc, &c.conjoin(&ab), &ab.conjoin(&b.conjoin(&c))] {
+        let wire = serde_json::to_value(joined).unwrap();
+        let restored: crate::parser::ResolvedSchemaType =
+            serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(&restored, joined);
+        assert_eq!(serde_json::to_value(restored).unwrap(), wire);
+        assert_eq!(
+            joined.owners().iter().count(),
+            wire["constraints"]["owner_layers"]
+                .as_object()
+                .unwrap()
+                .len()
+        );
+    }
+    assert_eq!(abc, c.conjoin(&ab));
+    assert_eq!(abc, ab.conjoin(&b.conjoin(&c)));
 }

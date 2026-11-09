@@ -4,6 +4,7 @@ use std::{cmp::Ordering, collections::BTreeMap};
 
 use serde::{Deserialize, Serialize};
 
+use super::{NonEmptySchemaTypeOwners, SchemaTypeOwner};
 use crate::schema::{AttrTypeKind, CompiledAttributeType, CompiledPattern, RefinedScalarKind};
 
 /// Unlike an Option field, an endpoint cannot silently default to unbounded
@@ -105,19 +106,53 @@ pub(super) struct ScalarConstraints {
     empty_intersection: bool,
 }
 
-/// An authored annotation names an identity. No member slots exist here.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// An authored annotation has either one owner or a checked map of at least two.
+/// No form has member slots, and no multi-owner form can have an empty map.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum IdentityConstraints {
+    Single(SingleOwnerConstraints),
+    Multi(MultiOwnerConstraints),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct SingleOwnerConstraints {
+    owner: SchemaTypeOwner,
+    scalar: IdentityConstraintKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct MultiOwnerConstraints {
+    scalar: IdentityConstraintKind,
+    layers: MultipleOwnerLayers,
+}
+
+// This type has no Default or unchecked conversion from a map. Construction
+// either promotes distinct single owners or validates a complete wire owner set.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MultipleOwnerLayers {
+    owners: NonEmptySchemaTypeOwners,
+    layers: BTreeMap<SchemaTypeOwner, IdentityConstraintKind>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct OwnerLayersWire(
+    #[serde(with = "owner_layers_wire")] BTreeMap<SchemaTypeOwner, IdentityConstraintKind>,
+);
+
+impl OwnerLayersWire {
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct IdentityConstraints {
+pub(super) struct IdentityConstraintsWire {
     scalar: IdentityConstraintKind,
     empty_intersection: bool,
-    // Preserve each owner's identity pattern, not a selected member pattern.
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        deserialize_with = "unique_owner_layers"
-    )]
-    owner_layers: BTreeMap<String, IdentityConstraintKind>,
+    #[serde(default, skip_serializing_if = "OwnerLayersWire::is_empty")]
+    owner_layers: OwnerLayersWire,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -178,29 +213,48 @@ enum IdentityConstraintKind {
     },
 }
 
-fn unique_owner_layers<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<BTreeMap<String, IdentityConstraintKind>, D::Error> {
-    struct OwnerLayersVisitor;
-    impl<'de> serde::de::Visitor<'de> for OwnerLayersVisitor {
-        type Value = BTreeMap<String, IdentityConstraintKind>;
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("one identity layer per schema owner")
+mod owner_layers_wire {
+    use super::*;
+    use serde::ser::SerializeMap;
+
+    pub(super) fn serialize<S: serde::Serializer>(
+        layers: &BTreeMap<SchemaTypeOwner, IdentityConstraintKind>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(layers.len()))?;
+        for (owner, layer) in layers {
+            map.serialize_entry(owner.provider_name(), layer)?;
         }
-        fn visit_map<M: serde::de::MapAccess<'de>>(
-            self,
-            mut map: M,
-        ) -> Result<Self::Value, M::Error> {
-            let mut layers = BTreeMap::new();
-            while let Some((owner, layer)) = map.next_entry::<String, IdentityConstraintKind>()? {
-                if layers.insert(owner, layer).is_some() {
-                    return Err(serde::de::Error::custom("duplicate owner layer"));
-                }
-            }
-            Ok(layers)
-        }
+        map.end()
     }
-    deserializer.deserialize_map(OwnerLayersVisitor)
+
+    pub(super) fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<SchemaTypeOwner, IdentityConstraintKind>, D::Error> {
+        struct OwnerLayersVisitor;
+        impl<'de> serde::de::Visitor<'de> for OwnerLayersVisitor {
+            type Value = BTreeMap<SchemaTypeOwner, IdentityConstraintKind>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("one identity layer per schema owner")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Self::Value, M::Error> {
+                let mut layers = BTreeMap::new();
+                while let Some((name, layer)) =
+                    map.next_entry::<String, IdentityConstraintKind>()?
+                {
+                    let owner = SchemaTypeOwner::Provider(name);
+                    if layers.insert(owner, layer).is_some() {
+                        return Err(serde::de::Error::custom("duplicate owner layer"));
+                    }
+                }
+                Ok(layers)
+            }
+        }
+        deserializer.deserialize_map(OwnerLayersVisitor)
+    }
 }
 
 impl IdentityConstraintKind {
@@ -209,6 +263,14 @@ impl IdentityConstraintKind {
             Self::String { identity_layer: _ } => RefinedScalarKind::String,
             Self::Int { identity_range: _ } => RefinedScalarKind::Int,
             Self::Float { range: _ } => RefinedScalarKind::Float,
+        }
+    }
+
+    fn bounds_are_empty(&self) -> bool {
+        match self {
+            Self::String { identity_layer } => identity_layer.length.is_empty(),
+            Self::Int { identity_range } => identity_range.is_empty(),
+            Self::Float { range } => range.is_empty(),
         }
     }
 
@@ -353,24 +415,59 @@ impl ScalarConstraints {
         Ok(())
     }
 
-    pub(super) fn identity_constraints(&self) -> IdentityConstraints {
-        IdentityConstraints::new(match &self.scalar {
-            ScalarConstraintKind::String {
-                identity_layer,
-                member_layer: _,
-            } => IdentityConstraintKind::String {
-                identity_layer: identity_layer.clone(),
+    pub(super) fn identity_constraints(&self, owner: SchemaTypeOwner) -> IdentityConstraints {
+        IdentityConstraints::single(
+            owner,
+            match &self.scalar {
+                ScalarConstraintKind::String {
+                    identity_layer,
+                    member_layer: _,
+                } => IdentityConstraintKind::String {
+                    identity_layer: identity_layer.clone(),
+                },
+                ScalarConstraintKind::Int {
+                    identity_range,
+                    member_range: _,
+                } => IdentityConstraintKind::Int {
+                    identity_range: *identity_range,
+                },
+                ScalarConstraintKind::Float { range } => {
+                    IdentityConstraintKind::Float { range: *range }
+                }
             },
-            ScalarConstraintKind::Int {
-                identity_range,
-                member_range: _,
-            } => IdentityConstraintKind::Int {
-                identity_range: *identity_range,
-            },
-            ScalarConstraintKind::Float { range } => {
-                IdentityConstraintKind::Float { range: *range }
+        )
+    }
+
+    fn matches_identity(&self, identity: &IdentityConstraintKind) -> bool {
+        match (&self.scalar, identity) {
+            (
+                ScalarConstraintKind::String {
+                    identity_layer,
+                    member_layer,
+                },
+                IdentityConstraintKind::String {
+                    identity_layer: other,
+                },
+            ) => {
+                identity_layer == other
+                    && member_layer.pattern.is_none()
+                    && member_layer.length.pair().is_none()
             }
-        })
+            (
+                ScalarConstraintKind::Int {
+                    identity_range,
+                    member_range,
+                },
+                IdentityConstraintKind::Int {
+                    identity_range: other,
+                },
+            ) => identity_range == other && member_range.pair().is_none(),
+            (
+                ScalarConstraintKind::Float { range },
+                IdentityConstraintKind::Float { range: other },
+            ) => range == other,
+            _ => false,
+        }
     }
 
     pub(super) fn materialize(&self, owned: &super::ResolvedSchemaType) -> CompiledAttributeType {
@@ -417,164 +514,157 @@ impl ScalarConstraints {
 }
 
 impl IdentityConstraints {
-    fn new(scalar: IdentityConstraintKind) -> Self {
-        let mut constraints = Self {
-            scalar,
-            empty_intersection: false,
-            owner_layers: BTreeMap::new(),
-        };
-        constraints.empty_intersection = constraints.bounds_are_empty();
-        constraints
+    fn single(owner: SchemaTypeOwner, scalar: IdentityConstraintKind) -> Self {
+        Self::Single(SingleOwnerConstraints { owner, scalar })
     }
 
-    pub(super) fn from_declaration(declaration: &CompiledAttributeType) -> Option<Self> {
-        // Clone the compiled identity pattern directly; never carry member data
-        // into annotation evidence, including enum/reference fallback lookups.
-        Some(Self::new(match declaration.kind() {
-            AttrTypeKind::String {
-                identity_layer,
-                member_layer: _,
-            } => IdentityConstraintKind::String {
-                identity_layer: StringIdentityConstraints {
-                    length: Bounds::new(identity_layer.length),
-                    pattern: identity_layer.pattern.clone().map(DeclarationPattern),
+    pub(super) fn from_declaration(
+        owner: SchemaTypeOwner,
+        declaration: &CompiledAttributeType,
+    ) -> Option<Self> {
+        Some(Self::single(
+            owner.clone(),
+            match declaration.kind() {
+                AttrTypeKind::String {
+                    identity_layer,
+                    member_layer: _,
+                } => IdentityConstraintKind::String {
+                    identity_layer: StringIdentityConstraints {
+                        length: Bounds::new(identity_layer.length),
+                        pattern: identity_layer.pattern.clone().map(DeclarationPattern),
+                    },
                 },
-            },
-            AttrTypeKind::Reference {
-                pattern, length, ..
-            } => IdentityConstraintKind::String {
-                identity_layer: StringIdentityConstraints {
-                    length: Bounds::new(*length),
-                    pattern: pattern.clone().map(DeclarationPattern),
+                AttrTypeKind::Reference {
+                    pattern, length, ..
+                } => IdentityConstraintKind::String {
+                    identity_layer: StringIdentityConstraints {
+                        length: Bounds::new(*length),
+                        pattern: pattern.clone().map(DeclarationPattern),
+                    },
                 },
+                AttrTypeKind::Int {
+                    identity_layer,
+                    member_layer: _,
+                } => IdentityConstraintKind::Int {
+                    identity_range: Bounds::new(identity_layer.range),
+                },
+                AttrTypeKind::Float { range, .. } => IdentityConstraintKind::Float {
+                    range: normalize_float_bounds(Bounds::new(*range)),
+                },
+                AttrTypeKind::Enum { base, .. } => return Self::from_declaration(owner, base),
+                _ => return None,
             },
-            AttrTypeKind::Int {
-                identity_layer,
-                member_layer: _,
-            } => IdentityConstraintKind::Int {
-                identity_range: Bounds::new(identity_layer.range),
-            },
-            AttrTypeKind::Float { range, .. } => IdentityConstraintKind::Float {
-                range: normalize_float_bounds(Bounds::new(*range)),
-            },
-            AttrTypeKind::Enum { base, .. } => return Self::from_declaration(base),
-            _ => return None,
-        }))
+        ))
+    }
+
+    fn scalar(&self) -> &IdentityConstraintKind {
+        match self {
+            Self::Single(single) => &single.scalar,
+            Self::Multi(multi) => &multi.scalar,
+        }
     }
 
     pub(super) fn kind(&self) -> RefinedScalarKind {
-        match self.scalar {
-            IdentityConstraintKind::String { .. } => RefinedScalarKind::String,
-            IdentityConstraintKind::Int { .. } => RefinedScalarKind::Int,
-            IdentityConstraintKind::Float { .. } => RefinedScalarKind::Float,
-        }
+        self.scalar().kind()
     }
-
     pub(super) fn is_empty(&self) -> bool {
-        self.empty_intersection
+        self.scalar().bounds_are_empty()
     }
 
-    fn bounds_are_empty(&self) -> bool {
-        match &self.scalar {
-            IdentityConstraintKind::String { identity_layer } => identity_layer.length.is_empty(),
-            IdentityConstraintKind::Int { identity_range } => identity_range.is_empty(),
-            IdentityConstraintKind::Float { range } => range.is_empty(),
+    pub(super) fn owners(&self) -> NonEmptySchemaTypeOwners {
+        match self {
+            Self::Single(single) => NonEmptySchemaTypeOwners::singleton(single.owner.clone()),
+            Self::Multi(multi) => multi.layers.owners.clone(),
         }
     }
 
-    pub(super) fn validate_record(
-        &mut self,
-        owners: &super::NonEmptySchemaTypeOwners,
-    ) -> Result<(), &'static str> {
-        if self.empty_intersection != self.bounds_are_empty() {
-            return Err("scalar bounds and empty-intersection marker disagree");
+    pub(super) fn to_wire(&self) -> IdentityConstraintsWire {
+        IdentityConstraintsWire {
+            scalar: self.scalar().clone(),
+            empty_intersection: self.is_empty(),
+            owner_layers: OwnerLayersWire(match self {
+                Self::Single(_) => BTreeMap::new(),
+                Self::Multi(multi) => multi.layers.layers.clone(),
+            }),
         }
-        self.scalar.normalize_float_bounds();
-        if owners.is_singleton() {
-            if !self.owner_layers.is_empty() {
-                return Err("single-owner annotations must omit owner layers");
-            }
-        } else if !self
-            .owner_layers
-            .keys()
-            .map(String::as_str)
-            .eq(owners.iter().map(|owner| {
-                let super::SchemaTypeOwner::Provider(owner) = owner;
-                owner.as_str()
-            }))
-        {
-            return Err("owner layers must match the annotation owner set exactly");
-        }
-        let mut expected: Option<IdentityConstraintKind> = None;
-        let kind = self.kind();
-        for layer in self.owner_layers.values_mut() {
-            layer.normalize_float_bounds();
-            if layer.kind() != kind {
-                return Err("owner layer scalar kind does not match annotation");
-            }
-            match &mut expected {
-                Some(expected) => expected.intersect(layer),
-                None => expected = Some(layer.clone()),
-            }
-        }
-        if expected.is_some_and(|expected| expected != self.scalar) {
-            return Err("owner layer conjunction does not match scalar constraints");
-        }
-        Ok(())
     }
 
-    fn layers_for(
+    pub(super) fn matches_projection(
         &self,
-        owners: &super::NonEmptySchemaTypeOwners,
-    ) -> BTreeMap<String, IdentityConstraintKind> {
-        if !self.owner_layers.is_empty() {
-            return self.owner_layers.clone();
-        }
-        assert!(
-            owners.is_singleton(),
-            "multi-owner annotation retains every owner layer"
-        );
-        let super::SchemaTypeOwner::Provider(owner) =
-            owners.iter().next().expect("nonempty owners");
-        BTreeMap::from([(owner.clone(), self.scalar.clone())])
+        owner: &SchemaTypeOwner,
+        constraints: &ScalarConstraints,
+    ) -> bool {
+        matches!(self, Self::Single(single) if &single.owner == owner && constraints.matches_identity(&single.scalar))
     }
 
-    pub(super) fn intersect(
-        &mut self,
-        owners: &super::NonEmptySchemaTypeOwners,
-        other: &Self,
-        other_owners: &super::NonEmptySchemaTypeOwners,
-    ) {
-        let all_owners = owners.union(other_owners);
-        if !all_owners.is_singleton() {
-            let mut layers = self.layers_for(owners);
-            for (owner, incoming) in other.layers_for(other_owners) {
-                layers
+    pub(super) fn conjoin(&self, other: &Self) -> Self {
+        let mut joined = self.clone();
+        match other {
+            Self::Single(single) => joined.insert(single.owner.clone(), single.scalar.clone()),
+            Self::Multi(multi) => {
+                for (owner, layer) in &multi.layers.layers {
+                    joined.insert(owner.clone(), layer.clone());
+                }
+            }
+        }
+        joined
+    }
+
+    fn insert(&mut self, owner: SchemaTypeOwner, incoming: IdentityConstraintKind) {
+        match self {
+            Self::Single(single) if single.owner == owner => single.scalar.intersect(&incoming),
+            Self::Single(single) => {
+                let owners = NonEmptySchemaTypeOwners::singleton(single.owner.clone())
+                    .union(&NonEmptySchemaTypeOwners::singleton(owner.clone()));
+                let mut scalar = single.scalar.clone();
+                scalar.intersect(&incoming);
+                let layers = BTreeMap::from([
+                    (single.owner.clone(), single.scalar.clone()),
+                    (owner, incoming),
+                ]);
+                // The unequal-owner arm supplies two distinct keys. Later
+                // conjoins can insert or intersect entries, never remove them.
+                *self = Self::Multi(MultiOwnerConstraints {
+                    scalar,
+                    layers: MultipleOwnerLayers { owners, layers },
+                });
+            }
+            Self::Multi(multi) => {
+                multi.scalar.intersect(&incoming);
+                multi.layers.owners = multi
+                    .layers
+                    .owners
+                    .union(&NonEmptySchemaTypeOwners::singleton(owner.clone()));
+                multi
+                    .layers
+                    .layers
                     .entry(owner)
                     .and_modify(|layer| layer.intersect(&incoming))
                     .or_insert(incoming);
             }
-            self.owner_layers = layers;
         }
-        // Only identity constraints participate. Each owner's pattern remains
-        // in the keyed layers; no annotation payload contains member slots.
-        self.scalar.intersect(&other.scalar);
-        self.empty_intersection = self.bounds_are_empty();
     }
 
     pub(super) fn owner_patterns(&self) -> impl Iterator<Item = &CompiledPattern> {
-        self.owner_layers.values().filter_map(|layer| match layer {
-            IdentityConstraintKind::String { identity_layer } => {
-                identity_layer.pattern.as_ref().map(|pattern| &pattern.0)
-            }
-            IdentityConstraintKind::Int { identity_range: _ }
-            | IdentityConstraintKind::Float { range: _ } => None,
-        })
+        let layers = match self {
+            Self::Single(_) => None,
+            Self::Multi(multi) => Some(&multi.layers.layers),
+        };
+        layers
+            .into_iter()
+            .flat_map(|layers| layers.values())
+            .filter_map(|layer| match layer {
+                IdentityConstraintKind::String { identity_layer } => {
+                    identity_layer.pattern.as_ref().map(|pattern| &pattern.0)
+                }
+                IdentityConstraintKind::Int { identity_range: _ }
+                | IdentityConstraintKind::Float { range: _ } => None,
+            })
     }
 
     pub(super) fn materialize(&self, owned: &super::ResolvedSchemaType) -> CompiledAttributeType {
         let binding = crate::schema::RefinementBinding::Annotation(owned.clone());
-        let kind = match &self.scalar {
+        let kind = match self.scalar() {
             IdentityConstraintKind::String { identity_layer } => AttrTypeKind::String {
                 identity_layer: crate::schema::StringIdentityLayer {
                     binding,
@@ -600,6 +690,58 @@ impl IdentityConstraints {
             },
         };
         CompiledAttributeType { kind }
+    }
+}
+
+impl IdentityConstraintsWire {
+    pub(super) fn bind(
+        mut self,
+        owners: &NonEmptySchemaTypeOwners,
+    ) -> Result<IdentityConstraints, &'static str> {
+        if self.empty_intersection != self.scalar.bounds_are_empty() {
+            return Err("scalar bounds and empty-intersection marker disagree");
+        }
+        self.scalar.normalize_float_bounds();
+        if let Some(owner) = owners.single_owner() {
+            if !self.owner_layers.is_empty() {
+                return Err("single-owner annotations must omit owner layers");
+            }
+            if self.scalar.bounds_are_empty() {
+                return Err("owner identity bounds must be nonempty");
+            }
+            return Ok(IdentityConstraints::single(owner.clone(), self.scalar));
+        }
+        let mut layers = self.owner_layers.0;
+        if !layers.keys().eq(owners.iter()) {
+            return Err("owner layers must match the annotation owner set exactly");
+        }
+        let kind = self.scalar.kind();
+        let mut expected: Option<IdentityConstraintKind> = None;
+        for layer in layers.values_mut() {
+            if layer.bounds_are_empty() {
+                return Err("owner identity bounds must be nonempty");
+            }
+            layer.normalize_float_bounds();
+            if layer.kind() != kind {
+                return Err("owner layer scalar kind does not match annotation");
+            }
+            match &mut expected {
+                Some(expected) => expected.intersect(layer),
+                None => expected = Some(layer.clone()),
+            }
+        }
+        if expected.as_ref() != Some(&self.scalar) {
+            return Err("owner layer conjunction does not match scalar constraints");
+        }
+        // NonEmptySchemaTypeOwners excludes zero; the single-owner arm is
+        // handled above. Exact key agreement therefore proves at least two.
+        Ok(IdentityConstraints::Multi(MultiOwnerConstraints {
+            scalar: self.scalar,
+            layers: MultipleOwnerLayers {
+                owners: owners.clone(),
+                layers,
+            },
+        }))
     }
 }
 

@@ -28,16 +28,41 @@ impl<'a> RefinedScalarPosition<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
+/// A read-only report; only the core traversal can create or modify it.
+///
+/// ```compile_fail
+/// use carina_core::schema::RefinementPositions;
+/// let _ = RefinementPositions { positions: Vec::new(), truncated: false };
+/// ```
+///
+/// ```compile_fail
+/// use carina_core::schema::RefinementPositions;
+/// fn clear(report: &mut RefinementPositions<'_>) {
+///     report.positions.clear();
+///     report.truncated = false;
+/// }
+/// ```
+#[derive(Debug)]
 pub struct RefinementPositions<'a> {
-    pub positions: Vec<RefinedScalarPosition<'a>>,
-    /// True only when an actual node could not be visited within the budget.
-    pub truncated: bool,
+    positions: Vec<RefinedScalarPosition<'a>>,
+    truncated: bool,
+}
+
+impl<'a> RefinementPositions<'a> {
+    pub fn positions(&self) -> &[RefinedScalarPosition<'a>] {
+        &self.positions
+    }
+
+    /// True only when a counted node was actually left unvisited.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
+    }
 }
 
 impl<'a> EffectiveType<'a> {
-    /// Visit at most `max_nodes` raw schema nodes, including each Ref and each
-    /// nested Union. Empty branches and exactly-fitting walks are complete.
+    /// Visit at most `max_nodes` named/structurally refined String/Int leaves
+    /// and structural nodes, including every Ref and nested Union. Plain scalar
+    /// leaves are omitted and cost no budget. Exactly-fitting walks are complete.
     pub fn refinement_positions(&self, max_nodes: usize) -> RefinementPositions<'a> {
         let mut positions = Vec::new();
         let complete = visit(
@@ -59,6 +84,9 @@ fn visit<'a>(
     budget: &mut ShapeWalkBudget,
     positions: &mut Vec<RefinedScalarPosition<'a>>,
 ) -> bool {
+    if !counts_for_refinements(&ty.attr_type.kind) {
+        return true;
+    }
     if !budget.take() {
         return false;
     }
@@ -178,20 +206,91 @@ fn visit<'a>(
     }
 }
 
+fn counts_for_refinements(kind: &AttrTypeKind<super::Compiled>) -> bool {
+    match kind {
+        AttrTypeKind::String {
+            identity_layer,
+            member_layer,
+        } => {
+            identity_layer.binding.identity().is_some()
+                || identity_layer.pattern.is_some()
+                || identity_layer.length.is_some()
+                || member_layer.pattern.is_some()
+                || member_layer.length.is_some()
+        }
+        AttrTypeKind::Int {
+            identity_layer,
+            member_layer,
+        } => {
+            identity_layer.binding.identity().is_some()
+                || identity_layer.range.is_some()
+                || member_layer.range.is_some()
+        }
+        AttrTypeKind::Ref(_)
+        | AttrTypeKind::Struct {
+            fields: _,
+            name: _,
+            field_groups: _,
+        }
+        | AttrTypeKind::List {
+            element_type: _,
+            ordered: _,
+            constraints: _,
+        }
+        | AttrTypeKind::Map {
+            key: _,
+            value: _,
+            constraints: _,
+        }
+        | AttrTypeKind::Union(_)
+        | AttrTypeKind::Enum {
+            base: _,
+            identity: _,
+            values: _,
+            dsl_aliases: _,
+            validate: _,
+            to_dsl: _,
+        } => true,
+        AttrTypeKind::Float {
+            binding: _,
+            range: _,
+        }
+        | AttrTypeKind::Bool
+        | AttrTypeKind::Duration
+        | AttrTypeKind::Reference {
+            identity: _,
+            pattern: _,
+            length: _,
+        }
+        | AttrTypeKind::UnloadedSchemaType(_)
+        | AttrTypeKind::ResourceHandle {
+            provider: _,
+            resource_type: _,
+        }
+        | AttrTypeKind::StringLiteralSet { values: _ } => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::schema::{AttributeSchema, AttributeType, ResourceSchema, StructField};
+
+    fn refined_string() -> AttributeType {
+        AttributeType::refined_string(None, None, Some((Some(1), Some(8))), None)
+    }
 
     #[test]
     fn refinement_walk_marks_only_unvisited_nodes() {
         for (draft, steps, expected, truncated) in [
             (AttributeType::struct_("Empty", vec![]), 1, 0, false),
-            (AttributeType::string(), 1, 1, false),
-            (AttributeType::string(), 0, 0, true),
+            (AttributeType::string(), 0, 0, false),
+            (AttributeType::bool(), 0, 0, false),
+            (refined_string(), 1, 1, false),
+            (refined_string(), 0, 0, true),
             (
                 AttributeType::struct_(
                     "One",
-                    vec![StructField::optional("value", AttributeType::string()).build()],
+                    vec![StructField::optional("value", refined_string()).build()],
                 ),
                 2,
                 1,
@@ -200,7 +299,7 @@ mod tests {
             (
                 AttributeType::struct_(
                     "One",
-                    vec![StructField::optional("value", AttributeType::string()).build()],
+                    vec![StructField::optional("value", refined_string()).build()],
                 ),
                 1,
                 0,
@@ -224,7 +323,7 @@ mod tests {
     #[test]
     fn refinement_walk_charges_nested_unions_and_refs() {
         let schema = ResourceSchema::new("Test")
-            .with_def("leaf", AttributeType::string())
+            .with_def("leaf", refined_string())
             .with_def(
                 "nested",
                 AttributeType::union(vec![AttributeType::ref_("leaf")]),

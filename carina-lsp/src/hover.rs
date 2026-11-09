@@ -59,7 +59,7 @@ fn find_use_import_path(
 fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> String {
     use carina_core::schema::{PatternSpecDisplay, RefinementPathSegment, Shape};
     let mut content = String::new();
-    for position in walk.positions {
+    for position in walk.positions() {
         let mut refinements = String::new();
         match position.value_type().shape() {
             Shape::String {
@@ -121,7 +121,7 @@ fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> Strin
         }
         content.push_str(&refinements);
     }
-    if walk.truncated {
+    if walk.is_truncated() {
         content.push_str("\n\n… further nested constraints omitted");
     }
     content
@@ -3113,6 +3113,75 @@ EOT
             1,
             "{}",
             content.value
+        );
+    }
+
+    fn hover_for_refinement_fields(fields: Vec<carina_core::schema::StructField>) -> String {
+        let schema = ResourceSchema::new("contact")
+            .attribute(
+                AttributeSchema::optional("details", AttributeType::struct_("Details", fields))
+                    .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", schema);
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+        let doc = Document::new(
+            "test.contact {\n details = {}\n}\n".into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        let hover = provider.hover(&doc, Position::new(1, 3)).unwrap();
+        let HoverContents::Markup(content) = hover.contents else {
+            panic!("Markdown hover")
+        };
+        content.value
+    }
+
+    #[test]
+    fn hover_plain_fields_leave_budget_for_refined_fields() {
+        let mut fields: Vec<_> = (0..70)
+            .map(|index| {
+                StructField::optional(format!("plain{index}"), AttributeType::string()).build()
+            })
+            .collect();
+        fields.push(
+            StructField::optional(
+                "constrained",
+                AttributeType::string_member(
+                    carina_core::schema::StringIdentityLayer::new(None, None, None, None),
+                    carina_core::schema::StringMemberConstraints::new(
+                        None,
+                        Some((Some(1), Some(8))),
+                    ),
+                ),
+            )
+            .build(),
+        );
+        let content = hover_for_refinement_fields(fields);
+        assert!(
+            content.contains("Field `constrained`") && content.contains("Member length"),
+            "{content}"
+        );
+        assert!(
+            !content.contains("further nested constraints omitted"),
+            "{content}"
+        );
+    }
+
+    #[test]
+    fn hover_plain_bools_do_not_show_a_truncation_marker() {
+        let fields = (0..70)
+            .map(|index| {
+                StructField::optional(format!("plain{index}"), AttributeType::bool()).build()
+            })
+            .collect();
+        let content = hover_for_refinement_fields(fields);
+        assert!(
+            !content.contains("further nested constraints omitted"),
+            "{content}"
         );
     }
 

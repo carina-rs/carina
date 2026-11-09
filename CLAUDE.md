@@ -628,16 +628,23 @@ A struct type represents a nested object with typed fields.
   values must satisfy every owner's identity layer. Annotation-origin evidence
   uses an identity-only payload with no member slots; only exact schema
   projections retain member constraints. Decoding annotation-origin member
-  records must fail. Single-owner annotations omit `owner_layers`; multi-owner
-  annotations retain one keyed identity record for every owner, with no extras.
-  Portable equality includes origin and projection fingerprint; inferred joins
-  select a canonical identity independently of operand order. Enum definition
+  records must fail. Native single-owner and multi-owner annotations are distinct
+  forms: a single holds one `SchemaTypeOwner`, and a multi holds a checked map
+  keyed by at least two `SchemaTypeOwner`s. Wire single-owner annotations omit
+  `owner_layers`; multi-owner annotations retain exactly one identity layer per
+  owner. Each owner's own bounds must be nonempty. Portable equality includes
+  origin and projection fingerprint.
+  Equal constraints in the same identity/owner scope join without resolution,
+  choosing the lexicographically least tuple (origin rank, routing key, evidence,
+  fingerprint), with Projection before Annotation to preserve exact rebinding.
+  Other joins try canonical identities lazily in sorted order. Enum definition
   and canonical-spelling disagreements remain typed errors. Built-in and
   aggregate comparisons accept identity-only typed projections. Exact
   declarations and their fingerprints preserve both layers. Hover renders
-  both layers through the core's bounded refinement walk, which counts Refs
-  and nested unions and reports only actual omissions. Shared provider docgen
-  must render both layers too. WIT stays 0.2.0.
+  both layers through the core's read-only bounded refinement walk, which counts
+  refined leaves and structural nodes, including Refs and nested unions. Plain
+  scalar leaves cost no budget; only actual omissions mark truncation. Shared
+  provider docgen must render both layers too. WIT stays 0.2.0.
   Schema fingerprints use v13 and saved plans use format 44; format 43 plans
   must fail the version gate before decoding the payload. Saved module
   `pending_constraints` contain `ValidateExpr` values, not retained types;
