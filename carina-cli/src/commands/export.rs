@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::output_style::Colorize;
 
-use carina_core::config_loader::load_configuration_with_config;
+use carina_core::config_loader::load_configuration_for_bootstrap;
 use carina_core::parser::ProviderContext;
 use carina_core::value::{PersistedExportValue, render_export_json_value};
 use carina_state::{StateUrl, load_published_exports_from_url};
@@ -42,7 +42,7 @@ pub async fn run_export(
         let project = carina_core::paths::ResolvedPath::new(path)
             .map_err(|error| AppError::Config(error.to_string()))?;
         let base_dir = &project;
-        let parsed = load_configuration_with_config(
+        let parsed = load_configuration_for_bootstrap(
             base_dir,
             provider_context,
             &carina_core::schema::SchemaRegistry::new(),

@@ -1732,3 +1732,22 @@ fn closure_module_attribute_owns_inline_name_and_value() {
         directory.assert_sibling_owner(&test_engine_with_wait_target(), message, &[(token, 0)]);
     }
 }
+
+#[test]
+fn r5_provider_finalization_survives_unrelated_failed_secret_let() {
+    let directory = Directory::new(&[
+        (
+            "main.crn",
+            "let tag_values = 'bad'\nlet unused = secret(env('R5_FINALIZE_UNSET'))\n",
+        ),
+        (
+            "sibling.crn",
+            "provider aws {\n default_tags =\n tag_values\n}\n",
+        ),
+    ]);
+    directory.assert_sibling_owner(
+        &test_engine_with_wait_target(),
+        "default_tags must resolve to a map",
+        &[("tag_values", 0)],
+    );
+}

@@ -28,6 +28,10 @@ struct Scenario {
 
 impl Scenario {
     fn from_fixture(name: &str) -> Self {
+        Self::from_fixture_with_env(name, &[])
+    }
+
+    fn from_fixture_with_env(name: &str, env: &[(&str, &str)]) -> Self {
         let temp = tempfile::tempdir().expect("create temporary project");
         let project = temp.path().to_path_buf();
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -42,7 +46,10 @@ impl Scenario {
             project,
             _temp: temp,
         };
-        assert_success("carina init", &scenario.carina(&["init", "."]));
+        assert_success(
+            "carina init",
+            &scenario.carina_with_env(&["init", "."], env),
+        );
         scenario
     }
 
@@ -173,10 +180,21 @@ fn unavailable_env_arguments_keep_anonymous_resource_identities_distinct() {
 }
 
 #[test]
-fn secret_wrapped_unavailable_interpolations_load_but_fail_when_planned() {
-    let scenario = Scenario::from_fixture("deferred_unavailable_secret_load");
+fn secret_wrapped_unavailable_interpolations_fail_strict_validate_and_plan() {
+    let scenario = Scenario::from_fixture_with_env(
+        "deferred_unavailable_secret_load",
+        &[("SECRET_V", "private-secret-3979")],
+    );
 
-    assert_success("carina validate", &scenario.carina(&["validate", "."]));
+    let validate = scenario.carina(&["validate", "."]);
+    let rendered = output_text(&validate);
+    assert!(!validate.status.success(), "{rendered}");
+    assert!(
+        rendered.contains(carina_core::resource::INSIDE_SECRET_MESSAGE),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("SECRET_V"), "{rendered}");
+    assert!(!rendered.contains("private-secret-3979"), "{rendered}");
 
     let plan = scenario.carina(&["plan", "--refresh=false", "."]);
     let rendered = output_text(&plan);
@@ -189,6 +207,79 @@ fn secret_wrapped_unavailable_interpolations_load_but_fail_when_planned() {
         "plan lost the protected unavailable-input diagnostic:\n{rendered}",
     );
     assert!(!rendered.contains("SECRET_V"), "{rendered}");
+}
+
+#[test]
+fn secret_wrapped_unavailable_interpolations_fail_strict_validation_and_plan() {
+    let scenario = Scenario::from_fixture("deferred_unavailable_secret_load");
+
+    let validate = scenario.carina(&["validate", "."]);
+    let rendered = output_text(&validate);
+    assert!(
+        !validate.status.success(),
+        "strict validation unexpectedly accepted a required missing secret input:\n{rendered}",
+    );
+    assert!(
+        rendered.contains(carina_core::resource::INSIDE_SECRET_MESSAGE),
+        "strict validation lost the protected unavailable-input diagnostic:\n{rendered}",
+    );
+    assert!(!rendered.contains("SECRET_V"), "{rendered}");
+
+    let plan = scenario.carina(&["plan", "--refresh=false", "."]);
+    let rendered = output_text(&plan);
+    assert!(
+        !plan.status.success(),
+        "plan unexpectedly accepted a required missing secret input:\n{rendered}",
+    );
+    assert!(
+        rendered.contains(carina_core::resource::INSIDE_SECRET_MESSAGE),
+        "plan lost the protected unavailable-input diagnostic:\n{rendered}",
+    );
+    assert!(!rendered.contains("SECRET_V"), "{rendered}");
+}
+
+#[test]
+fn issue_3979_saved_rehydration_reports_a_located_secret_failure_and_replan() {
+    const SECRET: &str = "private-saved-secret-3979";
+    let scenario = Scenario::from_fixture_with_env(
+        "deferred_unavailable_secret_load",
+        &[("SECRET_V", SECRET)],
+    );
+    let plan = scenario.carina_with_env(
+        &["plan", "--out", "plan.json", "."],
+        &[("SECRET_V", SECRET)],
+    );
+    assert_success("carina plan --out", &plan);
+    let saved = fs::read_to_string(scenario.project.join("plan.json")).unwrap();
+    assert!(!saved.contains(SECRET));
+    let state_before = fs::read(scenario.project.join("carina.state.json")).ok();
+    let provider_before = fs::read(&scenario.mock_state).ok();
+
+    let apply = scenario.carina(&["apply", "--auto-approve", "--lock=false", "plan.json"]);
+    let rendered = output_text(&apply);
+    assert!(!apply.status.success(), "{rendered}");
+    assert_eq!(
+        rendered
+            .matches("current secret could not be evaluated")
+            .count(),
+        1,
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("comment") && rendered.contains("carina plan"),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains("current configuration could not be evaluated"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains(SECRET), "{rendered}");
+    assert!(!rendered.contains("SECRET_V"), "{rendered}");
+    assert_eq!(
+        fs::read(scenario.project.join("carina.state.json")).ok(),
+        state_before
+    );
+    assert_eq!(fs::read(&scenario.mock_state).ok(), provider_before);
 }
 
 #[test]

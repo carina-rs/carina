@@ -88,8 +88,7 @@ impl Builtin {
                     )));
                 }
                 let argument = args.into_iter().next().expect("one argument");
-                let value = argument
-                    .into_value()
+                let value = crate::value_walk::value_argument(argument)
                     .ok_or_else(|| invalid("secret() expects a value argument".to_string()))?;
                 let value =
                     prepare_secret(value).map_err(crate::resource::InsideSecret::inside_secret)?;

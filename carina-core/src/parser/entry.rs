@@ -258,7 +258,8 @@ pub fn parse_file(
     config: &ProviderContext,
 ) -> Result<ParsedFile, ParseError> {
     let user_functions = resolve_top_level_user_functions(&[(path, input)], config)?;
-    let parsed = parse_with_seeded_bindings_inner(input, config, &[], &user_functions, true, path)?;
+    let parsed = parse_with_seeded_bindings_inner(input, config, &[], &user_functions, true, path)
+        .map_err(super::resolve::RootInputFailure::into_parse_error)?;
     super::resolve::reject_cyclic_let_bindings(&parsed)?;
     Ok(parsed)
 }
@@ -728,6 +729,7 @@ pub(crate) fn parse_with_seeded_bindings(
         true,
         std::path::Path::new("test.crn"),
     )
+    .map_err(super::resolve::RootInputFailure::into_parse_error)
 }
 
 /// Parse only the top-level function declarations from one source file.
@@ -929,7 +931,7 @@ pub(crate) fn parse_with_directory_context(
     seeds: &[BindingSeed<'_>],
     user_functions: &HashMap<String, UserFunction>,
     bindings_fully_classified: bool,
-) -> Result<ParsedFile, ParseError> {
+) -> Result<ParsedFile, super::resolve::RootInputFailure> {
     parse_with_seeded_bindings_inner(
         input,
         config,
@@ -947,7 +949,7 @@ fn parse_with_seeded_bindings_inner(
     seeded_user_functions: &HashMap<String, UserFunction>,
     bindings_fully_classified: bool,
     source_file: &std::path::Path,
-) -> Result<ParsedFile, ParseError> {
+) -> Result<ParsedFile, super::resolve::RootInputFailure> {
     let preprocessed_file = Arc::new(super::preprocess_file(input)?);
     let pairs = preprocessed_file.parse()?;
     let syntax = super::SyntaxInventory::from_pairs(pairs.clone(), &preprocessed_file, source_file);
@@ -990,8 +992,10 @@ fn parse_with_seeded_bindings_inner(
                     for stmt in inner.into_inner() {
                         match stmt.as_rule() {
                             Rule::backend_block => {
-                                backend =
-                                    Some(parse_backend_block(stmt, &ctx, &preprocessed_file)?);
+                                backend = Some(
+                                    parse_backend_block(stmt, &ctx, &preprocessed_file)
+                                        .map_err(super::resolve::RootInputFailure::Backend)?,
+                                );
                             }
                             Rule::provider_block => {
                                 let provider = parse_provider_block(stmt, &ctx)?;
@@ -1134,16 +1138,18 @@ fn parse_with_seeded_bindings_inner(
                                 let fn_name = user_fn.name.clone();
                                 // Check for shadowing builtins
                                 if crate::builtins::is_known_builtin(&fn_name) {
-                                    return Err(ParseError::UserFunctionError(format!(
+                                    return Err((ParseError::UserFunctionError(format!(
                                         "function '{fn_name}' shadows a built-in function"
-                                    )));
+                                    )))
+                                    .into());
                                 }
                                 if ctx.user_functions.contains_key(&fn_name)
                                     && !ctx.seeded_user_functions.remove(&fn_name)
                                 {
-                                    return Err(ParseError::UserFunctionError(format!(
+                                    return Err((ParseError::UserFunctionError(format!(
                                         "duplicate function definition: '{fn_name}'"
-                                    )));
+                                    )))
+                                    .into());
                                 }
                                 ctx.insert_user_function(fn_name, user_fn);
                             }
@@ -1183,7 +1189,9 @@ fn parse_with_seeded_bindings_inner(
                                         && (ctx.contains_binding(&name)
                                             || ctx.resource_bindings.contains_key(&name))
                                     {
-                                        return Err(ParseError::DuplicateBinding { name, line });
+                                        return Err(
+                                            (ParseError::DuplicateBinding { name, line }).into()
+                                        );
                                     }
                                     if shadows_seed {
                                         ctx.unmark_seeded(&name);
@@ -1404,10 +1412,10 @@ fn parse_with_seeded_bindings_inner(
                 // pipe/call already consumed them if they were used.
             }
             Err(error @ EvalValueError::BareStructuralHandle(_)) => {
-                return Err(ParseError::from_eval_value(error, source_line));
+                return Err((ParseError::from_eval_value(error, source_line)).into());
             }
             Err(error @ EvalValueError::PendingValue(_)) => {
-                return Err(ParseError::from_eval_value(error, source_line));
+                return Err((ParseError::from_eval_value(error, source_line)).into());
             }
         }
     }
@@ -1462,7 +1470,7 @@ fn parse_with_seeded_bindings_inner(
         config,
     );
     if let Some(error) = parsed.expression_report().first_function_error() {
-        return Err(error);
+        return Err((error).into());
     }
     // The parser never synthesizes composition resources, so its default
     // expansion trace remains empty until module expansion (#3306).

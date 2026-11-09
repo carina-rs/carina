@@ -1,0 +1,2 @@
+let protected = use { source = "./protected" }
+let instance = protected { password = secret("private-module-password-2715") enabled = true }

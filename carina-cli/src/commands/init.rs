@@ -2,6 +2,8 @@ use std::path::Path;
 
 use crate::output_style::Colorize;
 
+use carina_core::config_loader::load_configuration_for_bootstrap;
+#[cfg(test)]
 use carina_core::config_loader::load_configuration_with_config;
 use carina_core::parser::ProviderContext;
 
@@ -94,7 +96,7 @@ async fn run_init_with_provider_resolver(
     let base_dir = path;
 
     let provider_context = ProviderContext::new(environment);
-    let loaded = load_configuration_with_config(
+    let loaded = load_configuration_for_bootstrap(
         path,
         &provider_context,
         &carina_core::schema::SchemaRegistry::new(),

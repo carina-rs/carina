@@ -1,0 +1,6 @@
+let local = password
+
+fn protect(input: String): String {
+  let local = input
+  secret(local)
+}

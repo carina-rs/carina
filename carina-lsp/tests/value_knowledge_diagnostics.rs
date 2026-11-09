@@ -4,7 +4,7 @@ mod support;
 
 use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, SchemaRegistry};
 use support::fixture::{analyze, engine_with_schemas};
-use tower_lsp::lsp_types::DiagnosticSeverity;
+use tower_lsp::lsp_types::{DiagnosticSeverity, Position, Range};
 
 fn schemas() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
@@ -134,30 +134,86 @@ fn pending_secrets_and_local_absence_keep_directory_parity() {
 }
 
 #[test]
-fn unavailable_required_attribute_keeps_main_sibling_finding() {
+fn failed_secret_required_attribute_matches_unwrapped_diagnostic_order() {
+    const MISSING: &str = "CARINA_4316_UNUSED_MISSING";
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../carina-cli/tests/fixtures/value_knowledge/required_failure");
-    let fixture = tempfile::tempdir().unwrap();
-    for entry in std::fs::read_dir(source).unwrap() {
-        let entry = entry.unwrap();
-        std::fs::copy(entry.path(), fixture.path().join(entry.file_name())).unwrap();
-    }
-    let engine = engine_with_schemas(schemas());
-    let findings = analyze(&engine, &fixture, "main.crn");
-    let relevant = findings
-        .iter()
-        .filter(|finding| {
-            finding.message.contains("invalid value inside secret(...)")
-                || finding.message.contains("expected Map")
-        })
-        .collect::<Vec<_>>();
-    // Main retains the attempted failure until plan. The core Err collector
-    // is separately pinned with Cycle; this directory pins Failed parity.
-    assert_eq!(relevant.len(), 1, "{findings:#?}");
-    assert!(
-        !findings
+    for protected in [false, true] {
+        let fixture = tempfile::tempdir().unwrap();
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            std::fs::copy(entry.path(), fixture.path().join(entry.file_name())).unwrap();
+        }
+        if !protected {
+            let path = fixture.path().join("main.crn");
+            let text = std::fs::read_to_string(&path).unwrap().replace(
+                &format!("secret(env(\"{MISSING}\"))"),
+                &format!("env(\"{MISSING}\")"),
+            );
+            std::fs::write(path, text).unwrap();
+        }
+        let engine = engine_with_schemas(schemas());
+        let findings = analyze(&engine, &fixture, "main.crn");
+        let cause = if protected {
+            carina_core::resource::INSIDE_SECRET_MESSAGE.to_string()
+        } else {
+            format!("env(): environment variable '{MISSING}' is not set")
+        };
+        let strict_cause = format!("Invalid expression at line 1: {cause}");
+        let actual: Vec<_> = findings
             .iter()
-            .any(|finding| finding.message.contains("Missing required")),
-        "{findings:#?}"
-    );
+            .map(|finding| (finding.severity, finding.message.as_str()))
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                (Some(DiagnosticSeverity::ERROR), cause.as_str()),
+                (Some(DiagnosticSeverity::ERROR), strict_cause.as_str()),
+                (
+                    Some(DiagnosticSeverity::WARNING),
+                    "Type mismatch: expected Map<String>, got Int",
+                ),
+            ],
+            "protected={protected}: {findings:#?}",
+        );
+        let root_range = Range::new(
+            Position::new(0, 0),
+            Position::new(0, if protected { 87 } else { 79 }),
+        );
+        let tag_start = if protected { 77 } else { 69 };
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| (finding.range, finding.source.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (root_range, Some("carina")),
+                (root_range, Some("carina")),
+                (
+                    Range::new(Position::new(0, tag_start), Position::new(0, tag_start + 4)),
+                    Some("carina"),
+                ),
+            ],
+        );
+        // carina#4337: main also reports the failing site twice; preserve that count here.
+        assert_eq!(
+            findings
+                .iter()
+                .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+                .count(),
+            2,
+        );
+        assert!(
+            !findings
+                .iter()
+                .any(|finding| finding.message.contains("Missing required")),
+            "{findings:#?}"
+        );
+        if protected {
+            let rendered = format!("{findings:?}");
+            assert!(rendered.contains(carina_core::resource::INSIDE_SECRET_MESSAGE));
+            assert!(!rendered.contains(MISSING), "{rendered}");
+            assert!(!rendered.contains("secret(env("), "{rendered}");
+        }
+    }
 }

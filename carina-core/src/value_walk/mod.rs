@@ -1,8 +1,8 @@
 //! Structural value traversal with mandatory Secret re-entry.
 //!
-//! This preparatory kernel works over the existing public representation.
-//! Consumers have not yet migrated: the public resource enums and payload
-//! callbacks still permit independent walkers outside this module.
+//! The kernel works over the existing public representation. Parser/module
+//! substitutions and unavailable searches use it; the remaining public resource
+//! enums and payload callbacks still permit independent walkers elsewhere.
 //!
 //! Inspect borrows its input; Transform consumes it and returns a marked
 //! candidate. Cursors expose engine operations, never raw child values.
@@ -26,6 +26,23 @@ use crate::{
 
 mod engine;
 use engine::{LeafInput, Parts, ScalarInput, dispatch};
+mod bound_transform;
+use bound_transform::{BoundTransform, PublicTransform, TransformOutput};
+
+mod substitution;
+#[cfg(test)]
+pub(crate) use substitution::select_authored_module_ifs;
+#[cfg(test)]
+use substitution::{ParserRewrite, rewrite_parser_value};
+pub(crate) use substitution::{
+    RewritePosition, evaluate_expanded_module_functions, select_expanded_module_ifs,
+    substitute_function_call_argument, substitute_function_parameters, substitute_module_arguments,
+    value_argument,
+};
+mod unavailable;
+pub(crate) use unavailable::{
+    UnavailableSearchPolicy, contains_unavailable, find_required_unavailable,
+};
 
 mod sealed {
     pub trait Mode: Sized {
@@ -953,7 +970,10 @@ impl<P: ValueKind, B: BindingAddress> Children<'_, Transform, P, B> {
         algebra: &mut A,
         fold: impl FnOnce(Vec<A::Output>) -> A::Output,
     ) -> Step<Transform, A::Output, P, B> {
-        Step::new(self.parts.transform(self.at, algebra, fold))
+        Step::new(
+            self.parts
+                .transform(self.at, &mut PublicTransform(algebra), fold),
+        )
     }
 }
 impl<P: ValueKind, B: BindingAddress> ExprChildren<'_, Inspect, P, B> {
@@ -1169,17 +1189,23 @@ impl<P: ValueKind, B: BindingAddress> SecretChild<'_, Transform, P, B> {
         self,
         algebra: &mut A,
     ) -> SecretStep<Transform, A::Output, P, B> {
+        self.transform_bound(&mut PublicTransform(algebra))
+    }
+    fn transform_bound<A: BoundTransform<P, B>>(
+        self,
+        algebra: &mut A,
+    ) -> SecretStep<Transform, A::Output, P, B> {
         // SecretPayload currently has no consuming child accessor. Cloning is
         // confined to this adapter until representation ownership moves here.
         let child = self.payload.expose_plaintext().clone();
         SecretStep {
-            step: Step::new(dispatch::<Transform, _, _, _>(child, self.at, algebra).map(
-                |product| RewriteProduct {
+            step: Step::new(
+                engine::dispatch_bound(child, self.at, algebra).map(|product| RewriteProduct {
                     value: product.value.into_secret(),
                     output: product.output,
                     changed: product.changed,
-                },
-            )),
+                }),
+            ),
         }
     }
 }
