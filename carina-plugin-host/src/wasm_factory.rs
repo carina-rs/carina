@@ -3724,7 +3724,7 @@ impl WasmProviderFactory {
         format!("provider-{}.cwasm", &hash[..16])
     }
 
-    fn create_engine() -> Result<Engine, WasmProviderLoadError> {
+    pub(crate) fn create_engine() -> Result<Engine, WasmProviderLoadError> {
         let config = build_engine_config();
         Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {e}").into())
     }
@@ -3901,7 +3901,7 @@ impl WasmProviderFactory {
         // Keep this engine if a cold-cache publication fails; fallback must
         // not create a second engine or change the compilation environment.
         if !cwasm_path.exists()
-            && let Err(error) = Self::precompile(&engine, wasm_bytes, &cwasm_path)
+            && let Err(error) = Self::precompile(&engine, wasm_bytes, cache_dir)
         {
             eprintln!("Failed to write precompile cache, loading directly: {error}");
             return Self::new_uncached_configured(engine, wasm_bytes, configured, network_request)
@@ -3916,8 +3916,8 @@ impl WasmProviderFactory {
             CachedComponentAcquisition::Hit(component) => component,
             CachedComponentAcquisition::Miss => {
                 // Try to precompile and cache.
-                match Self::precompile(&engine, wasm_bytes, &cwasm_path) {
-                    Ok(()) => Self::deserialize_precompiled_component(&engine, &cwasm_path)
+                match Self::precompile(&engine, wasm_bytes, cache_dir) {
+                    Ok(cwasm_path) => Self::deserialize_precompiled_component(&engine, &cwasm_path)
                         .map_err(WasmProviderLoadError::PrecompiledDeserialization)?,
                     Err(error) => {
                         eprintln!("Failed to write precompile cache, loading directly: {error}");
@@ -3968,7 +3968,11 @@ impl WasmProviderFactory {
         Self::bring_up_component(engine, component, epoch_ticker, configured, network_request).await
     }
 
-    /// Precompile provider bytes with the cache-key engine and publish a .cwasm file.
+    /// Precompile provider bytes and publish a .cwasm file in `cache_dir`.
+    ///
+    /// The filename is derived from the exact bytes and the supplied engine's
+    /// compilation compatibility hash. Returns the published file's path, so
+    /// callers cannot select a filename keyed to a different engine or component.
     ///
     /// **Mmap safety invariant:** `deserialize_precompiled_component` loads
     /// `.cwasm` via `Component::deserialize_file`, which keeps the file
@@ -3991,8 +3995,9 @@ impl WasmProviderFactory {
     pub fn precompile(
         engine: &Engine,
         wasm_bytes: &[u8],
-        cwasm_path: &Path,
-    ) -> Result<(), DiagnosticText> {
+        cache_dir: &Path,
+    ) -> Result<PathBuf, DiagnosticText> {
+        let cwasm_path = cache_dir.join(Self::cache_key(wasm_bytes, engine));
         let serialized = engine
             .precompile_component(wasm_bytes)
             .map_err(|e| DiagnosticText::new(format!("Precompile error: {e:#}")))?;
@@ -4015,13 +4020,13 @@ impl WasmProviderFactory {
         let result = (|| {
             std::fs::write(&tmp_path, &serialized)
                 .map_err(|e| DiagnosticText::new(format!("Write error: {e}")))?;
-            std::fs::rename(&tmp_path, cwasm_path)
+            std::fs::rename(&tmp_path, &cwasm_path)
                 .map_err(|e| DiagnosticText::new(format!("Rename error: {e}")))
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp_path);
         }
-        result
+        result.map(|()| cwasm_path)
     }
 
     /// Load from a precompiled .cwasm file.

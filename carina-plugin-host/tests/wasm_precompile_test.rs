@@ -7,16 +7,11 @@ use std::path::{Path, PathBuf};
 
 use carina_core::UserDirs;
 use carina_core::provider::ProviderFactory;
+use carina_plugin_host::test_utils::engine;
 use carina_plugin_host::{WasmProviderFactory, WasmProviderLoadError};
 use carina_provider_resolver::{ProviderLoadIdentity, ProviderTrustClass, VerifiedLoad};
 use wit_component::{ComponentEncoder, StringEncoding};
 use wit_parser::{ManglingAndAbi, Resolve};
-
-fn engine() -> wasmtime::Engine {
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true).epoch_interruption(true);
-    wasmtime::Engine::new(&config).unwrap()
-}
 
 fn test_identity(name: &str) -> ProviderLoadIdentity {
     ProviderLoadIdentity::for_test(name, ProviderTrustClass::Untrusted)
@@ -42,7 +37,6 @@ fn non_instantiable_component() -> Vec<u8> {
 #[test]
 fn concurrent_precompile_writers_publish_complete_artifacts() {
     let cache = tempfile::tempdir().unwrap();
-    let path = cache.path().join("concurrent.cwasm");
     let bytes = non_instantiable_component();
     let barrier = std::sync::Barrier::new(16);
     std::thread::scope(|scope| {
@@ -51,7 +45,7 @@ fn concurrent_precompile_writers_publish_complete_artifacts() {
                 scope.spawn(|| {
                     barrier.wait();
                     for _ in 0..8 {
-                        WasmProviderFactory::precompile(&engine(), &bytes, &path)
+                        WasmProviderFactory::precompile(&engine().unwrap(), &bytes, cache.path())
                             .expect("every concurrent writer must publish atomically");
                     }
                 })
@@ -61,9 +55,8 @@ fn concurrent_precompile_writers_publish_complete_artifacts() {
             writer.join().unwrap();
         }
     });
-    let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true).epoch_interruption(true);
-    let engine = wasmtime::Engine::new(&config).unwrap();
+    let path = cached_component_path(cache.path());
+    let engine = engine().unwrap();
     // SAFETY: the fixture was produced only by our precompile calls above.
     unsafe { wasmtime::component::Component::deserialize_file(&engine, &path) }
         .expect("the last publication must be a complete compiled component");
@@ -259,10 +252,9 @@ async fn default_precompile_cache_uses_the_supplied_user_dirs() {
 async fn test_precompile_cache_creation() {
     let wasm = std::fs::read(skip_if_no_wasm!()).expect("read mock provider fixture");
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
 
     // Precompile and write .cwasm
-    WasmProviderFactory::precompile(&engine(), &wasm, &cwasm_path)
+    let cwasm_path = WasmProviderFactory::precompile(&engine().unwrap(), &wasm, cache_dir.path())
         .expect("precompile should succeed");
 
     // .cwasm file should now exist
@@ -570,11 +562,10 @@ async fn protocol_v2_is_rejected_before_current_world_binding() {
 #[tokio::test(flavor = "multi_thread")]
 async fn from_precompiled_classifies_failure_by_step() {
     let source_dir = tempfile::tempdir().expect("Failed to create source temp dir");
-    let cwasm_path = source_dir.path().join("non-instantiable.cwasm");
-    WasmProviderFactory::precompile(
-        &engine(),
+    let cwasm_path = WasmProviderFactory::precompile(
+        &engine().unwrap(),
         NON_INSTANTIABLE_COMPONENT_WAT.as_bytes(),
-        &cwasm_path,
+        source_dir.path(),
     )
     .expect("test component should precompile");
 
@@ -605,9 +596,8 @@ async fn from_precompiled_classifies_failure_by_step() {
 async fn precompiled_factory_is_schema_only() {
     let wasm = std::fs::read(skip_if_no_wasm!()).expect("read mock provider fixture");
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
 
-    WasmProviderFactory::precompile(&engine(), &wasm, &cwasm_path)
+    let cwasm_path = WasmProviderFactory::precompile(&engine().unwrap(), &wasm, cache_dir.path())
         .expect("precompile should succeed");
 
     let factory = WasmProviderFactory::from_precompiled(&cwasm_path, test_identity("mock"))
@@ -708,9 +698,8 @@ async fn test_byte_constructor_uses_explicit_cache() {
 async fn precompile_preserves_prior_factory_mmap() {
     let wasm = std::fs::read(skip_if_no_wasm!()).expect("read mock provider fixture");
     let cache_dir = tempfile::tempdir().expect("Failed to create temp dir");
-    let cwasm_path = cache_dir.path().join("carina_provider_mock.cwasm");
 
-    WasmProviderFactory::precompile(&engine(), &wasm, &cwasm_path)
+    let cwasm_path = WasmProviderFactory::precompile(&engine().unwrap(), &wasm, cache_dir.path())
         .expect("initial precompile should succeed");
     let factory1 = WasmProviderFactory::from_precompiled(&cwasm_path, test_identity("mock"))
         .await
@@ -719,8 +708,9 @@ async fn precompile_preserves_prior_factory_mmap() {
     // Overwrite the cache file via the public API while `factory1` still
     // holds its mmap. A `precompile` implementation that writes in place
     // would pull backing pages out from under `factory1`'s Component.
-    WasmProviderFactory::precompile(&engine(), &wasm, &cwasm_path)
+    let rewritten = WasmProviderFactory::precompile(&engine().unwrap(), &wasm, cache_dir.path())
         .expect("second precompile should succeed");
+    assert_eq!(rewritten, cwasm_path);
 
     let factory2 = WasmProviderFactory::from_precompiled(&cwasm_path, test_identity("mock"))
         .await

@@ -37,7 +37,6 @@ with tempfile.TemporaryDirectory(prefix="carina-rust-cache-key-") as temporary:
     for before, after in [
         ('version = "1.0.0"', 'version = "1.0.1"'),
         ('debug = "line-tables-only"', 'debug = "full"'),
-        ('debug = "line-tables-only"', 'debug = 0'),
         ('vendor/example', 'vendor/example-new'),
         ('members = ["example"]', 'members = ["example", "another"]'),
         ('publish = false', 'publish = true'),

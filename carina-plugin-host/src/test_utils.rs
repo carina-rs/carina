@@ -2,6 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
+/// Construct an engine with the production provider loader's configuration.
+pub fn engine() -> Result<wasmtime::Engine, crate::WasmProviderLoadError> {
+    crate::WasmProviderFactory::create_engine()
+}
+
 /// Use the nextest run's compiled cache, with a private fallback for standalone
 /// tests. This shares immutable code while callers retain their own lock/state
 /// directories. The setup script keeps this outside the default UserDirs cache.

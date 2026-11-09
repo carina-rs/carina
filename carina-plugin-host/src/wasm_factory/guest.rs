@@ -6800,7 +6800,7 @@ pub(super) mod tests {
         let error = WasmProviderFactory::precompile(
             &WasmProviderFactory::create_engine().unwrap(),
             component.as_bytes(),
-            &directory.path().join("test.cwasm"),
+            directory.path(),
         )
         .unwrap_err();
         let rendered = error.to_string();
@@ -8724,10 +8724,19 @@ pub(super) mod tests {
 
     #[tokio::test]
     async fn uncached_fallback_retains_the_callers_engine() {
-        let workspace = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
-        let bytes =
-            std::fs::read(workspace.join("target/wasm32-wasip2/debug/carina-provider-mock.wasm"))
-                .expect("the mock WASM fixture is required");
+        let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let wasm_path = ["carina_provider_mock.wasm", "carina-provider-mock.wasm"]
+            .into_iter()
+            .map(|name| workspace_root.join("target/wasm32-wasip2/debug").join(name))
+            .find(|path| path.exists());
+        let Some(wasm_path) = wasm_path else {
+            eprintln!(
+                "SKIP: WASM binary not found. Build with: cargo build -p \
+                 carina-provider-mock --target wasm32-wasip2"
+            );
+            return;
+        };
+        let bytes = std::fs::read(wasm_path).expect("read mock WASM provider");
         let engine = WasmProviderFactory::create_engine().unwrap();
         let identity = test_load_identity("mock");
         let factory = WasmProviderFactory::new_uncached_configured(
@@ -8756,13 +8765,49 @@ pub(super) mod tests {
         let engine = Engine::new(&config).unwrap();
         let bytes = wat::parse_str("(component)").unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let artifact = cache
+        let expected = cache
             .path()
             .join(WasmProviderFactory::cache_key(&bytes, &engine));
 
-        WasmProviderFactory::precompile(&engine, &bytes, &artifact).unwrap();
+        let artifact = WasmProviderFactory::precompile(&engine, &bytes, cache.path()).unwrap();
+        assert_eq!(
+            artifact, expected,
+            "precompile must derive its artifact path from its own engine and bytes"
+        );
         WasmProviderFactory::deserialize_precompiled_component(&engine, &artifact)
             .expect("the engine that selected the cache key must deserialize its compiled bytes");
+    }
+
+    #[test]
+    fn precompile_separates_content_and_engine_artifacts() {
+        let standard = WasmProviderFactory::create_engine().unwrap();
+        let mut config = build_engine_config();
+        config.epoch_interruption(false);
+        let different = Engine::new(&config).unwrap();
+        let bytes = wat::parse_str("(component)").unwrap();
+        let other_bytes = wat::parse_str("(component (core module))").unwrap();
+        let cache = tempfile::tempdir().unwrap();
+
+        let original = WasmProviderFactory::precompile(&standard, &bytes, cache.path()).unwrap();
+        let other_content =
+            WasmProviderFactory::precompile(&standard, &other_bytes, cache.path()).unwrap();
+        let other_engine =
+            WasmProviderFactory::precompile(&different, &bytes, cache.path()).unwrap();
+        let repeated = WasmProviderFactory::precompile(&standard, &bytes, cache.path()).unwrap();
+
+        assert_ne!(original, other_content);
+        assert_ne!(original, other_engine);
+        assert_ne!(other_content, other_engine);
+        assert_eq!(original, repeated);
+        assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 3);
+        for (engine, artifact) in [
+            (&standard, &original),
+            (&standard, &other_content),
+            (&different, &other_engine),
+        ] {
+            WasmProviderFactory::deserialize_precompiled_component(engine, artifact)
+                .expect("each derived cache path must contain bytes compiled by its engine");
+        }
     }
 
     #[test]

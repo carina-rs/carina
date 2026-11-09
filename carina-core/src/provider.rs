@@ -8096,18 +8096,13 @@ impl ProviderNormalizer<Bound> for ProviderRouter {
 /// External callers cannot bypass local schema validation through the private
 /// canonicalization function (carina#4276). This checks the downstream privacy
 /// boundary, where importing `canonicalize_custom_type_value` is an E0603 error.
+/// The example references only that function: making it public would make the
+/// example compile, without another private import masking the regression.
 ///
 /// ```compile_fail,E0603
-/// use carina_core::provider::{
-///     ProviderFactory, canonicalize_custom_type_value, identified_custom_type_identity,
-/// };
-/// use carina_core::resource::Value;
-/// use carina_core::schema::CompiledAttributeType;
+/// use carina_core::provider::canonicalize_custom_type_value;
 ///
-/// pub fn bypass(factory: &dyn ProviderFactory, declaration: &CompiledAttributeType, raw: &Value) {
-///     let canonical = canonicalize_custom_type_value(declaration, raw).unwrap().unwrap();
-///     factory.validate_custom_type(identified_custom_type_identity(declaration).unwrap(), &canonical).unwrap();
-/// }
+/// let _ = canonicalize_custom_type_value;
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CanonicalCustomTypeValue(String);
