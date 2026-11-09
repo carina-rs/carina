@@ -192,6 +192,9 @@
 //! let _ = ResourceSchema::new("test.Widget").with_validator(|_| Ok(()));
 //! ```
 
+mod indexed_struct_fields;
+pub use indexed_struct_fields::IndexedStructFields;
+
 mod compile_schema;
 mod compiled_pattern;
 mod pattern_display;
@@ -214,6 +217,7 @@ pub use input_rules::{
     InputRule, InputRuleCode, InputRuleError, InputRuleParts, InputRuleScope, InputRuleTarget,
     InputViolation, InputViolationMessage, InputViolationReason, NonEmptyString,
 };
+pub(crate) use input_rules::{InputDiagnosticKey, InputDiagnosticSegment};
 
 use crate::provider_text::{DiagnosticText, DiagnosticTextBuilder, ProviderKey};
 use crate::resource::InsideSecret;
@@ -1487,7 +1491,7 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     /// Struct (named object with typed fields)
     Struct {
         name: String,
-        fields: Vec<PatternStructField<R>>,
+        fields: IndexedStructFields<R>,
         field_groups: Vec<FieldGroup>,
         input_rules: Vec<InputRule<R>>,
     },
@@ -1783,7 +1787,7 @@ pub enum RawShape<'a, R: PatternForm = Draft> {
     /// Named struct — see [`AttrTypeKind::Struct`].
     Struct {
         name: &'a str,
-        fields: &'a [PatternStructField<R>],
+        fields: &'a IndexedStructFields<R>,
         field_groups: &'a [FieldGroup],
         input_rules: &'a [InputRule<R>],
     },
@@ -2731,6 +2735,14 @@ impl FieldPath {
         )
     }
 
+    pub(crate) fn push_protected_map_key(&self) -> Self {
+        self.pushed(
+            FieldPathStep::Redacted(RedactedPathField::MapKey),
+            LeafPathSegment::MapKey("<secret>".into()),
+            FieldPathDirection::After,
+        )
+    }
+
     fn prepend_field(&self, name: impl Into<String>) -> Self {
         let name = name.into();
         self.pushed(
@@ -3161,7 +3173,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 input_rules,
             } => RawShape::Struct {
                 name: name.as_str(),
-                fields: fields.as_slice(),
+                fields,
                 field_groups: field_groups.as_slice(),
                 input_rules: input_rules.as_slice(),
             },
@@ -3487,7 +3499,7 @@ impl<R: PatternForm> PatternAttributeType<R> {
         PatternAttributeType {
             kind: AttrTypeKind::Struct {
                 name: name.into(),
-                fields,
+                fields: fields.into(),
                 field_groups,
                 input_rules,
             },
@@ -6321,7 +6333,7 @@ struct RecognizedStructFields(IndexSet<String>);
 
 impl RecognizedStructFields {
     fn new<P: PlaceholderKind, B: BindingAddress>(
-        fields: &[CompiledStructField],
+        fields: &IndexedStructFields<Compiled>,
         map: &IndexMap<String, Value<P, B>>,
         ancestry: FieldAncestry,
     ) -> Self {
@@ -6698,30 +6710,30 @@ pub(crate) fn closest_union_member_for_value_on_path<'a, P: PlaceholderKind, B: 
 /// Fit, validation, diagnostics, and canonicalization all call this helper so
 /// accepted-key semantics cannot drift (#2214, #3877).
 pub(crate) fn struct_field_for_key<'a>(
-    fields: &'a [CompiledStructField],
+    fields: &'a IndexedStructFields<Compiled>,
     key: &str,
     ancestry: FieldAncestry,
 ) -> Option<&'a CompiledStructField> {
-    fields
-        .iter()
-        .rev()
-        .find(|field| field.name == key || ancestry.block_name(field) == Some(key))
+    fields.authored_field(key, |field| ancestry.block_name(field) == Some(key))
 }
 
 fn struct_field_is_present<P: crate::resource::ValueKind, B: BindingAddress>(
-    fields: &[CompiledStructField],
+    fields: &IndexedStructFields<Compiled>,
     map: &IndexMap<String, Value<P, B>>,
     expected: &CompiledStructField,
     ancestry: FieldAncestry,
 ) -> bool {
-    map.keys().any(|key| {
-        struct_field_for_key(fields, key, ancestry)
-            .is_some_and(|found| std::ptr::eq(found, expected))
-    })
+    std::iter::once(expected.name.as_str())
+        .chain(ancestry.block_name(expected))
+        .any(|key| {
+            map.contains_key(key)
+                && struct_field_for_key(fields, key, ancestry)
+                    .is_some_and(|found| std::ptr::eq(found, expected))
+        })
 }
 
 fn violated_struct_field_groups<'a, P: crate::resource::ValueKind, B: BindingAddress>(
-    fields: &'a [CompiledStructField],
+    fields: &'a IndexedStructFields<Compiled>,
     field_groups: &'a [FieldGroup],
     map: &'a IndexMap<String, Value<P, B>>,
     ancestry: FieldAncestry,
@@ -6732,8 +6744,7 @@ fn violated_struct_field_groups<'a, P: crate::resource::ValueKind, B: BindingAdd
             .iter()
             .filter(|name| {
                 fields
-                    .iter()
-                    .find(|field| field.name == name.as_str())
+                    .field(name)
                     .is_some_and(|field| struct_field_is_present(fields, map, field, ancestry))
             })
             .count();
@@ -9026,9 +9037,9 @@ pub enum AttributePathTypeError {
 pub(crate) fn struct_fields_with_defs<'a, R: PatternForm>(
     attr_type: &'a PatternAttributeType<R>,
     defs: &'a std::collections::BTreeMap<String, PatternAttributeType<R>>,
-) -> Option<&'a [PatternStructField<R>]> {
+) -> Option<&'a IndexedStructFields<R>> {
     match attr_type.resolve_refs_with_defs(defs).as_attr().kind() {
-        AttrTypeKind::Struct { fields, .. } => Some(fields.as_slice()),
+        AttrTypeKind::Struct { fields, .. } => Some(fields),
         _ => None,
     }
 }
@@ -9766,9 +9777,7 @@ impl<'a> EffectiveType<'a> {
         name: &str,
         budget: &mut ShapeWalkBudget,
     ) -> Option<EffectiveField<'a>> {
-        self.field_candidates_with_budget(budget)
-            .into_iter()
-            .find(|field| field.name() == name || field.block_name() == Some(name))
+        self.find_indexed_field(name, true, budget)
     }
 
     fn find_field_by_canonical_name_with_budget(
@@ -9776,9 +9785,100 @@ impl<'a> EffectiveType<'a> {
         name: &str,
         budget: &mut ShapeWalkBudget,
     ) -> Option<EffectiveField<'a>> {
-        self.field_candidates_with_budget(budget)
-            .into_iter()
-            .find(|field| field.name() == name)
+        self.find_indexed_field(name, false, budget)
+    }
+
+    fn find_indexed_field(
+        &self,
+        name: &str,
+        authored: bool,
+        budget: &mut ShapeWalkBudget,
+    ) -> Option<EffectiveField<'a>> {
+        let mut found = None;
+        lookup_effective_field(
+            self.attr_type,
+            self.defs,
+            &self.path,
+            self.field_ancestry,
+            (name, authored),
+            budget,
+            &mut found,
+        );
+        found
+    }
+}
+
+fn lookup_effective_field<'a>(
+    attr_type: &'a CompiledAttributeType,
+    defs: &'a BTreeMap<String, CompiledAttributeType>,
+    parent_path: &[String],
+    ancestry: FieldAncestry,
+    query: (&str, bool),
+    budget: &mut ShapeWalkBudget,
+    found: &mut Option<EffectiveField<'a>>,
+) {
+    if !budget.take() {
+        return;
+    }
+    match attr_type.shape_with_defs(defs) {
+        Shape::Struct { .. } => {
+            let Some(fields) = struct_fields_with_defs(attr_type, defs) else {
+                return;
+            };
+            let field = if query.1 {
+                fields.first_authored_field(query.0, |field| {
+                    ancestry.block_name(field) == Some(query.0)
+                })
+            } else {
+                fields.field(query.0)
+            };
+            if found.is_none()
+                && let Some(field) = field
+            {
+                let mut path = parent_path.to_vec();
+                path.push(field.name.clone());
+                *found = Some(EffectiveField {
+                    field,
+                    defs,
+                    path,
+                    ancestry,
+                });
+            }
+        }
+        Shape::List { element_type, .. } => lookup_effective_field(
+            element_type,
+            defs,
+            parent_path,
+            ancestry,
+            query,
+            budget,
+            found,
+        ),
+        Shape::Union => {
+            if let Some(members) = union_members_with_defs(attr_type, defs) {
+                // Preserve the candidate walk's budget and declaration order.
+                for member in members.iter().flatten() {
+                    lookup_effective_field(
+                        member.as_attr(),
+                        defs,
+                        parent_path,
+                        ancestry,
+                        query,
+                        budget,
+                        found,
+                    );
+                }
+            }
+        }
+        Shape::UnloadedSchemaType(_)
+        | Shape::Reference { .. }
+        | Shape::String { .. }
+        | Shape::Int { .. }
+        | Shape::Float { .. }
+        | Shape::Bool
+        | Shape::Duration
+        | Shape::Enum { .. }
+        | Shape::Map { .. } => {}
     }
 }
 
@@ -10147,14 +10247,13 @@ impl ValidatedResourceSchema {
                 Shape::Struct { name: struct_name } => {
                     let fields = struct_fields_with_defs(current.attr_type, current.defs)
                         .expect("Shape::Struct must expose struct fields internally");
-                    let field = fields
-                        .iter()
-                        .find(|field| field.name == *segment)
-                        .ok_or_else(|| AttributePathTypeError::UnknownStructField {
+                    let field = fields.field(segment).ok_or_else(|| {
+                        AttributePathTypeError::UnknownStructField {
                             parent_path: traversed.clone(),
                             field: segment.clone(),
                             struct_name: struct_name.to_string(),
-                        })?;
+                        }
+                    })?;
                     let mut field_path = current.path.clone();
                     field_path.push(field.name.clone());
                     EffectiveField {
@@ -11491,7 +11590,7 @@ fn validate_type_definition(
             input_rules::validate_rule_collection(
                 input_rules,
                 |name| {
-                    fields.iter().find(|field| field.name == name).map(|field| {
+                    fields.field(name).map(|field| {
                         (
                             &field.field_type,
                             provider_populated_ancestor.unwrap_or(false)
@@ -11545,7 +11644,7 @@ fn validate_type_definition(
                 "field",
                 |group_index| location.with_suffix(format_args!(".field_groups[{group_index}]")),
                 |name| {
-                    fields.iter().find(|field| field.name == name).map(|field| {
+                    fields.field(name).map(|field| {
                         FieldGroupMemberAdmission {
                             input_mode: field.declared_input_mode,
                             // StructField has no default in the core or current
@@ -12064,7 +12163,7 @@ fn validate_keyed_partial_update(
         return;
     };
     let key_name = keyed.key_field.as_str();
-    let Some(field) = fields.iter().find(|field| field.name == key_name) else {
+    let Some(field) = fields.field(key_name) else {
         push_schema_issue(
             issues,
             location,
@@ -12292,7 +12391,7 @@ fn strip_write_only_leaves_from_value<'schema, P: crate::resource::ValueKind>(
                 entries
                     .iter()
                     .filter_map(|(key, entry)| {
-                        let field = fields.iter().find(|field| field.name == *key);
+                        let field = fields.field(key);
                         match field {
                             Some(field) if field.write_only => None,
                             Some(field) => Some((
@@ -12827,6 +12926,50 @@ struct BlockFieldRef<'a> {
     child_ancestry: FieldAncestry,
 }
 
+struct BlockFields<'a> {
+    ordered: Vec<BlockFieldRef<'a>>,
+    canonical: HashMap<&'a str, usize>,
+    aliases: HashMap<&'a str, usize>,
+}
+
+impl<'a> FromIterator<BlockFieldRef<'a>> for BlockFields<'a> {
+    fn from_iter<T: IntoIterator<Item = BlockFieldRef<'a>>>(fields: T) -> Self {
+        let ordered = fields.into_iter().collect::<Vec<_>>();
+        let mut canonical = HashMap::with_capacity(ordered.len());
+        let mut aliases = HashMap::new();
+        for (index, field) in ordered.iter().enumerate() {
+            #[cfg(test)]
+            crate::input_rules::record_declaration_lookup_work(1);
+            canonical.entry(field.name).or_insert(index);
+            if let Some(alias) = field.block_name.filter(|alias| *alias != field.name) {
+                aliases.entry(alias).or_insert(index);
+            }
+        }
+        Self {
+            ordered,
+            canonical,
+            aliases,
+        }
+    }
+}
+impl<'a> BlockFields<'a> {
+    fn candidates(&self, key: &str) -> (Option<BlockFieldRef<'a>>, Option<BlockFieldRef<'a>>) {
+        #[cfg(test)]
+        crate::input_rules::record_declaration_lookup_work(2);
+        (
+            self.canonical.get(key).map(|index| self.ordered[*index]),
+            self.aliases.get(key).map(|index| self.ordered[*index]),
+        )
+    }
+}
+impl<'a, 'b> IntoIterator for &'a BlockFields<'b> {
+    type Item = &'a BlockFieldRef<'b>;
+    type IntoIter = std::slice::Iter<'a, BlockFieldRef<'b>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.ordered.iter()
+    }
+}
+
 #[derive(Clone, Copy)]
 enum BlockFieldMatch<'a> {
     Canonical,
@@ -12844,14 +12987,10 @@ fn nested_path(parent: &str, name: &str) -> String {
 fn match_block_field<'a, P: PlaceholderKind, B: BindingAddress>(
     key: &str,
     value: &Value<P, B>,
-    fields: &[BlockFieldRef<'a>],
+    fields: &BlockFields<'a>,
     defs: &BTreeMap<String, CompiledAttributeType>,
 ) -> Option<BlockFieldMatch<'a>> {
-    let canonical = fields.iter().copied().find(|field| field.name == key);
-    let alias = fields
-        .iter()
-        .copied()
-        .find(|field| field.block_name == Some(key) && field.name != key);
+    let (canonical, alias) = fields.candidates(key);
 
     match (canonical, alias) {
         // In the otherwise ambiguous case, a concrete list belongs to the
@@ -12891,7 +13030,7 @@ fn block_name_conflict(
 fn value_for_field<'a, P: PlaceholderKind, B: BindingAddress>(
     map: &'a IndexMap<String, Value<P, B>>,
     field: BlockFieldRef<'_>,
-    fields: &[BlockFieldRef<'_>],
+    fields: &BlockFields<'_>,
     defs: &BTreeMap<String, PatternAttributeType<Compiled>>,
 ) -> Option<&'a Value<P, B>> {
     if let Some(value) = map.get(field.name) {
@@ -12909,7 +13048,7 @@ fn value_for_field<'a, P: PlaceholderKind, B: BindingAddress>(
 fn resolve_block_names_in_map<P: PlaceholderKind, B: BindingAddress, AB: BindingAddress>(
     map: &mut IndexMap<String, Value<P, B>>,
     authored_map: Option<&IndexMap<String, Value<P, AB>>>,
-    fields: &[BlockFieldRef<'_>],
+    fields: &BlockFields<'_>,
     context: BlockNameResolutionContext<'_>,
     parent_path: BlockNamePath<'_>,
     conflicts: &mut Vec<BlockNameConflict>,
@@ -13006,7 +13145,7 @@ fn resolve_block_names_in_value<P: PlaceholderKind, B: BindingAddress, AB: Bindi
                     field_type: &field.field_type,
                     child_ancestry: ancestry.descend(field),
                 })
-                .collect::<Vec<_>>();
+                .collect::<BlockFields<'_>>();
             let authored_map = match authored_value {
                 Some(Value::Concrete(ConcreteValue::Map(map))) => Some(map),
                 _ => None,
@@ -13034,7 +13173,7 @@ fn resolve_block_names_in_value<P: PlaceholderKind, B: BindingAddress, AB: Bindi
                     field_type: &field.field_type,
                     child_ancestry: ancestry.descend(field),
                 })
-                .collect::<Vec<_>>();
+                .collect::<BlockFields<'_>>();
             let authored_items = match authored_value {
                 Some(Value::Concrete(ConcreteValue::List(items))) => Some(items.as_slice()),
                 _ => None,
@@ -13083,7 +13222,7 @@ struct BlockNameResolutionContext<'a> {
 
 type AttributePathRename = (Vec<crate::parser::AttributePathSegment>, String);
 
-fn block_fields(schema: &CompiledResourceSchema) -> Vec<BlockFieldRef<'_>> {
+fn block_fields(schema: &CompiledResourceSchema) -> BlockFields<'_> {
     schema
         .attributes
         .values()
@@ -13150,7 +13289,7 @@ fn resolve_attribute_block_names_with_authored<
 
 fn find_block_name_alias_in_map<P: PlaceholderKind, B: BindingAddress>(
     map: &IndexMap<String, Value<P, B>>,
-    fields: &[BlockFieldRef<'_>],
+    fields: &BlockFields<'_>,
     defs: &BTreeMap<String, CompiledAttributeType>,
     resource_id: &str,
     parent_path: &str,
@@ -13205,7 +13344,7 @@ fn find_block_name_alias_in_value<P: PlaceholderKind, B: BindingAddress>(
                     field_type: &field.field_type,
                     child_ancestry: ancestry.descend(field),
                 })
-                .collect::<Vec<_>>();
+                .collect::<BlockFields<'_>>();
             find_block_name_alias_in_map(map, &fields, defs, resource_id, path)
         }
         Shape::List { element_type, .. }
@@ -13222,7 +13361,7 @@ fn find_block_name_alias_in_value<P: PlaceholderKind, B: BindingAddress>(
                     field_type: &field.field_type,
                     child_ancestry: ancestry.descend(field),
                 })
-                .collect::<Vec<_>>();
+                .collect::<BlockFields<'_>>();
             items.iter().enumerate().find_map(|(index, item)| {
                 let Value::Concrete(ConcreteValue::Map(map)) = item else {
                     return None;
@@ -15542,7 +15681,7 @@ impl<R: PatternForm> PatternResourceSchema<R> {
         if !budget.take() {
             return None;
         }
-        struct_fields_with_defs(ty, &self.defs)
+        struct_fields_with_defs(ty, &self.defs).map(IndexedStructFields::as_slice)
     }
 
     pub fn union_members_with_budget<'a>(

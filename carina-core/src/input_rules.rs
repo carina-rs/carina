@@ -169,36 +169,31 @@ pub struct WriteSite<'a> {
     schema: &'a ValidatedResourceSchema,
     rules: Vec<&'a InputRule<Compiled>>,
     paired_deletes: Vec<PairedInputDelete>,
+    union_fits: std::cell::RefCell<union_fits::UnionFits<'a>>,
 }
 
-impl WriteSite<'_> {
+impl<'a> WriteSite<'a> {
     pub fn target(&self) -> Option<&InputEffectTarget> {
         self.target.as_ref()
     }
-    pub fn applicable_rules(&self) -> impl Iterator<Item = ApplicableInputRule<'_, '_>> {
+    pub fn applicable_rules<'s>(&'s self) -> impl Iterator<Item = ApplicableInputRule<'s, 'a>> {
         instances::for_site(self).into_iter()
     }
 
-    pub(crate) fn evaluated_rules(&self) -> Vec<InputEvaluation> {
-        let mut rows = self
-            .applicable_rules()
-            .filter_map(|rule| {
-                let evaluation = rule.evaluation();
-                let key = evaluation
-                    .findings
-                    .first()
-                    .map(|finding| {
-                        (
-                            finding.violation.path().clone(),
-                            finding.violation.code().clone(),
-                        )
-                    })
-                    .or_else(|| evaluation.pending.clone())?;
-                Some((key, evaluation))
-            })
-            .collect::<Vec<_>>();
-        rows.sort_by(|(a, _), (b, _)| a.cmp(b));
-        rows.into_iter().map(|(_, evaluation)| evaluation).collect()
+    /// Evaluate every applicable declaration through the single rule evaluator.
+    /// Successful rules never materialize a diagnostic path.
+    pub fn evaluate(&self) -> InputEvaluation {
+        let mut complete = InputEvaluation::empty();
+        for rule in self.applicable_rules() {
+            let InputEvaluation { findings, pending } = rule.evaluate();
+            complete.findings.extend(findings);
+            complete.pending.extend(pending);
+        }
+        complete.findings.sort_by(|a, b| {
+            (a.violation.path(), a.violation.code()).cmp(&(b.violation.path(), b.violation.code()))
+        });
+        complete.pending.sort();
+        complete
     }
 
     pub fn resource_id(&self) -> &ResourceId {
@@ -225,10 +220,113 @@ enum InputRuleBinding<'s, 'a> {
     },
 }
 
-#[derive(Default)]
-pub(crate) struct InputEvaluation {
-    pub(crate) findings: Vec<InputFinding>,
-    pub(crate) pending: Option<(InputDiagnosticPath, InputRuleCode)>,
+/// Complete typed results for one binding or an entire write site. There is
+/// no public conversion to the lossy, single-rule verdict used internally.
+#[derive(Debug, Clone)]
+pub struct InputEvaluation {
+    findings: Vec<InputFinding>,
+    pending: Vec<(InputDiagnosticPath, InputRuleCode)>,
+}
+
+#[derive(Debug, Clone)]
+pub enum InputEvaluationOutcome {
+    Finding(Box<InputFinding>),
+    Pending {
+        path: InputDiagnosticPath,
+        code: InputRuleCode,
+    },
+}
+
+impl InputEvaluation {
+    fn empty() -> Self {
+        Self {
+            findings: Vec::new(),
+            pending: Vec::new(),
+        }
+    }
+    pub fn findings(&self) -> &[InputFinding] {
+        &self.findings
+    }
+    pub fn pending(&self) -> &[(InputDiagnosticPath, InputRuleCode)] {
+        &self.pending
+    }
+    pub fn is_proven(&self) -> bool {
+        self.findings.is_empty() && self.pending.is_empty()
+    }
+    pub fn into_outcomes(self) -> impl Iterator<Item = InputEvaluationOutcome> {
+        let Self { findings, pending } = self;
+        findings
+            .into_iter()
+            .map(|finding| InputEvaluationOutcome::Finding(Box::new(finding)))
+            .chain(
+                pending
+                    .into_iter()
+                    .map(|(path, code)| InputEvaluationOutcome::Pending { path, code }),
+            )
+    }
+}
+
+/// A nonempty complete failure, retaining every established finding and
+/// unresolved obligation when one provider operation cannot be dispatched.
+#[derive(Debug, Clone)]
+pub struct InputEvaluationFailure {
+    first: InputEvaluationOutcome,
+    remaining: Vec<InputEvaluationOutcome>,
+}
+impl InputEvaluationFailure {
+    pub fn outcomes(&self) -> impl Iterator<Item = &InputEvaluationOutcome> {
+        std::iter::once(&self.first).chain(&self.remaining)
+    }
+    pub fn has_findings(&self) -> bool {
+        self.outcomes()
+            .any(|outcome| matches!(outcome, InputEvaluationOutcome::Finding(_)))
+    }
+}
+impl std::fmt::Display for InputEvaluationFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, outcome) in self.outcomes().enumerate() {
+            if index > 0 {
+                f.write_str("\n")?;
+            }
+            match outcome {
+                InputEvaluationOutcome::Finding(finding) => write!(
+                    f,
+                    "{} [{}]: {}",
+                    finding.violation.path(),
+                    finding.violation.code(),
+                    finding.message()
+                )?,
+                InputEvaluationOutcome::Pending { path, code } => {
+                    write!(f, "input rule {code} at {path} could not be discharged")?
+                }
+            }
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for InputEvaluationFailure {}
+
+impl InputEvaluation {
+    pub(crate) fn into_dispatch_failure(self) -> Option<crate::executor::EffectFailureKind> {
+        use crate::executor::EffectFailureKind;
+        let mut outcomes = self.into_outcomes();
+        let first = outcomes.next()?;
+        let remaining = outcomes.collect::<Vec<_>>();
+        Some(if remaining.is_empty() {
+            match first {
+                InputEvaluationOutcome::Finding(finding) => EffectFailureKind::InputRule {
+                    violation: finding.violation,
+                },
+                InputEvaluationOutcome::Pending { path, code } => {
+                    EffectFailureKind::UnresolvedInputRule { path, code }
+                }
+            }
+        } else {
+            EffectFailureKind::InputRuleEvaluation {
+                failure: Box::new(InputEvaluationFailure { first, remaining }),
+            }
+        })
+    }
 }
 
 impl<'s, 'a> ApplicableInputRule<'s, 'a> {
@@ -247,22 +345,12 @@ impl<'s, 'a> ApplicableInputRule<'s, 'a> {
             },
         })
     }
-    pub fn evaluate(&self) -> InputVerdict {
-        let evaluation = self.evaluation();
-        if let Some(finding) = evaluation.findings.into_iter().next() {
-            InputVerdict::Violation(finding.violation)
-        } else if evaluation.pending.is_some() {
-            InputVerdict::Undecided
-        } else {
-            InputVerdict::Proven
-        }
-    }
-    pub(crate) fn evaluation(&self) -> InputEvaluation {
+    pub fn evaluate(&self) -> InputEvaluation {
         let (first, remaining) = match &self.binding {
             InputRuleBinding::Instance(rule) => (rule, &[][..]),
             InputRuleBinding::DeferredSubtree { first, remaining } => (first, remaining.as_slice()),
         };
-        let mut evaluation = InputEvaluation::default();
+        let mut evaluation = InputEvaluation::empty();
         for rule in std::iter::once(first).chain(remaining) {
             match rule.evaluate() {
                 InputVerdict::Proven => {}
@@ -270,13 +358,46 @@ impl<'s, 'a> ApplicableInputRule<'s, 'a> {
                     evaluation.findings.push(rule.finding(violation))
                 }
                 InputVerdict::Undecided => {
-                    if evaluation.pending.is_none() {
-                        evaluation.pending = Some((rule.path().clone(), rule.code().clone()));
+                    // Unknown descendant membership retains one subtree
+                    // obligation while independent established failures survive.
+                    if evaluation.pending.is_empty() {
+                        evaluation
+                            .pending
+                            .push((rule.path().clone(), rule.code().clone()));
                     }
                 }
             }
         }
         evaluation
+    }
+    #[cfg(test)]
+    fn test_verdicts(&self) -> Vec<InputVerdict> {
+        let evaluation = self.evaluate();
+        if evaluation.is_proven() {
+            return vec![InputVerdict::Proven];
+        }
+        let mut verdicts = evaluation
+            .findings
+            .into_iter()
+            .map(|finding| InputVerdict::Violation(finding.violation))
+            .collect::<Vec<_>>();
+        verdicts.extend(
+            evaluation
+                .pending
+                .into_iter()
+                .map(|_| InputVerdict::Undecided),
+        );
+        verdicts
+    }
+    #[cfg(test)]
+    fn verdict_for_test(&self) -> InputVerdict {
+        let mut verdicts = self.test_verdicts();
+        assert_eq!(
+            verdicts.len(),
+            1,
+            "single-rule fixture must inspect all outcomes for a multi-rule binding"
+        );
+        verdicts.pop().unwrap()
     }
 }
 
@@ -299,7 +420,7 @@ impl BoundInputRule<'_, '_> {
     pub(crate) fn code(&self) -> &InputRuleCode {
         self.rule.code()
     }
-    pub fn evaluate(&self) -> InputVerdict {
+    fn evaluate(&self) -> InputVerdict {
         let verdict = verdict(self);
         match verdict {
             InputVerdict::Violation(mut violation) => {
@@ -525,6 +646,7 @@ fn classify_write_site<'a, S>(
         schema,
         rules,
         paired_deletes,
+        union_fits: Default::default(),
     }))
 }
 
@@ -798,15 +920,12 @@ impl<S> FinalizedPlan<S> {
                 context,
                 schema: Arc::clone(&schema),
             });
-            for evaluation in view.evaluated_rules() {
-                diagnostics.extend(
-                    evaluation
-                        .findings
-                        .into_iter()
-                        .map(|finding| (context, finding)),
-                );
-                undecided.extend(evaluation.pending);
-            }
+            let InputEvaluation {
+                findings,
+                pending: unresolved,
+            } = view.evaluate();
+            diagnostics.extend(findings.into_iter().map(|finding| (context, finding)));
+            undecided.extend(unresolved);
             if !undecided.is_empty() {
                 pending.push(PendingInputObligation {
                     target: view
@@ -871,7 +990,7 @@ impl<S> FinalizedPlan<S> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InputVerdict {
+enum InputVerdict {
     Proven,
     Violation(InputViolation),
     Undecided,
@@ -883,6 +1002,18 @@ enum Truth {
     False,
     Pending,
     Failed,
+}
+
+#[cfg(test)]
+thread_local! { static DECLARATION_LOOKUP_WORK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+pub(crate) fn record_declaration_lookup_work(count: usize) {
+    DECLARATION_LOOKUP_WORK.with(|work| {
+        if let Some(current) = work.get() {
+            work.set(Some(current + count));
+        }
+    });
 }
 
 fn presence(evidence: InputRead<'_>) -> Truth {
@@ -905,7 +1036,7 @@ fn path_evidence<'s>(applicable: &'s BoundInputRule<'_, '_>, path: &InputPath) -
 }
 
 fn literal_type<'a>(
-    applicable: &'a BoundInputRule<'_, '_>,
+    applicable: &BoundInputRule<'_, 'a>,
     path: &InputPath,
 ) -> Option<&'a CompiledAttributeType> {
     input_declaration(applicable, path, path.segments().count()).map(|(ty, _)| ty)
@@ -913,7 +1044,7 @@ fn literal_type<'a>(
 
 /// The declaration owner supplies both scalar identity and omission policy.
 fn input_declaration<'a>(
-    applicable: &'a BoundInputRule<'_, '_>,
+    applicable: &BoundInputRule<'_, 'a>,
     path: &InputPath,
     count: usize,
 ) -> Option<(&'a CompiledAttributeType, InputMode)> {
@@ -937,11 +1068,92 @@ fn input_declaration<'a>(
         let AttrTypeKind::Struct { fields, .. } = &ty.kind else {
             return None;
         };
-        let field = fields.iter().find(|f| f.name == segment)?;
+        let field = fields.field(segment)?;
         ty = &field.field_type;
         mode = field.parts().declared_input_mode;
     }
     Some((ty.resolve_refs_with_defs(defs).as_attr(), mode))
+}
+
+/// Known scalar evidence is canonical once, regardless of predicate or owner.
+/// Invalid evidence cannot fall through to conservative expression estimation.
+enum ScalarEvidence {
+    Known(InputLiteral),
+    Pending,
+    Failed,
+}
+
+fn scalar_value<'a>(
+    applicable: &BoundInputRule<'_, 'a>,
+    path: &InputPath,
+    evidence: &NodeRef<'_>,
+) -> ScalarEvidence {
+    use crate::resource::{
+        EnumValueResolver,
+        knowledge::{Classification, KnownView},
+    };
+    if evidence.failed() {
+        return ScalarEvidence::Failed;
+    }
+    if !evidence.known() {
+        return ScalarEvidence::Pending;
+    }
+    let Some(Classification::Known(known)) = evidence.proof() else {
+        return ScalarEvidence::Pending;
+    };
+    let defs = applicable.site.schema.as_schema().defs();
+    let Some(mut ty) = literal_type(applicable, path) else {
+        return ScalarEvidence::Failed;
+    };
+    while matches!(ty.kind(), crate::schema::AttrTypeKind::Union(_)) {
+        let Some(selected) =
+            applicable
+                .site
+                .union_fits
+                .borrow_mut()
+                .select(ty, evidence, defs, &mut Vec::new())
+        else {
+            return ScalarEvidence::Failed;
+        };
+        ty = selected.resolve_refs_with_defs(defs).as_attr();
+    }
+    let resolver = EnumValueResolver::with_defs(ty, defs);
+    let enum_literal = |result: Result<
+        crate::resource::CanonicalEnumValue,
+        crate::schema::TypeError,
+    >| match result {
+        Ok(value) => ScalarEvidence::Known(InputLiteral::Enum {
+            identity: value.identity().clone(),
+            api_value: value.api_value().into(),
+        }),
+        Err(_) => ScalarEvidence::Failed,
+    };
+    known.visit(
+        |value| match value {
+            KnownView::Bool(value) => ScalarEvidence::Known(InputLiteral::Bool(value)),
+            KnownView::Int(value) => ScalarEvidence::Known(InputLiteral::Int(value)),
+            KnownView::Float(value) => ScalarEvidence::Known(InputLiteral::Float(value)),
+            KnownView::CanonicalEnum(value) => {
+                if resolver.enum_identity().as_ref() != Some(value.identity()) {
+                    return ScalarEvidence::Failed;
+                }
+                enum_literal(resolver.resolve_state_text(value.api_value()))
+            }
+            KnownView::EnumIdentifier(value) => enum_literal(resolver.resolve_raw(value)),
+            KnownView::String(value) => {
+                if ty.enum_parts().is_some() {
+                    enum_literal(resolver.resolve_state_text(value.expose_plaintext()))
+                } else {
+                    ScalarEvidence::Known(InputLiteral::String(value.expose_plaintext().into()))
+                }
+            }
+            KnownView::Duration(_)
+            | KnownView::List(_)
+            | KnownView::StringList(_)
+            | KnownView::Map(_) => ScalarEvidence::Failed,
+        },
+        |_| ScalarEvidence::Failed,
+    )
 }
 
 /// Guard and target equality share this sole canonical scalar comparison.
@@ -951,68 +1163,16 @@ fn scalar_equals(
     literal: &InputLiteral,
     evidence: InputRead<'_>,
 ) -> Truth {
-    use crate::resource::{ConcreteValueRef, EnumValueResolver};
     let evidence = match evidence {
         InputRead::Present(value) => value,
         InputRead::Absent(_) => return Truth::False,
         InputRead::Withheld(_) => return Truth::Pending,
         InputRead::Failed(_) => return Truth::Failed,
     };
-    if evidence.failed() {
-        return Truth::Failed;
-    }
-    if !evidence.known() {
-        return Truth::Pending;
-    }
-    let Some(value) = evidence.source() else {
-        return Truth::Pending;
-    };
-    let ty = literal_type(applicable, path);
-    let resolver =
-        ty.map(|ty| EnumValueResolver::with_defs(ty, applicable.site.schema.as_schema().defs()));
-    let scalar = match value.as_concrete() {
-        Some(ConcreteValueRef::Bool(v)) => InputLiteral::Bool(v),
-        Some(ConcreteValueRef::Int(v)) => InputLiteral::Int(v),
-        Some(ConcreteValueRef::Float(v)) => InputLiteral::Float(v),
-        Some(ConcreteValueRef::CanonicalEnum(v)) => InputLiteral::Enum {
-            identity: v.identity().clone(),
-            api_value: v.api_value().to_owned(),
-        },
-        Some(ConcreteValueRef::EnumIdentifier(v)) => {
-            let Some(resolver) = resolver else {
-                return Truth::Failed;
-            };
-            let Ok(v) = resolver.resolve_raw(v) else {
-                return Truth::Failed;
-            };
-            InputLiteral::Enum {
-                identity: v.identity().clone(),
-                api_value: v.api_value().to_owned(),
-            }
-        }
-        Some(ConcreteValueRef::String(v)) => {
-            if ty.is_some_and(|ty| ty.enum_parts().is_some()) {
-                let Some(resolver) = resolver else {
-                    return Truth::Failed;
-                };
-                let Ok(v) = resolver.resolve_state_text(v.expose_plaintext()) else {
-                    return Truth::Failed;
-                };
-                InputLiteral::Enum {
-                    identity: v.identity().clone(),
-                    api_value: v.api_value().to_owned(),
-                }
-            } else {
-                InputLiteral::String(v.expose_plaintext().to_owned())
-            }
-        }
-        Some(
-            ConcreteValueRef::Duration(_)
-            | ConcreteValueRef::List(_)
-            | ConcreteValueRef::StringList(_)
-            | ConcreteValueRef::Map(_),
-        )
-        | None => return Truth::Failed,
+    let scalar = match scalar_value(applicable, path, &evidence) {
+        ScalarEvidence::Known(scalar) => scalar,
+        ScalarEvidence::Pending => return Truth::Pending,
+        ScalarEvidence::Failed => return Truth::Failed,
     };
     match (&scalar, literal) {
         (InputLiteral::Int(integer), InputLiteral::Float(float))
@@ -1121,12 +1281,22 @@ fn target_verdict(applicable: &BoundInputRule<'_, '_>) -> InputVerdict {
                 return failed_verdict(rule);
             }
             match rule.target() {
-                InputRuleTarget::Value(_) => {
-                    if let Some(text) = known_string(applicable, rule.path(), &value) {
+                InputRuleTarget::Value(_) => match scalar_value(applicable, rule.path(), &value) {
+                    ScalarEvidence::Known(
+                        InputLiteral::String(text)
+                        | InputLiteral::Enum {
+                            api_value: text, ..
+                        },
+                    ) => {
                         return evaluate_string(rule, &text)
                             .map_or_else(InputVerdict::Violation, |()| InputVerdict::Proven);
                     }
-                }
+                    ScalarEvidence::Known(
+                        InputLiteral::Bool(_) | InputLiteral::Int(_) | InputLiteral::Float(_),
+                    )
+                    | ScalarEvidence::Failed => return failed_verdict(rule),
+                    ScalarEvidence::Pending => {}
+                },
                 InputRuleTarget::MapKeys(_) => return map_keys_verdict(applicable, &value),
             }
             value
@@ -1170,30 +1340,6 @@ fn map_keys_verdict(applicable: &BoundInputRule<'_, '_>, evidence: &NodeRef<'_>)
     match remainder {
         InputVerdict::Proven if pending => InputVerdict::Undecided,
         verdict => verdict,
-    }
-}
-
-fn known_string(
-    applicable: &BoundInputRule<'_, '_>,
-    path: &InputPath,
-    value: &NodeRef<'_>,
-) -> Option<String> {
-    use crate::resource::{ConcreteValueRef, EnumValueResolver};
-    if !value.known() {
-        return None;
-    }
-    let value = value.source()?;
-    match value.as_concrete()? {
-        ConcreteValueRef::String(value) => Some(value.expose_plaintext().to_owned()),
-        ConcreteValueRef::CanonicalEnum(value) => Some(value.api_value().to_owned()),
-        ConcreteValueRef::EnumIdentifier(value) => literal_type(applicable, path)
-            .and_then(|ty| {
-                EnumValueResolver::with_defs(ty, applicable.site.schema.as_schema().defs())
-                    .resolve_raw(value)
-                    .ok()
-            })
-            .map(|v| v.api_value().to_owned()),
-        _ => None,
     }
 }
 
@@ -1465,14 +1611,16 @@ pub fn check_authored_inputs(
             }
         };
         if let Some(site) = site {
-            for evaluation in site.evaluated_rules() {
-                report.findings.extend(evaluation.findings);
-                if let Some((path, code)) = evaluation.pending {
-                    report.pending.push(AuthoredPendingInput {
-                        resource_id: resource.id.clone(),
-                        path,
-                        code,
-                    });
+            for outcome in site.evaluate().into_outcomes() {
+                match outcome {
+                    InputEvaluationOutcome::Finding(finding) => report.findings.push(*finding),
+                    InputEvaluationOutcome::Pending { path, code } => {
+                        report.pending.push(AuthoredPendingInput {
+                            resource_id: resource.id.clone(),
+                            path,
+                            code,
+                        })
+                    }
                 }
             }
         }

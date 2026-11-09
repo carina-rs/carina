@@ -297,6 +297,7 @@ impl<'a> AttributeDiagnosticLocations<'a> {
         path: &crate::schema::FieldPath,
     ) -> Option<&'a DeclarationLocation> {
         let mut node = self.elements.diagnostic_index().attribute(name);
+        let mut containing = self.root;
         for (depth, step) in path.steps().iter().enumerate() {
             match node.and_then(|node| node.value(self.elements)) {
                 Some(parent) if !parent.literal_container => {
@@ -307,11 +308,17 @@ impl<'a> AttributeDiagnosticLocations<'a> {
                     });
                 }
                 None if node.is_none_or(|node| node.first_block.is_none()) => {
-                    return Some(self.root);
+                    return Some(containing);
+                }
+                Some(parent) if depth > 0 => {
+                    containing = &parent.location;
                 }
                 Some(_) | None => {}
             }
             node = node.and_then(|node| node.child(step));
+            if node.is_none() {
+                return Some(containing);
+            }
         }
         None
     }

@@ -37,7 +37,7 @@ fn estimate(predicate: InputPredicate<crate::schema::PatternSpec>, value: Value)
     let site = classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
         .unwrap()
         .unwrap();
-    site.applicable_rules().next().unwrap().evaluate()
+    site.applicable_rules().next().unwrap().verdict_for_test()
 }
 
 #[test]
@@ -252,7 +252,7 @@ fn typed_target_estimate(
     let resource =
         Resource::with_provider("mock", "Target", "target", None).with_attribute("name", value);
     let site = authored_fixture_with_types(&resource, &schemas, &types);
-    site.applicable_rules().next().unwrap().evaluate()
+    site.applicable_rules().next().unwrap().verdict_for_test()
 }
 
 fn outcome(verdict: InputVerdict) -> &'static str {
@@ -1123,7 +1123,7 @@ fn estimate_in_context<S>(
     let resource =
         Resource::with_provider("mock", "Target", "target", None).with_attribute("name", value);
     let site = authored_fixture_with_types(&resource, schemas, types);
-    site.applicable_rules().next().unwrap().evaluate()
+    site.applicable_rules().next().unwrap().verdict_for_test()
 }
 
 #[test]
@@ -1434,7 +1434,7 @@ fn estimator_default_tags_are_checked_through_the_host_merge_for_unknown_maps() 
                 .unwrap();
         let site = authored_fixture_with_types(&target, &schemas, &types);
         assert_eq!(
-            outcome(site.applicable_rules().next().unwrap().evaluate()),
+            outcome(site.applicable_rules().next().unwrap().verdict_for_test()),
             expected
         );
     }
@@ -1486,7 +1486,7 @@ fn estimator_deferred_template_uses_retained_literals_and_defers_loop_slots() {
         .unwrap()
         .unwrap();
         assert_eq!(
-            outcome(site.applicable_rules().next().unwrap().evaluate()),
+            outcome(site.applicable_rules().next().unwrap().verdict_for_test()),
             expected
         );
     }
@@ -1607,14 +1607,20 @@ fn estimator_literal_map_keys_use_the_provider_api_spelling() {
             .unwrap()
             .unwrap();
     assert_eq!(
-        outcome(concrete.applicable_rules().next().unwrap().evaluate()),
+        outcome(
+            concrete
+                .applicable_rules()
+                .next()
+                .unwrap()
+                .verdict_for_test()
+        ),
         "violation"
     );
     let site = classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
         .unwrap()
         .unwrap();
     assert_eq!(
-        outcome(site.applicable_rules().next().unwrap().evaluate()),
+        outcome(site.applicable_rules().next().unwrap().verdict_for_test()),
         "violation"
     );
     for (source_key_type, expected) in [
@@ -1658,7 +1664,7 @@ fn estimator_literal_map_keys_use_the_provider_api_spelling() {
             .with_attribute("tags", reference());
         let site = authored_fixture_with_types(&target, &schemas, &types);
         assert_eq!(
-            outcome(site.applicable_rules().next().unwrap().evaluate()),
+            outcome(site.applicable_rules().next().unwrap().verdict_for_test()),
             expected
         );
     }

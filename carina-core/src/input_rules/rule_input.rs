@@ -1045,11 +1045,6 @@ impl<'a> NodeRef<'a> {
     pub(super) fn proof(self) -> Option<&'a Classification<'a, ParserPlaceholder>> {
         self.raw().full_proof.then_some(self.raw().proof.as_ref()?)
     }
-    pub(super) fn source(self) -> Option<&'a InputValue> {
-        self.input
-            .expression(self)
-            .map(|expression| expression.value)
-    }
     pub(super) fn expression(self) -> Option<BoundExpression<'a>> {
         self.input.expression(self)
     }

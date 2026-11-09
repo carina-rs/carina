@@ -42,7 +42,7 @@ fn evaluate_schema(
     schema: &carina_core::schema::ValidatedResourceSchema,
     value: &str,
 ) -> Result<(), carina_core::schema::InputViolation> {
-    use carina_core::{effect::Effect, input_rules::InputVerdict, plan::Plan, resource::*};
+    use carina_core::{effect::Effect, plan::Plan, resource::*};
     let mut registry = carina_core::schema::SchemaRegistry::new();
     registry.insert("mock", schema.clone());
     let resource = Resource::with_provider("mock", "test.Bucket", "example", None)
@@ -55,12 +55,13 @@ fn evaluate_schema(
     let current = std::collections::HashMap::new();
     for site in finalized.write_sites(&registry, &current) {
         let site = site.unwrap();
-        for rule in site.applicable_rules() {
-            match rule.evaluate() {
-                InputVerdict::Proven => {}
-                InputVerdict::Violation(violation) => return Err(violation),
-                InputVerdict::Undecided => panic!("literal fixture must be decidable"),
-            }
+        let evaluation = site.evaluate();
+        assert!(
+            evaluation.pending().is_empty(),
+            "literal fixture must be decidable"
+        );
+        if let Some(finding) = evaluation.findings().first() {
+            return Err(finding.violation().clone());
         }
     }
     Ok(())

@@ -62,7 +62,7 @@ fn evaluate(
         .unwrap()
         .unwrap();
     site.applicable_rules()
-        .map(|rule| rule.evaluate())
+        .flat_map(|rule| rule.test_verdicts())
         .collect()
 }
 
@@ -174,7 +174,7 @@ fn unsent_nested_omissions_remain_withheld_at_plan_and_dispatch() {
             .unwrap()
             .unwrap();
         assert_eq!(
-            site.applicable_rules().next().unwrap().evaluate(),
+            site.applicable_rules().next().unwrap().verdict_for_test(),
             if changed.len() == 1 {
                 InputVerdict::Undecided
             } else {
@@ -366,7 +366,7 @@ fn satisfied_recursive_rule_paths_have_linear_total_segment_work() {
         let (_, segments) = crate::schema::with_field_path_work(|| {
             let verdicts = site
                 .applicable_rules()
-                .map(|rule| rule.evaluate())
+                .flat_map(|rule| rule.test_verdicts())
                 .collect::<Vec<_>>();
             assert_eq!(verdicts, vec![InputVerdict::Proven; depth]);
         });
@@ -770,7 +770,7 @@ fn deferred_template_retains_literal_guard_evidence() {
                     InputWriteContext::DeferredCreate
                 }
             );
-            let verdict = site.applicable_rules().next().unwrap().evaluate();
+            let verdict = site.applicable_rules().next().unwrap().verdict_for_test();
             match expected {
                 "violation" => assert!(
                     matches!(verdict, InputVerdict::Violation(ref v) if v.reason() == InputViolationReason::NoSuffix),
@@ -838,7 +838,7 @@ fn ignored_unsent_guard_does_not_use_unapplied_authored_evidence() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        site.applicable_rules().next().unwrap().evaluate(),
+        site.applicable_rules().next().unwrap().verdict_for_test(),
         InputVerdict::Undecided,
         "the ignored guard is not sent, and its authored false value is not evidence"
     );
@@ -979,7 +979,7 @@ fn failed_string_targets_report_the_same_failure_at_resource_and_struct_scope() 
                 .unwrap();
         let verdicts = authored
             .applicable_rules()
-            .map(|rule| rule.evaluate())
+            .flat_map(|rule| rule.test_verdicts())
             .collect::<Vec<_>>();
         assert_eq!(verdicts.len(), 2);
         for verdict in &verdicts {
@@ -997,7 +997,7 @@ fn failed_string_targets_report_the_same_failure_at_resource_and_struct_scope() 
             .unwrap()
             .unwrap();
         for rule in site.applicable_rules() {
-            assert_failed(&rule.evaluate());
+            assert_failed(&rule.verdict_for_test());
         }
     }
 }
@@ -1081,7 +1081,7 @@ fn ignored_unsent_target_cannot_prove_a_conditional_equality() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        site.applicable_rules().next().unwrap().evaluate(),
+        site.applicable_rules().next().unwrap().verdict_for_test(),
         InputVerdict::Undecided
     );
     let checked = finalized.check_inputs(&schemas, &current).unwrap();
@@ -1116,7 +1116,7 @@ fn pending_unsent_string_target_retains_its_update_obligation_and_row() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        site.applicable_rules().next().unwrap().evaluate(),
+        site.applicable_rules().next().unwrap().verdict_for_test(),
         InputVerdict::Undecided
     );
     let checked = finalized.check_inputs(&schemas, &current).unwrap();
@@ -1754,7 +1754,7 @@ fn default_tag_membership_is_shared_by_presence_predicates_and_conditions() {
         let site = authored_fixture_with_types(&resource, &schemas, &types);
         assert_eq!(
             site.applicable_rules()
-                .map(|r| r.evaluate())
+                .flat_map(|r| r.test_verdicts())
                 .collect::<Vec<_>>(),
             vec![InputVerdict::Undecided]
         );
@@ -1939,7 +1939,7 @@ fn deep_rule_reachability_is_shared_with_a_linear_schema_visit_budget() {
             assert!(instances::has_declarations(&site));
             assert_eq!(
                 site.applicable_rules()
-                    .map(|r| r.evaluate())
+                    .flat_map(|r| r.test_verdicts())
                     .collect::<Vec<_>>(),
                 vec![InputVerdict::Proven]
             );

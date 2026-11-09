@@ -7,6 +7,76 @@ use carina_core::schema::{
 };
 
 #[test]
+fn missing_intermediate_objects_have_cli_lsp_directory_parity_at_the_nearest_parent() {
+    use carina_core::schema::StructField;
+    let schema = ResourceSchema::new("test.Conditional")
+        .attribute(
+            AttributeSchema::optional(
+                "config",
+                AttributeType::struct_(
+                    "Config",
+                    vec![
+                        StructField::optional(
+                            "outer",
+                            AttributeType::struct_(
+                                "Outer",
+                                vec![
+                                    StructField::optional(
+                                        "inner",
+                                        AttributeType::struct_(
+                                            "Inner",
+                                            vec![
+                                                StructField::optional(
+                                                    "target",
+                                                    AttributeType::bool(),
+                                                )
+                                                .build(),
+                                            ],
+                                        ),
+                                    )
+                                    .build(),
+                                ],
+                            ),
+                        )
+                        .build(),
+                    ],
+                ),
+            )
+            .build(),
+        )
+        .input_rule(InputRule::value(
+            InputRuleScope::EveryWrite,
+            InputPath::new("config.outer.inner.target").unwrap(),
+            InputRuleCode::new("test.inner_target").unwrap(),
+            InputPredicate::Present,
+        ));
+    let source = "let example = test.test.Conditional {\n  config = {\n    outer = {}\n  }\n}\n";
+    let fixture = write_fixture(&[
+        ("main.crn", source),
+        ("providers.crn", "provider test {}\n"),
+    ]);
+    let schemas = single_schema_map(schema);
+    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+    let cli = cli
+        .iter()
+        .flat_map(|message| message.lines())
+        .find(|message| message.contains("[test.inner_target]"))
+        .expect("CLI input finding");
+    let diagnostics = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    let findings = diagnostics
+        .iter()
+        .filter(|finding| finding.message == cli)
+        .collect::<Vec<_>>();
+    assert_eq!(findings.len(), 1, "{diagnostics:#?}");
+    assert_eq!(findings[0].severity, Some(DiagnosticSeverity::ERROR));
+    assert_eq!(
+        findings[0].range.start.line, 2,
+        "nearest authored object is outer, not config"
+    );
+    assert_eq!(findings[0].range.start.character, 12);
+}
+
+#[test]
 fn alias_conflicts_preserve_independent_cli_lsp_create_only_warnings() {
     let schema = ResourceSchema::new("test.Conditional")
         .attribute(AttributeSchema::optional("name", AttributeType::string()).build())

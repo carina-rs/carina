@@ -275,16 +275,10 @@ impl WriteCheck {
             .ok_or_else(|| {
                 EffectFailureKind::message("input rule schema unavailable at dispatch")
             })?;
-        for evaluation in site.evaluated_rules() {
-            if let Some(finding) = evaluation.findings.into_iter().next() {
-                return Err(EffectFailureKind::InputRule {
-                    violation: finding.violation().clone(),
-                });
-            }
-            if let Some((path, code)) = evaluation.pending {
-                return Err(EffectFailureKind::UnresolvedInputRule { path, code });
-            }
+        if let Some(failure) = site.evaluate().into_dispatch_failure() {
+            return Err(failure);
         }
+
         Ok(())
     }
 
@@ -713,6 +707,120 @@ mod tests {
     use crate::input_rules::FinalizedPlan;
     use crate::plan::Plan;
     use crate::resource::Value;
+
+    #[test]
+    fn create_and_update_discharge_preserve_every_late_input_finding() {
+        use crate::schema::{
+            AttributeSchema, AttributeType, InputPath, InputPredicate, InputRule, InputRuleCode,
+            InputRuleScope, NonEmptyString, ResourceSchema,
+        };
+        let string =
+            |value: &str| Value::Concrete(crate::resource::ConcreteValue::String(value.into()));
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "",
+            ResourceSchema::new("test")
+                .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+                .input_rule(InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("name").unwrap(),
+                    InputRuleCode::new("name.prefix").unwrap(),
+                    InputPredicate::NoPrefix(NonEmptyString::new("bad-").unwrap()),
+                ))
+                .input_rule(InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("name").unwrap(),
+                    InputRuleCode::new("name.suffix").unwrap(),
+                    InputPredicate::NoSuffix(NonEmptyString::new("-bad").unwrap()),
+                ))
+                .validate()
+                .unwrap(),
+        );
+        let bindings = crate::binding_index::ResolvedBindings::default();
+        let gate = super::super::ModuleConstraintGate::from_live_compositions(&[]);
+        crate::validation::deferred_types::with_session_for_test(
+            &crate::parser::LoadedProviderContext::empty_for_test(),
+            |type_checks| {
+                let context = ProviderPreparationContext::new(
+                    &bindings,
+                    &gate,
+                    &[],
+                    &crate::provider::NoopNormalizer,
+                    &[],
+                    &schemas,
+                    type_checks,
+                );
+                for update in [false, true] {
+                    let resource = crate::resource::Resource::new("test", "example")
+                        .with_attribute("name", string("good"));
+                    let initial = futures::executor::block_on(
+                        super::super::prepare_create_request(resource.clone(), &context),
+                    )
+                    .unwrap();
+                    let from = SnapshotState::existing(
+                        resource.id.clone(),
+                        crate::test_support::snapshot_attributes(HashMap::from([(
+                            "name".into(),
+                            string("old-good"),
+                        )])),
+                    )
+                    .with_identifier("existing");
+                    let mut plan = Plan::<crate::resource::ProviderModuleSource>::default();
+                    plan.add(if update {
+                        Effect::Update {
+                            from: Box::new(from.clone()),
+                            identifier: AppliedIdentifier::new("existing").unwrap(),
+                            to: initial.resource().as_inner().clone(),
+                            changed_attributes: vec!["name".into()],
+                        }
+                    } else {
+                        Effect::Create(initial.resource().as_inner().clone())
+                    });
+                    let checked = FinalizedPlan::new(plan)
+                        .check_inputs(&schemas, &HashMap::new())
+                        .unwrap();
+                    let check = ExecutionInputChecks::new(
+                        checked.execution_input_checks(),
+                        checked.effects(),
+                        &[0],
+                    )
+                    .unwrap()
+                    .take_write(0)
+                    .unwrap();
+                    let late = resource.with_attribute("name", string("bad-name-bad"));
+                    let request = futures::executor::block_on(
+                        super::super::prepare_create_request(late, &context),
+                    )
+                    .unwrap();
+                    let attributes = request.resource().as_resource().resolved_attributes();
+                    let writeback =
+                        SecretPreservingAttributes::from_provider_values(&attributes, &attributes);
+                    let error = if update {
+                        match check.prepare_update(
+                            from,
+                            &["name".into()],
+                            request.resource().clone(),
+                            writeback,
+                            &schemas,
+                        ) {
+                            Err(error) => error,
+                            Ok(_) => panic!("late update must fail"),
+                        }
+                    } else {
+                        match check.prepare_create(request, writeback, &schemas) {
+                            Err(error) => error,
+                            Ok(_) => panic!("late create must fail"),
+                        }
+                    };
+                    let message = error.to_string();
+                    assert!(
+                        message.contains("[name.prefix]") && message.contains("[name.suffix]"),
+                        "update={update}: {message}"
+                    );
+                }
+            },
+        );
+    }
 
     #[test]
     fn input_discharge_invalid_plan_mapping_returns_error_without_panicking() {

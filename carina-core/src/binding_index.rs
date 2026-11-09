@@ -1631,7 +1631,7 @@ pub(crate) fn narrow_type<'a, R: crate::schema::PatternForm>(
             (PathSegment::Field { name }, Shape::Struct { name: struct_name }) => {
                 let fields = crate::schema::struct_fields_with_defs(current, defs)
                     .expect("Shape::Struct must expose struct fields internally");
-                let Some(field) = fields.iter().find(|field| field.name == *name) else {
+                let Some(field) = fields.field(name) else {
                     return Err(RefTypeError::UnknownStructField {
                         path: full_path.to_string(),
                         field: name.clone(),

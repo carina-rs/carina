@@ -130,10 +130,11 @@ impl PatternAttributeType<Draft> {
                 field_groups,
                 input_rules,
             } => {
-                let fields = compile_all(fields, |field| {
-                    let field_location = location.with_suffix(format_args!(".{}", field.name));
-                    field.compile_patterns(field_location, issues)
-                });
+                let fields: Option<super::IndexedStructFields<Compiled>> =
+                    compile_all(fields, |field| {
+                        let field_location = location.with_suffix(format_args!(".{}", field.name));
+                        field.compile_patterns(field_location, issues)
+                    });
                 let input_rules =
                     compile_all(input_rules.into_iter().enumerate(), |(index, rule)| {
                         rule.compile_patterns(

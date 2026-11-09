@@ -695,7 +695,11 @@ A struct type represents a nested object with typed fields.
   scalar literals, enum identity and canonical membership, predicate compatibility,
   duplicate target/code pairs, and a condition depth limit of 16. The one evaluator
   uses runtime knowledge for presence and equality; unknown guards remain pending,
-  including under negation. Each write site owns one immutable `RuleInput`,
+  including under negation. Equality and string predicates share typed scalar
+  extraction: enum aliases use canonical API values, and invalid known values
+  remain failures. Public binding and site evaluation return complete typed
+  findings and pending obligations; only the private single-rule evaluator
+  returns a verdict. Dispatch retains every established finding. Each write site owns one immutable `RuleInput`,
   constructed only at authored, plan or protected dispatch stage boundaries.
   Authored checks require immutable parser/admission-minted `AuthoredInputs`;
   mutating public AST fields cannot reseal their snapshot. Every successful module
@@ -704,7 +708,8 @@ A struct type represents a nested object with typed fields.
   explicit error, never an empty successful report. Authored reports retain each
   resource's preparation errors alongside findings and pending obligations;
   consumers exhaustively render their typed outcomes. Schema fields are read literally
-  through compiled declarations; only declared rule paths use `InputPath` parsing.
+  through immutable ordered declarations with a shared name index; ordinary
+  validation, aliases and rule metadata use that index. Only declared rule paths use `InputPath` parsing.
   Guards, targets,
   instance enumeration and bound-expression estimation share the graph and
   ignore policy. Classification and diagnostic protection travel together on
@@ -714,9 +719,11 @@ A struct type represents a nested object with typed fields.
   Owner prefixes are shared, and diagnostic paths are materialized only for
   findings or pending results, which are then sorted. The shared validator also
   shares path prefixes; published diagnostic keys have immutable concrete storage.
-  Diagnostic identity and ordering use structured segments; literal field names
+  Diagnostic identity and ordering use structured segments; protected map keys
+  retain opaque instance ordinals and redact only their presentation. Literal field names
   are quoted when needed. Parser-owned locations share one structured index,
-  invalidated only by their owning mutation methods. Dispatch secret restoration
+  invalidated only by their owning mutation methods, and missing intermediate
+  objects retain the deepest authored containing location. Dispatch secret restoration
   establishes plaintext correspondence once and carries paired child cursors.
   Only complete replacement nodes and
   explicit removals prove absence; unsent omissions remain withheld at every

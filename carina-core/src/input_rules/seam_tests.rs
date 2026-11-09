@@ -20,6 +20,322 @@ fn registry(schema: ResourceSchema) -> SchemaRegistry {
 }
 
 #[test]
+fn missing_intermediate_target_uses_the_deepest_authored_object_location() {
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(
+                AttributeSchema::optional(
+                    "config",
+                    AttributeType::struct_(
+                        "Config",
+                        vec![
+                            StructField::optional(
+                                "outer",
+                                AttributeType::struct_(
+                                    "Outer",
+                                    vec![
+                                        StructField::optional(
+                                            "inner",
+                                            AttributeType::struct_(
+                                                "Inner",
+                                                vec![
+                                                    StructField::optional(
+                                                        "target",
+                                                        AttributeType::bool(),
+                                                    )
+                                                    .build(),
+                                                ],
+                                            ),
+                                        )
+                                        .build(),
+                                    ],
+                                ),
+                            )
+                            .build(),
+                        ],
+                    ),
+                )
+                .build(),
+            )
+            .input_rule(InputRule::value(
+                InputRuleScope::EveryWrite,
+                InputPath::new("config.outer.inner.target").unwrap(),
+                InputRuleCode::new("inner.target").unwrap(),
+                InputPredicate::Present,
+            )),
+    );
+    let parsed = crate::parser::parse_file(
+        "let example = mock.Review {\n config = {\n  outer = {}\n }\n}\n",
+        std::path::Path::new("main.crn"),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let tree = crate::parser::AnalysisTree::try_from_file(&parsed).unwrap();
+    let expected = tree.resources().next().unwrap().attribute_value_location(
+        "config",
+        &crate::schema::FieldPath::new().push_field("outer"),
+    );
+    let report = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas);
+    assert_eq!(report.findings().len(), 1);
+    assert_eq!(report.findings()[0].authored_location(), Some(expected));
+}
+
+fn enum_string_predicate_verdicts(text: &str) -> Vec<InputVerdict> {
+    let identity = crate::schema::TypeIdentity::new(Some("mock"), ["Review"], "Namespace");
+    let ty = AttributeType::enum_(
+        identity,
+        Some(vec!["global".into(), "account-regional".into()]),
+        vec![("account-regional".into(), "account_regional".into())],
+        None,
+        None,
+    );
+    let rule = || {
+        InputRule::value(
+            InputRuleScope::EveryWrite,
+            InputPath::new("namespace").unwrap(),
+            InputRuleCode::new("namespace.suffix").unwrap(),
+            InputPredicate::NoSuffix(crate::schema::NonEmptyString::new("_regional").unwrap()),
+        )
+    };
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("namespace", ty.clone()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "settings",
+                    AttributeType::struct_with_rules(
+                        "Settings",
+                        vec![StructField::optional("namespace", ty).build()],
+                        vec![],
+                        vec![rule()],
+                    ),
+                )
+                .build(),
+            )
+            .input_rule(rule()),
+    );
+    let resource = Resource::with_provider("mock", "Review", "example", None)
+        .with_attribute("namespace", self::text(text))
+        .with_attribute("settings", object([("namespace", self::text(text))]));
+    let site = classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+        .unwrap()
+        .unwrap();
+    site.applicable_rules()
+        .flat_map(|rule| rule.test_verdicts())
+        .collect()
+}
+
+#[test]
+fn enum_alias_strings_use_api_values_for_string_predicates_at_every_owner() {
+    for spelling in ["account-regional", "account_regional"] {
+        assert_eq!(
+            enum_string_predicate_verdicts(spelling),
+            vec![InputVerdict::Proven; 2],
+            "{spelling}"
+        );
+    }
+}
+
+#[test]
+fn invalid_enum_strings_fail_string_predicates_at_every_owner() {
+    let verdicts = enum_string_predicate_verdicts("private-nonmember");
+    assert_eq!(verdicts.len(), 2);
+    for verdict in verdicts {
+        assert!(
+            matches!(verdict, InputVerdict::Violation(ref finding) if finding.reason() == crate::schema::InputViolationReason::EvaluationFailed),
+            "{verdict:?}"
+        );
+    }
+}
+
+#[test]
+fn public_evaluator_retains_all_failed_instance_findings_and_kinds() {
+    let rule = |scope, target| {
+        InputRule::value(
+            scope,
+            InputPath::new(target).unwrap(),
+            InputRuleCode::new(format!("required.{target}")).unwrap(),
+            InputPredicate::Present,
+        )
+    };
+    let schemas = registry(
+        ResourceSchema::new("Review").attribute(
+            AttributeSchema::optional(
+                "settings",
+                AttributeType::struct_with_rules(
+                    "Settings",
+                    vec![
+                        StructField::optional("preview", AttributeType::bool()).build(),
+                        StructField::optional("write", AttributeType::bool()).build(),
+                    ],
+                    vec![],
+                    vec![
+                        rule(InputRuleScope::CreateOnly, "preview"),
+                        rule(InputRuleScope::EveryWrite, "write"),
+                    ],
+                ),
+            )
+            .build(),
+        ),
+    );
+    let failed = Value::Deferred(DeferredValue::Unavailable {
+        name: crate::builtins::BuiltinFunction::env,
+        args: vec![],
+        reason: crate::resource::UnavailableReason::from_builtin_error(
+            "private failed instance".into(),
+        ),
+        source_line: Default::default(),
+    });
+    let resource = Resource::with_provider("mock", "Review", "example", None)
+        .with_attribute("settings", failed);
+    let site = classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+        .unwrap()
+        .unwrap();
+    let evaluation = site.evaluate();
+    assert_eq!(
+        evaluation.findings().len(),
+        2,
+        "public evaluation must keep both independent findings"
+    );
+    assert!(evaluation.pending().is_empty());
+    assert!(!evaluation.is_proven());
+    assert_eq!(
+        evaluation.findings()[0].kind,
+        InputFindingKind::CreateOnlyPreview
+    );
+    assert_eq!(evaluation.findings()[1].kind, InputFindingKind::Violation);
+    assert_eq!(
+        evaluation.findings()[0].severity(),
+        InputFindingSeverity::Warning
+    );
+    assert_eq!(
+        evaluation.findings()[1].severity(),
+        InputFindingSeverity::Error
+    );
+    assert!(
+        evaluation
+            .findings()
+            .iter()
+            .all(|finding| finding.violation().reason()
+                == crate::schema::InputViolationReason::EvaluationFailed)
+    );
+}
+
+#[test]
+fn wide_struct_rules_have_a_linear_declaration_lookup_budget() {
+    const FIELDS: usize = 256;
+    const INSTANCES: usize = 4;
+    let fields = (0..FIELDS)
+        .map(|index| StructField::optional(format!("field_{index}"), AttributeType::bool()).build())
+        .collect();
+    let rules = (0..FIELDS)
+        .map(|index| {
+            let path = InputPath::new(format!("field_{index}")).unwrap();
+            InputRule::value(
+                InputRuleScope::EveryWrite,
+                path.clone(),
+                InputRuleCode::new(format!("field.rule_{index}")).unwrap(),
+                InputPredicate::Equals(InputLiteral::Bool(true)),
+            )
+            .with_condition(InputCondition::Equals {
+                path,
+                literal: InputLiteral::Bool(true),
+            })
+        })
+        .collect();
+    let schemas = registry(
+        ResourceSchema::new("Review").attribute(
+            AttributeSchema::optional(
+                "items",
+                AttributeType::list(AttributeType::struct_with_rules(
+                    "Wide",
+                    fields,
+                    vec![],
+                    rules,
+                )),
+            )
+            .build(),
+        ),
+    );
+    let item = Value::Concrete(ConcreteValue::Map(
+        (0..FIELDS)
+            .map(|index| {
+                (
+                    format!("field_{index}"),
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                )
+            })
+            .collect(),
+    ));
+    let resource = Resource::with_provider("mock", "Review", "example", None).with_attribute(
+        "items",
+        Value::Concrete(ConcreteValue::List(vec![item; INSTANCES])),
+    );
+    DECLARATION_LOOKUP_WORK.set(Some(0));
+    let site = classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+        .unwrap()
+        .unwrap();
+    let outcomes = site
+        .applicable_rules()
+        .flat_map(|rule| rule.test_verdicts())
+        .collect::<Vec<_>>();
+    let work = DECLARATION_LOOKUP_WORK.replace(None).unwrap();
+    assert_eq!(outcomes, vec![InputVerdict::Proven; FIELDS * INSTANCES]);
+    assert!(
+        work <= FIELDS * INSTANCES * 8,
+        "{work} declaration comparisons for {FIELDS} fields across {INSTANCES} instances"
+    );
+}
+
+#[test]
+fn protected_map_instances_keep_distinct_pending_path_identity() {
+    let local = AttributeType::struct_with_rules(
+        "Object",
+        vec![StructField::optional("target", AttributeType::bool()).build()],
+        vec![],
+        vec![InputRule::value(
+            InputRuleScope::EveryWrite,
+            InputPath::new("target").unwrap(),
+            InputRuleCode::new("object.target").unwrap(),
+            InputPredicate::Equals(InputLiteral::Bool(true)),
+        )],
+    );
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("objects", AttributeType::map(local)).build()),
+    );
+    let pending = || {
+        Value::Deferred(DeferredValue::Unknown(
+            crate::resource::ApplyTimeUnknown::PendingReRead(
+                crate::resource::PendingReRead::not_found(),
+            ),
+        ))
+    };
+    let objects = object([
+        ("private-key-one", object([("target", pending())])),
+        ("private-key-two", object([("target", pending())])),
+    ])
+    .into_secret();
+    let resource = Resource::with_provider("mock", "Review", "example", None)
+        .with_attribute("objects", objects);
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(
+        crate::resource::ResolvedResource::resolve_raw_fixture(resource, &schemas).unwrap(),
+    ));
+    let checked = FinalizedPlan::new(plan)
+        .check_inputs(&schemas, &HashMap::new())
+        .unwrap();
+    let rows = checked.pending_rows(0);
+    assert_eq!(
+        rows.len(),
+        2,
+        "redaction must preserve distinct instance identities"
+    );
+    let rendered = format!("{rows:?}");
+    assert!(!rendered.contains("private-key"), "{rendered}");
+}
+
+#[test]
 fn alias_preparation_errors_preserve_independent_findings_and_pending() {
     let schemas = registry(
         ResourceSchema::new("Review")
@@ -126,7 +442,7 @@ fn literal_dotted_fields_keep_distinct_diagnostics_and_pending_rows() {
         .unwrap();
     let paths = site
         .applicable_rules()
-        .map(|rule| rule.evaluation().pending.unwrap().0)
+        .map(|rule| rule.evaluate().pending.into_iter().next().unwrap().0)
         .collect::<Vec<_>>();
     assert_eq!(paths.len(), 2);
     assert_ne!(paths[0], paths[1]);
@@ -479,7 +795,7 @@ fn nested_secret_containers_protect_instantiated_map_keys() {
                 .unwrap();
         let findings = site
             .applicable_rules()
-            .flat_map(|rule| rule.evaluation().findings)
+            .flat_map(|rule| rule.evaluate().findings)
             .collect::<Vec<_>>();
         assert_eq!(findings.len(), 1);
         let text = format!("{} {findings:?}", findings[0]);
@@ -547,7 +863,7 @@ fn guarded_tag_keys(ignored: bool) -> InputVerdict {
         .next()
         .unwrap()
         .unwrap();
-    site.applicable_rules().next().unwrap().evaluate()
+    site.applicable_rules().next().unwrap().verdict_for_test()
 }
 
 #[test]
@@ -596,13 +912,13 @@ fn satisfied_recursive_rules_have_linear_path_work() {
     let (_, segments) = crate::schema::with_field_path_work(|| {
         let results = site
             .applicable_rules()
-            .map(|rule| rule.evaluation())
+            .map(|rule| rule.evaluate())
             .collect::<Vec<_>>();
         assert_eq!(results.len(), COUNT);
         assert!(
             results
                 .iter()
-                .all(|result| result.findings.is_empty() && result.pending.is_none())
+                .all(|result| result.findings.is_empty() && result.pending.is_empty())
         );
     });
     assert!(
@@ -894,7 +1210,10 @@ fn withheld_nested_map_keys_cannot_inspect_the_ancestor_expression() {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(site.applicable_rules().next().unwrap().evaluate(), expected);
+        assert_eq!(
+            site.applicable_rules().next().unwrap().verdict_for_test(),
+            expected
+        );
     }
 }
 
@@ -951,7 +1270,7 @@ fn recursive_union_binding_has_linear_path_work_for_every_container() {
             let site = classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
                 .unwrap().unwrap();
             let (_, segments) = crate::schema::with_field_path_work(|| {
-                let results = site.applicable_rules().map(|rule| rule.evaluate()).collect::<Vec<_>>();
+                let results = site.applicable_rules().flat_map(|rule| rule.test_verdicts()).collect::<Vec<_>>();
                 assert_eq!(results, vec![InputVerdict::Proven; COUNT]);
             });
             assert!(segments <= COUNT * 16,

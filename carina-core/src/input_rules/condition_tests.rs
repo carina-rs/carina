@@ -272,7 +272,7 @@ fn failed_guard_is_a_failure_even_under_negation_and_after_authored_projection()
         )
         .unwrap()
         .unwrap();
-        let verdict = site.applicable_rules().next().unwrap().evaluate();
+        let verdict = site.applicable_rules().next().unwrap().verdict_for_test();
         assert!(
             matches!(&verdict,InputVerdict::Violation(v) if v.reason() == crate::schema::InputViolationReason::EvaluationFailed)
         );
@@ -356,7 +356,7 @@ fn update_guard_cannot_use_an_ignored_leaf_copied_from_observation() {
         .unwrap()
         .unwrap();
     assert_eq!(
-        site.applicable_rules().next().unwrap().evaluate(),
+        site.applicable_rules().next().unwrap().verdict_for_test(),
         InputVerdict::Undecided
     );
 }

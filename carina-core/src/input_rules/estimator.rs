@@ -452,8 +452,7 @@ fn path_may_be_absent<'a>(
                     return true;
                 };
                 if fields
-                    .iter()
-                    .find(|field| field.name == *name)
+                    .field(name)
                     .is_none_or(|field| field.parts().declared_input_mode == InputMode::Optional)
                 {
                     return true;

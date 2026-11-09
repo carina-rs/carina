@@ -269,35 +269,95 @@ impl fmt::Display for InputCondition {
 /// An instantiated diagnostic location; declaration paths remain wildcard-free.
 #[derive(Debug, Clone)]
 pub struct InputDiagnosticPath(Box<InputDiagnosticPathData>);
+
+#[derive(Debug, Clone)]
+pub(crate) enum InputDiagnosticKey {
+    Public(String),
+    // The ordinal is local to its structured owner prefix, not a rendering
+    // of the secret key. No plaintext leaves the protected evidence graph.
+    Protected { ordinal: usize },
+}
+
+pub(crate) enum InputDiagnosticSegment {
+    Field(String),
+    Index(usize),
+    Key(InputDiagnosticKey),
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum DiagnosticIdentity<'a> {
+    Field(&'a str),
+    Index(usize),
+    PublicKey(&'a crate::resource::ValueString),
+    ProtectedKey(usize),
+}
+
 #[derive(Debug, Clone)]
 struct InputDiagnosticPathData {
     rendered: String,
     root: String,
     relative: super::ConcreteFieldPath,
+    protected: Box<[(usize, usize)]>,
 }
 impl InputDiagnosticPath {
+    #[cfg(test)]
     pub(crate) fn new(root: String, relative: super::FieldPath) -> Self {
+        Self::from_segments(
+            root,
+            relative
+                .canonical()
+                .segments()
+                .iter()
+                .map(|segment| match segment {
+                    super::LeafPathSegment::StructField(name) => {
+                        InputDiagnosticSegment::Field(name.clone())
+                    }
+                    super::LeafPathSegment::ListIndex(index) => {
+                        InputDiagnosticSegment::Index(*index)
+                    }
+                    super::LeafPathSegment::MapKey(key) => {
+                        InputDiagnosticSegment::Key(InputDiagnosticKey::Public(
+                            key.diagnostic_literal().expect("public fixture key").into(),
+                        ))
+                    }
+                }),
+        )
+    }
+    pub(crate) fn from_segments(
+        root: String,
+        segments: impl IntoIterator<Item = InputDiagnosticSegment>,
+    ) -> Self {
         use std::fmt::Write;
-        let relative = relative.into_concrete();
         let mut rendered = String::new();
+        let mut relative = super::FieldPath::new();
+        let mut protected = Vec::new();
         super::write_path_field(&mut rendered, &root, false).expect("write String");
-        for segment in relative.canonical() {
+        for (position, segment) in segments.into_iter().enumerate() {
             match segment {
-                super::LeafPathSegment::StructField(name) => {
-                    super::write_path_field(&mut rendered, name, true).expect("write String")
+                InputDiagnosticSegment::Field(name) => {
+                    super::write_path_field(&mut rendered, &name, true).expect("write String");
+                    relative = relative.push_field(name);
                 }
-                super::LeafPathSegment::ListIndex(index) => {
-                    write!(rendered, "[{index}]").expect("write String")
+                InputDiagnosticSegment::Index(index) => {
+                    write!(rendered, "[{index}]").expect("write String");
+                    relative = relative.push_index(index);
                 }
-                super::LeafPathSegment::MapKey(key) => {
-                    write!(rendered, "[{key:?}]").expect("write String")
+                InputDiagnosticSegment::Key(InputDiagnosticKey::Public(key)) => {
+                    write!(rendered, "[{key:?}]").expect("write String");
+                    relative = relative.push_map_key(key);
+                }
+                InputDiagnosticSegment::Key(InputDiagnosticKey::Protected { ordinal }) => {
+                    rendered.push_str("[\"<secret>\"]");
+                    protected.push((position, ordinal));
+                    relative = relative.push_protected_map_key();
                 }
             }
         }
         Self(Box::new(InputDiagnosticPathData {
             rendered,
             root,
-            relative,
+            relative: relative.into_concrete(),
+            protected: protected.into_boxed_slice(),
         }))
     }
     pub fn as_str(&self) -> &str {
@@ -309,14 +369,34 @@ impl InputDiagnosticPath {
     pub fn relative(&self) -> super::FieldPath {
         self.0.relative.as_field_path()
     }
+    fn identity(&self) -> impl Iterator<Item = DiagnosticIdentity<'_>> {
+        let mut next_protected = 0;
+        self.0
+            .relative
+            .canonical()
+            .iter()
+            .enumerate()
+            .map(move |(position, segment)| {
+                if let Some(&(index, ordinal)) = self.0.protected.get(next_protected)
+                    && index == position
+                {
+                    next_protected += 1;
+                    return DiagnosticIdentity::ProtectedKey(ordinal);
+                }
+                match segment {
+                    super::LeafPathSegment::StructField(name) => DiagnosticIdentity::Field(name),
+                    super::LeafPathSegment::ListIndex(index) => DiagnosticIdentity::Index(*index),
+                    super::LeafPathSegment::MapKey(key) => DiagnosticIdentity::PublicKey(key),
+                }
+            })
+    }
 }
 impl PartialEq for InputDiagnosticPath {
     fn eq(&self, other: &Self) -> bool {
-        self.0.root == other.0.root && self.0.relative == other.0.relative
+        self.0.root == other.0.root && self.identity().eq(other.identity())
     }
 }
 impl Eq for InputDiagnosticPath {}
-
 impl PartialOrd for InputDiagnosticPath {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -324,8 +404,10 @@ impl PartialOrd for InputDiagnosticPath {
 }
 impl Ord for InputDiagnosticPath {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.0.root.as_str(), self.0.relative.canonical())
-            .cmp(&(other.0.root.as_str(), other.0.relative.canonical()))
+        self.0
+            .root
+            .cmp(&other.0.root)
+            .then_with(|| self.identity().cmp(other.identity()))
     }
 }
 impl fmt::Display for InputDiagnosticPath {
@@ -341,8 +423,10 @@ impl From<InputPath> for InputDiagnosticPath {
     fn from(path: InputPath) -> Self {
         let mut parts = path.segments();
         let root = parts.next().expect("admitted path has a root").to_owned();
-        let relative = parts.fold(super::FieldPath::new(), |p, s| p.push_field(s));
-        Self::new(root, relative)
+        Self::from_segments(
+            root,
+            parts.map(|part| InputDiagnosticSegment::Field(part.into())),
+        )
     }
 }
 
@@ -680,10 +764,7 @@ pub(super) fn validate_rule_collection<'a, R: PatternForm>(
             let AttrTypeKind::Struct { fields, .. } = &ty.kind else {
                 return Err(InputRuleError::UnknownPath);
             };
-            let field = fields
-                .iter()
-                .find(|f| f.name == segment)
-                .ok_or(InputRuleError::UnknownPath)?;
+            let field = fields.field(segment).ok_or(InputRuleError::UnknownPath)?;
             populated |= field.declared_input_mode.is_provider_populated();
             ty = &field.field_type;
         }

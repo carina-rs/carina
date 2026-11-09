@@ -1,14 +1,14 @@
 //! Bind admitted declarations to existing object instances. No predicates are
 //! evaluated here; every instance goes through ApplicableInputRule::evaluate.
 use super::*;
-use crate::resource::{DiagnosticScope, ValueString};
+use crate::resource::DiagnosticScope;
 use crate::schema::AttrTypeKind;
 
 #[derive(Debug, Clone)]
 pub(super) enum Step {
     Field(String),
     Index(usize),
-    Key(ValueString),
+    Key(crate::schema::InputDiagnosticKey),
 }
 
 /// Shared immutable prefixes cost one segment per traversed edge. Binding a
@@ -62,15 +62,14 @@ pub(super) fn diagnostic_path(owner: &OwnerPath, path: &InputPath) -> InputDiagn
     let Some(Step::Field(root)) = steps.next() else {
         unreachable!("instance starts at a resource attribute");
     };
-    let relative =
-        crate::schema::FieldPath::from_canonical_segments(steps.map(|step| match step {
-            Step::Field(name) => crate::schema::LeafPathSegment::StructField(name),
-            Step::Index(index) => crate::schema::LeafPathSegment::ListIndex(index),
-            Step::Key(key) => crate::schema::LeafPathSegment::MapKey(ValueString::plain(
-                key.diagnostic_literal().unwrap_or("<secret>"),
-            )),
-        }));
-    InputDiagnosticPath::new(root, relative)
+    InputDiagnosticPath::from_segments(
+        root,
+        steps.map(|step| match step {
+            Step::Field(name) => crate::schema::InputDiagnosticSegment::Field(name),
+            Step::Index(index) => crate::schema::InputDiagnosticSegment::Index(index),
+            Step::Key(key) => crate::schema::InputDiagnosticSegment::Key(key),
+        }),
+    )
 }
 
 fn active(site: &WriteSite<'_>, owner: &OwnerPath, rule: &InputRule<Compiled>) -> bool {
@@ -131,7 +130,7 @@ fn bind<'s, 'a>(
 
 pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRule<'s, 'a>> {
     let mut instances = Vec::new();
-    let mut fits = super::union_fits::UnionFits::default();
+    let mut fits = site.union_fits.borrow_mut();
     for &rule in &site.rules {
         instances.extend(
             bind(
@@ -306,11 +305,11 @@ fn walk<'s, 'a>(
             value: value_type, ..
         } => {
             if let Some(fields) = value.node(&site.input).and_then(NodeRef::fields) {
-                for (key, value) in fields {
+                for (ordinal, (key, value)) in fields.into_iter().enumerate() {
                     owner.push(Step::Key(if scope.is_secret() {
-                        ValueString::diagnostic_sensitive(key)
+                        crate::schema::InputDiagnosticKey::Protected { ordinal }
                     } else {
-                        ValueString::plain(key)
+                        crate::schema::InputDiagnosticKey::Public(key.into())
                     }));
                     walk(
                         site,
