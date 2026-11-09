@@ -503,8 +503,7 @@ fn ignored_unsent_guard_does_not_use_unapplied_authored_evidence() {
             .unwrap();
     site.context = InputWriteContext::Update;
     let mut update = UpdateInputContext {
-        desired: resource.attributes.clone(),
-        projected: IndexMap::new(),
+        desired: project_attributes(&resource.attributes),
         changed: HashSet::new(),
         removed: HashSet::new(),
         ignored: ResolvedIgnoreChanges::indexed_for_test(
@@ -513,12 +512,12 @@ fn ignored_unsent_guard_does_not_use_unapplied_authored_evidence() {
             ParsedIgnorePath::new(vec![ParsedIgnorePathSegment::Attribute("guard".into())]),
         ),
     };
-    update.overlay(&crate::provider::UpdatePatch {
+    site.attributes = Some(Cow::Owned(update.overlay(&crate::provider::UpdatePatch {
         ops: vec![crate::provider::PatchOp::Replace {
             key: "target".into(),
             value: resource.attributes["target"].clone(),
         }],
-    });
+    })));
     site.update = Some(update);
     assert_eq!(
         site.applicable_rules().next().unwrap().evaluate(),
@@ -682,4 +681,388 @@ fn failed_string_targets_report_the_same_failure_at_resource_and_struct_scope() 
             assert_failed(&rule.evaluate());
         }
     }
+}
+
+fn guard_only_update(
+    schemas: &SchemaRegistry,
+    target: Value,
+    ignored_target: bool,
+) -> FinalizedPlan {
+    let mut resource = Resource::with_provider("mock", "Review", "example", None)
+        .with_attribute("guard", Value::Concrete(ConcreteValue::Bool(true)))
+        .with_attribute("target", target);
+    if ignored_target {
+        resource.directives.ignore_changes = vec![crate::resource::ParsedIgnorePath::new(vec![
+            crate::resource::ParsedIgnorePathSegment::Attribute("target".into()),
+        ])];
+    }
+    let previous = crate::resource::State::existing(
+        resource.id.clone(),
+        crate::test_support::snapshot_attributes::<crate::resource::NoPlaceholder>(HashMap::from(
+            [
+                ("guard".into(), Value::Concrete(ConcreteValue::Bool(false))),
+                (
+                    "target".into(),
+                    Value::Concrete(ConcreteValue::String("other".into())),
+                ),
+            ],
+        )),
+    )
+    .with_identifier("existing");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(previous),
+        identifier: crate::provider::AppliedIdentifier::new("existing").unwrap(),
+        to: resolved_input_fixture(resource, schemas),
+        changed_attributes: vec!["guard".into()],
+    });
+    FinalizedPlan::new(plan)
+}
+
+fn resolved_input_fixture(
+    resource: Resource,
+    schemas: &SchemaRegistry,
+) -> crate::resource::ResolvedResource {
+    let mut producer = Resource::with_provider("mock", "Review", "producer", None);
+    producer.binding = Some(crate::resource::absolute_binding_address_for_test(
+        "producer",
+    ));
+    let index = crate::resolved_graph::ExpandedBindingIndex::for_test_resources(&[
+        producer,
+        resource.clone(),
+    ])
+    .unwrap();
+    index.resolve_resource(resource, schemas).unwrap()
+}
+
+#[test]
+fn ignored_unsent_target_cannot_prove_a_conditional_equality() {
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .input_rule(rule(
+                "target",
+                InputPredicate::Equals(InputLiteral::String("required".into())),
+                InputCondition::Equals {
+                    path: path("guard"),
+                    literal: InputLiteral::Bool(true),
+                },
+            )),
+    );
+    let finalized = guard_only_update(
+        &schemas,
+        Value::Concrete(ConcreteValue::String("required".into())),
+        true,
+    );
+    let current = HashMap::new();
+    let site = finalized
+        .write_sites(&schemas, &current)
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        site.applicable_rules().next().unwrap().evaluate(),
+        InputVerdict::Undecided
+    );
+    let checked = finalized.check_inputs(&schemas, &current).unwrap();
+    assert_eq!(checked.pending_inputs().len(), 1);
+    assert_eq!(checked.pending_rows(0).len(), 1);
+}
+
+#[test]
+fn pending_unsent_string_target_retains_its_update_obligation_and_row() {
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .input_rule(rule(
+                "target",
+                InputPredicate::NoSuffix(crate::schema::NonEmptyString::new(".fifo").unwrap()),
+                InputCondition::Equals {
+                    path: path("guard"),
+                    literal: InputLiteral::Bool(true),
+                },
+            )),
+    );
+    let finalized = guard_only_update(
+        &schemas,
+        Value::root_resource_ref("producer", "name", vec![]),
+        false,
+    );
+    let current = HashMap::new();
+    let site = finalized
+        .write_sites(&schemas, &current)
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        site.applicable_rules().next().unwrap().evaluate(),
+        InputVerdict::Undecided
+    );
+    let checked = finalized.check_inputs(&schemas, &current).unwrap();
+    assert_eq!(checked.pending_inputs().len(), 1);
+    assert_eq!(checked.pending_rows(0).len(), 1);
+}
+
+#[test]
+fn conditional_suffix_estimation_is_shared_by_every_object_instance() {
+    let local_rule = || {
+        rule(
+            "name",
+            InputPredicate::NoSuffix(crate::schema::NonEmptyString::new(".fifo").unwrap()),
+            InputCondition::Equals {
+                path: path("guard"),
+                literal: InputLiteral::Bool(true),
+            },
+        )
+    };
+    let fields = || {
+        vec![
+            StructField::optional("guard", AttributeType::bool()).build(),
+            StructField::optional("name", AttributeType::string()).build(),
+        ]
+    };
+    let mut node_fields = fields();
+    node_fields.push(StructField::optional("child", AttributeType::ref_("Node")).build());
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .with_def(
+                "Config",
+                AttributeType::struct_with_rules("Config", fields(), vec![], vec![local_rule()]),
+            )
+            .with_def(
+                "Node",
+                AttributeType::struct_with_rules("Node", node_fields, vec![], vec![local_rule()]),
+            )
+            .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("config", AttributeType::ref_("Config")).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "items",
+                    AttributeType::list(AttributeType::ref_("Config")),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "by_name",
+                    AttributeType::map(AttributeType::ref_("Config")),
+                )
+                .build(),
+            )
+            .attribute(AttributeSchema::optional("node", AttributeType::ref_("Node")).build())
+            .input_rule(local_rule()),
+    );
+    for secret in [false, true] {
+        let expression = Value::Deferred(DeferredValue::Interpolation(vec![
+            crate::resource::InterpolationPart::Expr(Value::root_resource_ref(
+                "producer",
+                "name",
+                vec![],
+            )),
+            crate::resource::InterpolationPart::Literal(".fifo".into()),
+        ]));
+        let expression = if secret {
+            expression.into_secret()
+        } else {
+            expression
+        };
+        let instance = || {
+            object([
+                ("guard", Value::Concrete(ConcreteValue::Bool(true))),
+                ("name", expression.clone()),
+            ])
+        };
+        let fields = [
+            ("guard", Value::Concrete(ConcreteValue::Bool(true))),
+            ("name", expression.clone()),
+            ("config", instance()),
+            (
+                "items",
+                Value::Concrete(ConcreteValue::List(vec![instance()])),
+            ),
+            ("by_name", object([("entry", instance())])),
+            ("node", object([("child", instance())])),
+        ];
+        let verdicts = evaluate(&schemas, fields.clone());
+        let mut paths = verdicts
+            .iter()
+            .filter_map(|verdict| match verdict {
+                InputVerdict::Violation(violation)
+                    if violation.reason() == InputViolationReason::NoSuffix =>
+                {
+                    Some(violation.path().as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "by_name[\"entry\"].name",
+                "config.name",
+                "items[0].name",
+                "name",
+                "node.child.name"
+            ],
+            "{verdicts:?}"
+        );
+        let mut resource = Resource::with_provider("mock", "Review", "example", None);
+        resource.attributes = fields
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value))
+            .collect();
+        let mut file = crate::parser::ExpandedInferredFile::default();
+        file.resources.push(resource.clone()); // allow: direct — input-rule preview fixture
+        let report = check_authored_inputs(&file, &schemas).unwrap();
+        assert_eq!(report.len(), 5);
+        assert!(report.pending().is_empty());
+        assert!(
+            report
+                .iter()
+                .all(|finding| finding.severity() == InputFindingSeverity::Error)
+        );
+        let mut plan = Plan::new();
+        plan.add(Effect::Create(resolved_input_fixture(resource, &schemas)));
+        let rejected = FinalizedPlan::new(plan)
+            .check_inputs(&schemas, &HashMap::new())
+            .unwrap_err();
+        assert_eq!(rejected.errors().len(), 5);
+    }
+}
+
+#[test]
+fn preview_preserves_substitution_phase_and_reason() {
+    use crate::resource::knowledge::{Classification, KnowledgeContext, PendingReason, Phase};
+    use crate::resource::{LoopSlot, ParserPlaceholder};
+    for (placeholder, reason) in [
+        (
+            ParserPlaceholder::ModuleArgument {
+                name: "environment".into(),
+                diagnostic: Default::default(),
+            },
+            PendingReason::ModuleArgument,
+        ),
+        (
+            ParserPlaceholder::Loop(LoopSlot::Key),
+            PendingReason::LoopKey,
+        ),
+        (
+            ParserPlaceholder::Loop(LoopSlot::Index),
+            PendingReason::LoopIndex,
+        ),
+        (
+            ParserPlaceholder::Loop(LoopSlot::Value),
+            PendingReason::LoopValue,
+        ),
+    ] {
+        for secret in [false, true] {
+            let source: Value<ParserPlaceholder> =
+                Value::Deferred(DeferredValue::Placeholder(placeholder.clone()));
+            let source = if secret { source.into_secret() } else { source };
+            let preview = source.input_preview();
+            let knowledge = preview.knowledge(&KnowledgeContext::validation()).unwrap();
+            let Classification::Pending(pending) = knowledge.into_classification() else {
+                panic!("substitution stays pending");
+            };
+            assert_eq!((pending.phase(), pending.reason()), (Phase::Plan, &reason));
+            assert!(!crate::value::format_value(&preview).contains("read after apply"));
+        }
+    }
+    let template: Value<LoopSlot> = Value::Deferred(DeferredValue::Placeholder(LoopSlot::Value));
+    let preview = template.input_preview();
+    let knowledge = preview.knowledge(&KnowledgeContext::validation()).unwrap();
+    let Classification::Pending(pending) = knowledge.into_classification() else {
+        panic!("template substitution stays pending");
+    };
+    assert_eq!(
+        (pending.phase(), pending.reason()),
+        (Phase::Plan, &PendingReason::LoopValue)
+    );
+}
+
+#[test]
+fn suffix_estimation_uses_the_expression_bound_after_list_reordering() {
+    let schemas = registry(
+        ResourceSchema::new("Review").attribute(
+            AttributeSchema::optional(
+                "items",
+                AttributeType::list(AttributeType::struct_with_rules(
+                    "Config",
+                    vec![
+                        StructField::optional("guard", AttributeType::bool()).build(),
+                        StructField::optional("name", AttributeType::string()).build(),
+                    ],
+                    vec![],
+                    vec![rule(
+                        "name",
+                        InputPredicate::NoSuffix(
+                            crate::schema::NonEmptyString::new(".fifo").unwrap(),
+                        ),
+                        InputCondition::Equals {
+                            path: path("guard"),
+                            literal: InputLiteral::Bool(true),
+                        },
+                    )],
+                )),
+            )
+            .build(),
+        ),
+    );
+    let instance = |suffix: &str| {
+        object([
+            ("guard", Value::Concrete(ConcreteValue::Bool(true))),
+            (
+                "name",
+                Value::Deferred(DeferredValue::Interpolation(vec![
+                    crate::resource::InterpolationPart::Expr(Value::root_resource_ref(
+                        "producer",
+                        "name",
+                        vec![],
+                    )),
+                    crate::resource::InterpolationPart::Literal(suffix.into()),
+                ])),
+            ),
+        ])
+    };
+    let authored = Resource::with_provider("mock", "Review", "example", None).with_attribute(
+        "items",
+        Value::Concrete(ConcreteValue::List(vec![
+            instance(".fifo"),
+            instance(".standard"),
+        ])),
+    );
+    let types = InputTypeContext::from_sources(
+        &[crate::effect::deps::UnresolvedResource::from_pre_resolve(
+            authored.clone(),
+        )],
+        &[],
+        std::iter::empty(),
+        &[],
+        &schemas,
+    );
+    let actual = Resource::with_provider("mock", "Review", "example", None).with_attribute(
+        "items",
+        Value::Concrete(ConcreteValue::List(vec![
+            instance(".standard"),
+            instance(".fifo"),
+        ])),
+    );
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(resolved_input_fixture(actual, &schemas)));
+    let rejected = FinalizedPlan::new(plan)
+        .check_inputs_with_types(&schemas, &HashMap::new(), &types)
+        .unwrap_err();
+    let paths = rejected
+        .errors()
+        .iter()
+        .map(|error| match &error.kind {
+            PlanErrorKind::InputRule { path, .. } => path.as_str(),
+            other => panic!("unexpected finding: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["items[1].name"]);
 }

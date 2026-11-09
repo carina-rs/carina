@@ -27,9 +27,9 @@ mod private {
         where
             Self: super::BindingAddress;
 
-        fn input_preview(
-            value: super::super::Value<super::super::NoPlaceholder, Self>,
-        ) -> super::super::Value
+        fn input_preview<P: super::super::ValueKind>(
+            value: super::super::Value<P, Self>,
+        ) -> super::super::Value<P>
         where
             Self: super::BindingAddress;
     }
@@ -264,7 +264,7 @@ pub trait BindingAddress:
 }
 
 impl private::Sealed for RelativeBindingName {
-    fn input_preview(value: super::Value<super::NoPlaceholder, Self>) -> super::Value {
+    fn input_preview<P: super::ValueKind>(value: super::Value<P, Self>) -> super::Value<P> {
         // Parser-owned directories have root-relative bindings. Qualification
         // preserves their structure; preview knowledge never resolves them.
         value.resolve_root(&super::RootScope::new())
@@ -325,7 +325,7 @@ impl BindingAddress for RelativeBindingName {
 }
 
 impl private::Sealed for AbsoluteBindingAddress {
-    fn input_preview(value: super::Value<super::NoPlaceholder, Self>) -> super::Value {
+    fn input_preview<P: super::ValueKind>(value: super::Value<P, Self>) -> super::Value<P> {
         value
     }
 
@@ -387,9 +387,9 @@ pub(crate) fn knowledge_diagnostic<B: BindingAddress>(
     <B as private::Sealed>::knowledge_diagnostic(error)
 }
 
-pub(crate) fn input_preview<B: BindingAddress>(
-    value: super::Value<super::NoPlaceholder, B>,
-) -> super::Value {
+pub(crate) fn input_preview<P: super::ValueKind, B: BindingAddress>(
+    value: super::Value<P, B>,
+) -> super::Value<P> {
     <B as private::Sealed>::input_preview(value)
 }
 

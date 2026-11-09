@@ -1182,12 +1182,12 @@ impl<P: PlaceholderKind, B: BindingAddress> ProtectedSecret<'_, P, B> {
             .ok()
     }
 }
-impl ProtectedSecret<'_, NoPlaceholder, AbsoluteBindingAddress> {
+impl<P: PlaceholderKind> ProtectedSecret<'_, P, AbsoluteBindingAddress> {
     pub(crate) fn require_known_for_serialization(
         &self,
     ) -> Result<(), crate::value::SerializationError> {
         self.payload.try_inspect(|value| {
-            super::require_known_value(
+            super::require_known_classification(
                 value
                     .knowledge(&KnowledgeContext::validation())
                     .map(|proof| proof.into_classification())
@@ -2434,11 +2434,19 @@ impl SubstitutionKind {
     }
 }
 impl super::evaluable_leaf::Sealed for NoPlaceholder {
+    fn into_preview(self) -> ParserPlaceholder {
+        match self {}
+    }
+
     fn substitution_kind(&self) -> SubstitutionKind {
         match *self {}
     }
 }
 impl super::evaluable_leaf::Sealed for ParserPlaceholder {
+    fn into_preview(self) -> ParserPlaceholder {
+        self
+    }
+
     fn substitution_kind(&self) -> SubstitutionKind {
         match self {
             Self::ModuleArgument { .. } => SubstitutionKind::ModuleArgument,
@@ -2452,6 +2460,10 @@ impl super::evaluable_leaf::Sealed for ParserPlaceholder {
     }
 }
 impl super::evaluable_leaf::Sealed for super::LoopSlot {
+    fn into_preview(self) -> ParserPlaceholder {
+        ParserPlaceholder::Loop(self)
+    }
+
     fn substitution_kind(&self) -> SubstitutionKind {
         match self {
             Self::Key => SubstitutionKind::LoopKey,
@@ -2462,10 +2474,9 @@ impl super::evaluable_leaf::Sealed for super::LoopSlot {
 }
 
 impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
-    /// Retain shared knowledge and protected failures across parser/template
-    /// phases. Only substitution slots are erased; expression wrappers and
-    /// lexical bodies keep their evidence for the ordinary classifier.
-    pub(crate) fn input_preview(&self) -> Value {
+    /// Preserve shared knowledge, protected failures and typed substitutions
+    /// across parser/template phases. Preview grants no execution authority.
+    pub(crate) fn input_preview(&self) -> Value<ParserPlaceholder> {
         let source = match self.knowledge(&KnowledgeContext::validation()) {
             Ok(knowledge) => knowledge.to_value(),
             // Keep the source of classification failures too: a later consumer
@@ -2473,9 +2484,9 @@ impl<P: PlaceholderKind, B: BindingAddress> Value<P, B> {
             Err(_) => self.clone(),
         };
         let projected = source
-            .try_map_placeholder(&mut |_| {
-                Ok::<_, std::convert::Infallible>(Value::Deferred(DeferredValue::Unknown(
-                    ApplyTimeUnknown::PendingReRead(super::PendingReRead::not_found()),
+            .try_map_placeholder(&mut |placeholder| {
+                Ok::<_, std::convert::Infallible>(Value::Deferred(DeferredValue::Placeholder(
+                    placeholder.into_preview(),
                 )))
             })
             .unwrap_or_else(|never| match never {});

@@ -6770,8 +6770,8 @@ impl From<&ResourceId> for ProviderInstanceKey {
 
 /// Check a default-tag value before host-owned merging. Unresolved values are
 /// skippable; redacted secrets are fatal.
-fn assert_default_tag_value_encodable(
-    value: &crate::resource::knowledge::Classification<'_>,
+fn assert_default_tag_value_encodable<P: crate::resource::PlaceholderKind>(
+    value: &crate::resource::knowledge::Classification<'_, P>,
 ) -> Result<(), SerializationError> {
     use crate::resource::knowledge::{Classification, KnownValue, KnownView, ShapeView};
     if crate::resource::knowledge::ClassifiedRef::from(value)
@@ -6780,7 +6780,9 @@ fn assert_default_tag_value_encodable(
     {
         return Ok(());
     }
-    fn known(value: &KnownValue<'_>) -> Result<(), SerializationError> {
+    fn known<P: crate::resource::PlaceholderKind>(
+        value: &KnownValue<'_, P>,
+    ) -> Result<(), SerializationError> {
         value.visit(
             |value| match value {
                 KnownView::EnumIdentifier(value) => {
@@ -6835,7 +6837,8 @@ fn assert_default_tag_value_encodable(
             |_| Ok(()),
         ),
         Classification::Pending(value) => {
-            crate::resource::require_known_value(Classification::Pending(value.clone())).map(|_| ())
+            crate::resource::require_known_classification(Classification::Pending(value.clone()))
+                .map(|_| ())
         }
     }
 }
@@ -6881,6 +6884,15 @@ pub fn merge_default_tags<S, D>(
         crate::resource::AbsoluteBindingAddress,
         D,
     >],
+    registry: &SchemaRegistry,
+) -> HostResult<()> {
+    merge_default_tags_with_placeholders(config, resources, registry)
+}
+
+/// The same merge policy also accepts transient authored substitution evidence.
+pub(crate) fn merge_default_tags_with_placeholders<S, D, P: crate::resource::PlaceholderKind>(
+    config: &ProviderConfig<P, crate::resource::AbsoluteBindingAddress>,
+    resources: &mut [Resource<S, P, crate::resource::AbsoluteBindingAddress, D>],
     registry: &SchemaRegistry,
 ) -> HostResult<()> {
     if config.default_tags.is_empty() {
@@ -12132,6 +12144,23 @@ mod tests {
                 protected
             )]))))
         );
+    }
+
+    #[test]
+    fn default_tag_preview_does_not_invent_read_back_provenance() {
+        let source: crate::resource::Value<crate::resource::ParserPlaceholder> =
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                crate::resource::ParserPlaceholder::ModuleArgument {
+                    name: "environment".into(),
+                    diagnostic: Default::default(),
+                },
+            ));
+        let preview = source.input_preview();
+        let proof = preview
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .unwrap();
+        let error = assert_default_tag_value_encodable(&proof).unwrap_err();
+        assert!(!error.to_string().contains("read after apply"), "{error}");
     }
 
     #[test]

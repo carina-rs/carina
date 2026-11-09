@@ -757,67 +757,110 @@ impl Estimator<'_> {
     }
 }
 
-/// Private entry point: no arbitrary value/type API can bypass a WriteSite.
+/// Every owner enters through its bound, admitted rule and concrete instance.
 pub(super) fn estimate(
-    site: &WriteSite<'_>,
-    rule: &InputRule<Compiled>,
-    path: &[String],
+    applicable: &ApplicableInputRule<'_, '_>,
+    value: Option<&InputValue>,
 ) -> InputVerdict {
+    let site = applicable.site;
+    let rule = applicable.rule;
     if matches!(
         rule.predicate(),
         InputPredicate::Matches(_) | InputPredicate::NotMatches(_)
     ) {
         return InputVerdict::Undecided;
     }
+    let defs = site.schema.as_schema().defs();
     let mut estimator = Estimator {
         types: site.types,
-        literal_key_type: site
-            .schema
-            .effective_type_at_attribute_path(path)
-            .ok()
-            .and_then(|node| match node.shape() {
-                crate::schema::Shape::Map { key, .. } => Some((key, node.defs())),
+        literal_key_type: literal_type(applicable, rule.path()).and_then(|ty| {
+            match ty.shape_with_defs(defs) {
+                crate::schema::Shape::Map { key, .. } => Some((key, defs)),
                 _ => None,
-            }),
+            }
+        }),
         query: Query::new(rule.predicate()),
         steps: 0,
     };
-    match &site.authored {
-        Some(AuthoredAttributes::Resource(attributes)) => {
-            from_authored(attributes, path, site.schema, &mut estimator, rule)
-        }
-        Some(AuthoredAttributes::Template(attributes)) => {
-            from_authored(attributes, path, site.schema, &mut estimator, rule)
-        }
-        None => InputVerdict::Undecided,
+    // A retained expression already bound to this instance is authoritative,
+    // including after normalization reorders collections. Consult authored
+    // source only when the current projection has erased that expression.
+    if let Some(value) = value.filter(|value| {
+        !matches!(
+            peel_secret(value),
+            Value::Deferred(DeferredValue::Unknown(_))
+        )
+    }) {
+        let summary = estimator.at_path(
+            value,
+            &[],
+            matches!(rule.target(), InputRuleTarget::MapKeys(_)),
+            0,
+        );
+        return decide(summary, rule, &estimator.query);
     }
-}
-
-fn from_authored<P: ValueKind>(
-    attributes: &IndexMap<String, Value<P>>,
-    path: &[String],
-    schema: &ValidatedResourceSchema,
-    estimator: &mut Estimator<'_>,
-    rule: &InputRule<Compiled>,
-) -> InputVerdict {
-    if omitted_optional(attributes, path, schema) {
-        return InputVerdict::Proven;
-    }
-    let Some(value) = attributes.get(rule.path().root()) else {
+    let mut steps = applicable.owner.iter().cloned().chain(
+        rule.path()
+            .segments()
+            .map(|name| instances::Step::Field(name.to_owned())),
+    );
+    let Some(instances::Step::Field(root)) = steps.next() else {
         return InputVerdict::Undecided;
     };
-    let tail = path[1..]
-        .iter()
-        .map(|name| PathSegment::Field { name: name.clone() })
-        .collect::<Vec<_>>();
+    let tail = steps
+        .map(|step| match step {
+            instances::Step::Field(name) => Some(PathSegment::Field { name }),
+            instances::Step::Index(index) => {
+                i64::try_from(index)
+                    .ok()
+                    .map(|index| PathSegment::Subscript {
+                        index: Subscript::Int { index },
+                    })
+            }
+            instances::Step::Key(key) => Some(PathSegment::Subscript {
+                index: Subscript::Str { key },
+            }),
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(tail) = tail else {
+        return InputVerdict::Undecided;
+    };
+    let retained = match &site.authored {
+        Some(AuthoredAttributes::Resource(attributes)) => {
+            from_attributes(attributes, &root, &tail, &mut estimator, rule)
+        }
+        Some(AuthoredAttributes::Preview(attributes)) => {
+            from_attributes(attributes, &root, &tail, &mut estimator, rule)
+        }
+        Some(AuthoredAttributes::Template(attributes)) => {
+            from_attributes(attributes, &root, &tail, &mut estimator, rule)
+        }
+        None => None,
+    };
+    retained
+        .or_else(|| {
+            site.attributes.as_deref().and_then(|attributes| {
+                from_attributes(attributes, &root, &tail, &mut estimator, rule)
+            })
+        })
+        .unwrap_or(InputVerdict::Undecided)
+}
+
+fn from_attributes<P: ValueKind>(
+    attributes: &IndexMap<String, Value<P>>,
+    root: &str,
+    tail: &[PathSegment],
+    estimator: &mut Estimator<'_>,
+    rule: &InputRule<Compiled>,
+) -> Option<InputVerdict> {
+    let value = attributes.get(root)?;
     let summary = estimator.at_path(
         value,
-        &tail,
+        tail,
         matches!(rule.target(), InputRuleTarget::MapKeys(_)),
         0,
     );
-    // A concrete map's exact keys obey existential failure.
-    decide(summary, rule, &estimator.query)
+    Some(decide(summary, rule, &estimator.query))
 }
 
 fn key_spelling_is_stable(
@@ -845,25 +888,6 @@ fn key_spelling_is_stable(
         }
         _ => false,
     }
-}
-
-pub(super) fn omitted_optional<P: ValueKind>(
-    mut fields: &IndexMap<String, Value<P>>,
-    path: &[String],
-    schema: &ValidatedResourceSchema,
-) -> bool {
-    for (index, name) in path.iter().enumerate() {
-        let Some(value) = fields.get(name) else {
-            return schema
-                .effective_node_at_path(&path[..=index])
-                .is_some_and(|node| node.effective_input_mode() == InputMode::Optional);
-        };
-        match peel_secret(value) {
-            Value::Concrete(ConcreteValue::Map(map)) => fields = map,
-            _ => return false,
-        }
-    }
-    false
 }
 
 fn decide(summary: Summary, rule: &InputRule<Compiled>, query: &Query<'_>) -> InputVerdict {

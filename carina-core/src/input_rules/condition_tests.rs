@@ -249,7 +249,7 @@ fn failed_guard_is_a_failure_even_under_negation_and_after_authored_projection()
             crate::resource::Resource::with_provider("mock", "test.Conditional", "example", None)
                 .with_attribute("guard", projected);
         let site =
-            classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+            classify_write_site::<ModuleSource>(WriteSiteSource::Preview(&resource), &schemas)
                 .unwrap()
                 .unwrap();
         let verdict = site.applicable_rules().next().unwrap().evaluate();
@@ -312,8 +312,7 @@ fn update_guard_cannot_use_an_ignored_leaf_copied_from_observation() {
             .unwrap();
     site.context = InputWriteContext::Update;
     let mut update = UpdateInputContext {
-        desired: resource.attributes.clone(),
-        projected: IndexMap::new(),
+        desired: project_attributes(&resource.attributes),
         changed: HashSet::new(),
         removed: HashSet::new(),
         ignored: ResolvedIgnoreChanges::indexed_for_test(
@@ -325,12 +324,12 @@ fn update_guard_cannot_use_an_ignored_leaf_copied_from_observation() {
             ]),
         ),
     };
-    update.overlay(&crate::provider::UpdatePatch {
+    site.attributes = Some(Cow::Owned(update.overlay(&crate::provider::UpdatePatch {
         ops: vec![crate::provider::PatchOp::Replace {
             key: "settings".into(),
             value: object(false),
         }],
-    });
+    })));
     site.update = Some(update);
     assert_eq!(
         site.applicable_rules().next().unwrap().evaluate(),

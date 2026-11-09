@@ -906,6 +906,78 @@ async fn input_discharge_refreshes_resolved_guard_outside_the_update_patch() {
 }
 
 #[tokio::test]
+async fn input_discharge_keeps_ignored_unsent_target_unresolved() {
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "",
+        PatternResourceSchema::new("test")
+            .attribute(
+                PatternAttributeSchema::optional("guard", PatternAttributeType::bool()).build(),
+            )
+            .attribute(
+                PatternAttributeSchema::optional("target", PatternAttributeType::string()).build(),
+            )
+            .input_rule(
+                InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("target").unwrap(),
+                    InputRuleCode::new("test.target.required").unwrap(),
+                    InputPredicate::Equals(crate::schema::InputLiteral::String("required".into())),
+                )
+                .with_condition(crate::schema::InputCondition::Equals {
+                    path: InputPath::new("guard").unwrap(),
+                    literal: crate::schema::InputLiteral::Bool(true),
+                }),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let mut desired = Resource::new("test", "consumer")
+        .with_attribute("guard", Value::Concrete(ConcreteValue::Bool(true)))
+        .with_attribute("target", string("required"));
+    desired.directives.ignore_changes = vec![crate::resource::ParsedIgnorePath::new(vec![
+        crate::resource::ParsedIgnorePathSegment::Attribute("target".into()),
+    ])];
+    let desired =
+        crate::resource::ResolvedResource::resolve_raw_fixture(desired, &schemas).unwrap();
+    let previous = State::existing(
+        desired.id.clone(),
+        crate::test_support::snapshot_attributes(HashMap::from([
+            ("guard".into(), Value::Concrete(ConcreteValue::Bool(false))),
+            ("target".into(), string("other")),
+        ])),
+    )
+    .with_identifier("existing");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(previous),
+        identifier: AppliedIdentifier::new("existing").unwrap(),
+        to: desired.clone(),
+        changed_attributes: vec!["guard".into()],
+    });
+    let provider = MockProvider::new();
+    provider.push_update(Ok(ok_state(&desired.id)));
+    let (result, events) = run(
+        &provider,
+        plan,
+        &schemas,
+        HashMap::new(),
+        Default::default(),
+        &NoopNormalizer,
+    )
+    .await;
+    assert_eq!(
+        (result.success_count, result.failure_count()),
+        (0, 1),
+        "{events:?}"
+    );
+    assert!(provider.captured_update_requests().is_empty());
+    assert!(
+        matches!(result.failures()[0].kind(), EffectFailureKind::UnresolvedInputRule { path, .. } if path.as_str() == "target")
+    );
+}
+
+#[tokio::test]
 async fn input_discharge_update_only_checks_sent_paths() {
     for write_only in [false, true] {
         let mut schemas = SchemaRegistry::new();

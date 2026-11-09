@@ -191,9 +191,6 @@ impl InputPath {
     pub fn segments(&self) -> std::str::Split<'_, char> {
         self.0.split('.')
     }
-    pub(crate) fn attribute_segments(&self) -> Vec<String> {
-        self.segments().map(str::to_owned).collect()
-    }
     pub(crate) fn root(&self) -> &str {
         self.segments()
             .next()

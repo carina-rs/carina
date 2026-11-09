@@ -86,10 +86,10 @@ fn active(site: &WriteSite<'_>, owner: &[Step], rule: &InputRule<Compiled>) -> b
             InputCondition::Always,
             InputPredicate::Present | InputPredicate::Absent | InputPredicate::Equals(_),
         ) => update.changed.contains(rule.path().root()),
-        (InputCondition::Always, _) => site
-            .attributes
-            .as_deref()
-            .is_some_and(|attrs| attrs.contains_key(rule.path().root())),
+        (InputCondition::Always, _) => {
+            update.changed.contains(rule.path().root())
+                && !update.removed.contains(rule.path().root())
+        }
         (
             InputCondition::Present(_) | InputCondition::Equals { .. } | InputCondition::Not(_),
             _,
@@ -130,11 +130,7 @@ pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRu
     for &rule in &site.rules {
         instances.extend(bind(site, rule, None, &[], false));
     }
-    let values = site
-        .update
-        .as_ref()
-        .map(|update| &update.projected)
-        .or(site.attributes.as_deref());
+    let values = site.attributes.as_deref();
     for (name, attribute) in &site.schema.as_schema().attributes {
         if attribute.input_mode.is_provider_populated() {
             continue;
@@ -163,7 +159,7 @@ pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRu
 fn walk<'s, 'a>(
     site: &'s WriteSite<'a>,
     ty: &'a CompiledAttributeType,
-    value: Option<&Value>,
+    value: Option<&InputValue>,
     owner: &mut Vec<Step>,
     visited_refs: &mut HashSet<String>,
     out: &mut Vec<ApplicableInputRule<'s, 'a>>,
