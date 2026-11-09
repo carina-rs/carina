@@ -91,22 +91,20 @@ fn issue_4014_quoted_enum_and_secret_union_report_once() {
         let attribute = if label == "A" { "versioning" } else { "iv" };
         let context =
             carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
-        let report = schemas
-            .get("aws", "s3.bucket", SchemaKind::Resource)
-            .unwrap()
-            .validate_values_with_resolver(
-                &std::collections::HashMap::from([(
-                    attribute.into(),
-                    value
-                        .knowledge(
-                            &carina_core::resource::knowledge::KnowledgeContext::validation(),
-                        )
-                        .unwrap()
-                        .into_classification(),
-                )]),
-                &|name| name == "versioning",
-                context.custom_type_resolver(),
-            );
+        let report = carina_core::test_utils::admit_resource_attribute_report(
+            schemas
+                .get("aws", "s3.bucket", SchemaKind::Resource)
+                .unwrap(),
+            &std::collections::HashMap::from([(
+                attribute.into(),
+                value
+                    .knowledge(&carina_core::resource::knowledge::KnowledgeContext::validation())
+                    .unwrap()
+                    .into_classification(),
+            )]),
+            &|name| name == "versioning",
+            &context.custom_types,
+        );
         let messages = report.errors().map(ToString::to_string).collect::<Vec<_>>();
         if messages.len() != 1
             || matching

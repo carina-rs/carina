@@ -2574,7 +2574,10 @@ mod tests {
                 let bindings = carina_core::binding_index::ResolvedBindings::default();
                 let module_gate =
                     carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-                let schemas = carina_core::schema::SchemaRegistry::new();
+                let schemas = carina_core::test_utils::preparation_schemas(
+                    &resource.id,
+                    carina_core::schema::SchemaKind::Resource,
+                );
                 let provider_types = carina_core::provider::loaded_provider_snapshot_from_factories(
                     std::sync::Arc::new(Vec::new()),
                     schemas.clone(),

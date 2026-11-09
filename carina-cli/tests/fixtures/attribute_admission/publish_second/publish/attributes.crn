@@ -1,0 +1,1 @@
+attributes { role_arn = scheduler_role.arn }

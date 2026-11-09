@@ -546,13 +546,21 @@ pub(crate) fn contains_module_argument_matching<B: BindingAddress>(
     }
 }
 
-/// Internal adapter used only by [`crate::schema::OwnerBoundResourceSchema`]
-/// and owner-routing unit tests. Public callers validate through the bound
-/// schema so a lookup cannot be paired with a different witness.
+/// Bind owner-routing unit tests to their registered schema descriptor.
+#[cfg(test)]
 pub(crate) fn custom_type_lookup_for_schema<'resolver, 'schema>(
     resolver: &'resolver dyn crate::parser::CustomTypeResolver,
     schema: crate::schema::OwnerBoundResourceSchema<'schema>,
 ) -> impl crate::schema::ValidatedCustomTypeLookup + use<'resolver, 'schema> {
+    custom_type_lookup_for_owner(resolver, schema.owner())
+}
+
+/// Share dispatch and canonicalization policy between bound schemas and
+/// admission contracts. The caller derives the owner from its descriptor.
+pub(crate) fn custom_type_lookup_for_owner<'resolver, 'owner>(
+    resolver: &'resolver dyn crate::parser::CustomTypeResolver,
+    owner: &'owner str,
+) -> impl crate::schema::ValidatedCustomTypeLookup + use<'resolver, 'owner> {
     struct Lookup<'a, 'b> {
         resolver: &'a dyn crate::parser::CustomTypeResolver,
         owner: &'b str,
@@ -575,10 +583,7 @@ pub(crate) fn custom_type_lookup_for_schema<'resolver, 'schema>(
             custom_type_canonicalization_error(self.owner, declaration, error)
         }
     }
-    Lookup {
-        resolver,
-        owner: schema.owner(),
-    }
+    Lookup { resolver, owner }
 }
 
 /// Bind a provider-config value validator to its selected factory. Dispatch
@@ -607,7 +612,7 @@ pub fn custom_type_lookup_for_factory(
     Lookup(factory)
 }
 
-fn custom_type_canonicalization_error(
+pub(crate) fn custom_type_canonicalization_error(
     owner: &str,
     declaration: crate::parser::IdentifiedCustomTypeDeclaration<'_>,
     error: crate::schema::TypeError,

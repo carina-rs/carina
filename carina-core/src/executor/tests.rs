@@ -1,5 +1,7 @@
 use super::*;
 use crate::provider::Provider;
+#[path = "admission_resolution_tests.rs"]
+mod admission_resolution_tests;
 #[path = "input_discharge_tests.rs"]
 mod input_discharge_tests;
 use crate::schema::{
@@ -1564,6 +1566,13 @@ static TEST_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
         .validate()
         .expect("schema fixture must be valid"),
     );
+    registry.insert(
+        "test",
+        PatternResourceSchema::new("Lookup")
+            .as_data_source()
+            .validate()
+            .unwrap(),
+    );
     registry
 });
 
@@ -1580,6 +1589,13 @@ static DEFAULT_TAG_SCHEMAS: LazyLock<SchemaRegistry> = LazyLock::new(|| {
         ))
         .validate()
         .expect("schema fixture must be valid"),
+    );
+    registry.insert(
+        "test",
+        PatternResourceSchema::new("test")
+            .as_data_source()
+            .validate()
+            .unwrap(),
     );
     registry
 });
@@ -13768,7 +13784,14 @@ async fn forbidden_anonymous_deferred_admission(deposed: bool) {
 
 #[tokio::test]
 async fn review5_4283_unbound_loop_after_read_does_not_block_unrelated_replacement() {
-    let (mut template, _, schemas, child) = anonymous_deferred_collision_fixture();
+    let (mut template, _, mut schemas, child) = anonymous_deferred_collision_fixture();
+    schemas.insert(
+        "mock",
+        PatternResourceSchema::new("test.Lookup")
+            .as_data_source()
+            .validate()
+            .unwrap(),
+    );
     template.iterable = Value::root_resource_ref("lookup", "values", Vec::new());
     let parent = Resource::with_provider("mock", "test.Child", "producer", None)
         .with_root_binding("producer")

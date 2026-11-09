@@ -343,7 +343,10 @@ fn create_request_for(id: ResourceId) -> CreateRequest {
             async |checks| {
                 let bindings = Default::default();
                 let gate = crate::executor::ModuleConstraintGate::from_live_compositions(&[]);
-                let schemas = Default::default();
+                let schemas = crate::test_utils::preparation_schemas(
+                    &id,
+                    crate::schema::SchemaKind::Resource,
+                );
                 let context = crate::executor::ProviderPreparationContext::new(
                     &bindings,
                     &gate,

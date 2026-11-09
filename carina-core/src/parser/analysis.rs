@@ -1158,6 +1158,15 @@ where
         self.resource.id()
     }
 
+    pub(crate) fn diagnostic_label(&self) -> String {
+        match self.resource.context() {
+            super::ResourceContext::Direct => self.id().to_string(),
+            super::ResourceContext::Deferred(deferred) => {
+                format!("for-body `{}` {}", D::deferred_header(deferred), self.id())
+            }
+        }
+    }
+
     pub fn binding_address(&self) -> Option<&'a B> {
         self.resource.binding_address()
     }

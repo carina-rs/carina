@@ -6,6 +6,10 @@ inputs:
     description: Optional shared cache key passed through to Swatinem/rust-cache
     required: false
     default: ""
+  cache-job:
+    description: Reuse another job's automatic cache namespace (preserves existing keys)
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -23,6 +27,10 @@ runs:
     # and only evict main's. Queue runs still restore from main.
     - uses: Swatinem/rust-cache@v2
       with:
-        save-if: ${{ github.event_name != 'merge_group' }}
-        key: ${{ inputs.shared-key == '' && steps.manifest.outputs.key || '' }}
-        shared-key: ${{ inputs.shared-key != '' && format('{0}-{1}', inputs.shared-key, steps.manifest.outputs.key) || '' }}
+        # Consumers restore the build job's cache without racing to own it
+        # with their narrower dependency/feature graph.
+        save-if: ${{ inputs.cache-job == '' && github.event_name != 'merge_group' }}
+        key: ${{ inputs.shared-key == '' && inputs.cache-job == '' && steps.manifest.outputs.key || '' }}
+        # Swatinem appends the job id after key. Reproduce that order when
+        # another job restores Test's cache, retaining main's existing prefix.
+        shared-key: ${{ inputs.cache-job != '' && format('{0}-{1}', steps.manifest.outputs.key, inputs.cache-job) || (inputs.shared-key != '' && format('{0}-{1}', inputs.shared-key, steps.manifest.outputs.key) || '') }}

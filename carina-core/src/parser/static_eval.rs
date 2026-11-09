@@ -345,6 +345,28 @@ pub fn evaluate_static_value_for_validation(
         .and_then(Result::ok)
 }
 
+/// Evaluate the same statically available inputs after module expansion,
+/// retaining absolute binding addresses and the existing Knowledge permission.
+pub fn evaluate_expanded_value_for_validation(
+    value: &crate::resource::knowledge::Classification<
+        '_,
+        ParserPlaceholder,
+        crate::resource::AbsoluteBindingAddress,
+    >,
+    session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+) -> Option<crate::resource::Value<ParserPlaceholder>> {
+    value
+        .permits_static_evaluation()
+        .then(|| {
+            crate::resolver::resolve_ref_value(
+                &value.to_value(),
+                &crate::binding_index::ResolvedBindings::default(),
+                session,
+            )
+        })
+        .and_then(Result::ok)
+}
+
 #[cfg(test)]
 mod condition_dependency_tests {
     use super::*;

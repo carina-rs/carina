@@ -460,12 +460,12 @@ impl ParseError {
             ResolutionError::Message(message) => Self::InvalidExpression { line, message },
             ResolutionError::UnavailableSecret(error) => Self::UnavailableSecret(error),
             ResolutionError::InsideSecret {} => Self::InsideSecret { line },
-            error @ (ResolutionError::Knowledge(_) | ResolutionError::Context { .. }) => {
-                Self::Evaluation {
-                    line,
-                    error: Box::new(error),
-                }
-            }
+            error @ (ResolutionError::Knowledge(_)
+            | ResolutionError::AdmissionConstraints(_)
+            | ResolutionError::Context { .. }) => Self::Evaluation {
+                line,
+                error: Box::new(error),
+            },
         }
     }
     pub(crate) fn inside_secret_at(self, fallback_line: usize) -> Self {
