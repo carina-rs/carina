@@ -55,10 +55,10 @@ fn assignability_edges_wire_json_round_trip_retains_declarations() {
 
 #[test]
 fn assignability_edges_protocol_version_is_current() {
-    assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 25);
+    assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 26);
 }
 
 #[test]
 fn assignability_edges_min_supported_protocol_version_is_current() {
-    assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 25);
+    assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 26);
 }

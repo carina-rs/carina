@@ -1,9 +1,10 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **25**.
+The current protocol and minimum supported provider protocol are both **26**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
+| 26 | 26 | Required separate identity and member constraint records for refined String and Int. |
 | 25 | 25 | WIT 0.2.0 typed diagnostics and credential registration; guest stdout/stderr discarded. |
 | 24 | 24 | Required typed pattern specifications with explicit Full or justified Substring matching. |
 | 23 | 23 | Required scoped desired-input rules on every resource schema. |
@@ -16,6 +17,43 @@ The current protocol and minimum supported provider protocol are both **25**.
 | 16 | 16 | Required identity mode field; declared identity hashing and nested create-only diffing. |
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
+
+## Version 26
+
+Refined `String` and `Int` declarations carry two required records:
+`identity_layer` and `member_layer`. Empty layers are explicit `{}` records;
+missing records are rejected. A String identity owns its nominal identity,
+optional pattern and character-length interval, semantic validator binding and
+DSL transform. Its member record adds an optional pattern and length interval.
+An Int identity owns its nominal identity and range; its member adds a range.
+Float and typed Reference schemas retain their existing shapes.
+
+Validation keeps first-failure semantics: identity pattern, identity length or
+range, member pattern, member length or range, then the semantic callback.
+Structural constraints remain schema metadata and are never delegated to a
+callback. Every pattern retains its authored regex, explicit match mode and
+substring reason. Identity consistency and built-in admission compare only a
+typed identity projection; full declaration fingerprints include both layers.
+A core Email identity with a member length is valid, while changing Email's
+identity definition remains a built-in collision.
+
+Every typed destination uses one nominal scalar identity rule: same identity
+or an allowed structural/provider widening. This includes binding/export
+annotations, map/list element annotations, module arguments, and user-function
+parameters and returns. Destination member constraints remain resolved-value
+obligations; every destination kind supports the existing `NeedsLocal` path.
+Provably disjoint length intervals or numeric ranges reject statically;
+unproven pattern containment defers to the destination value check (#4349).
+Collection and coalesce inference use the same identity admission to join
+compatible declarations with different member restrictions, retaining child
+value evidence. Mismatches render the differing constraints or scalar kinds
+when the nominal names alone would be identical.
+
+Both `PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are 26. Protocol-25
+providers must rebuild against the current SDK before they can load, including
+on schema-only migration paths. WIT remains `carina:provider@0.2.0`: schemas
+already cross the boundary as JSON, and `validate-custom-type` continues to
+identify semantic checks by type identity. Carina v0.14.0 will ship protocol 26.
 
 ## Version 25
 
@@ -57,8 +95,8 @@ is exempt from count/rate limits, with a finite 256 KiB input cap.
 Legacy `0.1.0` WIT providers are rejected with a typed incompatibility before
 linking or executing guest code. Older packages require rebuilding the provider
 against the current Carina protocol; newer packages require upgrading Carina.
-Both the current and minimum supported protocol are 25. Providers built for
-protocol 24 or earlier must rebuild against the current SDK.
+Protocol 25 set the current and minimum supported versions to 25. The current
+host requires protocol 26, so protocol-25 providers must also rebuild.
 
 ## Version 24
 
@@ -161,11 +199,11 @@ are not serialized. Saved-plan input re-admission under the apply lock remains
 an explicitly typed TODO for phase 5.
 
 Version 23 introduced the required `input_rules`, `scope` and `target` fields.
-The current host requires protocol 25, including explicit pattern modes, and
+The current host requires protocol 26, including explicit pattern modes, and
 rejects older providers before schema decoding. The v12 migration adapter has
 been removed. The SDK's schema JSON export carries these rules; no WIT function
 or CRUD request field is added. AWS, AWSCC, and GitHub providers must rebuild
-against protocol 25.
+against protocol 26.
 
 ## Version 22
 
@@ -217,7 +255,7 @@ identity conversion; the existing length and range checks still apply, and sink
 validators still run on values during validation, planning, and apply.
 
 Version 21 introduced this required edge array. Hosts and providers must rebuild
-together; the current minimum is 25. Protocol-12 metadata is rejected, including
+together; the current minimum is 26. Protocol-12 metadata is rejected, including
 on read-only schema loading paths.
 
 ## Version 20

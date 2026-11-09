@@ -56,6 +56,15 @@ fn find_use_import_path(
     None
 }
 
+fn hover_bounds<T: std::fmt::Display>(bounds: Option<(Option<T>, Option<T>)>) -> Option<String> {
+    bounds.map(|(min, max)| match (min, max) {
+        (Some(min), Some(max)) => format!("{min}..={max}"),
+        (Some(min), None) => format!("{min}.."),
+        (None, Some(max)) => format!("..={max}"),
+        (None, None) => "..".into(),
+    })
+}
+
 /// Format a Value for hover display
 fn format_value_for_hover(value: &Value) -> String {
     match value {
@@ -546,13 +555,50 @@ impl HoverProvider {
         };
         let type_name = format!("{}", attr.field_type());
 
-        let content = format!(
+        let mut content = format!(
             "## {}\n\n{}\n\n- **Type**: {}\n- **Required**: {}",
             attr.name(),
             description,
             type_name,
             required
         );
+
+        use carina_core::schema::{PatternSpecDisplay, Shape};
+        let mut pattern = |label: &str, spec: Option<&carina_core::schema::PatternSpec>| {
+            if let Some(spec) = spec {
+                content.push_str(&format!(
+                    "\n- **{label} pattern**: {}",
+                    PatternSpecDisplay::new(spec)
+                ));
+            }
+        };
+        match attr.value_type().shape() {
+            Shape::String {
+                identity_layer,
+                member_layer,
+            } => {
+                pattern("Identity", identity_layer.pattern);
+                pattern("Member", member_layer.pattern);
+                if let Some(bounds) = hover_bounds(identity_layer.length) {
+                    content.push_str(&format!("\n- **Identity length**: {bounds}"));
+                }
+                if let Some(bounds) = hover_bounds(member_layer.length) {
+                    content.push_str(&format!("\n- **Member length**: {bounds}"));
+                }
+            }
+            Shape::Int {
+                identity_layer,
+                member_layer,
+            } => {
+                if let Some(bounds) = hover_bounds(identity_layer.range) {
+                    content.push_str(&format!("\n- **Identity range**: {bounds}"));
+                }
+                if let Some(bounds) = hover_bounds(member_layer.range) {
+                    content.push_str(&format!("\n- **Member range**: {bounds}"));
+                }
+            }
+            _ => {}
+        }
 
         Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -2727,5 +2773,84 @@ EOT
             hover.is_some(),
             "hover should survive an unrelated sibling parse error"
         );
+    }
+    #[test]
+    fn hover_preserves_identity_and_member_constraints() {
+        use carina_core::schema::{
+            IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+            StringMemberConstraints, TypeIdentity,
+        };
+        let schema = ResourceSchema::new("contact")
+            .attribute(
+                AttributeSchema::optional(
+                    "name",
+                    AttributeType::string_member(
+                        StringIdentityLayer::new(
+                            Some(TypeIdentity::bare("Name")),
+                            Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                            Some((Some(1), Some(32))),
+                            None,
+                        ),
+                        StringMemberConstraints::new(
+                            Some(PatternSpec::new("a.*", PatternMatch::Full)),
+                            Some((Some(2), Some(16))),
+                        ),
+                    ),
+                )
+                .build(),
+            )
+            .attribute(
+                AttributeSchema::optional(
+                    "count",
+                    AttributeType::int_member(
+                        IntIdentityLayer::new(
+                            Some(TypeIdentity::bare("Count")),
+                            Some((Some(1), Some(100))),
+                        ),
+                        IntMemberConstraints::new(Some((Some(10), Some(20)))),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert("test", schema);
+        let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+        let doc = Document::new(
+            "test.contact {\n name\n count\n}\n".into(),
+            Arc::new(ProviderContext::new(
+                carina_core::EnvironmentSnapshot::empty(),
+            )),
+        );
+        for (line, fragments) in [
+            (
+                1,
+                vec![
+                    "Identity pattern",
+                    "[a-z]+",
+                    "Member pattern",
+                    "a.*",
+                    "Identity length",
+                    "Member length",
+                ],
+            ),
+            (
+                2,
+                vec!["Identity range", "1..=100", "Member range", "10..=20"],
+            ),
+        ] {
+            let hover = provider.hover(&doc, Position::new(line, 2)).unwrap();
+            let HoverContents::Markup(content) = hover.contents else {
+                panic!("Markdown hover")
+            };
+            for fragment in fragments {
+                assert!(
+                    content.value.contains(fragment),
+                    "missing {fragment}: {}",
+                    content.value
+                );
+            }
+        }
     }
 }

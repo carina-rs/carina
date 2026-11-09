@@ -195,10 +195,16 @@
 mod compile_schema;
 mod compiled_pattern;
 mod pattern_display;
+mod refinement_layers;
 pub use carina_provider_protocol::types::{
     EmptyPatternReason, PatternMatch, PatternReason, PatternSpec, PatternSpecParts,
 };
 pub use pattern_display::{DiagnosticPatternSpec, PatternSpecDisplay};
+pub use refinement_layers::{
+    IntIdentityLayer, IntIdentityParts, IntMemberConstraints, IntMemberParts, StringIdentityLayer,
+    StringIdentityParts, StringMemberConstraints, StringMemberParts,
+};
+pub(crate) use refinement_layers::{ScalarIdentityParts, intersect_bounds};
 pub(crate) mod length_interval;
 use crate::resource::knowledge::{
     Classification, ClassifiedRef, KnownValue, PendingFit, StructuralPending,
@@ -1373,10 +1379,8 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     },
     /// String
     String {
-        binding: RefinementBinding,
-        pattern: Option<R::Pattern>,
-        length: Option<(Option<u64>, Option<u64>)>,
-        to_dsl: Option<DslTransform>,
+        identity_layer: StringIdentityLayer<R>,
+        member_layer: StringMemberConstraints<R>,
     },
     /// A resource handle used only by the schema-level boundary relation.
     ///
@@ -1393,8 +1397,8 @@ pub(crate) enum AttrTypeKind<R: PatternForm = Draft> {
     StringLiteralSet { values: Vec<String> },
     /// Integer
     Int {
-        binding: RefinementBinding,
-        range: Option<(Option<i64>, Option<i64>)>,
+        identity_layer: IntIdentityLayer,
+        member_layer: IntMemberConstraints,
     },
     /// Floating-point number
     Float {
@@ -1497,17 +1501,13 @@ pub enum Shape<'a, R: PatternForm = Draft> {
     },
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
-        identity: Option<&'a TypeIdentity>,
-        pattern: Option<&'a PatternSpec>,
-        length: Option<(Option<u64>, Option<u64>)>,
-        validate: Option<&'a CustomValidator>,
-        to_dsl: Option<&'a DslTransform>,
+        identity_layer: StringIdentityParts<'a>,
+        member_layer: StringMemberParts<'a>,
     },
     /// Integer — see [`AttrTypeKind::Int { .. }`].
     Int {
-        identity: Option<&'a TypeIdentity>,
-        range: Option<(Option<i64>, Option<i64>)>,
-        validate: Option<&'a CustomValidator>,
+        identity_layer: IntIdentityParts<'a>,
+        member_layer: IntMemberParts,
     },
     /// Floating-point — see [`AttrTypeKind::Float { .. }`].
     Float {
@@ -1594,25 +1594,32 @@ impl<R: PatternForm> fmt::Debug for Shape<'_, R> {
                 .field("length", length)
                 .finish(),
             Shape::String {
-                identity,
-                pattern,
-                length,
-                validate: _,
-                to_dsl: _,
+                identity_layer:
+                    StringIdentityParts {
+                        identity,
+                        pattern,
+                        length,
+                        ..
+                    },
+                member_layer,
             } => f
                 .debug_struct("Shape::String { .. }")
                 .field("identity", identity)
                 .field("pattern", pattern)
                 .field("length", length)
+                .field("member_layer", &member_layer)
                 .finish_non_exhaustive(),
             Shape::Int {
-                identity,
-                range,
-                validate: _,
+                identity_layer:
+                    IntIdentityParts {
+                        identity, range, ..
+                    },
+                member_layer,
             } => f
                 .debug_struct("Shape::Int { .. }")
                 .field("identity", identity)
                 .field("range", range)
+                .field("member_layer", &member_layer)
                 .finish_non_exhaustive(),
             Shape::Float {
                 identity,
@@ -1697,17 +1704,13 @@ pub enum RawShape<'a, R: PatternForm = Draft> {
     },
     /// String — see [`AttrTypeKind::String { .. }`].
     String {
-        identity: Option<&'a TypeIdentity>,
-        pattern: Option<&'a PatternSpec>,
-        length: Option<(Option<u64>, Option<u64>)>,
-        validate: Option<&'a CustomValidator>,
-        to_dsl: Option<&'a DslTransform>,
+        identity_layer: StringIdentityParts<'a>,
+        member_layer: StringMemberParts<'a>,
     },
     /// Integer — see [`AttrTypeKind::Int { .. }`].
     Int {
-        identity: Option<&'a TypeIdentity>,
-        range: Option<(Option<i64>, Option<i64>)>,
-        validate: Option<&'a CustomValidator>,
+        identity_layer: IntIdentityParts<'a>,
+        member_layer: IntMemberParts,
     },
     /// Floating-point — see [`AttrTypeKind::Float { .. }`].
     Float {
@@ -1772,25 +1775,32 @@ impl<R: PatternForm> fmt::Debug for RawShape<'_, R> {
                 .field("length", length)
                 .finish(),
             RawShape::String {
-                identity,
-                pattern,
-                length,
-                validate: _,
-                to_dsl: _,
+                identity_layer:
+                    StringIdentityParts {
+                        identity,
+                        pattern,
+                        length,
+                        ..
+                    },
+                member_layer,
             } => f
                 .debug_struct("RawShape::String { .. }")
                 .field("identity", identity)
                 .field("pattern", pattern)
                 .field("length", length)
+                .field("member_layer", &member_layer)
                 .finish_non_exhaustive(),
             RawShape::Int {
-                identity,
-                range,
-                validate: _,
+                identity_layer:
+                    IntIdentityParts {
+                        identity, range, ..
+                    },
+                member_layer,
             } => f
                 .debug_struct("RawShape::Int { .. }")
                 .field("identity", identity)
                 .field("range", range)
+                .field("member_layer", &member_layer)
                 .finish_non_exhaustive(),
             RawShape::Float {
                 identity,
@@ -2290,15 +2300,20 @@ impl<R: PatternForm> fmt::Debug for PatternAttributeType<R> {
                 .field("length", length)
                 .finish(),
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                to_dsl,
+                identity_layer:
+                    StringIdentityLayer {
+                        binding,
+                        pattern,
+                        length,
+                        to_dsl,
+                    },
+                member_layer,
             } => f
                 .debug_struct("String")
                 .field("identity", &binding.identity())
                 .field("pattern", pattern)
                 .field("length", length)
+                .field("member_layer", &member_layer)
                 .field("to_dsl", to_dsl)
                 .field("validate", &binding.callback().map(|_| "<closure>"))
                 .finish(),
@@ -2313,10 +2328,14 @@ impl<R: PatternForm> fmt::Debug for PatternAttributeType<R> {
             AttrTypeKind::StringLiteralSet { values } => {
                 f.debug_tuple("StringLiteralSet").field(values).finish()
             }
-            AttrTypeKind::Int { binding, range } => f
+            AttrTypeKind::Int {
+                identity_layer: IntIdentityLayer { binding, range },
+                member_layer,
+            } => f
                 .debug_struct("Int")
                 .field("identity", &binding.identity())
                 .field("range", range)
+                .field("member_layer", &member_layer)
                 .field("validate", &binding.callback().map(|_| "<closure>"))
                 .finish(),
             AttrTypeKind::Float { binding, range } => f
@@ -2711,30 +2730,33 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 length: *length,
             },
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                to_dsl,
+                identity_layer,
+                member_layer,
             } => Shape::String {
-                identity: binding.identity(),
-                pattern: pattern.as_ref().map(AsRef::as_ref),
-                length: *length,
-                validate: binding.callback(),
-                to_dsl: to_dsl.as_ref(),
+                identity_layer: identity_layer.parts(),
+                member_layer: member_layer.parts(),
             },
             AttrTypeKind::ResourceHandle { .. } | AttrTypeKind::StringLiteralSet { .. } => {
                 Shape::String {
-                    identity: None,
-                    pattern: None,
-                    length: None,
-                    validate: None,
-                    to_dsl: None,
+                    identity_layer: StringIdentityParts {
+                        identity: None,
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                    },
+                    member_layer: StringMemberParts {
+                        pattern: None,
+                        length: None,
+                    },
                 }
             }
-            AttrTypeKind::Int { binding, range } => Shape::Int {
-                identity: binding.identity(),
-                range: *range,
-                validate: binding.callback(),
+            AttrTypeKind::Int {
+                identity_layer,
+                member_layer,
+            } => Shape::Int {
+                identity_layer: identity_layer.parts(),
+                member_layer: member_layer.parts(),
             },
             AttrTypeKind::Float { binding, range } => Shape::Float {
                 identity: binding.identity(),
@@ -2817,30 +2839,33 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 length: *length,
             },
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                to_dsl,
+                identity_layer,
+                member_layer,
             } => RawShape::String {
-                identity: binding.identity(),
-                pattern: pattern.as_ref().map(AsRef::as_ref),
-                length: *length,
-                validate: binding.callback(),
-                to_dsl: to_dsl.as_ref(),
+                identity_layer: identity_layer.parts(),
+                member_layer: member_layer.parts(),
             },
             AttrTypeKind::ResourceHandle { .. } | AttrTypeKind::StringLiteralSet { .. } => {
                 RawShape::String {
-                    identity: None,
-                    pattern: None,
-                    length: None,
-                    validate: None,
-                    to_dsl: None,
+                    identity_layer: StringIdentityParts {
+                        identity: None,
+                        pattern: None,
+                        length: None,
+                        validate: None,
+                        to_dsl: None,
+                    },
+                    member_layer: StringMemberParts {
+                        pattern: None,
+                        length: None,
+                    },
                 }
             }
-            AttrTypeKind::Int { binding, range } => RawShape::Int {
-                identity: binding.identity(),
-                range: *range,
-                validate: binding.callback(),
+            AttrTypeKind::Int {
+                identity_layer,
+                member_layer,
+            } => RawShape::Int {
+                identity_layer: identity_layer.parts(),
+                member_layer: member_layer.parts(),
             },
             AttrTypeKind::Float { binding, range } => RawShape::Float {
                 identity: binding.identity(),
@@ -2909,10 +2934,13 @@ impl<R: PatternForm> PatternAttributeType<R> {
     pub fn string() -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::String {
-                binding: RefinementBinding::MetadataOnly(None),
-                pattern: None,
-                length: None,
-                to_dsl: None,
+                identity_layer: StringIdentityLayer {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    pattern: None,
+                    length: None,
+                    to_dsl: None,
+                },
+                member_layer: Default::default(),
             },
         }
     }
@@ -2965,10 +2993,13 @@ impl<R: PatternForm> PatternAttributeType<R> {
     ) -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::String {
-                binding: RefinementBinding::MetadataOnly(identity),
-                pattern,
-                length,
-                to_dsl,
+                identity_layer: StringIdentityLayer {
+                    binding: RefinementBinding::MetadataOnly(identity),
+                    pattern,
+                    length,
+                    to_dsl,
+                },
+                member_layer: Default::default(),
             },
         }
     }
@@ -2983,13 +3014,16 @@ impl<R: PatternForm> PatternAttributeType<R> {
     ) -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::String {
-                binding: RefinementBinding::Validator {
-                    identity,
-                    callback: validate,
+                identity_layer: StringIdentityLayer {
+                    binding: RefinementBinding::Validator {
+                        identity,
+                        callback: validate,
+                    },
+                    pattern,
+                    length,
+                    to_dsl,
                 },
-                pattern,
-                length,
-                to_dsl,
+                member_layer: Default::default(),
             },
         }
     }
@@ -2998,8 +3032,11 @@ impl<R: PatternForm> PatternAttributeType<R> {
     pub fn int() -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::Int {
-                binding: RefinementBinding::MetadataOnly(None),
-                range: None,
+                identity_layer: IntIdentityLayer {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    range: None,
+                },
+                member_layer: Default::default(),
             },
         }
     }
@@ -3011,8 +3048,11 @@ impl<R: PatternForm> PatternAttributeType<R> {
     ) -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::Int {
-                binding: RefinementBinding::MetadataOnly(identity),
-                range,
+                identity_layer: IntIdentityLayer {
+                    binding: RefinementBinding::MetadataOnly(identity),
+                    range,
+                },
+                member_layer: Default::default(),
             },
         }
     }
@@ -3025,11 +3065,14 @@ impl<R: PatternForm> PatternAttributeType<R> {
     ) -> Self {
         PatternAttributeType {
             kind: AttrTypeKind::Int {
-                binding: RefinementBinding::Validator {
-                    identity,
-                    callback: validate,
+                identity_layer: IntIdentityLayer {
+                    binding: RefinementBinding::Validator {
+                        identity,
+                        callback: validate,
+                    },
+                    range,
                 },
-                range,
+                member_layer: Default::default(),
             },
         }
     }
@@ -3321,9 +3364,13 @@ impl<R: PatternForm> PatternAttributeType<R> {
             AttrTypeKind::Duration => "Duration".to_string(),
             AttrTypeKind::Enum { identity, .. } => identity.to_string(),
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
+                identity_layer:
+                    StringIdentityLayer {
+                        binding,
+                        pattern,
+                        length,
+                        ..
+                    },
                 ..
             } => custom_display_name(
                 binding.identity(),
@@ -3340,7 +3387,10 @@ impl<R: PatternForm> PatternAttributeType<R> {
                 .map(|value| display_string_literal(value))
                 .collect::<Vec<_>>()
                 .join(" | "),
-            AttrTypeKind::Int { binding, .. } => binding
+            AttrTypeKind::Int {
+                identity_layer: IntIdentityLayer { binding, .. },
+                ..
+            } => binding
                 .identity()
                 .map(ToString::to_string)
                 .unwrap_or_else(|| "Int".to_string()),
@@ -3371,9 +3421,13 @@ impl<R: PatternForm> PatternAttributeType<R> {
             AttrTypeKind::UnloadedSchemaType(_) => false,
             AttrTypeKind::Reference { .. } => true,
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
+                identity_layer:
+                    StringIdentityLayer {
+                        binding,
+                        pattern,
+                        length,
+                        ..
+                    },
                 ..
             } => binding.identity().is_some() || pattern.is_some() || length.is_some(),
             _ => false,
@@ -3517,7 +3571,12 @@ impl PatternAttributeType<Compiled> {
         &self,
         value: ConcreteValueRef<'_, P, B>,
     ) -> Result<(), TypeError> {
-        if self.has_empty_scalar_intersection() {
+        if self.has_empty_scalar_intersection()
+            && !matches!(
+                self.kind,
+                AttrTypeKind::String { .. } | AttrTypeKind::Int { .. }
+            )
+        {
             return Err(TypeError::ValidationFailed {
                 message: format!(
                     "{} has an empty intersection of scalar constraints",
@@ -3532,19 +3591,24 @@ impl PatternAttributeType<Compiled> {
             }
             (
                 AttrTypeKind::String {
-                    binding,
-                    pattern,
-                    length,
-                    ..
+                    identity_layer,
+                    member_layer,
                 },
                 ConcreteValueRef::String(s),
             ) => {
+                let StringIdentityLayer {
+                    binding,
+                    pattern,
+                    length,
+                    to_dsl: _to_dsl,
+                } = identity_layer;
                 validate_string_refinement(binding.identity(), pattern.as_ref(), *length, s)?;
-                if let Some(owned) = binding.annotation() {
-                    for pattern in owned.patterns() {
-                        validate_string_refinement(binding.identity(), Some(pattern), None, s)?;
-                    }
-                }
+                validate_string_refinement(
+                    binding.identity(),
+                    member_layer.pattern.as_ref(),
+                    member_layer.length,
+                    s,
+                )?;
                 binding
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
@@ -3562,9 +3626,17 @@ impl PatternAttributeType<Compiled> {
             {
                 Ok(())
             }
-            (AttrTypeKind::Int { binding, range }, ConcreteValueRef::Int(i)) => {
-                validate_int_range(*range, i)?;
-                binding
+            (
+                AttrTypeKind::Int {
+                    identity_layer,
+                    member_layer,
+                },
+                ConcreteValueRef::Int(i),
+            ) => {
+                validate_int_range(identity_layer.range, i)?;
+                validate_int_range(member_layer.parts().range, i)?;
+                identity_layer
+                    .binding
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
             }
@@ -3761,9 +3833,9 @@ impl PatternAttributeType<Compiled> {
 
 impl<R: PatternForm> TypeInSchema<'_, R> {
     /// Check if a value of this source type can be assigned to `sink`.
-    /// Directional: narrowing source → wider sink is OK, but widening source →
-    /// narrower sink is NG. Each side resolves references against the
-    /// definition map carried by its own [`TypeInSchema`].
+    /// Identity widening is directional. Anonymous refinement evidence must
+    /// prove containment; nominal admission retains destination value checks.
+    /// Each side resolves references against its own [`TypeInSchema`] definitions.
     ///
     /// Rules (first match wins):
     /// 1. Peel top-level Ref chains on both sides. A missing definition,
@@ -3777,20 +3849,16 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///    assignable field types. Struct→Map is allowed when every field is
     ///    assignable to the map value type, preserving the DSL's structural
     ///    object-to-homogeneous-map coercion.
-    /// 7. Custom→Custom with both `identity: Some`: the source's identity
-    ///    must structurally subsume the sink's or follow an edge admitted by its authority and any length
-    ///    range must be contained by the sink's range. Enum→Enum additionally
-    ///    recurses on the two base types. This is the final verdict for
-    ///    identified custom types: pattern checks are subsumed by identity
-    ///    subsumption and are not consulted in this arm, while length
-    ///    containment remains a structural safety check. Directional
-    ///    per-axis subsumption — an
-    ///    empty axis on the **sink** widens (any source matches), but an empty
-    ///    axis on the **source** against a populated sink is rejected (no
-    ///    evidence). So `aws.iam.Role.Arn` flows into `aws.Arn` (sink is
-    ///    wider) but `aws.Arn` does not flow into `aws.iam.Role.Arn` (source
-    ///    has no Role-specific evidence). `aws.Region` and `gcp.Region` are
-    ///    rejected both ways (populated providers differ). Closes carina#3218.
+    /// 7. Identified String/Int/Float leaves admit the same identity or a
+    ///    widening allowed by structural axes or the sink authority's edges.
+    ///    Provably disjoint bounds reject; remaining destination constraints
+    ///    are checked on the resolved value at every sink, including annotations,
+    ///    exports, and function boundaries. Regex containment is not assumed.
+    ///    An empty sink axis widens; an empty source axis cannot satisfy a
+    ///    populated sink axis. Thus `aws.iam.Role.Arn` flows into `aws.Arn`,
+    ///    and the reverse direction rejects. Different populated providers
+    ///    also reject. Enum bases retain their declaration comparisons because
+    ///    they are not scalar member layers.
     /// 8. Custom→Custom where at least one side has `identity: None`: check
     ///    pattern (literal equality) and length containment (source ⊆ sink),
     ///    then recurse on base. Exception: an identity-bearing String, Int, or
@@ -3798,8 +3866,8 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     ///    primitive kind, and an identity-bearing Int source is also assignable
     ///    to an identity-less Float sink, regardless of the source's own
     ///    pattern/length/range. The sink's value constraints are checked when known
-    ///    at plan or before provider dispatch at apply (carina#3805). Rule 7
-    ///    and rule 8's identity-less refined-source comparisons are unchanged.
+    ///    at plan or before provider dispatch at apply (carina#3805).
+    ///    Identity-less refined-source comparisons still require containment.
     /// 9. Custom source → non-Custom sink: recurse on `source.base`.
     /// 10. A plain, unrefined primitive source → refined sink is split by
     ///     the sink's identity. An identified sink (including every Enum) is
@@ -3938,13 +4006,28 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     pub fn mismatch_type_names(&self, expected: TypeInSchema<'_, R>) -> (String, String) {
         let actual_name = self.resolved_type_name();
         let expected_name = expected.resolved_type_name();
-        let actual = self.resolved_type_name_on_path(&mut Vec::new(), true);
-        let expected = expected.resolved_type_name_on_path(&mut Vec::new(), true);
-        if (actual_name == expected_name && actual != expected)
-            || actual.contains("empty intersection")
-            || expected.contains("empty intersection")
+        let actual_constraints = self.resolved_type_name_on_path(&mut Vec::new(), true);
+        let expected_constraints = expected.resolved_type_name_on_path(&mut Vec::new(), true);
+        if (actual_name == expected_name && actual_constraints != expected_constraints)
+            || actual_constraints.contains("empty intersection")
+            || expected_constraints.contains("empty intersection")
         {
-            return (expected, actual);
+            return (expected_constraints, actual_constraints);
+        }
+        if actual_name == expected_name {
+            let kind = |ty: TypeInSchema<'_, R>| {
+                resolve_refs_on_path(ty.attr, ty.defs, &mut Vec::new())
+                    .ok()
+                    .and_then(|resolved| scalar_kind_for_schema_base(resolved.attr))
+            };
+            if let (Some(actual_kind), Some(expected_kind)) = (kind(*self), kind(expected))
+                && actual_kind != expected_kind
+            {
+                return (
+                    format!("{expected_name} ({expected_kind})"),
+                    format!("{actual_name} ({actual_kind})"),
+                );
+            }
         }
         (expected_name, actual_name)
     }
@@ -4032,10 +4115,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             // are checked on the materialized value before planning.
             (
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Reference {
                     identity: _,
@@ -4055,10 +4136,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     length: _,
                 },
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 },
             ) => true,
 
@@ -4077,19 +4156,19 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             (
                 StringLiteralSet { values: _ },
                 String {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer:
+                        StringIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
             ) => true,
             (
                 StringLiteralSet { values: _ },
                 String {
-                    binding,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: StringIdentityLayer { binding, .. },
+                    member_layer: _,
                 },
             ) if binding.identity().is_some() => false,
             (StringLiteralSet { values: source }, StringLiteralSet { values: sink }) => {
@@ -4099,26 +4178,24 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             // behavior.
             (
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 },
                 StringLiteralSet { values: _ },
             ) => true,
             // Anonymous source → identified sink has no proof of identity.
             (
                 String {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer:
+                        StringIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
                 String {
-                    binding,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: StringIdentityLayer { binding, .. },
+                    member_layer: _,
                 },
             ) if binding.identity().is_some() => false,
             // An identified String may flow into an identity-less String
@@ -4126,24 +4203,31 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             // before provider dispatch at apply (#3805, #4230).
             (
                 String {
-                    binding,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: StringIdentityLayer { binding, .. },
+                    member_layer: _,
                 },
                 String {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer:
+                        StringIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
             ) if binding.identity().is_some() => true,
             (
                 Int {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    range: _,
+                    identity_layer:
+                        IntIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
-                Int { binding, range: _ },
+                Int {
+                    identity_layer: IntIdentityLayer { binding, .. },
+                    member_layer: _,
+                },
             ) if binding.identity().is_some() => false,
             (
                 Float {
@@ -4155,10 +4239,17 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             // Identified numerics defer same-kind identity-less sink ranges
             // to the resolved value, like identified Strings (#3805, #4230).
             (
-                Int { binding, range: _ },
                 Int {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    range: _,
+                    identity_layer: IntIdentityLayer { binding, .. },
+                    member_layer: _,
+                },
+                Int {
+                    identity_layer:
+                        IntIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
             )
             | (
@@ -4173,14 +4264,19 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             // sink identity and identity-less source range evidence.
             (
                 Int {
-                    binding: source_binding,
-                    range: source_range,
+                    identity_layer:
+                        IntIdentityLayer {
+                            binding: source_binding,
+                            range: source_range,
+                        },
+                    member_layer: source_member,
                 },
                 Float {
                     binding: sink_binding,
                     range: sink_range,
                 },
             ) => {
+                let source_range = intersect_bounds(*source_range, source_member.range);
                 if (source_binding.identity().is_some() || source_range.is_none())
                     && sink_binding.identity().is_none()
                 {
@@ -4194,26 +4290,44 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             // The identified-sink arm above must remain ahead of this one.
             (
                 String {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    pattern: None,
-                    length: None,
-                    to_dsl: _,
+                    identity_layer:
+                        StringIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            pattern: None,
+                            length: None,
+                            ..
+                        },
+                    member_layer:
+                        StringMemberConstraints {
+                            pattern: None,
+                            length: None,
+                        },
                 },
                 String {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer:
+                        StringIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
             ) => true,
             (
                 Int {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    range: None,
+                    identity_layer:
+                        IntIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            range: None,
+                        },
+                    member_layer: IntMemberConstraints { range: None },
                 },
                 Int {
-                    binding: RefinementBinding::MetadataOnly(None),
-                    range: _,
+                    identity_layer:
+                        IntIdentityLayer {
+                            binding: RefinementBinding::MetadataOnly(None),
+                            ..
+                        },
+                    member_layer: _,
                 },
             ) => true,
             (
@@ -4228,39 +4342,45 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) => true,
             (
                 String {
-                    pattern: s_pat,
-                    length: s_len,
-                    binding: _,
-                    to_dsl: _,
+                    identity_layer: source,
+                    member_layer: source_member,
                 },
                 String {
-                    pattern: k_pat,
-                    length: k_len,
-                    binding: _,
-                    to_dsl: _,
+                    identity_layer: target,
+                    member_layer: target_member,
                 },
             ) => {
-                if !pattern_compatible(
-                    s_pat.as_ref().map(AsRef::as_ref),
-                    k_pat.as_ref().map(AsRef::as_ref),
-                ) {
-                    return false;
-                }
-                if !length_contains(s_len.as_ref(), k_len.as_ref()) {
-                    return false;
-                }
-                true
+                let source_patterns = [
+                    source.pattern.as_ref().map(AsRef::as_ref),
+                    source_member.pattern.as_ref().map(AsRef::as_ref),
+                ];
+                let target_patterns = [
+                    target.pattern.as_ref().map(AsRef::as_ref),
+                    target_member.pattern.as_ref().map(AsRef::as_ref),
+                ];
+                target_patterns.into_iter().flatten().all(|target| {
+                    source_patterns
+                        .into_iter()
+                        .flatten()
+                        .any(|source| pattern_compatible(Some(source), Some(target)))
+                }) && length_contains(
+                    intersect_bounds(source.length, source_member.length).as_ref(),
+                    intersect_bounds(target.length, target_member.length).as_ref(),
+                )
             }
             (
                 Int {
-                    range: s_range,
-                    binding: _,
+                    identity_layer: source,
+                    member_layer: source_member,
                 },
                 Int {
-                    range: k_range,
-                    binding: _,
+                    identity_layer: target,
+                    member_layer: target_member,
                 },
-            ) => i64_range_contains(s_range.as_ref(), k_range.as_ref()),
+            ) => i64_range_contains(
+                intersect_bounds(source.range, source_member.range).as_ref(),
+                intersect_bounds(target.range, target_member.range).as_ref(),
+            ),
             (
                 Float {
                     range: s_range,
@@ -4273,10 +4393,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) => f64_range_contains(s_range.as_ref(), k_range.as_ref()),
             (
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Reference {
                     identity: _,
@@ -4284,8 +4402,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     length: _,
                 },
                 Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -4322,14 +4440,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) => self.attr.type_name() == sink.attr.type_name(),
             (
                 Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 },
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Enum {
                     identity: _,
@@ -4371,14 +4487,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     range: _,
                 },
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Enum {
                     identity: _,
@@ -4445,14 +4559,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Union(_)
                 | Ref(_),
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -4498,14 +4610,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     resource_type: _,
                 },
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -4548,14 +4658,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) => false,
             (
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -4602,8 +4710,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) => false,
             (
                 Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -10059,6 +10167,9 @@ pub enum ProviderSchemaValidationError {
     MissingScalarKind {
         identity: TypeIdentity,
     },
+    ConflictingIdentityDeclarations {
+        identity: TypeIdentity,
+    },
     ConflictingScalarKinds {
         identity: TypeIdentity,
         first_kind: RefinedScalarKind,
@@ -10107,6 +10218,11 @@ impl fmt::Display for ProviderSchemaValidationError {
             Self::BuiltinTypeCollision { identity } => write!(
                 formatter,
                 "custom type `{identity}` conflicts with the built-in declaration; use the core types constructor (including its scalar kind and validator) or choose a different identity",
+                identity = DiagnosticText::new(identity.to_string())
+            ),
+            Self::ConflictingIdentityDeclarations { identity } => write!(
+                formatter,
+                "custom type `{identity}` has conflicting identity-layer constraints",
                 identity = DiagnosticText::new(identity.to_string())
             ),
             Self::MissingScalarKind { identity } => {
@@ -10229,6 +10345,7 @@ impl ValidatedProviderSchemaWitness {
         assignability_edges: Vec<AssignabilityEdge>,
     ) -> Result<Self, ProviderSchemaValidationError> {
         let declarations = identified_declarations_from_witnesses(&resources, &config);
+        let mut identity_signatures = BTreeMap::<TypeIdentity, String>::new();
         let mut scalar_kinds = BTreeMap::<TypeIdentity, RefinedScalarKind>::new();
         let mut declaration_kinds =
             BTreeMap::<TypeIdentity, std::collections::BTreeSet<IdentifiedDeclarationKind>>::new();
@@ -10251,7 +10368,12 @@ impl ValidatedProviderSchemaWitness {
 
         for (identity, attribute_type) in &declarations {
             if let Some(builtin) = builtin_type_registry().get(identity)
-                && !same_builtin_declaration(attribute_type, builtin)
+                && !same_builtin_declaration(
+                    attribute_type.scalar_identity_parts(),
+                    builtin
+                        .scalar_identity_parts()
+                        .expect("built-in scalar definition"),
+                )
             {
                 return Err(ProviderSchemaValidationError::BuiltinTypeCollision {
                     identity: identity.clone(),
@@ -10287,6 +10409,22 @@ impl ValidatedProviderSchemaWitness {
                     first_kind: *first_kind,
                     second_kind: scalar_kind,
                 });
+            }
+            if let Some(identity_layer) = attribute_type.scalar_identity_parts() {
+                let signature = identity_layer.agreement_signature();
+                if identity_signatures
+                    .get(identity)
+                    .is_some_and(|first| first != &signature)
+                {
+                    return Err(
+                        ProviderSchemaValidationError::ConflictingIdentityDeclarations {
+                            identity: identity.clone(),
+                        },
+                    );
+                }
+                identity_signatures
+                    .entry(identity.clone())
+                    .or_insert(signature);
             }
             scalar_kinds.entry(identity.clone()).or_insert(scalar_kind);
             declaration_kinds
@@ -10377,16 +10515,24 @@ fn identified_declaration_kind(
             length: _length,
         } => Some(IdentifiedDeclarationKind::String),
         RawShape::String {
-            identity: Some(_identity),
-            pattern: _pattern,
-            length: _length,
-            validate: _validate,
-            to_dsl: _to_dsl,
+            identity_layer:
+                StringIdentityParts {
+                    identity: Some(_identity),
+                    pattern: _pattern,
+                    length: _length,
+                    validate: _validate,
+                    to_dsl: _to_dsl,
+                },
+            member_layer: _,
         } => Some(IdentifiedDeclarationKind::String),
         RawShape::Int {
-            identity: Some(_identity),
-            range: _range,
-            validate: _validate,
+            identity_layer:
+                IntIdentityParts {
+                    identity: Some(_identity),
+                    range: _range,
+                    validate: _validate,
+                },
+            member_layer: _,
         } => Some(IdentifiedDeclarationKind::Int),
         RawShape::Float {
             identity: Some(_identity),
@@ -10402,16 +10548,12 @@ fn identified_declaration_kind(
             to_dsl: _to_dsl,
         } => Some(IdentifiedDeclarationKind::Enum),
         RawShape::String {
-            identity: None,
-            pattern: _,
-            length: _,
-            validate: _,
-            to_dsl: _,
+            identity_layer: StringIdentityParts { identity: None, .. },
+            member_layer: _,
         }
         | RawShape::Int {
-            identity: None,
-            range: _,
-            validate: _,
+            identity_layer: IntIdentityParts { identity: None, .. },
+            member_layer: _,
         }
         | RawShape::Float {
             identity: None,
@@ -10450,16 +10592,24 @@ fn identified_declaration_scalar_kind(
             length: _length,
         } => Some(RefinedScalarKind::String),
         RawShape::String {
-            identity: Some(_identity),
-            pattern: _pattern,
-            length: _length,
-            validate: _validate,
-            to_dsl: _to_dsl,
+            identity_layer:
+                StringIdentityParts {
+                    identity: Some(_identity),
+                    pattern: _pattern,
+                    length: _length,
+                    validate: _validate,
+                    to_dsl: _to_dsl,
+                },
+            member_layer: _,
         } => Some(RefinedScalarKind::String),
         RawShape::Int {
-            identity: Some(_identity),
-            range: _range,
-            validate: _validate,
+            identity_layer:
+                IntIdentityParts {
+                    identity: Some(_identity),
+                    range: _range,
+                    validate: _validate,
+                },
+            member_layer: _,
         } => Some(RefinedScalarKind::Int),
         RawShape::Float {
             identity: Some(_identity),
@@ -10475,16 +10625,12 @@ fn identified_declaration_scalar_kind(
             to_dsl: _to_dsl,
         } => scalar_kind_for_schema_base(base),
         RawShape::String {
-            identity: None,
-            pattern: _,
-            length: _,
-            validate: _,
-            to_dsl: _,
+            identity_layer: StringIdentityParts { identity: None, .. },
+            member_layer: _,
         }
         | RawShape::Int {
-            identity: None,
-            range: _,
-            validate: _,
+            identity_layer: IntIdentityParts { identity: None, .. },
+            member_layer: _,
         }
         | RawShape::Float {
             identity: None,
@@ -10524,16 +10670,20 @@ fn visit_identified_declarations(
             length: _length,
         } => visitor(identity, attribute_type),
         RawShape::String {
-            identity: Some(identity),
-            pattern: _,
-            length: _,
-            validate: _,
-            to_dsl: _,
+            identity_layer:
+                StringIdentityParts {
+                    identity: Some(identity),
+                    ..
+                },
+            member_layer: _,
         }
         | RawShape::Int {
-            identity: Some(identity),
-            range: _,
-            validate: _,
+            identity_layer:
+                IntIdentityParts {
+                    identity: Some(identity),
+                    ..
+                },
+            member_layer: _,
         }
         | RawShape::Float {
             identity: Some(identity),
@@ -10574,16 +10724,12 @@ fn visit_identified_declarations(
             }
         }
         RawShape::String {
-            identity: None,
-            pattern: _,
-            length: _,
-            validate: _,
-            to_dsl: _,
+            identity_layer: StringIdentityParts { identity: None, .. },
+            member_layer: _,
         }
         | RawShape::Int {
-            identity: None,
-            range: _,
-            validate: _,
+            identity_layer: IntIdentityParts { identity: None, .. },
+            member_layer: _,
         }
         | RawShape::Float {
             identity: None,
@@ -10650,7 +10796,14 @@ fn push_schema_issue(
 fn validate_identified_scalar_kind_consistency(
     attribute_type: &PatternAttributeType<Draft>,
     location: SchemaValidationIssueLocation,
-    seen: &mut HashMap<TypeIdentity, (RefinedScalarKind, SchemaValidationIssueLocation)>,
+    seen: &mut HashMap<
+        TypeIdentity,
+        (
+            RefinedScalarKind,
+            Option<String>,
+            SchemaValidationIssueLocation,
+        ),
+    >,
     issues: &mut Vec<SchemaDefinitionIssue>,
 ) {
     let identified = match attribute_type.raw_shape() {
@@ -10661,11 +10814,19 @@ fn validate_identified_scalar_kind_consistency(
             length: _length,
         } => Some((identity, RefinedScalarKind::String)),
         RawShape::String {
-            identity: Some(identity),
+            identity_layer:
+                StringIdentityParts {
+                    identity: Some(identity),
+                    ..
+                },
             ..
         } => Some((identity, RefinedScalarKind::String)),
         RawShape::Int {
-            identity: Some(identity),
+            identity_layer:
+                IntIdentityParts {
+                    identity: Some(identity),
+                    ..
+                },
             ..
         } => Some((identity, RefinedScalarKind::Int)),
         RawShape::Float {
@@ -10704,11 +10865,17 @@ fn validate_identified_scalar_kind_consistency(
                     if !matches!(
                         base.raw_shape(),
                         RawShape::String {
-                            identity: None,
-                            pattern: None,
-                            length: None,
-                            validate: None,
-                            to_dsl: None,
+                            identity_layer: StringIdentityParts {
+                                identity: None,
+                                pattern: None,
+                                length: None,
+                                validate: None,
+                                to_dsl: None,
+                            },
+                            member_layer: StringMemberParts {
+                                pattern: None,
+                                length: None
+                            }
                         }
                     ) {
                         push_schema_issue(
@@ -10747,8 +10914,14 @@ fn validate_identified_scalar_kind_consistency(
 
             kind.map(|kind| (identity, kind))
         }
-        RawShape::String { identity: None, .. }
-        | RawShape::Int { identity: None, .. }
+        RawShape::String {
+            identity_layer: StringIdentityParts { identity: None, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: IntIdentityParts { identity: None, .. },
+            ..
+        }
         | RawShape::Float { identity: None, .. }
         | RawShape::Bool
         | RawShape::Duration
@@ -10759,7 +10932,10 @@ fn validate_identified_scalar_kind_consistency(
         | RawShape::Ref(_) => None,
     };
     if let Some((identity, kind)) = identified {
-        if let Some((first_kind, first_location)) = seen.get(identity) {
+        let signature = attribute_type
+            .scalar_identity_parts()
+            .map(ScalarIdentityParts::agreement_signature);
+        if let Some((first_kind, first_signature, first_location)) = seen.get(identity) {
             if *first_kind != kind {
                 push_schema_issue(
                     issues,
@@ -10768,9 +10944,20 @@ fn validate_identified_scalar_kind_consistency(
                         "custom type `{identity}` is bound to both {first_kind} at {first_location} and {kind}"
                     ),
                 );
+            } else if first_signature.is_some()
+                && signature.is_some()
+                && first_signature != &signature
+            {
+                push_schema_issue(
+                    issues,
+                    &location,
+                    format!(
+                        "custom type `{identity}` has conflicting identity-layer constraints at {first_location} and {location}"
+                    ),
+                );
             }
         } else {
-            seen.insert(identity.clone(), (kind, location.clone()));
+            seen.insert(identity.clone(), (kind, signature, location.clone()));
         }
     }
 
@@ -13688,24 +13875,30 @@ impl<R: PatternForm> PatternAttributeType<R> {
         let mut constraints = Vec::new();
         match &self.kind {
             AttrTypeKind::String {
-                binding,
-                pattern,
-                length,
-                ..
+                identity_layer:
+                    StringIdentityLayer {
+                        binding: _binding,
+                        pattern,
+                        length,
+                        ..
+                    },
+                member_layer,
             } => {
                 constraints.push(format!("length {}", bounds(*length)));
-                if let Some(owned) = binding.annotation() {
-                    constraints.extend(owned.patterns().map(|pattern| {
-                        format!(
-                            "pattern {}",
-                            PatternSpecDisplay::new(pattern.as_ref()).quoted()
-                        )
-                    }));
-                } else if let Some(pattern) = pattern {
+                if let Some(pattern) = pattern {
                     constraints.push(format!(
                         "pattern {}",
                         PatternSpecDisplay::new(pattern.as_ref()).quoted()
                     ));
+                }
+                if let Some(pattern) = &member_layer.pattern {
+                    constraints.push(format!(
+                        "member pattern {}",
+                        PatternSpecDisplay::new(pattern.as_ref()).quoted()
+                    ));
+                }
+                if member_layer.length.is_some() {
+                    constraints.push(format!("member length {}", bounds(member_layer.length)));
                 }
             }
             AttrTypeKind::Reference {
@@ -13719,8 +13912,17 @@ impl<R: PatternForm> PatternAttributeType<R> {
                     ));
                 }
             }
-            AttrTypeKind::Int { range, .. } => {
-                constraints.push(format!("range {}", bounds(*range)))
+            AttrTypeKind::Int {
+                identity_layer: IntIdentityLayer { binding: _, range },
+                member_layer:
+                    IntMemberConstraints {
+                        range: member_range,
+                    },
+            } => {
+                constraints.push(format!("range {}", bounds(*range)));
+                if member_range.is_some() {
+                    constraints.push(format!("member range {}", bounds(*member_range)));
+                }
             }
             AttrTypeKind::Float { range, .. } => {
                 constraints.push(format!("range {}", bounds(*range)))
@@ -13738,8 +13940,14 @@ impl<R: PatternForm> PatternAttributeType<R> {
 
     pub(crate) fn has_empty_scalar_intersection(&self) -> bool {
         match &self.kind {
-            AttrTypeKind::String { binding, .. }
-            | AttrTypeKind::Int { binding, .. }
+            AttrTypeKind::String {
+                identity_layer: StringIdentityLayer { binding, .. },
+                ..
+            }
+            | AttrTypeKind::Int {
+                identity_layer: IntIdentityLayer { binding, .. },
+                ..
+            }
             | AttrTypeKind::Float { binding, .. } => binding
                 .annotation()
                 .is_some_and(crate::parser::ResolvedSchemaType::has_empty_intersection),
@@ -13789,61 +13997,18 @@ pub fn builtin_type_registry() -> &'static HashMap<TypeIdentity, CompiledAttribu
 }
 
 fn same_builtin_declaration(
-    declaration: &CompiledAttributeType,
-    builtin: &CompiledAttributeType,
+    declaration: Option<ScalarIdentityParts<'_>>,
+    builtin: ScalarIdentityParts<'_>,
 ) -> bool {
-    let callbacks_match = |actual: Option<&CustomValidator>, expected: Option<&CustomValidator>| {
-        actual
-            .zip(expected)
-            .is_some_and(|(actual, expected)| Arc::ptr_eq(actual, expected))
+    let Some(declaration) = declaration else {
+        return false;
     };
-    match (declaration.raw_shape(), builtin.raw_shape()) {
-        (RawShape::UnloadedSchemaType(_), _) | (_, RawShape::UnloadedSchemaType(_)) => false,
-        (
-            RawShape::String {
-                pattern: a_pattern,
-                length: a_length,
-                validate: a_validate,
-                to_dsl: a_dsl,
-                ..
-            },
-            RawShape::String {
-                pattern: b_pattern,
-                length: b_length,
-                validate: b_validate,
-                to_dsl: b_dsl,
-                ..
-            },
-        ) => {
-            a_pattern == b_pattern
-                && a_length == b_length
-                && a_dsl == b_dsl
-                && callbacks_match(a_validate, b_validate)
-        }
-        (
-            RawShape::Int {
-                range: a_range,
-                validate: a_validate,
-                ..
-            },
-            RawShape::Int {
-                range: b_range,
-                validate: b_validate,
-                ..
-            },
-        ) => a_range == b_range && callbacks_match(a_validate, b_validate),
-        (
-            RawShape::Float {
-                range: a_range,
-                validate: a_validate,
-                ..
-            },
-            RawShape::Float {
-                range: b_range,
-                validate: b_validate,
-                ..
-            },
-        ) => a_range == b_range && callbacks_match(a_validate, b_validate),
+    if declaration.signature() != builtin.signature() {
+        return false;
+    }
+    match (declaration.callback(), builtin.callback()) {
+        (Some(actual), Some(expected)) => Arc::ptr_eq(actual, expected),
+        (None, None) => true,
         _ => false,
     }
 }
@@ -13864,8 +14029,14 @@ pub fn builtin_validator_registry()
                 AttrTypeKind::UnloadedSchemaType(_) => {
                     unreachable!("built-ins carry scalar declarations")
                 }
-                AttrTypeKind::String { binding, .. } => (RefinedScalarKind::String, binding),
-                AttrTypeKind::Int { binding, .. } => (RefinedScalarKind::Int, binding),
+                AttrTypeKind::String {
+                    identity_layer: StringIdentityLayer { binding, .. },
+                    ..
+                } => (RefinedScalarKind::String, binding),
+                AttrTypeKind::Int {
+                    identity_layer: IntIdentityLayer { binding, .. },
+                    ..
+                } => (RefinedScalarKind::Int, binding),
                 AttrTypeKind::Float { binding, .. } => (RefinedScalarKind::Float, binding),
                 _ => continue,
             };

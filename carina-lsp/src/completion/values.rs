@@ -920,10 +920,18 @@ impl CompletionProvider {
                 length: _,
             })
             | Ok(Shape::String {
-                identity: Some(id), ..
+                identity_layer:
+                    carina_core::schema::StringIdentityParts {
+                        identity: Some(id), ..
+                    },
+                ..
             })
             | Ok(Shape::Int {
-                identity: Some(id), ..
+                identity_layer:
+                    carina_core::schema::IntIdentityParts {
+                        identity: Some(id), ..
+                    },
+                ..
             })
             | Ok(Shape::Float {
                 identity: Some(id), ..
@@ -1041,10 +1049,18 @@ impl CompletionProvider {
                 },
             ],
             Shape::String {
-                identity: Some(id), ..
+                identity_layer:
+                    carina_core::schema::StringIdentityParts {
+                        identity: Some(id), ..
+                    },
+                ..
             } if id.kind == "Cidr" || id.kind == "Ipv4Cidr" => self.cidr_completions(),
             Shape::String {
-                identity: Some(id), ..
+                identity_layer:
+                    carina_core::schema::StringIdentityParts {
+                        identity: Some(id), ..
+                    },
+                ..
             } if id.kind == "Ipv6Cidr" => self.ipv6_cidr_completions(),
             // Generic ARN snippet only for the bare `Arn` type. Specific
             // ARN families (`IamRoleArn`, `IamPolicyArn`,
@@ -1056,7 +1072,11 @@ impl CompletionProvider {
             // the per-type formats are useful enough to justify the
             // surface. See #2621.
             Shape::String {
-                identity: Some(id), ..
+                identity_layer:
+                    carina_core::schema::StringIdentityParts {
+                        identity: Some(id), ..
+                    },
+                ..
             } if id.kind == "Arn" => self.arn_completions(),
             // AvailabilityZone is split into two distinct types post-S2.5:
             // `aws.AvailabilityZone.ZoneName` and `aws.AvailabilityZone.ZoneId`.
@@ -1065,7 +1085,11 @@ impl CompletionProvider {
             // zone-name typed sinks — zone-id values look like `usw2-az1` and
             // are not derivable from region code + letter.
             Shape::String {
-                identity: Some(id), ..
+                identity_layer:
+                    carina_core::schema::StringIdentityParts {
+                        identity: Some(id), ..
+                    },
+                ..
             } if id.kind == "ZoneName"
                 && id.segments.first().map(String::as_str) == Some("AvailabilityZone") =>
             {
@@ -2586,13 +2610,26 @@ fn return_type_fits(
                 .any(|member| return_type_fits(ret, member.as_attr(), budget));
         }
         Shape::String {
-            identity,
-            pattern,
-            length,
-            to_dsl,
-            ..
+            identity_layer:
+                carina_core::schema::StringIdentityParts {
+                    identity,
+                    pattern,
+                    length,
+                    to_dsl,
+                    validate: _validate,
+                },
+            member_layer:
+                carina_core::schema::StringMemberParts {
+                    pattern: member_pattern,
+                    length: member_length,
+                },
         } => (
-            identity.is_none() && pattern.is_none() && length.is_none() && to_dsl.is_none(),
+            identity.is_none()
+                && pattern.is_none()
+                && length.is_none()
+                && to_dsl.is_none()
+                && member_pattern.is_none()
+                && member_length.is_none(),
             to_dsl.is_none(),
         ),
         Shape::UnloadedSchemaType(_)
@@ -2759,6 +2796,42 @@ fn collect_named_provider_instance_bindings(
 #[cfg(test)]
 mod return_type_fits_tests {
     use super::*;
+
+    #[test]
+    fn member_refined_strings_offer_only_constructed_string_builtins() {
+        use carina_core::schema::{
+            CompiledPattern, PatternMatch, PatternSpec, StringIdentityLayer,
+            StringMemberConstraints,
+        };
+        for member in [
+            StringMemberConstraints::new(None, Some((Some(1), Some(16)))),
+            StringMemberConstraints::new(
+                Some(
+                    CompiledPattern::try_new(&PatternSpec::new("[a-z]+", PatternMatch::Full))
+                        .unwrap(),
+                ),
+                None,
+            ),
+        ] {
+            let constrained = AttributeType::string_member(
+                StringIdentityLayer::new(None, None, None, None),
+                member,
+            );
+            for sink in [
+                constrained.clone(),
+                AttributeType::union(vec![AttributeType::bool(), constrained]),
+            ] {
+                let items = CompletionProvider::builtin_function_completions_for_type(&sink);
+                assert_eq!(
+                    items
+                        .iter()
+                        .map(|item| item.label.as_str())
+                        .collect::<Vec<_>>(),
+                    ["cidr_subnet", "join", "lower", "replace", "trim", "upper"]
+                );
+            }
+        }
+    }
 
     #[test]
     fn issue_4282_review_transformed_string_has_no_builtin_completions() {

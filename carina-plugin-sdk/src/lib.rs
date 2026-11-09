@@ -2794,19 +2794,19 @@ mod explicit_pattern_mode_tests {
             serde_json::from_str(&provider_schema_to_json(&witness).unwrap()).unwrap();
         let attrs = &json["resources"][0]["attributes"];
         assert_eq!(
-            attrs["full"]["attr_type"]["pattern"],
+            attrs["full"]["attr_type"]["identity_layer"]["pattern"],
             serde_json::json!({"regex":"abc", "mode":{"kind":"full"}})
         );
         assert_eq!(
-            attrs["substring"]["attr_type"]["pattern"],
+            attrs["substring"]["attr_type"]["identity_layer"]["pattern"],
             serde_json::json!({"regex":"abc", "mode":{"kind":"substring", "reason":"The upstream contract permits surrounding text"}})
         );
         let config_json: serde_json::Value =
             serde_json::from_str(&provider_config_schema_to_json(&config).unwrap()).unwrap();
         for name in ["full", "substring"] {
             assert_eq!(
-                config_json[name]["pattern"],
-                attrs[name]["attr_type"]["pattern"]
+                config_json[name]["identity_layer"]["pattern"],
+                attrs[name]["attr_type"]["identity_layer"]["pattern"]
             );
         }
     }

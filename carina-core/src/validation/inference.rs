@@ -293,6 +293,66 @@ struct InferenceSchemaContext<'a> {
     provider_context: &'a crate::parser::ProviderContext,
 }
 
+/// Join declaration evidence through the same identity admission used by sinks.
+/// A member restriction belongs to its producer, not to every collection item.
+/// The expression tree retains each child for its eventual destination check.
+pub(crate) fn join_inferred_types(
+    left: &TypeExpr,
+    right: &TypeExpr,
+    context: &crate::parser::ProviderContext,
+) -> Option<TypeExpr> {
+    if left == right {
+        return Some(left.clone());
+    }
+    match (left, right) {
+        (TypeExpr::List(left), TypeExpr::List(right)) => {
+            return join_inferred_types(left, right, context)
+                .map(|ty| TypeExpr::List(Box::new(ty)));
+        }
+        (TypeExpr::Map(left), TypeExpr::Map(right)) => {
+            return join_inferred_types(left, right, context).map(|ty| TypeExpr::Map(Box::new(ty)));
+        }
+        _ => {}
+    }
+    let scalar_identity = |ty: &TypeExpr| match ty {
+        TypeExpr::SchemaType { owned } => {
+            // Enum bases remain part of the enum declaration; they are not
+            // scalar member layers and cannot be erased by a collection join.
+            if owned
+                .resolve_projection(context)
+                .ok()?
+                .is_some_and(|declaration| declaration.scalar_identity_parts().is_none())
+            {
+                return None;
+            }
+            Some(owned.identity().clone())
+        }
+        TypeExpr::Simple(name) => {
+            crate::provider::identified_custom_type_identity(name.declaration()).cloned()
+        }
+        _ => None,
+    };
+    let left_identity = scalar_identity(left)?;
+    let right_identity = scalar_identity(right)?;
+    for identity in [left_identity, right_identity] {
+        let canonical =
+            super::resolve_type_expr(&TypeExpr::try_from(identity).ok()?, context).ok()?;
+        if [left, right].into_iter().all(|source| {
+            matches!(
+                super::typecheck::inferred_type_assignment(
+                    &canonical,
+                    source,
+                    &context.custom_types
+                ),
+                crate::schema::TypeAssignability::Assignable,
+            )
+        }) {
+            return Some(canonical);
+        }
+    }
+    None
+}
+
 fn heterogeneous_collection_error(first: &TypeExpr, next: &TypeExpr) -> InferenceError {
     InferenceError::HeterogeneousCollection {
         types: crate::schema::MismatchTypeNames::for_type_exprs(first, next),
@@ -328,11 +388,8 @@ fn infer_projected_type_with_visiting<P: PlaceholderKind, B: BindingAddress>(
                 context,
                 visiting,
             )?;
-            if then_type == else_type {
-                Ok(then_type)
-            } else {
-                Err(heterogeneous_collection_error(&then_type, &else_type).into())
-            }
+            join_inferred_types(&then_type, &else_type, context.provider_context)
+                .ok_or_else(|| heterogeneous_collection_error(&then_type, &else_type).into())
         }
         Value::Concrete(ConcreteValue::String(_)) => Ok(TypeExpr::String),
         // Enum identifiers infer as `String` for the type-expression
@@ -408,7 +465,7 @@ fn infer_projected_type_with_visiting<P: PlaceholderKind, B: BindingAddress>(
                 }
                 _ => crate::parser::retained::EmptyCoalesceDefault::None,
             };
-            crate::parser::retained::coalesce_type(left, right, empty)
+            crate::parser::retained::coalesce_type(left, right, empty, context.provider_context)
         }
         Value::Deferred(
             DeferredValue::FunctionCall { name, args, .. }
@@ -633,7 +690,7 @@ where
     // prefers loud failures; the user who wants the loose semantics
     // can add an explicit annotation to the export.
     let mut iter = items.into_iter();
-    let first = match iter.next() {
+    let mut first = match iter.next() {
         Some(v) => infer_projected_type_with_visiting(v, bindings, context, visiting)?,
         None => {
             return Err(InferenceError::UnknownType {
@@ -644,9 +701,8 @@ where
     };
     for next in iter {
         let next_type = infer_projected_type_with_visiting(next, bindings, context, visiting)?;
-        if next_type != first {
-            return Err(heterogeneous_collection_error(&first, &next_type).into());
-        }
+        first = join_inferred_types(&first, &next_type, context.provider_context)
+            .ok_or_else(|| heterogeneous_collection_error(&first, &next_type))?;
     }
     Ok(wrap(Box::new(first)))
 }
@@ -913,11 +969,19 @@ pub(super) fn attribute_type_to_type_expr(
     schema_owner: &str,
 ) -> TypeExpr {
     if let AttrTypeKind::String {
-        binding: crate::schema::RefinementBinding::Annotation(witness),
+        identity_layer:
+            crate::schema::StringIdentityLayer {
+                binding: crate::schema::RefinementBinding::Annotation(witness),
+                ..
+            },
         ..
     }
     | AttrTypeKind::Int {
-        binding: crate::schema::RefinementBinding::Annotation(witness),
+        identity_layer:
+            crate::schema::IntIdentityLayer {
+                binding: crate::schema::RefinementBinding::Annotation(witness),
+                ..
+            },
         ..
     }
     | AttrTypeKind::Float {
@@ -934,8 +998,14 @@ pub(super) fn attribute_type_to_type_expr(
             return TypeExpr::UnloadedSchemaType(unloaded.clone());
         }
         AttrTypeKind::Reference { identity, .. } => Some(identity),
-        AttrTypeKind::String { binding, .. }
-        | AttrTypeKind::Int { binding, .. }
+        AttrTypeKind::String {
+            identity_layer: crate::schema::StringIdentityLayer { binding, .. },
+            ..
+        }
+        | AttrTypeKind::Int {
+            identity_layer: crate::schema::IntIdentityLayer { binding, .. },
+            ..
+        }
         | AttrTypeKind::Float { binding, .. } => binding.identity(),
         AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }

@@ -45,6 +45,24 @@ impl Characters {
             Self::from_set(&CharSet::new(ranges).expect("valid scalar ranges"))
         }
     }
+    fn intersect(&self, other: &Self) -> Self {
+        let ranges = self
+            .0
+            .iter()
+            .flat_map(|(a, b)| {
+                other.0.iter().filter_map(move |(c, d)| {
+                    let start = (*a).max(*c);
+                    let end = (*b).min(*d);
+                    (start <= end).then_some((start, end))
+                })
+            })
+            .collect::<Vec<_>>();
+        if ranges.is_empty() {
+            Self::empty()
+        } else {
+            Self::from_set(&CharSet::new(ranges).expect("valid scalar ranges"))
+        }
+    }
     fn subset(&self, other: &Self) -> bool {
         self.0
             .iter()
@@ -704,9 +722,43 @@ impl Estimator<'_> {
             }
             _ if keys => Summary::unknown(&self.query),
             AttrTypeKind::String {
-                pattern, length, ..
+                identity_layer:
+                    crate::schema::StringIdentityLayer {
+                        binding: _binding,
+                        pattern,
+                        length,
+                        to_dsl: _to_dsl,
+                    },
+                member_layer:
+                    crate::schema::StringMemberConstraints {
+                        pattern: member_pattern,
+                        length: member_length,
+                    },
+            } => {
+                let Some(mut length) = LengthInterval::from_bounds(length.as_ref())
+                    .intersect(LengthInterval::from_bounds(member_length.as_ref()))
+                else {
+                    return Summary::unknown(&self.query);
+                };
+                let mut alphabet = Characters::all();
+                for pattern in [pattern.as_ref(), member_pattern.as_ref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some((set, pattern_length)) = pattern.whole_string_class() {
+                        let Some(intersection) = length.intersect(pattern_length) else {
+                            return Summary::unknown(&self.query);
+                        };
+                        length = intersection;
+                        alphabet = alphabet.intersect(&Characters::from_set(&set));
+                        if alphabet.0.is_empty() {
+                            return Summary::unknown(&self.query);
+                        }
+                    }
+                }
+                Summary::homogeneous(length, alphabet, &self.query)
             }
-            | AttrTypeKind::Reference {
+            AttrTypeKind::Reference {
                 pattern, length, ..
             } => {
                 let mut length = LengthInterval::from_bounds(length.as_ref());
@@ -1039,5 +1091,54 @@ fn violation(rule: &InputRule<Compiled>) -> InputViolation {
         path: rule.path().clone(),
         code: rule.code().clone(),
         reason: rule.predicate().violation_reason(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{
+        AttributeType, PatternMatch, PatternSpec, StringIdentityLayer, StringMemberConstraints,
+        ValidatedConfigSchema,
+    };
+
+    #[test]
+    fn member_layer_narrows_declared_summary() {
+        let schema = ValidatedConfigSchema::validate(BTreeMap::from([(
+            "value".into(),
+            AttributeType::string_member(
+                StringIdentityLayer::new(
+                    None,
+                    Some(PatternSpec::new("[a-z]{1,12}", PatternMatch::Full)),
+                    Some((Some(1), Some(20))),
+                    None,
+                ),
+                StringMemberConstraints::new(
+                    Some(PatternSpec::new("[m-z]{2,8}", PatternMatch::Full)),
+                    Some((Some(3), Some(5))),
+                ),
+            ),
+        )]))
+        .unwrap();
+        let predicate = InputPredicate::Length {
+            min: Some(0),
+            max: Some(10),
+        };
+        let mut estimator = Estimator {
+            types: None,
+            literal_key_type: None,
+            query: Query::new(&predicate),
+            steps: 0,
+        };
+        let summary = estimator.declared(&schema.parts()["value"], &BTreeMap::new(), false, 0);
+        assert_eq!(
+            summary.length,
+            LengthInterval {
+                min: 3,
+                max: Some(5)
+            }
+        );
+        assert!(summary.alphabet.contains('m'));
+        assert!(!summary.alphabet.contains('a'));
     }
 }

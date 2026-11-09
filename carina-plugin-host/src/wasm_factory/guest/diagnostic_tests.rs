@@ -523,7 +523,7 @@ async fn legacy_aws_import_is_rejected_before_linking() {
             let text = message.as_str();
             assert!(text.contains("carina:provider@0.1.0"), "{text}");
             assert!(text.contains("carina:provider@0.2.0"), "{text}");
-            assert!(text.contains("protocol 25"), "{text}");
+            assert!(text.contains("protocol 26"), "{text}");
         }
         _other => panic!(
             "legacy imports must produce the typed WIT incompatibility before linker failure"
@@ -576,7 +576,7 @@ async fn legacy_start_executes_zero_guest_code() {
         Err(WasmBindingCreationError::ProtocolVersion(message)) => {
             assert!(message.as_str().contains("carina:provider@0.1.0"));
             assert!(message.as_str().contains("carina:provider@0.2.0"));
-            assert!(message.as_str().contains("protocol 25"));
+            assert!(message.as_str().contains("protocol 26"));
         }
         _other => panic!("a legacy component must be rejected before instantiation"),
     }

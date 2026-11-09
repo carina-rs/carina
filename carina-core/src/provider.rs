@@ -8209,8 +8209,14 @@ pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option
     match attribute_type.raw_shape() {
         RawShape::UnloadedSchemaType(unloaded) => Some(unloaded.identity()),
         RawShape::Reference { .. } => None,
-        RawShape::String { identity, .. }
-        | RawShape::Int { identity, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { identity, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { identity, .. },
+            ..
+        }
         | RawShape::Float { identity, .. } => identity,
         RawShape::Enum { identity, .. } => Some(identity),
         RawShape::Bool
@@ -8237,17 +8243,31 @@ pub fn identified_custom_type_scalar_kind(
             length: _length,
         } => Some(RefinedScalarKind::String),
         RawShape::String {
-            identity: Some(_), ..
+            identity_layer:
+                crate::schema::StringIdentityParts {
+                    identity: Some(_), ..
+                },
+            ..
         } => Some(RefinedScalarKind::String),
         RawShape::Int {
-            identity: Some(_), ..
+            identity_layer:
+                crate::schema::IntIdentityParts {
+                    identity: Some(_), ..
+                },
+            ..
         } => Some(RefinedScalarKind::Int),
         RawShape::Float {
             identity: Some(_), ..
         } => Some(RefinedScalarKind::Float),
         RawShape::Enum { base, .. } => scalar_kind_from_base(base),
-        RawShape::String { identity: None, .. }
-        | RawShape::Int { identity: None, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { identity: None, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { identity: None, .. },
+            ..
+        }
         | RawShape::Float { identity: None, .. }
         | RawShape::Bool
         | RawShape::Duration
@@ -8325,29 +8345,41 @@ pub(crate) fn canonicalize_custom_type_value(
         }
         (
             RawShape::String {
-                identity: _,
-                pattern: _,
-                length: _,
-                validate: _,
-                to_dsl: _,
+                identity_layer:
+                    crate::schema::StringIdentityParts {
+                        identity: _,
+                        pattern: _,
+                        length: _,
+                        validate: _,
+                        to_dsl: _,
+                    },
+                member_layer: _,
             },
             Value::Concrete(ConcreteValue::String(value)),
         ) => Ok(Some(CanonicalCustomTypeValue::from_literal_string(value))),
         (
             RawShape::String {
-                identity: _,
-                pattern: _,
-                length: _,
-                validate: _,
-                to_dsl: _,
+                identity_layer:
+                    crate::schema::StringIdentityParts {
+                        identity: _,
+                        pattern: _,
+                        length: _,
+                        validate: _,
+                        to_dsl: _,
+                    },
+                member_layer: _,
             },
             Value::Concrete(ConcreteValue::EnumIdentifier(raw)),
         ) => Ok(Some(CanonicalCustomTypeValue(raw.as_str().to_string()))),
         (
             RawShape::Int {
-                identity: _,
-                range: _,
-                validate: _,
+                identity_layer:
+                    crate::schema::IntIdentityParts {
+                        identity: _,
+                        range: _,
+                        validate: _,
+                    },
+                member_layer: _,
             },
             Value::Concrete(ConcreteValue::Int(value)),
         ) => Ok(Some(CanonicalCustomTypeValue(value.to_string()))),
@@ -8813,10 +8845,18 @@ fn collect_type_names_from_type(
             names.insert(identity.clone());
         }
         RawShape::String {
-            identity: Some(id), ..
+            identity_layer:
+                crate::schema::StringIdentityParts {
+                    identity: Some(id), ..
+                },
+            ..
         }
         | RawShape::Int {
-            identity: Some(id), ..
+            identity_layer:
+                crate::schema::IntIdentityParts {
+                    identity: Some(id), ..
+                },
+            ..
         }
         | RawShape::Float {
             identity: Some(id), ..
@@ -8831,8 +8871,14 @@ fn collect_type_names_from_type(
         } => {
             names.insert(id.clone());
         }
-        RawShape::String { identity: None, .. }
-        | RawShape::Int { identity: None, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { identity: None, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { identity: None, .. },
+            ..
+        }
         | RawShape::Float { identity: None, .. } => {}
         RawShape::List {
             element_type: inner,
@@ -8875,8 +8921,14 @@ fn local_custom_validator(
             pattern: _pattern,
             length: _length,
         } => None,
-        RawShape::String { validate, .. }
-        | RawShape::Int { validate, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { validate, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { validate, .. },
+            ..
+        }
         | RawShape::Float { validate, .. }
         | RawShape::Enum { validate, .. } => validate,
         RawShape::Bool
@@ -9441,6 +9493,7 @@ where
     ) -> Result<crate::parser::ResolvedSchemaType, crate::parser::CustomTypeValidationError> {
         use crate::parser::{CustomTypeValidationError, ResolvedSchemaType, SchemaTypeOwner};
         let mut resolved: Option<ResolvedSchemaType> = None;
+        let mut identity_signature: Option<String> = None;
         for owner in owned.owners().iter() {
             let SchemaTypeOwner::Provider(owner) = owner;
             let missing = || CustomTypeValidationError::MissingDeclaration {
@@ -9454,11 +9507,31 @@ where
                 .filter(|declarations| !declarations.is_empty())
                 .ok_or_else(missing)?;
             for declaration in declarations {
-                let declaration = ResolvedSchemaType::from_schema_declaration(owner, declaration)
-                    .filter(|declaration| declaration.scalar_kind() == owned.scalar_kind())
-                    .ok_or_else(missing)?;
+                let identity_declaration = declaration.scalar_identity_parts();
+                if let Some(parts) = identity_declaration {
+                    let signature = parts.agreement_signature();
+                    if identity_signature
+                        .as_ref()
+                        .is_some_and(|first| first != &signature)
+                    {
+                        return Err(CustomTypeValidationError::Rejected {
+                            owner: owner.clone(),
+                            identity: owned.identity().clone(),
+                            message: "conflicting identity-layer declarations across schema owners"
+                                .into(),
+                        });
+                    }
+                    identity_signature.get_or_insert(signature);
+                }
+                let declaration = if identity_declaration.is_some() {
+                    ResolvedSchemaType::from_identity_declaration(owner, declaration)
+                } else {
+                    ResolvedSchemaType::from_schema_declaration(owner, declaration)
+                }
+                .filter(|declaration| declaration.scalar_kind() == owned.scalar_kind())
+                .ok_or_else(missing)?;
                 resolved = Some(match resolved {
-                    Some(existing) => existing.conjoin(&declaration),
+                    Some(existing) => existing.conjoin(&declaration)?,
                     None => declaration,
                 });
             }
@@ -9487,7 +9560,13 @@ where
                             identity: owned.identity().clone(),
                         }
                     })?;
-                Ok((owner.to_string(), declarations.clone()))
+                Ok((
+                    owner.to_string(),
+                    declarations
+                        .iter()
+                        .map(AttributeType::identity_only_declaration)
+                        .collect(),
+                ))
             })
             .collect()
     }

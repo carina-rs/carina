@@ -289,7 +289,7 @@ fn identity_edges_require_every_annotation_owner() {
 }
 
 #[test]
-fn identity_edges_preserve_rule_seven_length_containment() {
+fn identity_edges_defer_member_containment_but_reject_disjointness() {
     let loaded = snapshot(&[("p", true)]);
     let source = AttributeType::refined_string(
         Some(identity("NewName")),
@@ -306,6 +306,19 @@ fn identity_edges_preserve_rule_seven_length_containment() {
     assert_eq!(
         assignment(
             &source,
+            &sink,
+            &loaded.provider_context().custom_types,
+            &P_OWNER
+        ),
+        Ok(true)
+    );
+    let disjoint = AttributeType::string_member(
+        carina_core::schema::StringIdentityLayer::new(Some(identity("NewName")), None, None, None),
+        carina_core::schema::StringMemberConstraints::new(None, Some((Some(100), Some(128)))),
+    );
+    assert_eq!(
+        assignment(
+            &disjoint,
             &sink,
             &loaded.provider_context().custom_types,
             &P_OWNER

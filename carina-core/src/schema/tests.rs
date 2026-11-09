@@ -3227,7 +3227,11 @@ fn provider_schema_rejects_conflicting_builtin_bare_declarations() {
             None,
             match types::email().raw_shape() {
                 RawShape::String {
-                    validate: Some(validate),
+                    identity_layer:
+                        crate::schema::StringIdentityParts {
+                            validate: Some(validate),
+                            ..
+                        },
                     ..
                 } => validate.clone(),
                 _ => unreachable!(),
@@ -3769,9 +3773,13 @@ fn https_url_builtin_rejects_non_string_values() {
 fn https_url_builtin_constructor_and_json_roundtrip_preserve_validation() {
     let url_type = admit_builtin_type(types::https_url());
     let AttrTypeKind::String {
-        binding,
-        pattern,
-        length,
+        identity_layer:
+            crate::schema::StringIdentityLayer {
+                binding,
+                pattern,
+                length,
+                ..
+            },
         ..
     } = url_type.kind()
     else {
@@ -10414,14 +10422,22 @@ fn contains_unrefined_primitive(attr: &AttributeType) -> bool {
     match &attr.kind {
         AttrTypeKind::UnloadedSchemaType(_) => false,
         AttrTypeKind::String {
-            binding: RefinementBinding::MetadataOnly(None),
-            pattern: None,
-            length: None,
+            identity_layer:
+                crate::schema::StringIdentityLayer {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    pattern: None,
+                    length: None,
+                    ..
+                },
             ..
         }
         | AttrTypeKind::Int {
-            binding: RefinementBinding::MetadataOnly(None),
-            range: None,
+            identity_layer:
+                crate::schema::IntIdentityLayer {
+                    binding: RefinementBinding::MetadataOnly(None),
+                    range: None,
+                    ..
+                },
             ..
         }
         | AttrTypeKind::Float {
@@ -11134,24 +11150,28 @@ fn assignable_specific_arn_without_pattern_flows_into_generic_arn_with_pattern()
 }
 
 #[test]
-fn assignable_identified_custom_length_must_be_contained() {
+fn assignable_identified_members_defer_overlap_and_reject_disjointness() {
     let mk = |length: Option<(Option<u64>, Option<u64>)>| {
-        AttributeType::refined_string_with_validator(
-            TypeIdentity::bare("SizedString"),
-            None,
-            length,
-            crate::schema::legacy_validator(|_| Ok(())),
-            None,
+        AttributeType::string_member(
+            crate::schema::StringIdentityLayer::new(
+                Some(TypeIdentity::bare("SizedString")),
+                None,
+                None,
+                None,
+            ),
+            crate::schema::StringMemberConstraints::new(None, length),
         )
     };
 
     let narrow = mk(Some((Some(1), Some(32))));
     let wide = mk(Some((Some(1), Some(64))));
     assert!(assignable(&narrow, &wide));
-    assert!(!assignable(&wide, &narrow));
+    assert!(assignable(&wide, &narrow));
 
     let unproven = mk(None);
-    assert!(!assignable(&unproven, &wide));
+    assert!(assignable(&unproven, &wide));
+    let disjoint = mk(Some((Some(100), Some(128))));
+    assert!(!assignable(&disjoint, &wide));
 }
 
 /// carina#3413: two callers that independently construct the SAME
@@ -11749,10 +11769,10 @@ fn typed_ref_anonymous_refined_string_preserves_named_identity_rules() {
     let narrow = named(&[], Some((Some(10), Some(40))));
     let wide = named(&[], Some((Some(1), Some(1024))));
     assert!(
-        !assignable(&wide, &narrow),
-        "rule 7 still requires named length containment"
+        assignable(&wide, &narrow),
+        "matching identity retains the destination value check"
     );
-    assert!(!assignable(&arn, &narrow));
+    assert!(assignable(&arn, &narrow));
     assert!(assignable(&narrow, &wide));
 }
 
@@ -12127,9 +12147,13 @@ fn custom_carries_semantic_name_pattern_length() {
     );
     match t.kind() {
         AttrTypeKind::String {
-            binding,
-            pattern,
-            length,
+            identity_layer:
+                crate::schema::StringIdentityLayer {
+                    binding,
+                    pattern,
+                    length,
+                    ..
+                },
             ..
         } => {
             assert_eq!(binding.identity().map(|id| id.kind.as_str()), Some("VpcId"));
@@ -12249,7 +12273,7 @@ fn schema_pattern_dialect_rejects_unicode_account_ids_and_preserves_transport() 
         let wire = crate::protocol_convert::resource_schema_to_protocol(&admitted).unwrap();
         assert!(matches!(
             &wire.attributes["account_id"].attr_type,
-            carina_provider_protocol::types::AttributeType::String { pattern: Some(pattern), .. } if pattern.as_str() == source && matches!(pattern.mode(), carina_provider_protocol::types::PatternMatch::Full)
+            carina_provider_protocol::types::AttributeType::String { identity_layer: carina_provider_protocol::types::StringIdentityLayer { pattern: Some(pattern), .. }, member_layer: _ } if pattern.as_str() == source && matches!(pattern.mode(), carina_provider_protocol::types::PatternMatch::Full)
         ));
         let decoded = crate::protocol_convert::protocol_to_resource_schema(&wire).unwrap();
         assert_eq!(
@@ -12832,7 +12856,10 @@ fn validate_email_type() {
 
     // Type identity: refined String with kind "Email"
     match t.kind() {
-        AttrTypeKind::String { binding, .. } => {
+        AttrTypeKind::String {
+            identity_layer: crate::schema::StringIdentityLayer { binding, .. },
+            ..
+        } => {
             assert_eq!(binding.identity().map(|id| id.kind.as_str()), Some("Email"));
         }
         other => panic!("Expected refined String, got: {:?}", other),
@@ -13034,7 +13061,10 @@ fn validate_http_response_status_code_type() {
 
     // Type identity: refined String with kind "HttpResponseStatusCode"
     match t.kind() {
-        AttrTypeKind::String { binding, .. } => {
+        AttrTypeKind::String {
+            identity_layer: crate::schema::StringIdentityLayer { binding, .. },
+            ..
+        } => {
             assert_eq!(
                 binding.identity().map(|id| id.kind.as_str()),
                 Some("HttpResponseStatusCode")
@@ -18264,20 +18294,10 @@ fn pattern_reason_controls_are_escaped_in_every_diagnostic() {
             None,
             None,
         );
-        let annotation = AttributeType {
-            kind: AttrTypeKind::String {
-                binding: RefinementBinding::Annotation(
-                    crate::parser::ResolvedSchemaType::from_schema_declaration(
-                        "test",
-                        &declaration,
-                    )
-                    .unwrap(),
-                ),
-                pattern: None,
-                length: None,
-                to_dsl: None,
-            },
-        };
+        let annotation =
+            crate::parser::ResolvedSchemaType::from_schema_declaration("test", &declaration)
+                .unwrap()
+                .materialize();
         let draft = super::AttributeType::refined_string(None, Some(spec.clone()), None, None);
         let mismatch = string
             .validate(&Value::Concrete(ConcreteValue::String("bad".into())))

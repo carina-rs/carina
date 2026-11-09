@@ -19,7 +19,7 @@ use super::{
 };
 use crate::resource::Value;
 
-const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v12";
+const ENCODING_VERSION: &str = "carina-resource-schema-semantic-v13";
 
 #[derive(Default)]
 struct CanonicalEncoder {
@@ -423,15 +423,25 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             encode_optional_u64_range(encoder, *length);
         }
         AttrTypeKind::String {
-            binding,
-            pattern,
-            length,
-            to_dsl,
+            identity_layer:
+                crate::schema::StringIdentityLayer {
+                    binding,
+                    pattern,
+                    length,
+                    to_dsl,
+                },
+            member_layer,
         } => {
+            let super::StringMemberParts {
+                pattern: member_pattern,
+                length: member_length,
+            } = member_layer.parts();
             encoder.tag(0);
             encoder.option(binding.identity(), encode_type_identity);
             encoder.option(pattern.as_ref().map(AsRef::as_ref), encode_pattern);
             encode_optional_u64_range(encoder, *length);
+            encoder.option(member_pattern, encode_pattern);
+            encode_optional_u64_range(encoder, member_length);
             encode_callback_presence(encoder, binding.callback().is_some());
             encoder.option(to_dsl.as_ref(), encode_dsl_transform);
         }
@@ -452,10 +462,17 @@ fn encode_attribute_type(encoder: &mut CanonicalEncoder, attribute_type: &Attrib
             encoder.strings(&values);
             encode_callback_presence(encoder, false);
         }
-        AttrTypeKind::Int { binding, range } => {
+        AttrTypeKind::Int {
+            identity_layer: crate::schema::IntIdentityLayer { binding, range },
+            member_layer,
+        } => {
             encoder.tag(3);
             encoder.option(binding.identity(), encode_type_identity);
             encode_optional_i64_range(encoder, *range);
+            let super::IntMemberParts {
+                range: member_range,
+            } = member_layer.parts();
+            encode_optional_i64_range(encoder, member_range);
             encode_callback_presence(encoder, binding.callback().is_some());
         }
         AttrTypeKind::Float { binding, range } => {
@@ -765,7 +782,7 @@ mod tests {
     fn callback_presence_markers_reflect_the_new_binding_model() {
         assert_eq!(
             attribute_type_encoding(AttributeType::string()),
-            vec![0, 0, 0, 0, 0, 0],
+            vec![0, 0, 0, 0, 0, 0, 0, 0],
             "String encodes validate before to_dsl"
         );
         assert_eq!(
@@ -780,7 +797,7 @@ mod tests {
         );
         assert_eq!(
             attribute_type_encoding(AttributeType::int()),
-            vec![3, 0, 0, 0],
+            vec![3, 0, 0, 0, 0],
             "Int encodes validate"
         );
         assert_eq!(

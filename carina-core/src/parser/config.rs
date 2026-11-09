@@ -426,6 +426,20 @@ impl ResolvedSchemaType {
         })))
     }
 
+    pub(crate) fn from_identity_declaration(
+        owner: impl Into<String>,
+        declaration: &AttributeType,
+    ) -> Option<Self> {
+        Some(Self(std::sync::Arc::new(ResolvedScalarDeclaration {
+            owned: OwnedTypeIdentity::from_schema_declaration(owner, declaration)?,
+            constraints: super::scalar_constraints::ScalarConstraints::from_identity(
+                declaration.scalar_identity_parts()?,
+            ),
+            projection: None,
+            projection_fingerprint: None,
+        })))
+    }
+
     pub(crate) fn from_declaration(
         owner: impl Into<String>,
         declaration: IdentifiedCustomTypeDeclaration<'_>,
@@ -434,12 +448,18 @@ impl ResolvedSchemaType {
             .expect("admitted scalar declaration")
     }
 
-    pub(crate) fn conjoin(&self, other: &Self) -> Self {
+    pub(crate) fn conjoin(&self, other: &Self) -> Result<Self, CustomTypeValidationError> {
         assert_eq!(self.identity(), other.identity());
         assert_eq!(self.scalar_kind(), other.scalar_kind());
         let mut constraints = self.0.constraints.clone();
-        constraints.intersect(&other.0.constraints);
-        Self(std::sync::Arc::new(ResolvedScalarDeclaration {
+        constraints
+            .intersect(&other.0.constraints)
+            .map_err(|message| CustomTypeValidationError::Rejected {
+                owner: self.provider_names().next().expect("owner").into(),
+                identity: self.identity().clone(),
+                message: message.into(),
+            })?;
+        Ok(Self(std::sync::Arc::new(ResolvedScalarDeclaration {
             owned: self
                 .0
                 .owned
@@ -447,7 +467,7 @@ impl ResolvedSchemaType {
             constraints,
             projection: None,
             projection_fingerprint: None,
-        }))
+        })))
     }
 
     pub(crate) fn into_annotation(mut self) -> Self {
@@ -484,9 +504,6 @@ impl ResolvedSchemaType {
     }
     pub(crate) fn has_empty_intersection(&self) -> bool {
         self.0.constraints.is_empty()
-    }
-    pub(crate) fn patterns(&self) -> impl Iterator<Item = &crate::schema::CompiledPattern> {
-        self.0.constraints.patterns()
     }
 }
 

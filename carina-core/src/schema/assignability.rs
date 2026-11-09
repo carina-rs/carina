@@ -11,6 +11,8 @@ use crate::parser::CustomTypeValidationError;
 #[derive(Debug, Clone, PartialEq)]
 #[must_use]
 pub enum TypeAssignability<'s> {
+    /// The declarations admit this flow; consumers still check the concrete
+    /// destination value, including its member constraints.
     Assignable,
     Mismatch,
     Unchecked(TypeAssignmentDeferral<'s>),
@@ -101,12 +103,13 @@ fn identity_leaf<R: PatternForm>(kind: &AttrTypeKind<R>) -> Option<IdentityLeaf<
     match kind {
         AttrTypeKind::UnloadedSchemaType(unloaded) => Some(IdentityLeaf::Unloaded(unloaded)),
         AttrTypeKind::String {
-            binding,
-            pattern: _,
-            length: _,
-            to_dsl: _,
+            identity_layer: crate::schema::StringIdentityLayer { binding, .. },
+            member_layer: _,
         }
-        | AttrTypeKind::Int { binding, range: _ }
+        | AttrTypeKind::Int {
+            identity_layer: crate::schema::IntIdentityLayer { binding, .. },
+            member_layer: _,
+        }
         | AttrTypeKind::Float { binding, range: _ } => {
             binding.identity().map(|_| IdentityLeaf::Scalar(binding))
         }
@@ -223,10 +226,8 @@ impl<'a, R: PatternForm> AssignmentSink<'a, R> {
                 length: _,
             }
             | AttrTypeKind::String {
-                binding: _,
-                pattern: _,
-                length: _,
-                to_dsl: _,
+                identity_layer: _,
+                member_layer: _,
             }
             | AttrTypeKind::ResourceHandle {
                 provider: _,
@@ -234,8 +235,8 @@ impl<'a, R: PatternForm> AssignmentSink<'a, R> {
             }
             | AttrTypeKind::StringLiteralSet { values: _ }
             | AttrTypeKind::Int {
-                binding: _,
-                range: _,
+                identity_layer: _,
+                member_layer: _,
             }
             | AttrTypeKind::Float {
                 binding: _,
@@ -372,6 +373,32 @@ enum NominalScalarConstraints {
 }
 
 impl NominalScalarConstraints {
+    fn provably_disjoint(self, sink: Self) -> bool {
+        fn disjoint<T: Copy + Ord>(
+            source: Option<(Option<T>, Option<T>)>,
+            sink: Option<(Option<T>, Option<T>)>,
+        ) -> bool {
+            matches!(super::intersect_bounds(source, sink), Some((Some(min), Some(max))) if min > max)
+        }
+        match (self, sink) {
+            (Self::String(source), Self::String(sink)) => disjoint(source, sink),
+            (Self::Int(source), Self::Int(sink)) => disjoint(source, sink),
+            (Self::Float(source), Self::Float(sink)) => disjoint(source, sink),
+            (Self::Int(source), Self::Float(sink)) => {
+                let (source_min, source_max) = source.unwrap_or((None, None));
+                let (sink_min, sink_max) = sink.unwrap_or((None, None));
+                sink_min.is_some_and(|min| {
+                    super::compare_int_float(source_max.unwrap_or(i64::MAX), min).is_lt()
+                }) || sink_max.is_some_and(|max| {
+                    super::compare_int_float(source_min.unwrap_or(i64::MIN), max).is_gt()
+                })
+            }
+            (Self::String(_), Self::Int(_) | Self::Float(_))
+            | (Self::Int(_), Self::String(_))
+            | (Self::Float(_), Self::String(_) | Self::Int(_)) => true,
+        }
+    }
+
     fn contained_by(self, sink: Self) -> bool {
         match (self, sink) {
             (Self::String(source), Self::String(sink)) => {
@@ -400,12 +427,19 @@ fn nominal_scalar_constraints<'a, R: PatternForm>(
     let resolved = resolve_refs_on_path(ty.attr, ty.defs, refs).ok()?;
     let constraints = match &resolved.attr.kind {
         AttrTypeKind::String {
-            binding: _,
-            pattern: _,
-            length,
-            to_dsl: _,
-        } => Some(NominalScalarConstraints::String(*length)),
-        AttrTypeKind::Int { binding: _, range } => Some(NominalScalarConstraints::Int(*range)),
+            identity_layer,
+            member_layer,
+        } => Some(NominalScalarConstraints::String(super::intersect_bounds(
+            identity_layer.length,
+            member_layer.length,
+        ))),
+        AttrTypeKind::Int {
+            identity_layer,
+            member_layer,
+        } => Some(NominalScalarConstraints::Int(super::intersect_bounds(
+            identity_layer.range,
+            member_layer.range,
+        ))),
         AttrTypeKind::Float { binding: _, range } => Some(NominalScalarConstraints::Float(*range)),
         AttrTypeKind::Enum {
             identity: _,
@@ -527,7 +561,7 @@ impl<'s> AssignmentRelation<'s> {
 trait AssignmentCheck: Copy {
     type Result<'s>: AssignmentResult<'s>;
     fn identified_only(self) -> bool;
-    fn same_identity<'s>(self) -> Option<Self::Result<'s>>;
+    fn destination_obligation<'s>(self, scalar: bool) -> Option<Self::Result<'s>>;
 }
 
 trait AssignmentResult<'s>: From<TypeAssignability<'s>> {
@@ -590,20 +624,22 @@ impl<'s> AssignmentResult<'s> for AssignmentRelation<'s> {
 }
 
 #[derive(Clone, Copy)]
-enum StrictAssignmentCheck {
+enum DeclaredAssignmentCheck {
     Full,
     /// Re-admit original identities at a declared value's later sink. Only
-    /// identified leaves need this proof; their rule-7 containment still applies.
+    /// identified leaves need this proof; their destination value checks remain.
     IdentifiedLeaves,
 }
 
-impl AssignmentCheck for StrictAssignmentCheck {
+impl AssignmentCheck for DeclaredAssignmentCheck {
     type Result<'s> = TypeAssignability<'s>;
     fn identified_only(self) -> bool {
         matches!(self, Self::IdentifiedLeaves)
     }
-    fn same_identity<'s>(self) -> Option<Self::Result<'s>> {
-        None
+    fn destination_obligation<'s>(self, scalar: bool) -> Option<Self::Result<'s>> {
+        // Declared type compatibility admits nominal scalars by identity. The
+        // existing expression/value boundary still owes its concrete check.
+        scalar.then_some(TypeAssignability::Assignable)
     }
 }
 
@@ -618,7 +654,7 @@ impl AssignmentCheck for ReferenceAssignmentCheck {
     fn identified_only(self) -> bool {
         matches!(self, Self::IdentifiedLeaves)
     }
-    fn same_identity<'s>(self) -> Option<Self::Result<'s>> {
+    fn destination_obligation<'s>(self, _scalar: bool) -> Option<Self::Result<'s>> {
         Some(AssignmentRelation::NeedsLocal(None))
     }
 }
@@ -685,7 +721,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         let source: TypeInSchema<'query, R> = self;
         source.assignment_on_paths(
             sink,
-            StrictAssignmentCheck::Full,
+            DeclaredAssignmentCheck::Full,
             &mut Vec::new(),
             &mut Vec::new(),
         )
@@ -694,7 +730,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     /// Recheck original identity evidence after a value declaration has passed
     /// full assignment. An earlier owner's edge is not proof for this sink.
     /// Identity-less leaves keep the declaration's deferred value checks;
-    /// identified leaves retain ordinary identity admission and containment.
+    /// identified leaves retain the same identity admission and value obligations.
     pub(crate) fn identity_assignment_to<'query>(
         self,
         sink: AssignmentSink<'query, R>,
@@ -705,7 +741,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         let source: TypeInSchema<'query, R> = self;
         source.assignment_on_paths(
             sink,
-            StrictAssignmentCheck::IdentifiedLeaves,
+            DeclaredAssignmentCheck::IdentifiedLeaves,
             &mut Vec::new(),
             &mut Vec::new(),
         )
@@ -766,11 +802,31 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         let right = sink.rebind(target.attr);
         use AttrTypeKind::*;
         use TypeAssignability::*;
-        let same_identity = identity_leaf(&source.attr.kind)
-            .and_then(|leaf| leaf.identity())
-            .zip(identity_leaf(&target.attr.kind).and_then(|leaf| leaf.identity()))
-            .is_some_and(|(source, target)| source == target);
-        if same_identity && let Some(result) = check.same_identity() {
+        // Same identity is the zero-edge case of nominal admission. Reference
+        // destinations retain their existing resolved-value obligation for any
+        // admitted identity; unproven member containment is never a mismatch.
+        let scalar = matches!(&source.attr.kind, String { .. } | Int { .. } | Float { .. })
+            && matches!(&target.attr.kind, String { .. } | Int { .. } | Float { .. });
+        if let Some(obligation) = check.destination_obligation(scalar)
+            && let Some(source_identity) =
+                identity_leaf(&source.attr.kind).and_then(|leaf| leaf.identity())
+            && let Some(target_identity) = identity_leaf(&target.attr.kind)
+        {
+            let disjoint = source.attr.has_empty_scalar_intersection()
+                || target.attr.has_empty_scalar_intersection()
+                || nominal_scalar_constraints(left, source_refs)
+                    .zip(nominal_scalar_constraints(right.ty, sink_refs))
+                    .is_some_and(|(source, target)| source.provably_disjoint(target));
+            let result = C::Result::all([
+                right
+                    .identity_assignment(source_identity, target_identity)
+                    .into(),
+                if disjoint {
+                    Mismatch.into()
+                } else {
+                    obligation
+                },
+            ]);
             source_refs.truncate(source.restore_len);
             sink_refs.truncate(target.restore_len);
             return result;
@@ -792,14 +848,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             (
                 Union(members),
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -853,14 +907,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             })),
             (
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -910,14 +962,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             (
                 UnloadedSchemaType(unloaded),
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -963,14 +1013,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             )
             | (
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -1130,16 +1178,22 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             })),
             (
                 String {
-                    binding: source,
-                    pattern: _,
-                    length: source_length,
-                    to_dsl: _,
+                    identity_layer:
+                        crate::schema::StringIdentityLayer {
+                            binding: source,
+                            length: source_length,
+                            ..
+                        },
+                    member_layer: source_member,
                 },
                 String {
-                    binding: target,
-                    pattern: _,
-                    length: sink_length,
-                    to_dsl: _,
+                    identity_layer:
+                        crate::schema::StringIdentityLayer {
+                            binding: target,
+                            length: sink_length,
+                            ..
+                        },
+                    member_layer: target_member,
                 },
             ) if let (Some(source), Some(_)) = (source.identity(), target.identity()) => {
                 C::Result::all([
@@ -1147,19 +1201,27 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                         .identity_assignment(source, IdentityLeaf::Scalar(target))
                         .into(),
                     C::Result::from_bool(super::length_contains(
-                        source_length.as_ref(),
-                        sink_length.as_ref(),
+                        super::intersect_bounds(*source_length, source_member.length).as_ref(),
+                        super::intersect_bounds(*sink_length, target_member.length).as_ref(),
                     )),
                 ])
             }
             (
                 Int {
-                    binding: source,
-                    range: source_range,
+                    identity_layer:
+                        crate::schema::IntIdentityLayer {
+                            binding: source,
+                            range: source_range,
+                        },
+                    member_layer: source_member,
                 },
                 Int {
-                    binding: target,
-                    range: sink_range,
+                    identity_layer:
+                        crate::schema::IntIdentityLayer {
+                            binding: target,
+                            range: sink_range,
+                        },
+                    member_layer: target_member,
                 },
             ) if let (Some(source), Some(_)) = (source.identity(), target.identity()) => {
                 C::Result::all([
@@ -1167,8 +1229,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                         .identity_assignment(source, IdentityLeaf::Scalar(target))
                         .into(),
                     C::Result::from_bool(super::i64_range_contains(
-                        source_range.as_ref(),
-                        sink_range.as_ref(),
+                        super::intersect_bounds(*source_range, source_member.range).as_ref(),
+                        super::intersect_bounds(*sink_range, target_member.range).as_ref(),
                     )),
                 ])
             }
@@ -1194,8 +1256,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             }
             (
                 Int {
-                    binding: source,
-                    range: source_range,
+                    identity_layer:
+                        crate::schema::IntIdentityLayer {
+                            binding: source,
+                            range: source_range,
+                        },
+                    member_layer: source_member,
                 },
                 Float {
                     binding: target,
@@ -1207,7 +1273,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                         .identity_assignment(source, IdentityLeaf::Scalar(target))
                         .into(),
                     C::Result::from_bool(super::i64_range_assignable_to_f64(
-                        source_range.as_ref(),
+                        super::intersect_bounds(*source_range, source_member.range).as_ref(),
                         sink_range.as_ref(),
                     )),
                 ]),
@@ -1215,14 +1281,18 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             },
             (
                 String {
-                    binding: source,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer:
+                        crate::schema::StringIdentityLayer {
+                            binding: source, ..
+                        },
+                    member_layer: _,
                 }
                 | Int {
-                    binding: source,
-                    range: _,
+                    identity_layer:
+                        crate::schema::IntIdentityLayer {
+                            binding: source, ..
+                        },
+                    member_layer: _,
                 }
                 | Float {
                     binding: source,
@@ -1258,14 +1328,18 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     to_dsl: _,
                 },
                 String {
-                    binding: target,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer:
+                        crate::schema::StringIdentityLayer {
+                            binding: target, ..
+                        },
+                    member_layer: _,
                 }
                 | Int {
-                    binding: target,
-                    range: _,
+                    identity_layer:
+                        crate::schema::IntIdentityLayer {
+                            binding: target, ..
+                        },
+                    member_layer: _,
                 }
                 | Float {
                     binding: target,
@@ -1315,14 +1389,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ]),
             (
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -1342,14 +1414,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Duration
                 | Ref(_),
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -1402,14 +1472,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     to_dsl: _,
                 },
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -1451,14 +1519,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     constraints: _,
                 },
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -1503,14 +1569,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     constraints: _,
                 },
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -1555,14 +1619,12 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     field_groups: _,
                 },
                 String {
-                    binding: _,
-                    pattern: _,
-                    length: _,
-                    to_dsl: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Int {
-                    binding: _,
-                    range: _,
+                    identity_layer: _,
+                    member_layer: _,
                 }
                 | Float {
                     binding: _,
@@ -1650,6 +1712,81 @@ mod tests {
             TypeAssignability::Assignable,
             "identity-less enum bases retain the declaration's deferred value checks"
         );
+    }
+
+    #[test]
+    fn nominal_int_to_float_admission_uses_the_source_member_range() {
+        use crate::schema::{AttributeType, IntIdentityLayer, IntMemberConstraints};
+        let catalog = crate::parser::ProviderCustomTypes::default();
+        let owner = crate::parser::SchemaTypeOwner::Provider("test".into());
+        let sink = AttributeType::refined_float(
+            Some(TypeIdentity::from_dotted("aws.Count")),
+            Some((
+                Some(crate::FiniteF64::new(0.0).unwrap()),
+                Some(crate::FiniteF64::new(10.0).unwrap()),
+            )),
+        );
+        let sink =
+            TypeInSchema::schemaless(&sink).with_authority(&catalog, SinkAuthority::Owner(&owner));
+        for (range, expected) in [
+            (None, true),
+            (Some((Some(5), Some(10))), true),
+            (Some((Some(20), Some(30))), false),
+        ] {
+            let source = AttributeType::int_member(
+                IntIdentityLayer::new(
+                    Some(TypeIdentity::from_dotted("aws.service.Counter.Count")),
+                    Some((Some(0), Some(100))),
+                ),
+                IntMemberConstraints::new(range),
+            );
+            assert_eq!(
+                TypeInSchema::schemaless(&source)
+                    .assignment_to(sink)
+                    .require_loaded()
+                    .unwrap(),
+                expected,
+                "member range {range:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_nominal_name_mismatch_identifies_the_scalar_kinds() {
+        use crate::schema::{AttributeType, MismatchTypeNames};
+        let source = AttributeType::refined_float(Some(TypeIdentity::bare("Count")), None);
+        let sink = AttributeType::refined_int(Some(TypeIdentity::bare("Count")), None);
+        let names = MismatchTypeNames::for_types(
+            TypeInSchema::schemaless(&sink),
+            TypeInSchema::schemaless(&source),
+        );
+        assert_ne!(names.expected(), names.actual());
+        assert!(
+            names.expected().contains("Int") && names.actual().contains("Float"),
+            "{names}"
+        );
+    }
+
+    #[test]
+    fn disjoint_int_members_report_their_distinct_ranges() {
+        use crate::schema::{
+            AttributeType, IntIdentityLayer, IntMemberConstraints, MismatchTypeNames,
+        };
+        let declaration = |min, max| {
+            AttributeType::int_member(
+                IntIdentityLayer::new(Some(TypeIdentity::bare("Count")), None),
+                IntMemberConstraints::new(Some((Some(min), Some(max)))),
+            )
+        };
+        let source = declaration(100, 128);
+        let sink = declaration(1, 64);
+        let names = MismatchTypeNames::for_types(
+            TypeInSchema::schemaless(&sink),
+            TypeInSchema::schemaless(&source),
+        );
+        assert!(names.expected().contains("member range 1..=64"), "{names}");
+        assert!(names.actual().contains("member range 100..=128"), "{names}");
+        assert_ne!(names.expected(), names.actual());
     }
 
     #[test]

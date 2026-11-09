@@ -950,7 +950,11 @@ fn type_aware_equal_on_path<'a, R: ReferenceEquality>(
                 Value::Concrete(ConcreteValue::String(sa)),
                 Value::Concrete(ConcreteValue::String(sb)),
                 crate::schema::Shape::String {
-                    identity, to_dsl, ..
+                    identity_layer:
+                        crate::schema::StringIdentityParts {
+                            identity, to_dsl, ..
+                        },
+                    ..
                 },
             ) => {
                 let a = sa.expose_plaintext();

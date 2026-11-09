@@ -281,11 +281,15 @@ impl<'a> RefSink<'a> {
                     })
                 }
                 Shape::String {
-                    identity: _,
-                    pattern: _,
-                    length: _,
-                    validate: _,
-                    to_dsl: _,
+                    identity_layer:
+                        crate::schema::StringIdentityParts {
+                            identity: _,
+                            pattern: _,
+                            length: _,
+                            validate: _,
+                            to_dsl: _,
+                        },
+                    member_layer: _,
                 }
                 | Shape::Reference {
                     identity: _,
@@ -293,9 +297,13 @@ impl<'a> RefSink<'a> {
                     length: _,
                 }
                 | Shape::Int {
-                    identity: _,
-                    range: _,
-                    validate: _,
+                    identity_layer:
+                        crate::schema::IntIdentityParts {
+                            identity: _,
+                            range: _,
+                            validate: _,
+                        },
+                    member_layer: _,
                 }
                 | Shape::Float {
                     identity: _,
@@ -390,11 +398,15 @@ impl<'a> RefSink<'a> {
                     .map_entry(key)
                 }),
                 Shape::String {
-                    identity: _,
-                    pattern: _,
-                    length: _,
-                    validate: _,
-                    to_dsl: _,
+                    identity_layer:
+                        crate::schema::StringIdentityParts {
+                            identity: _,
+                            pattern: _,
+                            length: _,
+                            validate: _,
+                            to_dsl: _,
+                        },
+                    member_layer: _,
                 }
                 | Shape::Reference {
                     identity: _,
@@ -402,9 +414,13 @@ impl<'a> RefSink<'a> {
                     length: _,
                 }
                 | Shape::Int {
-                    identity: _,
-                    range: _,
-                    validate: _,
+                    identity_layer:
+                        crate::schema::IntIdentityParts {
+                            identity: _,
+                            range: _,
+                            validate: _,
+                        },
+                    member_layer: _,
                 }
                 | Shape::Float {
                     identity: _,

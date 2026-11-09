@@ -26,7 +26,7 @@ fn builtin_type_helpers_infer_draft_without_context() {
             let t = types::$constructor();
             assert!(matches!(
                 t.shape_ref_free().unwrap(),
-                Shape::String { identity: Some(identity), .. } if identity.kind == $name
+                Shape::String { identity_layer: carina_core::schema::StringIdentityParts { identity: Some(identity), .. }, .. } if identity.kind == $name
             ));
         };
     }
@@ -34,7 +34,7 @@ fn builtin_type_helpers_infer_draft_without_context() {
     let t = types::positive_int();
     assert!(matches!(
         t.shape_ref_free().unwrap(),
-        Shape::Int { identity: Some(identity), .. } if identity.kind == "PositiveInt"
+        Shape::Int { identity_layer: carina_core::schema::IntIdentityParts { identity: Some(identity), .. }, .. } if identity.kind == "PositiveInt"
     ));
     assert_string_type!(ipv4_cidr, "Ipv4Cidr");
     assert_string_type!(ipv4_address, "Ipv4Address");
@@ -58,10 +58,10 @@ fn draft_ref_free_walks_preserve_patterns_and_budget() {
     let shape: Shape<'_> = string.shape_ref_free().unwrap();
     assert!(matches!(
         shape,
-        Shape::String {
+        Shape::String { identity_layer: carina_core::schema::StringIdentityParts {
             pattern: Some(spec),
             ..
-        } if spec == &carina_core::schema::PatternSpec::new("(?=x)", carina_core::schema::PatternMatch::Full)
+        }, .. } if spec == &carina_core::schema::PatternSpec::new("(?=x)", carina_core::schema::PatternMatch::Full)
     ));
     let structure =
         AttributeType::struct_("Draft", vec![StructField::optional("name", string).build()]);
@@ -149,10 +149,10 @@ fn draft_schema_walks_resolve_definitions() {
     let secret = struct_field_type(&schema, &reference, "secret").unwrap();
     assert!(matches!(
         secret.shape_ref_free().unwrap(),
-        Shape::String {
+        Shape::String { identity_layer: carina_core::schema::StringIdentityParts {
             pattern: Some(spec),
             ..
-        } if spec == &carina_core::schema::PatternSpec::new("(?=x)", carina_core::schema::PatternMatch::Full)
+        }, .. } if spec == &carina_core::schema::PatternSpec::new("(?=x)", carina_core::schema::PatternMatch::Full)
     ));
     let children = struct_field_type(&schema, &reference, "children").unwrap();
     let Shape::List {
@@ -255,10 +255,10 @@ fn draft_metadata_walks_support_write_only_and_enum_aliases() {
     assert_eq!(leaves[0].1, secret);
     assert!(matches!(
         leaves[0].2.shape_ref_free().unwrap(),
-        Shape::String {
+        Shape::String { identity_layer: carina_core::schema::StringIdentityParts {
             pattern: Some(spec),
             ..
-        } if spec == &carina_core::schema::PatternSpec::new("(?=x)", carina_core::schema::PatternMatch::Full)
+        }, .. } if spec == &carina_core::schema::PatternSpec::new("(?=x)", carina_core::schema::PatternMatch::Full)
     ));
     assert_eq!(schema.validate().unwrap_err().pattern_errors().count(), 2);
 }

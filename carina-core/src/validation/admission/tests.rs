@@ -643,7 +643,7 @@ fn different_identities_keep_strict_assignment() {
 }
 
 #[test]
-fn unmigrated_kind_keeps_strict_assignment() {
+fn module_argument_retains_the_same_destination_obligation() {
     fixture(
         string_type("GroupId", Some(64)),
         string_type("GroupId", Some(36)),
@@ -655,7 +655,14 @@ fn unmigrated_kind_keeps_strict_assignment() {
                     contract: destination.contract.clone(),
                     kind: PhantomData,
                 };
-                assert!(validate(&strict, &reference(), bindings, session).is_err());
+                assert!(
+                    validate(&strict, &reference(), bindings, session)
+                        .unwrap()
+                        .ready()
+                        .unwrap_err()
+                        .local_obligation()
+                        .is_some()
+                );
             })
         },
     );
@@ -2022,6 +2029,428 @@ fn nested_field_group_renders_the_destination_path_once() {
                     "target.choices: at least one of [first, second] must be set"
                 );
             })
+        },
+    );
+}
+
+mod identity_member_obligations {
+    use super::*;
+    use crate::schema::{
+        IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+        StringMemberConstraints, ValidatedConfigSchema,
+    };
+
+    fn string(identity: &str, length: Option<(Option<u64>, Option<u64>)>) -> AttributeType {
+        AttributeType::string_member(
+            StringIdentityLayer::new(Some(TypeIdentity::from_dotted(identity)), None, None, None),
+            StringMemberConstraints::new(None, length),
+        )
+    }
+
+    fn target(identity: &str) -> AttributeType {
+        AttributeType::struct_(
+            "Target",
+            vec![
+                StructField::required(
+                    "role_arn",
+                    AttributeType::string_member(
+                        StringIdentityLayer::new(
+                            Some(TypeIdentity::from_dotted(identity)),
+                            None,
+                            None,
+                            None,
+                        ),
+                        StringMemberConstraints::new(
+                            Some(PatternSpec::new(
+                                "arn:.*:role/[A-Za-z]+",
+                                PatternMatch::Full,
+                            )),
+                            Some((Some(1), Some(1600))),
+                        ),
+                    ),
+                )
+                .build(),
+            ],
+        )
+    }
+
+    fn wire(declaration: AttributeType) -> AttributeType {
+        let schema = ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
+            "value".into(),
+            declaration,
+        )]))
+        .unwrap();
+        let encoded =
+            crate::protocol_convert::attribute_type_to_protocol(&schema.parts()["value"]).unwrap();
+        let json = serde_json::to_string(&encoded).unwrap();
+        crate::protocol_convert::protocol_to_attribute_type(&serde_json::from_str(&json).unwrap())
+            .unwrap()
+    }
+
+    fn role_arn(value: Value) -> Value {
+        Value::Concrete(crate::resource::ConcreteValue::Map(
+            indexmap::IndexMap::from([("role_arn".into(), value)]),
+        ))
+    }
+
+    fn check_destination_obligation(source_identity: &str, decoded: bool) {
+        let mut source = string(source_identity, None);
+        let mut target = target("aws.Arn");
+        if decoded {
+            source = wire(source);
+            target = wire(target);
+        }
+        fixture(source, target, |catalog, _, bindings, destination| {
+            with_session_for_test(catalog, |session| {
+                let long = format!("arn:aws:iam::123456789012:role/{}", "A".repeat(1600));
+                for (value, valid) in [
+                    ("", false),
+                    ("bad", false),
+                    (long.as_str(), false),
+                    ("arn:aws:iam::123456789012:role/Good", true),
+                ] {
+                    let pending = validate(destination, &role_arn(reference()), bindings, session)
+                        .expect("identity admission must defer unproven member constraints")
+                        .ready()
+                        .unwrap_err();
+                    assert!(pending.local_obligation().is_some());
+                    let mut resolved = ResolvedBindings::default();
+                    resolved.set(
+                        "producer",
+                        HashMap::from([("output".into(), text(value))]),
+                        BindingValueSource::Local,
+                    );
+                    let expected = validate(destination, &role_arn(text(value)), bindings, session);
+                    assert_eq!(expected.is_ok(), valid, "{value}: {expected:?}");
+                    match expected {
+                        Ok(_) => {
+                            assert!(pending.discharge(&resolved, session).is_ok());
+                        }
+                        Err(literal_error) => {
+                            let error = pending.discharge(&resolved, session).unwrap_err();
+                            assert_eq!(error.resolution_error(), literal_error.resolution_error());
+                            let ResolutionError::AdmissionConstraints(findings) =
+                                error.resolution_error()
+                            else {
+                                panic!("destination constraint: {error:?}");
+                            };
+                            assert_eq!(findings.findings().len(), 1);
+                            assert_eq!(findings.findings()[0].path.to_string(), "target.role_arn");
+                            assert_eq!(findings.to_string().matches("target.role_arn").count(), 1);
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn structural_widening_defers_member_constraints() {
+        check_destination_obligation("aws.iam.Role.Arn", false);
+    }
+
+    #[test]
+    fn same_identity_keeps_the_existing_member_obligation() {
+        check_destination_obligation("aws.Arn", false);
+    }
+
+    #[test]
+    fn decoded_protocol_widening_keeps_the_member_obligation() {
+        check_destination_obligation("aws.iam.Role.Arn", true);
+    }
+
+    #[test]
+    fn unproven_pattern_containment_is_a_destination_obligation() {
+        for identity in ["aws.Arn", "aws.iam.Role.Arn"] {
+            let source = AttributeType::string_member(
+                StringIdentityLayer::new(
+                    Some(TypeIdentity::from_dotted(identity)),
+                    None,
+                    None,
+                    None,
+                ),
+                StringMemberConstraints::new(
+                    Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                    Some((Some(1), Some(50))),
+                ),
+            );
+            fixture(
+                source,
+                target("aws.Arn"),
+                |catalog, _, bindings, destination| {
+                    with_session_for_test(catalog, |session| {
+                        assert!(
+                            validate(destination, &role_arn(reference()), bindings, session)
+                                .unwrap()
+                                .ready()
+                                .unwrap_err()
+                                .local_obligation()
+                                .is_some()
+                        );
+                    });
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn provably_disjoint_lengths_reject_same_identity_and_widening() {
+        for source_identity in ["aws.Arn", "aws.iam.Role.Arn"] {
+            fixture(
+                string(source_identity, Some((Some(2000), Some(3000)))),
+                target("aws.Arn"),
+                |catalog, _, bindings, destination| {
+                    with_session_for_test(catalog, |session| {
+                        assert!(
+                            validate(destination, &role_arn(reference()), bindings, session)
+                                .is_err()
+                        );
+                    });
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn a_widening_not_allowed_by_the_graph_still_rejects() {
+        for (source, sink) in [
+            ("aws.Arn", "aws.iam.Role.Arn"),
+            ("aws.iam.Role.Arn", "gcp.Arn"),
+            ("aws.iam.Role.Arn", "aws.acm.Certificate.Arn"),
+        ] {
+            fixture(
+                string(source, None),
+                target(sink),
+                |catalog, _, bindings, destination| {
+                    with_session_for_test(catalog, |session| {
+                        assert!(
+                            validate(destination, &role_arn(reference()), bindings, session)
+                                .is_err()
+                        );
+                    });
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn widening_int_ranges_defer_overlap_but_reject_proven_disjointness() {
+        for source_identity in ["aws.Count", "aws.service.Counter.Count"] {
+            for (source_range, admitted) in [
+                (None, true),
+                (Some((Some(0), Some(100))), true),
+                (Some((Some(0), Some(10))), true),
+                (Some((Some(30), Some(40))), false),
+            ] {
+                let source = AttributeType::int_member(
+                    IntIdentityLayer::new(Some(TypeIdentity::from_dotted(source_identity)), None),
+                    IntMemberConstraints::new(source_range),
+                );
+                let target = AttributeType::int_member(
+                    IntIdentityLayer::new(Some(TypeIdentity::from_dotted("aws.Count")), None),
+                    IntMemberConstraints::new(Some((Some(10), Some(20)))),
+                );
+                fixture(source, target, |catalog, _, bindings, destination| {
+                    with_session_for_test(catalog, |session| {
+                        let admission = validate(destination, &reference(), bindings, session);
+                        if !admitted {
+                            assert!(admission.is_err());
+                            return;
+                        }
+                        for value in [5, 10] {
+                            let pending = validate(destination, &reference(), bindings, session)
+                                .expect("overlapping ranges need a value check")
+                                .ready()
+                                .unwrap_err();
+                            let literal =
+                                Value::Concrete(crate::resource::ConcreteValue::Int(value));
+                            let mut resolved = ResolvedBindings::default();
+                            resolved.set(
+                                "producer",
+                                HashMap::from([("output".into(), literal.clone())]),
+                                BindingValueSource::Local,
+                            );
+                            let expected = validate(destination, &literal, bindings, session);
+                            assert_eq!(expected.is_ok(), value == 10, "{expected:?}");
+                            match expected {
+                                Ok(_) => {
+                                    assert!(pending.discharge(&resolved, session).is_ok());
+                                }
+                                Err(expected) => {
+                                    let error = pending.discharge(&resolved, session).unwrap_err();
+                                    assert_eq!(
+                                        error.resolution_error(),
+                                        expected.resolution_error()
+                                    );
+                                    let ResolutionError::AdmissionConstraints(findings) =
+                                        error.resolution_error()
+                                    else {
+                                        panic!("range finding");
+                                    };
+                                    assert_eq!(findings.findings().len(), 1);
+                                }
+                            }
+                        }
+                    });
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_owner_edge_uses_the_same_member_obligation() {
+        struct EdgeCatalog(crate::schema::ValidatedProviderSchemaWitness);
+        impl crate::parser::CustomTypeResolver for EdgeCatalog {
+            fn validate_validated(
+                &self,
+                _: &str,
+                _: crate::schema::LocallyValidatedCustomType<'_>,
+            ) -> Result<(), crate::parser::CustomTypeValidationError> {
+                Ok(())
+            }
+        }
+        impl crate::parser::ProviderCustomTypeSource for EdgeCatalog {
+            fn known_custom_types(
+                &self,
+            ) -> std::collections::BTreeSet<crate::parser::OwnedTypeIdentity> {
+                Default::default()
+            }
+            fn assignability_closures(
+                &self,
+            ) -> std::collections::BTreeMap<
+                crate::parser::SchemaTypeOwner,
+                crate::schema::AssignabilityClosure,
+            > {
+                std::collections::BTreeMap::from([(
+                    crate::parser::SchemaTypeOwner::Provider("test".into()),
+                    self.0.assignability_closure().clone(),
+                )])
+            }
+        }
+        let source = string("test.NewArn", None);
+        let target = target("test.Arn");
+        let witness = crate::schema::ValidatedProviderSchemaWitness::new(
+            vec![],
+            ValidatedConfigSchema::validate(std::collections::BTreeMap::from([
+                ("source".into(), source.clone()),
+                ("target".into(), target.clone()),
+            ]))
+            .unwrap(),
+            Default::default(),
+            vec![
+                crate::schema::AssignabilityEdge::new(
+                    TypeIdentity::from_dotted("test.NewArn"),
+                    TypeIdentity::from_dotted("test.Arn"),
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut catalog = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        catalog.custom_types =
+            crate::parser::ProviderCustomTypes::from_source(EdgeCatalog(witness));
+        fixture_in(
+            &catalog,
+            source,
+            target,
+            |catalog, _, bindings, destination| {
+                with_session_for_test(catalog, |session| {
+                    let pending = validate(destination, &role_arn(reference()), bindings, session)
+                        .expect("an admitted owner edge has the same destination obligation")
+                        .ready()
+                        .unwrap_err();
+                    let mut resolved = ResolvedBindings::default();
+                    resolved.set(
+                        "producer",
+                        HashMap::from([("output".into(), text("bad"))]),
+                        BindingValueSource::Local,
+                    );
+                    assert_eq!(
+                        pending
+                            .discharge(&resolved, session)
+                            .unwrap_err()
+                            .resolution_error(),
+                        validate(destination, &role_arn(text("bad")), bindings, session)
+                            .unwrap_err()
+                            .resolution_error()
+                    );
+                });
+            },
+        );
+    }
+}
+
+#[test]
+fn every_destination_kind_retains_the_same_member_obligation() {
+    use crate::schema::{PatternMatch, PatternSpec, StringIdentityLayer, StringMemberConstraints};
+    let ty = |member| {
+        AttributeType::string_member(
+            StringIdentityLayer::new(Some(TypeIdentity::bare("Name")), None, None, None),
+            member,
+        )
+    };
+    fixture(
+        ty(StringMemberConstraints::new(
+            None,
+            Some((Some(1), Some(128))),
+        )),
+        ty(StringMemberConstraints::new(
+            Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+            Some((Some(3), Some(6))),
+        )),
+        |catalog, _, bindings, resource| {
+            fn check<K: DestinationKind>(
+                resource: &Destination<kind::ResourceAttribute>,
+                bindings: &BindingIndex<'_, AbsoluteBindingAddress>,
+                session: &dyn ProviderTypeCheckContext,
+            ) {
+                let destination = Destination::<K> {
+                    identity: resource.identity.clone(),
+                    label: resource.label.clone(),
+                    contract: resource.contract.clone(),
+                    kind: PhantomData,
+                };
+                for (value, valid) in [("A", false), ("ab", false), ("abc", true)] {
+                    let pending = validate(&destination, &reference(), bindings, session)
+                        .expect("identity admission is independent of the destination kind")
+                        .ready()
+                        .unwrap_err();
+                    assert!(pending.local_obligation().is_some());
+                    let mut resolved = ResolvedBindings::default();
+                    resolved.set(
+                        "producer",
+                        HashMap::from([("output".into(), text(value))]),
+                        BindingValueSource::Local,
+                    );
+                    let expected = validate(&destination, &text(value), bindings, session);
+                    assert_eq!(expected.is_ok(), valid);
+                    match expected {
+                        Ok(_) => {
+                            assert!(pending.discharge(&resolved, session).is_ok());
+                        }
+                        Err(expected) => {
+                            let error = pending.discharge(&resolved, session).unwrap_err();
+                            assert_eq!(error.resolution_error(), expected.resolution_error());
+                            let ResolutionError::AdmissionConstraints(findings) =
+                                error.resolution_error()
+                            else {
+                                panic!("member failure");
+                            };
+                            assert_eq!(findings.findings().len(), 1);
+                        }
+                    }
+                }
+            }
+            with_session_for_test(catalog, |session| {
+                check::<kind::ResourceAttribute>(resource, bindings, session);
+                check::<kind::DataSourceAttribute>(resource, bindings, session);
+                check::<kind::ProviderConfigAttribute>(resource, bindings, session);
+                check::<kind::BackendAttribute>(resource, bindings, session);
+                check::<kind::ModuleArgument>(resource, bindings, session);
+                check::<kind::AnnotatedAttribute>(resource, bindings, session);
+                check::<kind::Export>(resource, bindings, session);
+                check::<kind::UpstreamExport>(resource, bindings, session);
+            });
         },
     );
 }

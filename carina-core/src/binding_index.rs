@@ -125,13 +125,16 @@ impl ReferenceTypeCheck {
 /// context required to interpret any nested schema `Ref`s.
 #[derive(Debug, Clone)]
 struct ResolvedTypeConstraint {
-    attr_type: AttributeType,
+    attr_type: Box<AttributeType>,
     defs: BTreeMap<String, AttributeType>,
 }
 
 impl ResolvedTypeConstraint {
     fn new(attr_type: AttributeType, defs: BTreeMap<String, AttributeType>) -> Self {
-        Self { attr_type, defs }
+        Self {
+            attr_type: Box::new(attr_type),
+            defs,
+        }
     }
 
     fn type_in_schema(&self) -> TypeInSchema<'_, crate::schema::Compiled> {
@@ -3423,7 +3426,7 @@ mod tests {
         let wide = AttributeType::refined_string(
             Some(identity.clone()),
             None,
-            Some((Some(1), Some(128))),
+            Some((Some(100), Some(128))),
             None,
         );
         let narrow =
@@ -3451,7 +3454,7 @@ mod tests {
         );
         assert_eq!(
             mismatch.actual_type_name(),
-            "aws.iam.Role.Name (length 1..=128)"
+            "aws.iam.Role.Name (length 100..=128)"
         );
         assert_eq!(mismatch.declared_type_name(), Some("aws.iam.Role.Name"));
     }
@@ -3462,7 +3465,7 @@ mod tests {
         let wide = AttributeType::refined_string(
             Some(identity.clone()),
             None,
-            Some((Some(1), Some(128))),
+            Some((Some(100), Some(128))),
             None,
         );
         let narrow =
@@ -3489,7 +3492,7 @@ mod tests {
         };
         assert_eq!(
             mismatch.actual_type_name(),
-            "aws.iam.Role.Name (length 1..=128)"
+            "aws.iam.Role.Name (length 100..=128)"
         );
         assert_eq!(
             mismatch.expected_type_name(),
@@ -3549,7 +3552,7 @@ mod tests {
 
     #[test]
     fn original_mismatch_does_not_record_an_incoming_boundary_deferral() {
-        // Both leaves are identified: rule 7 must still reject 1..20 -> 1..10
+        // Both leaves are identified: disjoint bounds must reject 20..30 -> 1..10
         // even though original identity-less refinements are no longer rechecked.
         let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let terminal = crate::validation::deferred_types::TypeCheckSession::run(
@@ -3566,7 +3569,7 @@ mod tests {
                     AttributeType::refined_string(
                         Some(TypeIdentity::bare("Sink")),
                         None,
-                        Some((Some(1), Some(20))),
+                        Some((Some(20), Some(30))),
                         None,
                     ),
                     BTreeMap::new(),

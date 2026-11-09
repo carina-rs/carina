@@ -610,6 +610,28 @@ A struct type represents a nested object with typed fields.
   `NativeDesiredNormalization`. Keep `ProviderWireError`
   terminal: render its typed conversion reason once, without input values,
   and access the typed reason through `conversion_error()`.
+- **Refinement layers** (carina#4348): protocol 26/minimum 26 requires
+  separate `identity_layer` and `member_layer` records for String and Int.
+  `StringIdentityLayer`/`IntIdentityLayer` own reusable definitions;
+  `StringMemberConstraints`/`IntMemberConstraints` add declaration-local bounds.
+  `string_member` and `int_member` take these distinct types once and preserve
+  the complete identity. Each String layer has one optional `PatternSpec` and
+  one optional length interval; each Int layer has one optional range. Float
+  is unchanged. Validate the identity pattern then bounds, member pattern then
+  bounds, and finally the semantic callback; retain first-failure diagnostics.
+  Never repeat structural checks in callbacks. Built-ins, aggregate admission
+  and owner-set signatures accept identity-only typed projections. Exact
+  declarations and their fingerprints preserve both layers. Hover renders
+  both layers; shared provider docgen must do the same. WIT stays 0.2.0.
+  Every typed sink uses the same nominal scalar identity-admission rule for
+  equal identities and allowed widenings (#4349), including annotations,
+  exports, module arguments, and function parameters/returns. All destination
+  kinds can retain the existing `NeedsLocal` resolved-value obligation; reject
+  only proven disjoint bounds. Unproven regex containment defers to the value
+  check. Collection/coalesce inference joins compatible nominal declarations
+  through their canonical identity while retaining child evidence. Never use
+  full declaration equality or display-name equality to reject identity-compatible
+  flows; mismatch names expose differing constraints or scalar kinds.
 - **Schema field transport**: `StructField` and `AttributeSchema` cross the
   WASM boundary as JSON via the `schemas: func() -> string` WIT export. The
   sole typed core/protocol boundary is `carina_core::protocol_convert`: the SDK
@@ -632,8 +654,8 @@ A struct type represents a nested object with typed fields.
   declarations share the identity's callback set, and separately allocated
   callbacks from repeated type-constructor calls are valid. This is the honest
   current-protocol (`PROTOCOL_VERSION`) behavior: the wire names an identity,
-  not a schema declaration, so the identity is the guest-side type and its
-  constraints are per provider. The current WIT keeps
+  not a schema declaration, for semantic callback dispatch. Structural identity
+  and member constraints are transported separately and checked by the host. The current WIT keeps
   `validate-custom-type(TypeIdentity, string)`: the guest parses canonical text
   with the binding's stored kind, and aggregate schema admission rejects an
   identity reused with another scalar kind. Resource/config schema walks pass
@@ -692,7 +714,7 @@ A struct type represents a nested object with typed fields.
   require `diagnostics` and `protected-material` imports in every provider
   world. Component type scanning rejects a legacy package before linking or
   executing any start/info code, naming the found package and the required
-  `carina:provider@0.2.0` / protocol 25. `ProviderDiagnostics::emit` accepts only typed events borrowing
+  `carina:provider@0.2.0` / the current protocol (26). `ProviderDiagnostics::emit` accepts only typed events borrowing
   provider errors/diagnostics or carrying structured value candidates. The
   host binds them through the same private text kernel as returned errors.
   Only that kernel mints `BoundProviderEvent`; its presenter consumes Bound

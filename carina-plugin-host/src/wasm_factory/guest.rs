@@ -7372,8 +7372,8 @@ pub(super) mod tests {
     #[test]
     fn pattern_diagnostics_are_rendered_once_in_provider_load_error() {
         let json = r#"{
-                "first":{"type":"String","pattern":{"regex":"(?=x)","mode":{"kind":"full"}}},
-                "second":{"type":"String","pattern":{"regex":"[","mode":{"kind":"full"}}}
+                "first":{"type":"String", "identity_layer": {"pattern":{"regex":"(?=x)","mode":{"kind":"full"}}}, "member_layer": {}},
+                "second":{"type":"String", "identity_layer": {"pattern":{"regex":"[","mode":{"kind":"full"}}}, "member_layer": {}}
             }"#;
         let detail = wasm_convert::json_to_attribute_types(json).unwrap_err();
         let diagnostic = ProviderDiagnostic::new(detail)

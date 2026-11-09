@@ -1470,13 +1470,16 @@ mod judgement {
         left: Result<TypeExpr, InferenceIssue>,
         default: Result<TypeExpr, InferenceIssue>,
         empty: EmptyCoalesceDefault,
+        config: &super::super::ProviderContext,
     ) -> Result<TypeExpr, InferenceIssue> {
         match (left, default) {
-            (Ok(left), Ok(right)) if left == right => Ok(left),
-            (Ok(left), Ok(right)) => Err(InferenceError::IncompatibleCoalesceTypes {
-                types: crate::schema::MismatchTypeNames::for_type_exprs(&left, &right),
-            }
-            .into()),
+            (Ok(left), Ok(right)) => inference::join_inferred_types(&left, &right, config)
+                .ok_or_else(|| {
+                    InferenceError::IncompatibleCoalesceTypes {
+                        types: crate::schema::MismatchTypeNames::for_type_exprs(&left, &right),
+                    }
+                    .into()
+                }),
             (Ok(left @ TypeExpr::List(_)), Err(_))
                 if matches!(empty, EmptyCoalesceDefault::List) =>
             {
@@ -2556,12 +2559,9 @@ mod judgement {
 
     fn assignment_error(expression: &JudgedExpr, sink: &TypeExpr) -> InferenceError {
         InferenceError::UnknownType {
-            reason: format!(
-                "expected {sink}, got {}",
-                expression
-                    .static_type()
-                    .map(ToString::to_string)
-                    .unwrap_or_else(|_| "collection".into())
+            reason: expression.static_type().map_or_else(
+                |_| format!("expected {sink}, got collection"),
+                |actual| crate::schema::MismatchTypeNames::for_type_exprs(sink, actual).to_string(),
             ),
         }
     }
@@ -3572,7 +3572,7 @@ mod judgement {
                         _ => EmptyCoalesceDefault::None,
                     };
                     let ty = match (&left, &right) {
-                        (Ok(_), Ok(_)) => coalesce_type(left, right, empty),
+                        (Ok(_), Ok(_)) => coalesce_type(left, right, empty, self.config),
                         _ if matches!((children[0].value_shape(), children[1].value_shape()), (Some(left), Some(right)) if left != right) => {
                             Err(InferenceError::UnknownType {
                                 reason: format!(
@@ -3583,7 +3583,7 @@ mod judgement {
                             }
                             .into())
                         }
-                        _ => coalesce_type(left, right, empty),
+                        _ => coalesce_type(left, right, empty, self.config),
                     };
                     let mut result = alternatives(ty, children);
                     result.data_mut().coalesce =
@@ -3624,17 +3624,16 @@ mod judgement {
                         Err(error.clone().into())
                     } else {
                         match children.first() {
-                            Some(first) => first.static_type().cloned().and_then(|first| {
+                            Some(first) => first.static_type().cloned().and_then(|mut first| {
                                 for child in &children[1..] {
                                     let next = child.static_type()?;
-                                    if *next != first {
-                                        return Err(InferenceError::HeterogeneousCollection {
+                                    first =
+                                        inference::join_inferred_types(&first, next, self.config)
+                                            .ok_or_else(|| InferenceError::HeterogeneousCollection {
                                             types: crate::schema::MismatchTypeNames::for_type_exprs(
                                                 &first, next,
                                             ),
-                                        }
-                                        .into());
-                                    }
+                                        })?;
                                 }
                                 Ok(if matches!(root.kind, ExprKind::List) {
                                     TypeExpr::List(Box::new(first))

@@ -1816,8 +1816,14 @@ impl<'a> ValueValidator<'a> {
 
 fn has_native_validator(attr: &CompiledAttributeType) -> bool {
     match &attr.kind {
-        AttrTypeKind::String { binding, .. }
-        | AttrTypeKind::Int { binding, .. }
+        AttrTypeKind::String {
+            identity_layer: crate::schema::StringIdentityLayer { binding, .. },
+            ..
+        }
+        | AttrTypeKind::Int {
+            identity_layer: crate::schema::IntIdentityLayer { binding, .. },
+            ..
+        }
         | AttrTypeKind::Float { binding, .. } => binding.callback().is_some(),
         AttrTypeKind::Enum { validate, .. } => validate.is_some(),
         _ => false,
