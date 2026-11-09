@@ -49,6 +49,22 @@ class TouchedCratesTests(unittest.TestCase):
                 "manifest_path": str(self.root / name / "Cargo.toml"),
                 "dependencies": [self.dependency(target, kind) for target, kind in dependencies],
             })
+        self.git("init", "-q", "--template=")
+        (self.root / ".git/info").mkdir(exist_ok=True)
+        (self.root / ".git/info/exclude").write_text("/bin/\n/scripts/\n/metadata.json\n/trace\n")
+
+    def git(self, *args):
+        return subprocess.check_output(
+            ["git", "-c", "user.name=Scope fixture", "-c",
+             "user.email=scope@example.invalid", *args], cwd=self.root,
+            env=self.env, stderr=subprocess.PIPE, text=True, timeout=10,
+        ).strip()
+
+    def track(self, filename, contents):
+        path = self.root / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(contents)
+        self.git("add", "--", filename)
 
     def dependency(self, directory, kind=None, **fields):
         return dict(name="renamed-dependency", path=str(self.root / directory), kind=kind, **fields)
@@ -134,18 +150,77 @@ class TouchedCratesTests(unittest.TestCase):
                 self.assertEqual(self.scope(filename), "--workspace")
         self.assertFalse(self.trace.exists())
 
-    def test_empty_and_ignored_changes_do_not_run_cargo(self):
+    def test_empty_changes_do_not_run_cargo_and_unreferenced_changes_stay_empty(self):
         self.assertEqual(self.scope(), "")
+        self.assertFalse(self.trace.exists())
         for filename in ("README.md", "CLAUDE.md", "scripts/check-plan-fixtures.sh",
                          ".github/ISSUE_TEMPLATE/bug.yml", "site/src/index.ts",
                          "notes/example.txt", "infra/example.crn"):
             with self.subTest(filename=filename):
                 self.assertEqual(self.scope(filename), "")
-        self.assertFalse(self.trace.exists())
+        # Workspace metadata now also determines which tracked Rust sources
+        # may own otherwise-ignorable inputs. No Rust check/build is invoked.
+        self.assertEqual(self.trace.read_text().splitlines(), ["metadata"] * 7)
+
+    def test_file_references_include_reverse_dependencies(self):
+        filename = "site/src/content/providers/writing/schemas.md"
+        self.track("carina-plugin-sdk/src/lib.rs",
+                   f'#[doc = include_str!("../../{filename}")]\n')
+        self.assertEqual(self.scope(filename),
+                         "-p carina-cli -p carina-plugin-host -p carina-plugin-sdk -p carina-provider-example")
+
+    def test_directory_references_include_every_owner_and_reverse_dependencies(self):
+        directory = "site/src/content/reference/registry"
+        self.track("carina-provider-example/tests/examples.rs",
+                   f'let directory = root.join("../{directory}");\n')
+        self.track("carina-tui/src/examples.rs",
+                   f'let directory = root.join("../../{directory}/");\n')
+        self.assertEqual(self.scope(directory + "/nested/static-registry.md"),
+                         "-p carina-cli -p carina-plugin-host -p carina-provider-example -p carina-tui")
+
+    def test_unreferenced_docs_do_not_inherit_longer_file_path_references(self):
+        self.track("carina-plugin-sdk/src/lib.rs",
+                   'include_str!("../../site/src/content/providers/writing/schemas.md");\n'
+                   'let use_site = site;\n'
+                   'debug.field("site", &site);\n'
+                   'debug.field("website/", &site);\n')
+        for filename in ("site/src/content/providers/writing/unreferenced.md", "site/astro.config.mjs"):
+            with self.subTest(filename=filename):
+                self.assertEqual(self.scope(filename), "")
+
+    def test_top_level_directory_reference_with_trailing_slash_is_owned(self):
+        self.track("carina-tui/src/lib.rs", 'let directory = root.join("../../site/");\n')
+        self.assertEqual(self.scope("site/astro.config.mjs"), "-p carina-tui")
+
+    def test_references_use_only_tracked_rust_sources_of_workspace_members(self):
+        filename = "notes/example.txt"
+        self.track("vendor/helper/src/lib.rs", f'include_str!("../../../{filename}");\n')
+        self.track("carina-tui/example.txt", filename)
+        untracked = self.root / "carina-tui/src/lib.rs"
+        untracked.parent.mkdir(parents=True)
+        untracked.write_text(f'include_str!("../../{filename}");\n')
+        self.assertEqual(self.scope(filename), "")
+        self.git("add", "--", "carina-tui/src/lib.rs")
+        self.assertEqual(self.scope(filename), "-p carina-tui")
+
+    def test_references_use_member_directories_from_metadata(self):
+        self.packages.append({
+            "id": "nested", "name": "nested", "dependencies": [],
+            "manifest_path": str(self.root / "nested/member/Cargo.toml"),
+        })
+        self.track("nested/member/src/lib.rs", 'include_str!("../../../notes/example.txt");\n')
+        self.assertEqual(self.scope("notes/example.txt"), "-p nested")
+
+    def test_git_grep_failure_falls_back_to_workspace(self):
+        binary = self.root / "bin/git"
+        binary.write_text("#!/bin/sh\nexit 74\n")
+        binary.chmod(0o755)
+        self.assertEqual(self.scope("site/example.md"), "--workspace")
 
     def test_metadata_failure_falls_back_to_workspace(self):
         self.env["METADATA_FAIL"] = "1"
         self.assertEqual(self.scope("carina-tui/src/lib.rs"), "--workspace")
+        self.assertEqual(self.scope("site/example.md"), "--workspace")
 
     def test_incomplete_metadata_falls_back_to_workspace(self):
         self.packages = []
@@ -162,8 +237,8 @@ class TouchedCratesTests(unittest.TestCase):
         )
         binary.chmod(0o755)
         for command, message in (
-            ("diff --name-only base...HEAD", "git diff base...HEAD failed"),
-            ("diff --name-only HEAD", "git diff HEAD failed"),
+            ("diff --no-renames --name-only base...HEAD", "git diff base...HEAD failed"),
+            ("diff --no-renames --name-only HEAD", "git diff HEAD failed"),
             ("ls-files --others --exclude-standard", "git ls-files failed"),
         ):
             with self.subTest(command=command):
@@ -176,6 +251,30 @@ class TouchedCratesTests(unittest.TestCase):
                 self.assertEqual(result.stdout, "")
                 self.assertIn(message, result.stderr)
         self.assertFalse(self.trace.exists())
+
+    def test_renames_include_both_old_and_new_crates_in_committed_and_working_diffs(self):
+        self.track("carina-cli/src/lib.rs", "// moved source\n")
+        self.git("commit", "-qm", "base")
+        base = self.git("rev-parse", "HEAD")
+        self.scope()  # Write the synthetic metadata before diff-mode invocations.
+        for committed in (False, True):
+            with self.subTest(committed=committed):
+                self.git("reset", "--hard", base)
+                destination = self.root / "carina-tui/src/lib.rs"
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                self.git("mv", "carina-cli/src/lib.rs", "carina-tui/src/lib.rs")
+                if committed:
+                    self.git("commit", "-qm", "move")
+                # Confirm this really is a rename whose old path would be
+                # lost without --no-renames, regardless of host Git config.
+                self.assertEqual(self.git("diff", "--find-renames", "--name-only", base),
+                                 "carina-tui/src/lib.rs")
+                result = subprocess.run(
+                    ["bash", str(HELPER), "--base", base], cwd=self.root, env=self.env,
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "-p carina-cli -p carina-tui")
 
     def test_no_merge_base_fails_scope_and_local_verify(self):
         def git(*args):

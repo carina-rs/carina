@@ -122,6 +122,99 @@ class WorkflowConditionTests(unittest.TestCase):
                 with self.subTest(job=name, event=event):
                     self.assertEqual(selected(field(self.jobs[name], "if"), event, True, True), name != "fmt" or event != "push")
 
+    def test_changes_job_uses_derived_scope_for_external_inputs(self):
+        block = self.jobs["changes"]
+        self.assertIn("fetch-depth: 0", block)
+        self.assertIn("ref: ${{ github.event.pull_request.head.sha || github.sha }}", block)
+        self.assertNotIn("site/src/content/providers/writing/(schemas|getting-started)", block)
+        program = textwrap.dedent(block.split("        run: |\n", 1)[1])
+        repo = WORKFLOW.parent.parent.parent
+        with tempfile.TemporaryDirectory(prefix="carina-changes-") as temporary:
+            root = Path(temporary)
+            environment = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+
+            def git(*args):
+                return subprocess.check_output(
+                    ["git", "-c", "user.name=Changes fixture", "-c",
+                     "user.email=changes@example.invalid", *args], cwd=root,
+                    env=environment, text=True, stderr=subprocess.PIPE, timeout=10,
+                ).strip()
+
+            def write(filename, contents):
+                path = root / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(contents)
+
+            git("init", "-q", "--template=")
+            for name in ("touched-crates.sh", "classify-ci-diff.sh", "wasm-fixture-crates.txt"):
+                destination = root / "scripts" / name
+                destination.parent.mkdir(exist_ok=True)
+                shutil.copyfile(repo / "scripts" / name, destination)
+                destination.chmod(0o755)
+            write("bin/cargo", '#!/bin/sh\n[ "$METADATA_FAIL" != 1 ] || exit 1\ncat "$METADATA_FIXTURE"\n')
+            (root / "bin/cargo").chmod(0o755)
+            environment.update(PATH=f"{root / 'bin'}:{os.environ['PATH']}",
+                               METADATA_FIXTURE=str(root / "metadata.json"), METADATA_FAIL="0")
+            members = ("carina-cli", "carina-core", "carina-plugin-sdk", "carina-provider-resolver")
+            write("metadata.json", json.dumps({
+                "workspace_root": str(root), "workspace_members": list(members),
+                "packages": [{"id": name, "name": name, "dependencies": [],
+                              "manifest_path": str(root / name / "Cargo.toml")} for name in members],
+            }))
+            write("carina-cli/src/lib.rs", 'include_str!("../../README.md");\n')
+            write("carina-core/src/lib.rs",
+                  'include_str!("../../site/src/content/reference/dsl/types-and-values.md");\n')
+            write("carina-plugin-sdk/src/lib.rs",
+                  'include_str!("../../site/src/content/providers/writing/schemas.md");\n')
+            write("carina-provider-resolver/tests/examples.rs",
+                  'root.join("site/src/content/reference/registry");\n')
+            inputs = {
+                "site/src/content/providers/writing/schemas.md": True,
+                "site/src/content/reference/registry/static-registry.md": True,
+                "site/src/content/reference/dsl/types-and-values.md": True,
+                "site/astro.config.mjs": False,
+                "site/src/content/providers/writing/unreferenced.md": False,
+                "README.md": True,
+                "unreferenced.md": False,
+                "notes/unexpected.rs": True,  # Preserve the existing path regex.
+            }
+            for filename in inputs:
+                write(filename, "before\n")
+            write("Cargo.toml", '[package]\nname = "example"\nversion = "1.0.0"\n')
+            git("add", ".")
+            git("commit", "-qm", "base")
+            base = git("rev-parse", "HEAD")
+            output = root / ".git/filter-output"
+
+            def filter_changes(event="pull_request", metadata_fail="0"):
+                output.write_text("")
+                result = subprocess.run(
+                    ["bash", "-e", "-o", "pipefail", "-c", program], cwd=root,
+                    env=dict(environment, EVENT_NAME=event, BASE_SHA=base,
+                             HEAD_SHA=git("rev-parse", "HEAD"), GITHUB_OUTPUT=str(output),
+                             METADATA_FAIL=metadata_fail), capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                return dict(line.split("=", 1) for line in output.read_text().splitlines())
+
+            for filename, expected in inputs.items():
+                with self.subTest(filename=filename):
+                    git("reset", "--hard", base)
+                    write(filename, "after\n")
+                    git("add", ".")
+                    git("commit", "-qm", "change")
+                    self.assertEqual(filter_changes(), {"version_only": "false", "code": str(expected).lower()})
+                    if not expected:
+                        self.assertEqual(filter_changes(metadata_fail="1"),
+                                         {"version_only": "false", "code": "true"})
+            git("reset", "--hard", base)
+            write("Cargo.toml", '[package]\nname = "example"\nversion = "1.0.1"\n')
+            git("add", ".")
+            git("commit", "-qm", "version")
+            self.assertEqual(filter_changes(), {"version_only": "true", "code": "true"})
+            for event in ("push", "merge_group"):
+                self.assertEqual(filter_changes(event), {"version_only": "false", "code": "true"})
+
     def commands(self, job, event):
         result = []
         for step in re.split(r"(?m)(?=^      - )", self.jobs[job]):
@@ -474,7 +567,7 @@ class WorkflowConditionTests(unittest.TestCase):
             original = WORKFLOW.read_text()
             self.assertEqual(audit(original).returncode, 0)
             for style in ("|", ">-"):
-                command = "scripts/verify.sh fmt" if style == "|" else "scripts/verify.sh\n          fmt"
+                command = "scripts/verify.sh fmt"
                 source = original.replace("run: scripts/verify.sh fmt\n",
                                           f"run: {style}\n          {command}\n", 1)
                 self.assertEqual(audit(source).returncode, 0)
@@ -491,6 +584,9 @@ class WorkflowConditionTests(unittest.TestCase):
                 "python3 scripts/check-synthetic.py",
                 "scripts/check-synthetic",
                 "bash scripts/nested/check-synthetic.bash",
+                'scripts/touched-crates.sh --base "$BASE_SHA"',
+                "scripts/verify.sh check || true",
+                "true || scripts/verify.sh check",
                 "|\n          scripts/verify.sh check\n          env CARGO_BUILD_JOBS=2 cargo check",
                 ">-\n          cargo\n          nextest run --workspace",
             ):
@@ -518,6 +614,7 @@ class WorkflowConditionTests(unittest.TestCase):
             # Setup exceptions allow only the setup command, not an arbitrary
             # check added beside it or elsewhere in the same job/action.
             for job, allowed in (("changes", "bash scripts/classify-ci-diff.sh a b"),
+                                 ("changes", 'scripts/touched-crates.sh --base "$BASE_SHA"'),
                                  ("test-partition", "bash scripts/require-wasm-fixtures.sh"),
                                  ("binary-build", "cargo build --release --bin carina")):
                 block = self.jobs[job]

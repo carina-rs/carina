@@ -23,7 +23,7 @@ function allowed_script(script) {
     if (script == "scripts/verify.sh") return 1 # The shared dispatcher.
     # Diff classification selects jobs; it does not perform verification.
     if (source == ".github/workflows/ci.yml" && job == "changes" &&
-        script == "scripts/classify-ci-diff.sh") return 1
+        (script == "scripts/classify-ci-diff.sh" || script == "scripts/touched-crates.sh")) return 1
     # Archive consumers must require their downloaded WASM artifacts.
     if (source == ".github/workflows/ci.yml" &&
         (job == "test-partition" || job == "test-isolation") &&
@@ -46,27 +46,40 @@ function violation(i, line) {
     printf "ERROR: %s:%d (%s) bypasses verify.sh: %s\n", source, lines[i], job, line > "/dev/stderr"
     failed = 1
 }
-function record_ci_kinds(run,    rest, words, n, i, kind, archive) {
+function valid_verify_command(run,    command) {
+    command = run
+    # The partition argument is the only expression in a verify invocation.
+    gsub(/\$\{\{ matrix\.partition \}\}/, "partition", command)
+    return command ~ /^scripts\/verify\.sh([ \t]+[[:alnum:]_.\/-]+)+$/
+}
+function allowed_step_if() {
+    return source == ".github/workflows/ci.yml" && job == "test" &&
+        ((step_command == "scripts/verify.sh nextest-compile" &&
+          step_if == "github.event_name == \047push\047") ||
+         (step_command == "scripts/verify.sh nextest-archive nextest-archive.tar.zst" &&
+          step_if == "github.event_name != \047push\047"))
+}
+function finish_step() {
+    if (step_verify && step_has_if && !allowed_step_if()) {
+        printf "ERROR: %s:%d (%s) verify step must not use step-level if: %s\n", source, step_if_line, job, step_if > "/dev/stderr"
+        failed = 1
+    }
+    step_open = step_verify = step_has_if = 0
+    step_command = step_if = ""
+}
+function record_ci_kinds(run,    words, n, i, kind, archive) {
     if (source != ".github/workflows/ci.yml") return
-    gsub(/\\\n[[:space:]]*/, " ", run)
-    while (match(run, /(^|[;&|\n])[[:space:]]*(bash[[:space:]]+)?["\047]?(\.\/)?scripts\/verify\.sh["\047]?([[:space:]]|$)/)) {
-        rest = substr(run, RSTART + RLENGTH)
-        run = rest
-        sub(/\n.*/, "", rest)
-        sub(/^[[:space:]]+/, "", rest)
-        n = split(rest, words, /[[:space:]]+/)
-        for (i = 1; i <= n; i++) {
-            kind = words[i]
-            if (!(kind in required)) break
-            seen[kind] = 1
-            # CI runs the default nextest check in archive partitions.
-            if (kind == "nextest-partition") seen["nextest"] = 1
-            if (kind == "isolation") {
-                archive = words[i + 1]
-                if (archive != "" && archive !~ /^[-;&|#]/ &&
-                    !(archive in required))
-                    seen["isolation-with-archive"] = 1
-            }
+    n = split(run, words, /[[:space:]]+/)
+    for (i = 2; i <= n; i++) {
+        kind = words[i]
+        if (!(kind in required)) break
+        seen[kind] = 1
+        # CI runs the default nextest check in archive partitions.
+        if (kind == "nextest-partition") seen["nextest"] = 1
+        if (kind == "isolation") {
+            archive = words[i + 1]
+            if (archive != "" && archive !~ /^-/ && !(archive in required))
+                seen["isolation-with-archive"] = 1
         }
     }
 }
@@ -74,8 +87,8 @@ function inspect(    i, line, rest, script, run) {
     run = ""
     for (i = 1; i <= count; i++) {
         line = body[i]
+        run = run (i == 1 ? "" : "\n") line
         sub(/^[[:space:]]*#[^\n]*/, "", line)
-        run = run (run_folded ? " " : "\n") line
         if (line ~ /(^|[^[:alnum:]_-])(cargo(-[[:alnum:]_-]+)?|\$CARGO|\$\{CARGO\})([[:space:]"\047]|$)/ && !allowed_cargo(line))
             violation(i, line)
         rest = line
@@ -86,7 +99,18 @@ function inspect(    i, line, rest, script, run) {
             rest = substr(rest, RSTART + RLENGTH)
         }
     }
-    record_ci_kinds(run)
+    sub(/^[[:space:]]+/, "", run)
+    sub(/[[:space:]]+$/, "", run)
+    if (index(run, "verify.sh")) {
+        step_verify = 1
+        if (!valid_verify_command(run)) {
+            printf "ERROR: %s:%d (%s) bypasses verify.sh: verify run must be a single scripts/verify.sh command: %s\n", source, lines[1], job, run > "/dev/stderr"
+            failed = 1
+        } else {
+            step_command = run
+            record_ci_kinds(run)
+        }
+    }
     count = 0
 }
 BEGIN {
@@ -100,6 +124,7 @@ source == ".github/workflows/ci.yml" && /continue-on-error/ {
 }
 /^  [[:alnum:]_-]+:/ {
     inspect()
+    finish_step()
     if (source ~ /^\.github\/workflows\//) {
         job = $1
         sub(/:$/, "", job)
@@ -113,6 +138,30 @@ source == ".github/workflows/ci.yml" && /continue-on-error/ {
         inspect()
         in_run = 0
     }
+    if (!in_run) {
+        if ($0 ~ /^[[:space:]]*- [[:alnum:]_-]+:/) {
+            finish_step()
+            step_open = 1
+            step_indent = indent
+        }
+        if (step_open && ((indent == step_indent && $0 ~ /^[[:space:]]*- if:/) ||
+                          (indent == step_indent + 2 && $0 ~ /^[[:space:]]*if:/))) {
+            step_has_if = 1
+            step_if_line = NR
+            step_if = $0
+            sub(/^[[:space:]]*(- )?if:[[:space:]]*/, "", step_if)
+        }
+        if (in_env && $0 !~ /^[[:space:]]*$/ && indent <= env_indent) in_env = 0
+        if (source == ".github/workflows/ci.yml" && indent >= 4 &&
+            $0 ~ /^[[:space:]]*(- )?env:/) {
+            in_env = 1
+            env_indent = indent + ($0 ~ /^[[:space:]]*- env:/ ? 2 : 0)
+        }
+        if (in_env && $0 ~ /(^|[[:space:],{])["\047]?(RUSTFLAGS|RUSTDOCFLAGS|CARGO_[[:alnum:]_]*|NEXTEST_[[:alnum:]_]*)["\047]?[[:space:]]*:/) {
+            printf "ERROR: %s:%d (%s) job/step env must not override Rust verification settings: %s\n", source, NR, job, $0 > "/dev/stderr"
+            failed = 1
+        }
+    }
     if ($0 ~ /^[[:space:]]*(- )?run:/) {
         inspect()
         run_indent = indent
@@ -120,7 +169,6 @@ source == ".github/workflows/ci.yml" && /continue-on-error/ {
         in_run = 1
         line = $0
         sub(/^[[:space:]]*(- )?run:[[:space:]]*/, "", line)
-        run_folded = (line ~ /^>/)
         if (line ~ /^[|>]/) next
     } else if (in_run) {
         line = $0
@@ -130,6 +178,7 @@ source == ".github/workflows/ci.yml" && /continue-on-error/ {
 }
 END {
     inspect()
+    finish_step()
     if (source == ".github/workflows/ci.yml") {
         for (kind in required) {
             if (!seen[kind]) {
@@ -253,6 +302,77 @@ class VerifyGuardTests(unittest.TestCase):
     def test_missing_ci_kind_is_rejected(self):
         self.ci.write_text(self.original_ci.replace("      - run: scripts/verify.sh fmt\n", ""))
         self.guard("verify.sh kind fmt is not run by ci.yml")
+
+    def test_verify_runs_reject_shell_operators_wrappers_and_multiple_lines(self):
+        for command in (
+            "scripts/verify.sh clippy || true",
+            "true || scripts/verify.sh clippy",
+            "scripts/verify.sh clippy && true",
+            "scripts/verify.sh clippy; true",
+            "scripts/verify.sh clippy | cat",
+            "scripts/verify.sh clippy &",
+            "scripts/verify.sh clippy > /dev/null",
+            "bash scripts/verify.sh clippy",
+            "env scripts/verify.sh clippy",
+            "./scripts/verify.sh clippy",
+            "'scripts/verify.sh' clippy",
+            "scripts/verify.sh clippy # comment",
+            '|\n          scripts/verify.sh clippy\n          true',
+            '>-\n          scripts/verify.sh\n          clippy',
+            'scripts/verify.sh clippy $(true)',
+            'scripts/verify.sh clippy `true`',
+        ):
+            with self.subTest(command=command):
+                self.ci.write_text(self.original_ci.replace(
+                    "run: scripts/verify.sh clippy\n", f"run: {command}\n", 1))
+                self.guard("verify run must be a single scripts/verify.sh command")
+
+    def test_verify_step_conditions_are_rejected_before_and_after_run(self):
+        original = "      - run: scripts/verify.sh clippy\n"
+        for condition in ("false", "true", "${{ always() }}", "github.event_name != 'push'"):
+            for replacement in (
+                f"      - if: {condition}\n        run: scripts/verify.sh clippy\n",
+                f"      - run: scripts/verify.sh clippy\n        if: {condition}\n",
+                f"      - name: Verify\n        if: {condition}\n        run: scripts/verify.sh clippy\n",
+            ):
+                with self.subTest(condition=condition, replacement=replacement):
+                    self.ci.write_text(self.original_ci.replace(original, replacement, 1))
+                    self.guard("verify step must not use step-level if")
+
+    def test_only_exact_archive_and_compile_step_conditions_are_allowed(self):
+        for kind, condition in (("nextest-compile", "github.event_name == 'push'"),
+                                ("nextest-archive nextest-archive.tar.zst", "github.event_name != 'push'")):
+            for replacement in ("false", "true", "${{ " + condition + " }}"):
+                with self.subTest(kind=kind, replacement=replacement):
+                    before = f"if: {condition}\n"
+                    # Restrict the mutation to this verify step, retaining
+                    # the legitimate conditions on artifact-upload steps.
+                    run = f"        run: scripts/verify.sh {kind}\n"
+                    prefix, suffix = self.original_ci.split(run, 1)
+                    position = prefix.rindex(before)
+                    prefix = prefix[:position] + prefix[position:].replace(before, f"if: {replacement}\n", 1)
+                    self.ci.write_text(prefix + run + suffix)
+                    self.guard("verify step must not use step-level if")
+
+    def test_job_and_step_env_cannot_override_rust_verification_settings(self):
+        for name in ("RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_BUILD_JOBS", "CARGO_PROFILE_TEST_DEBUG",
+                     "NEXTEST_TEST_THREADS", "NEXTEST_VERSION"):
+            for before, replacement in (
+                ("  changes:\n", f"  changes:\n    env:\n      {name}: value\n"),
+                ("  clippy:\n", f"  clippy:\n    env:\n      {name}: value\n"),
+                ("  clippy:\n", f"  clippy:\n    env: {{ {name}: value }}\n"),
+                ("      - run: scripts/verify.sh clippy\n",
+                 f"      - env:\n          {name}: value\n        run: scripts/verify.sh clippy\n"),
+                ("      - run: scripts/verify.sh clippy\n",
+                 f"      - run: scripts/verify.sh clippy\n        env:\n          {name}: value\n"),
+                ("      - run: scripts/verify.sh clippy\n",
+                 f"      - run: scripts/verify.sh clippy\n        env: {{ '{name}': value }}\n"),
+                ("      - run: scripts/verify.sh clippy\n",
+                 f'      - env: {{ "{name}": value }}\n        run: scripts/verify.sh clippy\n'),
+            ):
+                with self.subTest(name=name, replacement=replacement):
+                    self.ci.write_text(self.original_ci.replace(before, replacement, 1))
+                    self.guard("job/step env must not override Rust verification settings")
 
 
 unittest.main()

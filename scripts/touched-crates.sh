@@ -33,9 +33,9 @@
 #      If any changed file is outside a workspace crate
 #      AND outside the "ignore" set (site/notes/other CI/scripts/infra), emit
 #      `--workspace` to be safe.
-#   5. Remaining files in the ignore set (CLAUDE.md, .github/**, scripts/**,
-#      site/**, notes/**, infra/**, README.md, .gitignore, *.md at root) do
-#      not trigger any test crates on their own.
+#   5. Otherwise-ignorable files outside crates are owned by crates whose
+#      tracked Rust sources reference the file or one of its directories.
+#      Include their reverse dependencies too; unreferenced docs stay empty.
 
 set -euo pipefail
 
@@ -80,11 +80,11 @@ else
     fi
     # Process substitution hides command failures from mapfile and errexit.
     # Check each discovery command before classifying any of its output.
-    if ! committed_files=$(git diff --name-only "$base_ref"...HEAD); then
+    if ! committed_files=$(git diff --no-renames --name-only "$base_ref"...HEAD); then
         echo "touched-crates.sh: git diff $base_ref...HEAD failed; cannot determine touched crates" >&2
         exit 1
     fi
-    if ! working_files=$(git diff --name-only HEAD); then
+    if ! working_files=$(git diff --no-renames --name-only HEAD); then
         echo 'touched-crates.sh: git diff HEAD failed; cannot determine touched crates' >&2
         exit 1
     fi
@@ -101,16 +101,6 @@ fi
 
 # Keep artifact scope in sync with verify.sh's wasm-fixtures build.
 mapfile -t fixture_crates < "$(dirname "${BASH_SOURCE[0]}")/wasm-fixture-crates.txt"
-
-is_ignorable() {
-    local f="$1"
-    case "$f" in
-        CLAUDE.md|README.md|.gitignore|.gitmodules) return 0 ;;
-        .github/*|scripts/*|site/*|notes/*|infra/*|examples/*) return 0 ;;
-        *.md) [[ "$f" != */* ]] && return 0 ;;  # other top-level docs
-    esac
-    return 1
-}
 
 candidates=()
 for f in "${files[@]}"; do
@@ -138,16 +128,11 @@ for f in "${files[@]}"; do
         esac
     done
 
-    # Static scripts run regardless of crate scope; docs need no Cargo check.
-    if is_ignorable "$f"; then
-        continue
-    fi
-
     candidates+=("$f")
 done
 
 if [[ ${#candidates[@]} -eq 0 ]]; then
-    # Only ignorable changes — nothing to test.
+    # Discovery may have returned only blank lines.
     exit 0
 fi
 
@@ -161,6 +146,8 @@ fi
 if ! selection=$(python3 -c '
 import json
 from pathlib import Path
+import re
+import subprocess
 import sys
 
 metadata = json.load(sys.stdin)
@@ -172,14 +159,63 @@ packages = {
 if not packages or len(packages) != len(members):
     raise ValueError("incomplete workspace metadata")
 root = Path(metadata["workspace_root"]).resolve()
+
+def owner_of(path):
+    return next((parent for parent in (path, *path.parents) if parent in packages), None)
+
+def is_ignorable(filename):
+    path = Path(filename)
+    return (
+        filename in {"CLAUDE.md", "README.md", ".gitignore", ".gitmodules"}
+        or path.parts[0] in {".github", "scripts", "site", "notes", "infra", "examples"}
+        or (len(path.parts) == 1 and path.suffix == ".md")
+    )
+
+sources = []
+for directory in packages:
+    relative = directory.relative_to(root).as_posix()
+    sources.append(":(glob)" + (relative + "/" if relative != "." else "") + "**/*.rs")
+
+def reference_owners(filename):
+    parents = [str(parent) for parent in Path(filename).parents if parent != Path(".")]
+    patterns = [filename, *parents]
+    command = ["git", "grep", "-l", "-z", "-F"]
+    for pattern in patterns:
+        command.extend(["-e", pattern])
+    matches = subprocess.run(command + ["--", *sources], cwd=root,
+                             stdout=subprocess.PIPE, check=False, timeout=30)
+    if matches.returncode not in (0, 1):
+        raise RuntimeError("git grep failed")
+    # Match directory paths at their end, not prefixes of longer file paths.
+    # A bare top-level name needs / to distinguish site/ from Rust identifiers
+    # and unrelated strings such as .field("site", ...).
+    directory_references = [re.compile(r"(?<![\w.-])" + re.escape(parent)
+                                      + (r"/?" if "/" in parent else "/")
+                                      + r"(?=[\s\x22\x27`)]|$)")
+                            for parent in parents]
+    owners = set()
+    for source in matches.stdout.decode().split("\0"):
+        if not source:
+            continue
+        path = root / source
+        text = path.read_text()
+        if filename in text or any(pattern.search(text) for pattern in directory_references):
+            owner = owner_of(path.resolve())
+            if owner is not None:
+                owners.add(owner)
+    return owners
+
 touched = set()
 for filename in sys.argv[1:]:
     path = (root / filename).resolve()
-    owner = next((parent for parent in (path, *path.parents) if parent in packages), None)
-    if owner is None:
+    owner = owner_of(path)
+    if owner is not None:
+        touched.add(owner)
+    elif is_ignorable(filename):
+        touched.update(reference_owners(filename))
+    else:
         print("--workspace")
         sys.exit(0)
-    touched.add(owner)
 
 dependents = {directory: set() for directory in packages}
 for directory, package in packages.items():
