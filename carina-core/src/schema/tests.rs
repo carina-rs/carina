@@ -11150,7 +11150,7 @@ fn assignable_specific_arn_without_pattern_flows_into_generic_arn_with_pattern()
 }
 
 #[test]
-fn assignable_identified_members_defer_overlap_and_reject_disjointness() {
+fn assignability_ignores_source_members_and_rejects_disjoint_identity_bounds() {
     let mk = |length: Option<(Option<u64>, Option<u64>)>| {
         AttributeType::string_member(
             crate::schema::StringIdentityLayer::new(
@@ -11171,7 +11171,14 @@ fn assignable_identified_members_defer_overlap_and_reject_disjointness() {
     let unproven = mk(None);
     assert!(assignable(&unproven, &wide));
     let disjoint = mk(Some((Some(100), Some(128))));
-    assert!(!assignable(&disjoint, &wide));
+    assert!(assignable(&disjoint, &wide));
+    let identity_disjoint = AttributeType::refined_string(
+        Some(TypeIdentity::bare("SizedString")),
+        None,
+        Some((Some(100), Some(128))),
+        None,
+    );
+    assert!(!assignable(&identity_disjoint, &wide));
 }
 
 /// carina#3413: two callers that independently construct the SAME

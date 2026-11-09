@@ -212,8 +212,7 @@ fn counts_for_refinements(kind: &AttrTypeKind<super::Compiled>) -> bool {
             identity_layer,
             member_layer,
         } => {
-            identity_layer.binding.identity().is_some()
-                || identity_layer.pattern.is_some()
+            identity_layer.pattern.is_some()
                 || identity_layer.length.is_some()
                 || member_layer.pattern.is_some()
                 || member_layer.length.is_some()
@@ -221,19 +220,13 @@ fn counts_for_refinements(kind: &AttrTypeKind<super::Compiled>) -> bool {
         AttrTypeKind::Int {
             identity_layer,
             member_layer,
-        } => {
-            identity_layer.binding.identity().is_some()
-                || identity_layer.range.is_some()
-                || member_layer.range.is_some()
-        }
-        // A Reference always carries a nominal String identity, even when its
-        // optional pattern and bounds are absent.
+        } => identity_layer.range.is_some() || member_layer.range.is_some(),
         AttrTypeKind::Reference {
             identity: _,
-            pattern: _,
-            length: _,
-        }
-        | AttrTypeKind::Ref(_)
+            pattern,
+            length,
+        } => pattern.is_some() || length.is_some(),
+        AttrTypeKind::Ref(_)
         | AttrTypeKind::Struct {
             fields: _,
             name: _,
@@ -279,6 +272,28 @@ mod tests {
 
     fn refined_string() -> AttributeType {
         AttributeType::refined_string(None, None, Some((Some(1), Some(8))), None)
+    }
+
+    #[test]
+    fn bare_references_cost_no_refinement_budget() {
+        let schema = ResourceSchema::new("Test")
+            .attribute(
+                AttributeSchema::optional(
+                    "value",
+                    AttributeType::reference(
+                        crate::schema::TypeIdentity::from_dotted("test.Name"),
+                        None,
+                        None,
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let ty = schema.effective_attribute("value").unwrap().value_type();
+        let report = ty.refinement_positions(0);
+        assert!(!report.is_truncated());
+        assert!(report.positions().is_empty());
     }
 
     #[test]

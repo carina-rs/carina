@@ -2,6 +2,24 @@
 mod fixture;
 
 #[test]
+fn read_values_ignore_slot_members_and_distinct_identities_stay_heterogeneous() {
+    let snapshot = fixture::snapshot();
+    for &(main, exports) in fixture::READ_CASES {
+        let dir = fixture::directory(main, exports);
+        fixture::validate(dir.path(), &snapshot)
+            .unwrap_or_else(|error| panic!("{main}\n{exports}\n{error}"));
+        let mixed = exports.replace("b.account_id", "a.other_id");
+        let dir = fixture::directory(main, &mixed);
+        let error = fixture::validate(dir.path(), &snapshot)
+            .expect_err("different identities require an explicit compatible sink");
+        assert!(
+            error.contains("aws.AccountId") && error.contains("aws.OtherId"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn member_refined_account_ids_satisfy_every_directory_annotation() {
     let snapshot = fixture::snapshot();
     for &(main, exports) in fixture::CASES {

@@ -31,20 +31,12 @@
                 "max": {
                   "Inclusive": 100
                 }
-              },
-              "member_range": {
-                "min": {
-                  "Inclusive": 1
-                },
-                "max": {
-                  "Inclusive": 10
-                }
               }
             }
           },
           "empty_intersection": false
         },
-        "projection_fingerprint": "9374930cd4ae37a425be15392960f1f1b595c8c25f7043dee829ee50baacd1c9"
+        "projection_fingerprint": "3f78fa93b0dc477f97c01e172cd36acbfcfe8b90174876e478280bf8d1fbfd26"
       }
     }
   },
@@ -194,23 +186,12 @@
                     "kind": "full"
                   }
                 }
-              },
-              "member_layer": {
-                "length": {
-                  "min": {
-                    "Inclusive": 2
-                  },
-                  "max": {
-                    "Inclusive": 4
-                  }
-                },
-                "pattern": null
               }
             }
           },
           "empty_intersection": false
         },
-        "projection_fingerprint": "89d04fe7a71298399dacb5c232aa0839fdbf084580f81f3a0f6746328c391fbe"
+        "projection_fingerprint": "a5046742e473c0929b1f7c3eceaf18428264f0440e97e66b3dceed754381505c"
       }
     }
   }

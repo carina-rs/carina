@@ -73,7 +73,14 @@ impl ProviderFactory for Factory {
                 .attribute(
                     AttributeSchema::provider_populated("other_id", account("aws.OtherId")).build(),
                 )
-                .attribute(AttributeSchema::provider_populated("looser_account_id", looser).build())
+                .attribute(
+                    AttributeSchema::provider_populated("looser_account_id", looser.clone())
+                        .build(),
+                )
+                .validate()
+                .unwrap(),
+            ResourceSchema::new("organizations.LooserAccount")
+                .attribute(AttributeSchema::provider_populated("account_id", looser).build())
                 .validate()
                 .unwrap(),
         ]
@@ -153,8 +160,11 @@ pub fn validate(dir: &Path, snapshot: &LoadedProviderSnapshot) -> Result<(), Str
     )?;
     use carina_core::parser::ExportParamLike;
     for export in &parsed.export_params {
+        let expression = export.judgement().map_err(|e| e.to_string())?;
+        if export.type_expr_opt().is_none() {
+            expression.static_type().map_err(|e| e.to_string())?;
+        }
         if let (Some(ty), Some(value)) = (export.type_expr_opt(), export.value()) {
-            let expression = export.judgement().map_err(|e| e.to_string())?;
             carina_core::parser::retained::admit_expression(expression, ty)
                 .map_err(|e| e.to_string())?;
             carina_core::validation::typecheck::check_type_expr_value(
@@ -169,6 +179,29 @@ pub fn validate(dir: &Path, snapshot: &LoadedProviderSnapshot) -> Result<(), Str
     }
     Ok(())
 }
+
+pub const READ_CASES: &[(&str, &str)] = &[
+    (
+        "let a = awscc.organizations.Account {}\nlet b = awscc.organizations.LooserAccount {}",
+        "exports { ids = [a.account_id, b.account_id] }\n",
+    ),
+    (
+        "let a = awscc.organizations.Account {}\nlet b = awscc.organizations.LooserAccount {}",
+        "exports { ids = { x = a.account_id, y = b.account_id } }\n",
+    ),
+    (
+        "let a = awscc.organizations.Account {}\nlet b = awscc.organizations.LooserAccount {}",
+        "exports { id = a.account_id ?? b.account_id }\n",
+    ),
+    (
+        "let a = awscc.organizations.Account {}\nlet b = awscc.organizations.LooserAccount {}",
+        "exports { ids: list(aws.AccountId) = [a.account_id, b.account_id] }\n",
+    ),
+    (
+        "let a = awscc.organizations.Account {}\nlet b = awscc.organizations.LooserAccount {}",
+        "exports { ids: map(aws.AccountId) = { x = a.account_id, y = b.account_id } }\n",
+    ),
+];
 
 pub const CASES: &[(&str, &str)] = &[
     (

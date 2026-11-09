@@ -323,6 +323,21 @@ fn identity_edges_defer_member_containment_but_reject_disjointness() {
             &loaded.provider_context().custom_types,
             &P_OWNER
         ),
+        Ok(true)
+    );
+    let identity_disjoint = AttributeType::refined_string(
+        Some(identity("NewName")),
+        None,
+        Some((Some(100), Some(128))),
+        None,
+    );
+    assert_eq!(
+        assignment(
+            &identity_disjoint,
+            &sink,
+            &loaded.provider_context().custom_types,
+            &P_OWNER
+        ),
         Ok(false)
     );
 }

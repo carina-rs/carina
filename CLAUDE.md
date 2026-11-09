@@ -626,20 +626,25 @@ A struct type represents a nested object with typed fields.
   than redeclaring an identity with different constraints. Across different
   owners (for example AWS and AWSCC), annotation constraints are conjoined:
   values must satisfy every owner's identity layer. Annotation-origin evidence
-  uses an identity-only payload with no member slots; only exact schema
-  projections retain member constraints. Decoding annotation-origin member
-  records must fail. Native single-owner and multi-owner annotations are distinct
+  uses an identity-only payload with no member slots. Read-value projections
+  are identity-only too: their typed declarations preserve enum values,
+  reference kind and semantic callbacks but cannot store member constraints.
+  Projection fingerprints cover identity/value metadata, never slot members.
+  Decoding either value-evidence origin with member fields must fail.
+  Native single-owner and multi-owner annotations are distinct
   forms: a single holds one `SchemaTypeOwner`, and a multi holds a checked map
   keyed by at least two `SchemaTypeOwner`s. Wire single-owner annotations omit
   `owner_layers`; multi-owner annotations retain exactly one identity layer per
   owner. Decoding verifies the exact conjunction of owner layers, including
   empty bounds from same-owner repeats, and recomputes the empty-intersection
   marker after Float normalization. Owner sets derive from layer keys. Portable
-  equality includes origin and projection fingerprint. Same-identity joins keep
-  identical full evidence; otherwise they widen locally to identity-only
-  annotations by conjoining the operands' owner identity layers. They never
-  promote an operand to an exact Enum/Reference projection or resolve a catalog.
-  Different-identity joins try canonical identities lazily in sorted order.
+  equality includes origin and identity-only projection fingerprint.
+  A member layer belongs to its destination slot. Enforce it on writes through
+  identity admission and the deferred destination check; source bounds are
+  identity-layer bounds only. Unannotated collections, conditionals and coalesce
+  require identical `TypeExpr`s, as on main. Reads of slots differing only in
+  member constraints infer equal types. An explicit compatible annotation is
+  the way to accept otherwise mixed declarations; inference never widens them.
   Enum definition and canonical-spelling disagreements remain typed errors.
   Built-in and aggregate comparisons accept identity-only typed projections. Exact
   declarations and their fingerprints preserve both layers. Hover renders
@@ -655,12 +660,12 @@ A struct type represents a nested object with typed fields.
   equal identities and allowed widenings (#4349), including annotations,
   exports, module arguments, and function parameters/returns. All destination
   kinds can retain the existing `NeedsLocal` resolved-value obligation; reject
-  only proven disjoint String/Int bounds. Float sinks retain range containment,
-  including the effective identity/member range of an Int source. Unproven
-  regex containment defers to the value check. Collection/coalesce inference joins compatible nominal declarations
-  through their canonical identity while retaining child evidence. Never use
-  full declaration equality or display-name equality to reject identity-compatible
-  flows; mismatch names expose differing constraints or scalar kinds.
+  only proven disjoint identity bounds against the destination's effective
+  bounds. Int-to-Float widening also uses source identity bounds and retains
+  the destination value check; Float-to-Float keeps main's range containment.
+  Unproven regex containment defers to the value check. At annotated sinks,
+  declaration equality and display-name equality do not replace identity
+  admission; mismatch names expose differing constraints or scalar kinds.
 - **Schema field transport**: `StructField` and `AttributeSchema` cross the
   WASM boundary as JSON via the `schemas: func() -> string` WIT export. The
   sole typed core/protocol boundary is `carina_core::protocol_convert`: the SDK

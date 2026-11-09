@@ -1470,16 +1470,13 @@ mod judgement {
         left: Result<TypeExpr, InferenceIssue>,
         default: Result<TypeExpr, InferenceIssue>,
         empty: EmptyCoalesceDefault,
-        config: &super::super::ProviderContext,
     ) -> Result<TypeExpr, InferenceIssue> {
         match (left, default) {
-            (Ok(left), Ok(right)) => inference::join_inferred_types(&left, &right, config)
-                .ok_or_else(|| {
-                    InferenceError::IncompatibleCoalesceTypes {
-                        types: crate::schema::MismatchTypeNames::for_type_exprs(&left, &right),
-                    }
-                    .into()
-                }),
+            (Ok(left), Ok(right)) if left == right => Ok(left),
+            (Ok(left), Ok(right)) => Err(InferenceError::IncompatibleCoalesceTypes {
+                types: crate::schema::MismatchTypeNames::for_type_exprs(&left, &right),
+            }
+            .into()),
             (Ok(left @ TypeExpr::List(_)), Err(_))
                 if matches!(empty, EmptyCoalesceDefault::List) =>
             {
@@ -3572,7 +3569,7 @@ mod judgement {
                         _ => EmptyCoalesceDefault::None,
                     };
                     let ty = match (&left, &right) {
-                        (Ok(_), Ok(_)) => coalesce_type(left, right, empty, self.config),
+                        (Ok(_), Ok(_)) => coalesce_type(left, right, empty),
                         _ if matches!((children[0].value_shape(), children[1].value_shape()), (Some(left), Some(right)) if left != right) => {
                             Err(InferenceError::UnknownType {
                                 reason: format!(
@@ -3583,7 +3580,7 @@ mod judgement {
                             }
                             .into())
                         }
-                        _ => coalesce_type(left, right, empty, self.config),
+                        _ => coalesce_type(left, right, empty),
                     };
                     let mut result = alternatives(ty, children);
                     result.data_mut().coalesce =
@@ -3624,17 +3621,17 @@ mod judgement {
                         Err(error.clone().into())
                     } else {
                         match children.first() {
-                            Some(first) => first.static_type().cloned().and_then(|mut first| {
-                                let mut joiner = inference::InferredTypeJoiner::new(self.config);
+                            Some(first) => first.static_type().cloned().and_then(|first| {
                                 for child in &children[1..] {
                                     let next = child.static_type()?;
-                                    first = joiner.join(&first, next).ok_or_else(|| {
-                                        InferenceError::HeterogeneousCollection {
+                                    if *next != first {
+                                        return Err(InferenceError::HeterogeneousCollection {
                                             types: crate::schema::MismatchTypeNames::for_type_exprs(
                                                 &first, next,
                                             ),
                                         }
-                                    })?;
+                                        .into());
+                                    }
                                 }
                                 Ok(if matches!(root.kind, ExprKind::List) {
                                     TypeExpr::List(Box::new(first))

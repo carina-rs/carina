@@ -5117,11 +5117,6 @@ mod tests {
             )
             .validate()
             .expect("schema fixture must be valid");
-        let annotation = crate::parser::ResolvedSchemaType::from_annotation_declaration(
-            "test",
-            &schema.as_schema().attributes["identifier"].attr_type,
-        )
-        .unwrap();
         schemas.insert("test", schema);
 
         let (exports, errors) =
@@ -5136,13 +5131,17 @@ mod tests {
             });
 
         assert!(errors.is_empty(), "unexpected resolve errors: {errors:?}");
-        // Different evidence widens to an identity-only annotation in either order.
-        let expected =
-            UpstreamExportType::Static(ExportStaticType::Inferred(consumer_inferred_type(
-                TypeExpr::List(Box::new(TypeExpr::SchemaType { owned: annotation })),
-            )));
         for name in ["out", "reversed"] {
-            assert_eq!(exports["ups"][name].static_type, expected);
+            assert!(matches!(
+                &exports["ups"][name].static_type,
+                UpstreamExportType::Static(ExportStaticType::Inferred(
+                    crate::static_type::StaticType::Unchecked(
+                        crate::static_type::ConsumerInferredUncheckedReason::InferenceFailed(
+                            crate::static_type::InferenceError::HeterogeneousCollection { .. }
+                        )
+                    )
+                ))
+            ));
         }
     }
 

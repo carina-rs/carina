@@ -61,7 +61,29 @@ fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> Strin
     let mut content = String::new();
     for position in walk.positions() {
         let mut refinements = String::new();
-        match position.value_type().shape() {
+        let shape = position.value_type().shape();
+        let identity = match &shape {
+            Shape::Reference {
+                identity,
+                pattern: _,
+                length: _,
+            } => Some(*identity),
+            Shape::String {
+                identity_layer,
+                member_layer: _,
+            } => identity_layer.identity,
+            Shape::Int {
+                identity_layer,
+                member_layer: _,
+            } => identity_layer.identity,
+            _ => None,
+        };
+        if position.path().is_empty()
+            && let Some(identity) = identity
+        {
+            refinements.push_str(&format!("\n- **Identity**: `{identity}`"));
+        }
+        match shape {
             Shape::Reference {
                 identity: _,
                 pattern,
@@ -3153,6 +3175,60 @@ EOT
             panic!("Markdown hover")
         };
         content.value
+    }
+
+    #[test]
+    fn hover_top_level_refined_leaves_name_their_identity() {
+        use carina_core::schema::{
+            IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+            StringMemberConstraints, TypeIdentity,
+        };
+        for declaration in [
+            AttributeType::reference(
+                TypeIdentity::from_dotted("test.ReadName"),
+                Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                Some((Some(1), Some(8))),
+            ),
+            AttributeType::string_member(
+                StringIdentityLayer::new(
+                    Some(TypeIdentity::from_dotted("test.ReadName")),
+                    None,
+                    Some((Some(1), Some(32))),
+                    None,
+                ),
+                StringMemberConstraints::new(None, Some((Some(1), Some(8)))),
+            ),
+            AttributeType::int_member(
+                IntIdentityLayer::new(
+                    Some(TypeIdentity::from_dotted("test.ReadName")),
+                    Some((Some(0), Some(32))),
+                ),
+                IntMemberConstraints::new(Some((Some(1), Some(8)))),
+            ),
+        ] {
+            let schema = ResourceSchema::new("contact")
+                .attribute(AttributeSchema::optional("value", declaration).build())
+                .validate()
+                .unwrap();
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert("test", schema);
+            let provider = HoverProvider::new(Arc::new(schemas), vec![]);
+            let doc = Document::new(
+                "test.contact {\n value = 'abc'\n}\n".into(),
+                Arc::new(ProviderContext::new(
+                    carina_core::EnvironmentSnapshot::empty(),
+                )),
+            );
+            let hover = provider.hover(&doc, Position::new(1, 3)).unwrap();
+            let HoverContents::Markup(content) = hover.contents else {
+                panic!("Markdown hover")
+            };
+            assert!(
+                content.value.contains("**Identity**: `test.ReadName`"),
+                "{}",
+                content.value
+            );
+        }
     }
 
     #[test]

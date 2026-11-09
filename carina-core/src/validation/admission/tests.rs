@@ -2194,7 +2194,7 @@ mod identity_member_obligations {
     }
 
     #[test]
-    fn provably_disjoint_lengths_reject_same_identity_and_widening() {
+    fn source_member_lengths_defer_but_disjoint_identity_lengths_reject() {
         for source_identity in ["aws.Arn", "aws.iam.Role.Arn"] {
             fixture(
                 string(source_identity, Some((Some(2000), Some(3000)))),
@@ -2203,12 +2203,34 @@ mod identity_member_obligations {
                     with_session_for_test(catalog, |session| {
                         assert!(
                             validate(destination, &role_arn(reference()), bindings, session)
+                                .unwrap()
+                                .ready()
                                 .is_err()
                         );
                     });
                 },
             );
         }
+    }
+
+    #[test]
+    fn provably_disjoint_identity_lengths_reject_widening() {
+        fixture(
+            AttributeType::refined_string(
+                Some(TypeIdentity::from_dotted("aws.iam.Role.Arn")),
+                None,
+                Some((Some(2000), Some(3000))),
+                None,
+            ),
+            target("aws.Arn"),
+            |catalog, _, bindings, destination| {
+                with_session_for_test(catalog, |session| {
+                    assert!(
+                        validate(destination, &role_arn(reference()), bindings, session).is_err()
+                    );
+                })
+            },
+        );
     }
 
     #[test]
@@ -2234,7 +2256,7 @@ mod identity_member_obligations {
     }
 
     #[test]
-    fn widening_int_ranges_defer_overlap_but_reject_proven_disjointness() {
+    fn int_identity_ranges_reject_disjointness_and_member_ranges_defer() {
         for source_identity in ["aws.Count", "aws.service.Counter.Count"] {
             for (source_range, admitted) in [
                 (None, true),
@@ -2243,8 +2265,19 @@ mod identity_member_obligations {
                 (Some((Some(30), Some(40))), false),
             ] {
                 let source = AttributeType::int_member(
-                    IntIdentityLayer::new(Some(TypeIdentity::from_dotted(source_identity)), None),
-                    IntMemberConstraints::new(source_range),
+                    IntIdentityLayer::new(
+                        Some(TypeIdentity::from_dotted(source_identity)),
+                        if source_identity == "aws.Count" {
+                            None
+                        } else {
+                            source_range
+                        },
+                    ),
+                    IntMemberConstraints::new(if source_identity == "aws.Count" {
+                        source_range
+                    } else {
+                        None
+                    }),
                 );
                 let target = AttributeType::int_member(
                     IntIdentityLayer::new(Some(TypeIdentity::from_dotted("aws.Count")), None),
@@ -2253,7 +2286,7 @@ mod identity_member_obligations {
                 fixture(source, target, |catalog, _, bindings, destination| {
                     with_session_for_test(catalog, |session| {
                         let admission = validate(destination, &reference(), bindings, session);
-                        if !admitted {
+                        if !admitted && source_identity != "aws.Count" {
                             assert!(admission.is_err());
                             return;
                         }

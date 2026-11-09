@@ -45,9 +45,12 @@ owners, such as AWS and AWSCC, annotations conjoin the owners' identity
 constraints, so a value must satisfy every owner. Different identity constraints
 across owners are allowed. Enum definition and canonical-spelling disagreement
 remain typed errors. Authored annotations name an identity: their retained
-constraint payload has no member layer. Only exact schema-declaration projections
-carry member constraints. Annotation records containing member constraints are
-invalid, including records with an empty member layer. Native annotations have
+constraint payload has no member layer. The static type of a value read from an
+attribute or field is identity-only too. Typed value projections retain enum
+values, reference kind, semantic callbacks and an identity-only fingerprint,
+and have no member pattern, length or range fields. Either value-evidence origin
+rejects member fields during decoding, including empty member records.
+Native annotations have
 distinct single-owner and checked multi-owner forms; the latter maps at least
 two `SchemaTypeOwner`s to their identity constraints. Single-owner retained
 annotations omit `owner_layers`. Multi-owner records key exactly one identity
@@ -57,12 +60,16 @@ same-owner bounds as well as empty cross-owner intersections: after normalizing
 Float bounds, decoding verifies the exact conjunction of the owner layers and
 recomputes the `empty_intersection` marker. Exact projection records reject
 unknown constraint fields. Portable type equality includes origin and projection
-fingerprint. Same-identity joins keep identical full evidence; otherwise they
-widen to identity-only annotations built locally by conjoining the operands'
-owner identity layers. They never promote an element to an exact Enum/Reference
-projection or re-resolve a canonical declaration. Different-identity collection
-joins try canonical candidates lazily in sorted order. Both paths are independent
-of operand order.
+fingerprint, which excludes declaration-local member constraints.
+
+Member constraints belong to the destination slot, and are enforced when writing
+resource/config attributes, nested fields and annotated sinks through identity
+admission and the existing deferred destination obligation. Static disjointness
+uses the source's identity bounds and the destination's effective bounds.
+Unannotated collections, conditionals and coalesce retain main's equality-only
+rule: all alternatives must infer identical `TypeExpr`s. Slot reads differing
+only in member layers therefore compare equal. An explicit compatible annotation
+accepts otherwise mixed declarations; inference does not widen their types.
 
 Schema fingerprint encoding is v13. Saved-plan format 44 supersedes 43 because
 the schema fingerprint encoding changed. Saved module `pending_constraints`
@@ -77,12 +84,11 @@ annotations, map/list element annotations, module arguments, and user-function
 parameters and returns. Destination member constraints remain resolved-value
 obligations; every destination kind supports the existing `NeedsLocal` path.
 Provably disjoint String lengths or Int ranges reject statically; unproven
-pattern containment defers to the destination value check (#4349). Float sinks
-retain range containment, using both identity and member ranges for Int sources.
-Collection and coalesce inference use the same identity admission to join
-compatible declarations with different member restrictions, retaining child
-value evidence. Mismatches render the differing constraints or scalar kinds
-when the nominal names alone would be identical.
+pattern containment defers to the destination value check (#4349). Int-to-Float
+widening uses source identity bounds and defers overlapping values to the
+destination check. Float-to-Float retains main's range containment. Annotated
+sink mismatches render the differing constraints or scalar kinds when the nominal
+names alone would be identical.
 
 Both `PROTOCOL_VERSION` and `MIN_SUPPORTED_PROTOCOL_VERSION` are 26. Protocol-25
 providers must rebuild against the current SDK before they can load, including

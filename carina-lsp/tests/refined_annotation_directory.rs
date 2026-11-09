@@ -6,14 +6,16 @@ use std::sync::Arc;
 
 #[test]
 fn member_refined_directory_annotations_have_lsp_validate_parity() {
-    for &(main, exports) in fixture::CASES {
+    for &(main, exports) in fixture::CASES.iter().chain(fixture::READ_CASES) {
         for accepted in [true, false] {
             let (main, exports) = if accepted {
                 (main.into(), exports.into())
             } else {
                 (
                     main.replace("registry_prod.account_id", "registry_prod.other_id"),
-                    exports.replace("registry_prod.account_id", "registry_prod.other_id"),
+                    exports
+                        .replace("registry_prod.account_id", "registry_prod.other_id")
+                        .replace("b.account_id", "a.other_id"),
                 )
             };
             let snapshot = Arc::new(fixture::snapshot());

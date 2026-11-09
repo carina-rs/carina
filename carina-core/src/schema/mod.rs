@@ -4246,14 +4246,13 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                             binding: source_binding,
                             range: source_range,
                         },
-                    member_layer: source_member,
+                    member_layer: _,
                 },
                 Float {
                     binding: sink_binding,
                     range: sink_range,
                 },
             ) => {
-                let source_range = intersect_bounds(*source_range, source_member.range);
                 if (source_binding.identity().is_some() || source_range.is_none())
                     && sink_binding.identity().is_none()
                 {
@@ -4274,11 +4273,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                             length: None,
                             ..
                         },
-                    member_layer:
-                        StringMemberConstraints {
-                            pattern: None,
-                            length: None,
-                        },
+                    member_layer: _,
                 },
                 String {
                     identity_layer:
@@ -4296,7 +4291,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                             binding: RefinementBinding::MetadataOnly(None),
                             range: None,
                         },
-                    member_layer: IntMemberConstraints { range: None },
+                    member_layer: _,
                 },
                 Int {
                     identity_layer:
@@ -4320,42 +4315,35 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             (
                 String {
                     identity_layer: source,
-                    member_layer: source_member,
+                    member_layer: _,
                 },
                 String {
                     identity_layer: target,
                     member_layer: target_member,
                 },
             ) => {
-                let source_patterns = [
-                    source.pattern.as_ref().map(AsRef::as_ref),
-                    source_member.pattern.as_ref().map(AsRef::as_ref),
-                ];
                 let target_patterns = [
                     target.pattern.as_ref().map(AsRef::as_ref),
                     target_member.pattern.as_ref().map(AsRef::as_ref),
                 ];
                 target_patterns.into_iter().flatten().all(|target| {
-                    source_patterns
-                        .into_iter()
-                        .flatten()
-                        .any(|source| pattern_compatible(Some(source), Some(target)))
+                    pattern_compatible(source.pattern.as_ref().map(AsRef::as_ref), Some(target))
                 }) && length_contains(
-                    intersect_bounds(source.length, source_member.length).as_ref(),
+                    source.length.as_ref(),
                     intersect_bounds(target.length, target_member.length).as_ref(),
                 )
             }
             (
                 Int {
                     identity_layer: source,
-                    member_layer: source_member,
+                    member_layer: _,
                 },
                 Int {
                     identity_layer: target,
                     member_layer: target_member,
                 },
             ) => i64_range_contains(
-                intersect_bounds(source.range, source_member.range).as_ref(),
+                source.range.as_ref(),
                 intersect_bounds(target.range, target_member.range).as_ref(),
             ),
             (
