@@ -586,7 +586,7 @@ fn scalar_member_obligation<'result, 'sink, R: PatternForm, C: AssignmentCheck>(
                     TypeAssignability::Mismatch.into()
                 }
                 Some(_) => check
-                    .destination_obligation(true)
+                    .destination_obligation(true, false)
                     .expect("scalar member constraints have a destination obligation"),
                 None => TypeAssignability::Assignable.into(),
             }
@@ -673,7 +673,11 @@ impl<'s> AssignmentRelation<'s> {
 trait AssignmentCheck: Copy {
     type Result<'s>: AssignmentResult<'s>;
     fn identified_only(self) -> bool;
-    fn destination_obligation<'s>(self, scalar: bool) -> Option<Self::Result<'s>>;
+    fn destination_obligation<'s>(
+        self,
+        scalar: bool,
+        same_identity: bool,
+    ) -> Option<Self::Result<'s>>;
 }
 
 trait AssignmentResult<'s>: From<TypeAssignability<'s>> {
@@ -748,7 +752,11 @@ impl AssignmentCheck for DeclaredAssignmentCheck {
     fn identified_only(self) -> bool {
         matches!(self, Self::IdentifiedLeaves)
     }
-    fn destination_obligation<'s>(self, scalar: bool) -> Option<Self::Result<'s>> {
+    fn destination_obligation<'s>(
+        self,
+        scalar: bool,
+        _same_identity: bool,
+    ) -> Option<Self::Result<'s>> {
         // Declared type compatibility admits nominal scalars by identity. The
         // existing expression/value boundary still owes its concrete check.
         scalar.then_some(TypeAssignability::Assignable)
@@ -766,8 +774,12 @@ impl AssignmentCheck for ReferenceAssignmentCheck {
     fn identified_only(self) -> bool {
         matches!(self, Self::IdentifiedLeaves)
     }
-    fn destination_obligation<'s>(self, scalar: bool) -> Option<Self::Result<'s>> {
-        scalar.then_some(AssignmentRelation::NeedsLocal(None))
+    fn destination_obligation<'s>(
+        self,
+        scalar: bool,
+        same_identity: bool,
+    ) -> Option<Self::Result<'s>> {
+        (scalar || same_identity).then_some(AssignmentRelation::NeedsLocal(None))
     }
 }
 
@@ -920,11 +932,27 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         // only member bounds use disjointness and the resolved-value obligation.
         let scalar = matches!(&source.attr.kind, String { .. } | Int { .. })
             && matches!(&target.attr.kind, String { .. } | Int { .. } | Float { .. });
-        if let Some(obligation) = check.destination_obligation(scalar)
+        let same_identity = identity_leaf(&source.attr.kind)
+            .and_then(|leaf| leaf.identity())
+            .zip(identity_leaf(&target.attr.kind).and_then(|leaf| leaf.identity()))
+            .is_some_and(|(source, target)| source == target);
+        if let Some(obligation) = check.destination_obligation(scalar, same_identity)
             && let Some(source_identity) =
                 identity_leaf(&source.attr.kind).and_then(|leaf| leaf.identity())
             && let Some(target_identity) = identity_leaf(&target.attr.kind)
         {
+            if !scalar {
+                // Keep main's same-identity reference deferral for Float,
+                // Enum and unloaded leaves. Strict declaration checks still
+                // use their existing kind/base/range rules below.
+                let empty = identity_scalar_constraints(left, source_refs)
+                    .is_some_and(|bounds| bounds.provably_disjoint(bounds))
+                    || target.attr.has_empty_scalar_intersection();
+                let result = if empty { Mismatch.into() } else { obligation };
+                source_refs.truncate(source.restore_len);
+                sink_refs.truncate(target.restore_len);
+                return result;
+            }
             let identity_fits = identity_scalar_constraints(left, source_refs)
                 .zip(identity_scalar_constraints(right.ty, sink_refs))
                 .is_some_and(|(source, target)| source.contained_by(target));
@@ -1422,7 +1450,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 Enum {
                     identity: source,
                     base: source_base,
-                    values: source_values,
+                    values: _,
                     dsl_aliases: _,
                     validate: _,
                     to_dsl: _,
@@ -1430,26 +1458,21 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 Enum {
                     identity: target,
                     base: sink_base,
-                    values: sink_values,
+                    values: _,
                     dsl_aliases: _,
                     validate: _,
                     to_dsl: _,
                 },
             ) => C::Result::all([
                 C::Result::from_bool(source.structurally_assignable_to(target)),
-                // Enum identity-base bounds and values remain declaration
-                // proofs. Destination member bounds are value obligations.
+                // Preserve main's identity/base comparison. Enum values are
+                // checked on the resolved destination value, not as a subset proof.
                 C::Result::from_bool(
                     check.identified_only()
                         || identity_scalar_constraints(left, source_refs)
                             .zip(identity_scalar_constraints(right.ty, sink_refs))
                             .is_some_and(|(source, sink)| source.contained_by(sink)),
                 ),
-                C::Result::from_bool(match (source_values, sink_values) {
-                    (_, None) => true,
-                    (Some(source), Some(sink)) => source.iter().all(|value| sink.contains(value)),
-                    (None, Some(_)) => false,
-                }),
                 source_base.in_schema(self.defs).assignment_on_paths(
                     sink.rebind(sink_base),
                     check,
@@ -1785,7 +1808,7 @@ mod tests {
     }
 
     #[test]
-    fn nominal_float_sinks_preserve_range_containment() {
+    fn nominal_float_sinks_preserve_main_assignment_modes() {
         use crate::schema::AttributeType;
         let float = |max| {
             AttributeType::refined_float(
@@ -1810,7 +1833,7 @@ mod tests {
                 &mut Vec::new(),
                 &mut Vec::new(),
             ),
-            AssignmentRelation::Mismatch
+            AssignmentRelation::NeedsLocal(None)
         ));
     }
 
@@ -2063,7 +2086,7 @@ mod tests {
     }
 
     #[test]
-    fn reference_admission_does_not_bypass_enum_base_or_values() {
+    fn enum_admission_preserves_main_reference_and_declared_modes() {
         use crate::schema::AttributeType;
         let catalog = crate::parser::ProviderCustomTypes::default();
         let owner = crate::parser::SchemaTypeOwner::Provider("test".into());
@@ -2087,30 +2110,29 @@ mod tests {
         let destination = enum_type(8, Some(vec!["a".into()]));
         let sink = TypeInSchema::schemaless(&destination)
             .with_authority(&catalog, SinkAuthority::Owner(&owner));
-        for source in [
-            &scalar,
-            &enum_type(16, Some(vec!["a".into()])),
-            &enum_type(8, Some(vec!["a".into(), "b".into()])),
+        for (source, declared) in [
+            (scalar, false),
+            (enum_type(16, Some(vec!["a".into()])), false),
+            (enum_type(8, Some(vec!["a".into(), "b".into()])), true),
+            (destination.clone(), true),
         ] {
+            assert_eq!(
+                TypeInSchema::schemaless(&source)
+                    .assignment_to(sink)
+                    .require_loaded()
+                    .unwrap(),
+                declared
+            );
             assert!(matches!(
-                TypeInSchema::schemaless(source).assignment_on_paths(
+                TypeInSchema::schemaless(&source).assignment_on_paths(
                     sink,
                     ReferenceAssignmentCheck::Full,
                     &mut Vec::new(),
                     &mut Vec::new()
                 ),
-                AssignmentRelation::Mismatch
+                AssignmentRelation::NeedsLocal(None)
             ));
         }
-        assert!(matches!(
-            TypeInSchema::schemaless(&destination).assignment_on_paths(
-                sink,
-                ReferenceAssignmentCheck::Full,
-                &mut Vec::new(),
-                &mut Vec::new()
-            ),
-            AssignmentRelation::Assignable
-        ));
     }
 
     #[test]
@@ -2207,5 +2229,124 @@ mod tests {
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
             |session| unchecked.record_unchecked(session)
         ));
+    }
+
+    #[test]
+    fn round12_same_identity_float_references_keep_main_deferral() {
+        use crate::schema::AttributeType;
+        let source = AttributeType::refined_float(
+            Some(TypeIdentity::bare("Scalar")),
+            Some((Some(crate::finite(0.0)), Some(crate::finite(100.0)))),
+        );
+        let target = AttributeType::refined_float(
+            Some(TypeIdentity::bare("Scalar")),
+            Some((Some(crate::finite(0.0)), Some(crate::finite(10.0)))),
+        );
+        let catalog = crate::parser::ProviderCustomTypes::default();
+        let owner = crate::parser::SchemaTypeOwner::Provider("test".into());
+        let sink = TypeInSchema::schemaless(&target)
+            .with_authority(&catalog, SinkAuthority::Owner(&owner));
+        assert!(matches!(
+            TypeInSchema::schemaless(&source).assignment_on_paths(
+                sink,
+                ReferenceAssignmentCheck::Full,
+                &mut Vec::new(),
+                &mut Vec::new()
+            ),
+            AssignmentRelation::NeedsLocal(None)
+        ));
+    }
+
+    #[test]
+    fn round12_same_identity_enum_references_keep_main_deferral() {
+        use crate::schema::AttributeType;
+        let source = AttributeType::enum_(TypeIdentity::bare("Choice"), None, vec![], None, None);
+        let target = AttributeType::enum_(TypeIdentity::bare("Choice"), None, vec![], None, None);
+        let catalog = crate::parser::ProviderCustomTypes::default();
+        let owner = crate::parser::SchemaTypeOwner::Provider("test".into());
+        let sink = TypeInSchema::schemaless(&target)
+            .with_authority(&catalog, SinkAuthority::Owner(&owner));
+        assert!(matches!(
+            TypeInSchema::schemaless(&source).assignment_on_paths(
+                sink,
+                ReferenceAssignmentCheck::Full,
+                &mut Vec::new(),
+                &mut Vec::new()
+            ),
+            AssignmentRelation::NeedsLocal(None)
+        ));
+    }
+
+    #[test]
+    fn round12_same_identity_unloaded_references_keep_main_deferral() {
+        let source = super::super::PatternAttributeType::<super::super::Draft> {
+            kind: AttrTypeKind::UnloadedSchemaType(
+                TypeIdentity::from_dotted("test.X").try_into().unwrap(),
+            ),
+        };
+        let catalog = crate::parser::ProviderCustomTypes::default();
+        let owner = crate::parser::SchemaTypeOwner::Provider("test".into());
+        let sink = TypeInSchema::schemaless(&source)
+            .with_authority(&catalog, SinkAuthority::Owner(&owner));
+        assert!(matches!(
+            TypeInSchema::schemaless(&source).assignment_on_paths(
+                sink,
+                ReferenceAssignmentCheck::Full,
+                &mut Vec::new(),
+                &mut Vec::new()
+            ),
+            AssignmentRelation::NeedsLocal(None)
+        ));
+    }
+
+    #[test]
+    fn round12_empty_source_annotation_is_rejected_before_admission() {
+        use crate::parser::ResolvedSchemaType;
+        use crate::schema::CompiledAttributeType;
+        let id = TypeIdentity::from_dotted("test.X");
+        for (first, second, target) in [
+            (
+                CompiledAttributeType::refined_string(
+                    Some(id.clone()),
+                    None,
+                    Some((Some(1), Some(4))),
+                    None,
+                ),
+                CompiledAttributeType::refined_string(
+                    Some(id.clone()),
+                    None,
+                    Some((Some(8), Some(12))),
+                    None,
+                ),
+                CompiledAttributeType::refined_string(Some(id.clone()), None, None, None),
+            ),
+            (
+                CompiledAttributeType::refined_int(Some(id.clone()), Some((Some(1), Some(4)))),
+                CompiledAttributeType::refined_int(Some(id.clone()), Some((Some(8), Some(12)))),
+                CompiledAttributeType::refined_int(Some(id.clone()), None),
+            ),
+        ] {
+            let first = ResolvedSchemaType::from_annotation_declaration("a", &first).unwrap();
+            let second = ResolvedSchemaType::from_annotation_declaration("b", &second).unwrap();
+            let source = first.conjoin(&second).materialize();
+            assert!(source.has_empty_scalar_intersection());
+            let catalog = crate::parser::ProviderCustomTypes::default();
+            let owner = crate::parser::SchemaTypeOwner::Provider("b".into());
+            let sink = TypeInSchema::schemaless(&target)
+                .with_authority(&catalog, SinkAuthority::Owner(&owner));
+            assert_eq!(
+                TypeInSchema::schemaless(&source).assignment_to(sink),
+                TypeAssignability::Mismatch
+            );
+            assert!(matches!(
+                TypeInSchema::schemaless(&source).assignment_on_paths(
+                    sink,
+                    ReferenceAssignmentCheck::Full,
+                    &mut Vec::new(),
+                    &mut Vec::new()
+                ),
+                AssignmentRelation::Mismatch
+            ));
+        }
     }
 }

@@ -1919,24 +1919,26 @@ fn protocol_legacy_custom_to_core(
                     length: member_length,
                 },
         } => {
+            reject_legacy_custom_metadata(
+                enclosing_name,
+                "member_layer",
+                member_pattern.as_ref(),
+                "String",
+            )?;
+            reject_legacy_custom_metadata(
+                enclosing_name,
+                "member_layer",
+                member_length.as_ref(),
+                "String",
+            )?;
             reject_opaque_validator("String", base_validate)?;
             let identity = legacy_custom_identity(enclosing_name);
-            let member_pattern = if pattern.is_some() {
-                None
-            } else {
-                member_pattern.clone()
-            };
-            let member_length = if length.is_some() {
-                None
-            } else {
-                *member_length
-            };
             let pattern = prefer_outer_legacy_custom_metadata(pattern, base_pattern.clone());
             let length = prefer_outer_legacy_custom_metadata(length, *base_length);
             let to_dsl = prefer_outer_legacy_custom_metadata(to_dsl, base_to_dsl.clone());
             Ok(DraftAttributeType::string_member(
                 decoded_string_identity(identity, pattern, length, to_dsl),
-                crate::schema::StringMemberConstraints::new(member_pattern, member_length),
+                crate::schema::StringMemberConstraints::default(),
             ))
         }
         protocol::AttributeType::Int {
@@ -1950,6 +1952,12 @@ fn protocol_legacy_custom_to_core(
                     range: member_range,
                 },
         } => {
+            reject_legacy_custom_metadata(
+                enclosing_name,
+                "member_layer",
+                member_range.as_ref(),
+                "Int",
+            )?;
             reject_legacy_custom_metadata(enclosing_name, "pattern", pattern.as_ref(), "Int")?;
             reject_legacy_custom_metadata(enclosing_name, "to_dsl", to_dsl.as_ref(), "Int")?;
             let identity = legacy_custom_identity(enclosing_name);
@@ -1961,15 +1969,10 @@ fn protocol_legacy_custom_to_core(
                     ))
                 })
                 .transpose()?;
-            let member_range = if outer_range.is_some() {
-                None
-            } else {
-                *member_range
-            };
             let range = prefer_outer_legacy_custom_metadata(outer_range, *base_range);
             Ok(DraftAttributeType::int_member(
                 decoded_int_identity(identity, range),
-                crate::schema::IntMemberConstraints::new(member_range),
+                crate::schema::IntMemberConstraints::default(),
             ))
         }
         protocol::AttributeType::Float {
@@ -5595,106 +5598,70 @@ mod explicit_pattern_mode_tests {
     use crate::schema::{PatternMatch, PatternReason, PatternSpec};
 
     #[test]
-    fn round11_legacy_outer_metadata_supersedes_base_members() {
-        let inner = protocol::PatternSpec::new("^inner$", protocol::PatternMatch::Full);
-        let outer = protocol::PatternSpec::new("^outer$", protocol::PatternMatch::Full);
-        for (outer_pattern_present, outer_length_present) in
-            [(true, true), (true, false), (false, true), (false, false)]
-        {
-            let wire = protocol::AttributeType::Custom {
-                name: "test.X".into(),
-                base: Box::new(protocol::AttributeType::String {
-                    identity_layer: protocol::StringIdentityLayer {
-                        identity: None,
-                        pattern: None,
-                        length: None,
-                        validate: None,
-                        to_dsl: None,
-                    },
-                    member_layer: protocol::StringMemberConstraints {
-                        pattern: Some(inner.clone()),
-                        length: Some((Some(5), Some(5))),
-                    },
-                }),
-                pattern: outer_pattern_present.then(|| outer.clone()),
-                length: outer_length_present.then_some((Some(1), Some(8))),
-                validate: None,
-                to_dsl: None,
-            };
-            let decoded = protocol_to_attribute_type(&wire).unwrap();
-            let schema = crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-                "x".into(),
-                decoded,
-            )]))
-            .unwrap();
-            let value = crate::resource::ExpandedValue::Concrete(
-                crate::resource::ExpandedConcreteValue::String(
-                    if outer_pattern_present {
-                        "outer"
-                    } else {
-                        "inner"
-                    }
-                    .into(),
-                ),
-            );
-            assert!(
-                schema.parts()["x"].validate(&value).is_ok(),
-                "outer metadata wins over base member metadata"
-            );
-            let crate::schema::RawShape::String {
-                identity_layer,
-                member_layer,
-            } = schema.parts()["x"].raw_shape()
-            else {
-                panic!("string")
-            };
-            if outer_pattern_present {
-                assert!(
-                    member_layer.pattern.is_none(),
-                    "base member pattern must not survive an authoritative outer pattern"
-                );
-                assert_eq!(identity_layer.pattern, Some(&outer));
-            } else {
-                assert_eq!(
-                    member_layer.pattern.or(identity_layer.pattern),
-                    Some(&inner)
-                );
-            }
-            if outer_length_present {
-                assert!(member_layer.length.is_none());
-                assert_eq!(identity_layer.length, Some((Some(1), Some(8))));
-            } else {
-                assert_eq!(member_layer.length, Some((Some(5), Some(5))));
-            }
-        }
-        let wire = protocol::AttributeType::Custom {
-            name: "test.Count".into(),
-            base: Box::new(protocol::AttributeType::Int {
+    fn round12_legacy_custom_rejects_nonempty_base_members() {
+        let pattern = protocol::PatternSpec::new("inner", protocol::PatternMatch::Full);
+        let bases = [
+            protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    identity: None,
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                },
+                member_layer: protocol::StringMemberConstraints {
+                    pattern: Some(pattern.clone()),
+                    length: None,
+                },
+            },
+            protocol::AttributeType::String {
+                identity_layer: protocol::StringIdentityLayer {
+                    identity: None,
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                },
+                member_layer: protocol::StringMemberConstraints {
+                    pattern: None,
+                    length: Some((Some(1), Some(8))),
+                },
+            },
+            protocol::AttributeType::Int {
                 identity_layer: protocol::IntIdentityLayer {
                     identity: None,
                     range: None,
                 },
                 member_layer: protocol::IntMemberConstraints {
-                    range: Some((Some(100), Some(200))),
+                    range: Some((Some(1), Some(8))),
                 },
-            }),
-            pattern: None,
-            length: Some((Some(1), Some(8))),
-            validate: None,
-            to_dsl: None,
-        };
-        let schema = crate::schema::ValidatedConfigSchema::validate(BTreeMap::from([(
-            "x".into(),
-            protocol_to_attribute_type(&wire).unwrap(),
-        )]))
-        .expect("outer range replaces the inner member range");
-        assert!(
-            schema.parts()["x"]
-                .validate(&crate::resource::ExpandedValue::Concrete(
-                    crate::resource::ExpandedConcreteValue::Int(4)
-                ))
-                .is_ok()
-        );
+            },
+        ];
+        for base in bases {
+            let kind = if matches!(base, protocol::AttributeType::Int { .. }) {
+                "Int"
+            } else {
+                "String"
+            };
+            for outer_present in [false, true] {
+                for name in ["", "test.X"] {
+                    let wire = protocol::AttributeType::Custom {
+                        name: name.into(),
+                        base: Box::new(base.clone()),
+                        pattern: (outer_present && kind == "String").then(|| pattern.clone()),
+                        length: outer_present.then_some((Some(1), Some(32))),
+                        validate: None,
+                        to_dsl: None,
+                    };
+                    let error = protocol_to_attribute_type(&wire)
+                        .expect_err("legacy Custom cannot carry member metadata through its base");
+                    assert!(
+                        matches!(std::error::Error::source(&error).and_then(|cause| cause.downcast_ref::<ProtocolConvertError>()), Some(ProtocolConvertError::LegacyCustomUnsupportedMetadata { field: "member_layer", base_kind, .. }) if *base_kind == kind),
+                        "{error:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

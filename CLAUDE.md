@@ -643,8 +643,9 @@ A struct type represents a nested object with typed fields.
   so equal identity-level types compare and serialize equally. Callbacks,
   transforms, enums and references retain exact projection provenance.
   A member layer belongs to its destination slot. Enforce it on writes through
-  identity admission and the deferred destination check; source bounds are
-  identity-layer bounds only. Unannotated collections, conditionals and coalesce
+  identity admission and the deferred destination check; identified source bounds
+  are identity-layer bounds only. Anonymous String/Int declarations retain both
+  layers as structural evidence (matching patterns and intersected bounds). Unannotated collections, conditionals and coalesce
   require identical `TypeExpr`s, as on main. Reads of slots differing only in
   member constraints infer equal types. An explicit compatible annotation is
   the way to accept otherwise mixed declarations; inference never widens them.
@@ -666,7 +667,8 @@ A struct type represents a nested object with typed fields.
   identity bounds must be contained by destination identity bounds. Member
   constraints defer unless source identity bounds are provably disjoint from
   the effective destination bounds. Int-to-Float widening uses identity-bound
-  containment too; Float-to-Float keeps main's range containment.
+  containment too. Float retains main's strict range containment and same-identity
+  reference deferral; Enum/unloaded reference leaves retain that deferral too.
   Unproven regex containment defers to the value check. At annotated sinks,
   declaration equality and display-name equality do not replace identity
   admission; mismatch names expose differing constraints or scalar kinds.
@@ -726,10 +728,12 @@ A struct type represents a nested object with typed fields.
   `Custom` decoder preserves the first outer record's name as the only
   identity, including an empty name; nested `Custom.name` and primitive-base
   identities never fill it in. Enclosing String/int refinements take
-  precedence over nested/base metadata, falling back to the inner metadata
-  only when the enclosing record omits it. Anonymous legacy `Custom` records
-  with a List base remain ordinary refined lists. A named List base is the one
-  intentional legacy-Custom tightening: core cannot retain that enclosing
+  precedence over nested/base identity-layer metadata, falling back to the inner
+  identity metadata only when the enclosing record omits it. Legacy `Custom`
+  has no member layer: a terminal String/Int base with non-empty member metadata
+  is incompatible and returns a typed decode error, regardless of outer fields.
+  Anonymous legacy `Custom` records with a List base remain ordinary refined
+  lists. A named List base is also rejected: core cannot retain that enclosing
   identity, so decode returns a typed error instead of silently dropping it.
   Metadata incompatible with the terminal shape remains a typed error. The
   `ResourceSchema`, `AttributeSchema`, and `StructField` conversions destructure

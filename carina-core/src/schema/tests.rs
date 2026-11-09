@@ -18576,3 +18576,61 @@ fn round11_builtin_matching_requires_a_shared_callback() {
         assert!(same_builtin_declaration(Some(parts), parts));
     }
 }
+
+#[test]
+fn round12_anonymous_string_uses_both_layers_as_evidence() {
+    let pattern =
+        CompiledPattern::try_new(&PatternSpec::new("[a-z]+", PatternMatch::Full)).unwrap();
+    let source = AttributeType::string_member(
+        StringIdentityLayer::new(None, None, Some((Some(1), Some(100))), None),
+        StringMemberConstraints::new(Some(pattern.clone()), Some((Some(1), Some(8)))),
+    );
+    let sink = AttributeType::refined_string(None, Some(pattern), Some((Some(1), Some(16))), None);
+    assert!(
+        assignable(&source, &sink),
+        "anonymous member pattern and intersected bounds are structural evidence"
+    );
+    let source = AttributeType::string_member(
+        StringIdentityLayer::new(None, None, None, None),
+        StringMemberConstraints::new(
+            Some(
+                CompiledPattern::try_new(&PatternSpec::new("[a-z]+", PatternMatch::Full)).unwrap(),
+            ),
+            Some((Some(1), Some(8))),
+        ),
+    );
+    let incompatible = AttributeType::refined_string(
+        None,
+        Some(CompiledPattern::try_new(&PatternSpec::new("[0-9]+", PatternMatch::Full)).unwrap()),
+        Some((Some(1), Some(16))),
+        None,
+    );
+    assert!(
+        !assignable(&source, &incompatible),
+        "anonymous member-only patterns are still structural evidence"
+    );
+}
+
+#[test]
+fn round12_anonymous_int_uses_both_layers_as_evidence() {
+    let source = AttributeType::int_member(
+        IntIdentityLayer::new(None, Some((Some(1), Some(100)))),
+        IntMemberConstraints::new(Some((Some(1), Some(8)))),
+    );
+    let sink = AttributeType::refined_int(None, Some((Some(1), Some(16))));
+    assert!(assignable(&source, &sink));
+    let sink = AttributeType::refined_float(
+        None,
+        Some((Some(crate::finite(1.0)), Some(crate::finite(16.0)))),
+    );
+    assert!(assignable(&source, &sink));
+    let wide = AttributeType::int_member(
+        IntIdentityLayer::new(None, None),
+        IntMemberConstraints::new(Some((Some(1), Some(100)))),
+    );
+    assert!(!assignable(&wide, &sink));
+    assert!(!assignable(
+        &wide,
+        &AttributeType::refined_int(None, Some((Some(1), Some(16))))
+    ));
+}

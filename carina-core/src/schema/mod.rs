@@ -4246,13 +4246,18 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                             binding: source_binding,
                             range: source_range,
                         },
-                    member_layer: _,
+                    member_layer: source_member,
                 },
                 Float {
                     binding: sink_binding,
                     range: sink_range,
                 },
             ) => {
+                let source_range = if source_binding.identity().is_some() {
+                    *source_range
+                } else {
+                    intersect_bounds(*source_range, source_member.range)
+                };
                 if (source_binding.identity().is_some() || source_range.is_none())
                     && sink_binding.identity().is_none()
                 {
@@ -4273,7 +4278,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                             length: None,
                             ..
                         },
-                    member_layer: _,
+                    member_layer:
+                        StringMemberConstraints {
+                            pattern: None,
+                            length: None,
+                        },
                 },
                 String {
                     identity_layer:
@@ -4291,7 +4300,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                             binding: RefinementBinding::MetadataOnly(None),
                             range: None,
                         },
-                    member_layer: _,
+                    member_layer: IntMemberConstraints { range: None },
                 },
                 Int {
                     identity_layer:
@@ -4315,7 +4324,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             (
                 String {
                     identity_layer: source,
-                    member_layer: _,
+                    member_layer: source_member,
                 },
                 String {
                     identity_layer: target,
@@ -4326,26 +4335,49 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     target.pattern.as_ref().map(AsRef::as_ref),
                     target_member.pattern.as_ref().map(AsRef::as_ref),
                 ];
+                let source_patterns = [
+                    source.pattern.as_ref().map(AsRef::as_ref),
+                    if source.binding.identity().is_none() {
+                        source_member.pattern.as_ref().map(AsRef::as_ref)
+                    } else {
+                        None
+                    },
+                ];
+                let source_length = if source.binding.identity().is_some() {
+                    source.length
+                } else {
+                    intersect_bounds(source.length, source_member.length)
+                };
                 target_patterns.into_iter().flatten().all(|target| {
-                    pattern_compatible(source.pattern.as_ref().map(AsRef::as_ref), Some(target))
+                    source_patterns
+                        .into_iter()
+                        .flatten()
+                        .any(|source| pattern_compatible(Some(source), Some(target)))
                 }) && length_contains(
-                    source.length.as_ref(),
+                    source_length.as_ref(),
                     intersect_bounds(target.length, target_member.length).as_ref(),
                 )
             }
             (
                 Int {
                     identity_layer: source,
-                    member_layer: _,
+                    member_layer: source_member,
                 },
                 Int {
                     identity_layer: target,
                     member_layer: target_member,
                 },
-            ) => i64_range_contains(
-                source.range.as_ref(),
-                intersect_bounds(target.range, target_member.range).as_ref(),
-            ),
+            ) => {
+                let source_range = if source.binding.identity().is_some() {
+                    source.range
+                } else {
+                    intersect_bounds(source.range, source_member.range)
+                };
+                i64_range_contains(
+                    source_range.as_ref(),
+                    intersect_bounds(target.range, target_member.range).as_ref(),
+                )
+            }
             (
                 Float {
                     range: s_range,

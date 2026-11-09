@@ -3494,6 +3494,45 @@ mod tests {
         let wide = AttributeType::refined_string(
             Some(identity.clone()),
             None,
+            Some((Some(1), Some(128))),
+            None,
+        );
+        let narrow =
+            AttributeType::refined_string(Some(identity), None, Some((Some(8), Some(64))), None);
+        let source = ResolvedRefType::with_declared_type(
+            ResolvedTypeConstraint::new(narrow.clone(), BTreeMap::new()),
+            Some(ResolvedRefType::new(wide, BTreeMap::new())),
+        );
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::ParsedFile::default();
+        let schemas = SchemaRegistry::new();
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
+        let sink = TypeInSchema::schemaless(&narrow).with_authority(
+            &context.custom_types,
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        );
+        let RefTypeAssignabilityError::Mismatch(mismatch) =
+            source.is_assignable_to_sink(sink, &bindings).unwrap_err()
+        else {
+            panic!("evidence must fail the sink after the declaration passes")
+        };
+        assert_eq!(
+            mismatch.expected_type_name(),
+            "aws.iam.Role.Name (length 8..=64)"
+        );
+        assert_eq!(
+            mismatch.actual_type_name(),
+            "aws.iam.Role.Name (length 1..=128)"
+        );
+        assert_eq!(mismatch.declared_type_name(), Some("aws.iam.Role.Name"));
+    }
+
+    #[test]
+    fn inferred_evidence_mismatch_keeps_constraints_after_the_declaration_passes_disjoint() {
+        let identity = TypeIdentity::from_dotted("aws.iam.Role.Name");
+        let wide = AttributeType::refined_string(
+            Some(identity.clone()),
+            None,
             Some((Some(100), Some(128))),
             None,
         );
@@ -3529,6 +3568,47 @@ mod tests {
 
     #[test]
     fn review_declared_source_mismatch_preserves_both_constraint_names() {
+        let identity = TypeIdentity::from_dotted("aws.iam.Role.Name");
+        let wide = AttributeType::refined_string(
+            Some(identity.clone()),
+            None,
+            Some((Some(1), Some(128))),
+            None,
+        );
+        let narrow =
+            AttributeType::refined_string(Some(identity), None, Some((Some(8), Some(64))), None);
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::ParsedFile::default();
+        let schemas = SchemaRegistry::new();
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
+        let exact = TypeExpr::SchemaType {
+            owned: crate::parser::ResolvedSchemaType::from_schema_declaration("test", &wide)
+                .unwrap(),
+        };
+        let source = ResolvedRefType::new(wide, BTreeMap::new())
+            .with_value_declaration(&exact, &bindings)
+            .unwrap();
+        let sink = TypeInSchema::schemaless(&narrow).with_authority(
+            &context.custom_types,
+            crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+        );
+        let DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(mismatch)) =
+            source.assignment_to_sink(sink, &bindings)
+        else {
+            panic!("declaration must fail assignment")
+        };
+        assert_eq!(
+            mismatch.actual_type_name(),
+            "aws.iam.Role.Name (length 1..=128)"
+        );
+        assert_eq!(
+            mismatch.expected_type_name(),
+            "aws.iam.Role.Name (length 8..=64)"
+        );
+    }
+
+    #[test]
+    fn review_declared_source_mismatch_preserves_both_constraint_names_disjoint() {
         let identity = TypeIdentity::from_dotted("aws.iam.Role.Name");
         let wide = AttributeType::refined_string(
             Some(identity.clone()),
@@ -3620,6 +3700,60 @@ mod tests {
 
     #[test]
     fn original_mismatch_does_not_record_an_incoming_boundary_deferral() {
+        // Both leaves are identified: rule 7 must still reject 1..20 -> 1..10
+        // even though original identity-less refinements are no longer rechecked.
+        let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let terminal = crate::validation::deferred_types::TypeCheckSession::run(
+            &context,
+            |session| {
+                let parsed = crate::parser::ParsedFile::default();
+                let schemas = SchemaRegistry::new();
+                let signatures = crate::module_resolver::ResolvedModuleSignatures::default();
+                let index = BindingIndex::from_parsed_with_upstream_exports_and_module_signatures_in_session(
+                &parsed, &schemas, None, &signatures, session,
+            );
+                let declaration = crate::parser::parse_type_expr_str("Declared", &context).unwrap();
+                let source = ResolvedRefType::new(
+                    AttributeType::refined_string(
+                        Some(TypeIdentity::bare("Sink")),
+                        None,
+                        Some((Some(1), Some(20))),
+                        None,
+                    ),
+                    BTreeMap::new(),
+                )
+                .with_value_declaration(&declaration, &index)
+                .unwrap();
+                let sink = AttributeType::refined_string(
+                    Some(TypeIdentity::bare("Sink")),
+                    None,
+                    Some((Some(1), Some(10))),
+                    None,
+                );
+                source.assignment_to_sink(
+                    TypeInSchema::schemaless(&sink).with_authority(
+                        &session.catalog().custom_types,
+                        crate::schema::SinkAuthority::Owner(&TEST_OWNER),
+                    ),
+                    &index,
+                )
+            },
+        );
+        let mut deferred = Vec::new();
+        let result = terminal.publish(&mut deferred);
+        assert!(matches!(
+            result,
+            DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(_))
+        ));
+        assert_eq!(
+            deferred.len(),
+            1,
+            "only declaration-to-sink evidence should be deferred: {deferred:?}"
+        );
+    }
+
+    #[test]
+    fn original_mismatch_does_not_record_an_incoming_boundary_deferral_disjoint() {
         // Both leaves are identified: disjoint bounds must reject 20..30 -> 1..10
         // even though original identity-less refinements are no longer rechecked.
         let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());

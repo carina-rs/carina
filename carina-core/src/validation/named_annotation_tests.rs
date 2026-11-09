@@ -2885,3 +2885,121 @@ fn owner_constraint_conjoin_promotes_and_preserves_typed_owner_maps() {
     assert_eq!(abc, c.conjoin(&ab));
     assert_eq!(abc, ab.conjoin(&b.conjoin(&c)));
 }
+
+#[test]
+fn round12_cross_owner_enum_assignment_keeps_main_value_set_policy() {
+    for source_values in [None, Some(vec!["A".into(), "B".into()])] {
+        let loaded = snapshot(vec![
+            (
+                "a",
+                vec![DraftType::enum_(
+                    identity(),
+                    source_values,
+                    vec![],
+                    None,
+                    None,
+                )],
+            ),
+            (
+                "b",
+                vec![DraftType::enum_(
+                    identity(),
+                    Some(vec!["A".into()]),
+                    vec![],
+                    None,
+                    None,
+                )],
+            ),
+        ]);
+        assert!(
+            assign(
+                declaration(&loaded, "a", 0),
+                declaration(&loaded, "b", 0),
+                &loaded,
+                "b"
+            ),
+            "main compares enum identity and base, not value-set containment"
+        );
+    }
+}
+
+#[test]
+fn round12_unknown_function_return_rechecks_destination_member_at_resolution() {
+    use crate::binding_index::{BindingValueSource, ResolvedBindings};
+    use crate::resource::knowledge::KnowledgeContext;
+    use crate::validation::admission::{Candidate, admit};
+    let slot = |member_length| {
+        DraftType::string_member(
+            crate::schema::StringIdentityLayer::new(
+                Some(identity()),
+                None,
+                Some((Some(1), Some(64))),
+                None,
+            ),
+            crate::schema::StringMemberConstraints::new(None, member_length),
+        )
+    };
+    let loaded = snapshot(vec![(
+        "p",
+        vec![slot(None), slot(Some((Some(1), Some(8))))],
+    )]);
+    let context = loaded.provider_context().as_provider_context();
+    let mut authored = crate::parser::parse("let source = p.Values {}\nlet target = p.Values {}\nfn forward(value: aws.iam.Role.Name): aws.iam.Role.Name { value }\n", context).unwrap();
+    deferred_types::with_session_for_test(loaded.provider_context(), |session| {
+        resolve_file_type_exprs_report(&mut authored, session, None)
+    })
+    .unwrap();
+    let parsed = authored.resolve_root_for_test();
+    let bindings = BindingIndex::from_parsed(&parsed, loaded.schema_registry(), context);
+    let destination = loaded
+        .schema_registry()
+        .resource_attribute_destination(&parsed.resources[1].id, "value1", context)
+        .unwrap();
+    for (length, accepted) in [(7, true), (20, false)] {
+        let value = crate::resource::Value::Deferred(
+            crate::resource::DeferredValue::ResolvedFunctionCall {
+                function: Arc::new(parsed.user_functions["forward"].clone()),
+                functions: Arc::new(parsed.user_functions.clone()),
+                args: vec![crate::resource::FunctionArgument::from_value(
+                    crate::resource::Value::root_resource_ref("source", "value0", vec![]),
+                )],
+                source_line: 1.into(),
+            },
+        );
+        deferred_types::with_session_for_test(loaded.provider_context(), |session| {
+            let (candidate, boundary) = Candidate::validation_classified(
+                value
+                    .knowledge(&KnowledgeContext::validation())
+                    .unwrap()
+                    .into_classification(),
+                Some(&bindings),
+                session,
+            );
+            let pending = admit(&destination, candidate, &boundary)
+                .unwrap()
+                .ready()
+                .unwrap_err();
+            let mut resolved = ResolvedBindings::default();
+            resolved.set(
+                "source",
+                HashMap::from([(
+                    "value0".into(),
+                    crate::resource::Value::Concrete(crate::resource::ConcreteValue::String(
+                        "A".repeat(length).into(),
+                    )),
+                )]),
+                BindingValueSource::Local,
+            );
+            let result = pending.discharge(&resolved, session);
+            assert_eq!(result.is_ok(), accepted, "{result:?}");
+            if let Err(error) = result {
+                let message = error.resolution_error().to_string();
+                assert!(
+                    message.contains("outside allowed range") || message.contains("length"),
+                    "{message}"
+                );
+                assert_eq!(message.matches("value1:").count(), 1, "{message}");
+            }
+        });
+    }
+}

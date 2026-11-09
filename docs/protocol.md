@@ -70,7 +70,9 @@ resource/config attributes, nested fields and annotated sinks through identity
 admission and the existing deferred destination obligation. Source identity
 bounds must be contained by destination identity bounds. Member constraints defer
 unless source identity bounds are provably disjoint from effective destination
-bounds.
+bounds. Anonymous String/Int declarations retain both layers as structural
+evidence, using both patterns and intersecting bounds.
+
 Unannotated collections, conditionals and coalesce retain main's equality-only
 rule: all alternatives must infer identical `TypeExpr`s. Slot reads differing
 only in member layers therefore compare equal. An explicit compatible annotation
@@ -92,7 +94,8 @@ Identity bounds retain String length / Int range containment checks for both
 same-identity and widening admission. Destination member constraints retain the
 existing `NeedsLocal` check, with only proven disjointness rejecting statically;
 unproven pattern containment defers (#4349). Int-to-Float widening uses identity
-bound containment too. Float-to-Float retains main's range containment. Annotated
+bound containment too. Float retains main's strict range containment and
+same-identity reference deferral, also retained for Enum/unloaded leaves. Annotated
 sink mismatches render the differing constraints or scalar kinds when the nominal
 names alone would be identical.
 
