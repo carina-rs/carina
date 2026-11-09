@@ -683,9 +683,9 @@ A struct type represents a nested object with typed fields.
   24 also requires a typed pattern spec (regex plus explicit mode, and a reason
   containing visible text for Substring); convert the complete spec
   exhaustively, including its reason. Never supply a default mode or admit a bare
-  string, including on the schema-only migration path. Protocol 25 combines
-  the WIT 0.2.0 `diagnostics` and `protected-material` imports described below
-  with required `InputRule.condition` and Struct `input_rules`, even when the
+  string, including on the schema-only migration path. Protocol 25 requires
+  the WIT 0.2.0 `diagnostics` and `protected-material` imports described below.
+  Protocol 26 adds required `InputRule.condition` and Struct `input_rules`, even when the
   condition is `Always` or the collection is empty; neither field has a serde default.
   Conditions and Struct rules travel once in the existing schema JSON, with no
   further WIT change beyond the diagnostics imports. Resource and Struct
@@ -695,8 +695,15 @@ A struct type represents a nested object with typed fields.
   scalar literals, enum identity and canonical membership, predicate compatibility,
   duplicate target/code pairs, and a condition depth limit of 16. The one evaluator
   uses runtime knowledge for presence and equality; unknown guards remain pending,
-  including under negation. Update guards use admitted desired context overlaid
-  with the exact patch, including removals, never observed state. Both owners use
+  including under negation. Each write site owns one immutable `RuleInput`,
+  constructed only at authored, plan or protected dispatch stage boundaries.
+  Guards, targets, instance enumeration and bound-expression estimation share
+  its classified graph and ignore policy. Only complete replacement nodes and
+  explicit removals prove absence; unsent omissions remain withheld at every
+  depth. Default membership belongs to that graph and is recomputed at dispatch.
+  An erased normalized expression has no authored fallback without carried
+  correspondence. Update inputs overlay the exact annotated patch on the full
+  protected desired tree, never observed state. Both owners use
   the same write-scope classifier; `AuthoredDesired` evaluates `CreateOnly` as
   warnings with core-rendered rejected-if-created wording, while `EveryWrite`
   remains an error. The core finding derives severity from rule scope and write

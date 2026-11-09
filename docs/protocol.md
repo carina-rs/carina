@@ -1,13 +1,14 @@
 # Provider protocol versions
 
-The current protocol and minimum supported provider protocol are both **25**.
+The current protocol and minimum supported provider protocol are both **26**.
 
-This is the unreleased development snapshot after Carina v0.13.1. Released
-Carina v0.13.1 speaks protocol **24**, with minimum provider protocol **24**.
+Protocol 26 is the next unreleased protocol after the protocol-25 development
+snapshot. Released Carina v0.13.1 speaks protocol **24**, with minimum provider protocol **24**.
 
 | Protocol version | Minimum provider protocol | Change |
 |------------------|---------------------------|--------|
-| 25 | 25 | WIT 0.2.0 typed diagnostics and credential registration; guest stdout/stderr discarded; required typed input-rule conditions, Struct-local rules, and CreateOnly authoring previews. |
+| 26 | 26 | Required typed input-rule conditions, Struct-local rules, and CreateOnly authoring previews; fingerprint encoding v13. |
+| 25 | 25 | WIT 0.2.0 typed diagnostics and credential registration; guest stdout/stderr discarded. |
 | 24 | 24 | Required typed pattern specifications with explicit Full or justified Substring matching. |
 | 23 | 23 | Required scoped desired-input rules on every resource schema. |
 | 22 | 22 | Optional entry-count bound on `Map` attribute types. |
@@ -20,50 +21,7 @@ Carina v0.13.1 speaks protocol **24**, with minimum provider protocol **24**.
 | 15 | 15 | Create-progress variants, poll finality, and separate read-back budgets. |
 | 14 | 14 | Host-resolved AWS credentials through the typed AWS world. |
 
-## Version 25
-
-### Provider diagnostics (#4334)
-
-WIT package `carina:provider@0.2.0` requires the `diagnostics` and
-`protected-material` imports in every provider world. The host discards guest
-stdout and stderr from metadata loading through teardown. Provider errors,
-warnings, panic payloads, value diagnostics and HTTP traces use typed events
-bound by the same host redaction kernel as returned provider errors.
-
-Only long-lived AWS session credentials and GitHub tokens are registered.
-Registration is idempotent by credential value and keeps older generations for
-later redaction. Per-request signing fields are masked structurally by the host;
-ordinary query values do not enter the credential inventory. Value origin is
-advisory and cannot weaken host schema or secret classification.
-
-AWS providers enable the SDK's `aws` feature and implement `AwsSessionSource`.
-Each source returns `AwsSessionMaterial::new(credentials)` with the complete AWS
-SDK `Credentials` value. Registration reads its key, secret and token; the same
-credentials are returned after acknowledgement, preserving expiry, account ID,
-provider name and all feature/custom properties. Material Debug is opaque.
-The public AWS credential/configuration entry points are `AwsSessionMaterial`,
-`AwsSessionSource`, `AwsSessionFuture` and `AwsSdkParts`. Credential registration
-and acknowledged snapshots stay internal; snapshots cannot be installed as
-credentials providers or used to prepare unsigned requests.
-`AwsSdkParts::new(source, diagnostics).apply(builder)` installs the HTTP client
-and its registering credentials provider together on one AWS SDK config builder.
-Each credentials lookup fetches the current generation, registers it before
-returning signing credentials, and preserves its optional expiry. Registration
-failure returns a typed credentials error. Later changes through AWS config APIs
-remain under caller control; the SDK exposes neither paired component alone.
-
-`CARINA_WASI_HTTP_TRACE=1` is a host-only option and is never forwarded to guests.
-The SDK emits one completed typed HTTP event per request, including early failures.
-The default sink admits Debug/Trace only with that option; Error/Warn/Info remain
-visible. Native calls and WASM exports share per-call event budgets, separate trace
-quotas and a fixed host-authored suppression notice. Only the first panic per call
-is exempt from count/rate limits, with a finite 256 KiB input cap.
-
-Legacy `0.1.0` WIT providers are rejected with a typed incompatibility before
-linking or executing guest code. Older packages require rebuilding the provider
-against the current Carina protocol; newer packages require upgrading Carina.
-Providers built for protocol 24 or earlier must rebuild against the matching
-SDK for this development host.
+## Version 26
 
 ### Conditional input rules (#4263)
 
@@ -131,13 +89,57 @@ stages; scope and write context determine the finding kind and severity.
 EveryWrite update rules become active when their target or any guard changes,
 including removal. Guard evidence comes from admitted desired inputs overlaid
 with the exact patch, refreshed from resolved desired inputs at dispatch.
-Unsent fields are not proven absent, ignored guards remain Pending, and guards
-never read observed state. Dispatch rejects a remaining unresolved obligation.
+Unsent omissions at every depth and ignored inputs remain Pending. Both guards
+and targets consume the same immutable stage input; neither reads observed state. Dispatch rejects a remaining unresolved
+obligation.
 
 Schema fingerprint encoding is **v13**. It includes each rule's condition and
 literal payload, scope, target, code and predicate, plus Struct-local rules.
 Saved-plan format remains 43; plans carrying older schema fingerprints require
 replanning. Checked plans and pending input obligations are not serialized.
+
+## Version 25
+
+WIT package `carina:provider@0.2.0` requires the `diagnostics` and
+`protected-material` imports in every provider world. The host discards guest
+stdout and stderr from metadata loading through teardown. Provider errors,
+warnings, panic payloads, value diagnostics and HTTP traces use typed events
+bound by the same host redaction kernel as returned provider errors.
+
+Only long-lived AWS session credentials and GitHub tokens are registered.
+Registration is idempotent by credential value and keeps older generations for
+later redaction. Per-request signing fields are masked structurally by the host;
+ordinary query values do not enter the credential inventory. Value origin is
+advisory and cannot weaken host schema or secret classification.
+
+AWS providers enable the SDK's `aws` feature and implement `AwsSessionSource`.
+Each source returns `AwsSessionMaterial::new(credentials)` with the complete AWS
+SDK `Credentials` value. Registration reads its key, secret and token; the same
+credentials are returned after acknowledgement, preserving expiry, account ID,
+provider name and all feature/custom properties. Material Debug is opaque.
+The public AWS credential/configuration entry points are `AwsSessionMaterial`,
+`AwsSessionSource`, `AwsSessionFuture` and `AwsSdkParts`. Credential registration
+and acknowledged snapshots stay internal; snapshots cannot be installed as
+credentials providers or used to prepare unsigned requests.
+`AwsSdkParts::new(source, diagnostics).apply(builder)` installs the HTTP client
+and its registering credentials provider together on one AWS SDK config builder.
+Each credentials lookup fetches the current generation, registers it before
+returning signing credentials, and preserves its optional expiry. Registration
+failure returns a typed credentials error. Later changes through AWS config APIs
+remain under caller control; the SDK exposes neither paired component alone.
+
+`CARINA_WASI_HTTP_TRACE=1` is a host-only option and is never forwarded to guests.
+The SDK emits one completed typed HTTP event per request, including early failures.
+The default sink admits Debug/Trace only with that option; Error/Warn/Info remain
+visible. Native calls and WASM exports share per-call event budgets, separate trace
+quotas and a fixed host-authored suppression notice. Only the first panic per call
+is exempt from count/rate limits, with a finite 256 KiB input cap.
+
+Legacy `0.1.0` WIT providers are rejected with a typed incompatibility before
+linking or executing guest code. Older packages require rebuilding the provider
+against the current Carina protocol; newer packages require upgrading Carina.
+Both the current and minimum supported protocol are 25. Providers built for
+protocol 24 or earlier must rebuild against the current SDK.
 
 ## Version 24
 
@@ -170,7 +172,7 @@ schema-fingerprint verification.
 
 Every resource schema requires an `input_rules` array, including `[]` when
 no rules are declared. Each rule requires a `scope`, a typed `target`, a stable
-lowercase dotted diagnostic `code`, and a tagged `predicate`. Current protocol-25
+lowercase dotted diagnostic `code`, and a tagged `predicate`. Current protocol-26
 examples also include the required `condition`:
 
 ```json
@@ -242,7 +244,7 @@ validation reuses that same merge before checking desired inputs. Diagnostics
 name only the attribute, code and reason, including for secret values.
 
 The semantic schema fingerprint includes each rule's scope, target and complete
-predicate payload; protocol 25 also includes conditions and Struct rules, and
+predicate payload; protocol 26 also includes conditions and Struct rules, and
 the current encoding is v13. Checked plans and pending obligations are not
 serialized. Saved plans are re-admitted under the apply lock, and dispatch
 discharges pending rules against resolved desired inputs and exact requests.
@@ -253,7 +255,7 @@ pattern modes, conditions and Struct rule arrays. Older providers are rejected
 before schema decoding. The v12 migration adapter has
 been removed. The SDK's schema JSON export carries these input rules without
 adding WIT functions or CRUD request fields; the diagnostic imports are separate. AWS, AWSCC, and GitHub providers must rebuild
-against protocol 25 to target this unreleased host.
+against protocol 26 to target this unreleased host.
 
 ## Version 22
 

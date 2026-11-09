@@ -7516,7 +7516,7 @@ mod pattern_mode_tests {
 mod removed_legacy_pattern_window_tests {
     #[test]
     fn pattern_specs_require_supported_protocol_including_schema_only_loading() {
-        for version in [12, 22, 23, 24] {
+        for version in [12, 22, 23, 24, 25] {
             let info = serde_json::json!({"name": "old", "display_name": "Old", "version": "1.0.0", "protocol_version": version});
             let error = super::check_protocol_version(&info.to_string()).unwrap_err();
             assert!(error.contains(&format!(

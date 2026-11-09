@@ -23,6 +23,7 @@ Since v0.5.0, the first release that checks the version, every release has set t
 
 | Carina release | Protocol version | Oldest provider protocol it loads |
 |----------------|------------------|-----------------------------------|
+| Next development protocol (unreleased) | 26 | 26 |
 | Development snapshot after v0.13.1 (unreleased) | 25 | 25 |
 | v0.13.1 | 24 | 24 |
 | v0.13.0 | 24 | 24 |
@@ -48,7 +49,7 @@ The current development SDK and minimum supported provider protocol are both 25 
 
 For protocol 25 AWS configuration, use `AwsSessionMaterial`, `AwsSessionSource`, `AwsSessionFuture` and `AwsSdkParts` (SDK feature `aws`). Sources return `AwsSessionMaterial::new(credentials)` with the complete SDK value; registration retains expiry, account ID, provider name and feature/custom properties. Registration and acknowledged snapshots remain internal; snapshots cannot provide credentials independently or prepare unsigned requests. The SDK installs the refreshing provider and HTTP client together and registers every returned generation; later AWS config changes remain under caller control.
 
-The next protocol is 25, currently the unreleased development snapshot after v0.13.1. It combines WIT 0.2.0 typed provider diagnostics, credential registration and discarded guest stdout/stderr with required typed input-rule conditions and Struct `input_rules` arrays. Use the matching unreleased SDK when targeting this development host; released v0.13.1 rejects protocol-25 providers.
+The next protocol is 26. Its unreleased SDK and host require provider protocol 26. It adds required `InputRule.condition` and Struct `input_rules` arrays to the protocol-25 diagnostics contract, retaining WIT 0.2.0. CreateOnly input-rule violations are validate/LSP warnings with `(rejected if this resource is created)` wording and plan errors only at create-capable sites; EveryWrite violations remain errors. Use the matching protocol-26 SDK for this host: protocol-25 providers require rebuilding, and released v0.13.1 remains protocol 24/24. Schema fingerprint encoding stays v13.
 
 The protocol 21 schema envelope requires `assignability_edges`, even when empty, and SDK providers must implement `CarinaProvider::assignability_edges`. Both endpoints must be declared by that provider as scalar String, Int, or Float identities with the same scalar kind. Enum, Reference, and core built-in identities cannot be endpoints; self edges, duplicates, and cycles are rejected. Each provider's transitive closure is retained separately, so paths never combine different providers' declarations.
 

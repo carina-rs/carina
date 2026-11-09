@@ -2189,7 +2189,7 @@ pub enum AttributeType {
         fields: Vec<StructField>,
         /// Required in protocol v16, including when empty.
         field_groups: Vec<FieldGroup>,
-        /// Required in protocol v25, including when empty.
+        /// Required in protocol v26, including when empty.
         input_rules: Vec<InputRule>,
     },
     #[serde(rename = "union")]
