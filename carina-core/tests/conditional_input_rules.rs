@@ -504,7 +504,7 @@ fn authored_every_write_conditions_use_the_shared_report() {
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let findings = check_authored_inputs(&file, &schemas).unwrap();
+    let findings = check_authored_inputs(file.authored_inputs().unwrap(), &schemas).unwrap();
     assert_eq!(findings.len(), 1);
     assert!(
         findings[0]
@@ -903,7 +903,7 @@ fn s3_account_regional_suffix_is_create_only_and_imports_are_excluded() {
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let report = check_authored_inputs(&file, &schemas).unwrap();
+    let report = check_authored_inputs(file.authored_inputs().unwrap(), &schemas).unwrap();
     assert_eq!(report.len(), 1);
     assert_eq!(
         report[0].severity(),
@@ -1213,21 +1213,13 @@ fn authored_report_retains_pending_guards_as_obligations() {
         InputPredicate::Present,
         InputCondition::Not(Box::new(equals_guard())),
     )));
-    let mut file = carina_core::parser::parse_file(
-        "mock.test.Conditional { guard = true }",
+    let file = carina_core::parser::parse_file(
+        "arguments { enabled: Bool } mock.test.Conditional { guard = enabled }",
         std::path::Path::new("main.crn"),
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    file.resources[0].attributes.insert(
-        "guard".into(),
-        Value::Deferred(carina_core::resource::DeferredValue::Unknown(
-            carina_core::resource::ApplyTimeUnknown::PendingReRead(
-                carina_core::resource::PendingReRead::not_found(),
-            ),
-        )),
-    );
-    let report = check_authored_inputs(&file, &schemas).unwrap();
+    let report = check_authored_inputs(file.authored_inputs().unwrap(), &schemas).unwrap();
     assert!(report.is_empty());
     assert_eq!(report.pending().len(), 1);
     assert_eq!(report.pending()[0].path.as_str(), "target");
@@ -1290,20 +1282,22 @@ fn create_only_s3_namespace_preview_preserves_pending_create_obligations() {
         (Some(Some("account-regional")), 0, 0),
         (Some(None), 0, 1),
     ] {
-        let mut file = carina_core::parser::parse_file(
-            "let bucket = mock.test.Conditional { target = 'bucket-an' }",
+        let source = match namespace {
+            None => "let bucket = mock.test.Conditional { target = 'bucket-an' }".to_owned(),
+            Some(Some(value)) => format!("let bucket = mock.test.Conditional {{ target = 'bucket-an' bucket_namespace = '{value}' }}"),
+            Some(None) => "arguments { namespace: String } let bucket = mock.test.Conditional { target = 'bucket-an' bucket_namespace = namespace }".to_owned(),
+        };
+        let file = carina_core::parser::parse_file(
+            &source,
             std::path::Path::new("main.crn"),
             &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
         )
         .unwrap();
         let mut fields = vec![("target", string("bucket-an"))];
         if let Some(namespace) = namespace {
-            file.resources[0]
-                .attributes
-                .insert("bucket_namespace".into(), namespace_value(namespace));
             fields.push(("bucket_namespace", namespace_value(namespace)));
         }
-        let report = check_authored_inputs(&file, &schemas).unwrap();
+        let report = check_authored_inputs(file.authored_inputs().unwrap(), &schemas).unwrap();
         assert_eq!(report.len(), violations);
         assert_eq!(report.pending().len(), pending_count);
         for finding in report.iter() {

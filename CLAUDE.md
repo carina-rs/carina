@@ -697,8 +697,14 @@ A struct type represents a nested object with typed fields.
   uses runtime knowledge for presence and equality; unknown guards remain pending,
   including under negation. Each write site owns one immutable `RuleInput`,
   constructed only at authored, plan or protected dispatch stage boundaries.
-  Guards, targets, instance enumeration and bound-expression estimation share
-  its classified graph and ignore policy. Only complete replacement nodes and
+  Authored checks require immutable parser/admission-minted `AuthoredInputs`;
+  mutating public AST fields cannot reseal their snapshot. Guards, targets,
+  instance enumeration and bound-expression estimation share the graph and
+  ignore policy. Classification and diagnostic protection travel together on
+  every graph edge. Key cursors preserve withheld completeness and masked
+  membership; the estimator never recovers proof from an unsent map expression.
+  Owner prefixes are shared, and diagnostic paths are materialized only for
+  findings or pending results, which are then sorted. Only complete replacement nodes and
   explicit removals prove absence; unsent omissions remain withheld at every
   depth. Default membership belongs to that graph and is recomputed at dispatch.
   An erased normalized expression has no authored fallback without carried
@@ -718,7 +724,7 @@ A struct type represents a nested object with typed fields.
   require `diagnostics` and `protected-material` imports in every provider
   world. Component type scanning rejects a legacy package before linking or
   executing any start/info code, naming the found package and the required
-  `carina:provider@0.2.0` / protocol 25. `ProviderDiagnostics::emit` accepts only typed events borrowing
+  `carina:provider@0.2.0` and the current host protocol. `ProviderDiagnostics::emit` accepts only typed events borrowing
   provider errors/diagnostics or carrying structured value candidates. The
   host binds them through the same private text kernel as returned errors.
   Only that kernel mints `BoundProviderEvent`; its presenter consumes Bound

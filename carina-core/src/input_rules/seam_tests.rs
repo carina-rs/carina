@@ -243,3 +243,212 @@ fn ignored_missing_child_is_withheld_for_the_walker_and_predicate() {
         checked.pending_rows(0)
     );
 }
+
+#[test]
+fn nested_secret_containers_protect_instantiated_map_keys() {
+    let local = AttributeType::struct_with_rules(
+        "Object",
+        vec![
+            StructField::optional("guard", AttributeType::bool()).build(),
+            StructField::optional("target", AttributeType::string()).build(),
+        ],
+        vec![],
+        vec![
+            InputRule::value(
+                InputRuleScope::EveryWrite,
+                InputPath::new("target").unwrap(),
+                InputRuleCode::new("object.target").unwrap(),
+                InputPredicate::Present,
+            )
+            .with_condition(InputCondition::Present(InputPath::new("guard").unwrap())),
+        ],
+    );
+    let item = object([(
+        "private-key",
+        object([("guard", Value::Concrete(ConcreteValue::Bool(true)))]),
+    )])
+    .into_secret();
+    for (ty, value) in [
+        (
+            AttributeType::list(AttributeType::map(local.clone())),
+            Value::Concrete(ConcreteValue::List(vec![item.clone()])),
+        ),
+        (
+            AttributeType::map(AttributeType::map(local)),
+            object([("public", item)]),
+        ),
+    ] {
+        let schemas = registry(
+            ResourceSchema::new("Review")
+                .attribute(AttributeSchema::optional("objects", ty).build()),
+        );
+        let resource = Resource::with_provider("mock", "Review", "example", None)
+            .with_attribute("objects", value);
+        let site =
+            classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+                .unwrap()
+                .unwrap();
+        let findings = site
+            .applicable_rules()
+            .flat_map(|rule| rule.evaluation().findings)
+            .collect::<Vec<_>>();
+        assert_eq!(findings.len(), 1);
+        let text = format!("{} {findings:?}", findings[0]);
+        assert!(
+            !text.contains("private-key"),
+            "nested secret map key leaked: {text}"
+        );
+        assert!(text.contains("<secret>"));
+    }
+}
+
+fn guarded_tag_keys(ignored: bool) -> InputVerdict {
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+            .attribute(
+                AttributeSchema::optional("tags", AttributeType::map(AttributeType::string()))
+                    .build(),
+            )
+            .input_rule(
+                InputRule::new(
+                    InputRuleScope::EveryWrite,
+                    InputRuleTarget::MapKeys(InputPath::new("tags").unwrap()),
+                    InputRuleCode::new("tags.reserved").unwrap(),
+                    InputPredicate::NoPrefix(crate::schema::NonEmptyString::new("aws:").unwrap()),
+                )
+                .with_condition(InputCondition::Equals {
+                    path: InputPath::new("guard").unwrap(),
+                    literal: InputLiteral::Bool(true),
+                }),
+            ),
+    );
+    let tags = if ignored {
+        object([("aws:private", text("value"))])
+    } else {
+        object([])
+    };
+    let mut desired = Resource::with_provider("mock", "Review", "example", None)
+        .with_attribute("guard", Value::Concrete(ConcreteValue::Bool(true)))
+        .with_attribute("tags", tags.clone());
+    if ignored {
+        ignore_key(&mut desired, "tags", "aws:private");
+    }
+    let previous = State::existing(
+        desired.id.clone(),
+        crate::test_support::snapshot_attributes::<crate::resource::NoPlaceholder>(HashMap::from(
+            [
+                ("guard".into(), Value::Concrete(ConcreteValue::Bool(false))),
+                ("tags".into(), tags),
+            ],
+        )),
+    )
+    .with_identifier("existing");
+    let mut plan = Plan::new();
+    plan.add(Effect::Update {
+        from: Box::new(previous),
+        identifier: crate::provider::AppliedIdentifier::new("existing").unwrap(),
+        to: crate::resource::ResolvedResource::resolve_raw_fixture(desired, &schemas).unwrap(),
+        changed_attributes: vec!["guard".into()],
+    });
+    let finalized = FinalizedPlan::new(plan);
+    let current = HashMap::new();
+    let site = finalized
+        .write_sites(&schemas, &current)
+        .next()
+        .unwrap()
+        .unwrap();
+    site.applicable_rules().next().unwrap().evaluate()
+}
+
+#[test]
+fn unsent_map_keys_cannot_prove_absent_keys_through_estimation() {
+    assert_eq!(guarded_tag_keys(false), InputVerdict::Undecided);
+}
+
+#[test]
+fn ignored_map_keys_do_not_become_present_key_evidence() {
+    assert_eq!(guarded_tag_keys(true), InputVerdict::Undecided);
+}
+
+#[test]
+fn satisfied_recursive_rules_have_linear_path_work() {
+    const COUNT: usize = 64;
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .with_def(
+                "Node",
+                AttributeType::struct_with_rules(
+                    "Node",
+                    vec![
+                        StructField::optional("target", AttributeType::string()).build(),
+                        StructField::optional("child", AttributeType::ref_("Node")).build(),
+                    ],
+                    vec![],
+                    vec![InputRule::value(
+                        InputRuleScope::EveryWrite,
+                        InputPath::new("target").unwrap(),
+                        InputRuleCode::new("node.target").unwrap(),
+                        InputPredicate::Present,
+                    )],
+                ),
+            )
+            .attribute(AttributeSchema::optional("root", AttributeType::ref_("Node")).build()),
+    );
+    let mut value = object([("target", text("valid"))]);
+    for _ in 1..COUNT {
+        value = object([("target", text("valid")), ("child", value)]);
+    }
+    let resource =
+        Resource::with_provider("mock", "Review", "example", None).with_attribute("root", value);
+    let site = classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+        .unwrap()
+        .unwrap();
+    let (_, segments) = crate::schema::with_field_path_work(|| {
+        let results = site
+            .applicable_rules()
+            .map(|rule| rule.evaluation())
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), COUNT);
+        assert!(
+            results
+                .iter()
+                .all(|result| result.findings.is_empty() && result.pending.is_none())
+        );
+    });
+    assert!(
+        segments <= COUNT * 8,
+        "satisfied chain materialized {segments} path segments for {COUNT} nodes"
+    );
+}
+
+#[test]
+fn public_ast_mutations_cannot_reseal_authored_input() {
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .input_rule(
+                InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("target").unwrap(),
+                    InputRuleCode::new("target.required").unwrap(),
+                    InputPredicate::Present,
+                )
+                .with_condition(InputCondition::Present(InputPath::new("guard").unwrap())),
+            ),
+    );
+    let mut parsed = crate::parser::parse_file(
+        "let example = mock.Review { guard = true }",
+        std::path::Path::new("main.crn"),
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let before = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas).unwrap();
+    assert_eq!(before.len(), 1);
+    parsed.resources[0].attributes.clear();
+    let after = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas).unwrap();
+    assert_eq!(before.findings, after.findings);
+    let fabricated = crate::parser::ExpandedParsedFile::default();
+    assert!(fabricated.authored_inputs().is_none());
+}

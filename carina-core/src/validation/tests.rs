@@ -795,6 +795,7 @@ fn empty_parsed() -> ParsedFile {
         template_placeholder: std::marker::PhantomData,
         deferred_module_ifs: Vec::new(),
         expansion_trace: crate::resource::ExpansionTrace::new(),
+        authored_inputs: None,
     }
 }
 

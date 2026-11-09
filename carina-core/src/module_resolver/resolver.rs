@@ -79,6 +79,17 @@ impl ModuleCallConstraintReport {
     }
 }
 
+/// Complete graph owned by the successful module-admission boundary. Its
+/// constructor stays private to this resolver; mutable public ASTs cannot mint it.
+pub(crate) struct AuthoredModuleGraph<'a, E> {
+    file: &'a ModuleResolvedFile<E>,
+}
+impl<E> AuthoredModuleGraph<'_, E> {
+    pub(crate) fn file(&self) -> &ModuleResolvedFile<E> {
+        self.file
+    }
+}
+
 pub type ModuleCallConstraintReports = Vec<ModuleCallConstraintReport>;
 
 /// Diagnostic module-resolution outcome.
@@ -2102,7 +2113,7 @@ fn resolve_modules_with_diagnostics_and_resolver<
     graph.warnings.extend(resolver.provider_type_warnings());
     let mut graph = finish_root_expansion(graph, contributions, &root);
     crate::parser::retained::judge_configuration(&mut graph, resolver.schemas, resolver.config());
-    let (graph, deferred_for_errors) = finalize_deferred_for_bodies_collecting(graph);
+    let (mut graph, deferred_for_errors) = finalize_deferred_for_bodies_collecting(graph);
     errors.extend(deferred_for_errors);
     let constraint_reports = resolver
         .constraint_reports
@@ -2123,6 +2134,13 @@ fn resolve_modules_with_diagnostics_and_resolver<
     if !findings.is_empty() {
         ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors }
     } else if !resolution_failed {
+        graph.authored_inputs = None;
+        if let Ok(inputs) = crate::input_rules::AuthoredInputs::for_module_admission(
+            &AuthoredModuleGraph { file: &graph },
+            resolver.session.catalog(),
+        ) {
+            graph.attach_authored_inputs(inputs);
+        }
         ModuleResolutionDiagnosticResult::Expanded {
             graph: Box::new(graph),
         }

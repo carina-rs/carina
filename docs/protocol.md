@@ -138,8 +138,8 @@ is exempt from count/rate limits, with a finite 256 KiB input cap.
 Legacy `0.1.0` WIT providers are rejected with a typed incompatibility before
 linking or executing guest code. Older packages require rebuilding the provider
 against the current Carina protocol; newer packages require upgrading Carina.
-Both the current and minimum supported protocol are 25. Providers built for
-protocol 24 or earlier must rebuild against the current SDK.
+For this protocol generation, both version numbers were 25. Providers built for
+protocol 24 or earlier had to rebuild against the protocol-25 SDK.
 
 ## Version 24
 
@@ -229,7 +229,7 @@ Admission rejects unknown or provider-populated paths, incorrect target types,
 duplicate target/code declarations, invalid diagnostic codes, empty
 character sets or forbidden tokens, and missing or inverted length bounds.
 Rules are conjunctive. String predicates exempt an absent optional input when
-no value is sent; version-25 presence and equality predicates do not.
+no value is sent; version-26 presence and equality predicates do not.
 Schema attribute defaults are currently authoring metadata: the host does not
 insert them into requests. Values materialized by normalization are checked.
 Unknown desired inputs retain pending obligations, including on Updates; live
@@ -250,7 +250,7 @@ serialized. Saved plans are re-admitted under the apply lock, and dispatch
 discharges pending rules against resolved desired inputs and exact requests.
 
 Version 23 introduced the required `input_rules`, `scope` and `target` fields.
-For this development host, the version-25 requirements include explicit
+For this development host, the version-26 requirements include explicit
 pattern modes, conditions and Struct rule arrays. Older providers are rejected
 before schema decoding. The v12 migration adapter has
 been removed. The SDK's schema JSON export carries these input rules without

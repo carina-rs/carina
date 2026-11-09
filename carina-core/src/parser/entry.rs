@@ -230,6 +230,16 @@ impl<'a> BindingSeed<'a> {
     }
 }
 
+/// Only this parser module can attest that a complete source was parsed.
+pub(crate) struct AuthoredParse<'a> {
+    file: &'a ParsedFile,
+}
+impl AuthoredParse<'_> {
+    pub(crate) fn file(&self) -> &ParsedFile {
+        self.file
+    }
+}
+
 /// Parse a .crn file with the given configuration.
 ///
 /// The config allows injecting a decryptor function for `decrypt()` calls
@@ -1472,6 +1482,9 @@ fn parse_with_seeded_bindings_inner(
     if let Some(error) = parsed.expression_report().first_function_error() {
         return Err((error).into());
     }
+    let input =
+        crate::input_rules::AuthoredInputs::for_parser_output(&AuthoredParse { file: &parsed });
+    parsed.attach_authored_inputs(input);
     // The parser never synthesizes composition resources, so its default
     // expansion trace remains empty until module expansion (#3306).
     Ok(parsed)

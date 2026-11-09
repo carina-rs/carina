@@ -11,9 +11,52 @@ pub(super) enum Step {
     Key(ValueString),
 }
 
-pub(super) fn diagnostic_path(owner: &[Step], path: &InputPath) -> InputDiagnosticPath {
+/// Shared immutable prefixes cost one segment per traversed edge. Binding a
+/// successful rule clones only an Arc; diagnostics alone render the prefix.
+#[derive(Clone, Default)]
+pub(super) struct OwnerPath(Option<Arc<OwnerPrefix>>);
+struct OwnerPrefix {
+    parent: OwnerPath,
+    step: Step,
+    root: Arc<str>,
+}
+impl OwnerPath {
+    fn root(&self) -> Option<&str> {
+        self.0.as_ref().map(|prefix| prefix.root.as_ref())
+    }
+    fn push(&mut self, step: Step) {
+        let root = self.0.as_ref().map_or_else(
+            || match &step {
+                Step::Field(name) => Arc::from(name.as_str()),
+                _ => unreachable!("resource attribute first"),
+            },
+            |prefix| Arc::clone(&prefix.root),
+        );
+        *self = Self(Some(Arc::new(OwnerPrefix {
+            parent: self.clone(),
+            step,
+            root,
+        })));
+    }
+    fn pop(&mut self) {
+        *self = self.0.as_ref().expect("nonempty owner").parent.clone();
+    }
+    fn segments(&self) -> Vec<&Step> {
+        let mut segments = Vec::new();
+        let mut current = self;
+        while let Some(prefix) = &current.0 {
+            segments.push(&prefix.step);
+            current = &prefix.parent;
+        }
+        segments.reverse();
+        segments
+    }
+}
+
+pub(super) fn diagnostic_path(owner: &OwnerPath, path: &InputPath) -> InputDiagnosticPath {
+    let owner = owner.segments();
     let mut rendered = String::new();
-    for step in owner {
+    for step in &owner {
         match step {
             Step::Field(name) => {
                 if !rendered.is_empty() {
@@ -41,7 +84,7 @@ pub(super) fn diagnostic_path(owner: &[Step], path: &InputPath) -> InputDiagnost
     rendered.push_str(path.as_str());
     let mut steps = owner
         .iter()
-        .cloned()
+        .map(|step| (*step).clone())
         .chain(path.segments().map(|s| Step::Field(s.to_owned())));
     let Some(Step::Field(root)) = steps.next() else {
         unreachable!("instance starts at a resource attribute");
@@ -57,11 +100,11 @@ pub(super) fn diagnostic_path(owner: &[Step], path: &InputPath) -> InputDiagnost
     InputDiagnosticPath::new(rendered, root, relative)
 }
 
-fn active(site: &WriteSite<'_>, owner: &[Step], rule: &InputRule<Compiled>) -> bool {
+fn active(site: &WriteSite<'_>, owner: &OwnerPath, rule: &InputRule<Compiled>) -> bool {
     if !site.input.is_update() {
         return true;
     }
-    if let Some(Step::Field(root)) = owner.first() {
+    if let Some(root) = owner.root() {
         return site.input.changed(root);
     }
     match (rule.condition(), rule.predicate()) {
@@ -93,7 +136,7 @@ fn bind<'s, 'a>(
     site: &'s WriteSite<'a>,
     rule: &'a InputRule<Compiled>,
     owner_type: Option<&'a CompiledAttributeType>,
-    owner: &[Step],
+    owner: &OwnerPath,
     pending_instance: bool,
     instance: InstanceRef,
 ) -> Option<BoundInputRule<'s, 'a>> {
@@ -106,7 +149,8 @@ fn bind<'s, 'a>(
         rule,
         kind,
         owner_type,
-        path: diagnostic_path(owner, rule.path()),
+        path: OnceLock::new(),
+        owner: owner.clone(),
         pending_instance,
         instance,
     })
@@ -117,8 +161,15 @@ pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRu
     let mut fits = super::union_fits::UnionFits::default();
     for &rule in &site.rules {
         instances.extend(
-            bind(site, rule, None, &[], false, InstanceRef::Resource)
-                .map(ApplicableInputRule::instance),
+            bind(
+                site,
+                rule,
+                None,
+                &OwnerPath::default(),
+                false,
+                InstanceRef::Resource,
+            )
+            .map(ApplicableInputRule::instance),
         );
     }
     for (name, attribute) in &site.schema.as_schema().attributes {
@@ -135,7 +186,8 @@ pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRu
         let value = read.instance();
         // Only proven omissions have no instances. Missing update evidence
         // and deferred resources retain a subtree obligation.
-        let mut owner = vec![Step::Field(name.clone())];
+        let mut owner = OwnerPath::default();
+        owner.push(Step::Field(name.clone()));
         walk(
             site,
             &attribute.attr_type,
@@ -147,7 +199,6 @@ pub(super) fn for_site<'s, 'a>(site: &'s WriteSite<'a>) -> Vec<ApplicableInputRu
             &mut fits,
         );
     }
-    instances.sort_by(|a, b| (a.path(), a.code()).cmp(&(b.path(), b.code())));
     instances
 }
 
@@ -156,7 +207,7 @@ fn walk<'s, 'a>(
     site: &'s WriteSite<'a>,
     ty: &'a CompiledAttributeType,
     value: InstanceRef,
-    owner: &mut Vec<Step>,
+    owner: &mut OwnerPath,
     visited_refs: &mut HashSet<String>,
     out: &mut Vec<ApplicableInputRule<'s, 'a>>,
     scope: DiagnosticScope,
@@ -324,7 +375,7 @@ fn collect_deferred<'s, 'a>(
     site: &'s WriteSite<'a>,
     ty: &'a CompiledAttributeType,
     value: InstanceRef,
-    owner: &mut Vec<Step>,
+    owner: &mut OwnerPath,
     visited: &mut HashSet<declarations::DeclarationNode>,
     out: &mut Vec<BoundInputRule<'s, 'a>>,
 ) {

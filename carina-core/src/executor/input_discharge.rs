@@ -275,8 +275,7 @@ impl WriteCheck {
             .ok_or_else(|| {
                 EffectFailureKind::message("input rule schema unavailable at dispatch")
             })?;
-        for applicable in site.applicable_rules() {
-            let evaluation = applicable.evaluation();
+        for evaluation in site.evaluated_rules() {
             if let Some(finding) = evaluation.findings.into_iter().next() {
                 return Err(EffectFailureKind::InputRule {
                     violation: finding.violation().clone(),

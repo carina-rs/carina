@@ -990,7 +990,12 @@ impl ValidationReport<'_> {
     /// retains the effect-specific input gate instead.
     pub(crate) fn check_authored_inputs(mut self) -> Self {
         self.result = self.result.and_then(|parsed| {
-            let report = carina_core::input_rules::check_authored_inputs(&parsed, self.schemas)
+            let authored = parsed.authored_inputs().ok_or_else(|| {
+                NonEmptyValidationErrors(vec![AppError::Validation(
+                    "configuration has no authored input authority".into(),
+                )])
+            })?;
+            let report = carina_core::input_rules::check_authored_inputs(authored, self.schemas)
                 .map_err(|error| NonEmptyValidationErrors(vec![AppError::Provider(error)]))?;
             let mut errors = Vec::new();
             for finding in report {

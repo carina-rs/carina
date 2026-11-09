@@ -760,8 +760,9 @@ impl Estimator<'_> {
 /// Every owner enters through its bound, admitted rule and concrete instance.
 pub(super) fn estimate(
     applicable: &BoundInputRule<'_, '_>,
-    expression: BoundExpression<'_>,
+    input: rule_input::EstimatorInput<'_>,
 ) -> InputVerdict {
+    let (expression, keys) = input.into_parts();
     let rule = applicable.rule;
     if matches!(
         rule.predicate(),
@@ -781,12 +782,7 @@ pub(super) fn estimate(
         query: Query::new(rule.predicate()),
         steps: 0,
     };
-    let summary = estimator.at_path(
-        expression.value(),
-        &[],
-        matches!(rule.target(), InputRuleTarget::MapKeys(_)),
-        0,
-    );
+    let summary = estimator.at_path(expression.value(), &[], keys, 0);
     decide(summary, rule, &estimator.query)
 }
 

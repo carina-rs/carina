@@ -26,7 +26,7 @@ pub use elements::{
     ReferenceLocations, ReferenceProvenance, SyntaxInventory,
 };
 mod entry;
-pub(crate) use entry::scope_parse_failure;
+pub(crate) use entry::{AuthoredParse, scope_parse_failure};
 mod error;
 mod expressions;
 mod functions;

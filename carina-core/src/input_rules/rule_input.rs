@@ -203,17 +203,13 @@ impl RuleInput {
         })
     }
 
-    pub(super) fn for_authored<
-        S,
-        P: crate::resource::PlaceholderKind,
-        B: crate::resource::BindingAddress,
-        D,
-    >(
-        resource: &crate::resource::Resource<S, P, B, D>,
+    pub(super) fn for_authored(
+        source: &authored::AuthoredResource<'_>,
         schema: &ValidatedResourceSchema,
         declarations: Arc<TypeFacts>,
         schemas: &SchemaRegistry,
     ) -> crate::provider::HostResult<Arc<Self>> {
+        let resource = source.resource();
         let mut projected = crate::resource::Resource::<ModuleSource, ParserPlaceholder>::from_id(
             resource.id.clone(),
         );
@@ -598,7 +594,7 @@ impl<'a> EvidenceGraph<'a> {
                 Completeness::Replacement
             };
             let id = graph.push(
-                proof,
+                ClassifiedRef::from(&proof),
                 DiagnosticScope::Public,
                 false,
                 completeness,
@@ -620,15 +616,19 @@ impl<'a> EvidenceGraph<'a> {
 
     fn push(
         &mut self,
-        proof: Classification<'a, ParserPlaceholder>,
+        classified: ClassifiedRef<
+            '_,
+            'a,
+            ParserPlaceholder,
+            crate::resource::AbsoluteBindingAddress,
+        >,
         scope: DiagnosticScope,
         enclosing_failure: bool,
         completeness: Completeness,
         path: &mut Vec<crate::schema::LeafPathSegment>,
         input: &'a InputStorage,
     ) -> NodeId {
-        let (proof, protection) =
-            ClassifiedRef::from(&proof).for_input_rules(&InputEvidenceAuthority(()));
+        let (proof, protection) = classified.for_input_rules(&InputEvidenceAuthority(()));
         let scope = if scope.is_secret() { scope } else { protection };
         let blocked = input
             .update
@@ -651,14 +651,7 @@ impl<'a> EvidenceGraph<'a> {
                 path.push(crate::schema::LeafPathSegment::MapKey(ValueString::plain(
                     key,
                 )));
-                let child = self.push(
-                    value.for_input_rules(&InputEvidenceAuthority(())).0,
-                    scope,
-                    child_failure,
-                    completeness,
-                    path,
-                    input,
-                );
+                let child = self.push(value, scope, child_failure, completeness, path, input);
                 path.pop();
                 full_proof &= self.nodes[child.0].full_proof;
                 members.insert(key, child);
@@ -675,14 +668,7 @@ impl<'a> EvidenceGraph<'a> {
                     .list_item(index)
                     .expect("known list membership");
                 path.push(crate::schema::LeafPathSegment::ListIndex(index));
-                let child = self.push(
-                    value.for_input_rules(&InputEvidenceAuthority(())).0,
-                    scope,
-                    child_failure,
-                    completeness,
-                    path,
-                    input,
-                );
+                let child = self.push(value, scope, child_failure, completeness, path, input);
                 path.pop();
                 full_proof &= self.nodes[child.0].full_proof;
                 items.push(child);
@@ -767,7 +753,7 @@ impl<'a> EvidenceGraph<'a> {
                     };
                 }
                 let child = self.push(
-                    proof,
+                    ClassifiedRef::from(&proof),
                     self.nodes[root.0].scope,
                     false,
                     self.nodes[root.0].completeness,
@@ -983,14 +969,43 @@ impl<'a> NodeRef<'a> {
             _ => None,
         }
     }
-    pub(super) fn map_complete(self) -> bool {
-        matches!(self.raw().children, Children::Map { complete: true, .. })
-    }
-    pub(super) fn map_tail(self) -> bool {
-        matches!(self.raw().children, Children::Map { tail: true, .. })
-    }
-    pub(super) fn membership(self) -> Membership {
-        self.raw().membership
+    pub(super) fn keys(self) -> MapKeyCursor<'a> {
+        let entries = self
+            .fields()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(key, node)| {
+                (
+                    key,
+                    if node.raw().blocked {
+                        Membership::Possible
+                    } else {
+                        node.raw().membership
+                    },
+                )
+            })
+            .collect();
+        let remainder = match self.raw().completeness {
+            Completeness::Unsent => KeyRemainder::Withheld,
+            Completeness::Replacement => match &self.raw().children {
+                Children::Map {
+                    complete: true,
+                    tail: false,
+                    ..
+                } => KeyRemainder::Complete,
+                Children::Map { .. } | Children::Scalar
+                    if !self.raw().masked_children.is_empty() || self.raw().blocked =>
+                {
+                    KeyRemainder::Withheld
+                }
+                Children::Map { .. } | Children::Scalar | Children::List(_) => self
+                    .expression()
+                    .map_or(KeyRemainder::Withheld, |expression| {
+                        KeyRemainder::Expression(BoundKeyExpression(expression))
+                    }),
+            },
+        };
+        MapKeyCursor { entries, remainder }
     }
     pub(super) fn unselected(self) -> InstanceRef {
         InstanceRef::Deferred {
@@ -1047,6 +1062,34 @@ impl InstanceRef {
             Self::Node(id) => NodeRef { input, id }.scope(),
             Self::Deferred { scope, .. } => scope,
             Self::Resource => DiagnosticScope::Public,
+        }
+    }
+}
+
+/// A key cursor never borrows proof from the payload's raw expression. Only
+/// replacement membership can grant an expression handle for its unknown tail.
+pub(super) struct MapKeyCursor<'a> {
+    pub entries: Vec<(&'a str, Membership)>,
+    pub remainder: KeyRemainder<'a>,
+}
+pub(super) enum KeyRemainder<'a> {
+    Complete,
+    Withheld,
+    Expression(BoundKeyExpression<'a>),
+}
+
+/// Only the key cursor can mint this capability. A scalar expression handle
+/// cannot be interpreted as proof about map-key membership by the estimator.
+pub(super) struct BoundKeyExpression<'a>(BoundExpression<'a>);
+pub(super) enum EstimatorInput<'a> {
+    Value(BoundExpression<'a>),
+    Keys(BoundKeyExpression<'a>),
+}
+impl<'a> EstimatorInput<'a> {
+    pub(super) fn into_parts(self) -> (BoundExpression<'a>, bool) {
+        match self {
+            Self::Value(expression) => (expression, false),
+            Self::Keys(expression) => (expression.0, true),
         }
     }
 }

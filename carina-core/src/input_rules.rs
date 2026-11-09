@@ -4,12 +4,14 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     ops::Deref,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+mod authored;
+pub use authored::AuthoredInputs;
 mod declarations;
 mod estimator;
 mod instances;
@@ -48,7 +50,7 @@ type InputValue = Value<ParserPlaceholder>;
 type InputAttributes = IndexMap<String, InputValue>;
 pub(crate) use declarations::InputRuleDeclarations;
 pub use rule_input::{AbsenceProof, InputRead, NodeRef, PatchRead, RuleInput, WithheldReason};
-use rule_input::{BoundExpression, InstanceRef, Membership};
+use rule_input::{InstanceRef, Membership};
 
 // Only this classified write-site owner can open protected input evidence.
 pub(crate) struct InputEvidenceAuthority(());
@@ -177,6 +179,28 @@ impl WriteSite<'_> {
         instances::for_site(self).into_iter()
     }
 
+    pub(crate) fn evaluated_rules(&self) -> Vec<InputEvaluation> {
+        let mut rows = self
+            .applicable_rules()
+            .filter_map(|rule| {
+                let evaluation = rule.evaluation();
+                let key = evaluation
+                    .findings
+                    .first()
+                    .map(|finding| {
+                        (
+                            finding.violation.path().clone(),
+                            finding.violation.code().clone(),
+                        )
+                    })
+                    .or_else(|| evaluation.pending.clone())?;
+                Some((key, evaluation))
+            })
+            .collect::<Vec<_>>();
+        rows.sort_by(|(a, _), (b, _)| a.cmp(b));
+        rows.into_iter().map(|(_, evaluation)| evaluation).collect()
+    }
+
     pub fn resource_id(&self) -> &ResourceId {
         &self.resource_id
     }
@@ -223,18 +247,6 @@ impl<'s, 'a> ApplicableInputRule<'s, 'a> {
             },
         })
     }
-    fn first(&self) -> &BoundInputRule<'s, 'a> {
-        match &self.binding {
-            InputRuleBinding::Instance(rule) => rule,
-            InputRuleBinding::DeferredSubtree { first, .. } => first,
-        }
-    }
-    pub(crate) fn path(&self) -> &InputDiagnosticPath {
-        self.first().path()
-    }
-    pub(crate) fn code(&self) -> &InputRuleCode {
-        self.first().code()
-    }
     pub fn evaluate(&self) -> InputVerdict {
         let evaluation = self.evaluation();
         if let Some(finding) = evaluation.findings.into_iter().next() {
@@ -259,7 +271,7 @@ impl<'s, 'a> ApplicableInputRule<'s, 'a> {
                 }
                 InputVerdict::Undecided => {
                     if evaluation.pending.is_none() {
-                        evaluation.pending = Some((rule.path.clone(), rule.code().clone()));
+                        evaluation.pending = Some((rule.path().clone(), rule.code().clone()));
                     }
                 }
             }
@@ -273,14 +285,16 @@ struct BoundInputRule<'s, 'a> {
     rule: &'a InputRule<Compiled>,
     kind: InputFindingKind,
     owner_type: Option<&'a CompiledAttributeType>,
-    path: InputDiagnosticPath,
+    path: OnceLock<InputDiagnosticPath>,
+    owner: instances::OwnerPath,
     pending_instance: bool,
     instance: InstanceRef,
 }
 
 impl BoundInputRule<'_, '_> {
     pub(crate) fn path(&self) -> &InputDiagnosticPath {
-        &self.path
+        self.path
+            .get_or_init(|| instances::diagnostic_path(&self.owner, self.rule.path()))
     }
     pub(crate) fn code(&self) -> &InputRuleCode {
         self.rule.code()
@@ -289,7 +303,7 @@ impl BoundInputRule<'_, '_> {
         let verdict = verdict(self);
         match verdict {
             InputVerdict::Violation(mut violation) => {
-                violation.path = self.path.clone();
+                violation.path = self.path().clone();
                 InputVerdict::Violation(violation)
             }
             InputVerdict::Proven | InputVerdict::Undecided => verdict,
@@ -354,8 +368,10 @@ fn classify_write_site<'a, S>(
                 return Ok(None);
             };
             let schema = schema.schema();
+            let authored = AuthoredInputs::resource_for_test(resource);
+            let source = authored.resources().next().unwrap();
             let input =
-                RuleInput::for_authored(resource, schema, Arc::new(TypeFacts::default()), schemas)
+                RuleInput::for_authored(&source, schema, Arc::new(TypeFacts::default()), schemas)
                     .expect("fixture canonicalization");
             (
                 None,
@@ -782,8 +798,7 @@ impl<S> FinalizedPlan<S> {
                 context,
                 schema: Arc::clone(&schema),
             });
-            for applicable in view.applicable_rules() {
-                let evaluation = applicable.evaluation();
+            for evaluation in view.evaluated_rules() {
                 diagnostics.extend(
                     evaluation
                         .findings
@@ -1119,7 +1134,7 @@ fn target_verdict(applicable: &BoundInputRule<'_, '_>) -> InputVerdict {
             value
                 .expression()
                 .map_or(InputVerdict::Undecided, |expression| {
-                    estimator::estimate(applicable, expression)
+                    estimator::estimate(applicable, rule_input::EstimatorInput::Value(expression))
                 })
         }
     }
@@ -1127,39 +1142,34 @@ fn target_verdict(applicable: &BoundInputRule<'_, '_>) -> InputVerdict {
 
 fn map_keys_verdict(applicable: &BoundInputRule<'_, '_>, evidence: &NodeRef<'_>) -> InputVerdict {
     let rule = applicable.rule;
+    let cursor = evidence.keys();
     let mut pending = false;
-    if let Some(fields) = evidence.fields() {
-        let defs = applicable.site.schema.as_schema().defs();
-        let Some(ty) = literal_type(applicable, rule.path()) else {
+    let defs = applicable.site.schema.as_schema().defs();
+    let Some(ty) = literal_type(applicable, rule.path()) else {
+        return failed_verdict(rule);
+    };
+    let crate::schema::Shape::Map { key, .. } = ty.shape_with_defs(defs) else {
+        return failed_verdict(rule);
+    };
+    for (text, membership) in cursor.entries {
+        let Ok(text) = crate::value::canonicalize_authored_map_key_text(text, key, defs) else {
             return failed_verdict(rule);
         };
-        let crate::schema::Shape::Map { key, .. } = ty.shape_with_defs(defs) else {
-            return failed_verdict(rule);
-        };
-        for (text, value) in fields {
-            let Ok(text) = crate::value::canonicalize_authored_map_key_text(text, key, defs) else {
-                return failed_verdict(rule);
-            };
-            if let Err(violation) = evaluate_string(rule, &text) {
-                match value.membership() {
-                    Membership::Present => return InputVerdict::Violation(violation),
-                    Membership::Possible => pending = true,
-                }
+        if let Err(violation) = evaluate_string(rule, &text) {
+            match membership {
+                Membership::Present => return InputVerdict::Violation(violation),
+                Membership::Possible => pending = true,
             }
         }
-        if evidence.map_complete() && !evidence.map_tail() {
-            return if pending {
-                InputVerdict::Undecided
-            } else {
-                InputVerdict::Proven
-            };
-        }
     }
-    match evidence
-        .expression()
-        .map_or(InputVerdict::Undecided, |expression| {
-            estimator::estimate(applicable, expression)
-        }) {
+    let remainder = match cursor.remainder {
+        rule_input::KeyRemainder::Complete => InputVerdict::Proven,
+        rule_input::KeyRemainder::Withheld => InputVerdict::Undecided,
+        rule_input::KeyRemainder::Expression(expression) => {
+            estimator::estimate(applicable, rule_input::EstimatorInput::Keys(expression))
+        }
+    };
+    match remainder {
         InputVerdict::Proven if pending => InputVerdict::Undecided,
         verdict => verdict,
     }
@@ -1324,93 +1334,33 @@ impl IntoIterator for AuthoredInputReport {
 /// state and attribute-map callers cannot manufacture this source authority.
 /// The shared classifier marks CreateOnly previews as warnings and EveryWrite
 /// violations as errors. Unknown evidence remains a pending obligation.
-pub fn check_authored_inputs<E, P, T, D, B>(
-    parsed: &crate::parser::File<E, P, T, D, B>,
+/// A hand-built sparse file is not parser/admission evidence.
+///
+/// ```compile_fail,E0308
+/// use carina_core::{input_rules::check_authored_inputs, parser::ExpandedParsedFile, resource::{Resource, Value, ConcreteValue}, schema::SchemaRegistry};
+/// let mut patch_shaped = ExpandedParsedFile::default();
+/// patch_shaped.resources.push(Resource::with_provider("mock", "Review", "example", None)
+///     .with_attribute("target", Value::Concrete(ConcreteValue::String("changed".into()))));
+/// let _ = check_authored_inputs(&patch_shaped, &SchemaRegistry::new());
+/// ```
+pub fn check_authored_inputs(
+    parsed: &AuthoredInputs,
     schemas: &SchemaRegistry,
-) -> crate::provider::HostResult<AuthoredInputReport>
-where
-    P: crate::resource::PlaceholderKind,
-    T: crate::resource::PlaceholderKind,
-    B: crate::resource::BindingAddress,
-    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
-{
-    use crate::parser::ResourceRef;
-    let resources = parsed
-        .iter_all_resources()
-        .filter_map(|source| {
-            // Only managed authored resources enter this projection. Read models
-            // and data sources have no path into a desired write site.
-            let (id, attributes, declaration) = match source {
-                ResourceRef::Resource(resource) => (
-                    &resource.id,
-                    project_attributes(&resource.attributes),
-                    resource.declaration.clone(),
-                ),
-                ResourceRef::Deferred {
-                    resource,
-                    deferred: _,
-                } => (
-                    resource.id(),
-                    project_attributes(resource.attributes()),
-                    resource.as_resource().declaration.clone(),
-                ),
-                ResourceRef::DataSource(_) | ResourceRef::LiveComposition(_) => return None,
-            };
-            let mut resource = crate::resource::Resource::with_provider(
-                &id.provider,
-                &id.resource_type,
-                "_input_projection",
-                id.provider_instance.clone(),
-            );
-            resource.id = id.clone();
-            resource.attributes = attributes;
-            resource.declaration = declaration;
-            Some(resource)
-        })
-        .collect::<Vec<_>>();
-    let configs = parsed
-        .providers
-        .iter()
-        .map(|config| {
-            let crate::parser::ProviderConfig {
-                name,
-                attributes,
-                default_tags,
-                source,
-                version,
-                revision,
-                unresolved_attributes,
-                binding,
-            } = config;
-            crate::parser::ProviderConfig {
-                name: name.clone(),
-                attributes: project_attributes(attributes),
-                default_tags: project_attributes(default_tags),
-                source: source.clone(),
-                version: version.clone(),
-                revision: revision.clone(),
-                unresolved_attributes: project_attributes(unresolved_attributes),
-                binding: binding.clone(),
-            }
-        })
-        .collect::<Vec<_>>();
+) -> crate::provider::HostResult<AuthoredInputReport> {
     let types = InputTypeContext::<ModuleSource>::empty().with_default_tag_projection(
-        &configs,
+        parsed.configs(),
         schemas,
-        resources.iter().map(|resource| &resource.id),
+        parsed.resources().map(|resource| &resource.resource().id),
     )?;
     let mut report = AuthoredInputReport::default();
     let declarations = Arc::new(types.facts);
-    for resource in &resources {
+    for source in parsed.resources() {
+        let resource = source.resource();
         let Some(schema) = schemas.get_for(resource) else {
             continue;
         };
-        let input = RuleInput::for_authored(
-            resource,
-            schema.schema(),
-            Arc::clone(&declarations),
-            schemas,
-        )?;
+        let input =
+            RuleInput::for_authored(&source, schema.schema(), Arc::clone(&declarations), schemas)?;
         if let Some(site) = classify_write_site::<ModuleSource>(
             WriteSiteSource::Preview {
                 resource_id: resource.id.clone(),
@@ -1420,8 +1370,7 @@ where
         )
         .map_err(|error| crate::provider::HostError::invalid_input(error.to_string()))?
         {
-            for rule in site.applicable_rules() {
-                let evaluation = rule.evaluation();
+            for evaluation in site.evaluated_rules() {
                 report.findings.extend(evaluation.findings);
                 if let Some((path, code)) = evaluation.pending {
                     report.pending.push(AuthoredPendingInput {
@@ -1647,7 +1596,9 @@ fn authored_fixture_with_types<'a, S, P: crate::resource::PlaceholderKind>(
     types: &InputTypeContext<S>,
 ) -> WriteSite<'a> {
     let schema = schemas.get_for(resource).expect("fixture schema").schema();
-    let input = RuleInput::for_authored(resource, schema, Arc::new(types.facts.clone()), schemas)
+    let authored = AuthoredInputs::resource_for_test(resource);
+    let source = authored.resources().next().unwrap();
+    let input = RuleInput::for_authored(&source, schema, Arc::new(types.facts.clone()), schemas)
         .expect("fixture authored input");
     classify_write_site::<ModuleSource>(
         WriteSiteSource::Preview {

@@ -76,20 +76,11 @@ mod version_checked_bindings {
     use basic::CarinaProvider;
     use http::CarinaProviderWithHttp;
 
-    // The WIT generation and the JSON schema protocol evolve independently.
-    // Protocol 26 changes schema JSON while retaining the protocol-25 WIT world.
-    struct WitContract {
-        package_version: semver::Version,
-        introduced_in_protocol: u32,
-    }
-    const WIT_CONTRACT: WitContract = WitContract {
-        package_version: semver::Version::new(0, 2, 0),
-        introduced_in_protocol: 25,
-    };
+    const WIT_PACKAGE_VERSION: semver::Version = semver::Version::new(0, 2, 0);
     fn provider_interface_export() -> String {
         [
             "carina:provider/provider@",
-            WIT_CONTRACT.package_version.to_string().as_str(),
+            WIT_PACKAGE_VERSION.to_string().as_str(),
         ]
         .concat()
     }
@@ -146,7 +137,7 @@ mod version_checked_bindings {
             let component_type = component.component_type();
             // Reject the package before linking: legacy imports cannot be resolved,
             // and even an otherwise linkable component must execute no guest code.
-            let required_wit = WIT_CONTRACT.package_version.to_string();
+            let required_wit = WIT_PACKAGE_VERSION.to_string();
             let legacy_version = component_type
                 .imports(linker.engine())
                 .chain(component_type.exports(linker.engine()))
@@ -201,13 +192,12 @@ mod version_checked_bindings {
 
     fn legacy_wit_error(found: &str) -> WasmBindingCreationError {
         let remedy = match semver::Version::parse(found) {
-            Ok(version) if version > WIT_CONTRACT.package_version => "upgrade Carina",
+            Ok(version) if version > WIT_PACKAGE_VERSION => "upgrade Carina",
             Ok(_version) => "rebuild the provider against the current carina protocol",
             Err(_error) => "rebuild the provider against the current carina protocol",
         };
-        let required_wit = WIT_CONTRACT.package_version.to_string();
-        let required_protocol = WIT_CONTRACT.introduced_in_protocol.to_string();
-        let schema_protocol = carina_provider_protocol::PROTOCOL_VERSION.to_string();
+        let required_wit = WIT_PACKAGE_VERSION.to_string();
+        let required_protocol = carina_provider_protocol::PROTOCOL_VERSION.to_string();
         WasmBindingCreationError::ProtocolVersion(DiagnosticText::new(
             [
                 "Incompatible provider WIT package carina:provider@",
@@ -216,8 +206,6 @@ mod version_checked_bindings {
                 required_wit.as_str(),
                 " (protocol ",
                 required_protocol.as_str(),
-                " WIT contract; host schema protocol ",
-                schema_protocol.as_str(),
                 "); ",
                 remedy,
             ]

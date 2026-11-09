@@ -1274,19 +1274,22 @@ impl DiagnosticRun<'_> {
             });
             let semantic_tree = semantic_file
                 .and_then(|file| carina_core::parser::AnalysisTree::try_from_file(file).ok());
-            let input_resolution = carina_core::parser::resolve_resource_refs_from_analysis(
-                preferred_tree,
-                self.provider_context,
-            );
-            let input_findings = match input_resolution {
-                Ok(resolved) => {
-                    carina_core::input_rules::check_authored_inputs(&resolved, &self.schemas)
-                }
-                Err(_) => carina_core::input_rules::check_authored_inputs(
-                    pre_expansion_input,
-                    &self.schemas,
+            let authored_inputs = match directory.as_ref() {
+                Some(directory) => Some(
+                    carina_core::input_rules::AuthoredInputs::for_directory_in_session(
+                        &directory.parsed,
+                        self.provider_context,
+                    ),
                 ),
+                None => doc
+                    .parsed()
+                    .and_then(|parsed| parsed.authored_inputs())
+                    .map(|inputs| inputs.resolved_in_session(self.provider_context)),
             };
+            let input_findings = authored_inputs.map_or_else(
+                || Ok(carina_core::input_rules::AuthoredInputReport::default()),
+                |inputs| carina_core::input_rules::check_authored_inputs(&inputs, &self.schemas),
+            );
             match input_findings {
                 Ok(findings) => {
                     for finding in findings {

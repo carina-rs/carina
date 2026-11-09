@@ -301,7 +301,7 @@ fn unknown_reused_definitions_produce_one_deferred_subtree_obligation() {
 }
 
 #[test]
-fn recursive_rule_paths_have_quadratic_total_segment_work() {
+fn satisfied_recursive_rule_paths_have_linear_total_segment_work() {
     fn work(depth: usize, update: bool) -> usize {
         let schemas = registry(
             ResourceSchema::new("Review")
@@ -376,8 +376,8 @@ fn recursive_rule_paths_have_quadratic_total_segment_work() {
         let small = work(16, update);
         let large = work(32, update);
         assert!(
-            large <= small * 5,
-            "update={update}: doubling depth cost {small} -> {large} path segments; expected at most quadratic work"
+            large <= small * 3 && large <= 32 * 8,
+            "update={update}: doubling depth cost {small} -> {large} path segments; expected linear work for satisfied rules"
         );
     }
 }
@@ -596,7 +596,7 @@ fn nested_guard_retains_coalesce_failure() {
         file.resources[0]
             .attributes
             .insert("settings".into(), failed_coalesce());
-        let report = check_authored_inputs(&file, &schemas).unwrap();
+        let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas).unwrap();
         assert_eq!(report.len(), 1);
         assert!(report.pending().is_empty());
         assert_eq!(
@@ -907,7 +907,7 @@ fn authored_arithmetic_and_access_guards_preserve_failed_knowledge() {
         )
         .unwrap();
         file.resources[0].attributes.insert("guard".into(), value);
-        let report = check_authored_inputs(&file, &schemas).unwrap();
+        let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas).unwrap();
         assert!(report.pending().is_empty());
         assert!(!format!("{report:?}").contains("private attempted failure"));
         findings.push(
@@ -1235,7 +1235,7 @@ fn conditional_suffix_estimation_is_shared_by_every_object_instance() {
             .collect();
         let mut file = crate::parser::ExpandedInferredFile::default();
         file.resources.push(resource.clone()); // allow: direct — input-rule preview fixture
-        let report = check_authored_inputs(&file, &schemas).unwrap();
+        let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas).unwrap();
         assert_eq!(report.len(), 5);
         assert!(report.pending().is_empty());
         assert!(
@@ -1666,7 +1666,7 @@ fn possible_default_tags_keep_authored_absence_conditions_pending() {
             vec![],
         ),
     );
-    let report = check_authored_inputs(&file, &schemas).unwrap();
+    let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas).unwrap();
     assert!(
         report.is_empty(),
         "possible tags cannot prove the absence guard: {:?}",
@@ -1994,7 +1994,7 @@ fn deferred_subtree_preserves_each_scope_specific_finding() {
                 );
             }
         }
-        let report = check_authored_inputs(&file, &schemas).unwrap();
+        let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas).unwrap();
         if failed {
             assert_eq!(
                 report.len(),
