@@ -1,0 +1,4 @@
+let scheduler_role = aws.iam.Role {}
+let first = awscc.scheduler.Schedule {
+  target = { role_arn = scheduler_role.arn }
+}

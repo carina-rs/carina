@@ -1,0 +1,1 @@
+exports { fixture = "publish_second" }

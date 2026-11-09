@@ -10363,7 +10363,14 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
                 Value::Concrete(ConcreteValue::String("literal".into())),
             );
 
-            let empty_registry = carina_core::schema::SchemaRegistry::new();
+            let mut schemas = carina_core::schema::SchemaRegistry::new();
+            schemas.insert(
+                "test",
+                carina_core::schema::PatternResourceSchema::new("Lookup")
+                    .as_data_source()
+                    .validate()
+                    .unwrap(),
+            );
             let resolved = carina_core::validation::deferred_types::with_session_for_test(
                 &carina_core::parser::LoadedProviderContext::empty_for_test(),
                 |session| {
@@ -10374,7 +10381,7 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
                             compositions: &[],
                             managed_current: ManagedCurrentView::base(&HashMap::new()),
                             remote_bindings: &HashMap::new(),
-                            schemas: &empty_registry,
+                            schemas: &schemas,
                             wait_aliases: &[],
                             session,
                         },
@@ -10400,7 +10407,7 @@ async fn literal_input_data_source_refresh_reads_provider_once() {
                             &bindings,
                             &module_gate,
                             &[],
-                            &empty_registry,
+                            &schemas,
                             session,
                         )
                         .await

@@ -2340,6 +2340,15 @@ mod judgement {
                 reason: error.to_string(),
             })?;
         let ty = resolved_actual.as_ref();
+        if context == AdmissionContext::Resource
+            && matches!(kind, Some(InferredKind::Reference(_)))
+            && expression.check_owner() == ExpressionCheckOwner::BindingIndex
+        {
+            // Retain reference evidence for resource attribute admission. This
+            // expression pass has neither the destination descriptor nor the
+            // binding authority to decide that assignment a second time.
+            return Ok(ValueCheck);
+        }
         if context == AdmissionContext::Function
             && (matches!(ty, Some(TypeExpr::Ref(_)))
                 || (matches!(kind, Some(InferredKind::Reference(_)))

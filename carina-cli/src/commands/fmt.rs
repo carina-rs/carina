@@ -8,7 +8,7 @@ use crate::output_style::Colorize;
 use similar::{ChangeTag, TextDiff};
 
 use carina_core::config_loader::{
-    find_crn_files_in_dir, find_crn_files_recursive, load_configuration_with_config,
+    find_crn_files_in_dir, find_crn_files_recursive, load_configuration_for_metadata,
 };
 use carina_core::formatter::{self, FormatConfig};
 use carina_core::parser::{ProviderConfig as GenericProviderConfig, UseStatement};
@@ -117,7 +117,7 @@ fn load_formatting_directory_config(
     directory: &ResolvedPath,
     environment: &carina_core::EnvironmentSnapshot,
 ) -> FormattingDirectoryConfig {
-    let Some(loaded) = load_configuration_with_config(
+    let Some(loaded) = load_configuration_for_metadata(
         directory,
         &carina_core::parser::ProviderContext::new(environment.clone()),
         &carina_core::schema::SchemaRegistry::new(),
@@ -148,6 +148,41 @@ fn formatting_discovery_uses_environment_snapshot() {
     );
     assert_eq!(config.providers.len(), 1);
     assert_eq!(config.providers[0].name, "mock");
+}
+
+#[cfg(test)]
+#[test]
+fn formatting_discovery_retains_directory_config_with_unavailable_lets() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::write(
+        directory.path().join("main.crn"),
+        "let item = mock.test.resource { name = 'item' }\n",
+    )
+    .unwrap();
+    fs::write(directory.path().join("providers.crn"),
+        "provider mock { version = '1.2.3' }\nlet named = provider mock {}\nlet token = secret(env('UNSET_X'))\nlet unused = env('UNSET_Y')\n").unwrap();
+    fs::write(
+        directory.path().join("backend.crn"),
+        "backend local { path = 'state.json' }\n",
+    )
+    .unwrap();
+    let config = load_formatting_directory_config(
+        &ResolvedPath::new(directory.path()).unwrap(),
+        &carina_core::EnvironmentSnapshot::empty(),
+    );
+    assert_eq!(
+        config.providers.len(),
+        2,
+        "directory config must not fall back to defaults"
+    );
+    assert_eq!(
+        config.providers[0]
+            .version
+            .as_ref()
+            .map(ToString::to_string),
+        Some("1.2.3".to_string())
+    );
+    assert_eq!(config.providers[1].binding.as_deref(), Some("named"));
 }
 
 fn block_names_from_config<F>(

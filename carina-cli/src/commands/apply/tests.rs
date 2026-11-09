@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[path = "tests/attribute_admission.rs"]
+mod attribute_admission;
 #[path = "tests/cancellation_fixture.rs"]
 mod cancellation_fixture;
 
@@ -12650,4 +12652,32 @@ async fn bootstrap_unresolved_reference_returns_typed_preparation_error() {
         carina_core::executor::ProviderPreparationError::Serialization(_)
     ));
     assert_eq!(provider.create_calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn saved_plan_walk_failure_retains_its_source_instead_of_reporting_unavailable() {
+    let error = saved_plan_secret_rehydration_error(
+        carina_core::value::SecretRehydrationSiteError::new(
+            "mock.test.resource.example.token",
+            carina_core::value::SecretRehydrationError::ValueWalk(
+                carina_core::value_walk::WalkError::Rejected,
+            ),
+        ),
+        ApplyTarget::SavedPlan {
+            plan_file: Path::new("plan.json"),
+            source_dir: Path::new("."),
+        },
+    );
+    assert!(matches!(
+        &error,
+        AppError::ValueWalk {
+            error: carina_core::value_walk::WalkError::Rejected,
+            ..
+        }
+    ));
+    assert!(
+        std::error::Error::source(&error)
+            .is_some_and(|source| source.is::<carina_core::value_walk::WalkError>())
+    );
+    assert!(!error.to_string().contains("could not be evaluated"));
 }

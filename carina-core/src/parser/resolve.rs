@@ -7,11 +7,16 @@ use super::ast::{ExportParamLike, File, ParsedFile, ProviderConfig};
 use super::entry::BindingSeed;
 use super::error::{ParseError, undefined_identifier_error};
 use super::{ParsedDataSource as DataSource, ParsedResource as Resource, ParsedValue as Value};
+#[cfg(test)]
+use crate::config_loader::analysis_resolution_context;
+use crate::config_loader::{
+    ResolutionContext, diagnostics_resolution_context, strict_resolution_context,
+};
 use crate::resource::{
     AbsoluteBindingAddress, AccessMissPolicy, BindingAddress, ConcreteValue,
     ConcreteValue as GenericConcreteValue, DeferredValue, DiagnosticSourceLine, InterpolationPart,
-    LoopSlot, NoPlaceholder, ParserPlaceholder, RelativeBindingName, UnavailableCoalescePolicy,
-    UnavailableReason, UnavailableSecretPolicy, Value as GenericValue, find_unavailable_evaluation,
+    LoopSlot, NoPlaceholder, ParserPlaceholder, RelativeBindingName, UnavailableReason,
+    Value as GenericValue,
 };
 use crate::resource::{DiagnosticPath, DiagnosticScope, ReferencePath};
 use indexmap::IndexMap;
@@ -34,7 +39,7 @@ pub enum AnalysisResolutionError {
 }
 
 impl AnalysisResolutionError {
-    fn from_parse_failure(error: ParseError) -> Self {
+    pub(crate) fn from_parse_failure(error: ParseError) -> Self {
         match error {
             ParseError::AtElement(finding) => Self::Diagnostic(finding),
             error => Self::Invariant(super::AnalysisTreeError::new(
@@ -689,7 +694,7 @@ pub fn resolve_resource_refs_with_config<E: ExportParamLike>(
     parsed: &mut File<E>,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
-    resolve_resource_refs_with_policy(parsed, config, None, false, false)
+    resolve_resource_refs_in_context(parsed, config, None, strict_resolution_context())
 }
 
 /// Resolve pending checks with the same session used for declaration checks.
@@ -698,8 +703,13 @@ pub fn resolve_resource_refs_in_session<E: ExportParamLike>(
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<(), AnalysisResolutionError> {
     super::AnalysisTree::try_from_file(parsed)?;
-    resolve_resource_refs_with_policy(parsed, session.catalog(), Some(session), false, false)
-        .map_err(AnalysisResolutionError::from_parse_failure)
+    resolve_resource_refs_in_context(
+        parsed,
+        session.catalog(),
+        Some(session),
+        strict_resolution_context(),
+    )
+    .map_err(AnalysisResolutionError::from_parse_failure)
 }
 
 /// Resolve a copy of the already sealed input. The original remains a valid
@@ -724,8 +734,13 @@ pub fn resolve_resource_refs_from_analysis<E: ExportParamLike + Clone>(
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
 ) -> Result<File<E>, AnalysisResolutionError> {
     let mut parsed = tree.file().clone();
-    resolve_resource_refs_with_policy(&mut parsed, session.catalog(), Some(session), false, false)
-        .map_err(AnalysisResolutionError::from_parse_failure)?;
+    resolve_resource_refs_in_context(
+        &mut parsed,
+        session.catalog(),
+        Some(session),
+        strict_resolution_context(),
+    )
+    .map_err(AnalysisResolutionError::from_parse_failure)?;
     Ok(parsed)
 }
 
@@ -733,17 +748,19 @@ pub fn resolve_resource_refs_from_analysis<E: ExportParamLike + Clone>(
 pub(crate) fn resolve_resource_refs_in_session_unsealed<E: ExportParamLike>(
     parsed: &mut File<E>,
     session: &dyn crate::validation::deferred_types::ProviderTypeCheckContext,
+    resolution: ResolutionContext,
 ) -> Result<(), ParseError> {
-    resolve_resource_refs_with_policy(parsed, session.catalog(), Some(session), false, false)
+    resolve_resource_refs_in_context(parsed, session.catalog(), Some(session), resolution)
 }
 
 /// Evaluate deferred function calls in the raw resource snapshot retained for
 /// identity and dependency provenance, while leaving ordinary references in
 /// expression form. Sibling functions require the directory-merged function
 /// table, so this runs after file merge rather than during each file's parse.
-pub(crate) fn resolve_snapshot_function_calls_with_config(
+pub(crate) fn resolve_snapshot_function_calls_in_context(
     parsed: &mut ParsedFile,
     config: &ProviderContext,
+    resolution: ResolutionContext,
 ) -> Result<(), ParseError> {
     let mut binding_map: HashMap<String, HashMap<String, Value>> = HashMap::new();
     for resource in parsed.iter_top_level_resources() {
@@ -771,7 +788,7 @@ pub(crate) fn resolve_snapshot_function_calls_with_config(
     for resource in iter_pre_apply_resources_mut(parsed) {
         for value in resource.attributes_mut().values_mut() {
             *value =
-                resolve_function_calls_only(value, &binding_map, fn_ctx.config, None, true, false)?;
+                resolve_function_calls_only(value, &binding_map, fn_ctx.config, None, resolution)?;
         }
     }
     Ok(())
@@ -781,11 +798,17 @@ pub(crate) fn resolve_snapshot_function_calls_with_config(
 /// Unknown function names are preserved for the directory-wide pass, where
 /// the complete function table can distinguish a sibling function from a
 /// genuinely unknown call.
+#[cfg(test)]
 pub(crate) fn resolve_resource_refs_defer_unknown_functions(
     parsed: &mut ParsedFile,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
-    resolve_resource_refs_with_policy(parsed, config, None, true, false)
+    resolve_resource_refs_in_context(
+        parsed,
+        config,
+        None,
+        crate::config_loader::analysis_resolution_context(),
+    )
 }
 
 /// Resolve the directory-wide semantic view used by diagnostics.
@@ -799,16 +822,46 @@ pub(crate) fn resolve_resource_refs_for_diagnostics(
     parsed: &mut ParsedFile,
     config: &ProviderContext,
 ) -> Result<(), ParseError> {
-    resolve_resource_refs_with_policy(parsed, config, None, false, true)
+    resolve_resource_refs_in_context(parsed, config, None, diagnostics_resolution_context())
 }
 
-fn resolve_resource_refs_with_policy<E: ExportParamLike>(
+pub(crate) fn resolve_resource_refs_in_context<E: ExportParamLike>(
     parsed: &mut File<E>,
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-    defer_unknown_functions: bool,
-    preserve_failed_user_calls: bool,
+    resolution: ResolutionContext,
 ) -> Result<(), ParseError> {
+    resolve_resource_refs_with_backend_failure(parsed, config, session, resolution)
+        .map_err(RootInputFailure::into_parse_error)
+}
+
+#[derive(Debug)]
+pub(crate) enum RootInputFailure {
+    Backend(ParseError),
+    Value(ParseError),
+}
+impl RootInputFailure {
+    pub(crate) fn is_backend(&self) -> bool {
+        matches!(self, Self::Backend(_))
+    }
+    pub(crate) fn into_parse_error(self) -> ParseError {
+        match self {
+            Self::Backend(error) | Self::Value(error) => error,
+        }
+    }
+}
+impl From<ParseError> for RootInputFailure {
+    fn from(error: ParseError) -> Self {
+        Self::Value(error)
+    }
+}
+
+pub(crate) fn resolve_resource_refs_with_backend_failure<E: ExportParamLike>(
+    parsed: &mut File<E>,
+    config: &ProviderContext,
+    session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
+    resolution: ResolutionContext,
+) -> Result<(), RootInputFailure> {
     let syntax = parsed.parser_binding_metadata.syntax().clone();
     let locate_named = |kind, name: &str, error: ParseError| match syntax
         .declarations()
@@ -933,8 +986,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 &binding_map,
                 fn_ctx.config,
                 session,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
+                crate::config_loader::backend_resolution_context(resolution),
             )
             .map_err(|error| {
                 match syntax
@@ -946,8 +998,9 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                     Some(record) => error.at(record.location()),
                     None => error,
                 }
-            })?;
-            if crate::value::contains_secret(&evaluated) {
+            })
+            .map_err(RootInputFailure::Backend)?;
+            if resolution.backend_is_demanded() && crate::value::contains_secret(&evaluated) {
                 let span = backend.attribute_spans.get(key).copied().ok_or_else(|| {
                     ParseError::InternalError {
                         expected: format!("source span for backend attribute '{key}'"),
@@ -961,7 +1014,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                     start_column: span.start_column(),
                     end_column: span.end_column(),
                 };
-                return Err(
+                return Err(RootInputFailure::Backend(
                     match syntax
                         .backend_keys()
                         .iter()
@@ -971,7 +1024,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                         Some(record) => error.at(record.location()),
                         None => error,
                     },
-                );
+                ));
             }
             *value = evaluated;
         }
@@ -988,21 +1041,15 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
         let mut resolved_attrs: IndexMap<String, Value> = IndexMap::new();
 
         for (key, expr) in resource.attributes().iter() {
-            let resolved = resolve_value_with_config(
-                expr,
-                &binding_map,
-                fn_ctx.config,
-                session,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
-            )
-            .map_err(|error| match resource.declaration().location() {
-                Some(location) => error.at(location),
-                None => match &source_file {
-                    Some(path) => error.in_file(path.clone()),
-                    None => error,
-                },
-            })?;
+            let resolved =
+                resolve_value_with_config(expr, &binding_map, fn_ctx.config, session, resolution)
+                    .map_err(|error| match resource.declaration().location() {
+                    Some(location) => error.at(location),
+                    None => match &source_file {
+                        Some(path) => error.in_file(path.clone()),
+                        None => error,
+                    },
+                })?;
             resolved_attrs.insert(key.clone(), resolved);
         }
 
@@ -1012,8 +1059,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
             &binding_map,
             fn_ctx.config,
             session,
-            defer_unknown_functions,
-            preserve_failed_user_calls,
+            resolution,
         )?;
     }
 
@@ -1042,16 +1088,14 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 &binding_map,
                 fn_ctx.config,
                 session,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
+                resolution,
             )?,
             crate::parser::DeferredForBody::Read(source) => resolve_directive_function_calls(
                 &mut source.directives,
                 &binding_map,
                 fn_ctx.config,
                 session,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
+                resolution,
             )?,
             crate::parser::DeferredForBody::ModuleCall(_) => {}
         }
@@ -1064,8 +1108,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 &binding_map,
                 fn_ctx.config,
                 session,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
+                resolution,
             )
             .map_err(|error| match &location {
                 Some(location) => error.at(location),
@@ -1083,8 +1126,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                         &binding_map,
                         fn_ctx.config,
                         session,
-                        defer_unknown_functions,
-                        preserve_failed_user_calls,
+                        resolution,
                     )?
                 }
                 crate::parser::DeferredIfBody::DataSource(source) => {
@@ -1093,8 +1135,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                         &binding_map,
                         fn_ctx.config,
                         session,
-                        defer_unknown_functions,
-                        preserve_failed_user_calls,
+                        resolution,
                     )?
                 }
                 crate::parser::DeferredIfBody::ModuleCall(_) => {}
@@ -1113,17 +1154,11 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
     let var_keys: Vec<String> = parsed.variables.keys().cloned().collect();
     for key in var_keys {
         let expr = parsed.variables[&key].clone();
-        let resolved = resolve_function_calls_only(
-            &expr,
-            &binding_map,
-            fn_ctx.config,
-            session,
-            defer_unknown_functions,
-            preserve_failed_user_calls,
-        )
-        .map_err(|error| {
-            locate_named(crate::config_loader::DeclarationKind::Binding, &key, error)
-        })?;
+        let resolved =
+            resolve_function_calls_only(&expr, &binding_map, fn_ctx.config, session, resolution)
+                .map_err(|error| {
+                    locate_named(crate::config_loader::DeclarationKind::Binding, &key, error)
+                })?;
         parsed.variables[&key] = resolved;
     }
 
@@ -1136,15 +1171,8 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
         let location = call.id().declaration_location().clone();
         for argument in call.arguments_mut() {
             argument.try_rewrite(|value| {
-                resolve_function_calls_only(
-                    value,
-                    &binding_map,
-                    fn_ctx.config,
-                    session,
-                    defer_unknown_functions,
-                    preserve_failed_user_calls,
-                )
-                .map_err(|error| error.at(&location))
+                resolve_function_calls_only(value, &binding_map, fn_ctx.config, session, resolution)
+                    .map_err(|error| error.at(&location))
             })?;
         }
     }
@@ -1155,8 +1183,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 &binding_map,
                 fn_ctx.config,
                 session,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
+                resolution,
             )
             .map_err(|error| {
                 locate_named(
@@ -1180,8 +1207,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 &binding_map,
                 fn_ctx.config,
                 session,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
+                resolution,
             )
             .map_err(|error| {
                 locate_named(
@@ -1203,8 +1229,7 @@ fn resolve_resource_refs_with_policy<E: ExportParamLike>(
                 &binding_map,
                 fn_ctx.config,
                 session,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
+                resolution,
             )
             .map_err(|error| {
                 locate_named(
@@ -1659,8 +1684,7 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
     binding_map: &HashMap<String, HashMap<String, GenericValue<ParserPlaceholder, B>>>,
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-    defer_unknown_functions: bool,
-    preserve_failed_user_calls: bool,
+    resolution: ResolutionContext,
 ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
     resolve_value_with_binding_lookup(
         value,
@@ -1672,8 +1696,7 @@ fn resolve_value_with_config<B: ProviderAttributeBindingPhase>(
         },
         config,
         session,
-        defer_unknown_functions,
-        preserve_failed_user_calls,
+        resolution,
         DiagnosticScope::Public,
     )
 }
@@ -1683,20 +1706,20 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
     binding_lookup: &impl Fn(&B, &str) -> Option<GenericValue<ParserPlaceholder, B>>,
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-    defer_unknown_functions: bool,
-    preserve_failed_user_calls: bool,
+    resolution: ResolutionContext,
     scope: DiagnosticScope,
 ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
     match value {
         GenericValue::Deferred(DeferredValue::ModuleIf(deferred)) => {
+            // HEAD validates known failures in both retained module-if branches.
+            // Argument substitution still owns branch selection at runtime.
             let deferred = deferred.try_map(|value| {
                 resolve_value_with_binding_lookup(
                     value,
                     binding_lookup,
                     config,
                     session,
-                    defer_unknown_functions,
-                    preserve_failed_user_calls,
+                    resolution,
                     scope,
                 )
             })?;
@@ -1713,8 +1736,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 binding_lookup,
                 config,
                 session,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
+                resolution,
                 scope,
             )?;
             if let Ok(crate::resource::knowledge::Classification::Known(known)) =
@@ -1733,8 +1755,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                     binding_lookup,
                     config,
                     session,
-                    true,
-                    true,
+                    resolution.retained(),
                     scope,
                 )?;
                 Ok(GenericValue::Deferred(DeferredValue::Coalesce {
@@ -1749,8 +1770,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 binding_lookup,
                 config,
                 session,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
+                resolution,
                 scope,
             )?;
             let rhs = resolve_value_with_binding_lookup(
@@ -1758,8 +1778,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 binding_lookup,
                 config,
                 session,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
+                resolution,
                 scope,
             )?;
             let span = expression.operator_span();
@@ -1784,8 +1803,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                     binding_lookup,
                     config,
                     session,
-                    defer_unknown_functions,
-                    preserve_failed_user_calls,
+                    resolution,
                     scope,
                 ),
                 // A missing binding or attribute may become available later.
@@ -1802,8 +1820,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                         binding_lookup,
                         config,
                         session,
-                        defer_unknown_functions,
-                        preserve_failed_user_calls,
+                        resolution,
                         scope,
                     )
                 })
@@ -1820,8 +1837,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                         binding_lookup,
                         config,
                         session,
-                        defer_unknown_functions,
-                        preserve_failed_user_calls,
+                        resolution,
                         scope,
                     )?,
                 );
@@ -1838,8 +1854,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                             binding_lookup,
                             config,
                             session,
-                            defer_unknown_functions,
-                            preserve_failed_user_calls,
+                            resolution,
                             scope,
                         )?))
                     }
@@ -1847,7 +1862,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 })
                 .collect();
             let resolved = resolved?;
-            reject_required_interpolation_unavailable(&resolved, defer_unknown_functions)?;
+            reject_required_interpolation_unavailable(&resolved, resolution)?;
             Ok(GenericValue::Deferred(DeferredValue::Interpolation(resolved)).canonicalize())
         }
         GenericValue::Deferred(DeferredValue::Unavailable {
@@ -1856,9 +1871,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
             source_line,
             ..
         }) => {
-            // External inputs can remain unavailable below a secret until
-            // planning/apply. Deterministic builtin failures still fail validation.
-            if defer_unknown_functions || is_protected_external_input(*name, scope) {
+            if !resolution.requires_available() {
                 Ok(value.clone())
             } else {
                 Err(unavailable_builtin_error(*name, reason, *source_line))
@@ -1880,8 +1893,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                             binding_lookup,
                             config,
                             session,
-                            defer_unknown_functions,
-                            preserve_failed_user_calls,
+                            resolution,
                             scope,
                         )
                     })
@@ -1895,7 +1907,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 session,
                 evaluation_line,
             );
-            if preserve_failed_user_calls && evaluated.is_err() {
+            if resolution.retains_failed_calls() && evaluated.is_err() {
                 return Ok(value.clone());
             }
             evaluated
@@ -1915,8 +1927,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                             binding_lookup,
                             config,
                             session,
-                            defer_unknown_functions,
-                            preserve_failed_user_calls,
+                            resolution,
                             scope,
                         )
                     })
@@ -1955,7 +1966,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                         } else {
                             UnavailableReason::from_builtin_error(e.to_string())
                         };
-                        if defer_unknown_functions || is_protected_external_input(*name, scope) {
+                        if !resolution.requires_available() {
                             Ok(GenericValue::Deferred(DeferredValue::Unavailable {
                                 name: *name,
                                 args: resolved_args,
@@ -1982,8 +1993,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                 binding_lookup,
                 config,
                 session,
-                defer_unknown_functions,
-                preserve_failed_user_calls,
+                resolution,
                 scope,
             )?;
             access
@@ -2000,8 +2010,7 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
                     binding_lookup,
                     config,
                     session,
-                    defer_unknown_functions,
-                    preserve_failed_user_calls,
+                    resolution,
                     DiagnosticScope::Secret,
                 )
             })
@@ -2024,20 +2033,8 @@ fn resolve_value_with_binding_lookup<B: ProviderAttributeBindingPhase>(
     }
 }
 
-// Failure-retention policy, shared by an already-attempted input and the
-// first evaluation of its call. Validation retains protected external inputs;
-// plan/apply value admission still rejects their typed failure evidence.
-fn is_protected_external_input(
-    name: crate::builtins::BuiltinFunction,
-    scope: DiagnosticScope,
-) -> bool {
-    scope.is_secret()
-        && matches!(
-            name,
-            crate::builtins::BuiltinFunction::env | crate::builtins::BuiltinFunction::decrypt
-        )
-}
-
+// Demanded roots reject attempted builtin failures; retained roots preserve
+// their evidence. Protection controls masking independently of demand.
 fn unavailable_builtin_error(
     name: crate::builtins::BuiltinFunction,
     reason: &UnavailableReason,
@@ -2052,23 +2049,17 @@ fn unavailable_builtin_error(
 
 fn reject_required_interpolation_unavailable<B: BindingAddress>(
     parts: &[InterpolationPart<ParserPlaceholder, B>],
-    defer_unknown_functions: bool,
+    resolution: ResolutionContext,
 ) -> Result<(), ParseError> {
-    if defer_unknown_functions {
+    if !resolution.requires_available() {
         return Ok(());
     }
-    if let Some((function, reason, source_line)) = parts.iter().find_map(|part| {
-        if let InterpolationPart::Expr(value) = part {
-            find_unavailable_evaluation(
-                value,
-                UnavailableCoalescePolicy::ExcludeDefault,
-                UnavailableSecretPolicy::Exclude,
-            )
-        } else {
-            None
+    for part in parts {
+        if let InterpolationPart::Expr(value) = part
+            && let Some(error) = crate::value_walk::find_required_unavailable(value, resolution)?
+        {
+            return Err(error);
         }
-    }) {
-        return Err(unavailable_builtin_error(function, reason, source_line));
     }
     Ok(())
 }
@@ -2078,8 +2069,7 @@ fn resolve_directive_function_calls(
     binding_map: &HashMap<String, HashMap<String, Value>>,
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-    defer_unknown_functions: bool,
-    preserve_failed_user_calls: bool,
+    resolution: ResolutionContext,
 ) -> Result<(), ParseError> {
     directives.try_update_expressions(|_, expression| {
         expression.value = resolve_function_calls_only(
@@ -2087,8 +2077,7 @@ fn resolve_directive_function_calls(
             binding_map,
             config,
             session,
-            defer_unknown_functions,
-            preserve_failed_user_calls,
+            resolution,
         )
         .map_err(|error| match expression.source().declaration_location() {
             Some(location) => error.at(location),
@@ -2110,8 +2099,7 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
     binding_map: &HashMap<String, HashMap<String, GenericValue<ParserPlaceholder, B>>>,
     config: &ProviderContext,
     session: Option<&dyn crate::validation::deferred_types::ProviderTypeCheckContext>,
-    defer_unknown_functions: bool,
-    preserve_failed_user_calls: bool,
+    resolution: ResolutionContext,
 ) -> Result<GenericValue<ParserPlaceholder, B>, ParseError> {
     match value {
         GenericValue::Deferred(
@@ -2123,27 +2111,11 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
             | DeferredValue::Coalesce { .. }
             | DeferredValue::IntegerArithmetic(_)
             | DeferredValue::Secret(_),
-        ) => resolve_value_with_config(
-            value,
-            binding_map,
-            config,
-            session,
-            defer_unknown_functions,
-            preserve_failed_user_calls,
-        ),
+        ) => resolve_value_with_config(value, binding_map, config, session, resolution),
         GenericValue::Concrete(ConcreteValue::List(items)) => {
             let resolved: Result<Vec<_>, ParseError> = items
                 .iter()
-                .map(|v| {
-                    resolve_function_calls_only(
-                        v,
-                        binding_map,
-                        config,
-                        session,
-                        defer_unknown_functions,
-                        preserve_failed_user_calls,
-                    )
-                })
+                .map(|v| resolve_function_calls_only(v, binding_map, config, session, resolution))
                 .collect();
             Ok(GenericValue::Concrete(ConcreteValue::List(resolved?)))
         }
@@ -2152,14 +2124,7 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
             for (k, v) in map {
                 resolved.insert(
                     k.clone(),
-                    resolve_function_calls_only(
-                        v,
-                        binding_map,
-                        config,
-                        session,
-                        defer_unknown_functions,
-                        preserve_failed_user_calls,
-                    )?,
+                    resolve_function_calls_only(v, binding_map, config, session, resolution)?,
                 );
             }
             Ok(GenericValue::Concrete(ConcreteValue::Map(resolved)))
@@ -2168,21 +2133,14 @@ fn resolve_function_calls_only<B: ProviderAttributeBindingPhase>(
             let resolved: Result<Vec<_>, ParseError> = parts
                 .iter()
                 .map(|p| match p {
-                    InterpolationPart::Expr(v) => {
-                        Ok(InterpolationPart::Expr(resolve_function_calls_only(
-                            v,
-                            binding_map,
-                            config,
-                            session,
-                            defer_unknown_functions,
-                            preserve_failed_user_calls,
-                        )?))
-                    }
+                    InterpolationPart::Expr(v) => Ok(InterpolationPart::Expr(
+                        resolve_function_calls_only(v, binding_map, config, session, resolution)?,
+                    )),
                     other => Ok(other.clone()),
                 })
                 .collect();
             let resolved = resolved?;
-            reject_required_interpolation_unavailable(&resolved, defer_unknown_functions)?;
+            reject_required_interpolation_unavailable(&resolved, resolution)?;
             Ok(GenericValue::Deferred(DeferredValue::Interpolation(resolved)).canonicalize())
         }
         GenericValue::Concrete(
@@ -2349,8 +2307,14 @@ where
     for (index, provider) in parsed.providers.iter_mut().enumerate() {
         let mut resolved = IndexMap::new();
         for (key, expr) in &provider.unresolved_attributes {
-            let r = resolve_value_with_config(expr, &binding_map, config, None, false, false)
-                .map_err(|error| map_error(index, key, error))?;
+            let r = resolve_value_with_config(
+                expr,
+                &binding_map,
+                config,
+                None,
+                strict_resolution_context(),
+            )
+            .map_err(|error| map_error(index, key, error))?;
             resolved.insert(key.clone(), r);
         }
         provider.unresolved_attributes = resolved;
@@ -2441,8 +2405,7 @@ pub fn resolve_provider_attributes_with_remote<E, D>(
                     },
                     config.catalog(),
                     Some(config),
-                    false,
-                    false,
+                    strict_resolution_context(),
                     DiagnosticScope::Public,
                 )?;
                 let expanded = parser_resolved.into_expanded().map_err(|error| {
@@ -2566,6 +2529,10 @@ let consumer = mock.test.resource { name = q.name[0] }
         );
     }
 }
+
+#[cfg(test)]
+#[path = "resolve_context_tests.rs"]
+mod context_tests;
 
 #[cfg(test)]
 mod unavailable_evaluation_tests {

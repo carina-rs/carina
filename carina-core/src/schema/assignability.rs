@@ -55,14 +55,6 @@ impl<'s> TypeAssignmentDeferral<'s> {
 }
 
 impl<'s> TypeAssignability<'s> {
-    fn from_bool(assignable: bool) -> Self {
-        if assignable {
-            Self::Assignable
-        } else {
-            Self::Mismatch
-        }
-    }
-
     /// Loaded validation must prove assignment using the provider schemas.
     pub fn require_loaded(self) -> Result<bool, CustomTypeValidationError> {
         match self {
@@ -85,40 +77,6 @@ impl<'s> TypeAssignability<'s> {
             }
             Self::Mismatch => false,
         }
-    }
-
-    fn all(results: impl IntoIterator<Item = Self>) -> Self {
-        let mut result = Self::Assignable;
-        for next in results {
-            match next {
-                Self::Mismatch => return Self::Mismatch,
-                Self::Unchecked(evidence) => {
-                    result = Self::Unchecked(match result {
-                        Self::Unchecked(previous) => previous.merge(evidence),
-                        Self::Assignable | Self::Mismatch => evidence,
-                    })
-                }
-                Self::Assignable => {}
-            }
-        }
-        result
-    }
-
-    fn any(results: impl IntoIterator<Item = Self>) -> Self {
-        let mut result = Self::Mismatch;
-        for next in results {
-            match next {
-                Self::Assignable => return Self::Assignable,
-                Self::Unchecked(evidence) => {
-                    result = Self::Unchecked(match result {
-                        Self::Unchecked(previous) => previous.merge(evidence),
-                        Self::Assignable | Self::Mismatch => evidence,
-                    })
-                }
-                Self::Mismatch => {}
-            }
-        }
-        result
     }
 }
 
@@ -492,12 +450,177 @@ fn nominal_scalar_constraints<'a, R: PatternForm>(
     constraints
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AssignmentCheck {
+/// The reference-mode relation retains local obligations. Strict walks return
+/// `TypeAssignability` directly; this relation has no conversion back to it.
+///
+/// ```compile_fail,E0277
+/// use carina_core::schema::assignability::{AssignmentRelation, TypeAssignability};
+/// fn bypass(reference: AssignmentRelation<'_>) -> TypeAssignability<'_> {
+///     reference.into()
+/// }
+/// ```
+#[derive(Debug)]
+pub enum AssignmentRelation<'s> {
+    Assignable,
+    Mismatch,
+    Unchecked(TypeAssignmentDeferral<'s>),
+    NeedsLocal(Option<TypeAssignmentDeferral<'s>>),
+}
+impl<'s> From<TypeAssignability<'s>> for AssignmentRelation<'s> {
+    fn from(value: TypeAssignability<'s>) -> Self {
+        match value {
+            TypeAssignability::Assignable => Self::Assignable,
+            TypeAssignability::Mismatch => Self::Mismatch,
+            TypeAssignability::Unchecked(schema) => Self::Unchecked(schema),
+        }
+    }
+}
+impl<'s> AssignmentRelation<'s> {
+    pub(crate) fn all(results: impl IntoIterator<Item = Self>) -> Self {
+        let mut schema: Option<TypeAssignmentDeferral<'s>> = None;
+        let mut local = false;
+        for result in results {
+            let next = match result {
+                Self::Mismatch => return Self::Mismatch,
+                Self::Assignable => None,
+                Self::Unchecked(schema) => Some(schema),
+                Self::NeedsLocal(schema) => {
+                    local = true;
+                    schema
+                }
+            };
+            if let Some(next) = next {
+                schema = Some(match schema {
+                    Some(previous) => previous.merge(next),
+                    None => next,
+                });
+            }
+        }
+        if local {
+            Self::NeedsLocal(schema)
+        } else {
+            match schema {
+                Some(schema) => Self::Unchecked(schema),
+                None => Self::Assignable,
+            }
+        }
+    }
+    fn any(results: impl IntoIterator<Item = Self>) -> Self {
+        let mut pending = Vec::new();
+        for result in results {
+            match result {
+                Self::Assignable => return Self::Assignable,
+                Self::NeedsLocal(None) => return Self::NeedsLocal(None),
+                result @ (Self::Unchecked(_) | Self::NeedsLocal(Some(_))) => pending.push(result),
+                Self::Mismatch => {}
+            }
+        }
+        if pending.is_empty() {
+            Self::Mismatch
+        } else {
+            Self::all(pending)
+        }
+    }
+}
+
+/// Each mode selects its result before entering the shared recursive walk.
+trait AssignmentCheck: Copy {
+    type Result<'s>: AssignmentResult<'s>;
+    fn identified_only(self) -> bool;
+    fn same_identity<'s>(self) -> Option<Self::Result<'s>>;
+}
+
+trait AssignmentResult<'s>: From<TypeAssignability<'s>> {
+    fn from_bool(value: bool) -> Self {
+        if value {
+            TypeAssignability::Assignable.into()
+        } else {
+            TypeAssignability::Mismatch.into()
+        }
+    }
+    fn all(results: impl IntoIterator<Item = Self>) -> Self;
+    fn any(results: impl IntoIterator<Item = Self>) -> Self;
+}
+
+impl<'s> AssignmentResult<'s> for TypeAssignability<'s> {
+    fn all(results: impl IntoIterator<Item = Self>) -> Self {
+        let mut schema: Option<TypeAssignmentDeferral<'s>> = None;
+        for result in results {
+            match result {
+                Self::Mismatch => return Self::Mismatch,
+                Self::Assignable => {}
+                Self::Unchecked(next) => {
+                    schema = Some(match schema {
+                        Some(previous) => previous.merge(next),
+                        None => next,
+                    });
+                }
+            }
+        }
+        match schema {
+            Some(schema) => Self::Unchecked(schema),
+            None => Self::Assignable,
+        }
+    }
+
+    fn any(results: impl IntoIterator<Item = Self>) -> Self {
+        let mut pending = Vec::new();
+        for result in results {
+            match result {
+                Self::Assignable => return Self::Assignable,
+                result @ Self::Unchecked(_) => pending.push(result),
+                Self::Mismatch => {}
+            }
+        }
+        if pending.is_empty() {
+            Self::Mismatch
+        } else {
+            Self::all(pending)
+        }
+    }
+}
+
+impl<'s> AssignmentResult<'s> for AssignmentRelation<'s> {
+    fn all(results: impl IntoIterator<Item = Self>) -> Self {
+        Self::all(results)
+    }
+    fn any(results: impl IntoIterator<Item = Self>) -> Self {
+        Self::any(results)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StrictAssignmentCheck {
     Full,
     /// Re-admit original identities at a declared value's later sink. Only
     /// identified leaves need this proof; their rule-7 containment still applies.
     IdentifiedLeaves,
+}
+
+impl AssignmentCheck for StrictAssignmentCheck {
+    type Result<'s> = TypeAssignability<'s>;
+    fn identified_only(self) -> bool {
+        matches!(self, Self::IdentifiedLeaves)
+    }
+    fn same_identity<'s>(self) -> Option<Self::Result<'s>> {
+        None
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ReferenceAssignmentCheck {
+    Full,
+    IdentifiedLeaves,
+}
+
+impl AssignmentCheck for ReferenceAssignmentCheck {
+    type Result<'s> = AssignmentRelation<'s>;
+    fn identified_only(self) -> bool {
+        matches!(self, Self::IdentifiedLeaves)
+    }
+    fn same_identity<'s>(self) -> Option<Self::Result<'s>> {
+        Some(AssignmentRelation::NeedsLocal(None))
+    }
 }
 
 impl TypeInSchema<'_, super::Compiled> {
@@ -562,7 +685,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         let source: TypeInSchema<'query, R> = self;
         source.assignment_on_paths(
             sink,
-            AssignmentCheck::Full,
+            StrictAssignmentCheck::Full,
             &mut Vec::new(),
             &mut Vec::new(),
         )
@@ -572,7 +695,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
     /// full assignment. An earlier owner's edge is not proof for this sink.
     /// Identity-less leaves keep the declaration's deferred value checks;
     /// identified leaves retain ordinary identity admission and containment.
-    fn identity_assignment_to<'query>(
+    pub(crate) fn identity_assignment_to<'query>(
         self,
         sink: AssignmentSink<'query, R>,
     ) -> TypeAssignability<'query>
@@ -582,46 +705,89 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
         let source: TypeInSchema<'query, R> = self;
         source.assignment_on_paths(
             sink,
-            AssignmentCheck::IdentifiedLeaves,
+            StrictAssignmentCheck::IdentifiedLeaves,
             &mut Vec::new(),
             &mut Vec::new(),
         )
     }
 
-    fn assignment_on_paths<'sink>(
+    pub(crate) fn reference_assignment_to<'query, B: crate::resource::BindingAddress>(
+        self,
+        sink: AssignmentSink<'query, R>,
+        _reference: &crate::validation::admission::ReferenceCandidate<B>,
+    ) -> AssignmentRelation<'query>
+    where
+        'source: 'query,
+    {
+        let source: TypeInSchema<'query, R> = self;
+        source.assignment_on_paths(
+            sink,
+            ReferenceAssignmentCheck::Full,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+    }
+
+    pub(crate) fn identified_reference_assignment_to<'query, B: crate::resource::BindingAddress>(
+        self,
+        sink: AssignmentSink<'query, R>,
+        _reference: &crate::validation::admission::ReferenceCandidate<B>,
+    ) -> AssignmentRelation<'query>
+    where
+        'source: 'query,
+    {
+        let source: TypeInSchema<'query, R> = self;
+        source.assignment_on_paths(
+            sink,
+            ReferenceAssignmentCheck::IdentifiedLeaves,
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+    }
+
+    fn assignment_on_paths<'sink, C: AssignmentCheck>(
         self,
         sink: AssignmentSink<'sink, R>,
-        check: AssignmentCheck,
+        check: C,
         source_refs: &mut Vec<&'source str>,
         sink_refs: &mut Vec<&'sink str>,
-    ) -> TypeAssignability<'source>
+    ) -> C::Result<'source>
     where
         'sink: 'source,
     {
         let Ok(source) = resolve_refs_on_path(self.attr, self.defs, source_refs) else {
-            return TypeAssignability::Mismatch;
+            return TypeAssignability::Mismatch.into();
         };
         let Ok(target) = resolve_refs_on_path(sink.attr, sink.defs, sink_refs) else {
             source_refs.truncate(source.restore_len);
-            return TypeAssignability::Mismatch;
+            return TypeAssignability::Mismatch.into();
         };
         let left = source.attr.in_schema(self.defs);
         let right = sink.rebind(target.attr);
         use AttrTypeKind::*;
         use TypeAssignability::*;
+        let same_identity = identity_leaf(&source.attr.kind)
+            .and_then(|leaf| leaf.identity())
+            .zip(identity_leaf(&target.attr.kind).and_then(|leaf| leaf.identity()))
+            .is_some_and(|(source, target)| source == target);
+        if same_identity && let Some(result) = check.same_identity() {
+            source_refs.truncate(source.restore_len);
+            sink_refs.truncate(target.restore_len);
+            return result;
+        }
         let result = match (&source.attr.kind, &target.attr.kind) {
             (_, _)
                 if source.attr.has_empty_scalar_intersection()
                     || target.attr.has_empty_scalar_intersection() =>
             {
-                Mismatch
+                Mismatch.into()
             }
             (_, kind)
-                if check == AssignmentCheck::IdentifiedLeaves
+                if check.identified_only()
                     && identity_leaf(kind).is_none()
                     && !matches!(kind, List { .. } | Map { .. } | Struct { .. } | Union(_)) =>
             {
-                Assignable
+                Assignable.into()
             }
             (
                 Union(members),
@@ -677,7 +843,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Duration
                 | Union(_)
                 | Ref(_),
-            ) => TypeAssignability::all(members.as_raw_slice().iter().map(|member| {
+            ) => C::Result::all(members.as_raw_slice().iter().map(|member| {
                 member.in_schema(self.defs).assignment_on_paths(
                     right,
                     check,
@@ -738,7 +904,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Duration
                 | Ref(_),
                 Union(members),
-            ) => TypeAssignability::any(members.as_raw_slice().iter().map(|member| {
+            ) => C::Result::any(members.as_raw_slice().iter().map(|member| {
                 left.assignment_on_paths(sink.rebind(member), check, source_refs, sink_refs)
             })),
             (
@@ -853,19 +1019,22 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
             ) {
                 (Some(left), Some(right)) => {
                     if matches!(source.attr.kind, Enum { .. }) {
-                        TypeAssignability::from_bool(
+                        C::Result::from_bool(
                             right
                                 .identity()
                                 .is_some_and(|sink| left.structurally_assignable_to(sink)),
                         )
                     } else {
-                        sink.rebind(target.attr).identity_assignment(left, right)
+                        sink.rebind(target.attr)
+                            .identity_assignment(left, right)
+                            .into()
                     }
                 }
-                (None, Some(_)) => Mismatch,
+                (None, Some(_)) => Mismatch.into(),
                 (Some(_) | None, None) => Unchecked(TypeAssignmentDeferral::new(
                     crate::parser::TypeExpr::UnloadedSchemaType(unloaded.clone()),
-                )),
+                ))
+                .into(),
             },
             (
                 List {
@@ -895,7 +1064,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     value: rv,
                     constraints: _,
                 },
-            ) => TypeAssignability::all([
+            ) => C::Result::all([
                 lk.in_schema(self.defs).assignment_on_paths(
                     sink.rebind(rk),
                     check,
@@ -922,9 +1091,9 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 },
             ) => {
                 if left.len() != right.len() {
-                    Mismatch
+                    Mismatch.into()
                 } else {
-                    TypeAssignability::all(right.iter().map(|field| {
+                    C::Result::all(right.iter().map(|field| {
                         match left.iter().find(|candidate| candidate.name == field.name) {
                             Some(candidate) => candidate
                                 .field_type
@@ -935,7 +1104,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                                     source_refs,
                                     sink_refs,
                                 ),
-                            None => Mismatch,
+                            None => Mismatch.into(),
                         }
                     }))
                 }
@@ -951,7 +1120,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     key: _,
                     constraints: _,
                 },
-            ) => TypeAssignability::all(fields.iter().map(|field| {
+            ) => C::Result::all(fields.iter().map(|field| {
                 field.field_type.in_schema(self.defs).assignment_on_paths(
                     sink.rebind(value),
                     check,
@@ -973,9 +1142,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     to_dsl: _,
                 },
             ) if let (Some(source), Some(_)) = (source.identity(), target.identity()) => {
-                TypeAssignability::all([
-                    right.identity_assignment(source, IdentityLeaf::Scalar(target)),
-                    TypeAssignability::from_bool(super::length_contains(
+                C::Result::all([
+                    right
+                        .identity_assignment(source, IdentityLeaf::Scalar(target))
+                        .into(),
+                    C::Result::from_bool(super::length_contains(
                         source_length.as_ref(),
                         sink_length.as_ref(),
                     )),
@@ -991,9 +1162,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     range: sink_range,
                 },
             ) if let (Some(source), Some(_)) = (source.identity(), target.identity()) => {
-                TypeAssignability::all([
-                    right.identity_assignment(source, IdentityLeaf::Scalar(target)),
-                    TypeAssignability::from_bool(super::i64_range_contains(
+                C::Result::all([
+                    right
+                        .identity_assignment(source, IdentityLeaf::Scalar(target))
+                        .into(),
+                    C::Result::from_bool(super::i64_range_contains(
                         source_range.as_ref(),
                         sink_range.as_ref(),
                     )),
@@ -1009,9 +1182,11 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     range: sink_range,
                 },
             ) if let (Some(source), Some(_)) = (source.identity(), target.identity()) => {
-                TypeAssignability::all([
-                    right.identity_assignment(source, IdentityLeaf::Scalar(target)),
-                    TypeAssignability::from_bool(super::f64_range_contains(
+                C::Result::all([
+                    right
+                        .identity_assignment(source, IdentityLeaf::Scalar(target))
+                        .into(),
+                    C::Result::from_bool(super::f64_range_contains(
                         source_range.as_ref(),
                         sink_range.as_ref(),
                     )),
@@ -1027,14 +1202,16 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     range: sink_range,
                 },
             ) if target.identity().is_some() => match source.identity() {
-                Some(source) => TypeAssignability::all([
-                    right.identity_assignment(source, IdentityLeaf::Scalar(target)),
-                    TypeAssignability::from_bool(super::i64_range_assignable_to_f64(
+                Some(source) => C::Result::all([
+                    right
+                        .identity_assignment(source, IdentityLeaf::Scalar(target))
+                        .into(),
+                    C::Result::from_bool(super::i64_range_assignable_to_f64(
                         source_range.as_ref(),
                         sink_range.as_ref(),
                     )),
                 ]),
-                None => Mismatch,
+                None => Mismatch.into(),
             },
             (
                 String {
@@ -1059,9 +1236,9 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     validate: _,
                     to_dsl: _,
                 },
-            ) if let Some(source) = source.identity() => TypeAssignability::all([
-                TypeAssignability::from_bool(source.structurally_assignable_to(target)),
-                TypeAssignability::from_bool(
+            ) if let Some(source) = source.identity() => C::Result::all([
+                C::Result::from_bool(source.structurally_assignable_to(target)),
+                C::Result::from_bool(
                     match (
                         nominal_scalar_constraints(left, source_refs),
                         nominal_scalar_constraints(right.ty, sink_refs),
@@ -1094,13 +1271,13 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     binding: target,
                     range: _,
                 },
-            ) if target.identity().is_some() => TypeAssignability::all([
-                TypeAssignability::from_bool(
+            ) if target.identity().is_some() => C::Result::all([
+                C::Result::from_bool(
                     target
                         .identity()
                         .is_some_and(|target| source.structurally_assignable_to(target)),
                 ),
-                TypeAssignability::from_bool(
+                C::Result::from_bool(
                     match (
                         nominal_scalar_constraints(left, source_refs),
                         nominal_scalar_constraints(right.ty, sink_refs),
@@ -1127,8 +1304,8 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     validate: _,
                     to_dsl: _,
                 },
-            ) => TypeAssignability::all([
-                TypeAssignability::from_bool(source.structurally_assignable_to(target)),
+            ) => C::Result::all([
+                C::Result::from_bool(source.structurally_assignable_to(target)),
                 source_base.in_schema(self.defs).assignment_on_paths(
                     sink.rebind(sink_base),
                     check,
@@ -1214,7 +1391,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Bool
                 | Duration
                 | Ref(_),
-            ) => TypeAssignability::from_bool(left.is_assignable_to_known(right)),
+            ) => C::Result::from_bool(left.is_assignable_to_known(right)),
             (
                 Enum {
                     identity: _,
@@ -1266,7 +1443,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Bool
                 | Duration
                 | Ref(_),
-            ) => TypeAssignability::from_bool(left.is_assignable_to_known(right)),
+            ) => C::Result::from_bool(left.is_assignable_to_known(right)),
             (
                 List {
                     element_type: _,
@@ -1318,7 +1495,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Bool
                 | Duration
                 | Ref(_),
-            ) => TypeAssignability::from_bool(left.is_assignable_to_known(right)),
+            ) => C::Result::from_bool(left.is_assignable_to_known(right)),
             (
                 Map {
                     key: _,
@@ -1370,7 +1547,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Bool
                 | Duration
                 | Ref(_),
-            ) => TypeAssignability::from_bool(left.is_assignable_to_known(right)),
+            ) => C::Result::from_bool(left.is_assignable_to_known(right)),
             (
                 Struct {
                     name: _,
@@ -1417,7 +1594,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 | Bool
                 | Duration
                 | Ref(_),
-            ) => TypeAssignability::from_bool(left.is_assignable_to_known(right)),
+            ) => C::Result::from_bool(left.is_assignable_to_known(right)),
         };
         source_refs.truncate(source.restore_len);
         sink_refs.truncate(target.restore_len);

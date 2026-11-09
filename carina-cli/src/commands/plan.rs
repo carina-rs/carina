@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use crate::output_style::Colorize;
 use serde::{Deserialize, Serialize};
 
-use carina_core::config_loader::load_configuration_with_config;
+use carina_core::config_loader::{
+    load_configuration_for_bootstrap, load_configuration_with_config,
+};
 use carina_core::data_source_value::DataSourceValue;
 use carina_core::detail_rows::HistoricalDisplayAttributes;
 use carina_core::differ::rebind_current_for_move;
@@ -6978,7 +6980,7 @@ async fn build_upstream_backend<B: carina_core::resource::BindingAddress>(
     cycle_guard: &mut HashSet<CanonicalPath>,
 ) -> Result<ResolvedReadBackend, AppError> {
     let color_mode = runtime.color_mode();
-    let loaded = load_configuration_with_config(
+    let loaded = load_configuration_for_bootstrap(
         source_abs,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
@@ -7067,7 +7069,7 @@ async fn walk_upstream_cycles_only<B: carina_core::resource::BindingAddress>(
 
         // Parse the upstream so we can see its own `upstream_state`
         // blocks. We deliberately do NOT touch its backend.
-        let loaded = load_configuration_with_config(
+        let loaded = carina_core::config_loader::load_configuration_for_metadata(
             &source_abs,
             provider_context,
             &carina_core::schema::SchemaRegistry::new(),
@@ -7106,6 +7108,34 @@ mod load_upstream_states_tests {
     use super::*;
     #[cfg(test)]
     use std::fs;
+
+    #[tokio::test]
+    async fn r5_cycle_discovery_defers_upstream_values_and_backend() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::create_dir(directory.path().join("upstream")).unwrap();
+        fs::write(
+            directory.path().join("main.crn"),
+            "let upstream = upstream_state { source = './upstream' }\n",
+        )
+        .unwrap();
+        fs::write(directory.path().join("upstream/main.crn"), "let token = secret(env('R5_UPSTREAM_TOKEN'))\nbackend local { path = env('R5_UNUSED_BACKEND') }\n").unwrap();
+        let context = ProviderContext::new(carina_core::EnvironmentSnapshot::empty());
+        let base = ResolvedPath::new(directory.path()).unwrap();
+        let root = load_configuration_for_bootstrap(
+            &base,
+            &context,
+            &carina_core::schema::SchemaRegistry::new(),
+        )
+        .unwrap();
+        walk_upstream_cycles_only(
+            &root.parsed.upstream_states,
+            &base,
+            &context,
+            &mut HashSet::new(),
+        )
+        .await
+        .unwrap();
+    }
 
     #[tokio::test]
     async fn review2_f8_provider_upstream_inventory_masks_secret_reference_errors() {

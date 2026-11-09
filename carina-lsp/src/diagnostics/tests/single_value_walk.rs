@@ -9,7 +9,10 @@ use carina_core::schema::{
 };
 use tower_lsp::lsp_types::{Position, Range};
 
-struct WalkFactory(ValidatedResourceSchema);
+struct WalkFactory(
+    ValidatedResourceSchema,
+    Option<Arc<std::sync::atomic::AtomicUsize>>,
+);
 
 impl ProviderFactory for WalkFactory {
     fn name(&self) -> &str {
@@ -46,6 +49,9 @@ impl ProviderFactory for WalkFactory {
         value: &CanonicalCustomTypeValue,
         _session: &carina_core::provider::ProviderValidationInputs,
     ) -> ProviderResult<()> {
+        if let Some(calls) = &self.1 {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         if (identity.kind == "SubnetId" && value.as_str().starts_with("subnet-"))
             || (identity.kind == "VpcId" && value.as_str().starts_with("vpc-"))
         {
@@ -75,7 +81,10 @@ fn engine(ty: AttributeType) -> DiagnosticEngine {
 
 fn engine_with_schema(schema: ResourceSchema) -> DiagnosticEngine {
     DiagnosticEngine::new(
-        loaded_providers_from_factories(vec![Box::new(WalkFactory(schema.validate().unwrap()))]),
+        loaded_providers_from_factories(vec![Box::new(WalkFactory(
+            schema.validate().unwrap(),
+            None,
+        ))]),
         vec!["test".into()],
     )
 }
@@ -317,6 +326,36 @@ fn issue_4276_union_provider_failures_render_once() {
         diagnostics[0].range,
         Range::new(Position::new(1, 2), Position::new(1, 7))
     );
+}
+
+#[test]
+fn coalesce_parent_diagnostic_preserves_provider_branch_callback_counts() {
+    for (ty, expected) in [
+        (remote("Remote"), 2),
+        (
+            AttributeType::union(vec![remote("First"), remote("Second")]),
+            4,
+        ),
+    ] {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let schema = ResourceSchema::new("test.Widget")
+            .attribute(AttributeSchema::optional("value", ty).build())
+            .validate()
+            .unwrap();
+        let engine = DiagnosticEngine::new(
+            loaded_providers_from_factories(vec![Box::new(WalkFactory(
+                schema,
+                Some(Arc::clone(&calls)),
+            ))]),
+            vec!["test".into()],
+        );
+        let diagnostics = value_diagnostics(
+            &engine,
+            "test.test.Widget { value = secret(\"left\") ?? \"right\" }\n",
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), expected);
+    }
 }
 
 fn directory_diagnostics(

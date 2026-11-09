@@ -2180,7 +2180,10 @@ mod tests {
             async |type_checks| {
                 let bindings = carina_core::binding_index::ResolvedBindings::default();
                 let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-                let schemas = CoreSchemaRegistry::new();
+                let schemas = carina_core::test_utils::preparation_schemas(
+                    &resource.id,
+                    carina_core::schema::SchemaKind::Resource,
+                );
                 let context = carina_core::executor::ProviderPreparationContext::new(
                     &bindings,
                     &gate,
@@ -5030,7 +5033,7 @@ mod tests {
                 .with_attribute("map", secret(CoreValue::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([("key".into(), CoreValue::Concrete(ConcreteValue::String("value".into())))])))));
             let bindings = carina_core::binding_index::ResolvedBindings::default();
             let gate = carina_core::executor::ModuleConstraintGate::from_live_compositions(&[]);
-            let schemas = CoreSchemaRegistry::new();
+            let schemas = carina_core::test_utils::preparation_schemas(&resource.id, carina_core::schema::SchemaKind::Resource);
             let context = carina_core::executor::ProviderPreparationContext::new(&bindings, &gate, &[], &carina_core::provider::NoopNormalizer, &[], &schemas, type_checks);
             let request = carina_core::executor::prepare_create_request(resource, &context).await.unwrap();
             let wire = core_to_wit_create_request(&request).res;
@@ -6381,15 +6384,15 @@ mod tests {
         let mut registry = CoreSchemaRegistry::new();
         registry.insert("awscc", core_schema);
         let resolver = carina_core::parser::ProviderCustomTypes::default();
-        let err = registry
-            .get("awscc", "awscc.ec2.Vpc", CoreSchemaKind::Resource)
-            .expect("decoded fixture must be owner-bound")
-            .validate_with_resolver(
-                &HashMap::<String, carina_core::resource::knowledge::Classification<'_>>::new(),
-                &|_| false,
-                &resolver,
-            )
-            .unwrap_err();
+        let err = carina_core::test_utils::admit_resource_attributes(
+            registry
+                .get("awscc", "awscc.ec2.Vpc", CoreSchemaKind::Resource)
+                .expect("decoded fixture must be owner-bound"),
+            &HashMap::<String, carina_core::resource::knowledge::Classification<'_>>::new(),
+            &|_| false,
+            &resolver,
+        )
+        .unwrap_err();
         assert!(
             err.iter().any(|e| e
                 .to_string()
@@ -7300,25 +7303,24 @@ mod tests {
             )),
         );
         assert!(
-            bound_schema
-                .validate_with_resolver(
-                    &attrs
-                        .iter()
-                        .map(|(name, value)| (
-                            name.clone(),
-                            value
-                                .knowledge(
-                                    &carina_core::resource::knowledge::KnowledgeContext::validation(
-                                    )
-                                )
-                                .map(|proof| proof.into_classification())
-                                .unwrap()
-                        ))
-                        .collect(),
-                    &|_| false,
-                    &resolver
-                )
-                .is_err()
+            carina_core::test_utils::admit_resource_attributes(
+                bound_schema,
+                &attrs
+                    .iter()
+                    .map(|(name, value)| (
+                        name.clone(),
+                        value
+                            .knowledge(
+                                &carina_core::resource::knowledge::KnowledgeContext::validation()
+                            )
+                            .map(|proof| proof.into_classification())
+                            .unwrap()
+                    ))
+                    .collect(),
+                &|_| false,
+                &resolver
+            )
+            .is_err()
         );
 
         // normal tags should pass
@@ -7335,25 +7337,24 @@ mod tests {
             )),
         );
         assert!(
-            bound_schema
-                .validate_with_resolver(
-                    &attrs
-                        .iter()
-                        .map(|(name, value)| (
-                            name.clone(),
-                            value
-                                .knowledge(
-                                    &carina_core::resource::knowledge::KnowledgeContext::validation(
-                                    )
-                                )
-                                .map(|proof| proof.into_classification())
-                                .unwrap()
-                        ))
-                        .collect(),
-                    &|_| false,
-                    &resolver
-                )
-                .is_ok()
+            carina_core::test_utils::admit_resource_attributes(
+                bound_schema,
+                &attrs
+                    .iter()
+                    .map(|(name, value)| (
+                        name.clone(),
+                        value
+                            .knowledge(
+                                &carina_core::resource::knowledge::KnowledgeContext::validation()
+                            )
+                            .map(|proof| proof.into_classification())
+                            .unwrap()
+                    ))
+                    .collect(),
+                &|_| false,
+                &resolver
+            )
+            .is_ok()
         );
     }
 

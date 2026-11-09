@@ -1,6 +1,7 @@
 //! Validation utilities for resources and modules
 
 use crate::resource::{DiagnosticPath, DiagnosticScope, InsideSecret, SecretDiagnosticError};
+pub mod admission;
 pub mod deferred_populate;
 pub mod deferred_types;
 pub mod depends_on;
@@ -9,7 +10,7 @@ pub mod typecheck;
 pub mod wait;
 
 use crate::resource::ValueKind;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 use indexmap::IndexMap;
@@ -20,8 +21,7 @@ use crate::binding_index::{
 use crate::deps::collect_dependencies;
 use crate::parser::{
     ForBinding, LoadedProviderContext, ModuleCall, ModuleCallId, ParsedValue as Value,
-    ProviderContext, ResourceContext, ResourceRef, ResourceTypePath, SourceFileId, SourceSpan,
-    TypeExpr,
+    ProviderContext, ResourceRef, ResourceTypePath, SourceFileId, SourceSpan, TypeExpr,
 };
 use crate::provider::ProviderFactory;
 use crate::resource::{
@@ -2395,14 +2395,31 @@ fn collect_ref_diagnostics_with_sink<'a, P: PlaceholderKind, B: BindingAddress, 
 
 type ReferenceDiagnosticMessage = SecretDiagnosticError<String>;
 
-#[derive(Debug, Clone)]
+/// Render a reference mismatch for an attribute or a top-level value.
+/// `origin` includes its label (for example, `from producer.output`).
+pub fn reference_type_mismatch_message(
+    attribute: Option<&str>,
+    types: &MismatchTypeNames,
+    origin: Option<&dyn std::fmt::Display>,
+) -> String {
+    let message = match attribute {
+        Some(attribute) => format!("cannot assign {} to '{attribute}': {types}", types.actual()),
+        None => format!("Type mismatch: {types}"),
+    };
+    match origin {
+        Some(origin) => format!("{message} ({origin})"),
+        None => message,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ReferenceFindingLocation {
     Resource { location: String, attribute: String },
     Attribute(String),
     Export(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum ReferenceFindingKind {
     UnknownAttribute(ReferenceDiagnosticMessage),
     UnknownBinding(ReferenceDiagnosticMessage),
@@ -2414,13 +2431,26 @@ enum ReferenceFindingKind {
     },
 }
 
-#[derive(Debug)]
-struct ReferenceFinding {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceFinding {
     location: ReferenceFindingLocation,
     kind: ReferenceFindingKind,
 }
 
 impl ReferenceFinding {
+    /// Existence diagnostics own these errors in renderers that also consume
+    /// the attribute admission report.
+    pub fn is_lookup_error(&self) -> bool {
+        match &self.kind {
+            ReferenceFindingKind::UnknownAttribute(_) | ReferenceFindingKind::UnknownBinding(_) => {
+                true
+            }
+            ReferenceFindingKind::InvalidValue(_) | ReferenceFindingKind::TypeMismatch { .. } => {
+                false
+            }
+        }
+    }
+
     fn new(location: &ReferenceFindingLocation, kind: ReferenceFindingKind) -> Self {
         Self {
             location: location.clone(),
@@ -2492,11 +2522,15 @@ impl std::fmt::Display for ReferenceFinding {
                 origin,
             } => {
                 match &self.location {
-                    ReferenceFindingLocation::Resource { attribute, .. } => write!(
-                        f,
-                        "cannot assign {} to '{attribute}': {types}",
-                        types.actual()
-                    )?,
+                    ReferenceFindingLocation::Resource { attribute, .. } => {
+                        return f.write_str(&reference_type_mismatch_message(
+                            Some(attribute),
+                            types,
+                            origin
+                                .as_ref()
+                                .map(|origin| origin as &dyn std::fmt::Display),
+                        ));
+                    }
                     ReferenceFindingLocation::Attribute(_) => write!(f, "type mismatch: {types}")?,
                     ReferenceFindingLocation::Export(_) => {
                         write!(f, "type mismatch for '{path}': {types}")?
@@ -2704,58 +2738,6 @@ impl InsideSecret for crate::parser::Located<IntegerArithmeticTypeFinding> {
                 error: finding.error.inside_secret(),
             },
         )
-    }
-}
-
-#[derive(Debug)]
-enum ComputedAccessDiagnostic {
-    MissingEvidence(crate::parser::retained::MissingEvidence),
-    Protected,
-    Assignment {
-        location: String,
-        attribute: String,
-        error: DeferredAccessTypeError,
-    },
-}
-
-impl InsideSecret for ComputedAccessDiagnostic {
-    fn inside_secret(self) -> Self {
-        match self {
-            Self::MissingEvidence(_) => Self::Protected,
-            protected @ Self::Protected => protected,
-            Self::Assignment {
-                location,
-                attribute,
-                error,
-            } => Self::Assignment {
-                location,
-                attribute,
-                error: error.inside_secret(),
-            },
-        }
-    }
-}
-
-impl std::fmt::Display for ComputedAccessDiagnostic {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingEvidence(error) => error.fmt(formatter),
-            Self::Protected => inference::InferenceError::InsideSecret {}.fmt(formatter),
-            Self::Assignment {
-                location,
-                error: DeferredAccessTypeError::InvalidAccess { error },
-                ..
-            } => write!(formatter, "{location}: {error}"),
-            Self::Assignment {
-                location,
-                attribute,
-                error: DeferredAccessTypeError::TypeMismatch { types, origin },
-            } => write!(
-                formatter,
-                "{location}: cannot assign {} to '{attribute}': {types} ({origin})",
-                types.actual()
-            ),
-        }
     }
 }
 
@@ -4984,6 +4966,9 @@ struct ResourceValidationContext<'a> {
     known_providers: &'a HashSet<String>,
     provider_context: &'a ProviderContext,
     all_errors: &'a mut Vec<String>,
+    diagnostics: &'a mut dyn deferred_types::ProviderTypeCheckSink,
+    admissions:
+        Option<&'a HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>>,
 }
 
 fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
@@ -4996,21 +4981,72 @@ fn validate_resource_values<P: PlaceholderKind, B: BindingAddress>(
 ) {
     match schema {
         Some(schema) => {
-            let is_string_literal = |attr: &str| quoted_string_attrs.contains(attr);
             let mut classification_errors = Vec::new();
             let classified = crate::resource::knowledge::collect_classified_attributes(
                 attributes.iter().map(|(name, value)| (name.clone(), value)),
                 &crate::resource::knowledge::KnowledgeContext::validation(),
                 |name, error| classification_errors.push((name.to_owned(), error)),
             );
-            if let Err(errors) = schema.validate_with_resolver(
-                &classified,
-                &is_string_literal,
-                context.provider_context.custom_type_resolver(),
-            ) {
-                context
-                    .all_errors
-                    .extend(errors.into_iter().map(|error| format!("{id}: {error}")));
+            let checked;
+            let values = if let Some(values) =
+                context.admissions.and_then(|reports| reports.get(id))
+            {
+                values
+            } else {
+                checked = publish_admission_diagnostics(
+                    deferred_types::TypeCheckSession::run(context.provider_context, |session| {
+                        match kind {
+                            ValidatableKind::Resource => {
+                                admission::attributes::admit_validation_attributes::<
+                                    admission::kind::ResourceAttribute,
+                                    _,
+                                    _,
+                                >(
+                                    schema,
+                                    id,
+                                    &classified,
+                                    quoted_string_attrs,
+                                    None,
+                                    session,
+                                    None,
+                                    None,
+                                )
+                            }
+                            ValidatableKind::DataSource => {
+                                admission::attributes::admit_validation_attributes::<
+                                    admission::kind::DataSourceAttribute,
+                                    _,
+                                    _,
+                                >(
+                                    schema,
+                                    id,
+                                    &classified,
+                                    quoted_string_attrs,
+                                    None,
+                                    session,
+                                    None,
+                                    None,
+                                )
+                            }
+                        }
+                    }),
+                    context.diagnostics,
+                );
+                &checked
+            };
+            let symbolic = values
+                .symbolic_errors()
+                .map(|(name, path, _)| (name, path))
+                .collect::<HashSet<_>>();
+            for (error, path) in values.errors_with_paths() {
+                if path.is_some_and(|(name, _)| values.is_retained_failure(name)) {
+                    continue;
+                }
+                let rendered_symbolically =
+                    context.admissions.is_some() && path.is_some_and(|key| symbolic.contains(&key));
+                if !rendered_symbolically {
+                    context.all_errors.push(format!("{id}: {error}"));
+                }
             }
             context.all_errors.extend(
                 classification_errors
@@ -5077,6 +5113,33 @@ pub fn validate_resources<
     registry: &SchemaRegistry,
     known_providers: &HashSet<String>,
     provider_context: &ProviderContext,
+    diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
+) -> Result<(), String> {
+    validate_resources_from_report(
+        parsed,
+        registry,
+        known_providers,
+        provider_context,
+        None,
+        diagnostics,
+    )
+}
+
+fn validate_resources_from_report<
+    E,
+    P: PlaceholderKind,
+    T: PlaceholderKind,
+    D: crate::parser::DeferredForPhaseTraversal<P, T, B>,
+    B: BindingAddress,
+>(
+    parsed: &crate::parser::File<E, P, T, D, B>,
+    registry: &SchemaRegistry,
+    known_providers: &HashSet<String>,
+    provider_context: &ProviderContext,
+    admissions: Option<
+        &HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
+    >,
+    diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<(), String> {
     let mut all_errors = Vec::new();
     // A standalone module receives its providers from the caller, so schema
@@ -5116,6 +5179,8 @@ pub fn validate_resources<
             known_providers,
             provider_context,
             all_errors: &mut all_errors,
+            diagnostics,
+            admissions,
         };
         for rref in parsed.iter_all_resources() {
             // A deferred for-expression template body is always managed —
@@ -5203,8 +5268,60 @@ pub fn validate_resource_ref_types<
     judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     _argument_names: &HashSet<String>,
     bindings: &BindingIndex<'_, B>,
+    diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
 ) -> Result<(), ResourceRefTypeValidationError> {
-    validate_resource_ref_types_inner(judged, bindings)
+    let report = resource_admission_report(judged, bindings, diagnostics)?;
+    validation_messages_result(report.references)
+}
+
+fn validation_messages_result(errors: Vec<String>) -> Result<(), ResourceRefTypeValidationError> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ResourceRefTypeValidationError::Validation(
+            errors.join("\n"),
+        ))
+    }
+}
+
+/// Validate resource/data-source attributes once, then render value and
+/// reference findings from that report for CLI callers.
+pub fn validate_resource_admissions<
+    E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
+    B: BindingAddress,
+    D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
+>(
+    judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
+    bindings: &BindingIndex<'_, B>,
+    known_providers: &HashSet<String>,
+    diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
+) -> Result<(), ResourceRefTypeValidationError> {
+    let report = resource_admission_report(judged, bindings, diagnostics)?;
+    let mut errors = Vec::new();
+    if let Err(values) = validate_resources_from_report(
+        judged.file(),
+        judged.schemas(),
+        known_providers,
+        bindings.provider_context(),
+        Some(&report.attributes),
+        diagnostics,
+    ) {
+        errors.push(values);
+    }
+    errors.extend(report.references);
+    validation_messages_result(errors)
+}
+
+fn publish_admission_diagnostics<T>(
+    result: deferred_types::ProviderTypeCheckResult<T>,
+    sink: &mut (impl deferred_types::ProviderTypeCheckSink + ?Sized),
+) -> T {
+    result.publish(sink)
+}
+
+struct ResourceAdmissionReport {
+    attributes: HashMap<crate::resource::ResourceId, crate::schema::ResourceValueValidation>,
+    references: Vec<String>,
 }
 
 /// Recover the lexical type of a bare value that became an entire reference
@@ -5257,17 +5374,19 @@ fn module_resource_ref_declaration<'a, E, D, B: BindingAddress>(
     })
 }
 
-fn validate_resource_ref_types_inner<
+fn resource_admission_report<
     E: crate::parser::ExportParamLike<ParserPlaceholder, B>,
     B: BindingAddress,
     D: crate::parser::DeferredForPhaseTraversal<ParserPlaceholder, ParserPlaceholder, B>,
 >(
     judged: &crate::parser::retained::JudgedFile<'_, E, D, B>,
     bindings: &BindingIndex<'_, B>,
-) -> Result<(), ResourceRefTypeValidationError> {
+    diagnostics: &mut dyn deferred_types::ProviderTypeCheckSink,
+) -> Result<ResourceAdmissionReport, ResourceRefTypeValidationError> {
     let parsed = judged.file();
     let registry = judged.schemas();
     let mut all_errors = Vec::new();
+    let mut attributes = HashMap::new();
     let inference_bindings = inference::bindings_from_parsed(parsed);
     let report = parsed.expression_report();
     let tree = crate::parser::AnalysisTree::try_from_file(parsed)?;
@@ -5283,216 +5402,138 @@ fn validate_resource_ref_types_inner<
         all_errors.push(message);
     }
 
-    let mut validate_resource =
-        |resource_id: &crate::resource::ResourceId,
-         resource_location: String,
-         attrs: &indexmap::IndexMap<String, GenericValue<ParserPlaceholder, B>>,
-         validated_schema: crate::schema::OwnerBoundResourceSchema<'_>,
-         module_source: Option<&crate::resource::ModuleSource>| {
-            let report = match report.for_resource(resource_id) {
-                Ok(report) => report,
-                Err(error) => {
-                    all_errors.push(error.to_string());
-                    return;
-                }
-            };
-            for (attr_name, attr_value) in attrs {
-                let expression =
-                    tree.resources()
-                        .find(|resource| resource.id() == resource_id)
-                        .ok_or_else(|| {
-                            crate::parser::retained::MissingEvidence::new(format!(
-                                "resource {resource_id}"
-                            ))
-                        })
-                        .and_then(|resource| {
-                            report.expression(resource.attribute_value_location(
-                                attr_name,
-                                &crate::schema::FieldPath::new(),
-                            ))
-                        });
-                let expression = match expression {
-                    Ok(expression) => expression,
-                    Err(error) => {
-                        all_errors.push(error.to_string());
+    publish_admission_diagnostics(
+        crate::validation::deferred_types::TypeCheckSession::run(
+            bindings.provider_context(),
+            |session| {
+                // Match the main-branch project walk. Parser-side deferred read
+                // templates are checked at expansion, not admitted here.
+                for resource in tree.project_resources() {
+                    let Some(schema) = resource.schema(registry) else {
                         continue;
-                    }
-                };
-                let assignment_value = expression.assignment_value(attr_value);
-                let declared_source = module_source
-                    .and_then(crate::resource::ModuleSource::module_call)
-                    .and_then(|_call| {
-                        module_resource_ref_declaration(
-                            parsed,
-                            resource_id,
-                            attr_name,
-                            assignment_value,
-                            bindings,
-                        )
-                    });
-                let effective_sink = validated_schema
-                    .effective_attribute_by_authored_name(attr_name)
-                    .map(|attribute| attribute.value_type());
-                let sink = effective_sink.clone().map(|effective| {
-                    RefSink::from_effective_type(effective, validated_schema.schema_type_owner())
-                });
-                let interpolation_sink = lift_type_expr(&INTERPOLATION_REF_SINK)
-                    .expect("built-in interpolation operand types lift");
-                let reference_diagnostics = collect_ref_diagnostics_with_sink(
-                    assignment_value,
-                    sink,
-                    &mut |reference, sink, usage, _candidate_value, reference_findings| {
-                        let context = ResourceReferenceContext {
-                            location: ReferenceFindingLocation::Resource {
-                                location: resource_location.clone(),
-                                attribute: attr_name.clone(),
-                            },
-                            bindings,
-                            declared_source: declared_source.as_ref().map(|(_, source)| source),
-                            interpolation_sink: &interpolation_sink,
-                        };
-                        reference_findings
-                            .extend(check_resource_reference(&context, reference, sink, usage));
-                    },
-                );
-                all_errors.extend(
-                    reference_diagnostics
-                        .into_iter()
-                        .map(|finding| finding.to_string()),
-                );
-                let access_diagnostics = visit_computed_accesses_with_sink(
-                    assignment_value,
-                    sink,
-                    &mut |access, sink| {
-                        if matches!(
-                            access,
-                            GenericValue::Deferred(
-                                crate::resource::DeferredValue::IntegerArithmetic(_)
-                            )
-                        ) {
-                            return Vec::new();
-                        }
-                        let sink_type = match sink {
-                            Some(RefSink::EffectiveType {
-                                attr_type,
-                                defs,
-                                ancestry: _,
-                                owner,
-                            }) => attr_type.in_schema(defs).with_authority(
-                                &bindings.provider_context().custom_types,
-                                crate::schema::SinkAuthority::Owner(owner),
-                            ),
-                            Some(RefSink::Interpolation) => interpolation_sink
-                                .assignment_sink(&bindings.provider_context().custom_types),
-                            Some(RefSink::TypeExpr(_)) | None => return Vec::new(),
-                        };
-                        let checked = match declared_source.as_ref() {
-                        Some((name, declared)) => match declared.assignment_to_sink(sink_type, bindings) {
-                            crate::binding_index::DeclaredValueAssignment::Assignable
-                            | crate::binding_index::DeclaredValueAssignment::IncomingBoundaryMismatch => Ok(()),
-                            crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Mismatch(mismatch)) => Err(DeferredAccessTypeError::TypeMismatch {
-                                types: mismatch.type_names().clone(), origin: format!("from {name}"),
-                            }),
-                            crate::binding_index::DeclaredValueAssignment::Rejected(RefTypeAssignabilityError::Unchecked(reason)) => Err(unchecked_assignment_error(reason)),
-                        },
-                        None => check_deferred_access_type(access, sink_type,
-                            if std::ptr::eq(access, assignment_value)
-                                && expression.check_owner() == crate::parser::retained::ExpressionCheckOwner::BindingIndex
-                                && sink.is_some_and(|sink| expression.for_sink(&sink.expression_type(), bindings.provider_context()).requires_declared_assignment())
-                            {
-                                // A substituted parameter keeps its declared evidence.
-                                // The caller's projected access belongs to another instance.
-                                expression
-                            } else {
-                                match access { GenericValue::Deferred(crate::resource::DeferredValue::Access(access)) => match report.access(access) { Ok(evidence) => evidence, Err(error) => { return vec![ComputedAccessDiagnostic::MissingEvidence(error)]; } }, _ => expression }
-                            }, registry, bindings),
                     };
-                        checked
-                            .err()
-                            .into_iter()
-                            .map(|error| ComputedAccessDiagnostic::Assignment {
-                                location: resource_location.to_string(),
-                                attribute: attr_name.clone(),
-                                error,
-                            })
-                            .collect()
-                    },
-                );
-                all_errors.extend(
-                    access_diagnostics
-                        .into_iter()
-                        .map(|diagnostic| diagnostic.to_string()),
-                );
-                if let Some(effective_sink) = effective_sink {
-                    for finding in check_integer_arithmetic_types(
-                        attr_value,
-                        effective_sink,
-                        validated_schema.schema_type_owner(),
-                        report,
-                        bindings,
-                    ) {
-                        if declaration_arithmetic_findings
-                            .contains(&(finding.location().clone(), finding.to_string()))
-                        {
+                    let attrs = resource.attributes();
+                    let classified = crate::resource::knowledge::collect_classified_attributes(
+                        attrs.iter().map(|(name, value)| (name.clone(), value)),
+                        &crate::resource::knowledge::KnowledgeContext::validation(),
+                        |_, _| {},
+                    );
+                    let report = match report.for_resource(resource.id()) {
+                        Ok(report) => report,
+                        Err(error) => {
+                            all_errors.push(error.to_string());
                             continue;
                         }
-                        match finding.error() {
-                            DeferredAccessTypeError::InvalidAccess { .. } => {
-                                all_errors.push(format!("{}: {}", resource_location, finding));
-                            }
-                            DeferredAccessTypeError::TypeMismatch { types, origin } => {
-                                all_errors.push(format!(
-                                    "{}: cannot assign {} to '{}': {} ({})",
-                                    resource_location,
-                                    types.actual(),
-                                    attr_name,
+                    };
+                    let values = admission::attributes::resource_attribute_admissions(
+                        resource,
+                        parsed,
+                        schema,
+                        &classified,
+                        resource.quoted_string_attrs(),
+                        report,
+                        bindings,
+                        session,
+                        registry,
+                    );
+                    let location = resource.diagnostic_label();
+                    for (attribute, path, error) in values.symbolic_errors() {
+                        match error {
+                            TypeError::Reference { error, .. } => match error.as_ref() {
+                                SecretDiagnosticError::Public(
+                                    admission::AdmissionReferenceError::Arithmetic(finding),
+                                ) => {
+                                    if !declaration_arithmetic_findings.contains(&(
+                                        finding.location().clone(),
+                                        finding.to_string(),
+                                    )) {
+                                        all_errors.push(finding.to_string());
+                                    }
+                                }
+                                SecretDiagnosticError::Public(
+                                    admission::AdmissionReferenceError::Computed(
+                                        DeferredAccessTypeError::TypeMismatch { types, origin },
+                                    ),
+                                ) => {
+                                    let message = reference_type_mismatch_message(
+                                        Some(attribute),
+                                        types,
+                                        Some(origin),
+                                    );
+                                    all_errors.push(format!("{location}: {message}"));
+                                }
+                                SecretDiagnosticError::Public(
+                                    admission::AdmissionReferenceError::Computed(
+                                        DeferredAccessTypeError::InvalidAccess { error },
+                                    ),
+                                ) => {
+                                    all_errors.push(format!("{location}: {error}"));
+                                }
+                                SecretDiagnosticError::Public(
+                                    admission::AdmissionReferenceError::UnknownBinding { .. }
+                                    | admission::AdmissionReferenceError::Path(_),
+                                ) => all_errors.push(format!("{location}: {error}")),
+                                SecretDiagnosticError::Public(_)
+                                | SecretDiagnosticError::InsideSecret => {
+                                    all_errors.push(format!("{location}.{attribute}: {error}"))
+                                }
+                            },
+                            TypeError::TypeMismatch { types } => {
+                                let mut references = Vec::new();
+                                let leaf = path.segments().iter().try_fold(
+                                    &attrs[attribute],
+                                    |value, step| match (value, step) {
+                                        (
+                                            GenericValue::Concrete(
+                                                crate::resource::ConcreteValue::List(values),
+                                            ),
+                                            crate::schema::LeafPathSegment::ListIndex(index),
+                                        ) => values.get(*index),
+                                        (
+                                            GenericValue::Concrete(
+                                                crate::resource::ConcreteValue::Map(values),
+                                            ),
+                                            crate::schema::LeafPathSegment::StructField(name),
+                                        ) => values.get(name.as_str()),
+                                        (
+                                            GenericValue::Concrete(
+                                                crate::resource::ConcreteValue::Map(values),
+                                            ),
+                                            crate::schema::LeafPathSegment::MapKey(key),
+                                        ) => values.get(key.expose_plaintext()),
+                                        _ => None,
+                                    },
+                                );
+                                if let Some(leaf) = leaf {
+                                    leaf.visit_resource_refs_for_diagnostics(
+                                        &mut |reference, _| {
+                                            references
+                                                .push(reference.diagnostic_path().to_dot_string())
+                                        },
+                                    );
+                                    leaf.visit_binding_refs_for_diagnostics(&mut |binding| {
+                                        references.push(binding.diagnostic_path().to_dot_string())
+                                    });
+                                }
+                                let origin = references.first().map(|path| format!("from {path}"));
+                                let message = reference_type_mismatch_message(
+                                    Some(attribute),
                                     types,
-                                    origin,
-                                ));
+                                    origin
+                                        .as_ref()
+                                        .map(|origin| origin as &dyn std::fmt::Display),
+                                );
+                                all_errors.push(format!("{location}: {message}"));
                             }
+                            error => all_errors.push(format!("{location}.{attribute}: {error}")),
                         }
                     }
+                    attributes.insert(resource.id().clone(), values);
                 }
-            }
-        };
-
-    for rref in parsed.iter_all_resources() {
-        // A deferred for-expression template body is always managed.
-        let (schema, module_source) = match rref {
-            ResourceRef::LiveComposition(_) => continue,
-            ResourceRef::DataSource(d) => {
-                (registry.get_for_data_source(d), d.module_source.as_ref())
-            }
-            ResourceRef::Resource(m) => (registry.get_for(m), m.module_source.as_ref()),
-            ResourceRef::Deferred {
-                resource: m,
-                deferred: _deferred,
-            } => (registry.get_for(m.as_resource()), m.module_source()),
-        };
-        let Some(validated_schema) = schema else {
-            continue;
-        };
-        let resource_id = rref.id();
-        let resource_location = match rref.context() {
-            ResourceContext::Direct => resource_id.to_string(),
-            ResourceContext::Deferred(deferred) => {
-                format!(
-                    "for-body `{}` {}",
-                    D::deferred_header(deferred),
-                    resource_id
-                )
-            }
-        };
-
-        let attrs = rref.attributes();
-        validate_resource(
-            resource_id,
-            resource_location,
-            attrs.as_ref(),
-            validated_schema,
-            module_source,
-        );
-    }
+            },
+        ),
+        diagnostics,
+    );
 
     if parsed.deferred_for_sites().next().is_some() {
         all_errors.extend(
@@ -5507,13 +5548,10 @@ fn validate_resource_ref_types_inner<
         );
     }
 
-    if all_errors.is_empty() {
-        Ok(())
-    } else {
-        Err(ResourceRefTypeValidationError::Validation(
-            all_errors.join("\n"),
-        ))
-    }
+    Ok(ResourceAdmissionReport {
+        attributes,
+        references: all_errors,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

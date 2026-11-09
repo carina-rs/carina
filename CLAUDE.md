@@ -296,8 +296,12 @@ controls and passes owned inputs into the library.
 Run `scripts/test-in-process-isolation.sh` to check the CLI library, CLI binary
 unit tests, and mock library with eight libtest threads per process. It discovers
 executables through nextest and uses the same disposable HOME/TMPDIR setup as
-nextest; it does not use plain `cargo test`. CI runs it after nextest in the
-required `Test` job, reusing that job's WASM fixtures.
+nextest; it does not use plain `cargo test`. Both local discovery and CI's
+archive use `--workspace --all-features`, then select the same three suites.
+CI builds the test archive and WASM fixtures once, runs nextest partitions and
+in-process isolation from those artifacts, and runs provider-cause API checks
+and doctests in separate parallel jobs. The required `Test` job aggregates all
+of their results.
 
 ```bash
 # CLI commands — path defaults to cwd; if given, it must be a DIRECTORY, not a file
@@ -356,13 +360,15 @@ cheap once nextest has compiled the crates — public API doctests in
 `carina-core/src/utils.rs` and elsewhere are not covered by nextest, so
 always run it before declaring verify done.
 
-> CI's `Test` job runs `cargo build -p carina-provider-mock -p
-> carina-provider-mock-http --target wasm32-wasip2` *before* the test step,
-> but that build targets a different platform than the test step (host), so
-> it is not redundant — it produces the WASM fixtures that
-> `carina-plugin-host`'s integration tests load (`carina-provider-mock-http`
-> is the wasi:http guest used by the send-phase tests, carina#4057). Do not
-> generalize from that step to local development.
+> CI's archive build job runs `cargo build -p carina-provider-mock -p
+> carina-provider-mock-http --target wasm32-wasip2` and archives the host test
+> binaries. These target different platforms: the WASM build produces fixtures
+> loaded by `carina-plugin-host` integration tests, including the wasi:http guest
+> used by send-phase tests (carina#4057). Partitions and the separate isolation
+> job download both artifacts; provider-cause checks and doctests run in their
+> own jobs, and the required `Test` job aggregates the results. On main pushes,
+> the archive build job only compiles to warm its cache. Do not generalize the
+> fixture build to local builds.
 
 ## Incremental Build Strategy
 

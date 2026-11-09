@@ -2529,3 +2529,447 @@ fn r4_authored_resource_root_requires_its_named_constructor() {
         )]
     );
 }
+
+fn unavailable_candidate() -> crate::resource::AuthoredValue {
+    Value::Deferred(DeferredValue::Unavailable {
+        name: crate::builtins::BuiltinFunction::env,
+        args: vec![],
+        reason: crate::resource::UnavailableReason::from_builtin_error(
+            "private-unavailable-reason".into(),
+        ),
+        source_line: 7.into(),
+    })
+}
+
+#[test]
+fn unavailable_search_preserves_saved_scope_and_coalesce_policies() {
+    let unavailable = unavailable_candidate();
+    let fallback = |value| {
+        Value::Deferred(DeferredValue::Coalesce {
+            value: Box::new(Value::resource_ref("origin", "comment", vec![])),
+            default: Box::new(value),
+        })
+    };
+    for (candidate, inside) in [
+        (unavailable.clone(), false),
+        (unavailable.clone().into_secret(), true),
+        (fallback(unavailable.clone()), false),
+        (fallback(unavailable.clone().into_secret()), true),
+    ] {
+        assert!(contains_unavailable(&candidate, UnavailableSearchPolicy::SavedCandidate).unwrap());
+        assert_eq!(
+            contains_unavailable(&candidate, UnavailableSearchPolicy::SavedSecret).unwrap(),
+            inside
+        );
+    }
+    assert!(
+        find_required_unavailable(
+            &fallback(unavailable),
+            crate::config_loader::strict_resolution_context()
+        )
+        .unwrap()
+        .is_none()
+    );
+    // OnlyInside ignored an outer public failure but still searched its args.
+    let outer = Value::Deferred(DeferredValue::Unavailable {
+        name: crate::builtins::BuiltinFunction::upper,
+        args: vec![crate::resource::FunctionArgument::from_value(
+            unavailable_candidate().into_secret(),
+        )],
+        reason: crate::resource::UnavailableReason::from_builtin_error("outer".into()),
+        source_line: 1.into(),
+    });
+    assert!(contains_unavailable(&outer, UnavailableSearchPolicy::SavedSecret).unwrap());
+}
+
+#[test]
+fn unavailable_search_checks_both_module_if_branches() {
+    for (then_value, else_value) in [
+        (
+            unavailable_candidate(),
+            Value::Concrete(ConcreteValue::Bool(true)),
+        ),
+        (
+            Value::Concrete(ConcreteValue::Bool(true)),
+            unavailable_candidate(),
+        ),
+    ] {
+        let value = Value::Deferred(DeferredValue::ModuleIf(Box::new(
+            crate::parser::DeferredValueIf::new(
+                crate::parser::DeferredIfCondition::new(
+                    Value::Concrete(ConcreteValue::Bool(true)),
+                    "if.crn".into(),
+                    1,
+                ),
+                then_value,
+                else_value,
+            ),
+        )));
+        assert!(
+            find_required_unavailable(&value, crate::config_loader::strict_resolution_context())
+                .unwrap()
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn unavailable_search_ignores_captured_code_and_checks_call_arguments() {
+    let file = crate::parser::parse(
+        "fn captured(): String { 'ok' }",
+        &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+    )
+    .unwrap();
+    let mut function = file.user_functions["captured"].clone();
+    function.body.value = unavailable_candidate().into_secret();
+    let mut scope_function = function.clone();
+    scope_function.name = "unused".into();
+    let functions = Arc::new(HashMap::from([("unused".into(), scope_function)]));
+    let mut value = Value::Deferred(DeferredValue::ResolvedFunctionCall {
+        function: Arc::new(function),
+        functions,
+        args: vec![],
+        source_line: 1.into(),
+    });
+    assert!(!contains_unavailable(&value, UnavailableSearchPolicy::SavedCandidate).unwrap());
+    assert!(!contains_unavailable(&value, UnavailableSearchPolicy::SavedSecret).unwrap());
+    assert!(
+        find_required_unavailable(&value, crate::config_loader::strict_resolution_context())
+            .unwrap()
+            .is_none()
+    );
+    if let Value::Deferred(DeferredValue::ResolvedFunctionCall { args, .. }) = &mut value {
+        args.push(crate::resource::FunctionArgument::from_value(
+            unavailable_candidate().into_secret(),
+        ));
+    }
+    assert!(matches!(
+        value,
+        Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+    ));
+    assert!(contains_unavailable(&value, UnavailableSearchPolicy::SavedCandidate).unwrap());
+    assert!(contains_unavailable(&value, UnavailableSearchPolicy::SavedSecret).unwrap());
+    assert!(
+        find_required_unavailable(&value, crate::config_loader::strict_resolution_context())
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn unavailable_search_protects_secret_diagnostics() {
+    let error = find_required_unavailable(
+        &unavailable_candidate().into_secret(),
+        crate::config_loader::strict_resolution_context(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        error
+            .to_string()
+            .contains(crate::resource::INSIDE_SECRET_MESSAGE)
+    );
+    for rendered in [error.to_string(), format!("{error:?}")] {
+        assert!(
+            !rendered.contains("private-unavailable-reason"),
+            "{rendered}"
+        );
+    }
+}
+
+#[test]
+fn parser_substitution_keeps_nested_call_error_location_and_protection() {
+    use crate::{
+        eval_value::UnexpandedStructuralHandle,
+        parser::{ParseError, ResourceTypePath},
+        resource::{AuthoredValue, FunctionArgument, ParserPlaceholder},
+    };
+
+    let parameter =
+        AuthoredValue::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnParam {
+            name: "input".into(),
+        }));
+    let value = AuthoredValue::Deferred(DeferredValue::FunctionCall {
+        name: crate::builtins::BuiltinFunction::upper,
+        args: vec![FunctionArgument::from_value(Value::Concrete(
+            ConcreteValue::List(vec![parameter]),
+        ))],
+        source_line: 29.into(),
+    });
+    let substitutions = HashMap::from([(
+        "input".into(),
+        FunctionArgument::from_handle(UnexpandedStructuralHandle::module_parameter(
+            "private-handle-2715",
+            ResourceTypePath::new("mock", "test.resource"),
+        )),
+    )]);
+    let error = crate::value_walk::substitute_function_parameters(
+        &value,
+        &substitutions,
+        1,
+        crate::value_walk::RewritePosition::Value,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ParseError::InvalidExpression { line: 29, .. }),
+        "{error}"
+    );
+    let error = crate::value_walk::substitute_function_parameters(
+        &value.into_secret(),
+        &substitutions,
+        1,
+        crate::value_walk::RewritePosition::Value,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(crate::resource::INSIDE_SECRET_MESSAGE)
+    );
+    assert!(!format!("{error:?} {error}").contains("private-handle-2715"));
+}
+
+#[test]
+fn parser_substitution_preserves_captured_lexical_scopes_and_arc_identity() {
+    use crate::resource::{AuthoredValue, FunctionArgument, ParserPlaceholder};
+
+    let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let file = crate::parser::parse(
+        "fn nested(input: String): String { let local = input secret(local) }",
+        &context,
+    )
+    .unwrap();
+    let function = Arc::new(file.user_functions["nested"].clone());
+    let functions = Arc::new(file.user_functions);
+    let parameter =
+        AuthoredValue::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnParam {
+            name: "input".into(),
+        }));
+    let call = AuthoredValue::Deferred(DeferredValue::ResolvedFunctionCall {
+        function: function.clone(),
+        functions: functions.clone(),
+        args: vec![FunctionArgument::from_value(parameter)],
+        source_line: 17.into(),
+    })
+    .into_secret();
+    let replacement =
+        AuthoredValue::Concrete(ConcreteValue::String("private-lexical-input".into()));
+    let substitutions = HashMap::from([(
+        "input".into(),
+        FunctionArgument::from_value(replacement.clone()),
+    )]);
+    let rewritten = crate::value_walk::substitute_function_parameters(
+        &call,
+        &substitutions,
+        1,
+        crate::value_walk::RewritePosition::Value,
+    )
+    .unwrap();
+    assert!(!format!("{rewritten:?}").contains("private-lexical-input"));
+    assert!(matches!(
+        &rewritten,
+        Value::Deferred(DeferredValue::Secret(_))
+    ));
+    if let Value::Deferred(DeferredValue::Secret(payload)) = &rewritten {
+        assert!(matches!(
+            payload.plaintext_for_test(),
+            Value::Deferred(DeferredValue::ResolvedFunctionCall { .. })
+        ));
+        if let Value::Deferred(DeferredValue::ResolvedFunctionCall {
+            function: callee,
+            functions: scope,
+            args,
+            ..
+        }) = payload.plaintext_for_test()
+        {
+            assert!(Arc::ptr_eq(callee, &function));
+            assert!(Arc::ptr_eq(scope, &functions));
+            assert_eq!(args[0].walker_value(), &replacement);
+        }
+    }
+}
+
+#[test]
+fn parser_policy_selection_preserves_secret_and_does_not_evaluate_inactive_operands() {
+    use crate::{
+        parser::{DeferredIfCondition, DeferredValueIf, ParseError},
+        resource::{AuthoredValue, ParserPlaceholder, RelativeBindingName},
+    };
+
+    struct Select;
+    impl ParserRewrite<RelativeBindingName> for Select {
+        type Error = ParseError;
+        fn error(&mut self, error: ParseError) -> ParseError {
+            error
+        }
+        fn source_line(&self) -> usize {
+            1
+        }
+        fn leaf(
+            &mut self,
+            _: &LeafInput<'_, Transform, ParserPlaceholder, RelativeBindingName>,
+            _: RewritePosition,
+        ) -> Result<Option<AuthoredValue>, ParseError> {
+            Err(ParseError::UserFunctionError(
+                "private-inactive-operand".into(),
+            ))
+        }
+        fn select(
+            &mut self,
+            kind: ExpressionKind,
+            _: &AuthoredValue,
+            _: Option<(&std::path::Path, usize)>,
+        ) -> Result<Option<usize>, ParseError> {
+            Ok(if kind == ExpressionKind::ModuleIf {
+                Some(1)
+            } else if kind == ExpressionKind::Coalesce {
+                Some(0)
+            } else {
+                None
+            })
+        }
+    }
+    let inactive =
+        AuthoredValue::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnParam {
+            name: "unused".into(),
+        }))
+        .into_secret();
+    let selected = AuthoredValue::Concrete(ConcreteValue::Int(42)).into_secret();
+    let conditional =
+        AuthoredValue::Deferred(DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
+            DeferredIfCondition::new(
+                AuthoredValue::Concrete(ConcreteValue::Bool(true)),
+                "if.crn".into(),
+                1,
+            ),
+            selected.clone(),
+            inactive.clone(),
+        ))));
+    let coalesce = AuthoredValue::Deferred(DeferredValue::Coalesce {
+        value: Box::new(selected.clone()),
+        default: Box::new(inactive),
+    });
+    for expression in [conditional, coalesce] {
+        let result =
+            rewrite_parser_value(&expression, RewritePosition::Value, &mut Select).unwrap();
+        assert_eq!(result, selected);
+    }
+}
+
+#[test]
+fn parser_policy_callbacks_are_confined_to_the_kernel() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let adapter = std::fs::read_to_string(root.join("value_walk/substitution.rs")).unwrap();
+    assert!(adapter.contains("pub(super) trait ParserRewrite"));
+    assert!(adapter.contains("pub(super) fn rewrite_parser_value"));
+    for owner in ["parser/functions.rs", "module_resolver/expander.rs"] {
+        let source = std::fs::read_to_string(root.join(owner)).unwrap();
+        assert!(
+            !source.contains("ParserRewrite"),
+            "{owner} can receive raw protected nodes"
+        );
+        assert!(
+            !source.contains("rewrite_parser_value"),
+            "{owner} can supply raw-node callbacks"
+        );
+    }
+}
+
+#[test]
+fn substitution_if_branches_inside_access_bases_remain_value_positions() {
+    use crate::eval_value::UnexpandedStructuralHandle;
+    use crate::parser::{DeferredIfCondition, DeferredValueIf, ResourceTypePath};
+    use crate::resource::{AuthoredValue, FunctionArgument, ParserPlaceholder, PathSegment};
+    let parameter = |name: &str| {
+        AuthoredValue::Deferred(DeferredValue::Placeholder(ParserPlaceholder::FnParam {
+            name: name.into(),
+        }))
+    };
+    let conditional =
+        AuthoredValue::Deferred(DeferredValue::ModuleIf(Box::new(DeferredValueIf::new(
+            DeferredIfCondition::new(parameter("c"), "branches.crn".into(), 7),
+            parameter("p"),
+            parameter("q"),
+        ))));
+    let body = crate::resource::apply_postfix_access(
+        conditional,
+        PathSegment::Field {
+            name: "field".into(),
+        },
+        7,
+        crate::resource::AccessMissPolicy::Error,
+    )
+    .unwrap();
+    let substitutions = HashMap::from([
+        (
+            "c".into(),
+            FunctionArgument::from_value(AuthoredValue::Concrete(ConcreteValue::Bool(true))),
+        ),
+        (
+            "p".into(),
+            FunctionArgument::from_handle(UnexpandedStructuralHandle::module_parameter(
+                "resource",
+                ResourceTypePath::new("mock", "test.resource"),
+            )),
+        ),
+        (
+            "q".into(),
+            FunctionArgument::from_value(AuthoredValue::Concrete(ConcreteValue::Map(
+                indexmap::indexmap! {
+                    "field".into() => AuthoredValue::Concrete(ConcreteValue::String("value".into())),
+                },
+            ))),
+        ),
+    ]);
+    let error = crate::value_walk::substitute_function_parameters(
+        &body,
+        &substitutions,
+        7,
+        crate::value_walk::RewritePosition::Value,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Invalid expression at line 7: 'p' is a resource handle, not a value; reference one of its attributes, e.g. 'p.<attribute>'"
+    );
+}
+
+#[test]
+fn r5_function_path_substitution_preserves_authored_reference_locations() {
+    use crate::resource::{AuthoredValue, FunctionArgument};
+    let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
+    let parsed = crate::parser::parse_file(
+        "let source = mock.test.resource {}\nlet input = source.field\n",
+        std::path::Path::new("reference.crn"),
+        &context,
+    )
+    .unwrap();
+    let input = &parsed.variables["input"];
+    assert!(
+        matches!(
+            input,
+            AuthoredValue::Deferred(DeferredValue::ResourceRef { .. })
+        ),
+        "expected reference: {input:?}"
+    );
+    if let AuthoredValue::Deferred(DeferredValue::ResourceRef { path }) = input {
+        let locations = path.reference_locations().cloned().unwrap();
+        let replacement = AuthoredValue::resource_ref("target", "name", vec![]);
+        let substitutions = HashMap::from([(
+            "source".into(),
+            FunctionArgument::from_value(AuthoredValue::Concrete(ConcreteValue::Map(
+                indexmap::IndexMap::from([("field".into(), replacement)]),
+            ))),
+        )]);
+        let rewritten = crate::value_walk::substitute_function_parameters(
+            input,
+            &substitutions,
+            2,
+            crate::value_walk::RewritePosition::Value,
+        )
+        .unwrap();
+        assert!(
+            matches!(rewritten, AuthoredValue::Deferred(DeferredValue::ResourceRef { path }) if path.binding() == "target" && path.reference_locations() == Some(&locations))
+        );
+    }
+}

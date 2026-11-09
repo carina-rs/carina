@@ -7,7 +7,9 @@ use crate::output_style::Colorize;
 use clap_complete::engine::{ArgValueCompleter, CompletionCandidate};
 use futures::stream::{FuturesUnordered, StreamExt};
 
-use carina_core::config_loader::load_configuration_with_config;
+use carina_core::config_loader::{
+    load_configuration_for_bootstrap, load_configuration_with_config,
+};
 use carina_core::data_source_value::DataSourceValue;
 #[cfg(test)]
 use carina_core::deps::sort_resources_by_dependencies;
@@ -459,7 +461,7 @@ async fn run_state_migration_check(
     let project = carina_core::paths::ResolvedPath::new(config_dir)
         .map_err(|error| AppError::Config(error.to_string()))?;
     let base_dir = &project;
-    let loaded = load_configuration_with_config(
+    let loaded = load_configuration_for_bootstrap(
         base_dir,
         &ProviderContext::new(runtime.environment().clone()),
         &carina_core::schema::SchemaRegistry::new(),
@@ -622,7 +624,7 @@ pub async fn run_state_forget(
     let project = carina_core::paths::ResolvedPath::new(path)
         .map_err(|error| AppError::Config(error.to_string()))?;
     let base_dir = &project;
-    let loaded = load_configuration_with_config(
+    let loaded = load_configuration_for_bootstrap(
         base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
@@ -765,7 +767,7 @@ pub async fn run_force_unlock(
     let project = carina_core::paths::ResolvedPath::new(path)
         .map_err(|error| AppError::Config(error.to_string()))?;
     let base_dir = &project;
-    let parsed = load_configuration_with_config(
+    let parsed = load_configuration_for_bootstrap(
         base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
@@ -837,7 +839,7 @@ async fn load_state_file(
     let project = carina_core::paths::ResolvedPath::new(path)
         .map_err(|error| AppError::Config(error.to_string()))?;
     let base_dir = &project;
-    let loaded = load_configuration_with_config(
+    let loaded = load_configuration_for_bootstrap(
         base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),

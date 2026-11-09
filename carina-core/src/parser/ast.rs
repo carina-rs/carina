@@ -1809,7 +1809,8 @@ impl DeferredForExpansionError {
                 expression,
                 error,
             },
-            error @ crate::resolver::ResolutionError::Context { .. } => Self::Evaluation {
+            error @ (crate::resolver::ResolutionError::Context { .. }
+            | crate::resolver::ResolutionError::AdmissionConstraints(_)) => Self::Evaluation {
                 line,
                 expression,
                 error: Box::new(error),

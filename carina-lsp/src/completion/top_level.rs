@@ -375,10 +375,15 @@ impl CompletionProvider {
                     &self.schemas,
                 ),
         };
-        carina_core::config_loader::parse_directory(&module_path, &provider_context)
-            .ok()
-            .map(|directory| directory.into_parsed())
-            .filter(|parsed| !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty())
+        carina_core::config_loader::parse_directory_for_metadata(
+            &module_path,
+            &provider_context,
+            &std::collections::HashMap::new(),
+            &self.schemas,
+        )
+        .ok()
+        .map(|directory| directory.into_parsed())
+        .filter(|parsed| !parsed.arguments.is_empty() || !parsed.attribute_params.is_empty())
     }
 
     pub(super) fn module_parameter_completions(

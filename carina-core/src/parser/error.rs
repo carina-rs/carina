@@ -149,6 +149,13 @@ pub enum ParseError {
     #[error(transparent)]
     UnavailableSecret(#[from] crate::resource::UnavailableSecretError),
 
+    #[error("value traversal failed")] // error-chain: caller-renders-sources
+    ValueWalk(
+        #[from]
+        #[source]
+        crate::value_walk::WalkError,
+    ),
+
     /// A semantic parse/evaluation error whose expression is owned by another
     /// file in the same directory. The inner error retains the precise line;
     /// this wrapper retains which document that line belongs to.
@@ -453,12 +460,12 @@ impl ParseError {
             ResolutionError::Message(message) => Self::InvalidExpression { line, message },
             ResolutionError::UnavailableSecret(error) => Self::UnavailableSecret(error),
             ResolutionError::InsideSecret {} => Self::InsideSecret { line },
-            error @ (ResolutionError::Knowledge(_) | ResolutionError::Context { .. }) => {
-                Self::Evaluation {
-                    line,
-                    error: Box::new(error),
-                }
-            }
+            error @ (ResolutionError::Knowledge(_)
+            | ResolutionError::AdmissionConstraints(_)
+            | ResolutionError::Context { .. }) => Self::Evaluation {
+                line,
+                error: Box::new(error),
+            },
         }
     }
     pub(crate) fn inside_secret_at(self, fallback_line: usize) -> Self {
@@ -475,6 +482,7 @@ impl ParseError {
                 )))
             }
             Self::UnavailableSecret(error) => Self::UnavailableSecret(error.inside_secret()),
+            Self::ValueWalk(error) => Self::ValueWalk(error),
             Self::InsideSecret { line } => Self::InsideSecret { line },
             error => {
                 let line = match error {

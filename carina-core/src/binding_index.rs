@@ -245,6 +245,24 @@ impl DeclaredValueAssignment {
 }
 
 impl DeclaredValueSource {
+    pub(crate) fn declaration_type(&self) -> TypeInSchema<'_, crate::schema::Compiled> {
+        TypeInSchema::schemaless(&self.declaration)
+    }
+
+    pub(crate) fn original(&self) -> &ResolvedRefType {
+        &self.original
+    }
+
+    pub(crate) fn incoming_mismatch<B: BindingAddress>(
+        &self,
+        bindings: &BindingIndex<'_, B>,
+    ) -> bool {
+        self.original.has_proven_mismatch_at(
+            self.declaration
+                .assignment_sink(&bindings.provider_context().custom_types),
+        )
+    }
+
     pub(crate) fn assignment_to_sink<B: BindingAddress>(
         &self,
         sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
@@ -309,6 +327,42 @@ impl RefTypeMismatch {
 }
 
 impl ResolvedRefType {
+    pub(crate) fn reference_assignment<'a>(
+        &'a self,
+        sink: crate::schema::AssignmentSink<'a, crate::schema::Compiled>,
+        mut judge: impl FnMut(
+            TypeInSchema<'a, crate::schema::Compiled>,
+        ) -> crate::schema::assignability::AssignmentRelation<'a>,
+    ) -> Result<crate::schema::assignability::AssignmentRelation<'a>, RefTypeMismatch> {
+        use crate::schema::assignability::AssignmentRelation;
+        let mut relations = Vec::new();
+        for (index, constraint) in self.constraints().enumerate() {
+            match judge(constraint) {
+                AssignmentRelation::Mismatch => {
+                    return Err(RefTypeMismatch {
+                        types: crate::schema::MismatchTypeNames::for_types(*sink, constraint),
+                        declared: (index > 0
+                            && self.authoritative.is_declared_composition_attribute())
+                        .then(|| self.display_type_name()),
+                    });
+                }
+                relation @ (AssignmentRelation::Assignable
+                | AssignmentRelation::NeedsLocal(_)
+                | AssignmentRelation::Unchecked(_)) => relations.push(relation),
+            }
+        }
+        Ok(AssignmentRelation::all(relations))
+    }
+
+    /// Admission must retain both the declaration and every forwarded source.
+    pub(crate) fn constraints(
+        &self,
+    ) -> impl Iterator<Item = TypeInSchema<'_, crate::schema::Compiled>> {
+        std::iter::once(self.authoritative.constraint())
+            .chain(&self.evidence)
+            .map(ResolvedTypeConstraint::type_in_schema)
+    }
+
     pub(crate) fn mismatch_type_names(
         &self,
         expected: TypeInSchema<'_, crate::schema::Compiled>,

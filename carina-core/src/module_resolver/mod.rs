@@ -27,7 +27,7 @@
 
 mod deferred_if;
 mod error;
-mod expander;
+pub(crate) mod expander;
 pub(crate) mod loader;
 mod resolver;
 mod signature;

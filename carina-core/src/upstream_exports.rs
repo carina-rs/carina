@@ -416,19 +416,22 @@ fn resolve_upstream_exports_with_context<B: BindingAddress>(
             out.insert(us.binding.clone(), HashMap::new());
             continue;
         }
-        match crate::config_loader::parse_directory_with_overrides(
+        match crate::config_loader::parse_directory_for_metadata(
             &source_abs,
             config.catalog(),
             &crate::config_loader::directory_source_overrides(&source_abs, overrides),
+            schemas.unwrap_or(&crate::schema::SchemaRegistry::new()),
         ) {
             Ok(parsed) => {
-                let mut parsed = parsed.into_parsed();
+                let parsed = parsed.try_update(|parsed| {
+                    crate::validation::resolve_file_type_exprs_best_effort(parsed, config)
+                })?;
                 // Normalize every consumer-visible declaration before module
                 // expansion and export inference. Inference compares the
                 // structural TypeExpr values it receives, so leaving one
                 // declaration as DottedUnresolved while an equivalent schema
                 // projection is already SchemaType creates a false mismatch.
-                crate::validation::resolve_file_type_exprs_best_effort(&mut parsed, config)?;
+
                 // Expand module calls before inference so that
                 // `attributes { ... }`-typed `Virtual` resources land in
                 // `parsed.resources` (#2493). Without this the inferer
@@ -2660,6 +2663,7 @@ mod tests {
                     configuration.judged(),
                     &std::collections::HashSet::new(),
                     &bindings,
+                    &mut Vec::new(),
                 )
                 .err()
                 .map(|joined| joined.to_string().lines().map(str::to_string).collect())
@@ -2894,7 +2898,7 @@ mod tests {
     }
 
     #[test]
-    fn type_check_leaves_ambiguous_map_shaped_union_without_a_nested_sink() {
+    fn type_check_rejects_reference_fitting_no_member_of_ambiguous_map_shaped_union() {
         let parsed = parse_project_with_provider(
             r#"
                 let orgs = upstream_state { source = "../organizations" }
@@ -2921,9 +2925,50 @@ mod tests {
 
         let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
 
+        assert_eq!(
+            errs.len(),
+            1,
+            "Int fits neither the Map value nor the Struct field, so validation must reject it: {errs:?}",
+        );
+        assert!(
+            errs[0].contains(
+                "cannot assign Int to 'name': expected String, got Int (from orgs.count)"
+            ),
+            "the rejection must name the attribute and reference origin: {errs:?}",
+        );
+    }
+
+    #[test]
+    fn type_check_accepts_reference_fitting_all_members_of_ambiguous_map_shaped_union() {
+        let parsed = parse_project_with_provider(
+            r#"
+                let orgs = upstream_state { source = "../organizations" }
+                test.r.res {
+                    name = { count = orgs.count }
+                }
+            "#,
+            "test",
+        );
+        let exports = mk_typed_exports(&[("orgs", &[("count", TypeExpr::String)])]);
+        let schemas = schema_with_attr(
+            "name",
+            PatternAttributeType::union(vec![
+                PatternAttributeType::map(PatternAttributeType::string()),
+                PatternAttributeType::struct_(
+                    "Count".to_string(),
+                    vec![
+                        PatternStructField::optional("count", PatternAttributeType::string())
+                            .build(),
+                    ],
+                ),
+            ]),
+        );
+
+        let errs = check_upstream_ref_types_via_binding_index(&parsed, &exports, &schemas);
+
         assert!(
             errs.is_empty(),
-            "Map and Struct both match the value shape, so no unique nested sink may be guessed: {errs:?}",
+            "String fits both candidate members without guessing a nested sink: {errs:?}",
         );
     }
 
@@ -3060,6 +3105,7 @@ mod tests {
             configuration.judged(),
             &std::collections::HashSet::new(),
             &bindings,
+            &mut Vec::new(),
         )
         .err()
         .map(|error| {

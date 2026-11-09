@@ -5722,19 +5722,19 @@ fn tied_scalar_union_reports_every_alternative_once_with_cli_lsp_parity() {
             )
         })
         .collect();
-    let core_errors = core_registry
-        .get(
-            "test",
-            "route53.Record",
-            carina_core::schema::SchemaKind::Resource,
-        )
-        .expect("test schema must be owner-bound")
-        .validate_with_resolver(
-            &classified_attributes,
-            &|name| name == "hosted_zone_id",
-            &core_resolver,
-        )
-        .expect_err("both union alternatives must reject the value");
+    let core_errors = carina_core::test_utils::admit_resource_attributes(
+        core_registry
+            .get(
+                "test",
+                "route53.Record",
+                carina_core::schema::SchemaKind::Resource,
+            )
+            .expect("test schema must be owner-bound"),
+        &classified_attributes,
+        &|name| name == "hosted_zone_id",
+        &core_resolver,
+    )
+    .expect_err("both union alternatives must reject the value");
     assert_eq!(core_errors.len(), 1, "core errors: {core_errors:#?}");
     let expected = core_errors[0].to_string();
     assert!(
@@ -8382,7 +8382,7 @@ fn pattern_reason_controls_are_escaped_in_cli_and_lsp_diagnostics() {
     }
 }
 
-fn assert_round2_attribute_siblings(name: &str) {
+fn round2_attribute_fixture(name: &str) -> TempDir {
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/value_knowledge")
         .join(name);
@@ -8391,6 +8391,10 @@ fn assert_round2_attribute_siblings(name: &str) {
         let entry = entry.unwrap();
         std::fs::copy(entry.path(), fixture.path().join(entry.file_name())).unwrap();
     }
+    fixture
+}
+
+fn round2_attribute_schemas() -> SchemaRegistry {
     let mut schemas = SchemaRegistry::new();
     schemas.insert(
         "mock",
@@ -8409,8 +8413,13 @@ fn assert_round2_attribute_siblings(name: &str) {
             .validate()
             .unwrap(),
     );
-    let cli = cli_diagnostics(factories_for(&schemas), &fixture);
-    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+    schemas
+}
+
+fn assert_round2_attribute_siblings(fixture: &TempDir) {
+    let schemas = round2_attribute_schemas();
+    let cli = cli_diagnostics(factories_for(&schemas), fixture);
+    let lsp = lsp_diagnostics(&engine_with_schemas(schemas), fixture, "main.crn");
     let errors: Vec<_> = lsp
         .iter()
         .filter(|d| {
@@ -8435,11 +8444,118 @@ fn assert_round2_attribute_siblings(name: &str) {
 }
 
 #[test]
-fn failed_attribute_preserves_cli_lsp_sibling_findings() {
-    assert_round2_attribute_siblings("multi_attribute");
+fn failed_secret_attribute_matches_unwrapped_strict_cli_and_lsp_findings() {
+    const MISSING: &str = "CARINA_KNOWLEDGE_MISSING_INPUT";
+    for protected in [false, true] {
+        let fixture = round2_attribute_fixture("multi_attribute");
+        if !protected {
+            let path = fixture.path().join("main.crn");
+            let text = std::fs::read_to_string(&path).unwrap().replace(
+                &format!("secret(env(\"{MISSING}\"))"),
+                &format!("env(\"{MISSING}\")"),
+            );
+            std::fs::write(path, text).unwrap();
+        }
+        let schemas = round2_attribute_schemas();
+        let cli = cli_diagnostics(factories_for(&schemas), &fixture);
+        let lsp = lsp_diagnostics(&engine_with_schemas(schemas), &fixture, "main.crn");
+        let cause = if protected {
+            carina_core::resource::INSIDE_SECRET_MESSAGE.to_string()
+        } else {
+            format!("env(): environment variable '{MISSING}' is not set")
+        };
+        let strict_cause = format!("Invalid expression at line 3: {cause}");
+        assert_eq!(
+            cli,
+            [format!(
+                "{}:1:1: {strict_cause}",
+                fixture.path().join("main.crn").display()
+            )],
+        );
+        let actual: Vec<_> = lsp
+            .iter()
+            .map(|finding| (finding.severity, finding.message.as_str()))
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                (Some(DiagnosticSeverity::ERROR), cause.as_str()),
+                (Some(DiagnosticSeverity::ERROR), strict_cause.as_str()),
+                (
+                    Some(DiagnosticSeverity::WARNING),
+                    "Type mismatch: expected String, got Bool"
+                ),
+                (
+                    Some(DiagnosticSeverity::WARNING),
+                    "Type mismatch: expected Map<String>, got Int"
+                ),
+            ]
+        );
+        let root_range = Range::new(Position::new(0, 0), Position::new(5, 1));
+        assert_eq!(
+            lsp.iter()
+                .map(|finding| (finding.range, finding.source.as_deref()))
+                .collect::<Vec<_>>(),
+            [
+                (root_range, Some("carina")),
+                (root_range, Some("carina")),
+                (
+                    Range::new(Position::new(3, 2), Position::new(3, 9)),
+                    Some("carina"),
+                ),
+                (
+                    Range::new(Position::new(4, 2), Position::new(4, 6)),
+                    Some("carina"),
+                ),
+            ],
+        );
+        // carina#4337: main also reports the failing site twice; preserve that count here.
+        assert_eq!(
+            lsp.iter()
+                .filter(|finding| finding.severity == Some(DiagnosticSeverity::ERROR))
+                .count(),
+            2
+        );
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_carina"))
+            .current_dir(fixture.path())
+            .env("NO_COLOR", "1")
+            .env_remove("CLICOLOR_FORCE")
+            .env_remove(MISSING)
+            .args(["validate", "."])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!("Error: ./main.crn:1:1: {strict_cause}\n")
+        );
+        if protected {
+            let rendered = format!(
+                "{cli:?} {lsp:?} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(rendered.contains(carina_core::resource::INSIDE_SECRET_MESSAGE));
+            assert!(!rendered.contains(MISSING), "{rendered}");
+            assert!(!rendered.contains("secret(env("), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn invalid_sibling_attributes_are_both_reported_without_failed_input() {
+    let fixture = round2_attribute_fixture("multi_attribute");
+    let path = fixture.path().join("main.crn");
+    let text = std::fs::read_to_string(&path).unwrap().replace(
+        r#""x-${secret(env("CARINA_KNOWLEDGE_MISSING_INPUT"))}""#,
+        r#""available-parent""#,
+    );
+    assert!(!text.contains("env("), "{text}");
+    std::fs::write(path, text).unwrap();
+    assert_round2_attribute_siblings(&fixture);
 }
 
 #[test]
 fn guarded_failure_preserves_cli_lsp_sibling_findings() {
-    assert_round2_attribute_siblings("guarded_failure_siblings");
+    assert_round2_attribute_siblings(&round2_attribute_fixture("guarded_failure_siblings"));
 }

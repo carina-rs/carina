@@ -8,6 +8,7 @@ use guest::{guest_stderr, guest_store};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::future::Future;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -3690,17 +3691,23 @@ fn metadata_call_error(
 }
 
 impl WasmProviderFactory {
-    /// Compute a cache-safe filename for the exact provider bytes.
-    fn cache_key(wasm_bytes: &[u8]) -> String {
+    /// Bind compiled code to both the exact bytes and Wasmtime's compilation
+    /// environment (version, target, CPU features and engine configuration).
+    fn cache_key(wasm_bytes: &[u8], engine: &Engine) -> String {
         let mut hasher = Sha256::new();
         hasher.update(wasm_bytes);
         // Include the crate version so cache is invalidated on host upgrades.
         hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
+        let mut compatibility = DefaultHasher::new();
+        engine
+            .precompile_compatibility_hash()
+            .hash(&mut compatibility);
+        hasher.update(compatibility.finish().to_le_bytes());
         let hash = format!("{:x}", hasher.finalize());
         format!("provider-{}.cwasm", &hash[..16])
     }
 
-    fn create_engine() -> Result<Engine, WasmProviderLoadError> {
+    pub(crate) fn create_engine() -> Result<Engine, WasmProviderLoadError> {
         let config = build_engine_config();
         Engine::new(&config).map_err(|e| format!("Failed to create WASM engine: {e}").into())
     }
@@ -3870,20 +3877,19 @@ impl WasmProviderFactory {
         configured: ConfiguredProvider,
         network_request: GuestNetworkRequest<'_>,
     ) -> Result<Self, WasmProviderLoadError> {
-        let cwasm_name = Self::cache_key(wasm_bytes);
+        let engine = Self::create_engine()?;
+        let cwasm_name = Self::cache_key(wasm_bytes, &engine);
         let cwasm_path = cache_dir.join(&cwasm_name);
 
-        // A cold-cache write can fail because the cache directory is
-        // unavailable. Resolve that fallback before creating the runtime so
-        // `new_uncached` remains the only runtime owner on this path.
+        // Keep this engine if a cold-cache publication fails; fallback must
+        // not create a second engine or change the compilation environment.
         if !cwasm_path.exists()
-            && let Err(error) = Self::precompile(wasm_bytes, &cwasm_path)
+            && let Err(error) = Self::precompile(&engine, wasm_bytes, cache_dir)
         {
             eprintln!("Failed to write precompile cache, loading directly: {error}");
-            return Self::new_uncached_configured(wasm_bytes, configured, network_request).await;
+            return Self::new_uncached_configured(engine, wasm_bytes, configured, network_request)
+                .await;
         }
-
-        let engine = Self::create_engine()?;
 
         // On resolver-backed loads, verified provider bytes select the
         // `.cwasm` by content hash. The `.cwasm` itself is native code
@@ -3893,8 +3899,8 @@ impl WasmProviderFactory {
             CachedComponentAcquisition::Hit(component) => component,
             CachedComponentAcquisition::Miss => {
                 // Try to precompile and cache.
-                match Self::precompile(wasm_bytes, &cwasm_path) {
-                    Ok(()) => Self::deserialize_precompiled_component(&engine, &cwasm_path)
+                match Self::precompile(&engine, wasm_bytes, cache_dir) {
+                    Ok(cwasm_path) => Self::deserialize_precompiled_component(&engine, &cwasm_path)
                         .map_err(WasmProviderLoadError::PrecompiledDeserialization)?,
                     Err(error) => {
                         eprintln!("Failed to write precompile cache, loading directly: {error}");
@@ -3925,6 +3931,7 @@ impl WasmProviderFactory {
         let egress =
             ConsentedEgress::from_lock(Some(&locked_egress), declaration, load.carina_rs_signed())?;
         Self::new_uncached_configured(
+            Self::create_engine()?,
             load.bytes().as_bytes(),
             configured,
             GuestNetworkRequest::Runtime { egress, aws },
@@ -3933,18 +3940,22 @@ impl WasmProviderFactory {
     }
 
     async fn new_uncached_configured(
+        engine: Engine,
         wasm_bytes: &[u8],
         configured: ConfiguredProvider,
         network_request: GuestNetworkRequest<'_>,
     ) -> Result<Self, WasmProviderLoadError> {
-        let engine = Self::create_engine()?;
         let component = Self::load_component_from_bytes(&engine, wasm_bytes)?;
         let epoch_ticker = EpochTicker::start(engine.clone());
 
         Self::bring_up_component(engine, component, epoch_ticker, configured, network_request).await
     }
 
-    /// Precompile provider bytes and save the result to a .cwasm file.
+    /// Precompile provider bytes and publish a .cwasm file in `cache_dir`.
+    ///
+    /// The filename is derived from the exact bytes and the supplied engine's
+    /// compilation compatibility hash. Returns the published file's path, so
+    /// callers cannot select a filename keyed to a different engine or component.
     ///
     /// **Mmap safety invariant:** `deserialize_precompiled_component` loads
     /// `.cwasm` via `Component::deserialize_file`, which keeps the file
@@ -3962,38 +3973,43 @@ impl WasmProviderFactory {
     /// previously-loaded factories remain valid. Do not "simplify" this to
     /// a direct `std::fs::write(cwasm_path, …)`.
     ///
-    /// The tempfile path includes the current process ID so that multiple
-    /// processes racing to precompile the same component don't clobber each
-    /// other's in-progress writes.
-    pub fn precompile(wasm_bytes: &[u8], cwasm_path: &Path) -> Result<(), DiagnosticText> {
-        let config = build_engine_config();
-        let engine =
-            Engine::new(&config).map_err(|e| DiagnosticText::new(format!("Engine error: {e}")))?;
+    /// Each publication uses a unique sibling path, including within one
+    /// process, so concurrent writers cannot clobber in-progress writes.
+    pub fn precompile(
+        engine: &Engine,
+        wasm_bytes: &[u8],
+        cache_dir: &Path,
+    ) -> Result<PathBuf, DiagnosticText> {
+        let cwasm_path = cache_dir.join(Self::cache_key(wasm_bytes, engine));
         let serialized = engine
             .precompile_component(wasm_bytes)
             .map_err(|e| DiagnosticText::new(format!("Precompile error: {e:#}")))?;
-        if let Some(parent) = cwasm_path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| DiagnosticText::new(format!("Mkdir error: {e}")))?;
-            // Tempfile + atomic rename; preserves any live mmap held by a
-            // previously-loaded Component (see doc comment above for why).
-            let tmp_path = parent.join(format!(
-                ".{}.tmp.{}",
-                cwasm_path
-                    .file_name()
-                    .and_then(|f| f.to_str())
-                    .unwrap_or("cwasm"),
-                std::process::id()
-            ));
+        let parent = cwasm_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)
+            .map_err(|e| DiagnosticText::new(format!("Mkdir error: {e}")))?;
+        // Always publish by rename, including bare filenames in the cwd.
+        let tmp_path = parent.join(format!(
+            ".{}.tmp.{}.{}",
+            cwasm_path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("cwasm"),
+            std::process::id(),
+            uuid::Uuid::new_v4(),
+        ));
+        let result = (|| {
             std::fs::write(&tmp_path, &serialized)
                 .map_err(|e| DiagnosticText::new(format!("Write error: {e}")))?;
-            std::fs::rename(&tmp_path, cwasm_path)
-                .map_err(|e| DiagnosticText::new(format!("Rename error: {e}")))?;
-        } else {
-            std::fs::write(cwasm_path, &serialized)
-                .map_err(|e| DiagnosticText::new(format!("Write error: {e}")))?;
+            std::fs::rename(&tmp_path, &cwasm_path)
+                .map_err(|e| DiagnosticText::new(format!("Rename error: {e}")))
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
         }
-        Ok(())
+        result.map(|()| cwasm_path)
     }
 
     /// Load from a precompiled .cwasm file.

@@ -14,7 +14,9 @@ use futures::stream::{self, StreamExt};
 use carina_core::binding_index::{
     LivePreDataSourceReadInputs, ResolvedBindings, SavedPreApplyInputs, WaitAliasSpec,
 };
-use carina_core::config_loader::load_configuration_with_config;
+use carina_core::config_loader::{
+    load_configuration_for_saved_rehydration, load_configuration_with_config,
+};
 use carina_core::data_source_value::{DataSourceValues, ExecutableDataSourceValues};
 use carina_core::differ::Orphans;
 use carina_core::executor::{
@@ -121,6 +123,9 @@ fn saved_plan_secret_rehydration_error(
     let carina_core::value::SecretRehydrationSiteError { location, source } = error;
     let replan = apply_target.replan_command().to_string();
     let error = match source {
+        carina_core::value::SecretRehydrationError::ValueWalk(error) => {
+            return AppError::ValueWalk { location, error };
+        }
         carina_core::value::SecretRehydrationError::UnavailableSecret(source) => {
             SavedPlanSecretVerificationError::UnavailableSecret {
                 location,
@@ -3750,23 +3755,18 @@ async fn run_apply_from_plan_with_observer_factory(
     // validation and provider-config resolution: placeholder-free plans may
     // outlive unrelated validation errors in the source configuration (R5),
     // while a valid backend edit must still require migration or replanning.
-    let loaded_current_config = load_configuration_with_config(
+    let loaded_current_config = load_configuration_for_saved_rehydration(
         base_dir,
         provider_context,
         &carina_core::schema::SchemaRegistry::new(),
     );
     let (inspected_plan, parsed_backend) = match inspected_plan {
         InspectedPlanFile::Verified(plan) => {
-            let parsed_backend = loaded_current_config
-                .ok()
-                .map(|config| {
-                    config
-                        .into_root_expanded()
-                        .backend
-                        .map(carina_core::parser::BackendConfig::into_expanded)
-                        .transpose()
-                })
-                .transpose()?;
+            let parsed_backend = match loaded_current_config {
+                Ok(config) => Some(config.into_root_expanded().backend.map(carina_core::parser::BackendConfig::into_expanded).transpose()?),
+                Err(error) if error.kind() == carina_core::config_loader::ConfigurationLoadFailureKind::BackendInput => return Err(AppError::Config(error.to_string())),
+                Err(_) => None,
+            };
             (
                 ProviderBoundPlanFile::verified(plan, providers),
                 parsed_backend,
@@ -3774,7 +3774,10 @@ async fn run_apply_from_plan_with_observer_factory(
         }
         InspectedPlanFile::NeedsSecretVerification(plan) => {
             let current_config = loaded_current_config.map_err(|source| {
-                saved_plan_secret_evaluation_error(AppError::Config(source), apply_target)
+                saved_plan_secret_evaluation_error(
+                    AppError::Config(source.to_string()),
+                    apply_target,
+                )
             })?;
             let parsed = current_config.parsed;
             let unresolved = current_config.unresolved_parsed;
