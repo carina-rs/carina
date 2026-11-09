@@ -32,6 +32,10 @@ ordinary query values do not enter the credential inventory. Value origin is
 advisory and cannot weaken host schema or secret classification.
 
 AWS providers enable the SDK's `aws` feature and implement `AwsSessionSource`.
+Each source returns `AwsSessionMaterial::new(credentials)` with the complete AWS
+SDK `Credentials` value. Registration reads its key, secret and token; the same
+credentials are returned after acknowledgement, preserving expiry, account ID,
+provider name and all feature/custom properties. Material Debug is opaque.
 The public AWS credential/configuration entry points are `AwsSessionMaterial`,
 `AwsSessionSource`, `AwsSessionFuture` and `AwsSdkParts`. Credential registration
 and acknowledged snapshots stay internal; snapshots cannot be installed as

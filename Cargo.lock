@@ -1289,6 +1289,7 @@ dependencies = [
 name = "carina-provider-mock-http"
 version = "0.13.1"
 dependencies = [
+ "aws-credential-types",
  "aws-smithy-runtime-api",
  "carina-plugin-sdk",
  "carina-provider-mock",

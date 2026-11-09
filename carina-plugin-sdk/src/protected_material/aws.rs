@@ -3,29 +3,21 @@ use super::RegistrationError;
 use crate::ProviderDiagnostics;
 use aws_credential_types::{Credentials, provider::error::CredentialsError};
 use carina_provider_protocol::diagnostics as wire;
-use std::{future::Future, pin::Pin, time::SystemTime};
+use std::{future::Future, pin::Pin};
 
-/// One credential generation, including the expiry used by the AWS SDK cache.
+/// One SDK credential generation, retained whole through registration.
 #[derive(Clone)]
 pub struct AwsSessionMaterial {
-    values: wire::AwsSession,
-    expires_at: Option<SystemTime>,
+    credentials: Credentials,
 }
 impl AwsSessionMaterial {
-    pub fn new(
-        access_key_id: String,
-        secret_access_key: String,
-        session_token: Option<String>,
-        expires_at: Option<SystemTime>,
-    ) -> Self {
-        Self {
-            values: wire::AwsSession {
-                access_key_id,
-                secret_access_key,
-                session_token,
-            },
-            expires_at,
-        }
+    pub fn new(credentials: Credentials) -> Self {
+        Self { credentials }
+    }
+}
+impl std::fmt::Debug for AwsSessionMaterial {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<protected AWS session material>")
     }
 }
 
@@ -50,24 +42,16 @@ impl ProviderDiagnostics {
         &self,
         material: AwsSessionMaterial,
     ) -> Result<RegisteredAwsSession, RegistrationError> {
-        self.register(wire::ProtectedMaterial::AwsSession(material.values.clone()))?;
+        self.register(wire::ProtectedMaterial::AwsSession(wire::AwsSession {
+            access_key_id: material.credentials.access_key_id().to_owned(),
+            secret_access_key: material.credentials.secret_access_key().to_owned(),
+            session_token: material.credentials.session_token().map(str::to_owned),
+        }))?;
         Ok(RegisteredAwsSession { material })
     }
 }
 impl RegisteredAwsSession {
     pub(crate) fn into_credentials(self) -> Credentials {
-        let AwsSessionMaterial { values, expires_at } = self.material;
-        let wire::AwsSession {
-            access_key_id,
-            secret_access_key,
-            session_token,
-        } = values;
-        Credentials::new(
-            access_key_id,
-            secret_access_key,
-            session_token,
-            expires_at,
-            "carina-registered-session",
-        )
+        self.material.credentials
     }
 }

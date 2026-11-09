@@ -333,7 +333,12 @@ impl ProvideCredentials for RegisteredAwsCredentials {
 /// struct Current;
 /// impl AwsSessionSource for Current {
 ///     fn current_session(&self) -> AwsSessionFuture<'_> {
-///         Box::pin(async { Ok(AwsSessionMaterial::new("access".into(), "secret".into(), None, None)) })
+///         Box::pin(async {
+///             let credentials = aws_credential_types::Credentials::new(
+///                 "access", "secret", None, None, "example-source",
+///             );
+///             Ok(AwsSessionMaterial::new(credentials))
+///         })
 ///     }
 /// }
 /// let session = ProviderPlan::state_only().session("aws", None, None);
@@ -1076,10 +1081,13 @@ mod tests {
         let diagnostics = ProviderDiagnostics::from_session(&session);
         let config = super::AwsSdkParts::new(
             StaticSource(AwsSessionMaterial::new(
-                "long-lived-access".into(),
-                "long-lived-key".into(),
-                Some("long-lived-session".into()),
-                None,
+                aws_credential_types::Credentials::new(
+                    "long-lived-access",
+                    "long-lived-key",
+                    Some("long-lived-session".into()),
+                    None,
+                    "example-source",
+                ),
             )),
             diagnostics.clone(),
         )

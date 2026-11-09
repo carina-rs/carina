@@ -156,10 +156,13 @@ async fn apply_replaces_credentials_and_preserves_remaining_settings() {
 
     let session = ProviderPlan::state_only().session("aws", None, None);
     let source = super::aws_session_tests::StaticSource(AwsSessionMaterial::new(
-        "registered-access".into(),
-        "registered-secret".into(),
-        Some("registered-token".into()),
-        None,
+        aws_credential_types::Credentials::new(
+            "registered-access",
+            "registered-secret",
+            Some("registered-token".into()),
+            None,
+            "pairing-test-source",
+        ),
     ));
     let builder = SdkConfig::builder()
         .region(Region::new("us-west-2"))

@@ -710,7 +710,11 @@ A struct type represents a nested object with typed fields.
   adoption requires acknowledgement before operational wrappers reach transport.
   Registration is idempotent by value, retains old generations, and charges only
   new credentials. AWS providers enable the SDK `aws` feature and implement
-  `AwsSessionSource`, returning each current generation with optional expiry.
+  `AwsSessionSource`, returning each current generation as
+  `AwsSessionMaterial::new(credentials)`. Material privately retains the complete
+  AWS SDK `Credentials`; registration reads only its key/secret/token. After
+  acknowledgement the same credentials are returned unchanged, preserving expiry,
+  account ID, provider name and feature/custom properties. Material Debug is opaque.
   The public AWS credential/configuration entry points are `AwsSessionMaterial`,
   `AwsSessionSource`, `AwsSessionFuture` and `AwsSdkParts`. Registration and its
   consuming snapshot conversion are internal; snapshots implement no public

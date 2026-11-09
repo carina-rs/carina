@@ -243,10 +243,13 @@ pub fn wasi_http_send_phase(url: &str, method: &str, body: &str, kind: ProbeKind
                 Box::pin(async {
                     Ok(
                         carina_plugin_sdk::protected_material::AwsSessionMaterial::new(
-                            "http-probe-access-key".into(),
-                            "http-probe-secret-key".into(),
-                            None,
-                            None,
+                            aws_credential_types::Credentials::new(
+                                "http-probe-access-key",
+                                "http-probe-secret-key",
+                                None,
+                                None,
+                                "mock-http-source",
+                            ),
                         ),
                     )
                 })

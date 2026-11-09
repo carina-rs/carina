@@ -3,7 +3,9 @@ use crate::protected_material::{
 };
 use crate::wasi_http::AwsSdkParts;
 use crate::{EventLevel, ProviderDiagnostics, ProviderEvent};
-use aws_credential_types::provider::ProvideCredentials;
+use aws_credential_types::{
+    Credentials, credential_feature::AwsCredentialFeature, provider::ProvideCredentials,
+};
 use carina_core::provider::{ProviderError, ProviderPlan};
 use carina_core::provider_text::present_event;
 use carina_core::test_utils::provider_text::captured_session;
@@ -20,12 +22,13 @@ impl Generations {
     fn material(&self) -> AwsSessionMaterial {
         let index = self.0.fetch_add(1, Ordering::SeqCst);
         let generation = if index == 0 { "a" } else { "b" };
-        AwsSessionMaterial::new(
+        AwsSessionMaterial::new(aws_credential_types::Credentials::new(
             format!("refresh-access-{generation}"),
             format!("refresh-secret-{generation}"),
             Some(format!("refresh-token-{generation}")),
             Some(Self::expiry(if index == 0 { 0 } else { 1 })),
-        )
+            "generation-source",
+        ))
     }
     fn expiry(index: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(2_000_000_000 + index)
@@ -135,5 +138,115 @@ async fn aws_session_source_registration_failure_preserves_its_cause() {
         "refresh-token-b",
     ] {
         assert!(!format!("{error:?}").contains(secret));
+    }
+}
+
+struct SdkCredentialsSource(Credentials);
+impl AwsSessionSource for SdkCredentialsSource {
+    fn current_session(&self) -> AwsSessionFuture<'_> {
+        Box::pin(async { Ok(AwsSessionMaterial::new(self.0.clone())) })
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceMetadata(&'static str);
+fn metadata_credentials() -> Credentials {
+    let mut credentials = Credentials::builder()
+        .access_key_id("metadata-access-canary")
+        .secret_access_key("metadata-secret-canary")
+        .session_token("metadata-token-canary")
+        .expiry(Generations::expiry(0))
+        .account_id("222222222222")
+        .provider_name("assume-role-source")
+        .build();
+    credentials
+        .get_property_mut_or_default::<Vec<AwsCredentialFeature>>()
+        .push(AwsCredentialFeature::CredentialsStsAssumeRole);
+    credentials.set_property(SourceMetadata("source-property-canary"));
+    credentials
+}
+async fn credentials_from_parts(credentials: Credentials) -> Credentials {
+    let session = ProviderPlan::state_only().session("aws", None, None);
+    let config = AwsSdkParts::new(
+        SdkCredentialsSource(credentials),
+        ProviderDiagnostics::from_session(&session),
+    )
+    .apply(Default::default())
+    .build();
+    config
+        .credentials_provider()
+        .unwrap()
+        .provide_credentials()
+        .await
+        .unwrap()
+}
+#[tokio::test]
+async fn aws_session_source_preserves_account_id_and_identity() {
+    let expected = metadata_credentials();
+    let credentials = credentials_from_parts(expected.clone()).await;
+    assert_eq!(credentials.account_id(), expected.account_id());
+    assert_eq!(credentials.expiry(), expected.expiry());
+    let identity = aws_smithy_runtime_api::client::identity::Identity::from(credentials);
+    assert_eq!(
+        identity
+            .property::<aws_credential_types::attributes::AccountId>()
+            .map(|id| id.as_str()),
+        Some("222222222222")
+    );
+    assert_eq!(identity.expiration(), expected.expiry());
+}
+#[tokio::test]
+async fn aws_session_source_preserves_feature_and_custom_metadata() {
+    let expected = metadata_credentials();
+    let credentials = credentials_from_parts(expected.clone()).await;
+    assert_eq!(
+        credentials.get_property::<Vec<AwsCredentialFeature>>(),
+        expected.get_property::<Vec<AwsCredentialFeature>>()
+    );
+    assert_eq!(
+        credentials.get_property::<SourceMetadata>(),
+        expected.get_property::<SourceMetadata>()
+    );
+    let identity = aws_smithy_runtime_api::client::identity::Identity::from(credentials);
+    let features = identity
+        .property::<aws_smithy_types::config_bag::FrozenLayer>()
+        .unwrap();
+    assert!(
+        features
+            .load::<AwsCredentialFeature>()
+            .any(|feature| *feature == AwsCredentialFeature::CredentialsStsAssumeRole)
+    );
+}
+#[tokio::test]
+async fn aws_session_source_preserves_provider_name() {
+    // Credentials equality includes the private provider name. Keep every other
+    // field equal here so this assertion detects just that provenance change.
+    let expected = Credentials::new(
+        "provider-access",
+        "provider-secret",
+        None,
+        Some(Generations::expiry(0)),
+        "original-source-provider",
+    );
+    let credentials = credentials_from_parts(expected.clone()).await;
+    assert_eq!(credentials, expected);
+}
+
+#[test]
+fn aws_session_material_debug_is_opaque() {
+    let material = AwsSessionMaterial::new(metadata_credentials());
+    let rendered = format!("{material:?}");
+    for hidden in [
+        "metadata-access-canary",
+        "metadata-secret-canary",
+        "metadata-token-canary",
+        "222222222222",
+        "assume-role-source",
+        "CredentialsStsAssumeRole",
+        "source-property-canary",
+    ] {
+        assert!(
+            !rendered.contains(hidden),
+            "material Debug exposed {hidden}"
+        );
     }
 }

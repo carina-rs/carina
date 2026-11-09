@@ -19,10 +19,13 @@ pub(crate) fn read(id: &ResourceId, mode: &str) -> Result<Option<ReadOutcome>, P
             fn current_session(&self) -> AwsSessionFuture<'_> {
                 Box::pin(async {
                     Ok(AwsSessionMaterial::new(
-                        "guest-access-canary".into(),
-                        "guest-key-canary".into(),
-                        Some("guest-token-canary".into()),
-                        None,
+                        aws_credential_types::Credentials::new(
+                            "guest-access-canary",
+                            "guest-key-canary",
+                            Some("guest-token-canary".into()),
+                            None,
+                            "mock-diagnostic-source",
+                        ),
                     ))
                 })
             }
