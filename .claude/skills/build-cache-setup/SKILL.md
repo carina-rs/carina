@@ -101,9 +101,10 @@ time, each verify cycle gets slower. Contention sources, in order of severity:
 
 Mitigations, in order to try them:
 
-1. **Scope tests to touched crates** (biggest win, applies even with one
-   worktree). Use `scripts/touched-crates.sh` instead of defaulting to
-   `--workspace`; prefer `cargo check -p <crate>` for mid-iteration sanity.
+1. **Use local verification scope** (biggest win, applies even with one
+   worktree). Run `scripts/verify.sh --local` for the shared check set with
+   touched crates and reverse dependents; prefer `cargo check -p <crate>`
+   for mid-iteration sanity.
 2. **Cap test parallelism per worktree with `cargo nextest run -j N`** when
    multiple worktrees are active. Pick `N` so the total across worktrees stays
    at or below the physical core count (e.g. 16-core / 2 worktrees → `-j 8`
