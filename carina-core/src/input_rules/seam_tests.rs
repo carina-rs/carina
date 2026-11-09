@@ -18,6 +18,195 @@ fn registry(schema: ResourceSchema) -> SchemaRegistry {
     schemas.insert("mock", schema.validate().unwrap());
     schemas
 }
+
+#[test]
+fn alias_preparation_errors_preserve_independent_findings_and_pending() {
+    let schemas = registry(
+        ResourceSchema::new("Review")
+            .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+            .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "entries",
+                    AttributeType::list(AttributeType::struct_("Entry", vec![])),
+                )
+                .with_block_name("entry")
+                .build(),
+            )
+            .input_rule(InputRule::value(
+                InputRuleScope::CreateOnly,
+                InputPath::new("name").unwrap(),
+                InputRuleCode::new("name.creation").unwrap(),
+                InputPredicate::NoSuffix(crate::schema::NonEmptyString::new("-an").unwrap()),
+            ))
+            .input_rule(
+                InputRule::value(
+                    InputRuleScope::EveryWrite,
+                    InputPath::new("target").unwrap(),
+                    InputRuleCode::new("target.required").unwrap(),
+                    InputPredicate::Present,
+                )
+                .with_condition(InputCondition::Equals {
+                    path: InputPath::new("guard").unwrap(),
+                    literal: InputLiteral::Bool(true),
+                }),
+            ),
+    );
+    let valid = "let warning = mock.Review { name = 'bucket-an' }\nlet pending = mock.Review { guard = producer.flag }\n";
+    let broken = "let conflict = mock.Review { entries = [] entry {} }\n";
+    for source in [format!("{valid}{broken}"), format!("{broken}{valid}")] {
+        let parsed = crate::parser::parse_file(
+            &source,
+            std::path::Path::new("main.crn"),
+            &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+        )
+        .unwrap();
+        let report = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas);
+        assert_eq!(report.preparation_errors().len(), 1);
+        assert_eq!(report.findings().len(), 1);
+        assert_eq!(
+            report.findings()[0].severity(),
+            InputFindingSeverity::Warning
+        );
+        assert_eq!(report.pending().len(), 1);
+    }
+}
+
+#[test]
+fn literal_dotted_fields_keep_distinct_diagnostics_and_pending_rows() {
+    let leaf = AttributeType::struct_with_rules(
+        "Leaf",
+        vec![StructField::optional("target", AttributeType::bool()).build()],
+        vec![],
+        vec![InputRule::value(
+            InputRuleScope::EveryWrite,
+            InputPath::new("target").unwrap(),
+            InputRuleCode::new("leaf.target").unwrap(),
+            InputPredicate::Equals(InputLiteral::Bool(true)),
+        )],
+    );
+    let schemas = registry(
+        ResourceSchema::new("Review").attribute(
+            AttributeSchema::optional(
+                "settings",
+                AttributeType::struct_(
+                    "Settings",
+                    vec![
+                        StructField::optional("a.b", leaf.clone()).build(),
+                        StructField::optional(
+                            "a",
+                            AttributeType::struct_(
+                                "A",
+                                vec![StructField::optional("b", leaf).build()],
+                            ),
+                        )
+                        .build(),
+                    ],
+                ),
+            )
+            .build(),
+        ),
+    );
+    let pending = || {
+        Value::Deferred(DeferredValue::Unknown(
+            crate::resource::ApplyTimeUnknown::PendingReRead(
+                crate::resource::PendingReRead::not_found(),
+            ),
+        ))
+    };
+    let settings = object([
+        ("a.b", object([("target", pending())])),
+        ("a", object([("b", object([("target", pending())]))])),
+    ]);
+    let resource = Resource::with_provider("mock", "Review", "example", None)
+        .with_attribute("settings", settings);
+    let site = classify_write_site::<ModuleSource>(WriteSiteSource::Authored(&resource), &schemas)
+        .unwrap()
+        .unwrap();
+    let paths = site
+        .applicable_rules()
+        .map(|rule| rule.evaluation().pending.unwrap().0)
+        .collect::<Vec<_>>();
+    assert_eq!(paths.len(), 2);
+    assert_ne!(paths[0], paths[1]);
+    assert_ne!(
+        paths[0].cmp(&paths[1]),
+        std::cmp::Ordering::Equal,
+        "Ord must agree with structured Eq"
+    );
+    let names = paths
+        .iter()
+        .map(|p| p.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        names,
+        std::collections::BTreeSet::from(["settings[\"a.b\"].target", "settings.a.b.target"])
+    );
+    let mut plan = Plan::new();
+    plan.add(Effect::Create(
+        crate::resource::ResolvedResource::resolve_raw_fixture(resource, &schemas).unwrap(),
+    ));
+    let checked = FinalizedPlan::new(plan)
+        .check_inputs(&schemas, &HashMap::new())
+        .unwrap();
+    assert_eq!(checked.pending_rows(0).len(), 2);
+}
+
+#[test]
+fn diagnostic_path_identity_distinguishes_fields_map_keys_and_indices() {
+    use crate::schema::{FieldPath, LeafPath, LeafPathSegment};
+    let paths = [
+        InputDiagnosticPath::new("settings".into(), FieldPath::new().push_field("a.b")),
+        InputDiagnosticPath::new("settings".into(), FieldPath::new().push_map_key("a.b")),
+        InputDiagnosticPath::new(
+            "settings".into(),
+            FieldPath::new().push_field("a").push_field("b"),
+        ),
+        InputDiagnosticPath::new("settings".into(), FieldPath::new().push_field("0")),
+        InputDiagnosticPath::new("settings".into(), FieldPath::new().push_index(0)),
+    ];
+    assert_eq!(
+        paths[0].as_str(),
+        paths[1].as_str(),
+        "rendering is not identity"
+    );
+    for (i, a) in paths.iter().enumerate() {
+        for (j, b) in paths.iter().enumerate() {
+            assert_eq!(a == b, i == j);
+            assert_eq!(a.cmp(b) == std::cmp::Ordering::Equal, a == b);
+        }
+    }
+    for name in [
+        "a.b",
+        "x-y",
+        "a[0]",
+        "quoted\"field",
+        "line\nfield",
+        "(secret)",
+    ] {
+        let expected = format!("[{name:?}]");
+        assert_eq!(FieldPath::new().push_field(name).to_string(), expected);
+        assert_eq!(
+            LeafPath::from_segments([LeafPathSegment::StructField(name.into())]).to_string(),
+            expected
+        );
+        assert_eq!(
+            InputDiagnosticPath::new(name.into(), FieldPath::new()).as_str(),
+            expected
+        );
+    }
+    use crate::resource::InsideSecret;
+    let masked = FieldPath::new().push_field("private").inside_secret();
+    assert_eq!(masked.to_string(), "(secret)");
+    assert_eq!(masked.push_field("a.b").to_string(), "(secret)[\"a.b\"]");
+    assert_eq!(
+        LeafPath::from_segments([LeafPathSegment::StructField("private".into())])
+            .inside_secret()
+            .to_string(),
+        "(secret)"
+    );
+}
 fn ignore_key(resource: &mut Resource, attribute: &str, key: &str) {
     resource.directives.ignore_changes = vec![ParsedIgnorePath::new(vec![
         ParsedIgnorePathSegment::Attribute(attribute.into()),
@@ -444,10 +633,10 @@ fn public_ast_mutations_cannot_reseal_authored_input() {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let before = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas).unwrap();
-    assert_eq!(before.len(), 1);
+    let before = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas);
+    assert_eq!(before.findings().len(), 1);
     parsed.resources[0].attributes.clear();
-    let after = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas).unwrap();
+    let after = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas);
     assert_eq!(before.findings, after.findings);
     let fabricated = crate::parser::ExpandedParsedFile::default();
     assert!(fabricated.authored_inputs().is_err());
@@ -489,8 +678,8 @@ fn admitted_literal_attribute_names_do_not_panic_input_validation() {
             &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
-        let findings = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas).unwrap();
-        assert_eq!(findings.len(), usize::from(rules_elsewhere));
+        let findings = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas);
+        assert_eq!(findings.findings().len(), usize::from(rules_elsewhere));
     }
     for name in ["x-y", "a.b"] {
         for supplied in [false, true] {
@@ -531,8 +720,12 @@ fn check_nested_literal_field(name: &'static str, supplied: bool) {
         &crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let findings = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas).unwrap();
-    assert_eq!(findings.len(), usize::from(supplied), "field {name}");
+    let findings = check_authored_inputs(parsed.authored_inputs().unwrap(), &schemas);
+    assert_eq!(
+        findings.findings().len(),
+        usize::from(supplied),
+        "field {name}"
+    );
 }
 
 #[test]
@@ -621,7 +814,7 @@ fn all_module_publication_paths_retain_authored_rule_authority() {
                 .unwrap();
             graph
                 .authored_inputs()
-                .map(|inputs| check_authored_inputs(inputs, &schemas).unwrap().len())
+                .map(|inputs| check_authored_inputs(inputs, &schemas).findings().len())
         })
         .collect::<Vec<_>>();
     assert!(results.iter().all(Result::is_ok), "{results:?}");

@@ -242,23 +242,21 @@ pub(super) struct RestoredSecrets {
     paths: Vec<Vec<SecretSlot>>,
 }
 
-impl RestoredSecrets {
-    fn restore(&mut self, source: &Value, target: &mut Value, path: &mut Vec<SecretSlot>) {
-        // Positional/field identity is available only when the complete
-        // plaintext value is unchanged. A transformed subtree carries no
-        // correspondence; protect all of it rather than guessing its origin.
-        if crate::value::contains_secret(source)
-            && unwrap_secret(source.clone()) != unwrap_secret(target.clone())
-        {
-            self.protect(target, path);
-            return;
-        }
-        match (source, target) {
+/// A correspondence is established once for the enclosing normalization
+/// result. Descendants inherit the paired source/target cursor; there is no
+/// independently supplied proof that could be reused for another subtree.
+struct CorrespondingSecretValue<'a> {
+    source: &'a Value,
+    target: &'a mut Value,
+}
+
+impl CorrespondingSecretValue<'_> {
+    fn restore(self, restored: &mut RestoredSecrets, path: &mut Vec<SecretSlot>) {
+        match (self.source, self.target) {
             (Value::Deferred(DeferredValue::Secret(_)), target)
                 if !matches!(target, Value::Deferred(DeferredValue::Secret(_))) =>
             {
-                *target = target.clone().into_secret();
-                self.paths.push(path.clone());
+                restored.protect(target, path);
             }
             (
                 Value::Concrete(ConcreteValue::Map(source)),
@@ -267,7 +265,7 @@ impl RestoredSecrets {
                 for (key, source) in source {
                     if let Some(target) = target.get_mut(key) {
                         path.push(SecretSlot::Key(key.clone()));
-                        self.restore(source, target, path);
+                        CorrespondingSecretValue { source, target }.restore(restored, path);
                         path.pop();
                     }
                 }
@@ -278,17 +276,62 @@ impl RestoredSecrets {
             ) => {
                 for (index, (source, target)) in source.iter().zip(target).enumerate() {
                     path.push(SecretSlot::Index(index));
-                    self.restore(source, target, path);
+                    CorrespondingSecretValue { source, target }.restore(restored, path);
                     path.pop();
                 }
             }
             _ => {}
         }
     }
+}
 
+enum SecretRestoration<'a> {
+    Corresponding {
+        source: &'a indexmap::IndexMap<String, Value>,
+        target: &'a mut indexmap::IndexMap<String, Value>,
+    },
+    Changed(&'a mut indexmap::IndexMap<String, Value>),
+}
+
+impl<'a> SecretRestoration<'a> {
+    fn establish(
+        source: &'a indexmap::IndexMap<String, Value>,
+        target: &'a mut indexmap::IndexMap<String, Value>,
+    ) -> Self {
+        // A transformed/reordered result carries no correspondence. Compare
+        // complete plaintext once, never again at each recursive child.
+        let changed = source.values().any(crate::value::contains_secret)
+            && plaintext_attributes(source) != plaintext_attributes(target);
+        if changed {
+            Self::Changed(target)
+        } else {
+            Self::Corresponding { source, target }
+        }
+    }
+
+    fn restore(self, restored: &mut RestoredSecrets) {
+        match self {
+            Self::Changed(target) => {
+                for (key, target) in target {
+                    restored.protect(target, &[SecretSlot::Key(key.clone())]);
+                }
+            }
+            Self::Corresponding { source, target } => {
+                for (key, target) in target {
+                    if let Some(source) = source.get(key) {
+                        CorrespondingSecretValue { source, target }
+                            .restore(restored, &mut vec![SecretSlot::Key(key.clone())]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl RestoredSecrets {
     fn protect(&mut self, target: &mut Value, path: &[SecretSlot]) {
         if !matches!(target, Value::Deferred(DeferredValue::Secret(_))) {
-            *target = target.clone().into_secret();
+            *target = clone_plaintext_input(target).into_secret();
             self.paths.push(path.to_vec());
         }
     }
@@ -298,21 +341,7 @@ impl RestoredSecrets {
         source: &indexmap::IndexMap<String, Value>,
         target: &mut indexmap::IndexMap<String, Value>,
     ) {
-        let source_tree = Value::Concrete(ConcreteValue::Map(source.clone()));
-        let target_tree = Value::Concrete(ConcreteValue::Map(target.clone()));
-        if crate::value::contains_secret(&source_tree)
-            && unwrap_secret(source_tree) != unwrap_secret(target_tree)
-        {
-            for (key, value) in target {
-                self.protect(value, &[SecretSlot::Key(key.clone())]);
-            }
-        } else {
-            for (key, value) in target {
-                if let Some(source) = source.get(key) {
-                    self.restore(source, value, &mut vec![SecretSlot::Key(key.clone())]);
-                }
-            }
-        }
+        SecretRestoration::establish(source, target).restore(self);
     }
 
     pub(super) fn remove(&self, attributes: &mut indexmap::IndexMap<String, Value>) {
@@ -362,42 +391,59 @@ impl RestoredSecrets {
 pub(crate) fn unwrap_dispatch_desired(resources: &mut [crate::resource::ProviderResource]) {
     for resource in resources {
         for value in resource.attributes.values_mut() {
-            *value = unwrap_secret(value.clone());
+            *value = unwrap_secret(value);
         }
     }
 }
 
 /// Main's dispatch projection, applied only after protected host checks.
-pub(super) fn unwrap_secret(value: Value) -> Value {
+pub(super) fn unwrap_secret(value: &Value) -> Value {
+    #[cfg(test)]
+    SECRET_RESTORATION_WORK.with(|work| {
+        if let Some(count) = work.get() {
+            work.set(Some(count + 1));
+        }
+    });
     match value {
         Value::Deferred(DeferredValue::Secret(payload)) => {
-            unwrap_secret(payload.expose_plaintext().clone())
+            unwrap_secret(payload.expose_plaintext())
         }
         Value::Deferred(DeferredValue::Coalesce { value, default }) => {
             Value::Deferred(DeferredValue::Coalesce {
-                value: Box::new(unwrap_secret(*value)),
-                default: Box::new(unwrap_secret(*default)),
+                value: Box::new(unwrap_secret(value)),
+                default: Box::new(unwrap_secret(default)),
             })
         }
         Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
-            let lhs = unwrap_secret(expression.lhs().clone());
-            let rhs = unwrap_secret(expression.rhs().clone());
-            let original = Value::Deferred(DeferredValue::IntegerArithmetic(expression.clone()));
+            let lhs = unwrap_secret(expression.lhs());
+            let rhs = unwrap_secret(expression.rhs());
             expression
                 .evaluate_with_operands(lhs, rhs)
-                .unwrap_or(original)
+                .unwrap_or_else(|_| clone_plaintext_input(value))
         }
         Value::Concrete(ConcreteValue::List(values)) => Value::Concrete(ConcreteValue::List(
-            values.into_iter().map(unwrap_secret).collect(),
+            values.iter().map(unwrap_secret).collect(),
         )),
-        Value::Concrete(ConcreteValue::Map(values)) => Value::Concrete(ConcreteValue::Map(
-            values
-                .into_iter()
-                .map(|(key, value)| (key, unwrap_secret(value)))
-                .collect(),
-        )),
-        value => value,
+        Value::Concrete(ConcreteValue::Map(values)) => {
+            Value::Concrete(ConcreteValue::Map(plaintext_attributes(values)))
+        }
+        value => clone_plaintext_input(value),
     }
+}
+
+fn plaintext_attributes(
+    values: &indexmap::IndexMap<String, Value>,
+) -> indexmap::IndexMap<String, Value> {
+    values
+        .iter()
+        .map(|(key, value)| (key.clone(), unwrap_secret(value)))
+        .collect()
+}
+
+fn clone_plaintext_input(value: &Value) -> Value {
+    #[cfg(test)]
+    record_plaintext_copy(value);
+    value.clone()
 }
 
 /// Apply the full desired-side pipeline to a resource slice in place.
@@ -572,8 +618,103 @@ pub fn states_contain_unknown<P: crate::resource::StateValueLeaf>(
 }
 
 #[cfg(test)]
+thread_local! {
+    static SECRET_RESTORATION_WORK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn record_plaintext_copy(value: &Value) {
+    if SECRET_RESTORATION_WORK.get().is_none() {
+        return;
+    }
+    SECRET_RESTORATION_WORK.set(Some(SECRET_RESTORATION_WORK.get().unwrap() + 1));
+    match value {
+        Value::Concrete(ConcreteValue::Map(values)) => {
+            values.values().for_each(record_plaintext_copy)
+        }
+        Value::Concrete(ConcreteValue::List(values)) => {
+            values.iter().for_each(record_plaintext_copy)
+        }
+        Value::Deferred(DeferredValue::Secret(payload)) => {
+            record_plaintext_copy(payload.expose_plaintext())
+        }
+        Value::Deferred(DeferredValue::Coalesce { value, default }) => {
+            record_plaintext_copy(value);
+            record_plaintext_copy(default);
+        }
+        Value::Deferred(DeferredValue::IntegerArithmetic(expression)) => {
+            record_plaintext_copy(expression.lhs());
+            record_plaintext_copy(expression.rhs());
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
 mod correspondence_tests {
     use super::*;
+
+    #[test]
+    fn unchanged_recursive_secret_restoration_has_linear_correspondence_work() {
+        const DEPTH: usize = 96;
+        for container in ["map", "list"] {
+            let mut source =
+                Value::Concrete(ConcreteValue::String("protected".into())).into_secret();
+            for _ in 0..DEPTH {
+                source = match container {
+                    "map" => Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                        "child".into(),
+                        source,
+                    )]))),
+                    "list" => Value::Concrete(ConcreteValue::List(vec![source])),
+                    _ => unreachable!(),
+                };
+            }
+            let plain = unwrap_secret(&source);
+            let sources = indexmap::IndexMap::from([("objects".into(), source)]);
+            let mut targets = indexmap::IndexMap::from([("objects".into(), plain)]);
+            SECRET_RESTORATION_WORK.set(Some(0));
+            let mut restored = RestoredSecrets::default();
+            restored.restore_attributes(&sources, &mut targets);
+            let work = SECRET_RESTORATION_WORK.replace(None).unwrap();
+            assert_eq!(targets, sources, "annotations must be restored exactly");
+            assert!(
+                work <= (DEPTH + 3) * 4,
+                "{container}: {work} plaintext node visits for depth {DEPTH}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_secret_ancestors_have_a_linear_plaintext_copy_budget() {
+        const DEPTH: usize = 96;
+        let mut source = Value::Concrete(ConcreteValue::Bool(true)).into_secret();
+        for _ in 0..DEPTH {
+            source = Value::Concrete(ConcreteValue::Map(indexmap::IndexMap::from([(
+                "child".into(),
+                source,
+            )])))
+            .into_secret();
+        }
+        let plain = unwrap_secret(&source);
+        let source = indexmap::IndexMap::from([("objects".into(), source)]);
+        let mut target = indexmap::IndexMap::from([("objects".into(), plain)]);
+        SECRET_RESTORATION_WORK.set(Some(0));
+        RestoredSecrets::default().restore_attributes(&source, &mut target);
+        let work = SECRET_RESTORATION_WORK.replace(None).unwrap();
+        assert!(matches!(
+            target["objects"],
+            Value::Deferred(DeferredValue::Secret(_))
+        ));
+        assert_eq!(
+            unwrap_secret(&source["objects"]),
+            unwrap_secret(&target["objects"])
+        );
+        assert!(
+            work <= (DEPTH + 3) * 4,
+            "{work} node visits/copies for {DEPTH} protected ancestors"
+        );
+    }
 
     #[test]
     fn changed_collection_cannot_restore_secrets_by_position() {
@@ -584,15 +725,16 @@ mod correspondence_tests {
         .into_secret();
         let public = Value::Concrete(ConcreteValue::Bool(false));
         let source = Value::Concrete(ConcreteValue::List(vec![secret.clone(), public.clone()]));
-        let mut target = Value::Concrete(ConcreteValue::List(vec![public, unwrap_secret(secret)]));
+        let target = Value::Concrete(ConcreteValue::List(vec![public, unwrap_secret(&secret)]));
         let mut restored = RestoredSecrets::default();
-        restored.restore(
-            &source,
-            &mut target,
-            &mut vec![SecretSlot::Key("objects".into())],
-        );
+        let source = indexmap::IndexMap::from([("objects".into(), source)]);
+        let mut target_attributes = indexmap::IndexMap::from([("objects".into(), target)]);
+        restored.restore_attributes(&source, &mut target_attributes);
         assert!(
-            matches!(target, Value::Deferred(DeferredValue::Secret(_))),
+            matches!(
+                target_attributes["objects"],
+                Value::Deferred(DeferredValue::Secret(_))
+            ),
             "without carried correspondence the complete changed collection must remain protected"
         );
     }

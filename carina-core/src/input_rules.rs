@@ -1302,6 +1302,55 @@ impl std::fmt::Display for InputFinding {
 pub struct AuthoredInputReport {
     findings: Vec<InputFinding>,
     pending: Vec<AuthoredPendingInput>,
+    preparation_errors: Vec<AuthoredInputPreparationError>,
+}
+
+/// Preparation failed for this resource; other resources remain evaluable.
+#[derive(Clone)]
+pub struct AuthoredInputPreparationError {
+    resource_id: ResourceId,
+    error: crate::provider::HostError,
+    declaration: crate::parser::DeclarationProvenance,
+}
+
+impl AuthoredInputPreparationError {
+    pub fn resource_id(&self) -> &ResourceId {
+        &self.resource_id
+    }
+    pub fn authored_location(&self) -> Option<&crate::parser::DeclarationLocation> {
+        self.declaration.location()
+    }
+    pub fn into_host_error(self) -> crate::provider::HostError {
+        self.error
+    }
+}
+impl std::fmt::Display for AuthoredInputPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+impl std::fmt::Debug for AuthoredInputPreparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthoredInputPreparationError")
+            .field("resource_id", &self.resource_id)
+            .field("error", &self.error)
+            .finish()
+    }
+}
+impl std::error::Error for AuthoredInputPreparationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // Transparent metadata wrapper: retain the underlying cause chain
+        // without repeating the same terminal error text as another link.
+        std::error::Error::source(&self.error)
+    }
+}
+
+/// Iteration includes every outcome, so clients cannot silently discard
+/// resource preparation errors while rendering only successful evaluations.
+pub enum AuthoredInputOutcome {
+    Finding(InputFinding),
+    Pending(AuthoredPendingInput),
+    PreparationFailed(Box<AuthoredInputPreparationError>),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthoredPendingInput {
@@ -1310,21 +1359,50 @@ pub struct AuthoredPendingInput {
     pub code: InputRuleCode,
 }
 impl AuthoredInputReport {
+    /// Established rule findings only. Preparation errors and unresolved
+    /// obligations remain explicit in the report's exhaustive outcome stream.
+    pub fn findings(&self) -> &[InputFinding] {
+        &self.findings
+    }
     pub fn pending(&self) -> &[AuthoredPendingInput] {
         &self.pending
     }
-}
-impl Deref for AuthoredInputReport {
-    type Target = [InputFinding];
-    fn deref(&self) -> &Self::Target {
-        &self.findings
+    pub fn preparation_errors(&self) -> &[AuthoredInputPreparationError] {
+        &self.preparation_errors
+    }
+    fn preparation_failed(
+        &mut self,
+        resource_id: &ResourceId,
+        declaration: &crate::parser::DeclarationProvenance,
+        error: crate::provider::HostError,
+    ) {
+        self.preparation_errors.push(AuthoredInputPreparationError {
+            resource_id: resource_id.clone(),
+            declaration: declaration.clone(),
+            error,
+        });
     }
 }
 impl IntoIterator for AuthoredInputReport {
-    type Item = InputFinding;
-    type IntoIter = std::vec::IntoIter<Self::Item>;
+    type Item = AuthoredInputOutcome;
+    type IntoIter = std::vec::IntoIter<AuthoredInputOutcome>;
     fn into_iter(self) -> Self::IntoIter {
-        self.findings.into_iter()
+        let Self {
+            findings,
+            pending,
+            preparation_errors,
+        } = self;
+        findings
+            .into_iter()
+            .map(AuthoredInputOutcome::Finding)
+            .chain(pending.into_iter().map(AuthoredInputOutcome::Pending))
+            .chain(
+                preparation_errors
+                    .into_iter()
+                    .map(|error| AuthoredInputOutcome::PreparationFailed(Box::new(error))),
+            )
+            .collect::<Vec<_>>()
+            .into_iter()
     }
 }
 
@@ -1344,7 +1422,7 @@ impl IntoIterator for AuthoredInputReport {
 pub fn check_authored_inputs(
     parsed: &AuthoredInputs,
     schemas: &SchemaRegistry,
-) -> crate::provider::HostResult<AuthoredInputReport> {
+) -> AuthoredInputReport {
     let mut types = InputTypeContext::<ModuleSource>::empty();
     types.facts.defaults = parsed.defaults().to_vec();
     let mut report = AuthoredInputReport::default();
@@ -1354,17 +1432,39 @@ pub fn check_authored_inputs(
         let Some(schema) = schemas.get_for(resource) else {
             continue;
         };
-        let input =
-            RuleInput::for_authored(&source, schema.schema(), Arc::clone(&declarations), schemas)?;
-        if let Some(site) = classify_write_site::<ModuleSource>(
+        let input = match RuleInput::for_authored(
+            &source,
+            schema.schema(),
+            Arc::clone(&declarations),
+            schemas,
+        ) {
+            Ok(input) => input,
+            Err(error) => {
+                report.preparation_failed(&resource.id, &resource.declaration, error);
+                continue;
+            }
+        };
+        let site = match classify_write_site::<ModuleSource>(
             WriteSiteSource::Preview {
                 resource_id: resource.id.clone(),
                 input,
             },
             schemas,
-        )
-        .map_err(|error| crate::provider::HostError::invalid_input(error.to_string()))?
-        {
+        ) {
+            Ok(site) => site,
+            Err(error) => {
+                report.preparation_failed(
+                    &resource.id,
+                    &resource.declaration,
+                    crate::provider::HostError::invalid_input_caused_by(
+                        "input rule preparation failed",
+                        error,
+                    ),
+                );
+                continue;
+            }
+        };
+        if let Some(site) = site {
             for evaluation in site.evaluated_rules() {
                 report.findings.extend(evaluation.findings);
                 if let Some((path, code)) = evaluation.pending {
@@ -1377,7 +1477,7 @@ pub fn check_authored_inputs(
             }
         }
     }
-    Ok(report)
+    report
 }
 
 fn project_attributes<P: crate::resource::PlaceholderKind, B: crate::resource::BindingAddress>(

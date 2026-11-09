@@ -596,15 +596,15 @@ fn nested_guard_retains_coalesce_failure() {
         file.resources[0]
             .attributes
             .insert("settings".into(), failed_coalesce());
-        let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas).unwrap();
-        assert_eq!(report.len(), 1);
+        let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas);
+        assert_eq!(report.findings().len(), 1);
         assert!(report.pending().is_empty());
         assert_eq!(
-            report[0].violation().reason(),
+            report.findings()[0].violation().reason(),
             InputViolationReason::EvaluationFailed
         );
         assert!(
-            !report[0]
+            !report.findings()[0]
                 .to_string()
                 .contains("private nested attempted failure")
         );
@@ -907,11 +907,12 @@ fn authored_arithmetic_and_access_guards_preserve_failed_knowledge() {
         )
         .unwrap();
         file.resources[0].attributes.insert("guard".into(), value);
-        let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas).unwrap();
+        let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas);
         assert!(report.pending().is_empty());
         assert!(!format!("{report:?}").contains("private attempted failure"));
         findings.push(
             report
+                .findings()
                 .iter()
                 .map(|finding| finding.violation().reason())
                 .collect::<Vec<_>>(),
@@ -1235,11 +1236,12 @@ fn conditional_suffix_estimation_is_shared_by_every_object_instance() {
             .collect();
         let mut file = crate::parser::ExpandedInferredFile::default();
         file.resources.push(resource.clone()); // allow: direct — input-rule preview fixture
-        let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas).unwrap();
-        assert_eq!(report.len(), 5);
+        let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas);
+        assert_eq!(report.findings().len(), 5);
         assert!(report.pending().is_empty());
         assert!(
             report
+                .findings()
                 .iter()
                 .all(|finding| finding.severity() == InputFindingSeverity::Error)
         );
@@ -1666,11 +1668,15 @@ fn possible_default_tags_keep_authored_absence_conditions_pending() {
             vec![],
         ),
     );
-    let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas).unwrap();
+    let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas);
     assert!(
-        report.is_empty(),
+        report.findings().is_empty(),
         "possible tags cannot prove the absence guard: {:?}",
-        report.iter().map(ToString::to_string).collect::<Vec<_>>()
+        report
+            .findings()
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
     );
     assert_eq!(report.pending().len(), 1);
 }
@@ -1994,16 +2000,17 @@ fn deferred_subtree_preserves_each_scope_specific_finding() {
                 );
             }
         }
-        let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas).unwrap();
+        let report = check_authored_inputs(&AuthoredInputs::for_test(&file), &schemas);
         if failed {
             assert_eq!(
-                report.len(),
+                report.findings().len(),
                 2,
                 "grouping must retain each independent rule verdict"
             );
             for severity in [InputFindingSeverity::Warning, InputFindingSeverity::Error] {
                 assert_eq!(
                     report
+                        .findings()
                         .iter()
                         .filter(|finding| finding.severity() == severity)
                         .count(),
@@ -2012,7 +2019,7 @@ fn deferred_subtree_preserves_each_scope_specific_finding() {
             }
             assert!(report.pending().is_empty());
         } else {
-            assert!(report.is_empty());
+            assert!(report.findings().is_empty());
             assert_eq!(
                 report.pending().len(),
                 1,

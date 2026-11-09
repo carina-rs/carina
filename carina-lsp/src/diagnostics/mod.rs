@@ -1293,34 +1293,58 @@ impl DiagnosticRun<'_> {
             };
             let input_findings = authored_inputs
                 .map_err(carina_core::provider::HostError::from)
-                .and_then(|inputs| {
+                .map(|inputs| {
                     carina_core::input_rules::check_authored_inputs(&inputs, &self.schemas)
                 });
+            let input_owners = preferred_tree
+                .resources()
+                .map(|resource| (resource.id(), resource))
+                .collect::<std::collections::HashMap<_, _>>();
             match input_findings {
-                Ok(findings) => {
-                    for finding in findings {
-                        let Some(resource) = preferred_tree
-                            .resources()
-                            .find(|resource| resource.id() == finding.resource_id())
-                        else {
-                            continue;
+                Ok(report) => {
+                    for outcome in report {
+                        use carina_core::input_rules::{
+                            AuthoredInputOutcome, InputFindingSeverity,
                         };
-                        let location = finding
-                            .authored_location()
-                            .unwrap_or_else(|| resource.type_location());
-                        diagnostics.extend(render_merged(
-                            doc,
-                            &carina_core::parser::Located::new(location.clone(), ()),
-                            match finding.severity() {
-                                carina_core::input_rules::InputFindingSeverity::Error => {
-                                    DiagnosticSeverity::ERROR
-                                }
-                                carina_core::input_rules::InputFindingSeverity::Warning => {
-                                    DiagnosticSeverity::WARNING
-                                }
-                            },
-                            finding.to_string(),
-                        ));
+                        let (resource_id, location, severity, message) = match &outcome {
+                            AuthoredInputOutcome::Finding(finding) => (
+                                finding.resource_id(),
+                                finding.authored_location(),
+                                match finding.severity() {
+                                    InputFindingSeverity::Error => DiagnosticSeverity::ERROR,
+                                    InputFindingSeverity::Warning => DiagnosticSeverity::WARNING,
+                                },
+                                finding.to_string(),
+                            ),
+                            AuthoredInputOutcome::Pending(_) => continue,
+                            AuthoredInputOutcome::PreparationFailed(error) => (
+                                error.resource_id(),
+                                error.authored_location(),
+                                DiagnosticSeverity::ERROR,
+                                error.to_string(),
+                            ),
+                        };
+                        let location = location.or_else(|| {
+                            input_owners
+                                .get(resource_id)
+                                .map(|resource| resource.type_location())
+                        });
+                        if let Some(location) = location {
+                            diagnostics.extend(render_merged(
+                                doc,
+                                &carina_core::parser::Located::new(location.clone(), ()),
+                                severity,
+                                message,
+                            ));
+                        } else {
+                            diagnostics.push(Diagnostic {
+                                range: Range::default(),
+                                severity: Some(severity),
+                                source: Some("carina".into()),
+                                message,
+                                ..Default::default()
+                            });
+                        }
                     }
                 }
                 Err(error) => diagnostics.push(Diagnostic {

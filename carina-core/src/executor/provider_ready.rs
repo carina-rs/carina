@@ -1208,7 +1208,7 @@ pub(super) fn prepare_provider_ready_data_source_after_resolution<S, D>(
     let protected = ResolvedDataSource::new(value.clone());
     WireReady::try_new(protected, ProviderWireTarget::Resource(value.id.clone()))?;
     for attribute in value.attributes.values_mut() {
-        *attribute = unwrap_secret(attribute.clone());
+        *attribute = unwrap_secret(attribute);
     }
     let value = ResolvedDataSource::new(value);
     let directives = context.schemas.resolve_directives(

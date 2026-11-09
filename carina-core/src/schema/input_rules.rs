@@ -171,15 +171,7 @@ pub struct InputPath(String);
 impl InputPath {
     pub fn new(value: impl Into<String>) -> Result<Self, InputRuleError> {
         let value = value.into();
-        if value.split('.').all(|segment| {
-            segment
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
-                && segment
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
-        }) {
+        if value.split('.').all(super::is_path_identifier) {
             Ok(Self(value))
         } else {
             Err(InputRuleError::InvalidPath)
@@ -275,20 +267,37 @@ impl fmt::Display for InputCondition {
 }
 
 /// An instantiated diagnostic location; declaration paths remain wildcard-free.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct InputDiagnosticPath(Box<InputDiagnosticPathData>);
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 struct InputDiagnosticPathData {
     rendered: String,
     root: String,
     relative: super::ConcreteFieldPath,
 }
 impl InputDiagnosticPath {
-    pub(crate) fn new(rendered: String, root: String, relative: super::FieldPath) -> Self {
+    pub(crate) fn new(root: String, relative: super::FieldPath) -> Self {
+        use std::fmt::Write;
+        let relative = relative.into_concrete();
+        let mut rendered = String::new();
+        super::write_path_field(&mut rendered, &root, false).expect("write String");
+        for segment in relative.canonical() {
+            match segment {
+                super::LeafPathSegment::StructField(name) => {
+                    super::write_path_field(&mut rendered, name, true).expect("write String")
+                }
+                super::LeafPathSegment::ListIndex(index) => {
+                    write!(rendered, "[{index}]").expect("write String")
+                }
+                super::LeafPathSegment::MapKey(key) => {
+                    write!(rendered, "[{key:?}]").expect("write String")
+                }
+            }
+        }
         Self(Box::new(InputDiagnosticPathData {
             rendered,
             root,
-            relative: relative.into_concrete(),
+            relative,
         }))
     }
     pub fn as_str(&self) -> &str {
@@ -300,13 +309,14 @@ impl InputDiagnosticPath {
     pub fn relative(&self) -> super::FieldPath {
         self.0.relative.as_field_path()
     }
-    pub fn segments(&self) -> impl Iterator<Item = &str> {
-        self.0
-            .rendered
-            .split(['.', '[', ']'])
-            .filter(|s| !s.is_empty())
+}
+impl PartialEq for InputDiagnosticPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.root == other.0.root && self.0.relative == other.0.relative
     }
 }
+impl Eq for InputDiagnosticPath {}
+
 impl PartialOrd for InputDiagnosticPath {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -314,7 +324,8 @@ impl PartialOrd for InputDiagnosticPath {
 }
 impl Ord for InputDiagnosticPath {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.rendered.cmp(&other.0.rendered)
+        (self.0.root.as_str(), self.0.relative.canonical())
+            .cmp(&(other.0.root.as_str(), other.0.relative.canonical()))
     }
 }
 impl fmt::Display for InputDiagnosticPath {
@@ -331,7 +342,7 @@ impl From<InputPath> for InputDiagnosticPath {
         let mut parts = path.segments();
         let root = parts.next().expect("admitted path has a root").to_owned();
         let relative = parts.fold(super::FieldPath::new(), |p, s| p.push_field(s));
-        Self::new(path.0, root, relative)
+        Self::new(root, relative)
     }
 }
 

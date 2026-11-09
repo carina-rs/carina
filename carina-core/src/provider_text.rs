@@ -1834,7 +1834,8 @@ macro_rules! host_sources {
 host_sources!(
     crate::provider::HostError,
     InvalidRequiredPermission,
-    crate::input_rules::AuthoredInputUnavailable
+    crate::input_rules::AuthoredInputUnavailable,
+    crate::provider::UpdatePatchError
 );
 impl diagnostic_source_sealed::Sealed<Bound> for HostDiagnostic {}
 impl DiagnosticSource<Bound> for HostDiagnostic {

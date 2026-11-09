@@ -178,69 +178,145 @@ pub struct DeclarationProvenance {
     elements: Arc<super::elements::ElementLocations>,
 }
 
+/// One immutable index of parser-owned structured paths, shared by all
+/// findings and analysis cursors borrowing this resource's provenance.
+#[derive(Debug, Default)]
+pub(super) struct AttributeLocationIndex {
+    root: AttributeLocationNode,
+}
+
+#[derive(Debug, Default)]
+struct AttributeLocationNode {
+    fields: std::collections::HashMap<String, AttributeLocationNode>,
+    indices: std::collections::HashMap<usize, AttributeLocationNode>,
+    keys: Vec<usize>,
+    first_block: Option<usize>,
+    last_value: Option<usize>,
+    replaceable: Option<usize>,
+    list_literal: bool,
+    contains_value: bool,
+}
+
+impl AttributeLocationIndex {
+    pub(super) fn build(elements: &super::elements::ElementLocations) -> Self {
+        let mut result = Self::default();
+        for (index, key) in elements.keys().iter().enumerate() {
+            let node = result.insert(key.path(), false);
+            node.keys.push(index);
+            if key.is_block() {
+                node.first_block.get_or_insert(index);
+            }
+        }
+        for (index, value) in elements.attribute_values().iter().enumerate() {
+            let node = result.insert(&value.path, true);
+            node.last_value = Some(index);
+            if value.replaceable {
+                node.replaceable = Some(index);
+            }
+            node.list_literal |= value.list_literal;
+        }
+        result
+    }
+
+    fn insert(
+        &mut self,
+        path: &[super::AttributePathSegment],
+        value: bool,
+    ) -> &mut AttributeLocationNode {
+        let mut node = &mut self.root;
+        node.contains_value |= value;
+        for segment in path {
+            #[cfg(test)]
+            record_attribute_location_work(1);
+            node = match segment {
+                super::AttributePathSegment::Attribute(name)
+                | super::AttributePathSegment::StructField(name)
+                | super::AttributePathSegment::Key(name) => {
+                    node.fields.entry(name.clone()).or_default()
+                }
+                super::AttributePathSegment::ListIndex(index) => {
+                    node.indices.entry(*index).or_default()
+                }
+            };
+            node.contains_value |= value;
+        }
+        node
+    }
+
+    fn attribute(&self, name: &str) -> Option<&AttributeLocationNode> {
+        #[cfg(test)]
+        record_attribute_location_work(1);
+        self.root.fields.get(name)
+    }
+
+    fn at(&self, name: &str, path: &crate::schema::FieldPath) -> Option<&AttributeLocationNode> {
+        let mut node = self.attribute(name)?;
+        for step in path.steps() {
+            node = node.child(step)?;
+        }
+        Some(node)
+    }
+}
+
+impl AttributeLocationNode {
+    fn child(&self, step: &crate::schema::FieldPathStep) -> Option<&Self> {
+        #[cfg(test)]
+        record_attribute_location_work(1);
+        match step {
+            crate::schema::FieldPathStep::Field(name) => self.fields.get(name),
+            crate::schema::FieldPathStep::Index(index) => self.indices.get(index),
+            crate::schema::FieldPathStep::Redacted(_) => None,
+        }
+    }
+    fn key<'a>(
+        &self,
+        elements: &'a super::elements::ElementLocations,
+    ) -> Option<&'a super::AttributeKeyLocation> {
+        self.keys.last().map(|index| &elements.keys()[*index])
+    }
+    fn value<'a>(
+        &self,
+        elements: &'a super::elements::ElementLocations,
+    ) -> Option<&'a super::elements::AttributeValueLocation> {
+        self.last_value
+            .map(|index| &elements.attribute_values()[index])
+    }
+}
+
 struct AttributeDiagnosticLocations<'a> {
-    attribute_keys: &'a [super::AttributeKeyLocation],
-    attribute_values: &'a [super::elements::AttributeValueLocation],
+    elements: &'a super::elements::ElementLocations,
     root: &'a DeclarationLocation,
 }
 
 impl<'a> AttributeDiagnosticLocations<'a> {
-    fn attribute_key_location(&self, _name: &str) -> &'a DeclarationLocation {
-        self.root
-    }
-    fn matches_attribute_path(
-        path: &[super::AttributePathSegment],
-        name: &str,
-        steps: &[crate::schema::FieldPathStep],
-    ) -> bool {
-        use super::AttributePathSegment as Segment;
-        use crate::schema::FieldPathStep as Step;
-        matches!(path.first(), Some(Segment::Attribute(attr)) if attr == name)
-            && path.len() == steps.len() + 1
-            && path[1..]
-                .iter()
-                .zip(steps)
-                .all(|(segment, step)| match (segment, step) {
-                    (Segment::StructField(a) | Segment::Key(a), Step::Field(b)) => a == b,
-                    (Segment::ListIndex(a), Step::Index(b)) => a == b,
-                    _ => false,
-                })
-    }
-
-    /// Computed containers may have no authored leaf. Use their closest
-    /// authored parent, whose location was sealed with the resource.
+    /// Computed containers have no authored child. Walk the indexed ancestors
+    /// once and use the first computed expression's original parser location.
     fn computed_parent_location(
         &self,
         name: &str,
         path: &crate::schema::FieldPath,
     ) -> Option<&'a DeclarationLocation> {
-        for depth in 0..path.steps().len() {
-            let steps = &path.steps()[..depth];
-            if let Some(parent) = self
-                .attribute_values
-                .iter()
-                .rev()
-                .find(|value| Self::matches_attribute_path(&value.path, name, steps))
-            {
-                if !parent.literal_container {
+        let mut node = self.elements.diagnostic_index().attribute(name);
+        for (depth, step) in path.steps().iter().enumerate() {
+            match node.and_then(|node| node.value(self.elements)) {
+                Some(parent) if !parent.literal_container => {
                     return Some(if depth == 0 {
-                        self.attribute_key_location(name)
+                        self.root
                     } else {
                         &parent.anchor
                     });
                 }
-            } else if !self
-                .attribute_keys
-                .iter()
-                .any(|key| key.is_block() && Self::matches_attribute_path(key.path(), name, steps))
-            {
-                return Some(self.attribute_key_location(name));
+                None if node.is_none_or(|node| node.first_block.is_none()) => {
+                    return Some(self.root);
+                }
+                Some(_) | None => {}
             }
+            node = node.and_then(|node| node.child(step));
         }
         None
     }
 
-    pub fn attribute_value_location(
+    fn attribute_value_location(
         &self,
         name: &str,
         path: &crate::schema::FieldPath,
@@ -248,20 +324,41 @@ impl<'a> AttributeDiagnosticLocations<'a> {
         if let Some(parent) = self.computed_parent_location(name, path) {
             return parent;
         }
-        let mut steps = path.steps();
-        loop {
-            if let Some(value) = self
-                .attribute_values
-                .iter()
-                .rev()
-                .find(|value| Self::matches_attribute_path(&value.path, name, steps))
-            {
-                return &value.location;
+        let mut nodes = Vec::new();
+        let mut current = self.elements.diagnostic_index().attribute(name);
+        if let Some(node) = current {
+            nodes.push(node);
+        }
+        for step in path.steps() {
+            current = current.and_then(|node| node.child(step));
+            if let Some(node) = current {
+                nodes.push(node);
             }
-            let Some((_, parent)) = steps.split_last() else {
-                return self.attribute_key_location(name);
-            };
-            steps = parent;
+        }
+        nodes
+            .into_iter()
+            .rev()
+            .find_map(|node| node.value(self.elements))
+            .map_or(self.root, |value| &value.location)
+    }
+
+    fn attribute_path_location(
+        &self,
+        name: &str,
+        path: &crate::schema::FieldPath,
+    ) -> &'a DeclarationLocation {
+        if let Some(parent) = self.computed_parent_location(name, path) {
+            return parent;
+        }
+        let Some(node) = self.elements.diagnostic_index().at(name, path) else {
+            return self.root;
+        };
+        if let Some(key) = node.key(self.elements) {
+            key.location()
+        } else if let Some(value) = node.value(self.elements) {
+            &value.anchor
+        } else {
+            self.root
         }
     }
 }
@@ -274,22 +371,25 @@ impl DeclarationProvenance {
         path: &crate::schema::InputDiagnosticPath,
     ) -> Option<&DeclarationLocation> {
         let elements = self.elements();
-        let root = elements.keys.iter().rev().find(|key| matches!(key.path(), [super::AttributePathSegment::Attribute(name)] if name == path.root()));
+        let root = elements
+            .diagnostic_index()
+            .attribute(path.root())
+            .and_then(|node| node.key(elements));
         let Some(root) = root else {
             return elements
                 .get(super::elements::ElementKind::ResourceType)
                 .or(self.location());
         };
-        if path.relative().is_empty() {
+        let relative = path.relative();
+        if relative.is_empty() {
             return Some(root.location());
         }
         Some(
             AttributeDiagnosticLocations {
-                attribute_keys: &elements.keys,
-                attribute_values: &elements.attribute_values,
+                elements,
                 root: root.location(),
             }
-            .attribute_value_location(path.root(), &path.relative()),
+            .attribute_value_location(path.root(), &relative),
         )
     }
 
@@ -335,8 +435,7 @@ impl DeclarationProvenance {
 
     pub(in crate::parser) fn set_iterable(&mut self, location: DeclarationLocation) {
         Arc::make_mut(&mut self.elements)
-            .values
-            .push((super::elements::ElementKind::Iterable, location));
+            .push_element(super::elements::ElementKind::Iterable, location);
     }
 
     pub(crate) fn location(&self) -> Option<&DeclarationLocation> {
@@ -627,8 +726,7 @@ pub struct AnalysisResourceRef<
     in_project_walk: bool,
     location: &'a DeclarationLocation,
     attribute_locations: std::collections::HashMap<String, &'a super::AttributeKeyLocation>,
-    attribute_keys: &'a [super::AttributeKeyLocation],
-    attribute_values: &'a [super::elements::AttributeValueLocation],
+    elements: &'a super::elements::ElementLocations,
     type_location: &'a DeclarationLocation,
     ignore_changes_location: Option<&'a DeclarationLocation>,
     references: Vec<AnalysisReference<B>>,
@@ -1069,29 +1167,28 @@ fn attribute_provenance<'a, P: ValueKind, B: BindingAddress>(
     let mut keys = std::collections::HashMap::new();
     let mut references = Vec::new();
     for (key, value) in attributes {
-        let mut root_keys =
-            provenance.elements().keys.iter().filter(|entry| {
-                matches!(entry.path(), [super::AttributePathSegment::Attribute(name)] if name == key)
-            });
-        // Blocks are collected into a list after assignments. Otherwise the
-        // parser keeps the last authored assignment for each attribute.
-        let key_location = root_keys
-            .clone()
-            .find(|entry| entry.is_block())
-            .or_else(|| root_keys.next_back())
+        let node = provenance.elements().diagnostic_index().attribute(key);
+        // Blocks are collected after assignments; otherwise the parser keeps
+        // the final authored assignment. Both facts are indexed once.
+        let key_location = node
+            .and_then(|node| {
+                node.first_block
+                    .map(|index| &provenance.elements().keys()[index])
+                    .or_else(|| node.key(provenance.elements()))
+            })
             .ok_or_else(|| {
                 AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
                     declaration: location.clone(),
                     element: format!("attribute key {key}"),
                 })
             })?;
-        if !provenance.elements().attribute_values.iter().any(|value| {
-            matches!(value.path.first(), Some(super::AttributePathSegment::Attribute(name)) if name == key)
-        }) {
-            return Err(AnalysisTreeError::new(AnalysisTreeErrorKind::MissingElementProvenance {
-                declaration: location.clone(),
-                element: format!("attribute value {key}"),
-            }));
+        if node.is_none_or(|node| !node.contains_value) {
+            return Err(AnalysisTreeError::new(
+                AnalysisTreeErrorKind::MissingElementProvenance {
+                    declaration: location.clone(),
+                    element: format!("attribute value {key}"),
+                },
+            ));
         }
         keys.insert(key.clone(), key_location);
         let mut result = Ok(());
@@ -1297,7 +1394,7 @@ where
         &self.references
     }
     pub fn attribute_keys(&self) -> &'a [super::AttributeKeyLocation] {
-        self.attribute_keys
+        self.elements.keys()
     }
     pub fn type_location(&self) -> &'a DeclarationLocation {
         self.type_location
@@ -1315,33 +1412,23 @@ where
         &'s self,
         name: &'s str,
     ) -> impl Iterator<Item = &'a DeclarationLocation> + 's {
-        self.attribute_keys.iter().filter(move |key| {
-            key.is_block() && matches!(key.path(), [super::AttributePathSegment::Attribute(attr)] if attr == name)
-        }).map(|key| key.location())
+        self.elements
+            .diagnostic_index()
+            .attribute(name)
+            .into_iter()
+            .flat_map(|node| node.keys.iter())
+            .map(|index| &self.elements.keys()[*index])
+            .filter(|key| key.is_block())
+            .map(|key| key.location())
     }
 
-    fn matches_attribute_path(
-        path: &[super::AttributePathSegment],
-        name: &str,
-        steps: &[crate::schema::FieldPathStep],
-    ) -> bool {
-        AttributeDiagnosticLocations::matches_attribute_path(path, name, steps)
-    }
     fn diagnostic_locations(&self, name: &str) -> AttributeDiagnosticLocations<'a> {
         AttributeDiagnosticLocations {
-            attribute_keys: self.attribute_keys,
-            attribute_values: self.attribute_values,
+            elements: self.elements,
             root: self.attribute_key_location(name),
         }
     }
-    fn computed_parent_location(
-        &self,
-        name: &str,
-        path: &crate::schema::FieldPath,
-    ) -> Option<&'a DeclarationLocation> {
-        self.diagnostic_locations(name)
-            .computed_parent_location(name, path)
-    }
+
     pub fn attribute_value_location(
         &self,
         name: &str,
@@ -1356,40 +1443,23 @@ where
         name: &str,
         path: &crate::schema::FieldPath,
     ) -> &'a DeclarationLocation {
-        if let Some(parent) = self.computed_parent_location(name, path) {
-            return parent;
-        }
-        if let Some(key) = self
-            .attribute_keys
-            .iter()
-            .rev()
-            .find(|key| Self::matches_attribute_path(key.path(), name, path.steps()))
-        {
-            return key.location();
-        }
-        if let Some(value) = self
-            .attribute_values
-            .iter()
-            .rev()
-            .find(|value| Self::matches_attribute_path(&value.path, name, path.steps()))
-        {
-            return &value.anchor;
-        }
-        self.attribute_key_location(name)
+        self.diagnostic_locations(name)
+            .attribute_path_location(name, path)
     }
 
     pub fn replaceable_attribute_value(&self, name: &str) -> Option<&'a DeclarationLocation> {
-        self.attribute_values
-            .iter()
-            .rev()
-            .find(|value| Self::matches_attribute_path(&value.path, name, &[]) && value.replaceable)
-            .map(|value| &value.location)
+        self.elements
+            .diagnostic_index()
+            .attribute(name)
+            .and_then(|node| node.replaceable)
+            .map(|index| &self.elements.attribute_values()[index].location)
     }
 
     pub fn is_list_literal(&self, name: &str) -> bool {
-        self.attribute_values
-            .iter()
-            .any(|value| Self::matches_attribute_path(&value.path, name, &[]) && value.list_literal)
+        self.elements
+            .diagnostic_index()
+            .attribute(name)
+            .is_some_and(|node| node.list_literal)
     }
 
     pub fn schema<'s>(
@@ -1817,8 +1887,7 @@ where
                     dependency_edges,
                     provider_location,
                     iterable,
-                    attribute_keys: &provenance.elements().keys,
-                    attribute_values: &provenance.elements().attribute_values,
+                    elements: provenance.elements(),
                     type_location: if matches!(resource, ResourceRef::LiveComposition(_)) {
                         location
                     } else {
@@ -2785,8 +2854,97 @@ where
 }
 
 #[cfg(test)]
+thread_local! {
+    static ATTRIBUTE_LOCATION_WORK: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn record_attribute_location_work(steps: usize) {
+    ATTRIBUTE_LOCATION_WORK.with(|work| {
+        if let Some(count) = work.get() {
+            work.set(Some(count + steps));
+        }
+    });
+}
+
+#[cfg(test)]
 mod location_tests {
     use super::*;
+
+    #[test]
+    fn collection_input_findings_use_a_linear_authored_location_budget() {
+        use crate::schema::{
+            AttributeSchema, AttributeType, InputCondition, InputPath, InputPredicate, InputRule,
+            InputRuleCode, InputRuleScope, ResourceSchema, SchemaRegistry, StructField,
+        };
+        const COUNT: usize = 256;
+        for container in ["list", "map"] {
+            let item = AttributeType::struct_with_rules(
+                "Item",
+                vec![
+                    StructField::optional("guard", AttributeType::bool()).build(),
+                    StructField::optional("target", AttributeType::string()).build(),
+                ],
+                vec![],
+                vec![
+                    InputRule::value(
+                        InputRuleScope::EveryWrite,
+                        InputPath::new("target").unwrap(),
+                        InputRuleCode::new("item.target").unwrap(),
+                        InputPredicate::Present,
+                    )
+                    .with_condition(InputCondition::Present(InputPath::new("guard").unwrap())),
+                ],
+            );
+            let item_type = match container {
+                "list" => AttributeType::list(item),
+                "map" => AttributeType::map(item),
+                _ => unreachable!(),
+            };
+            let mut schemas = SchemaRegistry::new();
+            schemas.insert(
+                "mock",
+                ResourceSchema::new("Review")
+                    .attribute(AttributeSchema::optional("items", item_type).build())
+                    .validate()
+                    .unwrap(),
+            );
+            let items = (0..COUNT)
+                .map(|i| match container {
+                    "list" => "{ guard = true }".into(),
+                    "map" => format!("key{i} = {{ guard = true }}"),
+                    _ => unreachable!(),
+                })
+                .collect::<Vec<String>>()
+                .join(", ");
+            let (open, close) = if container == "list" {
+                ("[", "]")
+            } else {
+                ("{", "}")
+            };
+            let source = format!("let example = mock.Review {{ items = {open}{items}{close} }}");
+            let parsed = super::super::parse_file(
+                &source,
+                Path::new("main.crn"),
+                &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
+            )
+            .unwrap();
+            let report = crate::input_rules::check_authored_inputs(
+                parsed.authored_inputs().unwrap(),
+                &schemas,
+            );
+            assert_eq!(report.findings().len(), COUNT);
+            ATTRIBUTE_LOCATION_WORK.set(Some(0));
+            for finding in report.findings().iter() {
+                assert!(finding.authored_location().is_some());
+            }
+            let work = ATTRIBUTE_LOCATION_WORK.replace(None).unwrap();
+            assert!(
+                work <= COUNT * 48,
+                "{container}: {work} location steps for {COUNT} findings"
+            );
+        }
+    }
 
     #[test]
     fn secret_origin_4275_round2_iterable_provenance_masks_secret_path() {
@@ -2859,9 +3017,7 @@ mod location_tests {
             &super::super::ProviderContext::new(crate::EnvironmentSnapshot::empty()),
         )
         .unwrap();
-        Arc::make_mut(&mut parsed.resources[0].declaration.elements)
-            .attribute_values
-            .clear();
+        Arc::make_mut(&mut parsed.resources[0].declaration.elements).clear_attribute_values();
         let error = match AnalysisTree::try_from_file(&parsed) {
             Ok(_) => panic!("missing value provenance must fail before any analysis runs"),
             Err(error) => error,

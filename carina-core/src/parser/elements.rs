@@ -2,7 +2,10 @@
 use pest::iterators::{Pair, Pairs};
 
 use super::{DeclarationLocation, Located, PreprocessedFile, Rule};
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{Arc, OnceLock},
+};
 
 /// A key occurrence, including its path through maps, lists and repeated blocks.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,11 +43,25 @@ pub(crate) enum ElementKind {
     Iterable,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct ElementLocations {
-    pub(crate) keys: Vec<AttributeKeyLocation>,
-    pub(crate) attribute_values: Vec<AttributeValueLocation>,
-    pub(crate) values: Vec<(ElementKind, DeclarationLocation)>,
+    keys: Vec<AttributeKeyLocation>,
+    attribute_values: Vec<AttributeValueLocation>,
+    values: Vec<(ElementKind, DeclarationLocation)>,
+    diagnostic_index: OnceLock<super::analysis::AttributeLocationIndex>,
+}
+
+impl Clone for ElementLocations {
+    fn clone(&self) -> Self {
+        Self {
+            keys: self.keys.clone(),
+            attribute_values: self.attribute_values.clone(),
+            values: self.values.clone(),
+            // Arc clones share the immutable cache. A mutable provenance fork
+            // starts a fresh index rather than copying an index it will invalidate.
+            diagnostic_index: OnceLock::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -106,11 +123,30 @@ fn value_location(
 }
 
 impl ElementLocations {
+    pub(crate) fn keys(&self) -> &[AttributeKeyLocation] {
+        &self.keys
+    }
+    pub(crate) fn attribute_values(&self) -> &[AttributeValueLocation] {
+        &self.attribute_values
+    }
+    pub(super) fn diagnostic_index(&self) -> &super::analysis::AttributeLocationIndex {
+        self.diagnostic_index
+            .get_or_init(|| super::analysis::AttributeLocationIndex::build(self))
+    }
+    pub(super) fn push_element(&mut self, kind: ElementKind, location: DeclarationLocation) {
+        self.values.push((kind, location));
+    }
+    #[cfg(test)]
+    pub(super) fn clear_attribute_values(&mut self) {
+        self.attribute_values.clear();
+        self.diagnostic_index.take();
+    }
     pub(crate) fn rename_attribute_path(
         &mut self,
         from: &[super::AttributePathSegment],
         name: &str,
     ) {
+        self.diagnostic_index.take();
         use super::AttributePathSegment as Segment;
         let rename = |path: &mut [Segment]| {
             // Map literals and block syntax use different segment variants
@@ -195,6 +231,7 @@ impl ElementLocations {
             keys,
             attribute_values,
             values: Vec::new(),
+            diagnostic_index: OnceLock::new(),
         }
     }
 

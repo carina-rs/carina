@@ -504,10 +504,10 @@ fn authored_every_write_conditions_use_the_shared_report() {
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let findings = check_authored_inputs(file.authored_inputs().unwrap(), &schemas).unwrap();
-    assert_eq!(findings.len(), 1);
+    let findings = check_authored_inputs(file.authored_inputs().unwrap(), &schemas);
+    assert_eq!(findings.findings().len(), 1);
     assert!(
-        findings[0]
+        findings.findings()[0]
             .to_string()
             .ends_with("target [test.dependency]: must be present when guard is present")
     );
@@ -903,14 +903,14 @@ fn s3_account_regional_suffix_is_create_only_and_imports_are_excluded() {
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let report = check_authored_inputs(file.authored_inputs().unwrap(), &schemas).unwrap();
-    assert_eq!(report.len(), 1);
+    let report = check_authored_inputs(file.authored_inputs().unwrap(), &schemas);
+    assert_eq!(report.findings().len(), 1);
     assert_eq!(
-        report[0].severity(),
+        report.findings()[0].severity(),
         carina_core::input_rules::InputFindingSeverity::Warning
     );
     assert_eq!(
-        report[0].to_string(),
+        report.findings()[0].to_string(),
         format!(
             "{}: target [s3.bucket.namespace_suffix]: has a forbidden suffix when not (guard equals mock.s3.Bucket.Namespace::\"account-regional\") (rejected if this resource is created)",
             file.resources[0].id
@@ -1219,8 +1219,8 @@ fn authored_report_retains_pending_guards_as_obligations() {
         &carina_core::parser::ProviderContext::new(carina_core::EnvironmentSnapshot::empty()),
     )
     .unwrap();
-    let report = check_authored_inputs(file.authored_inputs().unwrap(), &schemas).unwrap();
-    assert!(report.is_empty());
+    let report = check_authored_inputs(file.authored_inputs().unwrap(), &schemas);
+    assert!(report.findings().is_empty());
     assert_eq!(report.pending().len(), 1);
     assert_eq!(report.pending()[0].path.as_str(), "target");
     assert_eq!(report.pending()[0].code.as_str(), "test.dependency");
@@ -1297,10 +1297,10 @@ fn create_only_s3_namespace_preview_preserves_pending_create_obligations() {
         if let Some(namespace) = namespace {
             fields.push(("bucket_namespace", namespace_value(namespace)));
         }
-        let report = check_authored_inputs(file.authored_inputs().unwrap(), &schemas).unwrap();
-        assert_eq!(report.len(), violations);
+        let report = check_authored_inputs(file.authored_inputs().unwrap(), &schemas);
+        assert_eq!(report.findings().len(), violations);
         assert_eq!(report.pending().len(), pending_count);
-        for finding in report.iter() {
+        for finding in report.findings().iter() {
             assert_eq!(finding.severity(), InputFindingSeverity::Warning);
             assert_eq!(
                 finding.to_string(),

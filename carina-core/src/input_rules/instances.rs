@@ -55,33 +55,6 @@ impl OwnerPath {
 
 pub(super) fn diagnostic_path(owner: &OwnerPath, path: &InputPath) -> InputDiagnosticPath {
     let owner = owner.segments();
-    let mut rendered = String::new();
-    for step in &owner {
-        match step {
-            Step::Field(name) => {
-                if !rendered.is_empty() {
-                    rendered.push('.');
-                }
-                rendered.push_str(name);
-            }
-            Step::Index(index) => {
-                use std::fmt::Write;
-                write!(rendered, "[{index}]").expect("write String");
-            }
-            Step::Key(key) => {
-                rendered.push('[');
-                rendered.push_str(&format!(
-                    "{:?}",
-                    key.diagnostic_literal().unwrap_or("<secret>")
-                ));
-                rendered.push(']');
-            }
-        }
-    }
-    if !rendered.is_empty() {
-        rendered.push('.');
-    }
-    rendered.push_str(path.as_str());
     let mut steps = owner
         .iter()
         .map(|step| (*step).clone())
@@ -97,7 +70,7 @@ pub(super) fn diagnostic_path(owner: &OwnerPath, path: &InputPath) -> InputDiagn
                 key.diagnostic_literal().unwrap_or("<secret>"),
             )),
         }));
-    InputDiagnosticPath::new(rendered, root, relative)
+    InputDiagnosticPath::new(root, relative)
 }
 
 fn active(site: &WriteSite<'_>, owner: &OwnerPath, rule: &InputRule<Compiled>) -> bool {

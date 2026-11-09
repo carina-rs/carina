@@ -7,6 +7,68 @@ use carina_core::schema::{
 };
 
 #[test]
+fn alias_conflicts_preserve_independent_cli_lsp_create_only_warnings() {
+    let schema = ResourceSchema::new("test.Conditional")
+        .attribute(AttributeSchema::optional("name", AttributeType::string()).build())
+        .attribute(
+            AttributeSchema::optional(
+                "entries",
+                AttributeType::list(AttributeType::struct_("Entry", vec![])),
+            )
+            .with_block_name("entry")
+            .build(),
+        )
+        .input_rule(InputRule::value(
+            InputRuleScope::CreateOnly,
+            InputPath::new("name").unwrap(),
+            InputRuleCode::new("test.creation_name").unwrap(),
+            InputPredicate::NoSuffix(carina_core::schema::NonEmptyString::new("-an").unwrap()),
+        ));
+    let fixture = write_fixture(&[
+        ("providers.crn", "provider test {}\n"),
+        (
+            "main.crn",
+            "let example = test.test.Conditional { name = 'bucket-an' }\n",
+        ),
+        (
+            "broken.crn",
+            "let broken = test.test.Conditional { entries = [] entry {} }\n",
+        ),
+    ]);
+    let schemas = single_schema_map(schema);
+    let cli = carina_cli::commands::validate::validate_diagnostics_with_factories(
+        &carina_core::paths::ResolvedPath::new(fixture.path()).unwrap(),
+        carina_cli::wiring::LoadedProviderFactory::for_test(factories_for(&schemas)),
+        Default::default(),
+    );
+    assert!(!cli.errors.is_empty(), "alias conflict remains an error");
+    assert_eq!(
+        cli.input_warnings.len(),
+        1,
+        "independent warning must survive: {:?}",
+        cli.errors
+    );
+    let message = cli.input_warnings[0].to_string();
+    assert!(message.ends_with("(rejected if this resource is created)"));
+    let engine = engine_with_schemas(schemas);
+    let diagnostics = lsp_diagnostics(&engine, &fixture, "main.crn");
+    let warnings = diagnostics
+        .iter()
+        .filter(|finding| finding.message == message)
+        .collect::<Vec<_>>();
+    assert_eq!(warnings.len(), 1, "{diagnostics:#?}");
+    assert_eq!(warnings[0].severity, Some(DiagnosticSeverity::WARNING));
+    let broken = lsp_diagnostics(&engine, &fixture, "broken.crn");
+    assert!(
+        broken.iter().any(
+            |finding| finding.severity == Some(DiagnosticSeverity::ERROR)
+                && finding.message.contains("cannot use both")
+        ),
+        "{broken:#?}"
+    );
+}
+
+#[test]
 fn invalid_module_default_tags_preserve_independent_cli_lsp_input_findings() {
     let schema = ResourceSchema::new("test.Conditional")
         .attribute(AttributeSchema::optional("name", AttributeType::string()).build())

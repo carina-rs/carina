@@ -1171,15 +1171,49 @@ pub enum LeafPathSegment {
 }
 
 /// Location of one write-only field inside a top-level attribute value.
-#[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
-pub struct LeafPath(Vec<LeafPathSegment>);
+pub struct LeafPath(Vec<LeafPathSegment>, #[serde(skip)] LeafPathRendering);
+
+#[derive(Debug, Clone, Copy, Default)]
+enum LeafPathRendering {
+    #[default]
+    Literal,
+    Redacted,
+}
+
+impl fmt::Debug for LeafPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("LeafPath").field(&self.0).finish()
+    }
+}
+
+// Diagnostic protection never changes the canonical identity or wire shape.
+impl PartialEq for LeafPath {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for LeafPath {}
+impl PartialOrd for LeafPath {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for LeafPath {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(&other.0)
+    }
+}
+impl std::hash::Hash for LeafPath {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
 
 impl LeafPath {
     pub fn from_segments(segments: impl IntoIterator<Item = LeafPathSegment>) -> Self {
-        Self(segments.into_iter().collect())
+        Self(segments.into_iter().collect(), LeafPathRendering::Literal)
     }
 
     /// Borrow the typed steps from the containing attribute to this leaf.
@@ -1192,12 +1226,15 @@ impl fmt::Display for LeafPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for (index, segment) in self.0.iter().enumerate() {
             match segment {
-                LeafPathSegment::StructField(name) => {
-                    if index > 0 {
-                        f.write_str(".")?;
+                LeafPathSegment::StructField(name) => match self.1 {
+                    LeafPathRendering::Literal => write_path_field(f, name, index > 0)?,
+                    LeafPathRendering::Redacted => {
+                        if index > 0 {
+                            f.write_str(".")?;
+                        }
+                        f.write_str(SECRET_VALUE_MASK)?;
                     }
-                    f.write_str(name)?;
-                }
+                },
                 LeafPathSegment::ListIndex(index) => write!(f, "[{index}]")?,
                 LeafPathSegment::MapKey(key) => write!(f, "[{key:?}]")?,
             }
@@ -2394,13 +2431,52 @@ impl<R: PatternForm> fmt::Debug for PatternAttributeType<R> {
 pub enum FieldPathStep {
     Field(String),
     Index(usize),
+    Redacted(RedactedPathField),
+}
+
+/// A diagnostic marker is not an authored field with the marker's spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactedPathField {
+    SecretValue,
+    MapKey,
+}
+
+impl fmt::Display for RedactedPathField {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SecretValue => f.write_str(SECRET_VALUE_MASK),
+            Self::MapKey => f.write_str("<secret>"),
+        }
+    }
+}
+
+pub(crate) fn is_path_identifier(name: &str) -> bool {
+    name.as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || *byte == b'_')
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Render a literal field, never interpreting its bytes as path separators.
+fn write_path_field(out: &mut impl fmt::Write, name: &str, has_parent: bool) -> fmt::Result {
+    if is_path_identifier(name) {
+        if has_parent {
+            out.write_char('.')?;
+        }
+        out.write_str(name)
+    } else {
+        write!(out, "[{name:?}]")
+    }
 }
 
 impl fmt::Display for FieldPathStep {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            FieldPathStep::Field(name) => write!(f, "{}", name),
+            FieldPathStep::Field(name) => write_path_field(f, name, false),
             FieldPathStep::Index(i) => write!(f, "[{}]", i),
+            FieldPathStep::Redacted(marker) => marker.fmt(f),
         }
     }
 }
@@ -2443,14 +2519,22 @@ pub(crate) struct ConcreteFieldPath {
 }
 
 impl ConcreteFieldPath {
+    pub(crate) fn canonical(&self) -> &[LeafPathSegment] {
+        &self.canonical
+    }
     pub(crate) fn as_field_path(&self) -> FieldPath {
-        FieldPath::from_canonical_segments(self.canonical.iter().cloned())
+        self.steps
+            .iter()
+            .zip(&self.canonical)
+            .fold(FieldPath::new(), |path, (step, canonical)| {
+                path.pushed(step.clone(), canonical.clone(), FieldPathDirection::After)
+            })
     }
 }
 
 impl PartialEq for ConcreteFieldPath {
     fn eq(&self, other: &Self) -> bool {
-        self.steps == other.steps
+        self.canonical == other.canonical
     }
 }
 impl Eq for ConcreteFieldPath {}
@@ -2595,9 +2679,10 @@ impl FieldPath {
             let step = match &canonical {
                 LeafPathSegment::StructField(name) => FieldPathStep::Field(name.clone()),
                 LeafPathSegment::ListIndex(index) => FieldPathStep::Index(*index),
-                LeafPathSegment::MapKey(key) => {
-                    FieldPathStep::Field(key.diagnostic_literal().unwrap_or("<secret>").to_owned())
-                }
+                LeafPathSegment::MapKey(key) => match key.diagnostic_literal() {
+                    Some(key) => FieldPathStep::Field(key.to_owned()),
+                    None => FieldPathStep::Redacted(RedactedPathField::MapKey),
+                },
             };
             path = path.pushed(step, canonical, FieldPathDirection::After);
         }
@@ -2670,12 +2755,15 @@ impl fmt::Display for FieldPath {
         for step in self.steps() {
             match step {
                 FieldPathStep::Field(name) => {
-                    if !first {
-                        write!(f, ".")?;
-                    }
-                    write!(f, "{}", name)?;
+                    write_path_field(f, name, !first)?;
                 }
                 FieldPathStep::Index(i) => write!(f, "[{}]", i)?,
+                FieldPathStep::Redacted(marker) => {
+                    if !first {
+                        f.write_str(".")?;
+                    }
+                    marker.fmt(f)?;
+                }
             }
             first = false;
         }
@@ -8087,7 +8175,7 @@ impl TypeError {
             | TypeError::BlockSyntaxNotAllowed { attribute: name } => Some(name),
             TypeError::FieldGroupViolation { path, .. } => match path.steps().first() {
                 Some(FieldPathStep::Field(name)) => Some(name),
-                Some(FieldPathStep::Index(_)) | None => None,
+                Some(FieldPathStep::Index(_) | FieldPathStep::Redacted(_)) | None => None,
             },
             TypeError::ListItemError { inner, .. }
             | TypeError::MapKeyError { inner, .. }
@@ -15811,13 +15899,19 @@ pub(crate) fn assignment_catalog_without_edges_for_test()
 
 impl crate::resource::InsideSecret for LeafPath {
     fn inside_secret(self) -> Self {
-        Self::from_segments(self.0.into_iter().map(|segment| match segment {
-            LeafPathSegment::StructField(_) => {
-                LeafPathSegment::StructField(SECRET_VALUE_MASK.to_owned())
-            }
-            LeafPathSegment::MapKey(_) => LeafPathSegment::MapKey(SECRET_VALUE_MASK.into()),
-            LeafPathSegment::ListIndex(index) => LeafPathSegment::ListIndex(index),
-        }))
+        Self(
+            self.0
+                .into_iter()
+                .map(|segment| match segment {
+                    LeafPathSegment::StructField(_) => {
+                        LeafPathSegment::StructField(SECRET_VALUE_MASK.to_owned())
+                    }
+                    LeafPathSegment::MapKey(_) => LeafPathSegment::MapKey(SECRET_VALUE_MASK.into()),
+                    LeafPathSegment::ListIndex(index) => LeafPathSegment::ListIndex(index),
+                })
+                .collect(),
+            LeafPathRendering::Redacted,
+        )
     }
 }
 
@@ -15827,7 +15921,9 @@ impl crate::resource::InsideSecret for FieldPath {
         let mut path = Self::new();
         for (step, canonical) in segments.steps.iter().zip(&segments.canonical) {
             let step = match step {
-                FieldPathStep::Field(_) => FieldPathStep::Field(SECRET_VALUE_MASK.to_string()),
+                FieldPathStep::Field(_) | FieldPathStep::Redacted(_) => {
+                    FieldPathStep::Redacted(RedactedPathField::SecretValue)
+                }
                 FieldPathStep::Index(index) => FieldPathStep::Index(*index),
             };
             let canonical = match canonical {

@@ -991,9 +991,11 @@ impl ValidationReport<'_> {
     /// retains the effect-specific input gate instead.
     pub(crate) fn check_authored_inputs(mut self) -> Self {
         let mut errors = Vec::new();
-        match carina_core::input_rules::check_authored_inputs(&self.authored_inputs, self.schemas) {
-            Ok(report) => {
-                for finding in report {
+        for outcome in
+            carina_core::input_rules::check_authored_inputs(&self.authored_inputs, self.schemas)
+        {
+            match outcome {
+                carina_core::input_rules::AuthoredInputOutcome::Finding(finding) => {
                     match finding.severity() {
                         carina_core::input_rules::InputFindingSeverity::Error => {
                             errors.push(AppError::Validation(finding.to_string()));
@@ -1003,8 +1005,11 @@ impl ValidationReport<'_> {
                         }
                     }
                 }
+                carina_core::input_rules::AuthoredInputOutcome::Pending(_) => {}
+                carina_core::input_rules::AuthoredInputOutcome::PreparationFailed(error) => {
+                    errors.push(AppError::Provider(error.into_host_error()));
+                }
             }
-            Err(error) => errors.push(AppError::Provider(error)),
         }
         self.result = append_load_findings(self.result, errors);
         self

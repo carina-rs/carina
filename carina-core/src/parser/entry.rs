@@ -462,7 +462,7 @@ impl SourceSpanIndex {
                         descend(first, rest)
                     }
                 }
-                FieldPathStep::Index(_) => None,
+                FieldPathStep::Index(_) | FieldPathStep::Redacted(_) => None,
             }
         }
 

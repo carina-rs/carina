@@ -701,7 +701,9 @@ A struct type represents a nested object with typed fields.
   mutating public AST fields cannot reseal their snapshot. Every successful module
   publication retains resource authority even if provider configuration fails;
   unavailable default-map membership remains pending. Missing authority is an
-  explicit error, never an empty successful report. Schema fields are read literally
+  explicit error, never an empty successful report. Authored reports retain each
+  resource's preparation errors alongside findings and pending obligations;
+  consumers exhaustively render their typed outcomes. Schema fields are read literally
   through compiled declarations; only declared rule paths use `InputPath` parsing.
   Guards, targets,
   instance enumeration and bound-expression estimation share the graph and
@@ -712,6 +714,10 @@ A struct type represents a nested object with typed fields.
   Owner prefixes are shared, and diagnostic paths are materialized only for
   findings or pending results, which are then sorted. The shared validator also
   shares path prefixes; published diagnostic keys have immutable concrete storage.
+  Diagnostic identity and ordering use structured segments; literal field names
+  are quoted when needed. Parser-owned locations share one structured index,
+  invalidated only by their owning mutation methods. Dispatch secret restoration
+  establishes plaintext correspondence once and carries paired child cursors.
   Only complete replacement nodes and
   explicit removals prove absence; unsent omissions remain withheld at every
   depth. Default membership belongs to that graph and is recomputed at dispatch.

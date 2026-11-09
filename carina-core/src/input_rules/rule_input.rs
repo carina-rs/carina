@@ -23,29 +23,28 @@ use yoke::{Yoke, Yokeable};
 ///
 /// ```no_run
 /// # include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/internal_rule_input_doctest.rs"));
-/// fn protected_source(ready: &crate::provider::ProviderReadyResource) {
-///     let _ = ready.protected_desired_tree();
+/// fn dispatch_checked_input(ready: &crate::provider::ProviderReadyResource, request: &crate::provider::UpdateRequest, schema: &crate::schema::ValidatedResourceSchema) {
+///     let _ = (ready.protected_desired_tree(), request.patch());
+///     let _ = crate::input_rules::RuleInput::for_dispatch_update(request.protected_input(), schema);
 /// }
 /// fn main() {}
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// # include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/internal_rule_input_doctest.rs"));
 /// fn mismatch(
 ///     a: &crate::provider::ProviderReadyResource,
-///     b: &crate::provider::ProviderReadyResource,
 ///     request_b: &crate::provider::UpdateRequest,
 ///     schema: &crate::schema::ValidatedResourceSchema,
 /// ) {
-///     let desired_a = a.protected_desired_tree();
-///     let patch_b = b.annotated_exact_patch(request_b);
-///     let _ = crate::input_rules::RuleInput::for_dispatch_update(&desired_a, &patch_b, schema);
+///     let independently_paired = (a.protected_desired_tree(), request_b.patch());
+///     let _ = crate::input_rules::RuleInput::for_dispatch_update(&independently_paired, schema);
 /// }
 /// fn main() {}
 /// ```
-/// ```compile_fail
+/// ```compile_fail,E0308
 /// # include!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/internal_rule_input_doctest.rs"));
-/// fn mismatch(a: &crate::provider::ProviderReadyResource, request_b: &crate::provider::UpdateRequest) {
-///     let _ = a.annotated_exact_patch(request_b);
+/// fn patch_only(request: &crate::provider::UpdateRequest, schema: &crate::schema::ValidatedResourceSchema) {
+///     let _ = crate::input_rules::RuleInput::for_dispatch_update(request.patch(), schema);
 /// }
 /// fn main() {}
 /// ```
