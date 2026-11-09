@@ -218,6 +218,34 @@ with tempfile.TemporaryDirectory(prefix="carina-provider-cause-api-") as tempora
                     sys.exit(f'ERROR: host diagnostic plumbing visibility: {filename}, target={target}, features={features}')
             print(f'OK: provider emission allowed; host session, presentation and call-budget plumbing private (E0624); target={target}, features={features}.')
 
+    # Initialization fixtures expose session construction only to native hosts;
+    # test-utils alone must not grant this extension trait through a glob import.
+    shutil.copyfile(repo / "scripts/tests/provider-diagnostic-host-api/initialize_fixture.rs", fixture / "src/lib.rs")
+    for features, should_compile in (("unified-test-utils", False), ("unified-test-utils,forbidden-provider-host", True)):
+        result = subprocess.run([
+            "cargo", "check", "--offline", "--lib", "--message-format=json",
+            "--features", features, "--manifest-path", str(manifest_path),
+            "--target-dir", str(repo / "target"),
+        ], env=environment, capture_output=True, text=True, timeout=600)
+        errors = []
+        for line in result.stdout.splitlines():
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if message.get("reason") == "compiler-message" and message["message"]["level"] == "error":
+                errors.append(message["message"])
+        rejected_trait = any(
+            (error.get("code") or {}).get("code") == "E0432" and "InitializeFixture" in error["message"]
+            for error in errors
+        )
+        if (should_compile and result.returncode != 0) or (not should_compile and (result.returncode != 101 or not rejected_trait)):
+            for error in errors:
+                print(error.get("rendered", error["message"]), file=sys.stderr)
+            print(result.stderr, file=sys.stderr)
+            sys.exit(f"ERROR: initialization fixture must require provider-host: features={features}")
+        print(f"OK: initialization fixture visibility follows provider-host; features={features}.")
+
     for target, filename in (([], "forbidden.rs"), (["--target", "wasm32-wasip2"], "allowed.rs")):
         shutil.copyfile(repo / "scripts/tests/provider-diagnostic-host-api" / filename, fixture / "src/lib.rs")
         result = subprocess.run([

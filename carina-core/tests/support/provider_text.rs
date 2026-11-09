@@ -26,26 +26,6 @@ impl InspectDiagnostic for HostDiagnostic {
     }
 }
 
-pub trait InitializeFixture: ProviderFactory + Sized {
-    fn initialize_fixture(
-        &self,
-        binding: Option<&str>,
-        config: &ProviderReadyConfig,
-    ) -> BoxFuture<'_, HostResult<InitializedProvider>> {
-        let session = ProviderPlan::state_only().session(self.name(), binding, Some(config));
-        Box::pin(async move { ProviderBoundary::initialize(self, &session).await })
-    }
-    fn initialize_normalizer_fixture(
-        &self,
-        binding: Option<&str>,
-        config: &ProviderReadyConfig,
-    ) -> BoxFuture<'_, HostResult<ConfiguredNormalizer>> {
-        let session = ProviderPlan::state_only().session(self.name(), binding, Some(config));
-        Box::pin(async move { ProviderBoundary::initialize_normalizer(self, &session).await })
-    }
-}
-impl<T: ProviderFactory> InitializeFixture for T {}
-
 /// Explicitly opaque label for legacy unit probes; grants no Display implementation.
 pub trait OpaqueFixtureLabel {
     fn to_string(&self) -> String {

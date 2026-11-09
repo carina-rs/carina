@@ -8,6 +8,29 @@ use crate::schema::{
 };
 use std::sync::{Arc, Mutex};
 
+/// Initialize host fixtures through the real provider boundary and session.
+#[cfg(feature = "provider-host")]
+pub trait InitializeFixture: ProviderFactory + Sized {
+    fn initialize_fixture(
+        &self,
+        binding: Option<&str>,
+        config: &ProviderReadyConfig,
+    ) -> BoxFuture<'_, HostResult<InitializedProvider>> {
+        let session = ProviderPlan::state_only().session(self.name(), binding, Some(config));
+        Box::pin(async move { ProviderBoundary::initialize(self, &session).await })
+    }
+    fn initialize_normalizer_fixture(
+        &self,
+        binding: Option<&str>,
+        config: &ProviderReadyConfig,
+    ) -> BoxFuture<'_, HostResult<ConfiguredNormalizer>> {
+        let session = ProviderPlan::state_only().session(self.name(), binding, Some(config));
+        Box::pin(async move { ProviderBoundary::initialize_normalizer(self, &session).await })
+    }
+}
+#[cfg(feature = "provider-host")]
+impl<T: ProviderFactory> InitializeFixture for T {}
+
 pub fn plan_for_desired<S, D>(
     desired: &[Resource<
         S,
