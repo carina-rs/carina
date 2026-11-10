@@ -2486,3 +2486,119 @@ fn every_destination_kind_retains_the_same_member_obligation() {
         },
     );
 }
+
+#[test]
+fn round13_cross_owner_same_identity_defers_in_reference_and_declared_admission() {
+    use crate::binding_index::ResolvedBindings;
+    let arn = TypeIdentity::from_dotted("aws.iam.Role.Arn");
+    let source =
+        AttributeType::refined_string(Some(arn.clone()), None, Some((Some(1), Some(2048))), None);
+    let sink = AttributeType::string_member(
+        crate::schema::StringIdentityLayer::new(
+            Some(arn),
+            None,
+            Some((Some(20), Some(2048))),
+            None,
+        ),
+        crate::schema::StringMemberConstraints::new(None, Some((None, Some(1600)))),
+    );
+    let catalog = crate::parser::LoadedProviderContext::empty_for_test();
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("Values")
+            .attribute(AttributeSchema::optional("value0", source).build())
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("Values")
+            .attribute(AttributeSchema::optional("value0", sink).build())
+            .validate()
+            .unwrap(),
+    );
+    let parsed = crate::parser::parse_file(
+        "let source = awscc.Values {}\nlet target = aws.Values {}\n",
+        std::path::Path::new("main.crn"),
+        catalog.as_provider_context(),
+    )
+    .unwrap()
+    .resolve_root_for_test();
+    let bindings = BindingIndex::from_parsed(&parsed, &schemas, &catalog);
+    let destination = schemas
+        .resource_attribute_destination(&parsed.resources[1].id, "value0", &catalog)
+        .unwrap();
+    let source_schema = schemas
+        .get("awscc", "Values", crate::schema::SchemaKind::Resource)
+        .unwrap();
+    let source_type = source_schema
+        .effective_attribute_by_authored_name("value0")
+        .unwrap();
+    let declared_type = crate::parser::TypeExpr::SchemaType {
+        owned: crate::parser::ResolvedSchemaType::from_schema_declaration(
+            "awscc",
+            source_type.field_type(),
+        )
+        .unwrap(),
+    };
+    let crate::binding_index::RefType::Typed(source) =
+        bindings.ref_type(&crate::resource::AccessPath::root("source", "value0"))
+    else {
+        panic!("typed source")
+    };
+    let declared = source
+        .with_value_declaration(&declared_type, &bindings)
+        .unwrap();
+    for as_declared in [false, true] {
+        for (length, accepted) in [(10, false), (32, true), (1700, false)] {
+            with_session_for_test(&catalog, |session| {
+                let value = Value::root_resource_ref("source", "value0", vec![]);
+                let (candidate, mut boundary) = Candidate::validation_classified(
+                    value
+                        .knowledge(&KnowledgeContext::validation())
+                        .unwrap()
+                        .into_classification(),
+                    Some(&bindings),
+                    session,
+                );
+                if as_declared {
+                    boundary.declaration = Some(("argument", &declared));
+                }
+                let pending = admit(&destination, candidate, &boundary)
+                    .expect("overlapping same-identity bounds defer")
+                    .ready()
+                    .unwrap_err();
+                assert!(pending.local_obligation().is_some());
+                let mut resolved = ResolvedBindings::default();
+                resolved.set(
+                    "source",
+                    HashMap::from([(
+                        "value0".into(),
+                        Value::Concrete(crate::resource::ConcreteValue::String(
+                            "A".repeat(length).into(),
+                        )),
+                    )]),
+                    BindingValueSource::Local,
+                );
+                let result = pending.discharge(&resolved, session);
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "declared={as_declared}, length={length}: {result:?}"
+                );
+                if let Err(error) = result {
+                    let ResolutionError::AdmissionConstraints(findings) = error.resolution_error()
+                    else {
+                        panic!("resolved value must fail the destination constraints: {error:?}");
+                    };
+                    assert_eq!(findings.findings().len(), 1);
+                    assert!(matches!(
+                        findings.findings()[0].error,
+                        TypeError::LengthOutOfRange { .. }
+                    ));
+                }
+            });
+        }
+    }
+}

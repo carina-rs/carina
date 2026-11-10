@@ -182,50 +182,77 @@ impl<'a> ScalarIdentityParts<'a> {
         }
     }
 
-    pub(crate) fn agreement_signature(self) -> String {
-        match self {
-            // Float keeps its existing owner-range conjunction policy. Only
-            // String and Int gain separate identity/member declarations here.
-            Self::Float {
-                identity,
-                validate,
-                range: _range,
-            } => Self::Float {
-                identity,
-                validate,
-                range: None,
+    /// Compare reusable identity metadata without allocating. Callbacks retain
+    /// owner-local semantic dispatch and have no portable behavior identity.
+    pub(crate) fn agrees_with(self, other: Self) -> bool {
+        match (self, other) {
+            (
+                Self::String(StringIdentityParts {
+                    identity: left_identity,
+                    pattern: left_pattern,
+                    length: left_length,
+                    validate: _,
+                    to_dsl: left_to_dsl,
+                }),
+                Self::String(StringIdentityParts {
+                    identity: right_identity,
+                    pattern: right_pattern,
+                    length: right_length,
+                    validate: _,
+                    to_dsl: right_to_dsl,
+                }),
+            ) => {
+                left_identity == right_identity
+                    && left_pattern == right_pattern
+                    && left_length == right_length
+                    && left_to_dsl == right_to_dsl
             }
-            .signature(),
-            other => other.signature(),
+            (
+                Self::Int(IntIdentityParts {
+                    identity: left_identity,
+                    range: left_range,
+                    validate: _,
+                }),
+                Self::Int(IntIdentityParts {
+                    identity: right_identity,
+                    range: right_range,
+                    validate: _,
+                }),
+            ) => left_identity == right_identity && left_range == right_range,
+            // Float keeps its existing owner-range conjunction policy.
+            (
+                Self::Float {
+                    identity: left,
+                    range: _,
+                    validate: _,
+                },
+                Self::Float {
+                    identity: right,
+                    range: _,
+                    validate: _,
+                },
+            ) => left == right,
+            _ => false,
         }
     }
 
-    pub(crate) fn signature(self) -> String {
-        // An identity-only canonical projection. Executable callbacks retain
-        // owner-local semantic dispatch and have no portable behavior identity.
-        let value = match self {
-            Self::String(StringIdentityParts {
-                identity,
-                pattern,
-                length,
-                validate: _validate,
-                to_dsl,
-            }) => serde_json::json!(["String", identity, pattern, length, to_dsl]),
-            Self::Int(IntIdentityParts {
-                identity,
-                range,
-                validate: _validate,
-            }) => serde_json::json!(["Int", identity, range]),
-            Self::Float {
-                identity,
-                range,
-                validate: _validate,
-            } => serde_json::json!(["Float", identity, range]),
-        };
-        use sha2::Digest;
-        hex::encode(sha2::Sha256::digest(
-            serde_json::to_vec(&value).expect("identity metadata is JSON"),
-        ))
+    /// Built-ins additionally require the canonical Float range.
+    pub(crate) fn same_definition(self, other: Self) -> bool {
+        match (self, other) {
+            (
+                Self::Float {
+                    identity: left_identity,
+                    range: left_range,
+                    validate: _,
+                },
+                Self::Float {
+                    identity: right_identity,
+                    range: right_range,
+                    validate: _,
+                },
+            ) => left_identity == right_identity && left_range == right_range,
+            (left, right) => left.agrees_with(right),
+        }
     }
 }
 
@@ -343,7 +370,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_signatures_exclude_members_and_full_fingerprints_include_them() {
+    fn identity_agreement_excludes_members_and_full_fingerprints_include_them() {
         let schema = ValidatedConfigSchema::validate(BTreeMap::from([
             (
                 "first".into(),
@@ -366,9 +393,11 @@ mod tests {
         .unwrap();
         let first = &schema.parts()["first"];
         let second = &schema.parts()["second"];
-        assert_eq!(
-            first.scalar_identity_parts().unwrap().signature(),
-            second.scalar_identity_parts().unwrap().signature()
+        assert!(
+            first
+                .scalar_identity_parts()
+                .unwrap()
+                .same_definition(second.scalar_identity_parts().unwrap())
         );
         assert_ne!(
             first.declaration_fingerprint(),
@@ -403,5 +432,58 @@ mod tests {
             ValidatedProviderSchemaWitness::new(vec![resource], config, BTreeMap::new(), vec![]),
             Err(ProviderSchemaValidationError::ConflictingIdentityDeclarations { .. })
         ));
+    }
+
+    struct AgreementAllocationCounter;
+    std::thread_local! {
+        static AGREEMENT_ALLOCATIONS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    }
+    fn record_agreement_allocation() {
+        let _ = AGREEMENT_ALLOCATIONS.try_with(|counter| {
+            if let Some(count) = counter.get() {
+                counter.set(Some(count + 1));
+            }
+        });
+    }
+    // SAFETY: every operation forwards the caller's pointer/layout contract
+    // unchanged to System; the thread-local counter never allocates.
+    unsafe impl std::alloc::GlobalAlloc for AgreementAllocationCounter {
+        unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+            record_agreement_allocation();
+            // SAFETY: layout satisfies GlobalAlloc's caller contract.
+            unsafe { std::alloc::GlobalAlloc::alloc(&std::alloc::System, layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+            // SAFETY: ptr/layout are forwarded unchanged to their allocator.
+            unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, ptr, layout) }
+        }
+        unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+            record_agreement_allocation();
+            // SAFETY: layout satisfies GlobalAlloc's caller contract.
+            unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+            record_agreement_allocation();
+            // SAFETY: pointer, layout and new size satisfy the caller contract.
+            unsafe { std::alloc::GlobalAlloc::realloc(&std::alloc::System, ptr, layout, size) }
+        }
+    }
+    #[global_allocator]
+    static AGREEMENT_ALLOCATOR: AgreementAllocationCounter = AgreementAllocationCounter;
+
+    #[test]
+    fn round13_identity_agreement_does_not_allocate() {
+        let first = named();
+        let second = named();
+        let first = ScalarIdentityParts::String(first.parts());
+        let second = ScalarIdentityParts::String(second.parts());
+        AGREEMENT_ALLOCATIONS.set(Some(0));
+        let agree = first.agrees_with(second);
+        let allocations = AGREEMENT_ALLOCATIONS.replace(None).unwrap();
+        assert!(agree);
+        assert_eq!(
+            allocations, 0,
+            "identity agreement must compare borrowed metadata without JSON/hashing"
+        );
     }
 }

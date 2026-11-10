@@ -4337,17 +4337,9 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                 ];
                 let source_patterns = [
                     source.pattern.as_ref().map(AsRef::as_ref),
-                    if source.binding.identity().is_none() {
-                        source_member.pattern.as_ref().map(AsRef::as_ref)
-                    } else {
-                        None
-                    },
+                    source_member.pattern.as_ref().map(AsRef::as_ref),
                 ];
-                let source_length = if source.binding.identity().is_some() {
-                    source.length
-                } else {
-                    intersect_bounds(source.length, source_member.length)
-                };
+                let source_length = intersect_bounds(source.length, source_member.length);
                 target_patterns.into_iter().flatten().all(|target| {
                     source_patterns
                         .into_iter()
@@ -4368,11 +4360,7 @@ impl<'source, R: PatternForm> TypeInSchema<'source, R> {
                     member_layer: target_member,
                 },
             ) => {
-                let source_range = if source.binding.identity().is_some() {
-                    source.range
-                } else {
-                    intersect_bounds(source.range, source_member.range)
-                };
+                let source_range = intersect_bounds(source.range, source_member.range);
                 i64_range_contains(
                     source_range.as_ref(),
                     intersect_bounds(target.range, target_member.range).as_ref(),
@@ -9068,13 +9056,66 @@ impl fmt::Display for SchemaValidationIssueLocation {
     }
 }
 
+/// An Enum base describes the enum definition, never a destination slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnumBaseMemberLayerError;
+
+impl EnumBaseMemberLayerError {
+    fn message(self) -> &'static str {
+        "enum base cannot contain slot-local member constraints"
+    }
+}
+
+impl fmt::Display for EnumBaseMemberLayerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
+    }
+}
+impl std::error::Error for EnumBaseMemberLayerError {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SchemaDefinitionMessage {
+    Text(DiagnosticText),
+    EnumBaseMemberLayer(EnumBaseMemberLayerError),
+}
+
+impl SchemaDefinitionMessage {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Text(text) => text.as_str(),
+            Self::EnumBaseMemberLayer(error) => error.message(),
+        }
+    }
+    fn enum_base_member_error(&self) -> Option<&EnumBaseMemberLayerError> {
+        match self {
+            Self::EnumBaseMemberLayer(error) => Some(error),
+            Self::Text(_) => None,
+        }
+    }
+}
+impl From<String> for SchemaDefinitionMessage {
+    fn from(text: String) -> Self {
+        Self::Text(text.into())
+    }
+}
+impl From<DiagnosticText> for SchemaDefinitionMessage {
+    fn from(text: DiagnosticText) -> Self {
+        Self::Text(text)
+    }
+}
+impl fmt::Display for SchemaDefinitionMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SchemaDefinitionIssue {
     input_rule_error: Option<InputRuleError>,
     pattern_error: Option<PatternCompileError>,
     location: SchemaValidationIssueLocation,
     path: ProviderKey,
-    message: DiagnosticText,
+    message: SchemaDefinitionMessage,
 }
 
 impl fmt::Display for SchemaDefinitionIssue {
@@ -9101,6 +9142,17 @@ pub struct ResourceSchemaValidationError {
 }
 
 impl ResourceSchemaValidationError {
+    pub fn enum_base_member_errors(
+        &self,
+    ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &EnumBaseMemberLayerError)> {
+        self.issues.iter().filter_map(|issue| {
+            issue
+                .message
+                .enum_base_member_error()
+                .map(|error| (&issue.location, error))
+        })
+    }
+
     pub fn input_rule_errors(
         &self,
     ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &InputRuleError)> {
@@ -9156,6 +9208,17 @@ pub struct ConfigSchemaValidationError {
 }
 
 impl ConfigSchemaValidationError {
+    pub fn enum_base_member_errors(
+        &self,
+    ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &EnumBaseMemberLayerError)> {
+        self.issues.iter().filter_map(|issue| {
+            issue
+                .message
+                .enum_base_member_error()
+                .map(|error| (&issue.location, error))
+        })
+    }
+
     pub fn pattern_errors(
         &self,
     ) -> impl Iterator<Item = (&SchemaValidationIssueLocation, &PatternCompileError)> {
@@ -10341,7 +10404,7 @@ impl ValidatedProviderSchemaWitness {
         assignability_edges: Vec<AssignabilityEdge>,
     ) -> Result<Self, ProviderSchemaValidationError> {
         let declarations = identified_declarations_from_witnesses(&resources, &config);
-        let mut identity_signatures = BTreeMap::<TypeIdentity, String>::new();
+        let mut identity_layers = BTreeMap::<TypeIdentity, ScalarIdentityParts<'_>>::new();
         let mut scalar_kinds = BTreeMap::<TypeIdentity, RefinedScalarKind>::new();
         let mut declaration_kinds =
             BTreeMap::<TypeIdentity, std::collections::BTreeSet<IdentifiedDeclarationKind>>::new();
@@ -10407,10 +10470,9 @@ impl ValidatedProviderSchemaWitness {
                 });
             }
             if let Some(identity_layer) = attribute_type.scalar_identity_parts() {
-                let signature = identity_layer.agreement_signature();
-                if identity_signatures
+                if identity_layers
                     .get(identity)
-                    .is_some_and(|first| first != &signature)
+                    .is_some_and(|first| !first.agrees_with(identity_layer))
                 {
                     return Err(
                         ProviderSchemaValidationError::ConflictingIdentityDeclarations {
@@ -10418,9 +10480,9 @@ impl ValidatedProviderSchemaWitness {
                         },
                     );
                 }
-                identity_signatures
+                identity_layers
                     .entry(identity.clone())
-                    .or_insert(signature);
+                    .or_insert(identity_layer);
             }
             scalar_kinds.entry(identity.clone()).or_insert(scalar_kind);
             declaration_kinds
@@ -10770,7 +10832,7 @@ fn normalize_issues(issues: &mut Vec<SchemaDefinitionIssue>) {
     issues.sort_by(|left, right| {
         left.path
             .cmp(&right.path)
-            .then_with(|| left.message.cmp(&right.message))
+            .then_with(|| left.message.as_str().cmp(right.message.as_str()))
     });
     issues.dedup();
 }
@@ -10785,18 +10847,18 @@ fn push_schema_issue(
         pattern_error: None,
         path: location.raw_path().into(),
         location: location.clone(),
-        message: DiagnosticText::new(message),
+        message: DiagnosticText::new(message).into(),
     });
 }
 
-fn validate_identified_scalar_kind_consistency(
-    attribute_type: &PatternAttributeType<Draft>,
+fn validate_identified_scalar_kind_consistency<'a>(
+    attribute_type: &'a PatternAttributeType<Draft>,
     location: SchemaValidationIssueLocation,
     seen: &mut HashMap<
         TypeIdentity,
         (
             RefinedScalarKind,
-            Option<String>,
+            Option<ScalarIdentityParts<'a>>,
             SchemaValidationIssueLocation,
         ),
     >,
@@ -10928,10 +10990,8 @@ fn validate_identified_scalar_kind_consistency(
         | RawShape::Ref(_) => None,
     };
     if let Some((identity, kind)) = identified {
-        let signature = attribute_type
-            .scalar_identity_parts()
-            .map(ScalarIdentityParts::agreement_signature);
-        if let Some((first_kind, first_signature, first_location)) = seen.get(identity) {
+        let identity_layer = attribute_type.scalar_identity_parts();
+        if let Some((first_kind, first_layer, first_location)) = seen.get(identity) {
             if *first_kind != kind {
                 push_schema_issue(
                     issues,
@@ -10940,9 +11000,9 @@ fn validate_identified_scalar_kind_consistency(
                         "custom type `{identity}` is bound to both {first_kind} at {first_location} and {kind}"
                     ),
                 );
-            } else if first_signature.is_some()
-                && signature.is_some()
-                && first_signature != &signature
+            } else if first_layer
+                .zip(identity_layer)
+                .is_some_and(|(first, second)| !first.agrees_with(second))
             {
                 push_schema_issue(
                     issues,
@@ -10953,7 +11013,7 @@ fn validate_identified_scalar_kind_consistency(
                 );
             }
         } else {
-            seen.insert(identity.clone(), (kind, signature, location.clone()));
+            seen.insert(identity.clone(), (kind, identity_layer, location.clone()));
         }
     }
 
@@ -11278,6 +11338,40 @@ fn validate_field_group_admission(
     }
 }
 
+fn enum_base_has_member_layer<'a>(
+    base: &'a PatternAttributeType<Draft>,
+    defs: &'a BTreeMap<String, PatternAttributeType<Draft>>,
+    refs: &mut Vec<&'a str>,
+) -> bool {
+    let Ok(resolved) = resolve_refs_on_path(base, defs, refs) else {
+        return false; // The existing definition checks report invalid refs.
+    };
+    let has_member_layer = match &resolved.attr.kind {
+        AttrTypeKind::String {
+            identity_layer: _,
+            member_layer,
+        } => {
+            let StringMemberConstraints { pattern, length } = member_layer;
+            pattern.is_some() || length.is_some()
+        }
+        AttrTypeKind::Int {
+            identity_layer: _,
+            member_layer: IntMemberConstraints { range },
+        } => range.is_some(),
+        AttrTypeKind::Enum {
+            identity: _,
+            base,
+            values: _,
+            dsl_aliases: _,
+            validate: _,
+            to_dsl: _,
+        } => enum_base_has_member_layer(base, defs, refs),
+        _ => false,
+    };
+    refs.truncate(resolved.restore_len);
+    has_member_layer
+}
+
 fn validate_type_definition(
     attr_type: &PatternAttributeType<Draft>,
     defs: &BTreeMap<String, PatternAttributeType<Draft>>,
@@ -11416,6 +11510,25 @@ fn validate_type_definition(
                 );
             }
         }
+        AttrTypeKind::Enum {
+            identity: _,
+            base,
+            values: _,
+            dsl_aliases: _,
+            validate: _,
+            to_dsl: _,
+        } => {
+            if enum_base_has_member_layer(base, defs, &mut Vec::new()) {
+                let location = location.with_suffix(".<base>");
+                issues.push(SchemaDefinitionIssue {
+                    input_rule_error: None,
+                    pattern_error: None,
+                    path: location.raw_path().into(),
+                    location,
+                    message: SchemaDefinitionMessage::EnumBaseMemberLayer(EnumBaseMemberLayerError),
+                });
+            }
+        }
         AttrTypeKind::Reference { .. }
         | AttrTypeKind::String { .. }
         | AttrTypeKind::ResourceHandle { .. }
@@ -11423,8 +11536,7 @@ fn validate_type_definition(
         | AttrTypeKind::Int { .. }
         | AttrTypeKind::Float { .. }
         | AttrTypeKind::Bool
-        | AttrTypeKind::Duration
-        | AttrTypeKind::Enum { .. } => {}
+        | AttrTypeKind::Duration => {}
     }
 }
 
@@ -14039,7 +14151,7 @@ fn same_builtin_declaration(
     let Some(declaration) = declaration else {
         return false;
     };
-    if declaration.signature() != builtin.signature() {
+    if !declaration.same_definition(builtin) {
         return false;
     }
     match (declaration.callback(), builtin.callback()) {

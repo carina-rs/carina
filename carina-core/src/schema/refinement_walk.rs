@@ -62,8 +62,8 @@ impl<'a> RefinementPositions<'a> {
 impl<'a> EffectiveType<'a> {
     /// Visit at most `max_nodes` refined String/Int/Reference leaves and
     /// structural nodes, including every Ref and nested Union. Plain scalar
-    /// leaves are omitted. Identity-only leaves are reported without charging
-    /// the budget. Exactly-fitting walks are complete.
+    /// leaves are omitted. Every reported leaf consumes budget; a bare
+    /// Reference reports nothing and is free. Exactly-fitting walks are complete.
     pub fn refinement_positions(&self, max_nodes: usize) -> RefinementPositions<'a> {
         let mut positions = Vec::new();
         let complete = visit(
@@ -85,27 +85,10 @@ fn visit<'a>(
     budget: &mut ShapeWalkBudget,
     positions: &mut Vec<RefinedScalarPosition<'a>>,
 ) -> bool {
-    let counted = counts_for_refinements(&ty.attr_type.kind);
-    let identified = match &ty.attr_type.kind {
-        AttrTypeKind::String {
-            identity_layer,
-            member_layer: _,
-        } => identity_layer.binding.identity().is_some(),
-        AttrTypeKind::Int {
-            identity_layer,
-            member_layer: _,
-        } => identity_layer.binding.identity().is_some(),
-        AttrTypeKind::Reference {
-            identity: _,
-            pattern: _,
-            length: _,
-        } => true,
-        _ => false,
-    };
-    if !counted && !identified {
+    if !counts_for_refinements(&ty.attr_type.kind) {
         return true;
     }
-    if counted && !budget.take() {
+    if !budget.take() {
         return false;
     }
     let mut descend = |attr_type, segment, field_ancestry, field_name: Option<&str>| {
@@ -230,7 +213,8 @@ fn counts_for_refinements(kind: &AttrTypeKind<super::Compiled>) -> bool {
             identity_layer,
             member_layer,
         } => {
-            identity_layer.pattern.is_some()
+            identity_layer.binding.identity().is_some()
+                || identity_layer.pattern.is_some()
                 || identity_layer.length.is_some()
                 || member_layer.pattern.is_some()
                 || member_layer.length.is_some()
@@ -238,7 +222,11 @@ fn counts_for_refinements(kind: &AttrTypeKind<super::Compiled>) -> bool {
         AttrTypeKind::Int {
             identity_layer,
             member_layer,
-        } => identity_layer.range.is_some() || member_layer.range.is_some(),
+        } => {
+            identity_layer.binding.identity().is_some()
+                || identity_layer.range.is_some()
+                || member_layer.range.is_some()
+        }
         AttrTypeKind::Reference {
             identity: _,
             pattern,
@@ -311,11 +299,7 @@ mod tests {
         let ty = schema.effective_attribute("value").unwrap().value_type();
         let report = ty.refinement_positions(0);
         assert!(!report.is_truncated());
-        assert_eq!(
-            report.positions().len(),
-            1,
-            "identity is visible without consuming budget"
-        );
+        assert!(report.positions().is_empty());
     }
 
     #[test]
@@ -415,5 +399,43 @@ mod tests {
         let exact = ty.refinement_positions(5);
         assert_eq!(exact.positions.len(), 1);
         assert!(!exact.truncated);
+    }
+
+    #[test]
+    fn round13_identity_only_positions_are_budgeted() {
+        let field_type = AttributeType::refined_string(
+            Some(crate::schema::TypeIdentity::from_dotted("test.Name")),
+            None,
+            None,
+            None,
+        );
+        let schema = ResourceSchema::new("Test")
+            .attribute(
+                AttributeSchema::optional(
+                    "value",
+                    AttributeType::struct_(
+                        "Many",
+                        (0..1000)
+                            .map(|i| {
+                                StructField::optional(format!("field{i}"), field_type.clone())
+                                    .build()
+                            })
+                            .collect(),
+                    ),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap();
+        let ty = schema.effective_attribute("value").unwrap().value_type();
+        for budget in [0, 1, 16, 64] {
+            let walk = ty.refinement_positions(budget);
+            assert!(
+                walk.positions().len() <= budget,
+                "{} positions exceed budget {budget}",
+                walk.positions().len()
+            );
+            assert!(walk.is_truncated());
+        }
     }
 }

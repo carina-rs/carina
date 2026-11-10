@@ -103,33 +103,50 @@ fn refinement_hover(walk: carina_core::schema::RefinementPositions<'_>) -> Strin
                 identity_layer,
                 member_layer,
             } => {
-                for (label, spec) in [
-                    ("Identity", identity_layer.pattern),
-                    ("Member", member_layer.pattern),
-                ] {
+                let (pattern_labels, length_labels) = if identity.is_some() {
+                    (
+                        ["Identity pattern", "Member pattern"],
+                        ["Identity length", "Member length"],
+                    )
+                } else {
+                    (["Pattern", "Pattern"], ["Length", "Length"])
+                };
+                for (label, spec) in pattern_labels
+                    .into_iter()
+                    .zip([identity_layer.pattern, member_layer.pattern])
+                {
                     if let Some(spec) = spec {
                         refinements.push_str(&format!(
-                            "\n- **{label} pattern**: {}",
+                            "\n- **{label}**: {}",
                             PatternSpecDisplay::new(spec)
                         ));
                     }
                 }
-                if let Some(bounds) = identity_layer.length.map(format_refinement_bounds) {
-                    refinements.push_str(&format!("\n- **Identity length**: {bounds}"));
-                }
-                if let Some(bounds) = member_layer.length.map(format_refinement_bounds) {
-                    refinements.push_str(&format!("\n- **Member length**: {bounds}"));
+                for (label, length) in length_labels
+                    .into_iter()
+                    .zip([identity_layer.length, member_layer.length])
+                {
+                    if let Some(bounds) = length.map(format_refinement_bounds) {
+                        refinements.push_str(&format!("\n- **{label}**: {bounds}"));
+                    }
                 }
             }
             Shape::Int {
                 identity_layer,
                 member_layer,
             } => {
-                if let Some(bounds) = identity_layer.range.map(format_refinement_bounds) {
-                    refinements.push_str(&format!("\n- **Identity range**: {bounds}"));
-                }
-                if let Some(bounds) = member_layer.range.map(format_refinement_bounds) {
-                    refinements.push_str(&format!("\n- **Member range**: {bounds}"));
+                let labels = if identity.is_some() {
+                    ["Identity range", "Member range"]
+                } else {
+                    ["Range", "Range"]
+                };
+                for (label, range) in labels
+                    .into_iter()
+                    .zip([identity_layer.range, member_layer.range])
+                {
+                    if let Some(bounds) = range.map(format_refinement_bounds) {
+                        refinements.push_str(&format!("\n- **{label}**: {bounds}"));
+                    }
                 }
             }
             _ => {}
@@ -2940,7 +2957,12 @@ EOT
                     "mode",
                     AttributeType::enum_with_base(
                         TypeIdentity::from_dotted("test.Mode"),
-                        name,
+                        AttributeType::refined_string(
+                            None,
+                            Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                            Some((Some(2), Some(8))),
+                            None,
+                        ),
                         None,
                         vec![],
                         None,
@@ -2965,7 +2987,12 @@ EOT
             let HoverContents::Markup(content) = hover.contents else {
                 panic!("Markdown hover")
             };
-            for fragment in ["Identity pattern", "[a-z]+", "Member length", "2..=8"] {
+            let fragments = if line == 1 {
+                ["Identity pattern", "[a-z]+", "Member length", "2..=8"]
+            } else {
+                ["Pattern", "[a-z]+", "Length", "2..=8"]
+            };
+            for fragment in fragments {
                 assert!(
                     content.value.contains(fragment),
                     "line {line}: missing {fragment}: {}",
@@ -3169,6 +3196,47 @@ EOT
     }
 
     #[test]
+    fn round13_anonymous_refinements_have_structural_labels() {
+        use carina_core::schema::{
+            IntIdentityLayer, IntMemberConstraints, PatternMatch, PatternSpec, StringIdentityLayer,
+            StringMemberConstraints,
+        };
+        for (declaration, labels) in [
+            (
+                AttributeType::string_member(
+                    StringIdentityLayer::new(
+                        None,
+                        Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                        Some((Some(1), Some(100))),
+                        None,
+                    ),
+                    StringMemberConstraints::new(
+                        Some(PatternSpec::new("a.*", PatternMatch::Full)),
+                        Some((Some(1), Some(8))),
+                    ),
+                ),
+                vec!["**Pattern**", "**Length**"],
+            ),
+            (
+                AttributeType::int_member(
+                    IntIdentityLayer::new(None, Some((Some(1), Some(100)))),
+                    IntMemberConstraints::new(Some((Some(1), Some(8)))),
+                ),
+                vec!["**Range**"],
+            ),
+        ] {
+            let content = hover_for_refinement_fields(vec![
+                StructField::optional("anonymous", declaration).build(),
+            ]);
+            for label in labels {
+                assert!(content.contains(label), "{content}");
+            }
+            assert!(!content.contains("**Identity"), "{content}");
+            assert!(!content.contains("**Member"), "{content}");
+        }
+    }
+
+    #[test]
     fn round11_hover_nested_and_unbounded_leaves_name_their_identity() {
         use carina_core::schema::{PatternMatch, PatternSpec, TypeIdentity};
         for leaf in [
@@ -3185,7 +3253,11 @@ EOT
                 None,
             ),
             AttributeType::refined_int(Some(TypeIdentity::from_dotted("test.X")), None),
-            AttributeType::reference(TypeIdentity::from_dotted("test.X"), None, None),
+            AttributeType::reference(
+                TypeIdentity::from_dotted("test.X"),
+                Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                None,
+            ),
         ] {
             for nested in [
                 leaf.clone(),
@@ -3338,7 +3410,7 @@ EOT
         );
         let content = hover_for_refinement_fields(fields);
         assert!(
-            content.contains("Field `constrained`") && content.contains("Member length"),
+            content.contains("Field `constrained`") && content.contains("**Length**"),
             "{content}"
         );
         assert!(

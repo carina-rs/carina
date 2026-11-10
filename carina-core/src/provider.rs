@@ -9502,39 +9502,20 @@ where
                 owner: owner.clone(),
                 identity: owned.identity().clone(),
             };
-            let declarations = self
+            let declaration = self
                 .index
                 .get(owner)
-                .and_then(|index| index.declarations.get(owned.identity()))
-                .filter(|declarations| !declarations.is_empty())
-                .ok_or_else(missing)?;
-            if let Some(declaration) = self.index[owner]
-                .identity_declarations
-                .get(owned.identity())
-            {
-                let declaration = declaration.as_ref().map_err(Clone::clone)?;
-                if declaration.scalar_kind() != owned.scalar_kind() {
-                    return Err(missing());
-                }
-                resolved = Some(match resolved {
-                    Some(existing) => existing.conjoin(declaration),
-                    None => declaration.clone(),
-                });
-                continue;
+                .and_then(|index| index.identity_declarations.get(owned.identity()))
+                .ok_or_else(missing)?
+                .as_ref()
+                .map_err(Clone::clone)?;
+            if declaration.scalar_kind() != owned.scalar_kind() {
+                return Err(missing());
             }
-            // Enum bases are definition constraints, not scalar member layers.
-            // This view projects the base; owner-bound annotation validation
-            // still checks the complete enum, including its values and aliases.
-            for declaration in declarations {
-                let declaration =
-                    ResolvedSchemaType::from_annotation_declaration(owner, declaration)
-                        .filter(|declaration| declaration.scalar_kind() == owned.scalar_kind())
-                        .ok_or_else(missing)?;
-                resolved = Some(match resolved {
-                    Some(existing) => existing.conjoin(&declaration),
-                    None => declaration,
-                });
-            }
+            resolved = Some(match resolved {
+                Some(existing) => existing.conjoin(declaration),
+                None => declaration.clone(),
+            });
         }
         Ok(resolved
             .expect("nonempty owners and declarations")
@@ -10587,6 +10568,36 @@ mod tests {
 
     fn initialized(provider: impl Provider + 'static) -> InitializedProvider {
         InitializedProvider::for_test(Box::new(provider), ReferenceScope::Unavailable)
+    }
+
+    #[test]
+    fn round13_annotation_resolution_requires_the_total_identity_index() {
+        use crate::parser::{CustomTypeResolver, CustomTypeValidationError, OwnedTypeIdentity};
+        let identity = TypeIdentity::from_dotted("test.Indexed");
+        let declaration = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(ConfigOnlyCustomTypeFactory)];
+        let index = BTreeMap::from([(
+            "config-owner".into(),
+            OwnerCustomTypeIndex {
+                factory_index: 0,
+                declarations: BTreeMap::from([(identity.clone(), vec![declaration])]),
+                identity_declarations: BTreeMap::new(),
+            },
+        )]);
+        let resolver = FactoryCustomTypeResolver::with_index(
+            factories.as_slice(),
+            index,
+            &SchemaRegistry::new(),
+        );
+        let owned =
+            OwnedTypeIdentity::provider("config-owner", identity, RefinedScalarKind::String);
+        assert!(
+            matches!(
+                resolver.annotation_declaration(&owned),
+                Err(CustomTypeValidationError::MissingDeclaration { .. })
+            ),
+            "raw declarations cannot replace missing indexed evidence"
+        );
     }
 
     #[test]

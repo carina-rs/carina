@@ -650,12 +650,17 @@ A struct type represents a nested object with typed fields.
   member constraints infer equal types. An explicit compatible annotation is
   the way to accept otherwise mixed declarations; inference never widens them.
   Enum definition and canonical-spelling disagreements remain typed errors.
+  Enum bases describe definitions, never slots: schema admission rejects String/Int
+  member constraints inside a base with `EnumBaseMemberLayerError`.
   Built-in and aggregate comparisons accept identity-only typed projections. Exact
   declarations and their fingerprints preserve both layers. Hover renders
   both layers through the core's read-only bounded refinement walk, which counts
   refined String/Int/Reference leaves and structural nodes, including Refs and
-  nested unions. Identity-only leaves expose their names without consuming budget;
-  plain scalar leaves cost no budget, and only actual omissions mark truncation. Shared provider docgen must render both layers too. WIT stays 0.2.0.
+  nested unions. Every emitted position, including an identity-only String/Int,
+  consumes budget. Plain scalar leaves and bare References emit nothing and cost
+  no budget; only actual omissions mark truncation. Anonymous refinements use
+  structural labels rather than identity/member labels. Shared provider docgen
+  must render both layers too. WIT stays 0.2.0.
   Schema fingerprints use v13 and saved plans use format 44; format 43 plans
   must fail the version gate before decoding the payload. Saved module
   `pending_constraints` contain `ValidateExpr` values, not retained types;
@@ -663,10 +668,13 @@ A struct type represents a nested object with typed fields.
   Every typed sink uses the same String/Int identity-admission rule for
   equal identities and allowed widenings (#4349), including annotations,
   exports, module arguments, and function parameters/returns. All destination
-  kinds can retain the existing `NeedsLocal` resolved-value obligation. Source
-  identity bounds must be contained by destination identity bounds. Member
-  constraints defer unless source identity bounds are provably disjoint from
-  the effective destination bounds. Int-to-Float widening uses identity-bound
+  kinds can retain the existing `NeedsLocal` resolved-value obligation. Same-identity
+  value admission, including a declared source, defers overlapping identity bounds
+  to the local check; provably disjoint bounds reject statically. Different-identity
+  widening requires source identity bounds to be contained by destination identity
+  bounds. Strict declaration compatibility retains main's containment checks.
+  Member constraints defer unless source identity bounds are provably disjoint
+  from the effective destination bounds. Int-to-Float widening uses identity-bound
   containment too. Float retains main's strict range containment and same-identity
   reference deferral; Enum/unloaded reference leaves retain that deferral too.
   Unproven regex containment defers to the value check. At annotated sinks,

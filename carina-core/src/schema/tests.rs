@@ -18634,3 +18634,56 @@ fn round12_anonymous_int_uses_both_layers_as_evidence() {
         &AttributeType::refined_int(None, Some((Some(1), Some(16))))
     ));
 }
+
+#[test]
+fn round13_schema_admission_rejects_members_inside_enum_bases() {
+    let member_bases = [
+        super::AttributeType::string_member(
+            StringIdentityLayer::new(None, None, None, None),
+            StringMemberConstraints::new(
+                Some(PatternSpec::new("[a-z]+", PatternMatch::Full)),
+                None,
+            ),
+        ),
+        super::AttributeType::string_member(
+            StringIdentityLayer::new(None, None, None, None),
+            StringMemberConstraints::new(None, Some((Some(1), Some(8)))),
+        ),
+        super::AttributeType::int_member(
+            IntIdentityLayer::new(None, None),
+            IntMemberConstraints::new(Some((Some(1), Some(8)))),
+        ),
+    ];
+    for base in member_bases {
+        let enumeration = super::AttributeType::enum_with_base(
+            TypeIdentity::from_dotted("test.Open"),
+            base,
+            None,
+            vec![],
+            None,
+            None,
+        );
+        let resource = super::ResourceSchema::new("Example")
+            .attribute(super::AttributeSchema::optional("choice", enumeration.clone()).build());
+        let error = resource
+            .validate()
+            .expect_err("an enum base cannot carry slot-local member constraints");
+        assert_eq!(error.enum_base_member_errors().count(), 1);
+        assert!(
+            error
+                .issues()
+                .any(|(_, message)| message.contains("member") && message.contains("enum")),
+            "{error}"
+        );
+        let error =
+            ValidatedConfigSchema::validate(BTreeMap::from([("choice".into(), enumeration)]))
+                .expect_err("config enums use the same admission rule");
+        assert_eq!(error.enum_base_member_errors().count(), 1);
+        assert!(
+            error
+                .issues()
+                .any(|(_, message)| message.contains("member") && message.contains("enum")),
+            "{error}"
+        );
+    }
+}

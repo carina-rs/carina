@@ -25,7 +25,10 @@ Refined `String` and `Int` declarations carry two required records:
 missing records are rejected. A String identity owns its nominal identity,
 optional pattern and character-length interval, semantic validator binding and
 DSL transform. Its member record adds an optional pattern and length interval.
-An Int identity owns its nominal identity and range; its member adds a range.
+An Int identity owns its nominal identity and range; its member adds a range. Enum bases
+are definitions rather than destination slots: schema admission rejects any
+String/Int member constraints inside an Enum base with a typed
+`EnumBaseMemberLayerError`.
 Float and typed Reference schemas retain their existing shapes.
 
 Validation keeps first-failure semantics: identity pattern, identity length or
@@ -90,9 +93,12 @@ or an allowed structural/provider widening. This includes binding/export
 annotations, map/list element annotations, module arguments, and user-function
 parameters and returns. Destination member constraints remain resolved-value
 obligations; every destination kind supports the existing `NeedsLocal` path.
-Identity bounds retain String length / Int range containment checks for both
-same-identity and widening admission. Destination member constraints retain the
-existing `NeedsLocal` check, with only proven disjointness rejecting statically;
+Same-identity value admission, including admission with a declared source,
+defers overlapping identity bounds through `NeedsLocal`; provably disjoint bounds
+reject statically. Different-identity widening retains String length / Int range
+containment checks. Strict declaration compatibility retains main's containment
+checks. Destination member constraints retain the existing `NeedsLocal` check,
+with only proven disjointness rejecting statically;
 unproven pattern containment defers (#4349). Int-to-Float widening uses identity
 bound containment too. Float retains main's strict range containment and
 same-identity reference deferral, also retained for Enum/unloaded leaves. Annotated
