@@ -2,8 +2,8 @@ use carina_provider_protocol::{MIN_SUPPORTED_PROTOCOL_VERSION, PROTOCOL_VERSION,
 
 #[test]
 fn refinement_layers_require_protocol_27() {
-    assert_eq!(PROTOCOL_VERSION, 27);
-    assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 27);
+    assert_eq!(PROTOCOL_VERSION, 28);
+    assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 28);
 }
 
 #[test]

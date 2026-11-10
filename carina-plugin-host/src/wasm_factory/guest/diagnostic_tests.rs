@@ -471,30 +471,34 @@ fn masked_http_fields_still_consume_the_input_size_budget() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn legacy_wit_package_is_rejected_explicitly_before_current_world_binding() {
     let engine = Engine::new(&build_engine_config()).unwrap();
-    let component = Component::new(
-        &engine,
-        r#"(component (instance $old) (export "carina:provider/provider@0.1.0" (instance $old)))"#,
-    )
-    .unwrap();
-    let identity = ProviderLoadIdentity::for_test("mock", ProviderTrustClass::Untrusted);
-    let label = Arc::new(ProviderLabel {
-        name: "mock".into(),
-        source: identity.source().clone(),
-    });
-    let result = create_instance(
-        &engine,
-        &component,
-        label,
-        GuestNetwork::SchemaOnly,
-        GuestCallBudget::PRODUCTION,
-        None,
-    )
-    .await;
-    match result {
-        Err(WasmBindingCreationError::ProtocolVersion(message)) => {
-            assert!(message.as_str().contains("0.2.0"))
+    for version in ["0.1.0", "0.2.0"] {
+        let component = Component::new(
+            &engine,
+            format!(
+                r#"(component (instance $old) (export "carina:provider/provider@{version}" (instance $old)))"#,
+            ),
+        )
+        .unwrap();
+        let identity = ProviderLoadIdentity::for_test("mock", ProviderTrustClass::Untrusted);
+        let label = Arc::new(ProviderLabel {
+            name: "mock".into(),
+            source: identity.source().clone(),
+        });
+        let result = create_instance(
+            &engine,
+            &component,
+            label,
+            GuestNetwork::SchemaOnly,
+            GuestCallBudget::PRODUCTION,
+            None,
+        )
+        .await;
+        match result {
+            Err(WasmBindingCreationError::ProtocolVersion(message)) => {
+                assert!(message.as_str().contains("0.3.0"))
+            }
+            _ => panic!("old WIT must be a typed protocol incompatibility"),
         }
-        _ => panic!("old WIT must be a typed protocol incompatibility"),
     }
 }
 
@@ -522,7 +526,7 @@ async fn legacy_aws_import_is_rejected_before_linking() {
         Err(WasmBindingCreationError::ProtocolVersion(message)) => {
             let text = message.as_str();
             assert!(text.contains("carina:provider@0.1.0"), "{text}");
-            assert!(text.contains("carina:provider@0.2.0"), "{text}");
+            assert!(text.contains("carina:provider@0.3.0"), "{text}");
             assert!(
                 text.contains(&format!(
                     "protocol {}",
@@ -540,10 +544,12 @@ async fn legacy_aws_import_is_rejected_before_linking() {
 #[tokio::test]
 async fn legacy_start_executes_zero_guest_code() {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    let engine = Engine::new(&build_engine_config()).unwrap();
-    let component = Component::new(
-        &engine,
-        r#"(component
+    for version in ["0.1.0", "0.2.0"] {
+        let engine = Engine::new(&build_engine_config()).unwrap();
+        let component = Component::new(
+            &engine,
+            format!(
+                r#"(component
         (import "probe" (func $probe))
         (core func $lower (canon lower (func $probe)))
         (core module $m
@@ -553,41 +559,47 @@ async fn legacy_start_executes_zero_guest_code() {
         (core instance $imports (export "probe" (func $lower)))
         (core instance $run (instantiate $m (with "" (instance $imports))))
         (instance $old)
-        (export "carina:provider/provider@0.1.0" (instance $old)))"#,
-    )
-    .unwrap();
-    let mut store = diagnostic_store(&engine);
-    let mut linker = create_linker(
-        &engine,
-        &GuestNetwork::SchemaOnly,
-        InstantiationWorld::Basic,
-    )
-    .unwrap_or_else(|_| panic!("test linker must be constructible"));
-    let calls = Arc::new(AtomicUsize::new(0));
-    let called = calls.clone();
-    linker
-        .root()
-        .func_wrap("probe", move |_store, (): ()| {
-            called.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        })
+        (export "carina:provider/provider@{version}" (instance $old)))"#
+            ),
+        )
         .unwrap();
-    let result = WasmBindings::instantiate_basic(&mut store, &component, &linker).await;
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "legacy component start ran before rejection"
-    );
-    match result {
-        Err(WasmBindingCreationError::ProtocolVersion(message)) => {
-            assert!(message.as_str().contains("carina:provider@0.1.0"));
-            assert!(message.as_str().contains("carina:provider@0.2.0"));
-            assert!(message.as_str().contains(&format!(
-                "protocol {}",
-                carina_provider_protocol::PROTOCOL_VERSION
-            )));
+        let mut store = diagnostic_store(&engine);
+        let mut linker = create_linker(
+            &engine,
+            &GuestNetwork::SchemaOnly,
+            InstantiationWorld::Basic,
+        )
+        .unwrap_or_else(|_| panic!("test linker must be constructible"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let called = calls.clone();
+        linker
+            .root()
+            .func_wrap("probe", move |_store, (): ()| {
+                called.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .unwrap();
+        let result = WasmBindings::instantiate_basic(&mut store, &component, &linker).await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "legacy component start ran before rejection"
+        );
+        match result {
+            Err(WasmBindingCreationError::ProtocolVersion(message)) => {
+                assert!(
+                    message
+                        .as_str()
+                        .contains(&format!("carina:provider@{version}"))
+                );
+                assert!(message.as_str().contains("carina:provider@0.3.0"));
+                assert!(message.as_str().contains(&format!(
+                    "protocol {}",
+                    carina_provider_protocol::PROTOCOL_VERSION
+                )));
+            }
+            _other => panic!("a legacy component must be rejected before instantiation"),
         }
-        _other => panic!("a legacy component must be rejected before instantiation"),
     }
 }
 
@@ -608,7 +620,7 @@ async fn assert_wit_remediation(version: &str, remedy: &str) {
                 text.contains(&format!("carina:provider@{version}")),
                 "{text}"
             );
-            assert!(text.contains("carina:provider@0.2.0"), "{text}");
+            assert!(text.contains("carina:provider@0.3.0"), "{text}");
             assert!(
                 text.contains(&format!(
                     "protocol {}",
@@ -624,13 +636,15 @@ async fn assert_wit_remediation(version: &str, remedy: &str) {
 
 #[tokio::test]
 async fn older_wit_package_explains_provider_rebuild_before_linking() {
-    assert_wit_remediation(
-        "0.1.0",
-        "rebuild the provider against the current carina protocol",
-    )
-    .await;
+    for version in ["0.1.0", "0.2.0"] {
+        assert_wit_remediation(
+            version,
+            "rebuild the provider against the current carina protocol",
+        )
+        .await;
+    }
 }
 #[tokio::test]
 async fn newer_wit_package_explains_host_upgrade_before_linking() {
-    assert_wit_remediation("0.3.0", "upgrade Carina").await;
+    assert_wit_remediation("0.4.0", "upgrade Carina").await;
 }

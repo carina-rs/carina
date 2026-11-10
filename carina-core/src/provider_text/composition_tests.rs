@@ -219,7 +219,7 @@ fn foreign_wrapper_inherits_the_nearest_classified_diagnostic() {
 }
 
 #[test]
-fn unclassified_foreign_frame_does_not_hide_a_transient_descendant() {
+fn explicit_unclassified_below_a_foreign_frame_is_final() {
     let leaf = ProviderError::api_error("leaf").with_retryability(Retryability::Transient);
     let nearest = ProviderError::internal_caused_by("validation", leaf)
         .with_retryability(Retryability::Unclassified);
@@ -229,11 +229,143 @@ fn unclassified_foreign_frame_does_not_hide_a_transient_descendant() {
     );
     let wrapped = ForeignValidation(ProviderDiagnostic::new(nearest).into());
     let error = ProviderError::invalid_input_caused_by("outer", wrapped);
-    assert!(error.is_transient());
-    assert!(
+    assert_eq!(error.retryability(), Retryability::Unclassified);
+    assert_eq!(
         error
             .with_secrets(&RedactionSet::for_test(&[]))
-            .is_transient()
+            .retryability(),
+        Retryability::Unclassified,
+    );
+}
+
+#[test]
+fn structural_validation_wrappers_inherit_their_childs_retryability() {
+    use crate::schema::TypeError;
+
+    for retryability in [
+        Retryability::Transient,
+        Retryability::DependencyBlocked,
+        Retryability::Unclassified,
+    ] {
+        let leaf = TypeError::ValidationFailed {
+            message: ProviderDiagnostic::new(ForeignDiagnostic(
+                ProviderDiagnostic::new(
+                    ProviderError::internal_caused_by(
+                        "nearest",
+                        ProviderError::api_error("leaf").with_retryability(Retryability::Transient),
+                    )
+                    .with_retryability(retryability),
+                )
+                .with_secrets(&RedactionSet::for_test(&[])),
+            ))
+            .into(),
+        };
+        for category in [
+            TypeError::ListItemError {
+                index: 0,
+                inner: Box::new(leaf.clone()),
+            },
+            TypeError::MapKeyError {
+                key: "key".into(),
+                inner: Box::new(leaf.clone()),
+            },
+            TypeError::MapValueError {
+                key: "key".into(),
+                inner: Box::new(leaf.clone()),
+            },
+            TypeError::StructFieldError {
+                field: "field".into(),
+                inner: Box::new(leaf.clone()),
+            },
+            TypeError::CustomTypeValidation {
+                error: Box::new(
+                    crate::parser::CustomTypeValidationError::InvalidDeclarationValue {
+                        owner: "test".into(),
+                        identity: crate::schema::TypeIdentity::bare("Custom"),
+                        error: Box::new(leaf),
+                    },
+                ),
+                attribute: None,
+            },
+        ] {
+            let error = ProviderError::invalid_input_caused_by("outer", category);
+            assert_eq!(error.retryability(), retryability);
+            let host = error.with_secrets(&RedactionSet::for_test(&[]));
+            assert_eq!(host.retryability(), retryability);
+        }
+    }
+}
+
+#[test]
+fn custom_type_validation_inherits_visible_and_hidden_child_retryability() {
+    for masked in [false, true] {
+        let category = crate::schema::TypeError::CustomTypeValidation {
+            error: Box::new(crate::parser::CustomTypeValidationError::ProviderRejected {
+                owner: "test".into(),
+                identity: crate::schema::TypeIdentity::bare("Custom"),
+                error: std::sync::Arc::new(
+                    ProviderError::api_error("leaf")
+                        .with_retryability(Retryability::Transient)
+                        .with_secrets(&RedactionSet::for_test(&[])),
+                ),
+                masked,
+            }),
+            attribute: None,
+        };
+        let error = ProviderError::invalid_input_caused_by("outer", category);
+        assert_eq!(error.retryability(), Retryability::Transient);
+        let host = error.with_secrets(&RedactionSet::for_test(&[]));
+        assert_eq!(host.retryability(), Retryability::Transient);
+    }
+}
+
+fn assert_validation_alternatives_retryability(classes: [Retryability; 2], expected: Retryability) {
+    use crate::schema::{TypeError, UnionArmFailures};
+
+    let arm = |message, retryability| TypeError::ValidationFailed {
+        message: ProviderDiagnostic::new(
+            ProviderError::api_error(message).with_retryability(retryability),
+        )
+        .into(),
+    };
+    let failures =
+        UnionArmFailures::new(arm("first", classes[0]), [arm("second", classes[1])]).unwrap();
+    let direct = ProviderError::invalid_input_caused_by("outer", failures.clone());
+    let wrapped = ProviderError::invalid_input_caused_by(
+        "outer",
+        TypeError::StructFieldError {
+            field: "field".into(),
+            inner: Box::new(TypeError::UnionAlternativesMismatch { failures }),
+        },
+    );
+    for error in [direct, wrapped] {
+        assert_eq!(error.retryability(), expected);
+        let host = error.with_secrets(&RedactionSet::for_test(&[]));
+        assert_eq!(host.retryability(), expected);
+    }
+}
+
+#[test]
+fn validation_alternatives_inherit_transient_when_every_arm_agrees() {
+    assert_validation_alternatives_retryability(
+        [Retryability::Transient, Retryability::Transient],
+        Retryability::Transient,
+    );
+}
+
+#[test]
+fn validation_alternatives_with_transient_and_dependency_blocked_arms_are_unclassified() {
+    assert_validation_alternatives_retryability(
+        [Retryability::Transient, Retryability::DependencyBlocked],
+        Retryability::Unclassified,
+    );
+}
+
+#[test]
+fn validation_alternatives_with_transient_and_unclassified_arms_are_unclassified() {
+    assert_validation_alternatives_retryability(
+        [Retryability::Transient, Retryability::Unclassified],
+        Retryability::Unclassified,
     );
 }
 

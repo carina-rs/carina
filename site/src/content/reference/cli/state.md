@@ -275,7 +275,7 @@ carina \
 Supply overrides only for provider kinds declared by that directory. The
 trust suffix is the credential class (`aws` for both AWS providers), but the
 metadata-only checker does not receive credentials. It requires providers built
-for the current protocol (27), just like normal plan/apply loading. Older
+for the current protocol (28), just like normal plan/apply loading. Older
 artifacts, including released protocol-v12 providers, are rejected with a
 protocol-version error because their schemas do not declare pattern match
 modes. Rebuild the providers against the current SDK before running the check.

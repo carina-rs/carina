@@ -419,9 +419,8 @@ fn assert_saved_diagnostic_from_another_cwd(relative: bool) {
 
 #[test]
 fn destroy_retry_exhaustion_reports_distinctive_provider_reason() {
-    // The mock's original provider error includes the identity. Put the AWS
-    // retry classification and a distinctive blocker in it without adding a
-    // second mock-only failure protocol.
+    // The mock authors the dependency class explicitly. Marker text in the
+    // identity remains diagnostic metadata for the distinctive blocker.
     let scenario = Scenario::new(
         r#"let DependencyViolation_eni_4174_a = mock.test.resource { name = "a" }
 let DependencyViolation_eni_4174_b = mock.test.resource { name = "b" }
@@ -439,7 +438,10 @@ let DependencyViolation_eni_4174_b = mock.test.resource { name = "b" }
             "--parallelism",
             "1",
         ],
-        &[("CARINA_MOCK_DELETE_FAIL_FOR", "*")],
+        &[
+            ("CARINA_MOCK_DELETE_FAIL_FOR", "*"),
+            ("CARINA_MOCK_DELETE_DEPENDENCY_BLOCKED", "true"),
+        ],
     );
     assert!(!output.status.success(), "{}", output_text(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -482,10 +484,13 @@ let DependencyViolation_eni_4174 = mock.test.resource {
             "--parallelism",
             "1",
         ],
-        &[(
-            "CARINA_MOCK_DELETE_FAIL_FOR",
-            "test.resource.DependencyViolation_eni_4174",
-        )],
+        &[
+            (
+                "CARINA_MOCK_DELETE_FAIL_FOR",
+                "test.resource.DependencyViolation_eni_4174",
+            ),
+            ("CARINA_MOCK_DELETE_DEPENDENCY_BLOCKED", "true"),
+        ],
     );
     assert!(!output.status.success(), "{}", output_text(&output));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -551,6 +556,7 @@ let c_never_ran = mock.test.resource { name = "never-ran" }
                 "CARINA_MOCK_DELETE_FAIL_FOR",
                 "test.resource.a_DependencyViolation_eni_4174",
             )
+            .env("CARINA_MOCK_DELETE_DEPENDENCY_BLOCKED", "true")
             .env(
                 "CARINA_MOCK_DELETE_DELAY_MS_FOR",
                 "test.resource.b_draining",

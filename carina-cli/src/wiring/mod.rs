@@ -9578,15 +9578,10 @@ pub(crate) fn resolve_import_target<D>(
         .unwrap_or_else(|| to.to_unrouted_resource_id())
 }
 
-/// Check whether a `ProviderError` is an AWS throttling error that should be retried.
-fn is_throttling_error(err: &HostError) -> bool {
-    err.is_throttled() || err.is_transient()
-}
-
-/// Read a resource via the provider with retry and exponential backoff for throttling errors.
+/// Read a resource with retry and exponential backoff for typed transient errors.
 ///
-/// Retries up to 3 times with delays of 1s, 2s, 4s when the error looks like an
-/// AWS throttling / rate-limit response.
+/// Retries up to 3 times with delays of 1s, 2s, 4s when the provider classifies
+/// the failure as transient.
 pub async fn read_with_retry(
     provider: &dyn HostProvider,
     target: &RefreshTarget,
@@ -9608,10 +9603,10 @@ pub async fn read_with_retry(
                 // plan instead of aborting.
                 return Ok(State::not_found(id.clone()));
             }
-            Err(e) if attempt < max_retries && is_throttling_error(&e) => {
+            Err(e) if attempt < max_retries && e.is_transient() => {
                 let delay = Duration::from_secs(1 << attempt); // 1s, 2s, 4s
                 eprintln!(
-                    "  Throttled reading {}, retrying in {}s...",
+                    "  Transient error reading {}, retrying in {}s...",
                     id,
                     delay.as_secs()
                 );
@@ -9782,7 +9777,7 @@ async fn refresh_resource_set_with_state_reads<'a>(
     Ok(())
 }
 
-/// Read a data source resource via the provider with retry on throttling errors.
+/// Read a data source resource via the provider with retry on transient errors.
 ///
 /// Same backoff policy as [`read_with_retry`] but uses [`Provider::read_data_source`]
 /// so the provider receives the full [`DataSource`](carina_core::resource::DataSource)

@@ -30,8 +30,8 @@ fn struct_input_rules_are_required_including_when_empty() {
 
 #[test]
 fn conditional_schema_requires_protocol_27() {
-    assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 27);
-    assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 27);
+    assert_eq!(carina_provider_protocol::PROTOCOL_VERSION, 28);
+    assert_eq!(carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION, 28);
 }
 
 #[test]

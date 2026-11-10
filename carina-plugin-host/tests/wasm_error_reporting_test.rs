@@ -16,7 +16,7 @@ const HTTP_AND_BOGUS_COMPONENT_WAT: &str = r#"
   (type $bogus (instance (export "missing-function" (func))))
   (import "bogus:fake-3688/iface@99.0.0" (instance (type $bogus)))
   (instance $provider)
-  (export "carina:provider/provider@0.2.0" (instance $provider))
+  (export "carina:provider/provider@0.3.0" (instance $provider))
 )
 "#;
 
@@ -28,7 +28,7 @@ const NON_WASI_BOGUS_COMPONENT_WAT: &str = r#"
   (type $bogus (instance (export "missing-function" (func))))
   (import "bogus:fake-1681/iface@99.0.0" (instance (type $bogus)))
   (instance $provider)
-  (export "carina:provider/provider@0.2.0" (instance $provider))
+  (export "carina:provider/provider@0.3.0" (instance $provider))
 )
 "#;
 

@@ -545,7 +545,7 @@ async fn protocol_v2_is_rejected_before_current_world_binding() {
         "protocol rejection must not be classified as typed instantiation failure: {rendered}"
     );
     let expected = format!(
-        "Incompatible provider WIT package carina:provider@0.1.0; host requires carina:provider@0.2.0 (protocol {}); rebuild the provider against the current carina protocol",
+        "Incompatible provider WIT package carina:provider@0.1.0; host requires carina:provider@0.3.0 (protocol {}); rebuild the provider against the current carina protocol",
         carina_provider_protocol::PROTOCOL_VERSION,
     );
     assert!(

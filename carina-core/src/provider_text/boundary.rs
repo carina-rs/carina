@@ -623,11 +623,6 @@ impl Provider<super::Bound> for ProviderBoundary<'_> {
                                     error.as_ref().clone().with_secrets(&self.secrets),
                                 )))
                             }
-                            Err(ReferenceError::Transient(error)) => {
-                                Err(ReferenceError::Transient(std::sync::Arc::new(
-                                    error.as_ref().clone().with_secrets(&self.secrets),
-                                )))
-                            }
                             Err(ReferenceError::InvalidReference(error)) => {
                                 Err(ReferenceError::InvalidReference(std::sync::Arc::new(
                                     error.as_ref().clone().with_secrets(&self.secrets),

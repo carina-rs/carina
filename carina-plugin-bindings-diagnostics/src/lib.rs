@@ -5,8 +5,8 @@ wit_bindgen::generate!({
     inline: r#"
         package carina:plugin-sdk;
         world diagnostic-client {
-            import carina:provider/diagnostics@0.2.0;
-            import carina:provider/protected-material@0.2.0;
+            import carina:provider/diagnostics@0.3.0;
+            import carina:provider/protected-material@0.3.0;
         }
     "#,
     world: "carina:plugin-sdk/diagnostic-client",

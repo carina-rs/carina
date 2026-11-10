@@ -3453,7 +3453,7 @@ mod historical_display_tests {
                     serde_json::from_value(serde_json::json!({
                         "alias/shared": {"Ok": {"Resolved": "key/shared"}},
                         "alias/historical": {"Err": {"AccessDenied": {
-                            "kind": "api_error", "message": "historical row lookup denied"
+                            "kind": "api_error", "retryability": "unclassified", "message": "historical row lookup denied"
                         }}}
                     }))
                     .unwrap(),

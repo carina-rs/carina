@@ -9,6 +9,31 @@ use std::sync::{Arc, Mutex};
 type TableResult = Result<wire::ReferenceOutcome, wire::ReferenceError>;
 
 #[test]
+fn reference_error_display_uses_retryability_class() {
+    use crate::provider_text::Retryability;
+
+    for (retryability, expected) in [
+        (Retryability::Unclassified, "invalid reference"),
+        (
+            Retryability::Transient,
+            "reference resolution temporarily failed",
+        ),
+        (Retryability::DependencyBlocked, "invalid reference"),
+    ] {
+        let error: ReferenceError<Bound> = ReferenceError::InvalidReference(
+            HostError::api_error("lookup diagnostic")
+                .with_retryability(retryability)
+                .into(),
+        );
+        assert_eq!(error.to_string(), expected);
+        assert_eq!(
+            std::error::Error::source(&error).unwrap().to_string(),
+            "lookup diagnostic"
+        );
+    }
+}
+
+#[test]
 fn provider_text_reference_plan_context_sanitizes_raw_path_and_value() {
     let raw = format!("path\x1b[2J\u{9b}{}", "x".repeat(20 * 1024));
     let error = ReferencePlanError {
@@ -22,6 +47,61 @@ fn provider_text_reference_plan_context_sanitizes_raw_path_and_value() {
     assert!(!rendered.contains(['\x1b', '\u{9b}']));
     assert!(rendered.len() <= crate::provider_text::MAX_PROVIDER_TEXT_BYTES);
     assert_eq!(error.path, raw);
+}
+
+#[test]
+fn inside_secret_preserves_reference_failure_kind_and_retryability() {
+    use crate::provider_text::Retryability;
+    use crate::resource::InsideSecret as _;
+
+    for retryability in [
+        Retryability::Unclassified,
+        Retryability::Transient,
+        Retryability::DependencyBlocked,
+    ] {
+        for error in [
+            HostError::invalid_input("private diagnostic"),
+            HostError::api_error("private diagnostic"),
+            HostError::not_found("private diagnostic"),
+            HostError::timeout("private diagnostic"),
+            HostError::internal("private diagnostic"),
+        ] {
+            let kind = error.kind();
+            let error = Arc::new(error.with_retryability(retryability));
+            for source in [
+                ReferenceFailure::DesiredNotFound(error.clone()),
+                ReferenceFailure::Call(error.clone()),
+                ReferenceFailure::Resolution(ReferenceError::AccessDenied(error.clone())),
+                ReferenceFailure::Resolution(ReferenceError::InvalidReference(error.clone())),
+            ] {
+                let redacted = ReferencePlanError {
+                    instance: ProviderInstanceKey::new("test", None),
+                    resource: ResourceId::with_identity("test.Widget", "example"),
+                    path: "private path".into(),
+                    raw: "private value".into(),
+                    source,
+                }
+                .inside_secret();
+                let error = match &redacted.source {
+                    ReferenceFailure::DesiredNotFound(error)
+                    | ReferenceFailure::Call(error)
+                    | ReferenceFailure::Resolution(
+                        ReferenceError::AccessDenied(error)
+                        | ReferenceError::InvalidReference(error),
+                    ) => error,
+                    source => panic!("unexpected reference failure: {source:?}"),
+                };
+                assert_eq!(error.kind(), kind);
+                assert_eq!(error.retryability(), retryability);
+                assert_eq!(error.to_string(), crate::resource::INSIDE_SECRET_MESSAGE);
+                assert!(!redacted.to_string().contains("private"));
+                assert_eq!(
+                    HostError::from(Box::new(redacted)).retryability(),
+                    retryability
+                );
+            }
+        }
+    }
 }
 
 struct TableProvider {
@@ -64,9 +144,6 @@ impl Provider for TableProvider {
                         }
                         Err(wire::ReferenceError::AccessDenied(error)) => Err(
                             ReferenceError::AccessDenied(ProviderError::from_wire(*error).into()),
-                        ),
-                        Err(wire::ReferenceError::Transient(error)) => Err(
-                            ReferenceError::Transient(ProviderError::from_wire(*error).into()),
                         ),
                         Err(wire::ReferenceError::InvalidReference(error)) => {
                             Err(ReferenceError::InvalidReference(
@@ -148,6 +225,7 @@ fn string(s: &str) -> Value {
 fn error() -> Box<wire::ProviderError> {
     Box::new(wire::ProviderError {
         kind: wire::ProviderErrorKind::ApiError,
+        retryability: wire::ProviderErrorRetryability::Unclassified,
         message: "service diagnostic".into(),
         resource_id: None,
         cause: Some("transport diagnostic".into()),
@@ -156,6 +234,12 @@ fn error() -> Box<wire::ProviderError> {
         status: Some(403),
         code: Some("DeniedCode".into()),
         request_id: Some("request-123".into()),
+    })
+}
+fn transient_error() -> Box<wire::ProviderError> {
+    Box::new(wire::ProviderError {
+        retryability: wire::ProviderErrorRetryability::Transient,
+        ..*error()
     })
 }
 fn schema(create_only: bool, write_only: bool) -> ValidatedResourceSchema {
@@ -575,7 +659,8 @@ async fn byte_equal_references_do_not_resolve_even_if_alias_was_repointed() {
 async fn round8_enumerates_other_resources_without_judging_unused_outcomes() {
     for outcome in [
         Err(wire::ReferenceError::AccessDenied(error())),
-        Err(wire::ReferenceError::Transient(error())),
+        Err(wire::ReferenceError::InvalidReference(transient_error())),
+        Err(wire::ReferenceError::InvalidReference(error())),
         Ok(wire::ReferenceOutcome::NotFound(error())),
     ] {
         for repointed in [false, true] {
@@ -1286,7 +1371,7 @@ async fn every_d6_table_cell_is_enforced_with_typed_sources() {
                 "resolved" => resolved("key/same"),
                 "not_found" => Ok(wire::ReferenceOutcome::NotFound(error())),
                 "denied" => Err(wire::ReferenceError::AccessDenied(error())),
-                "transient" => Err(wire::ReferenceError::Transient(error())),
+                "transient" => Err(wire::ReferenceError::InvalidReference(transient_error())),
                 "invalid" => Err(wire::ReferenceError::InvalidReference(error())),
                 _ => unreachable!(),
             };
@@ -1335,14 +1420,26 @@ async fn every_d6_table_cell_is_enforced_with_typed_sources() {
                                 "denied"
                             )
                             | (
-                                ReferenceFailure::Resolution(ReferenceError::Transient(_)),
-                                "transient"
-                            )
-                            | (
                                 ReferenceFailure::Resolution(ReferenceError::InvalidReference(_)),
-                                "invalid"
+                                "transient" | "invalid"
                             )
                     ));
+                    if let ReferenceFailure::Resolution(
+                        ReferenceError::AccessDenied(inner)
+                        | ReferenceError::InvalidReference(inner),
+                    ) = &error.source
+                    {
+                        assert_eq!(inner.is_transient(), kind == "transient");
+                        assert_eq!(
+                            error.source.to_string(),
+                            match kind {
+                                "denied" => "reference access denied",
+                                "transient" => "reference resolution temporarily failed",
+                                "invalid" => "invalid reference",
+                                _ => unreachable!(),
+                            }
+                        );
+                    }
                     assert_eq!(error.path, "key");
                     assert_eq!(error.raw.expose_plaintext(), raw);
                     assert_eq!(error.instance, ProviderInstanceKey::new("test", None));
