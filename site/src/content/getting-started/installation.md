@@ -24,7 +24,7 @@ sudo mv carina-<VERSION>-macos-aarch64/carina carina-<VERSION>-macos-aarch64/car
 
 Each archive has a matching `.sha256` file, and `checksums-sha256.txt` lists them all.
 
-Stable tags (`vX.Y.Z`) publish the latest release and update Homebrew. Release candidate tags (`vX.Y.Z-rc.N`, for example `v0.14.0-rc.1`) publish GitHub pre-releases without changing the latest release or Homebrew. To install a release candidate, use its version (for example `0.14.0-rc.1`) for `<VERSION>` above.
+Stable tags (`vX.Y.Z`) publish the latest release and update Homebrew. Release candidates (`vX.Y.Z-rc.N`) appear on the [releases page](https://github.com/carina-rs/carina/releases) rather than `/releases/latest`, and do not update Homebrew. To install one, use its version (for example `0.14.0-rc.1`) for `<VERSION>` above.
 
 ## Build from source
 

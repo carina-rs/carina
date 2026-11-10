@@ -134,7 +134,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           prerelease: ${{ needs.tag.outputs.channel == 'rc' }}
-          make_latest: ${{ needs.tag.outputs.channel == 'stable' && 'true' || 'false' }}
+          # An empty input preserves the current latest release on stable re-runs.
+          make_latest: ${{ needs.tag.outputs.channel == 'rc' && 'false' || '' }}
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz
