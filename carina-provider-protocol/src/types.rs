@@ -1845,10 +1845,36 @@ pub struct CharSet {
     pub ranges: Vec<CharRange>,
 }
 
+/// A finite typed scalar used by an admitted condition or equality predicate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum InputLiteral {
+    Bool(bool),
+    Int(i64),
+    Float(crate::FiniteF64),
+    String(String),
+    Enum {
+        identity: TypeIdentity,
+        api_value: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum InputCondition {
+    Always,
+    Present(String),
+    Equals { path: String, literal: InputLiteral },
+    Not(Box<InputCondition>),
+}
+
 /// Portable desired-input predicates. Regexes use the schema dialect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum InputPredicate {
+    Present,
+    Absent,
+    Equals(InputLiteral),
     Length {
         min: Option<u64>,
         max: Option<u64>,
@@ -1891,6 +1917,7 @@ pub struct InputRule {
     pub scope: InputRuleScope,
     pub target: InputRuleTarget,
     pub code: String,
+    pub condition: InputCondition,
     pub predicate: InputPredicate,
 }
 
@@ -2162,6 +2189,8 @@ pub enum AttributeType {
         fields: Vec<StructField>,
         /// Required in protocol v16, including when empty.
         field_groups: Vec<FieldGroup>,
+        /// Required in protocol v26, including when empty.
+        input_rules: Vec<InputRule>,
     },
     #[serde(rename = "union")]
     Union {
@@ -3001,6 +3030,7 @@ mod tests {
     #[test]
     fn test_attribute_type_roundtrip() {
         let attr = AttributeType::Struct {
+            input_rules: Vec::new(),
             name: "Config".into(),
             fields: vec![StructField {
                 name: "enabled".into(),
@@ -3572,6 +3602,7 @@ mod tests {
             defs: std::collections::BTreeMap::from([(
                 "Statement".to_string(),
                 AttributeType::Struct {
+                    input_rules: Vec::new(),
                     name: "Statement".into(),
                     fields: vec![StructField {
                         name: "and_statement".into(),
@@ -3680,6 +3711,7 @@ mod tests {
         let attr = AttributeType::Union {
             members: vec![
                 AttributeType::Struct {
+                    input_rules: Vec::new(),
                     name: "IamPolicyPrincipal".into(),
                     fields: vec![StructField {
                         name: "service".into(),

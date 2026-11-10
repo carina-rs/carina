@@ -1112,11 +1112,10 @@ async fn prepare_update_request_for_dispatch<S: Clone>(
             })?;
         effective_changed.extend(additional.value);
     }
-    let request = UpdateRequest::checked(from.clone(), &effective_changed, &resolved_to, schema)
-        .map_err(EffectFailureKind::execution)?;
     check.prepare_update(
-        &to.id,
-        request,
+        from.clone(),
+        &effective_changed,
+        resolved_to,
         resolved_desired_attributes,
         preparation.schemas(),
     )

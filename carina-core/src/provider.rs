@@ -1186,6 +1186,42 @@ impl CreateRequest {
 #[derive(Debug, Clone, Default)]
 pub struct ReadRequest;
 
+/// Protected desired evidence and its exact checked patch, minted together
+/// only by UpdateRequest::checked. No constructor accepts an existing request
+/// alongside a different desired resource.
+#[derive(Clone)]
+pub(crate) struct ProtectedUpdateInput {
+    id: ResourceId,
+    attributes: IndexMap<String, Value>,
+    ignored: crate::resource::ResolvedIgnoreChanges,
+    patch: UpdatePatch,
+    selection: crate::input_rules::InputSelectionAuthority,
+}
+
+impl fmt::Debug for ProtectedUpdateInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ProtectedUpdateInput(<protected>)")
+    }
+}
+
+impl ProtectedUpdateInput {
+    pub(crate) fn selection_authority(&self) -> &crate::input_rules::InputSelectionAuthority {
+        &self.selection
+    }
+    pub(crate) fn id(&self) -> &ResourceId {
+        &self.id
+    }
+    pub(crate) fn attributes(&self) -> &IndexMap<String, Value> {
+        &self.attributes
+    }
+    pub(crate) fn ignored(&self) -> &crate::resource::ResolvedIgnoreChanges {
+        &self.ignored
+    }
+    pub(crate) fn patch(&self) -> &UpdatePatch {
+        &self.patch
+    }
+}
+
 /// Per-operation request record for [`Provider::update`].
 ///
 /// Mirrors `update-request` in `wit/types.wit`. `from` is the current
@@ -1239,7 +1275,9 @@ pub struct UpdateRequest {
     patch: WireReady<UpdatePatch>,
     /// Effective directives resolved from the managed resource schema.
     directives: ProviderDirectives,
-    diagnostic_values: Vec<Value>,
+    input: Arc<ProtectedUpdateInput>,
+    #[cfg(any(test, feature = "test-utils"))]
+    desired_for_fixture: ProviderReadyResource,
 }
 
 impl UpdateRequest {
@@ -1251,23 +1289,49 @@ impl UpdateRequest {
     ) -> Result<Self, crate::executor::ProviderPreparationError> {
         let patch = build_update_patch(changed_attributes, resource, &from, schema)?;
         let patch = WireReady::try_new(patch, ProviderWireTarget::Resource(resource.id.clone()))?;
-        let diagnostic_values = patch
-            .as_inner()
-            .ops
-            .iter()
-            .filter_map(|op| match op {
-                PatchOp::Add { key, value }
-                | PatchOp::Replace { key, value }
-                | PatchOp::Reassert { key, value } => Some(resource.diagnostic_value(key, value)),
-                PatchOp::Remove { .. } => None,
-            })
-            .collect();
+        let protected = resource.protected_desired_tree();
+        let annotated_patch = UpdatePatch {
+            ops: patch
+                .as_inner()
+                .ops
+                .iter()
+                .map(|op| match op {
+                    PatchOp::Add { key, value } => PatchOp::Add {
+                        key: key.clone(),
+                        value: resource.diagnostic_value(key, value),
+                    },
+                    PatchOp::Replace { key, value } => PatchOp::Replace {
+                        key: key.clone(),
+                        value: resource.diagnostic_value(key, value),
+                    },
+                    PatchOp::Reassert { key, value } => PatchOp::Reassert {
+                        key: key.clone(),
+                        value: resource.diagnostic_value(key, value),
+                    },
+                    PatchOp::Remove { key } => PatchOp::Remove { key: key.clone() },
+                })
+                .collect(),
+        };
+        let input = Arc::new(ProtectedUpdateInput {
+            id: protected.id().clone(),
+            attributes: protected.attributes().clone(),
+            ignored: protected.ignored().clone(),
+            patch: annotated_patch,
+            selection: protected.selection_authority().clone(),
+        });
         Ok(Self {
+            #[cfg(any(test, feature = "test-utils"))]
+            desired_for_fixture: resource.clone(),
             from,
             patch,
             directives: *resource.directives(),
-            diagnostic_values,
+            input,
         })
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn desired_for_fixture(&self) -> &ProviderReadyResource {
+        &self.desired_for_fixture
     }
 
     /// Current provider-side state.
@@ -1281,7 +1345,11 @@ impl UpdateRequest {
     }
 
     pub(crate) fn diagnostic_values(&self) -> impl Iterator<Item = &Value> {
-        self.diagnostic_values.iter()
+        self.input.patch.ops.iter().filter_map(PatchOp::sent_value)
+    }
+
+    pub(crate) fn protected_input(&self) -> &ProtectedUpdateInput {
+        &self.input
     }
 
     /// The checked projection consumed by provider transport adapters.
@@ -1535,17 +1603,6 @@ impl PatchOp {
 }
 
 impl UpdatePatch {
-    /// Desired values actually sent by this patch, including reasserted inputs.
-    pub(crate) fn sent_projection(&self) -> IndexMap<String, Value> {
-        self.ops
-            .iter()
-            .filter_map(|op| {
-                op.sent_value()
-                    .map(|value| (op.key().to_owned(), value.clone()))
-            })
-            .collect()
-    }
-
     pub(crate) fn sent_attributes(&self) -> SentAttributes {
         SentAttributes::from_update_patch(self)
     }
@@ -6780,17 +6837,16 @@ impl From<&ResourceId> for ProviderInstanceKey {
 
 /// Check a default-tag value before host-owned merging. Unresolved values are
 /// skippable; redacted secrets are fatal.
-fn assert_default_tag_value_encodable(
-    value: &crate::resource::knowledge::Classification<'_>,
+pub(crate) fn assert_default_tag_value_encodable<P: crate::resource::PlaceholderKind>(
+    value: &crate::resource::knowledge::Classification<'_, P>,
 ) -> Result<(), SerializationError> {
     use crate::resource::knowledge::{Classification, KnownValue, KnownView, ShapeView};
-    if crate::resource::knowledge::ClassifiedRef::from(value)
-        .secret()
-        .is_some()
-    {
+    if crate::resource::knowledge::ClassifiedRef::from(value).is_protected() {
         return Ok(());
     }
-    fn known(value: &KnownValue<'_>) -> Result<(), SerializationError> {
+    fn known<P: crate::resource::PlaceholderKind>(
+        value: &KnownValue<'_, P>,
+    ) -> Result<(), SerializationError> {
         value.visit(
             |value| match value {
                 KnownView::EnumIdentifier(value) => {
@@ -6845,7 +6901,8 @@ fn assert_default_tag_value_encodable(
             |_| Ok(()),
         ),
         Classification::Pending(value) => {
-            crate::resource::require_known_value(Classification::Pending(value.clone())).map(|_| ())
+            crate::resource::require_known_classification(Classification::Pending(value.clone()))
+                .map(|_| ())
         }
     }
 }
@@ -6891,6 +6948,15 @@ pub fn merge_default_tags<S, D>(
         crate::resource::AbsoluteBindingAddress,
         D,
     >],
+    registry: &SchemaRegistry,
+) -> HostResult<()> {
+    merge_default_tags_with_placeholders(config, resources, registry)
+}
+
+/// The same merge policy also accepts transient authored substitution evidence.
+pub(crate) fn merge_default_tags_with_placeholders<S, D, P: crate::resource::PlaceholderKind>(
+    config: &ProviderConfig<P, crate::resource::AbsoluteBindingAddress>,
+    resources: &mut [Resource<S, P, crate::resource::AbsoluteBindingAddress, D>],
     registry: &SchemaRegistry,
 ) -> HostResult<()> {
     if config.default_tags.is_empty() {
@@ -12267,6 +12333,23 @@ mod tests {
                 protected
             )]))))
         );
+    }
+
+    #[test]
+    fn default_tag_preview_does_not_invent_read_back_provenance() {
+        let source: crate::resource::Value<crate::resource::ParserPlaceholder> =
+            crate::resource::Value::Deferred(crate::resource::DeferredValue::Placeholder(
+                crate::resource::ParserPlaceholder::ModuleArgument {
+                    name: "environment".into(),
+                    diagnostic: Default::default(),
+                },
+            ));
+        let preview = source.input_preview();
+        let proof = preview
+            .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
+            .unwrap();
+        let error = assert_default_tag_value_encodable(&proof).unwrap_err();
+        assert!(!error.to_string().contains("read after apply"), "{error}");
     }
 
     #[test]

@@ -395,7 +395,10 @@ pub type InferredRootDirectory = RootDirectoryParse<crate::parser::InferredExpor
 
 impl<E> RootDirectoryParse<E> {
     fn with_resolution(parsed: File<E>, resolution: ResolutionContext) -> Self {
-        Self { parsed, resolution }
+        let mut root = Self { parsed, resolution };
+        let inputs = crate::input_rules::AuthoredInputs::for_directory(&root);
+        root.parsed.attach_authored_inputs(inputs);
+        root
     }
 
     pub(crate) fn module_resolution_context(&self) -> ModuleResolutionContext {
@@ -457,6 +460,20 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
         crate::validation::resolve_file_type_exprs_report(&mut self.parsed, config, None)
     }
 
+    pub fn resolve_resource_refs_with_config(
+        &mut self,
+        config: &ProviderContext,
+    ) -> Result<(), parser::ParseError> {
+        parser::resolve_resource_refs_in_context(
+            &mut self.parsed,
+            config,
+            None,
+            self.resolution.strict_recheck(),
+        )
+    }
+}
+
+impl<E: parser::ExportParamLike + Clone> RootDirectoryParse<E> {
     /// Resolve root-relative resource references while preserving this witness.
     pub fn resolve_resource_refs_in_session(
         &mut self,
@@ -470,18 +487,6 @@ impl RootDirectoryParse<crate::parser::InferredExportParam> {
             self.resolution.strict_recheck(),
         )
         .map_err(parser::AnalysisResolutionError::from_parse_failure)
-    }
-
-    pub fn resolve_resource_refs_with_config(
-        &mut self,
-        config: &ProviderContext,
-    ) -> Result<(), parser::ParseError> {
-        parser::resolve_resource_refs_in_context(
-            &mut self.parsed,
-            config,
-            None,
-            self.resolution.strict_recheck(),
-        )
     }
 }
 

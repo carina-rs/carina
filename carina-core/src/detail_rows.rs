@@ -414,7 +414,7 @@ fn combine_with_desired_secret_shape(
 pub enum DetailRow {
     /// Input eligibility cannot yet be decided for this exact desired write slot.
     PendingInput {
-        path: crate::schema::InputPath,
+        path: crate::schema::InputDiagnosticPath,
         codes: Vec<crate::schema::InputRuleCode>,
     },
     /// A preformatted informational line.

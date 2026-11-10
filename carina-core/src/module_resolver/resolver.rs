@@ -79,6 +79,34 @@ impl ModuleCallConstraintReport {
     }
 }
 
+/// Complete graph owned by the successful module-admission boundary. Its
+/// constructor stays private to this resolver; mutable public ASTs cannot mint it.
+pub(crate) struct AuthoredModuleGraph<'a, E> {
+    file: &'a ModuleResolvedFile<E>,
+}
+impl<E> AuthoredModuleGraph<'_, E> {
+    pub(crate) fn file(&self) -> &ModuleResolvedFile<E> {
+        self.file
+    }
+}
+
+/// Every successful module publication advances resource authority together;
+/// unavailable provider defaults remain a separate fact in that snapshot.
+fn publish_authored_module_graph<E>(
+    mut graph: ModuleResolvedFile<E>,
+    config: &ProviderContext,
+) -> ModuleResolvedFile<E>
+where
+    E: crate::parser::ExportParamLike<ParserPlaceholder, AbsoluteBindingAddress> + Clone,
+{
+    let inputs = crate::input_rules::AuthoredInputs::for_module_admission(
+        &AuthoredModuleGraph { file: &graph },
+        config,
+    );
+    graph.attach_authored_inputs(inputs);
+    graph
+}
+
 pub type ModuleCallConstraintReports = Vec<ModuleCallConstraintReport>;
 
 /// Diagnostic module-resolution outcome.
@@ -1882,6 +1910,7 @@ pub fn resolve_modules_with_config<E: ResolveExportBindingPhase<ParserPlaceholde
             .expand()?;
     ensure_expanded_root_graph(&expanded)?;
     finalize_deferred_for_bodies(expanded)
+        .map(|graph| publish_authored_module_graph(graph, config.catalog()))
 }
 
 /// Resolve modules in a bootstrap/editor context. Every value check is
@@ -1911,6 +1940,7 @@ pub fn resolve_modules_with_providerless_config<E: ResolveExportBindingPhase<Par
         .expand()?;
         ensure_expanded_root_graph(&expanded)?;
         finalize_deferred_for_bodies(expanded)
+            .map(|graph| publish_authored_module_graph(graph, config.catalog()))
     })()
     .map_err(|error: ModuleError| error.with_provider_type_warnings(warnings))
 }
@@ -1929,6 +1959,7 @@ pub fn resolve_module_template_with_config<E: ResolveExportBindingPhase<ParserPl
         RefCheckedModuleGraph::check(&mut parsed, base_dir, config, schemas, resolution)?
             .expand()?;
     finalize_deferred_for_bodies(expanded)
+        .map(|graph| publish_authored_module_graph(graph, config.catalog()))
 }
 
 /// Providerless/editor form of [`resolve_module_template_with_config`].
@@ -1958,6 +1989,7 @@ pub fn resolve_module_template_with_providerless_config<
         )?
         .expand()?;
         finalize_deferred_for_bodies(expanded)
+            .map(|graph| publish_authored_module_graph(graph, config.catalog()))
     })()
     .map_err(|error: ModuleError| error.with_provider_type_warnings(warnings))
 }
@@ -1987,6 +2019,7 @@ pub(crate) fn resolve_upstream_modules_with_providerless_config<
     )?
     .expand()?;
     finalize_deferred_for_bodies(expanded)
+        .map(|graph| publish_authored_module_graph(graph, config.catalog()))
 }
 
 pub(crate) fn resolve_upstream_modules_with_config<
@@ -2010,6 +2043,7 @@ pub(crate) fn resolve_upstream_modules_with_config<
     )?
     .expand()?;
     finalize_deferred_for_bodies(expanded)
+        .map(|graph| publish_authored_module_graph(graph, config.catalog()))
 }
 
 /// Resolve modules while retaining the expander's own per-call constraint
@@ -2123,6 +2157,7 @@ fn resolve_modules_with_diagnostics_and_resolver<
     if !findings.is_empty() {
         ModuleResolutionDiagnosticResult::ConstraintFailed { findings, errors }
     } else if !resolution_failed {
+        let graph = publish_authored_module_graph(graph, resolver.session.catalog());
         ModuleResolutionDiagnosticResult::Expanded {
             graph: Box::new(graph),
         }

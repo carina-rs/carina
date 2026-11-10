@@ -652,7 +652,77 @@ A struct type represents a nested object with typed fields.
   24 also requires a typed pattern spec (regex plus explicit mode, and a reason
   containing visible text for Substring); convert the complete spec
   exhaustively, including its reason. Never supply a default mode or admit a bare
-  string, including on the schema-only migration path. Adding
+  string, including on the schema-only migration path. Protocol 25 requires
+  the WIT 0.2.0 `diagnostics` and `protected-material` imports described below.
+  Protocol 26 adds required `InputRule.condition` and Struct `input_rules`, even when the
+  condition is `Always` or the collection is empty; neither field has a serde default.
+  Conditions and Struct rules travel once in the existing schema JSON, with no
+  further WIT change beyond the diagnostics imports. Resource and Struct
+  declarations use the same admitted rule type,
+  with Struct paths relative to each object instance (including recursive defs).
+  The shared input-rule admission gate checks writable canonical paths, typed
+  scalar literals, enum identity and canonical membership, predicate compatibility,
+  duplicate target/code pairs, and a condition depth limit of 16. The one evaluator
+  uses runtime knowledge for presence and equality; unknown guards remain pending,
+  including under negation. Equality and string predicates share typed scalar
+  extraction: enum aliases use canonical API values, and invalid known values
+  remain failures. Public binding and site evaluation return complete typed
+  findings and pending obligations; only the private single-rule evaluator
+  returns a verdict. Dispatch retains every established finding. Each write site owns one immutable `RuleInput`,
+  constructed only at authored, plan or protected dispatch stage boundaries.
+  Those constructors seal ordinary union fits with their stage's provider
+  lookup, retaining nested choices in the graph. Evaluation consumes that
+  authority; unavailable provider validation remains pending and never selects
+  a branch by structural declaration order alone. The same authority travels
+  through admitted provider-ready values and their protected update capability.
+  Recursive admission memoizes declaration/node judgements, including provider
+  callbacks, ancestry and reference guards. Fit children share immutable witnesses
+  rather than copying subtrees on memo hits. Schema walkers consume cached
+  protected classifications through a scoped capability that protects results
+  before returning; they never reopen those payloads for classification.
+  Authored checks require immutable parser/admission-minted `AuthoredInputs`;
+  mutating public AST fields cannot reseal their snapshot. Every successful module
+  publication retains resource authority even if provider configuration fails;
+  unavailable default-map membership remains pending. Missing authority is an
+  explicit error, never an empty successful report. Authored reports retain each
+  resource's preparation errors alongside findings and pending obligations;
+  consumers exhaustively render their typed outcomes. Schema fields are read literally
+  through immutable ordered declarations with a shared name index; ordinary
+  validation, aliases and rule metadata use that index. Only declared rule paths use `InputPath` parsing.
+  Alias binding covers Struct, List, Map, selected Union and Secret instances,
+  retaining protection and authored locations. Canonical root identities precede
+  patch, default-membership and ignore queries. Shared schema canonicalization
+  uses mutable path prefixes and renders only actual renames or errors; authored
+  location renames are indexed and applied in one batch.
+  Guards, targets,
+  instance enumeration and bound-expression estimation share the graph and
+  ignore policy. Classification and diagnostic protection travel together on
+  every graph edge. Key cursors preserve withheld completeness and masked
+  membership; the estimator never recovers proof from an unsent map expression.
+  Withheld ancestors carry protection without granting a target-node capability.
+  Owner prefixes are shared, and diagnostic paths are materialized only for
+  findings or pending results, which are then sorted. The shared validator also
+  shares path prefixes; published diagnostic keys have immutable concrete storage.
+  Diagnostic identity and ordering use structured segments; protected map keys
+  retain opaque instance ordinals and redact only their presentation. Literal field names
+  are quoted when needed. Parser-owned locations share one structured index,
+  invalidated only by their owning mutation methods, and missing intermediate
+  objects retain the deepest authored containing location. Dispatch secret restoration
+  establishes plaintext correspondence once and carries paired child cursors.
+  Only complete replacement nodes and
+  explicit removals prove absence; unsent omissions remain withheld at every
+  depth. Default membership belongs to that graph and is recomputed at dispatch.
+  An erased normalized expression has no authored fallback without carried
+  correspondence. Update inputs overlay the exact annotated patch on the full
+  protected desired tree, never observed state. `UpdateRequest::checked` mints
+  their sealed `ProtectedUpdateInput` together; dispatch cannot accept a desired
+  tree and a patch independently. Both owners use
+  the same write-scope classifier; `AuthoredDesired` evaluates `CreateOnly` as
+  warnings with core-rendered rejected-if-created wording, while `EveryWrite`
+  remains an error. The core finding derives severity from rule scope and write
+  context once; CLI and LSP render that fact. Unknown guards remain pending.
+  Plans reject `CreateOnly` violations only at create-capable write sites.
+  Semantic fingerprints encode conditions and nested rules in encoding v13. Adding
   a protocol field must break compilation until it is consciously carried
   across or explicitly bound and documented as unavailable on the destination
   side. Never use a catch-all `_` or `..` at this seam; a silently dropped field
@@ -661,7 +731,7 @@ A struct type represents a nested object with typed fields.
   require `diagnostics` and `protected-material` imports in every provider
   world. Component type scanning rejects a legacy package before linking or
   executing any start/info code, naming the found package and the required
-  `carina:provider@0.2.0` / protocol 25. `ProviderDiagnostics::emit` accepts only typed events borrowing
+  `carina:provider@0.2.0` and the current host protocol. `ProviderDiagnostics::emit` accepts only typed events borrowing
   provider errors/diagnostics or carrying structured value candidates. The
   host binds them through the same private text kernel as returned errors.
   Only that kernel mints `BoundProviderEvent`; its presenter consumes Bound

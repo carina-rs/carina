@@ -91,14 +91,12 @@ pub fn update_permit_with_schemas_for_test(
     request: crate::provider::UpdateRequest,
     schemas: &crate::schema::SchemaRegistry,
 ) -> UpdatePermit {
-    let id = request.from().id.clone();
-    let mut desired = crate::resource::Resource::from_id(id.clone());
-    desired.attributes = request.patch().sent_projection();
+    let desired = request.desired_for_fixture().clone();
     let (ready, check) = fixture_write_authority(
         Effect::Update {
             from: Box::new(request.from().clone()),
             identifier,
-            to: crate::resource::ResolvedResource::new(desired.into()),
+            to: desired.as_inner().clone(),
             changed_attributes: request
                 .patch()
                 .ops
@@ -108,13 +106,18 @@ pub fn update_permit_with_schemas_for_test(
         },
         schemas,
     );
-    let attributes = request.patch().sent_projection().into_iter().collect();
+    let attributes = desired
+        .as_resource()
+        .attributes
+        .clone()
+        .into_iter()
+        .collect();
     let writeback = crate::binding_index::SecretPreservingAttributes::from_provider_values(
         &attributes,
         &attributes,
     );
     let write = check
-        .prepare_update(&id, request, writeback, schemas)
+        .prepare_update_fixture(request, writeback, schemas)
         .expect("fixture input discharge");
     let ScheduledBasicEffect::Update { update, .. } = ready else {
         unreachable!("fixture update slot")

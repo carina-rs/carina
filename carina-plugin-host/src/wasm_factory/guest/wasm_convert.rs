@@ -2134,6 +2134,7 @@ fn proto_struct_field_to_core(
     field: &proto::StructField,
 ) -> Result<CoreStructField, SchemaDecodeError> {
     let admitted = proto_attr_type_to_core(&proto::AttributeType::Struct {
+        input_rules: Vec::new(),
         name: "TestField".to_string(),
         fields: vec![field.clone()],
         field_groups: Vec::new(),
@@ -3076,6 +3077,7 @@ mod tests {
         schema.defs.insert(
             "Tag".to_string(),
             proto::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "Tag".to_string(),
                 field_groups: vec![],
                 fields: vec![proto::StructField {
@@ -3121,6 +3123,7 @@ mod tests {
         let mut output = proto_attr(
             "output",
             proto::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "Output".to_string(),
                 field_groups: vec![],
                 fields: vec![proto::StructField {
@@ -3208,6 +3211,7 @@ mod tests {
         let destination = proto::StructField {
             name: "destination".to_string(),
             field_type: proto::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "Destination".to_string(),
                 field_groups: vec![],
                 fields: vec![illegal_leaf],
@@ -3225,6 +3229,7 @@ mod tests {
         let metadata = proto_attr(
             "metadata_configuration",
             proto::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "MetadataConfiguration".to_string(),
                 field_groups: vec![],
                 fields: vec![destination],
@@ -3250,6 +3255,7 @@ mod tests {
         let mut config = proto_attr(
             "config",
             proto::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "Config".to_string(),
                 field_groups: vec![],
                 fields: vec![proto::StructField {
@@ -3295,6 +3301,7 @@ mod tests {
             let mut attribute = proto_attr(
                 name,
                 proto::AttributeType::Struct {
+                    input_rules: Vec::new(),
                     name: "Config".to_string(),
                     field_groups: vec![],
                     fields: vec![proto::StructField {
@@ -3361,6 +3368,7 @@ mod tests {
                 members: vec![
                     proto_string(),
                     proto::AttributeType::Struct {
+                        input_rules: Vec::new(),
                         name: "OidcConfig".to_string(),
                         field_groups: vec![],
                         fields: vec![proto::StructField {
@@ -5468,7 +5476,7 @@ mod tests {
                             "element_type":{
                                 "type":"struct",
                                 "name":"DomainValidation",
-                                "field_groups":[],
+                                "input_rules": [], "field_groups":[],
                                 "fields":[{
                                     "name":"domain_name",
                                     "field_type":{"type":"String"},
@@ -5484,7 +5492,7 @@ mod tests {
                                     "field_type":{
                                         "type":"struct",
                                         "name":"HttpRedirect",
-                                        "field_groups":[],
+                                        "input_rules": [], "field_groups":[],
                                         "fields":[{
                                             "name":"redirect_from",
                                             "field_type":{"type":"String"},
@@ -5519,7 +5527,7 @@ mod tests {
                                     "field_type":{
                                         "type":"struct",
                                         "name":"ResourceRecord",
-                                        "field_groups":[],
+                                        "input_rules": [], "field_groups":[],
                                         "fields":[{
                                             "name":"name",
                                             "field_type":{"type":"String"},
@@ -5726,7 +5734,7 @@ mod tests {
                         "attr_type":{
                             "type":"struct",
                             "name":"Config",
-                            "field_groups":[],
+                            "input_rules": [], "field_groups":[],
                             "fields":[{
                                 "name":"client_secret",
                                 "field_type":{"type":"String"},
@@ -5830,7 +5838,7 @@ mod tests {
                       {
                         "type": "struct",
                         "name": "IngressRule",
-                        "field_groups": [],
+                        "input_rules": [], "field_groups": [],
                         "fields": [
                           {
                             "name": "from_port",
@@ -6203,6 +6211,7 @@ mod tests {
         schema.defs.insert(
             "Tag".to_string(),
             proto::AttributeType::Struct {
+                input_rules: Vec::new(),
                 name: "Tag".to_string(),
                 field_groups: vec![],
                 fields: vec![proto::StructField {
@@ -7464,7 +7473,7 @@ mod pattern_mode_tests {
                 serde_json::json!({"type": "reference", "identity": {"provider": "test", "segments": [], "kind": "Id"}, "pattern": pattern}),
             ] {
                 // All current-protocol metadata is present, isolating the pattern failure.
-                let nested = serde_json::json!({"type": "struct", "name": "Nested", "field_groups": [], "fields": [{
+                let nested = serde_json::json!({"type": "struct", "name": "Nested", "input_rules": [], "field_groups": [], "fields": [{
                     "name": "value", "required": false, "read_only": false, "write_only": false,
                     "create_only": false, "identity": "none", "field_type": terminal
                 }]});
@@ -7507,7 +7516,7 @@ mod pattern_mode_tests {
 mod removed_legacy_pattern_window_tests {
     #[test]
     fn pattern_specs_require_supported_protocol_including_schema_only_loading() {
-        for version in [12, 22, 23, 24] {
+        for version in [12, 22, 23, 24, 25] {
             let info = serde_json::json!({"name": "old", "display_name": "Old", "version": "1.0.0", "protocol_version": version});
             let error = super::check_protocol_version(&info.to_string()).unwrap_err();
             assert!(error.contains(&format!(
@@ -7588,6 +7597,70 @@ mod pattern_mode_roundtrip_tests {
             serde_json::from_str::<serde_json::Value>(&config_json).unwrap(),
             serde_json::from_str::<serde_json::Value>(
                 &carina_plugin_sdk::provider_config_schema_to_json(&decoded_config).unwrap()
+            )
+            .unwrap()
+        );
+    }
+}
+
+#[cfg(test)]
+mod conditional_input_rule_roundtrip_tests {
+    use super::*;
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, InputCondition, InputLiteral, InputPath, InputPredicate,
+        InputRule, InputRuleCode, InputRuleScope, ResourceSchema, StructField,
+        ValidatedConfigSchema, ValidatedProviderSchemaWitness,
+    };
+
+    #[test]
+    fn sdk_json_host_roundtrip_preserves_conditions_and_struct_local_rules() {
+        let condition = InputCondition::Not(Box::new(InputCondition::Equals {
+            path: InputPath::new("guard").unwrap(),
+            literal: InputLiteral::Bool(true),
+        }));
+        let rule = InputRule::value(
+            InputRuleScope::EveryWrite,
+            InputPath::new("target").unwrap(),
+            InputRuleCode::new("test.guard").unwrap(),
+            InputPredicate::Present,
+        )
+        .with_condition(condition);
+        let nested = AttributeType::struct_with_rules(
+            "Nested",
+            vec![
+                StructField::optional("guard", AttributeType::bool()).build(),
+                StructField::optional("target", AttributeType::string()).build(),
+            ],
+            vec![],
+            vec![rule.clone()],
+        );
+        let schema = ResourceSchema::new("test.Conditional")
+            .attribute(AttributeSchema::optional("guard", AttributeType::bool()).build())
+            .attribute(AttributeSchema::optional("target", AttributeType::string()).build())
+            .attribute(
+                AttributeSchema::optional(
+                    "nested",
+                    AttributeType::list(AttributeType::ref_("Nested")),
+                )
+                .build(),
+            )
+            .with_def("Nested", nested)
+            .input_rule(rule)
+            .validate()
+            .unwrap();
+        let witness = ValidatedProviderSchemaWitness::new(
+            vec![schema],
+            ValidatedConfigSchema::default(),
+            BTreeMap::new(),
+            vec![],
+        )
+        .unwrap();
+        let json = carina_plugin_sdk::provider_schema_to_json(&witness).unwrap();
+        let decoded = json_to_provider_schema(&json, ValidatedConfigSchema::default()).unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&json).unwrap(),
+            serde_json::from_str::<serde_json::Value>(
+                &carina_plugin_sdk::provider_schema_to_json(&decoded).unwrap()
             )
             .unwrap()
         );

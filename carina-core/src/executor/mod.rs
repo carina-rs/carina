@@ -1262,11 +1262,14 @@ impl std::fmt::Display for UnsatisfiedDependency {
 /// Typed reason an effect did not complete successfully.
 #[derive(Debug, Clone)]
 pub enum EffectFailureKind {
+    InputRuleEvaluation {
+        failure: Box<crate::input_rules::InputEvaluationFailure>,
+    },
     InputRule {
         violation: crate::schema::InputViolation,
     },
     UnresolvedInputRule {
-        path: crate::schema::InputPath,
+        path: crate::schema::InputDiagnosticPath,
         code: crate::schema::InputRuleCode,
     },
     Provider {
@@ -1300,6 +1303,13 @@ impl EffectFailureKind {
     /// Short final-summary label. The observer renders the full cause once.
     pub fn label(&self) -> &'static str {
         match self {
+            Self::InputRuleEvaluation { failure } => {
+                if failure.has_findings() {
+                    "input rule violation"
+                } else {
+                    "input rule unresolved"
+                }
+            }
             Self::InputRule { .. } => "input rule violation",
             Self::UnresolvedInputRule { .. } => "input rule unresolved",
             Self::Provider { .. } => "provider error",
@@ -1388,6 +1398,7 @@ impl EffectFailureKind {
             Self::DeferredMaterialization { failure } => Some(failure.as_ref()),
             Self::MissingDependency { .. }
             | Self::InputRule { .. }
+            | Self::InputRuleEvaluation { .. }
             | Self::UnresolvedInputRule { .. }
             | Self::DependencyCycle { .. }
             | Self::BlockedByDependencyCycle { .. }
@@ -1400,6 +1411,7 @@ impl EffectFailureKind {
 impl std::fmt::Display for EffectFailureKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::InputRuleEvaluation { failure } => failure.fmt(formatter),
             Self::InputRule { violation } => violation.fmt(formatter),
             Self::UnresolvedInputRule { path, code } => write!(
                 formatter,
