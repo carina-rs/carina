@@ -161,7 +161,12 @@ checksum = "example"
                 self.classify("full", self.base, self.commit())
 
     def test_new_file(self):
-        for path, content in [("new-file", "extra\n"), ("new/Cargo.toml", '[package]\nversion = "0.13.1"\n')]:
+        for path, content in [
+            ("new-file", "extra\n"),
+            ("new/Cargo.toml", '[package]\nversion = "0.13.1"\n'),
+            ("scripts/release-tag-channel.sh", "echo stable\n"),
+            ("scripts/test-release-tag-channel.sh", "exit 0\n"),
+        ]:
             with self.subTest(path):
                 self.setUp()
                 self.write(path, content)
