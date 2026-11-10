@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import sys
 import subprocess
 import tempfile
@@ -12,7 +13,7 @@ import textwrap
 from types import SimpleNamespace
 import unittest
 
-WORKFLOW = Path(sys.argv.pop(1))
+WORKFLOW = Path(sys.argv.pop(1)).resolve()
 CODE_JOBS = {
     "check", "feature-isolation", "fmt", "clippy", "check-examples",
     "validate-crn", "check-example-warnings", "test", "binary-build",
@@ -121,6 +122,107 @@ class WorkflowConditionTests(unittest.TestCase):
                 with self.subTest(job=name, event=event):
                     self.assertEqual(selected(field(self.jobs[name], "if"), event, True, True), name != "fmt" or event != "push")
 
+    def test_changes_job_uses_derived_scope_for_external_inputs(self):
+        block = self.jobs["changes"]
+        self.assertIn("fetch-depth: 0", block)
+        self.assertIn("ref: ${{ github.event.pull_request.head.sha || github.sha }}", block)
+        self.assertNotIn("site/src/content/providers/writing/(schemas|getting-started)", block)
+        program = textwrap.dedent(block.split("        run: |\n", 1)[1])
+        repo = WORKFLOW.parent.parent.parent
+        with tempfile.TemporaryDirectory(prefix="carina-changes-") as temporary:
+            root = Path(temporary)
+            environment = dict(os.environ, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+
+            def git(*args):
+                return subprocess.check_output(
+                    ["git", "-c", "user.name=Changes fixture", "-c",
+                     "user.email=changes@example.invalid", *args], cwd=root,
+                    env=environment, text=True, stderr=subprocess.PIPE, timeout=10,
+                ).strip()
+
+            def write(filename, contents):
+                path = root / filename
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(contents)
+
+            git("init", "-q", "--template=")
+            for name in ("touched-crates.sh", "classify-ci-diff.sh", "wasm-fixture-crates.txt"):
+                destination = root / "scripts" / name
+                destination.parent.mkdir(exist_ok=True)
+                shutil.copyfile(repo / "scripts" / name, destination)
+                destination.chmod(0o755)
+            write("bin/cargo", '#!/bin/sh\n[ "$METADATA_FAIL" != 1 ] || exit 1\ncat "$METADATA_FIXTURE"\n')
+            (root / "bin/cargo").chmod(0o755)
+            environment.update(PATH=f"{root / 'bin'}:{os.environ['PATH']}",
+                               METADATA_FIXTURE=str(root / "metadata.json"), METADATA_FAIL="0")
+            members = ("carina-cli", "carina-core", "carina-plugin-sdk", "carina-provider-resolver")
+            write("metadata.json", json.dumps({
+                "workspace_root": str(root), "workspace_members": list(members),
+                "packages": [{"id": name, "name": name, "dependencies": [],
+                              "manifest_path": str(root / name / "Cargo.toml")} for name in members],
+            }))
+            write("carina-cli/src/lib.rs", 'include_str!("../../README.md");\n')
+            write("carina-core/src/lib.rs",
+                  '// Per CLAUDE.md "directory-scoped, never single-file".\n'
+                  'let temporary = "infra/foo";\n'
+                  'let bare_name = "README.md";\n'
+                  'include_str!("../../site/src/content/reference/dsl/types-and-values.md");\n')
+            write("carina-plugin-sdk/src/lib.rs",
+                  'include_str!("../../site/src/content/providers/writing/schemas.md");\n')
+            write("carina-provider-resolver/tests/examples.rs",
+                  'root.join("site/src/content/reference/registry");\n')
+            inputs = {
+                "site/src/content/providers/writing/schemas.md": True,
+                "site/src/content/reference/registry/static-registry.md": True,
+                "site/src/content/reference/dsl/types-and-values.md": True,
+                "site/astro.config.mjs": False,
+                "site/src/content/providers/writing/unreferenced.md": False,
+                "README.md": True,
+                "CLAUDE.md": False,
+                ".claude/skills/x/SKILL.md": False,
+                "docs/a.md": False,
+                "Makefile": False,
+                "LICENSE": False,
+                "unreferenced.md": False,
+                "notes/unexpected.rs": True,  # Preserve the existing path regex.
+            }
+            for filename in inputs:
+                write(filename, "before\n")
+            write("Cargo.toml", '[package]\nname = "example"\nversion = "1.0.0"\n')
+            git("add", ".")
+            git("commit", "-qm", "base")
+            base = git("rev-parse", "HEAD")
+            output = root / ".git/filter-output"
+
+            def filter_changes(event="pull_request", metadata_fail="0"):
+                output.write_text("")
+                result = subprocess.run(
+                    ["bash", "-e", "-o", "pipefail", "-c", program], cwd=root,
+                    env=dict(environment, EVENT_NAME=event, BASE_SHA=base,
+                             HEAD_SHA=git("rev-parse", "HEAD"), GITHUB_OUTPUT=str(output),
+                             METADATA_FAIL=metadata_fail), capture_output=True, text=True, timeout=30,
+                )
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                return dict(line.split("=", 1) for line in output.read_text().splitlines())
+
+            for filename, expected in inputs.items():
+                with self.subTest(filename=filename):
+                    git("reset", "--hard", base)
+                    write(filename, "after\n")
+                    git("add", ".")
+                    git("commit", "-qm", "change")
+                    self.assertEqual(filter_changes(), {"version_only": "false", "code": str(expected).lower()})
+                    if not expected:
+                        self.assertEqual(filter_changes(metadata_fail="1"),
+                                         {"version_only": "false", "code": "true"})
+            git("reset", "--hard", base)
+            write("Cargo.toml", '[package]\nname = "example"\nversion = "1.0.1"\n')
+            git("add", ".")
+            git("commit", "-qm", "version")
+            self.assertEqual(filter_changes(), {"version_only": "true", "code": "true"})
+            for event in ("push", "merge_group"):
+                self.assertEqual(filter_changes(event), {"version_only": "false", "code": "true"})
+
     def commands(self, job, event):
         result = []
         for step in re.split(r"(?m)(?=^      - )", self.jobs[job]):
@@ -133,6 +235,48 @@ class WorkflowConditionTests(unittest.TestCase):
             self.assertNotIn(run, ("|", ">"), "update the test for new multiline run syntax")
             result.append(run)
         return result
+
+    def verify_commands(self, *arguments, scope="--workspace", fail="", missing=(),
+                        installed_targets="wasm32-wasip2"):
+        """Observe the real dispatcher with recording substitutes, never Cargo."""
+        repo = WORKFLOW.parent.parent.parent
+        with tempfile.TemporaryDirectory(prefix="carina-verify-") as temporary:
+            root = Path(temporary)
+            (root / "scripts").mkdir()
+            (root / "bin").mkdir()
+            shutil.copyfile(repo / "scripts/verify.sh", root / "scripts/verify.sh")
+            shutil.copyfile(repo / "scripts/wasm-fixture-crates.txt", root / "scripts/wasm-fixture-crates.txt")
+            # Keep real Rust tools out of these tests, including prerequisite
+            # discovery. Missing-tool cases must not find the host installation.
+            for tool in ("bash", "dirname", "grep"):
+                (root / "bin" / tool).symlink_to(shutil.which(tool))
+            recorder = root / "bin/cargo"
+            if "cargo" not in missing:
+                recorder.write_text('#!/usr/bin/env bash\nprintf "cargo %s\\n" "$*" >> "$TRACE"\n'
+                                    '[[ "$1" != "$FAIL_COMMAND" ]]\n')
+                recorder.chmod(0o755)
+            for tool in ("cargo-nextest", "cargo-hack", "rustup"):
+                if tool in missing:
+                    continue
+                substitute = root / "bin" / tool
+                substitute.write_text('#!/bin/sh\nprintf "%s\\n" "$INSTALLED_TARGETS"\n'
+                                      if tool == "rustup" else '#!/bin/sh\nexit 0\n')
+                substitute.chmod(0o755)
+            (root / "scripts/touched-crates.sh").write_text(
+                'printf "base %s\\n" "$*" >> "$TRACE"\nprintf "%s\\n" "$TOUCHED_SCOPE"\n')
+            for script in (repo / "scripts").glob("*.sh"):
+                name = script.name
+                if name in ("verify.sh", "touched-crates.sh"):
+                    continue
+                (root / "scripts" / name).write_text(
+                    f'printf "{name} %s\\n" "$*" >> "$TRACE"\n')
+            trace = root / "trace"
+            environment = dict(os.environ, PATH=str(root / "bin"), TRACE=str(trace),
+                               TOUCHED_SCOPE=scope, FAIL_COMMAND=fail, INSTALLED_TARGETS=installed_targets)
+            result = subprocess.run(["bash", str(root / "scripts/verify.sh"), *arguments],
+                                    env=environment, capture_output=True, text=True)
+            commands = trace.read_text().splitlines() if trace.exists() else []
+            return result, [command.rstrip() for command in commands]
 
     def test_ci_debug_overrides_are_global_and_shared_by_cache_jobs(self):
         source = WORKFLOW.read_text()
@@ -148,13 +292,24 @@ class WorkflowConditionTests(unittest.TestCase):
         self.assertNotIn("add-rust-environment-hash-key: false", action)
 
     def test_push_only_compiles_test_artifacts(self):
-        build = "cargo build -p carina-provider-mock -p carina-provider-mock-http --target wasm32-wasip2"
-        archive = "cargo nextest archive --workspace --all-features --archive-file nextest-archive.tar.zst --zstd-level 1"
+        build = "scripts/verify.sh wasm-fixtures"
+        archive = "scripts/verify.sh nextest-archive nextest-archive.tar.zst"
         version = "rustc --version | awk '{print \"version=\" $2}' >> \"$GITHUB_OUTPUT\""
-        self.assertEqual(self.commands("test", "push"), [version, build, "cargo nextest run --workspace --all-features --no-run"])
+        self.assertEqual(self.commands("test", "push"), [version, build, "scripts/verify.sh nextest-compile"])
         for event in ("merge_group", "pull_request"):
             self.assertEqual(self.commands("test", event), [version, build, archive])
-        self.assertEqual(self.commands("test-doctests", "pull_request"), ["cargo test --workspace --doc --all-features"])
+        self.assertEqual(self.commands("test-doctests", "pull_request"), ["scripts/verify.sh doctests"])
+        for arguments, expected in [
+            (("wasm-fixtures", "doctests"), [
+                "cargo build -p carina-provider-mock -p carina-provider-mock-http --target wasm32-wasip2",
+                "cargo test --workspace --doc --all-features",
+            ]),
+            (("nextest-compile",), ["cargo nextest run --workspace --all-features --no-run"]),
+        ]:
+            with self.subTest(arguments=arguments):
+                result, commands = self.verify_commands(*arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(commands, expected)
         self.assertNotIn("shared-key:", self.jobs["test"])
         self.assertNotIn("cache-job:", self.jobs["test"])
         for name in AUX_CACHE_JOBS:
@@ -164,7 +319,10 @@ class WorkflowConditionTests(unittest.TestCase):
 
     def test_provider_cause_fetches_before_offline_checks(self):
         self.assertEqual(self.commands("test-provider-cause", "pull_request"),
-                         ["cargo fetch --locked", "bash scripts/check-provider-cause-test-api.sh"])
+                         ["scripts/verify.sh provider-cause"])
+        result, commands = self.verify_commands("provider-cause")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, ["cargo fetch --locked", "check-provider-cause-test-api.sh"])
 
     def test_archive_consumers_install_the_build_rustc_release(self):
         build = self.jobs["test"]
@@ -198,18 +356,44 @@ class WorkflowConditionTests(unittest.TestCase):
         repo = WORKFLOW.parent.parent.parent
         source = (repo / "scripts/test-in-process-isolation.sh").read_text()
         program = source.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
-        assignment = next(node for node in ast.parse(program).body
-                          if isinstance(node, ast.Assign)
-                          and any(isinstance(target, ast.Name) and target.id == "build_args"
-                                  for target in node.targets))
+        selection = next(node for node in ast.parse(program).body
+                         if isinstance(node, ast.If)
+                         and any(isinstance(child, ast.Assign)
+                                 and any(isinstance(target, ast.Name) and target.id == "build_args"
+                                         for target in child.targets)
+                                 for child in ast.walk(node)))
         # Inspect only argument selection. Never execute isolation, Cargo or
         # native test binaries from this workflow self-check.
-        expression = compile(ast.Expression(assignment.value), "isolation build_args", "eval")
-        local = eval(expression, {"sys": SimpleNamespace(argv=["isolation"])})
-        archived = eval(expression, {"sys": SimpleNamespace(argv=["isolation", "fixtures.tar.zst"])})
-        self.assertEqual(local, ["--workspace", "--all-features"])
-        self.assertEqual(archived, ["--archive-file", "fixtures.tar.zst", "--workspace-remap", ".",
-                                    "--extract-to", ".", "--extract-overwrite"])
+        selection_code = compile(ast.Module(body=[selection], type_ignores=[]), "isolation build_args", "exec")
+        for args, expected in [
+            (["--build", "--workspace", "--all-features"], ["--workspace", "--all-features"]),
+            (["fixtures.tar.zst"], ["--archive-file", "fixtures.tar.zst", "--workspace-remap", ".",
+                                    "--extract-to", ".", "--extract-overwrite"]),
+        ]:
+            namespace = {"sys": SimpleNamespace(argv=["isolation", *args])}
+            exec(selection_code, namespace)
+            self.assertEqual(namespace["build_args"], expected)
+        for args in ([], ["--build"], ["--unknown"], ["first.tar.zst", "second.tar.zst"]):
+            with self.subTest(invalid_arguments=args):
+                namespace = {"sys": SimpleNamespace(argv=["isolation", *args], stderr=sys.stderr)}
+                with self.assertRaises(SystemExit) as error:
+                    exec(selection_code, namespace)
+                self.assertEqual(error.exception.code, 2)
+        result, commands = self.verify_commands("--local", "isolation", scope="-p carina-tui")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, ["base", "test-in-process-isolation.sh --build --workspace --all-features"])
+        result, commands = self.verify_commands("--local", "isolation", scope="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, ["base"])
+        self.assertEqual(result.stdout.count("skipped: no touched crates"), 1)
+
+        # Exercise the shell entry point as well: bare --build must fail before
+        # Cargo discovery, even with the Rust tools unavailable.
+        environment = dict(os.environ, CARGO="/nonexistent/carina-cargo")
+        result = subprocess.run(["bash", str(repo / "scripts/test-in-process-isolation.sh"), "--build"],
+                                env=environment, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("usage:", result.stderr)
 
     def test_archive_and_fixtures_are_used_by_every_consumer(self):
         self.assertIn("partition: [1, 2, 3, 4, 5, 6]", self.jobs["test-partition"])
@@ -223,8 +407,335 @@ class WorkflowConditionTests(unittest.TestCase):
             self.assertEqual(self.commands(job, "pull_request")[0], "bash scripts/require-wasm-fixtures.sh")
             self.assertNotIn("cargo build", block)
         command = self.commands("test-partition", "pull_request")[1]
-        self.assertEqual(command, "cargo nextest run --archive-file nextest-archive.tar.zst --workspace-remap . --extract-to . --extract-overwrite --partition count:${{ matrix.partition }}/6 --no-fail-fast")
-        self.assertEqual(self.commands("test-isolation", "pull_request")[1], "scripts/test-in-process-isolation.sh nextest-archive.tar.zst")
+        self.assertEqual(command, "scripts/verify.sh nextest-partition nextest-archive.tar.zst ${{ matrix.partition }}/6")
+        self.assertEqual(self.commands("test-isolation", "pull_request")[1], "scripts/verify.sh isolation nextest-archive.tar.zst")
+        for arguments, expected in [
+            (("nextest-archive", "fixtures.tar.zst"),
+             "cargo nextest archive --workspace --all-features --archive-file fixtures.tar.zst --zstd-level 1"),
+            (("nextest-partition", "fixtures.tar.zst", "2/6"),
+             "cargo nextest run --archive-file fixtures.tar.zst --workspace-remap . --extract-to . --extract-overwrite --partition count:2/6 --no-fail-fast"),
+            (("isolation", "fixtures.tar.zst"), "test-in-process-isolation.sh fixtures.tar.zst"),
+            (("nextest",), "cargo nextest run --workspace --all-features --no-fail-fast"),
+        ]:
+            with self.subTest(arguments=arguments):
+                result, commands = self.verify_commands(*arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(commands, [expected])
+
+    def test_local_only_changes_crate_scope_and_preserves_failures(self):
+        for scope, cargo_scope in [("-p carina-lsp -p carina-cli", "-p carina-lsp -p carina-cli"),
+                                   ("--workspace", "--workspace")]:
+            result, commands = self.verify_commands("--local", "--base", "main", "check", "feature-isolation",
+                                                   "clippy", "nextest", "doctests", scope=scope)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(commands, [
+                "base --base main",
+                f"cargo check {cargo_scope} --all-targets --all-features",
+                f"cargo hack check {cargo_scope} --each-feature --no-dev-deps",
+                f"cargo clippy {cargo_scope} --all-targets --all-features -- -D warnings",
+                f"cargo nextest run {cargo_scope} --all-features --no-fail-fast",
+                f"cargo test {cargo_scope} --doc --all-features",
+            ])
+        result, commands = self.verify_commands("--local", "check", "feature-isolation", "clippy",
+                                               "nextest", "doctests", "isolation", "wasm-fixtures", "fmt", scope="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, ["base", "cargo fmt --all -- --check"])
+        self.assertEqual(result.stdout.count("skipped: no touched crates"), 7)
+        result, commands = self.verify_commands("check", "fmt", "clippy", fail="check")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(len(commands), 3, commands)
+        self.assertIn("check (exit 1)", result.stdout)
+        self.assertIn("=== total:", result.stdout)
+
+    def test_default_local_and_ci_runs_have_identical_check_kinds(self):
+        ci, ci_commands = self.verify_commands()
+        local, local_commands = self.verify_commands("--local", scope="-p carina-cli")
+        self.assertEqual(ci.returncode, 0, ci.stdout + ci.stderr)
+        self.assertEqual(local.returncode, 0, local.stdout + local.stderr)
+        self.assertEqual(local_commands[0], "base")
+        self.assertEqual(local_commands[1:], [
+            command.replace("--workspace", "-p carina-cli") if command.startswith("cargo ") else command
+            for command in ci_commands
+        ])
+        ci_kinds = re.findall(r"^=== ([a-z-]+) ===$", ci.stdout, re.MULTILINE)
+        local_kinds = re.findall(r"^=== ([a-z-]+) ===$", local.stdout, re.MULTILINE)
+        self.assertEqual(ci_kinds, local_kinds)
+        self.assertIn("nextest", ci_kinds)
+        self.assertNotIn("nextest-archive", ci_kinds)
+
+    def test_list_ci_kinds_matches_default_dispatch_without_prerequisites(self):
+        default, _ = self.verify_commands()
+        result, commands = self.verify_commands(
+            "--list-kinds=ci", missing=("cargo", "cargo-nextest", "cargo-hack", "rustup"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, [])
+        self.assertEqual(result.stdout.splitlines(),
+                         re.findall(r"^=== ([a-z-]+) ===$", default.stdout, re.MULTILINE) + [
+            "nextest-compile", "nextest-archive", "nextest-partition", "isolation-with-archive",
+        ])
+
+    def test_ci_mechanics_validate_exact_arguments_before_running_checks(self):
+        for arguments in (
+            ("nextest-compile", "fmt"), ("fmt", "nextest-compile"),
+            ("nextest-archive",), ("nextest-partition",),
+            ("nextest-archive", "fixtures.tar.zst", "fmt"),
+            ("nextest-partition", "fixtures.tar.zst", "2/6", "fmt"),
+            ("fmt", "nextest-archive", "fixtures.tar.zst"),
+            ("isolation", "fixtures.tar.zst", "fmt"),
+            ("fmt", "isolation", "fixtures.tar.zst"),
+            ("nextest-partition", "fixtures.tar.zst"),
+            ("nextest-partition", "fixtures.tar.zst", "0/6"),
+            ("nextest-partition", "fixtures.tar.zst", "2/0"),
+            ("nextest-partition", "fixtures.tar.zst", "wrong"),
+        ):
+            with self.subTest(arguments=arguments):
+                result, commands = self.verify_commands(*arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(commands, [])
+                self.assertIn("verify.sh:", result.stderr)
+        for kind in ("nextest-archive", "nextest-partition", "isolation"):
+            for archive in ("", "-file.tar.zst", "--file.tar.zst", "--build"):
+                arguments = [kind, archive] + (["2/6"] if kind == "nextest-partition" else [])
+                with self.subTest(arguments=arguments):
+                    result, commands = self.verify_commands(*arguments)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(commands, [])
+        # Kind names cannot be archive filenames. With isolation they remain
+        # ordinary kind names, so "isolation fmt" is still a valid combination.
+        for kind in ("nextest-archive", "nextest-partition"):
+            for archive in ("fmt", "isolation", "nextest-compile"):
+                arguments = [kind, archive] + (["2/6"] if kind == "nextest-partition" else [])
+                with self.subTest(arguments=arguments):
+                    result, commands = self.verify_commands(*arguments)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(commands, [])
+        result, commands = self.verify_commands("isolation", "fmt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, ["test-in-process-isolation.sh --build --workspace --all-features",
+                                    "cargo fmt --all -- --check"])
+
+    def test_missing_prerequisites_fail_before_any_selected_check(self):
+        for arguments, missing in [
+            (("fmt",), "cargo"),
+            (("fmt", "feature-isolation"), "cargo-hack"),
+            (("fmt", "nextest"), "cargo-nextest"),
+            (("nextest-compile",), "cargo-nextest"),
+            (("nextest-archive", "fixtures.tar.zst"), "cargo-nextest"),
+            (("nextest-partition", "fixtures.tar.zst", "1/6"), "cargo-nextest"),
+            (("isolation", "fixtures.tar.zst"), "cargo-nextest"),
+            (("isolation",), "cargo-nextest"),
+            (("wasm-fixtures",), "rustup"),
+            (("provider-cause",), "rustup"),
+        ]:
+            with self.subTest(arguments=arguments, missing=missing):
+                result, commands = self.verify_commands(*arguments, missing=(missing,))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(commands, [])
+                self.assertIn(f"requires {missing} on PATH", result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+        for kind in ("wasm-fixtures", "provider-cause"):
+            with self.subTest(missing_target=kind):
+                result, commands = self.verify_commands("fmt", kind, installed_targets="")
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(commands, [])
+                self.assertIn("requires the wasm32-wasip2 target", result.stderr)
+                self.assertEqual(len(result.stderr.splitlines()), 1)
+
+    def test_prerequisites_are_only_required_for_checks_that_will_run(self):
+        missing = ("cargo-nextest", "cargo-hack", "rustup")
+        result, commands = self.verify_commands("fmt", missing=missing)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, ["cargo fmt --all -- --check"])
+        result, commands = self.verify_commands("--local", "check", "feature-isolation", "clippy",
+                                               "nextest", "doctests", "isolation", "wasm-fixtures",
+                                               scope="", missing=(*missing, "cargo"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(commands, ["base"])
+        self.assertEqual(result.stdout.count("skipped: no touched crates"), 7)
+
+    def test_verify_guard_rejects_synthetic_workflow_and_script_drift(self):
+        repo = WORKFLOW.parent.parent.parent
+        guard = repo / "scripts/test-verify-sh.sh"
+        with tempfile.TemporaryDirectory(prefix="carina-verify-drift-") as temporary:
+            root = Path(temporary)
+            workflow = root / ".github/workflows/ci.yml"
+            workflow.parent.mkdir(parents=True)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            shutil.copyfile(repo / "scripts/verify.sh", scripts / "verify.sh")
+            shutil.copyfile(repo / "scripts/wasm-fixture-crates.txt", scripts / "wasm-fixture-crates.txt")
+            for script in (repo / "scripts").glob("*.sh"):
+                if script.name != "verify.sh":
+                    (scripts / script.name).touch()
+
+            def audit(source):
+                workflow.write_text(source)
+                return subprocess.run(["bash", str(guard), str(root)], capture_output=True, text=True)
+
+            original = WORKFLOW.read_text()
+            self.assertEqual(audit(original).returncode, 0)
+            for style in ("|", ">-"):
+                command = "scripts/verify.sh fmt"
+                source = original.replace("run: scripts/verify.sh fmt\n",
+                                          f"run: {style}\n          {command}\n", 1)
+                self.assertEqual(audit(source).returncode, 0)
+            for command in (
+                "cargo check --all-features",
+                "cargo-nextest run --workspace",
+                "cargo-hack check --each-feature",
+                '\"$CARGO\" check --workspace',
+                "${CARGO} check --workspace",
+                '\"${CARGO}\" check --workspace',
+                "bash scripts/check-plan-fixtures.sh",
+                "bash scripts/test-check-docs-spellings.sh",
+                "bash scripts/validate-crn-files.sh",
+                "python3 scripts/check-synthetic.py",
+                "scripts/check-synthetic",
+                "bash scripts/nested/check-synthetic.bash",
+                'scripts/touched-crates.sh --base "$BASE_SHA"',
+                "scripts/verify.sh check || true",
+                "true || scripts/verify.sh check",
+                "|\n          scripts/verify.sh check\n          env CARGO_BUILD_JOBS=2 cargo check",
+                ">-\n          cargo\n          nextest run --workspace",
+            ):
+                with self.subTest(command=command):
+                    result = audit(original.replace("run: scripts/verify.sh check\n", f"run: {command}\n", 1))
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn("bypasses verify.sh", result.stderr)
+            workflow.write_text(original)
+            # Audit other workflows and composite actions, including scripts
+            # whose names do not use the check-/test- convention.
+            for path in (root / ".github/workflows/extra.yml",
+                         root / ".github/actions/nested/fixture/action.yml"):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                for command in ("cargo check", "cargo-nextest run", '\"$CARGO\" check',
+                                "bash scripts/validate-crn-files.sh", "python3 scripts/check-synthetic.py",
+                                "scripts/check-synthetic"):
+                    with self.subTest(path=path, command=command):
+                        path.write_text("runs:\n  using: composite\n  steps:\n"
+                                        f"    - shell: bash\n      run: {command}\n")
+                        result = audit(original)
+                        self.assertEqual(result.returncode, 1, result.stdout)
+                        self.assertIn("bypasses verify.sh", result.stderr)
+                        self.assertIn(str(path.relative_to(root)), result.stderr)
+                path.unlink()
+            # Setup exceptions allow only the setup command, not an arbitrary
+            # check added beside it or elsewhere in the same job/action.
+            for job, allowed in (("changes", "bash scripts/classify-ci-diff.sh a b"),
+                                 ("changes", 'scripts/touched-crates.sh --base "$BASE_SHA"'),
+                                 ("test-partition", "bash scripts/require-wasm-fixtures.sh"),
+                                 ("binary-build", "cargo build --release --bin carina")):
+                block = self.jobs[job]
+                source = original.replace(block, block + f"      - run: {allowed}\n", 1)
+                self.assertEqual(audit(source).returncode, 0)
+                result = audit(source.replace(f"run: {allowed}\n",
+                                             f"run: {allowed} && bash scripts/validate-crn-files.sh\n", 1))
+                self.assertEqual(result.returncode, 1, result.stdout)
+                self.assertIn("bypasses verify.sh", result.stderr)
+
+            # Every declared kind must retain its CI execution, including
+            # partitioned nextest and archive mechanics.
+            kinds = subprocess.check_output(["bash", str(scripts / "verify.sh"), "--list-kinds=ci"],
+                                            text=True).splitlines()
+            for kind in kinds:
+                ci_kind = {"nextest": "nextest-partition", "isolation-with-archive": "isolation"}.get(kind, kind)
+                source, removed = re.subn(
+                    r"(?m)^([ \t]*(?:- )?run: )scripts/verify\.sh " + re.escape(ci_kind) + r"(?: [^\n]*)?\n",
+                    r"\1echo omitted\n", original)
+                self.assertGreater(removed, 0, kind)
+                with self.subTest(missing_ci_kind=kind):
+                    result = audit(source)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(f"kind {kind} is not run by ci.yml", result.stderr)
+            for mention in ("echo omitted # scripts/verify.sh fmt", "echo 'scripts/verify.sh fmt'",
+                            "|\n          scripts/verify.sh check\n          fmt"):
+                source = original.replace("run: scripts/verify.sh fmt\n", f"run: {mention}\n", 1)
+                with self.subTest(mention=mention):
+                    result = audit(source)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn("kind fmt is not run by ci.yml", result.stderr)
+            source = original.replace("scripts/verify.sh isolation nextest-archive.tar.zst",
+                                      "scripts/verify.sh isolation")
+            result = audit(source)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("kind isolation-with-archive is not run by ci.yml", result.stderr)
+
+            dispatcher = scripts / "verify.sh"
+            original_dispatcher = dispatcher.read_text()
+            dispatcher.write_text(original_dispatcher.replace("default_kinds=(\n",
+                                                            "default_kinds=(\n    synthetic-kind\n", 1))
+            result = audit(original)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("kind synthetic-kind is not run by ci.yml", result.stderr)
+            dispatcher.write_text(original_dispatcher)
+            dispatcher.write_text(original_dispatcher.replace("mechanic_kinds=(",
+                                                            "mechanic_kinds=(synthetic-mechanic ", 1))
+            result = audit(original)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("kind synthetic-mechanic is not run by ci.yml", result.stderr)
+            dispatcher.write_text(original_dispatcher)
+
+            for filename in ("check-synthetic.sh", "test-check-synthetic.sh", "test-synthetic.sh"):
+                with self.subTest(filename=filename):
+                    added = scripts / filename
+                    added.touch()
+                    result = audit(original)
+                    self.assertEqual(result.returncode, 1, result.stdout)
+                    self.assertIn(f"{filename} is not run by verify.sh", result.stderr)
+                    added.unlink()
+            (scripts / "verify.sh").write_text((scripts / "verify.sh").read_text().replace(
+                "            bash scripts/test-touched-crates.sh\n", ""))
+            result = audit(original)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("test-touched-crates.sh is not run by verify.sh", result.stderr)
+
+    def test_touched_crates_includes_uncommitted_changes(self):
+        helper = WORKFLOW.parent.parent.parent / "scripts/touched-crates.sh"
+        with tempfile.TemporaryDirectory(prefix="carina-touched-crates-") as temporary:
+            root = Path(temporary)
+            # Metadata is a recording fixture: this test still exercises real
+            # Git diffs, but never invokes Cargo on the host.
+            binary = root / "bin/cargo"
+            binary.parent.mkdir()
+            metadata = root / "metadata.json"
+            metadata.write_text(json.dumps({
+                "workspace_root": str(root), "workspace_members": ["cli", "core"],
+                "packages": [
+                    {"id": "cli", "name": "carina-cli", "dependencies": [],
+                     "manifest_path": str(root / "carina-cli/Cargo.toml")},
+                    {"id": "core", "name": "carina-core", "dependencies": [],
+                     "manifest_path": str(root / "carina-core/Cargo.toml")},
+                ],
+            }))
+            binary.write_text('#!/bin/sh\ncat "$TOUCHED_METADATA"\n')
+            binary.chmod(0o755)
+            environment = dict(os.environ, PATH=f"{binary.parent}:{os.environ['PATH']}",
+                               TOUCHED_METADATA=str(metadata))
+
+            def git(*args):
+                subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+
+            git("init", "--quiet")
+            tracked = root / "carina-cli/src/lib.rs"
+            tracked.parent.mkdir(parents=True)
+            tracked.write_text("// initial\n")
+            git("add", ".")
+            git("-c", "user.name=Verify Test", "-c", "user.email=verify@example.invalid",
+                "commit", "--quiet", "-m", "Fixture baseline")
+
+            def scope():
+                return subprocess.check_output(["bash", str(helper), "--base", "HEAD"],
+                                               cwd=root, env=environment, text=True).strip()
+
+            self.assertEqual(scope(), "")
+            tracked.write_text("// unstaged\n")
+            self.assertEqual(scope(), "-p carina-cli")
+            git("add", ".")
+            self.assertEqual(scope(), "-p carina-cli")
+            untracked = root / "carina-core/src/untracked.rs"
+            untracked.parent.mkdir(parents=True)
+            untracked.touch()
+            self.assertEqual(scope(), "--workspace")
 
     def test_only_the_aggregate_is_named_test(self):
         self.assertEqual({job for job, block in self.jobs.items() if field(block, "name") == "Test"}, {"test-result"})

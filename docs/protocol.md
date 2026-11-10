@@ -129,7 +129,10 @@ failure returns a typed credentials error. Later changes through AWS config APIs
 remain under caller control; the SDK exposes neither paired component alone.
 
 `CARINA_WASI_HTTP_TRACE=1` is a host-only option and is never forwarded to guests.
-The SDK emits one completed typed HTTP event per request, including early failures.
+Each request the transport accepts emits one completed typed HTTP event,
+including early transport failures. A body rejected by `TryFrom<&SdkBody>` is
+returned to the SDK as a user `ConnectorError` with `UnbufferedRequestBody` as its
+source, without an HTTP event.
 The default sink admits Debug/Trace only with that option; Error/Warn/Info remain
 visible. Native calls and WASM exports share per-call event budgets, separate trace
 quotas and a fixed host-authored suppression notice. Only the first panic per call

@@ -277,9 +277,9 @@ example-based tests already provide sufficient coverage.
 
 Tests run under nextest (`cargo nextest run`, install once with
 `cargo install cargo-nextest --locked`; version 0.9.133 or newer, which
-`.config/nextest.toml` requires). Two things nextest does *not*
-give you: doctests need a separate `cargo test --workspace --doc` before
-opening a PR, and it is process-per-test.
+`.config/nextest.toml` requires). Nextest does not run doctests and uses one
+process per test. `scripts/verify.sh` also runs doctests and checks in-process
+isolation.
 
 Run tests through nextest, not plain `cargo test`. The setup script in
 `.config/nextest.toml` points `HOME`, `TMPDIR` and `CARINA_*` at a per-run
@@ -311,105 +311,74 @@ cargo run -- plan
 aws-vault exec <profile> -- cargo run -- plan
 ```
 
-## Verify Protocol — Do Not Run Redundant Builds
+## Verify Protocol
 
-The verify cycle is the slowest thing about working on this repo. The
-single biggest waste is running `cargo build` immediately before
-`cargo test`: the test step compiles the same artifacts the build step
-just produced.
+`scripts/verify.sh` requires Bash 4.4 or newer and needs cargo-nextest,
+cargo-hack, and the `wasm32-wasip2` target (`rustup target add wasm32-wasip2`)
+for its full check set. When selecting kinds, only their required tools are
+checked before execution.
 
-**Rules:**
+`--local` has a known limit: a `-p` scope resolves dependency features only for
+the selected packages, so feature unification can differ from CI's `--workspace`
+run. When in doubt, run `scripts/verify.sh` without `--local`.
 
-- **Do not run `cargo build`** as a separate verification step.
-  `cargo nextest run` (or `cargo test`) already compiles everything it needs.
-- For a faster compile-only sanity check during iteration, use
-  `cargo check -p <crate>` (skips linking, ~30–50% faster than `cargo build`).
-- The only legitimate use of `cargo build` in the verify cycle is
-  `cargo build --release` immediately before opening a PR, to catch
-  release-only issues that debug builds miss. Skip it for refactors,
-  bug fixes, or anything that has not changed `Cargo.toml` / unsafe code /
-  the `release` profile config.
+1. Run `scripts/verify.sh --local` before `gh pr create` and before pushing
+   follow-up commits to an open PR. It runs the same check definitions and
+   feature flags as CI; only crate scope comes from `scripts/touched-crates.sh`.
+   Local scope includes touched crates and their transitive reverse dependents
+   in the workspace, including dependents through dev and build dependencies.
+   Use `--base <ref>` to override the helper's default base of `origin/main`.
+2. PR CI must be green before merge.
 
-**Verify cycle order** (from #2289 / #2291):
+CI keeps its parallel jobs by selecting kinds from `scripts/verify.sh`.
+The archive job builds the WASM mock fixtures and host test archive once;
+partitions and in-process isolation consume those artifacts. Provider-cause
+API checks and doctests run in separate jobs, and the required `Test` job
+aggregates their results. On main pushes, the archive job compiles tests to
+warm its cache. Local verify builds the same WASM fixtures before its tests.
 
-```bash
-# 1. Compile-only sanity (crate-scoped during iteration)
-cargo check -p <crate>
+## While Working
 
-# 2. Tests, scoped to what changed (see touched-crates.sh below)
-SCOPE=$(scripts/touched-crates.sh)
-if [[ -n "$SCOPE" ]]; then
-    cargo nextest run $SCOPE
-fi
-
-# 3. Doctests (cheap; nextest does not run them)
-cargo test --workspace --doc
-
-# 4. Lints
-cargo clippy --workspace --all-targets -- -D warnings
-
-# 5. Repo invariants
-bash scripts/check-*.sh
-```
-
-Broaden step 2 to `cargo nextest run --workspace` only when the change
-spans crates. Steps 3–5 stay workspace-scoped: they are fast and catch
-cross-crate doctest references, workspace-level lint config, and repo-wide
-invariants that a crate-scoped run misses. The `cargo test --doc` step is
-cheap once nextest has compiled the crates — public API doctests in
-`carina-core/src/utils.rs` and elsewhere are not covered by nextest, so
-always run it before declaring verify done.
-
-> CI's archive build job runs `cargo build -p carina-provider-mock -p
-> carina-provider-mock-http --target wasm32-wasip2` and archives the host test
-> binaries. These target different platforms: the WASM build produces fixtures
-> loaded by `carina-plugin-host` integration tests, including the wasi:http guest
-> used by send-phase tests (carina#4057). Partitions and the separate isolation
-> job download both artifacts; provider-cause checks and doctests run in their
-> own jobs, and the required `Test` job aggregates the results. On main pushes,
-> the archive build job only compiles to warm its cache. Do not generalize the
-> fixture build to local builds.
-
-## Incremental Build Strategy
-
-When working on a specific crate, use crate-specific commands to avoid
-unnecessary compilation:
-
-- After modifying a single crate, test only that crate with
-  `cargo nextest run -p <crate-name>`. Do **not** run
-  `cargo build -p <crate-name>` first — the test command does the build.
-- Use full workspace `cargo nextest run` only when changes affect multiple
-  crates or before creating a PR; follow it with `cargo test --workspace --doc`.
-- For the fastest iteration loop, `cargo check -p <crate-name>` skips linking.
-- Provider crates (aws, awscc) are in separate repositories — changes here
-  may require updating those repos.
+Use `cargo check -p <crate>` for a quick compile-only check and
+`cargo nextest run -p <crate>` for tests during iteration. Nextest already
+compiles its test binaries, so a separate `cargo build` is unnecessary.
+`scripts/touched-crates.sh` can select crate scope for these iteration runs.
+Provider crates (aws, awscc) are in separate repositories; changes here may
+require updating those repos.
 
 ### Crate-Scoped Verify Helper
 
-`scripts/touched-crates.sh` maps changed files to the cargo `-p <crate>`
-flags that exercise them, so iteration verify can stay crate-scoped:
+`scripts/touched-crates.sh` maps changed files, including uncommitted changes,
+to cargo `-p <crate>` flags for touched crates and their transitive reverse
+dependents. It derives workspace membership and dependency paths from Cargo
+metadata, including all dependency kinds:
 
 ```bash
 # What crates does the current branch touch (vs origin/main)?
 scripts/touched-crates.sh
-# → "-p carina-core -p carina-cli"   (or "--workspace", or empty)
+# → "-p carina-cli -p carina-tui"   (or "--workspace", or empty)
 
-cargo nextest run $(scripts/touched-crates.sh)   # run only touched crates
+scripts/verify.sh --local                      # shared checks with local crate scope
 scripts/touched-crates.sh --base main            # diff against a specific base
 git diff --name-only | scripts/touched-crates.sh --stdin   # custom file list
 ```
 
 | Output           | Meaning                                                   |
 | ---------------- | --------------------------------------------------------- |
-| `-p <crate> ...` | Run only those crates' tests; transitive consumers are not invalidated. |
-| `--workspace`    | Cross-cutting change (touched `carina-core`, root `Cargo.toml`/`Cargo.lock`, or an unrecognized path). Sweep the whole workspace. |
-| (empty)          | No test-relevant files changed (only docs / CI / scripts / infra). Skip the test step. |
+| `-p <crate> ...` | Run touched crates and their transitive reverse dependents. Otherwise ignored files gain an owner only through a path string literal containing `/` outside comments in tracked Rust sources, resolving to the tracked file or a tracked ancestor directory relative to the source directory, crate root, or repo root. |
+| `--workspace`    | Cross-cutting change (core changes or ownership, manifests, WASM fixture crates, Cargo execution scripts/configuration, CI/local actions, or an unrecognized path), or the dependency closure covers every member. Sweep the whole workspace. |
+| (empty)          | Only ignored paths without an owner changed (any-depth Markdown, site/notes/infra/examples, static-check scripts, non-CI GitHub files, Makefile/LICENSE, release configuration, packaging/assets/editors/docs). `verify.sh --local` skips only crate-scoped kinds; static kinds still run. |
 
-The helper is intentionally pessimistic. Two "fall back to `--workspace`"
-rules: **(1) `carina-core` touched** — every other crate depends on it, so
-testing only `carina-core` would miss downstream regressions; **(2) unknown
-path** — a new top-level directory or unclassified file is treated as
-workspace-wide until the helper learns about it.
+The helper is intentionally pessimistic. Changes to `carina-core`, manifests,
+WASM fixture crates, or Cargo execution configuration require the full
+workspace. Artifact consumers have no Cargo dependency edge to the fixture
+crates listed in `scripts/wasm-fixture-crates.txt`. A new top-level directory or
+unclassified file also requires the full workspace until the helper learns
+about it.
+
+A `cargo metadata` failure emits a warning and deliberately widens to
+`--workspace` to avoid missing tests. A git failure is an error because the
+helper cannot determine which files changed.
 
 ## Plan Display Testing
 
@@ -797,10 +766,18 @@ A struct type represents a nested object with typed fields.
   error with its source chain. Direct WASI AWS
   client constructors remain private. This guarantees paired installation on
   that builder; later changes through AWS APIs remain under caller control.
+  The synchronous WASI HTTP transport accepts only fully buffered request
+  bodies and carries `RequestBody::Empty` / `Sized` through to explicit
+  `Content-Length` framing. `TryFrom<&SdkBody>` rejects streaming or taken
+  bodies with `UnbufferedRequestBody`, retained as the source of a non-retryable
+  `ConnectorError::user` before sending. It never polls or buffers a stream.
+  The generic HTTP path classifies its owned `Vec<u8>` infallibly.
   Per-request headers and query fields use the existing
   structural HTTP trace masking, followed by the session `RedactionSet`. Each
-  request emits one completed HTTP event, including early failures; signing
-  material and ordinary query values never enter the long-lived inventory.
+  request the transport accepts emits one completed HTTP event, including early
+  transport failures. A body rejected by `TryFrom<&SdkBody>` is returned to the
+  SDK as a user error without an HTTP event. Signing material and ordinary query
+  values never enter the long-lived inventory.
   Core owns all diagnostic budgets. Count/rate windows reset per WASM export
   and native dispatch through the same core call scope,
   with separate quotas for Error/Warn/Info and Debug/Trace. Only the first panic
@@ -1074,10 +1051,9 @@ High-value patterns in this repo:
 
 Constraints specific to this repo:
 
-- A workflow does NOT relax any gate. Each agent still runs the
-  crate-scoped verify cycle (`cargo check -p` → `cargo nextest run` →
-  doctests → clippy → `scripts/check-*.sh`), and findings still need a
-  reproducing test before a fix lands.
+- A workflow does NOT relax any gate. Each agent still runs
+  `scripts/verify.sh --local` as described in the Verify Protocol. Findings
+  still need a reproducing test before a fix lands.
 - Agents that mutate files in parallel must use `isolation: 'worktree'`
   to avoid clobbering each other; read-only finders do not need it.
 - Have agents return structured output (the `schema` option) rather
