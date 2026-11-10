@@ -1756,10 +1756,20 @@ impl<'a> OpaqueFrame<'a> {
                 | crate::schema::ValidationDiagnostic::HiddenChild { child, .. } => {
                     cause_retryability(*child)
                 }
-                crate::schema::ValidationDiagnostic::Alternatives(_)
-                | crate::schema::ValidationDiagnostic::Plain(_) => Retryability::Unclassified,
+                crate::schema::ValidationDiagnostic::Alternatives(arms) => {
+                    Self::Alternatives(arms).retryability()
+                }
+                crate::schema::ValidationDiagnostic::Plain(_) => Retryability::Unclassified,
             },
-            Self::Alternatives(_) => Retryability::Unclassified,
+            Self::Alternatives(arms) => {
+                let mut classes = arms.iter().map(|arm| cause_retryability(arm));
+                let first = classes.next().unwrap_or(Retryability::Unclassified);
+                if classes.all(|class| class == first) {
+                    first
+                } else {
+                    Retryability::Unclassified
+                }
+            }
             Self::Dispatch(error) => match error {
                 crate::provider::CustomTypeDispatchError::Validation(category) => {
                     cause_retryability(category.as_ref())

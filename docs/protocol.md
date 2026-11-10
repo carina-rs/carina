@@ -31,8 +31,8 @@ providers may explicitly replace it with `with_retryability`, including
 `Unclassified`. The nearest Carina error that authors a verdict in the cause
 chain decides the class; an explicit `Unclassified` is final. Foreign frames
 and Carina pass-through wrappers are skipped. Structural validation wrappers
-inherit from their child; validation alternatives are `Unclassified` because
-their verdict is ambiguous.
+inherit from their child; validation alternatives keep a class only when every
+arm agrees, otherwise they are `Unclassified`.
 
 Reference errors now have only `AccessDenied` and `InvalidReference` variants
 (WIT: `access-denied` and `invalid-reference`). The `Transient` reference-error
