@@ -1892,3 +1892,32 @@ fn explicit_full_pattern_mode_proves_a_whole_value_character_class() {
         );
     }
 }
+
+#[test]
+fn rule_input_estimator_intersects_both_string_layers() {
+    use crate::schema::{PatternMatch, PatternSpec, StringIdentityLayer, StringMemberConstraints};
+    let ty = AttributeType::string_member(
+        StringIdentityLayer::new(
+            Some(crate::schema::TypeIdentity::bare("Name")),
+            Some(PatternSpec::new("[a-z0-9]{1,20}", PatternMatch::Full)),
+            Some((Some(1), Some(100))),
+            None,
+        ),
+        StringMemberConstraints::new(
+            Some(PatternSpec::new("[m-z]{2,8}", PatternMatch::Full)),
+            Some((Some(3), Some(5))),
+        ),
+    );
+    for predicate in [
+        InputPredicate::Length {
+            min: Some(3),
+            max: Some(5),
+        },
+        InputPredicate::AllowedChars(CharSet::new([('m', 'z')]).unwrap()),
+    ] {
+        assert_eq!(
+            outcome(typed_estimate(predicate, reference(), ty.clone())),
+            "proven"
+        );
+    }
+}

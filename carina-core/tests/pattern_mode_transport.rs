@@ -7,14 +7,17 @@ use carina_provider_protocol::types as protocol;
 #[test]
 fn nested_custom_precedence_preserves_the_complete_mode_and_reason() {
     let terminal = protocol::AttributeType::String {
-        pattern: Some(protocol::PatternSpec::new(
-            "base",
-            protocol::PatternMatch::Full,
-        )),
-        length: None,
-        validate: None,
-        to_dsl: None,
-        identity: None,
+        identity_layer: protocol::StringIdentityLayer {
+            pattern: Some(protocol::PatternSpec::new(
+                "base",
+                protocol::PatternMatch::Full,
+            )),
+            length: None,
+            validate: None,
+            to_dsl: None,
+            identity: None,
+        },
+        member_layer: Default::default(),
     };
     let middle = protocol::AttributeType::Custom {
         name: "ignored.Middle".into(),
@@ -63,11 +66,15 @@ fn nested_custom_precedence_preserves_the_complete_mode_and_reason() {
         let schema =
             protocol_to_config_schema(BTreeMap::from([("value".into(), decoded)])).unwrap();
         let RawShape::String {
-            identity,
-            pattern,
-            length: _length,
-            validate: _validate,
-            to_dsl: _to_dsl,
+            identity_layer:
+                carina_core::schema::StringIdentityParts {
+                    identity,
+                    pattern,
+                    length: _length,
+                    validate: _validate,
+                    to_dsl: _to_dsl,
+                },
+            member_layer: _,
         } = schema.parts()["value"].raw_shape()
         else {
             panic!("String refinement");
@@ -88,7 +95,7 @@ fn valid_outer_custom_spec_cannot_admit_an_incomplete_inner_pattern() {
         let wire = serde_json::json!({
             "type":"custom", "name":"test.Outer",
             "pattern":{"regex":"abc","mode":{"kind":"full"}},
-            "base":{"type":"custom","name":"ignored.Middle", "base":{"type":"String","pattern":inner}}
+            "base":{"type":"custom","name":"ignored.Middle", "base":{"type":"String", "identity_layer": {"pattern":inner}, "member_layer": {}}}
         });
         assert!(serde_json::from_value::<protocol::AttributeType>(wire).is_err());
     }

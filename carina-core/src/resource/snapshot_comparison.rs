@@ -941,7 +941,11 @@ fn append_schema_pairing_hashes<R: ReferenceEquality>(
             hashes.push(pairing_component_hash(0x09, &0_u8));
         }
         Shape::String {
-            identity, to_dsl, ..
+            identity_layer:
+                crate::schema::StringIdentityParts {
+                    identity, to_dsl, ..
+                },
+            ..
         } => {
             if let Value::Concrete(ConcreteValue::String(text)) = value {
                 hashes.push(pairing_component_hash(

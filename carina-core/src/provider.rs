@@ -8275,8 +8275,14 @@ pub fn identified_custom_type_identity(attribute_type: &AttributeType) -> Option
     match attribute_type.raw_shape() {
         RawShape::UnloadedSchemaType(unloaded) => Some(unloaded.identity()),
         RawShape::Reference { .. } => None,
-        RawShape::String { identity, .. }
-        | RawShape::Int { identity, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { identity, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { identity, .. },
+            ..
+        }
         | RawShape::Float { identity, .. } => identity,
         RawShape::Enum { identity, .. } => Some(identity),
         RawShape::Bool
@@ -8303,17 +8309,31 @@ pub fn identified_custom_type_scalar_kind(
             length: _length,
         } => Some(RefinedScalarKind::String),
         RawShape::String {
-            identity: Some(_), ..
+            identity_layer:
+                crate::schema::StringIdentityParts {
+                    identity: Some(_), ..
+                },
+            ..
         } => Some(RefinedScalarKind::String),
         RawShape::Int {
-            identity: Some(_), ..
+            identity_layer:
+                crate::schema::IntIdentityParts {
+                    identity: Some(_), ..
+                },
+            ..
         } => Some(RefinedScalarKind::Int),
         RawShape::Float {
             identity: Some(_), ..
         } => Some(RefinedScalarKind::Float),
         RawShape::Enum { base, .. } => scalar_kind_from_base(base),
-        RawShape::String { identity: None, .. }
-        | RawShape::Int { identity: None, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { identity: None, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { identity: None, .. },
+            ..
+        }
         | RawShape::Float { identity: None, .. }
         | RawShape::Bool
         | RawShape::Duration
@@ -8391,29 +8411,41 @@ pub(crate) fn canonicalize_custom_type_value(
         }
         (
             RawShape::String {
-                identity: _,
-                pattern: _,
-                length: _,
-                validate: _,
-                to_dsl: _,
+                identity_layer:
+                    crate::schema::StringIdentityParts {
+                        identity: _,
+                        pattern: _,
+                        length: _,
+                        validate: _,
+                        to_dsl: _,
+                    },
+                member_layer: _,
             },
             Value::Concrete(ConcreteValue::String(value)),
         ) => Ok(Some(CanonicalCustomTypeValue::from_literal_string(value))),
         (
             RawShape::String {
-                identity: _,
-                pattern: _,
-                length: _,
-                validate: _,
-                to_dsl: _,
+                identity_layer:
+                    crate::schema::StringIdentityParts {
+                        identity: _,
+                        pattern: _,
+                        length: _,
+                        validate: _,
+                        to_dsl: _,
+                    },
+                member_layer: _,
             },
             Value::Concrete(ConcreteValue::EnumIdentifier(raw)),
         ) => Ok(Some(CanonicalCustomTypeValue(raw.as_str().to_string()))),
         (
             RawShape::Int {
-                identity: _,
-                range: _,
-                validate: _,
+                identity_layer:
+                    crate::schema::IntIdentityParts {
+                        identity: _,
+                        range: _,
+                        validate: _,
+                    },
+                member_layer: _,
             },
             Value::Concrete(ConcreteValue::Int(value)),
         ) => Ok(Some(CanonicalCustomTypeValue(value.to_string()))),
@@ -8879,10 +8911,18 @@ fn collect_type_names_from_type(
             names.insert(identity.clone());
         }
         RawShape::String {
-            identity: Some(id), ..
+            identity_layer:
+                crate::schema::StringIdentityParts {
+                    identity: Some(id), ..
+                },
+            ..
         }
         | RawShape::Int {
-            identity: Some(id), ..
+            identity_layer:
+                crate::schema::IntIdentityParts {
+                    identity: Some(id), ..
+                },
+            ..
         }
         | RawShape::Float {
             identity: Some(id), ..
@@ -8897,8 +8937,14 @@ fn collect_type_names_from_type(
         } => {
             names.insert(id.clone());
         }
-        RawShape::String { identity: None, .. }
-        | RawShape::Int { identity: None, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { identity: None, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { identity: None, .. },
+            ..
+        }
         | RawShape::Float { identity: None, .. } => {}
         RawShape::List {
             element_type: inner,
@@ -8941,8 +8987,14 @@ fn local_custom_validator(
             pattern: _pattern,
             length: _length,
         } => None,
-        RawShape::String { validate, .. }
-        | RawShape::Int { validate, .. }
+        RawShape::String {
+            identity_layer: crate::schema::StringIdentityParts { validate, .. },
+            ..
+        }
+        | RawShape::Int {
+            identity_layer: crate::schema::IntIdentityParts { validate, .. },
+            ..
+        }
         | RawShape::Float { validate, .. }
         | RawShape::Enum { validate, .. } => validate,
         RawShape::Bool
@@ -9354,6 +9406,10 @@ fn enum_definition_signature(attribute_type: &AttributeType) -> Option<EnumDefin
 struct OwnerCustomTypeIndex {
     factory_index: usize,
     declarations: BTreeMap<TypeIdentity, Vec<AttributeType>>,
+    identity_declarations: BTreeMap<
+        TypeIdentity,
+        Result<crate::parser::ResolvedSchemaType, crate::parser::CustomTypeValidationError>,
+    >,
 }
 
 struct ProviderFactorySchemaSnapshot {
@@ -9459,8 +9515,7 @@ where
                 declarations_by_identity
                     .entry((identity.clone(), owned.scalar_kind()))
                     .and_modify(|existing| {
-                        *existing =
-                            existing.with_merged_owners(existing.owners().union(owned.owners()));
+                        *existing = existing.conjoin(&owned);
                     })
                     .or_insert(owned);
             }
@@ -9513,21 +9568,20 @@ where
                 owner: owner.clone(),
                 identity: owned.identity().clone(),
             };
-            let declarations = self
+            let declaration = self
                 .index
                 .get(owner)
-                .and_then(|index| index.declarations.get(owned.identity()))
-                .filter(|declarations| !declarations.is_empty())
-                .ok_or_else(missing)?;
-            for declaration in declarations {
-                let declaration = ResolvedSchemaType::from_schema_declaration(owner, declaration)
-                    .filter(|declaration| declaration.scalar_kind() == owned.scalar_kind())
-                    .ok_or_else(missing)?;
-                resolved = Some(match resolved {
-                    Some(existing) => existing.conjoin(&declaration),
-                    None => declaration,
-                });
+                .and_then(|index| index.identity_declarations.get(owned.identity()))
+                .ok_or_else(missing)?
+                .as_ref()
+                .map_err(Clone::clone)?;
+            if declaration.scalar_kind() != owned.scalar_kind() {
+                return Err(missing());
             }
+            resolved = Some(match resolved {
+                Some(existing) => existing.conjoin(declaration),
+                None => declaration.clone(),
+            });
         }
         Ok(resolved
             .expect("nonempty owners and declarations")
@@ -9553,7 +9607,13 @@ where
                             identity: owned.identity().clone(),
                         }
                     })?;
-                Ok((owner.to_string(), declarations.clone()))
+                Ok((
+                    owner.to_string(),
+                    declarations
+                        .iter()
+                        .map(AttributeType::identity_only_declaration)
+                        .collect(),
+                ))
             })
             .collect()
     }
@@ -9663,11 +9723,43 @@ fn build_owner_custom_type_index(
             for (identity, declaration) in factory.witness.identified_declarations() {
                 declarations.entry(identity).or_default().push(declaration);
             }
+            // Aggregate witness admission already proved agreement within
+            // this owner, once. Different owners are conjoined at resolution.
+            let identity_declarations = declarations
+                .iter()
+                .map(|(identity, declarations)| {
+                    let mut layers = declarations.iter().map(|declaration| {
+                        crate::parser::ResolvedSchemaType::from_annotation_declaration(
+                            &factory.name,
+                            declaration,
+                        )
+                        .ok_or_else(|| {
+                            crate::parser::CustomTypeValidationError::MissingDeclaration {
+                                owner: factory.name.clone(),
+                                identity: identity.clone(),
+                            }
+                        })
+                    });
+                    // Every grouped identity has a declaration. Enum/Reference
+                    // bases contribute constraints too; unsupported bases keep
+                    // a typed failure in the index instead of dropping its key.
+                    let resolved = layers
+                        .next()
+                        .expect("nonempty identity declaration group")
+                        .and_then(|first| {
+                            layers.try_fold(first, |resolved, layer| {
+                                layer.map(|layer| resolved.conjoin(&layer))
+                            })
+                        });
+                    (identity.clone(), resolved)
+                })
+                .collect();
             (
                 factory.name.clone(),
                 OwnerCustomTypeIndex {
                     factory_index,
                     declarations,
+                    identity_declarations,
                 },
             )
         })
@@ -10205,6 +10297,47 @@ mod tests {
         }
 
         #[test]
+        fn round11_owner_index_is_total_for_scalar_and_enum_declarations() {
+            use crate::provider::{ProviderFactorySchemaSnapshot, build_owner_custom_type_index};
+            use crate::schema::PatternAttributeType;
+            use std::collections::BTreeMap;
+            let id = TypeIdentity::from_dotted("test.X");
+            let scalar = PatternAttributeType::refined_string(Some(id.clone()), None, None, None);
+            let enumeration = PatternAttributeType::enum_with_base(
+                id.clone(),
+                PatternAttributeType::string(),
+                Some(vec!["yes".into()]),
+                Vec::new(),
+                None,
+                None,
+            );
+            let witness = ValidatedProviderSchemaWitness::new(
+                Vec::new(),
+                ValidatedConfigSchema::validate(BTreeMap::from([
+                    ("scalar".into(), scalar),
+                    ("enum".into(), enumeration),
+                ]))
+                .unwrap(),
+                Default::default(),
+                Vec::new(),
+            )
+            .unwrap();
+            let snapshots = [ProviderFactorySchemaSnapshot {
+                name: "test".into(),
+                witness,
+            }];
+            let index = build_owner_custom_type_index(&snapshots);
+            assert!(
+                index["test"]
+                    .identity_declarations
+                    .get(&id)
+                    .is_some_and(Result::is_ok),
+                "an enum base must not drop the identity's scalar index"
+            );
+            assert_eq!(index["test"].declarations[&id].len(), 2);
+        }
+
+        #[test]
         fn registry_witness_edges_reach_loaded_catalog_without_a_factory() {
             let mut registry = SchemaRegistry::new();
             registry
@@ -10501,6 +10634,36 @@ mod tests {
 
     fn initialized(provider: impl Provider + 'static) -> InitializedProvider {
         InitializedProvider::for_test(Box::new(provider), ReferenceScope::Unavailable)
+    }
+
+    #[test]
+    fn round13_annotation_resolution_requires_the_total_identity_index() {
+        use crate::parser::{CustomTypeResolver, CustomTypeValidationError, OwnedTypeIdentity};
+        let identity = TypeIdentity::from_dotted("test.Indexed");
+        let declaration = AttributeType::refined_string(Some(identity.clone()), None, None, None);
+        let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(ConfigOnlyCustomTypeFactory)];
+        let index = BTreeMap::from([(
+            "config-owner".into(),
+            OwnerCustomTypeIndex {
+                factory_index: 0,
+                declarations: BTreeMap::from([(identity.clone(), vec![declaration])]),
+                identity_declarations: BTreeMap::new(),
+            },
+        )]);
+        let resolver = FactoryCustomTypeResolver::with_index(
+            factories.as_slice(),
+            index,
+            &SchemaRegistry::new(),
+        );
+        let owned =
+            OwnedTypeIdentity::provider("config-owner", identity, RefinedScalarKind::String);
+        assert!(
+            matches!(
+                resolver.annotation_declaration(&owned),
+                Err(CustomTypeValidationError::MissingDeclaration { .. })
+            ),
+            "raw declarations cannot replace missing indexed evidence"
+        );
     }
 
     #[test]
@@ -11176,6 +11339,7 @@ mod tests {
             "config-owner".into(),
             OwnerCustomTypeIndex {
                 factory_index: 0,
+                identity_declarations: BTreeMap::new(),
                 declarations: BTreeMap::from([(identity.clone(), vec![declaration])]),
             },
         )]);
@@ -11224,6 +11388,7 @@ mod tests {
             "config-owner".into(),
             OwnerCustomTypeIndex {
                 factory_index: 0,
+                identity_declarations: BTreeMap::new(),
                 declarations: BTreeMap::from([(identity.clone(), vec![AttributeType::string()])]),
             },
         )]);

@@ -2387,23 +2387,26 @@ mod provider_config_tests {
     #[test]
     fn resource_lookup_validates_only_the_exact_declared_type() {
         let identity = TypeIdentity::new(Some("shared"), Vec::<String>::new(), "Identifier");
-        let own_declaration = PatternAttributeType::refined_string(
-            Some(identity.clone()),
-            Some(crate::schema::PatternSpec::new(
-                "^own$".to_string(),
-                crate::schema::PatternMatch::Full,
-            )),
-            None,
-            None,
+        let base = crate::schema::StringIdentityLayer::new(Some(identity), None, None, None);
+        let own_declaration = PatternAttributeType::string_member(
+            base.clone(),
+            crate::schema::StringMemberConstraints::new(
+                Some(crate::schema::PatternSpec::new(
+                    "^own$",
+                    crate::schema::PatternMatch::Full,
+                )),
+                None,
+            ),
         );
-        let sibling_declaration = PatternAttributeType::refined_string(
-            Some(identity),
-            Some(crate::schema::PatternSpec::new(
-                "^sibling$".to_string(),
-                crate::schema::PatternMatch::Full,
-            )),
-            None,
-            None,
+        let sibling_declaration = PatternAttributeType::string_member(
+            base,
+            crate::schema::StringMemberConstraints::new(
+                Some(crate::schema::PatternSpec::new(
+                    "^sibling$",
+                    crate::schema::PatternMatch::Full,
+                )),
+                None,
+            ),
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let factories: Vec<Box<dyn ProviderFactory>> = vec![Box::new(RoutingFactory {
@@ -2685,11 +2688,14 @@ mod provider_config_tests {
         ];
         let decoded = crate::protocol_convert::protocol_to_attribute_type(
             &carina_provider_protocol::types::AttributeType::String {
-                pattern: None,
-                length: None,
-                validate: None,
-                to_dsl: None,
-                identity: Some("shared.Identifier".to_string()),
+                identity_layer: carina_provider_protocol::types::StringIdentityLayer {
+                    pattern: None,
+                    length: None,
+                    validate: None,
+                    to_dsl: None,
+                    identity: Some("shared.Identifier".to_string()),
+                },
+                member_layer: Default::default(),
             },
         )
         .expect("callback-free protocol refinement must decode");

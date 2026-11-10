@@ -1,0 +1,212 @@
+{
+  "int": {
+    "SchemaType": {
+      "owned": {
+        "owners": [
+          {
+            "Provider": "p"
+          }
+        ],
+        "identity": {
+          "provider": "aws",
+          "segments": [],
+          "kind": "Count"
+        },
+        "scalar_kind": "Int",
+        "declaration": {
+          "Int": {
+            "provider": "aws",
+            "segments": [],
+            "kind": "Count"
+          }
+        },
+        "origin": "Annotation",
+        "constraints": {
+          "scalar": {
+            "Int": {
+              "identity_range": {
+                "min": {
+                  "Inclusive": 0
+                },
+                "max": {
+                  "Inclusive": 100
+                }
+              }
+            }
+          },
+          "empty_intersection": false
+        },
+        "projection_fingerprint": null
+      }
+    }
+  },
+  "owners": {
+    "SchemaType": {
+      "owned": {
+        "owners": [
+          {
+            "Provider": "p"
+          },
+          {
+            "Provider": "q"
+          }
+        ],
+        "identity": {
+          "provider": "aws",
+          "segments": [
+            "iam",
+            "Role"
+          ],
+          "kind": "Name"
+        },
+        "scalar_kind": "String",
+        "declaration": {
+          "String": {
+            "provider": "aws",
+            "segments": [
+              "iam",
+              "Role"
+            ],
+            "kind": "Name"
+          }
+        },
+        "origin": "Annotation",
+        "constraints": {
+          "scalar": {
+            "String": {
+              "identity_layer": {
+                "length": {
+                  "min": {
+                    "Inclusive": 3
+                  },
+                  "max": {
+                    "Inclusive": 16
+                  }
+                },
+                "patterns": [
+                  {
+                    "regex": "A.*",
+                    "mode": {
+                      "kind": "full"
+                    }
+                  },
+                  {
+                    "regex": "[A-Z]+",
+                    "mode": {
+                      "kind": "full"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "empty_intersection": false,
+          "owner_layers": {
+            "p": {
+              "String": {
+                "identity_layer": {
+                  "length": {
+                    "min": {
+                      "Inclusive": 1
+                    },
+                    "max": {
+                      "Inclusive": 16
+                    }
+                  },
+                  "patterns": [
+                    {
+                      "regex": "[A-Z]+",
+                      "mode": {
+                        "kind": "full"
+                      }
+                    }
+                  ]
+                }
+              }
+            },
+            "q": {
+              "String": {
+                "identity_layer": {
+                  "length": {
+                    "min": {
+                      "Inclusive": 3
+                    },
+                    "max": {
+                      "Inclusive": 32
+                    }
+                  },
+                  "patterns": [
+                    {
+                      "regex": "A.*",
+                      "mode": {
+                        "kind": "full"
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "projection_fingerprint": null
+      }
+    }
+  },
+  "string": {
+    "SchemaType": {
+      "owned": {
+        "owners": [
+          {
+            "Provider": "p"
+          }
+        ],
+        "identity": {
+          "provider": "aws",
+          "segments": [
+            "iam",
+            "Role"
+          ],
+          "kind": "Name"
+        },
+        "scalar_kind": "String",
+        "declaration": {
+          "String": {
+            "provider": "aws",
+            "segments": [
+              "iam",
+              "Role"
+            ],
+            "kind": "Name"
+          }
+        },
+        "origin": "Annotation",
+        "constraints": {
+          "scalar": {
+            "String": {
+              "identity_layer": {
+                "length": {
+                  "min": {
+                    "Inclusive": 1
+                  },
+                  "max": {
+                    "Inclusive": 32
+                  }
+                },
+                "patterns": [
+                  {
+                    "regex": "[A-Z]+",
+                    "mode": {
+                      "kind": "full"
+                    }
+                  }
+                ]
+              }
+            }
+          },
+          "empty_intersection": false
+        },
+        "projection_fingerprint": null
+      }
+    }
+  }
+}

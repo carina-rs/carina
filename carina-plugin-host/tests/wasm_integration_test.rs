@@ -7436,11 +7436,15 @@ async fn wasm_pattern_modes_preserve_matching_and_reason() {
         for (name, accepts_containing) in [("full", false), ("substring", true)] {
             let ty = schema.parts().attributes[name].attr_type();
             let RawShape::String {
-                identity: _identity,
-                pattern: Some(spec),
-                length: _length,
-                validate: _validate,
-                to_dsl: _to_dsl,
+                identity_layer:
+                    carina_core::schema::StringIdentityParts {
+                        identity: _identity,
+                        pattern: Some(spec),
+                        length: _length,
+                        validate: _validate,
+                        to_dsl: _to_dsl,
+                    },
+                member_layer: _,
             } = ty.raw_shape()
             else {
                 panic!("pattern fixture string");

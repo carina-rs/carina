@@ -28,8 +28,8 @@ fn empty_input_rules_survive_json_round_trip() {
 
 #[test]
 fn input_rule_protocol_is_current() {
-    assert_eq!(PROTOCOL_VERSION, 26);
-    assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 26);
+    assert_eq!(PROTOCOL_VERSION, 27);
+    assert_eq!(MIN_SUPPORTED_PROTOCOL_VERSION, 27);
 }
 
 #[test]

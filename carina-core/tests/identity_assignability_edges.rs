@@ -289,7 +289,7 @@ fn identity_edges_require_every_annotation_owner() {
 }
 
 #[test]
-fn identity_edges_preserve_rule_seven_length_containment() {
+fn identity_edges_defer_member_containment_but_reject_disjointness() {
     let loaded = snapshot(&[("p", true)]);
     let source = AttributeType::refined_string(
         Some(identity("NewName")),
@@ -297,15 +297,41 @@ fn identity_edges_preserve_rule_seven_length_containment() {
         Some((Some(1), Some(20))),
         None,
     );
-    let sink = AttributeType::refined_string(
-        Some(identity("Name")),
-        None,
-        Some((Some(1), Some(10))),
-        None,
+    let sink = AttributeType::string_member(
+        carina_core::schema::StringIdentityLayer::new(Some(identity("Name")), None, None, None),
+        carina_core::schema::StringMemberConstraints::new(None, Some((Some(1), Some(10)))),
     );
     assert_eq!(
         assignment(
             &source,
+            &sink,
+            &loaded.provider_context().custom_types,
+            &P_OWNER
+        ),
+        Ok(true)
+    );
+    let disjoint = AttributeType::string_member(
+        carina_core::schema::StringIdentityLayer::new(Some(identity("NewName")), None, None, None),
+        carina_core::schema::StringMemberConstraints::new(None, Some((Some(100), Some(128)))),
+    );
+    assert_eq!(
+        assignment(
+            &disjoint,
+            &sink,
+            &loaded.provider_context().custom_types,
+            &P_OWNER
+        ),
+        Ok(true)
+    );
+    let identity_disjoint = AttributeType::refined_string(
+        Some(identity("NewName")),
+        None,
+        Some((Some(100), Some(128))),
+        None,
+    );
+    assert_eq!(
+        assignment(
+            &identity_disjoint,
             &sink,
             &loaded.provider_context().custom_types,
             &P_OWNER

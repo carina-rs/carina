@@ -10036,11 +10036,14 @@ fn shared_identity_annotation_is_owner_conjunctive_in_multi_file_lsp_analysis() 
 fn named_annotation_engine(source_max: u64) -> DiagnosticEngine {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
     let name = |max| {
-        AttributeType::refined_string(
-            Some(TypeIdentity::from_schema_type("aws", "iam.Role", "Name")),
-            None,
-            Some((Some(1), Some(max))),
-            None,
+        AttributeType::string_member(
+            carina_core::schema::StringIdentityLayer::new(
+                Some(TypeIdentity::from_schema_type("aws", "iam.Role", "Name")),
+                None,
+                Some((Some(1), Some(64))),
+                None,
+            ),
+            carina_core::schema::StringMemberConstraints::new(None, Some((Some(1), Some(max)))),
         )
     };
     let mut schemas = SchemaRegistry::new();
@@ -10065,11 +10068,14 @@ fn named_annotation_engine(source_max: u64) -> DiagnosticEngine {
 fn computed_access_rejects_heterogeneous_collection_in_lsp_diagnostics() {
     use carina_core::schema::{AttributeSchema, AttributeType, ResourceSchema, TypeIdentity};
     let name = |max| {
-        AttributeType::refined_string(
-            Some(TypeIdentity::from_schema_type("aws", "iam.Role", "Name")),
-            None,
-            Some((Some(1), Some(max))),
-            None,
+        AttributeType::string_member(
+            carina_core::schema::StringIdentityLayer::new(
+                Some(TypeIdentity::from_schema_type("aws", "iam.Role", "Name")),
+                None,
+                None,
+                None,
+            ),
+            carina_core::schema::StringMemberConstraints::new(None, Some((Some(1), Some(max)))),
         )
     };
     let mut schemas = SchemaRegistry::new();
@@ -10101,16 +10107,11 @@ fn computed_access_rejects_heterogeneous_collection_in_lsp_diagnostics() {
     std::fs::write(root.join("source.crn"), "let src = aws.NameSource {}\n").unwrap();
     std::fs::write(
         module.join("main.crn"),
-        "arguments {\n  x: aws.iam.Role.Name\n}\naws.iam.Role { role_name = x }\n",
+        "arguments {\n  x: aws.iam.Role.Name\n}\n",
     )
     .unwrap();
     for (fallback, expected_error) in [
-        (
-            "[src.narrow, src.wide]",
-            Some(
-                "collection element types disagree: `aws.iam.Role.Name (length 1..=64)` vs `aws.iam.Role.Name (length 1..=128)`",
-            ),
-        ),
+        ("[src.narrow, src.wide]", None),
         (
             "['ValidName', 1]",
             Some("collection element types disagree: `String` vs `Int`"),
@@ -10170,24 +10171,10 @@ fn named_annotation_diagnostics_match_cli_for_arguments_and_nested_calls() {
             );
         }
         let diagnostics = analyze_with_buffer(&engine, &root, "main.crn", root_source);
-        if source_max <= 64 {
-            assert!(
-                diagnostics.is_empty(),
-                "width {source_max}: {diagnostics:#?}"
-            );
-        } else {
-            assert!(
-                diagnostics.iter().any(|diagnostic| {
-                    diagnostic
-                        .message
-                        .contains("expected aws.iam.Role.Name (length 1..=64)")
-                        && diagnostic
-                            .message
-                            .contains("got aws.iam.Role.Name (length 1..=128)")
-                }),
-                "wider exact sources must fail in the shared checker: {diagnostics:#?}"
-            );
-        }
+        assert!(
+            diagnostics.is_empty(),
+            "the shared identity bounds every member source at width {source_max}: {diagnostics:#?}"
+        );
     }
 }
 
@@ -17921,4 +17908,229 @@ fn review_r7_skipped_lookup_does_not_suppress_a_list_constraint() {
         ),
         "{diagnostics:#?}"
     );
+}
+
+fn widening_member_obligation_parity(decoded: bool) {
+    use carina_core::binding_index::{BindingIndex, BindingValueSource, ResolvedBindings};
+    use carina_core::resource::knowledge::KnowledgeContext;
+    use carina_core::resource::{ConcreteValue, Value};
+    use carina_core::schema::{
+        AttributeSchema, AttributeType, PatternMatch, PatternSpec, ResourceSchema,
+        StringIdentityLayer, StringMemberConstraints, StructField, TypeIdentity,
+        ValidatedConfigSchema,
+    };
+    use carina_core::validation::admission::{Candidate, admit};
+
+    let declaration = |ty: AttributeType| {
+        if !decoded {
+            return ty;
+        }
+        let schema = ValidatedConfigSchema::validate(std::collections::BTreeMap::from([(
+            "value".into(),
+            ty,
+        )]))
+        .unwrap();
+        let wire =
+            carina_core::protocol_convert::attribute_type_to_protocol(&schema.parts()["value"])
+                .unwrap();
+        let json = serde_json::to_string(&wire).unwrap();
+        carina_core::protocol_convert::protocol_to_attribute_type(
+            &serde_json::from_str(&json).unwrap(),
+        )
+        .unwrap()
+    };
+    let mut schemas = SchemaRegistry::new();
+    schemas.insert(
+        "aws",
+        ResourceSchema::new("iam.Role")
+            .attribute(
+                AttributeSchema::provider_populated(
+                    "arn",
+                    declaration(AttributeType::refined_string(
+                        Some(TypeIdentity::from_dotted("aws.iam.Role.Arn")),
+                        None,
+                        None,
+                        None,
+                    )),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    schemas.insert(
+        "awscc",
+        ResourceSchema::new("scheduler.Schedule")
+            .attribute(
+                AttributeSchema::required(
+                    "target",
+                    declaration(AttributeType::struct_(
+                        "Target",
+                        vec![
+                            StructField::required(
+                                "role_arn",
+                                AttributeType::string_member(
+                                    StringIdentityLayer::new(
+                                        Some(TypeIdentity::from_dotted("aws.Arn")),
+                                        None,
+                                        None,
+                                        None,
+                                    ),
+                                    StringMemberConstraints::new(
+                                        Some(PatternSpec::new(
+                                            "arn:.*:role/[A-Za-z]+",
+                                            PatternMatch::Full,
+                                        )),
+                                        Some((Some(1), Some(1600))),
+                                    ),
+                                ),
+                            )
+                            .build(),
+                        ],
+                    )),
+                )
+                .build(),
+            )
+            .validate()
+            .unwrap(),
+    );
+    let engine = custom_engine(schemas);
+    let source = "provider aws {}\nprovider awscc {}\nlet producer = aws.iam.Role {}\nlet sink = awscc.scheduler.Schedule { target = { role_arn = producer.arn } }\n";
+    let parse = |source: &str| {
+        carina_core::parser::parse_file(source, Path::new("main.crn"), &engine.provider_context)
+            .unwrap()
+    };
+    let providers = std::collections::HashSet::from(["aws".into(), "awscc".into()]);
+    carina_core::validation::validate_resources(
+        &parse(source),
+        &engine.schemas,
+        &providers,
+        &engine.provider_context,
+        &mut Vec::new(),
+    )
+    .expect("validate must admit the widening and defer its destination member");
+    let authored = parse(source);
+    let configuration = carina_core::config_loader::load_buffer_configuration(
+        &authored,
+        &engine.schemas,
+        &engine.provider_context,
+    );
+    let authored_bindings =
+        BindingIndex::from_parsed(&authored, &engine.schemas, &engine.provider_context);
+    carina_core::validation::validate_resource_ref_types(
+        configuration.judged(),
+        &std::collections::HashSet::new(),
+        &authored_bindings,
+        &mut Vec::new(),
+    )
+    .expect("validate reference checking must defer the admitted widening");
+    let diagnostics = engine.analyze(&create_document(source), None);
+    assert!(
+        !diagnostics
+            .iter()
+            .any(|d| d.message.contains("Type mismatch") || d.message.contains("cannot assign")),
+        "{diagnostics:#?}"
+    );
+
+    let parsed = parse(source).resolve_root_for_test();
+    let bindings = BindingIndex::from_parsed(&parsed, &engine.schemas, &engine.provider_context);
+    let destination = engine
+        .schemas
+        .resource_attribute_destination(&parsed.resources[1].id, "target", &engine.provider_context)
+        .unwrap();
+    let target = |value| {
+        Value::Concrete(ConcreteValue::Map(
+            [("role_arn".into(), value)].into_iter().collect(),
+        ))
+    };
+    let reference = target(Value::Deferred(
+        carina_core::resource::DeferredValue::ResourceRef {
+            path: carina_core::resource::AccessPath::new("producer", "arn").resolve_root_for_test(),
+        },
+    ));
+    carina_core::validation::deferred_types::with_session_for_test(
+        &engine.provider_context,
+        |session| {
+            let judge = |value: &Value| {
+                let (candidate, boundary) = Candidate::validation_classified(
+                    value
+                        .knowledge(&KnowledgeContext::validation())
+                        .unwrap()
+                        .into_classification(),
+                    Some(&bindings),
+                    session,
+                );
+                admit(&destination, candidate, &boundary)
+            };
+            let long = format!("arn:aws:iam::123456789012:role/{}", "A".repeat(1600));
+            for (raw, failure) in [
+                ("bad", Some("does not match required pattern")),
+                (&long, Some("outside allowed range")),
+                ("arn:aws:iam::123456789012:role/Good", None),
+            ] {
+                let pending = judge(&reference).unwrap().ready().unwrap_err();
+                assert!(pending.local_obligation().is_some());
+                let literal = Value::Concrete(ConcreteValue::String(raw.into()));
+                let mut resolved = ResolvedBindings::default();
+                resolved.set(
+                    "producer",
+                    HashMap::from([("arn".into(), literal.clone())]),
+                    BindingValueSource::Local,
+                );
+                let literal_source =
+                    source.replace("producer.arn", &serde_json::to_string(raw).unwrap());
+                let diagnostics = engine.analyze(&create_document(&literal_source), None);
+                let checked = carina_core::validation::validate_resources(
+                    &parse(&literal_source),
+                    &engine.schemas,
+                    &providers,
+                    &engine.provider_context,
+                    &mut Vec::new(),
+                );
+                match failure {
+                    None => {
+                        checked.unwrap();
+                        assert!(
+                            !diagnostics.iter().any(|d| d.message.contains("role_arn")),
+                            "{diagnostics:#?}"
+                        );
+                        assert!(pending.discharge(&resolved, session).is_ok());
+                    }
+                    Some(fragment) => {
+                        let message = checked.unwrap_err();
+                        assert_eq!(message.matches(fragment).count(), 1, "{message}");
+                        assert_eq!(
+                            diagnostics
+                                .iter()
+                                .filter(|d| d.message.contains(fragment))
+                                .count(),
+                            1,
+                            "{diagnostics:#?}"
+                        );
+                        let expected = judge(&target(literal)).unwrap_err();
+                        let error = pending.discharge(&resolved, session).unwrap_err();
+                        assert_eq!(error.resolution_error(), expected.resolution_error());
+                        assert_eq!(
+                            error
+                                .resolution_error()
+                                .to_string()
+                                .matches("target.role_arn")
+                                .count(),
+                            1
+                        );
+                    }
+                }
+            }
+        },
+    );
+}
+
+#[test]
+fn widening_member_obligation_has_lsp_validate_and_resolved_value_parity() {
+    widening_member_obligation_parity(false);
+}
+
+#[test]
+fn decoded_widening_member_obligation_has_lsp_validate_parity() {
+    widening_member_obligation_parity(true);
 }

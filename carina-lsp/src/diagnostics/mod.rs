@@ -1219,7 +1219,7 @@ impl DiagnosticRun<'_> {
             // The shared authority owns ordinary direct bare-binding sinks
             // even when they succeed. Admitted single builtin string
             // constructions retain their enclosing schema value checks.
-            // Native interpolation keeps its existing operand suppression.
+            // Native interpolation leaves its enclosing schema check active.
             // An enum-typed argument must not
             // be reinterpreted by the LSP's legacy BindingIndex pass using a
             // differently enriched bootstrap identity. Nested uses keep the
@@ -1447,6 +1447,51 @@ impl DiagnosticRun<'_> {
                     diagnostics.extend(
                         self.module_resolver_error_diagnostics(doc, tree, error, base_path),
                     );
+                }
+            }
+            if let Some(inputs) = expanded_validation_inputs.as_ref() {
+                // A rejected call already owns the diagnostic. Do not add a
+                // downstream resource consequence of that same rejection.
+                let rejected_calls: Vec<_> = diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+                    .map(|diagnostic| diagnostic.range)
+                    .collect();
+                let authored_ids: HashSet<_> = tree
+                    .project_resources()
+                    .map(|resource| resource.id().clone())
+                    .collect();
+                for resource in &inputs.configuration.file().resources {
+                    if authored_ids.contains(&resource.id) {
+                        continue;
+                    }
+                    let Some(carina_core::resource::ModuleSource::Module(origin)) =
+                        &resource.module_source
+                    else {
+                        continue;
+                    };
+                    let call = &origin.module_call_path().root().id;
+                    let Some(report) =
+                        inputs.resource_admissions(&resource.id, self.provider_context)
+                    else {
+                        continue;
+                    };
+                    for error in report.errors() {
+                        let finding = carina_core::parser::Located::new(
+                            call.declaration_location().clone(),
+                            error,
+                        );
+                        if let Some(diagnostic) = render_merged(
+                            doc,
+                            &finding,
+                            DiagnosticSeverity::ERROR,
+                            format!("{}: {}", resource.id, finding.detail()),
+                        ) && !rejected_calls.contains(&diagnostic.range)
+                            && !diagnostics.contains(&diagnostic)
+                        {
+                            diagnostics.push(diagnostic);
+                        }
+                    }
                 }
             }
             // The document AST intentionally preserves function calls for
@@ -2114,12 +2159,14 @@ impl DiagnosticRun<'_> {
                             {
                                 continue;
                             }
-                            if matches!(&error, TypeError::Reference { .. })
-                                && error.attribute_name().is_some_and(|name| {
-                                    binding_error_sinks
-                                        .contains(&(resource_id.clone(), name.to_string()))
-                                })
-                            {
+                            // The binding-use authority checks the resolved value,
+                            // including its destination member constraints. Its
+                            // diagnostic owns this sink even when the schema pass
+                            // sees a concrete local error instead of a reference.
+                            if error.attribute_name().is_some_and(|name| {
+                                binding_error_sinks
+                                    .contains(&(resource_id.clone(), name.to_string()))
+                            }) {
                                 continue;
                             }
                             if error

@@ -107,8 +107,8 @@
 //! }
 //! ```
 //!
-//! Pending work is holdable for every kind, including kinds whose local
-//! obligation is uninhabited. Discharge has the same generic boundary.
+//! Every destination kind retains the same resolved-value obligation.
+//! Discharge has the same generic boundary.
 //!
 //! ```
 //! use carina_core::validation::admission::{DestinationKind, PendingAdmission, kind};
@@ -180,40 +180,6 @@ pub trait DestinationKind: sealed::Sealed {
 }
 
 pub mod kind {
-    macro_rules! kinds {
-        ($($name:ident),+ $(,)?) => {$(
-            #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-            pub struct $name;
-            impl super::sealed::Sealed for $name {
-                fn local(_: &super::Destination<Self>, _: Vec<super::assignment::LocalPath>, schema: super::SchemaObligation) -> Result<<Self as super::DestinationKind>::LocalObligation, super::SchemaObligation> { Err(schema) }
-                fn defer_reference_check(_: &super::LeafPath) -> Option<super::assignment::LocalPath> { None }
-                fn schema(obligation: &<Self as super::DestinationKind>::LocalObligation) -> &super::SchemaObligation { match *obligation {} }
-                fn reference_assignment<'a, B: super::BindingAddress>(
-                    source: crate::schema::TypeInSchema<'a, crate::schema::Compiled>,
-                    sink: crate::schema::AssignmentSink<'a, crate::schema::Compiled>,
-                    _: &super::ReferenceCandidate<B>,
-                ) -> crate::schema::assignability::AssignmentRelation<'a> {
-                    source.assignment_to(sink).into()
-                }
-                fn reference_original_assignment<'a, B: super::BindingAddress>(
-                    source: crate::schema::TypeInSchema<'a, crate::schema::Compiled>,
-                    sink: crate::schema::AssignmentSink<'a, crate::schema::Compiled>,
-                    _: &super::ReferenceCandidate<B>,
-                ) -> crate::schema::assignability::AssignmentRelation<'a> { source.identity_assignment_to(sink).into() }
-            }
-            impl super::DestinationKind for $name {
-                type LocalObligation = std::convert::Infallible;
-            }
-        )+};
-    }
-    kinds!(
-        ProviderConfigAttribute,
-        BackendAttribute,
-        ModuleArgument,
-        AnnotatedAttribute,
-        Export,
-        UpstreamExport
-    );
     macro_rules! rechecks {
         ($($name:ident),+ $(,)?) => {$(
             #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -247,7 +213,16 @@ pub mod kind {
             impl super::RechecksResolved for $name {}
         )+};
     }
-    rechecks!(ResourceAttribute, DataSourceAttribute);
+    rechecks!(
+        ResourceAttribute,
+        DataSourceAttribute,
+        ProviderConfigAttribute,
+        BackendAttribute,
+        ModuleArgument,
+        AnnotatedAttribute,
+        Export,
+        UpstreamExport
+    );
 }
 
 #[derive(Debug, Clone, PartialEq)]

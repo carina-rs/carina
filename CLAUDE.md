@@ -579,6 +579,87 @@ A struct type represents a nested object with typed fields.
   `NativeDesiredNormalization`. Keep `ProviderWireError`
   terminal: render its typed conversion reason once, without input values,
   and access the typed reason through `conversion_error()`.
+- **Refinement layers** (carina#4348): protocol 27/minimum 27 requires
+  separate `identity_layer` and `member_layer` records for String and Int.
+  `StringIdentityLayer`/`IntIdentityLayer` own reusable definitions;
+  `StringMemberConstraints`/`IntMemberConstraints` add declaration-local bounds.
+  `string_member` and `int_member` take these distinct types once and preserve
+  the complete identity. Each String layer has one optional `PatternSpec` and
+  one optional length interval; each Int layer has one optional range. Float
+  is unchanged. Validate the identity pattern then bounds, member pattern then
+  bounds, and finally the semantic callback; retain first-failure diagnostics.
+  Never repeat structural checks in callbacks. Within one provider, every
+  occurrence of a String/Int/Float identity must have the same identity-layer
+  definition (including Float ranges);
+  aggregate admission rejects `ConflictingIdentityDeclarations`. Provider
+  migrations must move resource-specific bounds into the member layer rather
+  than redeclaring an identity with different constraints. Across different
+  owners (for example AWS and AWSCC), annotation constraints are conjoined:
+  values must satisfy every owner's identity layer. Annotation-origin evidence
+  uses an identity-only payload with no member slots. Read-value projections
+  are identity-only too: their typed declarations preserve enum values,
+  reference kind and semantic callbacks but cannot store member constraints.
+  Projection fingerprints cover identity/value metadata, never slot members.
+  Decoding either value-evidence origin with member fields must fail.
+  Native single-owner and multi-owner annotations are distinct
+  forms: a single holds one `SchemaTypeOwner`, and a multi holds a checked map
+  keyed by at least two `SchemaTypeOwner`s. Wire single-owner annotations omit
+  `owner_layers`; multi-owner annotations retain exactly one identity layer per
+  owner. Decoding verifies the exact conjunction of owner layers, including
+  empty bounds from same-owner repeats, and recomputes the empty-intersection
+  marker after Float normalization. Owner sets derive from layer keys. Annotation
+  pattern conjunctions are sorted, deduplicated sets, including same-owner repeats.
+  Structural scalar reads use the same canonical evidence as identity annotations,
+  so equal identity-level types compare and serialize equally. Callbacks,
+  transforms, enums and references retain exact projection provenance.
+  A member layer belongs to its destination slot. Enforce it on writes through
+  identity admission and the deferred destination check; identified source bounds
+  are identity-layer bounds only. Anonymous String/Int declarations retain both
+  layers as structural evidence (matching patterns and intersected bounds). Unannotated collections, conditionals and coalesce
+  require identical `TypeExpr`s, as on main. Reads of slots differing only in
+  member constraints infer equal types. An explicit compatible annotation is
+  the way to accept otherwise mixed declarations; inference never widens them.
+  Enum definition and canonical-spelling disagreements remain typed errors.
+  Enum bases describe definitions, never slots: schema admission rejects String/Int
+  member constraints inside a base with `EnumBaseMemberLayerError`.
+  Built-in and aggregate comparisons accept identity-only typed projections. Exact
+  declarations and their fingerprints preserve both layers. Hover renders
+  both layers through the core's read-only bounded refinement walk, which counts
+  refined String/Int/Reference leaves and structural nodes, including Refs and
+  nested unions. Every emitted position, including an identity-only String/Int,
+  consumes budget. Plain scalar leaves and bare References emit nothing and cost
+  no budget; only actual omissions mark truncation. Anonymous refinements use
+  structural labels with intersected bounds and every pattern rather than
+  identity/member labels; identified leaves show every identity-conjunction
+  pattern. Shared provider docgen
+  must render both layers too. WIT stays 0.2.0.
+  Schema fingerprints use v13 and saved plans use format 44; format 43 plans
+  must fail the version gate before decoding the payload. Saved module
+  `pending_constraints` contain `ValidateExpr` values, not retained types;
+  replay reloads refinement layers from fingerprint-checked provider schemas.
+  Every typed sink uses the same String/Int identity-admission rule for
+  equal identities and allowed widenings (#4349), including annotations,
+  exports, module arguments, and function parameters/returns. All destination
+  kinds can retain the existing `NeedsLocal` resolved-value obligation. Same-identity
+  value admission, including a declared source, defers overlapping identity bounds
+  to the local check; provably disjoint bounds reject statically. Different-identity
+  widening requires source identity bounds to be contained by destination identity
+  bounds. Strict declaration compatibility retains main's containment checks.
+  Declaration compatibility admits types; only value admission grants placement.
+  `NeedsLocal` exists only in the admission-facing reference relation, requiring
+  a `ReferenceCandidate`; it cannot convert back into general type compatibility.
+  Admission consumes it by registering the existing `LocalPath` on the destination
+  contract. `PendingAdmission::discharge` re-enters `admit_apply`, checking the
+  resolved value against that destination's complete declaration and both layers.
+  Known binding values also enter the destination's ordinary value validator after
+  declaration compatibility. Member String failures keep their structured pattern/
+  length category and label the slot's member constraint; identity failures run first.
+  Int-to-Float widening uses identity-bound
+  containment too. Float retains main's strict range containment and same-identity
+  reference deferral; Enum/unloaded reference leaves retain that deferral too.
+  Unproven regex containment defers to the value check. At annotated sinks,
+  declaration equality and display-name equality do not replace identity
+  admission; mismatch names expose differing constraints or scalar kinds.
 - **Schema field transport**: `StructField` and `AttributeSchema` cross the
   WASM boundary as JSON via the `schemas: func() -> string` WIT export. The
   sole typed core/protocol boundary is `carina_core::protocol_convert`: the SDK
@@ -601,8 +682,8 @@ A struct type represents a nested object with typed fields.
   declarations share the identity's callback set, and separately allocated
   callbacks from repeated type-constructor calls are valid. This is the honest
   current-protocol (`PROTOCOL_VERSION`) behavior: the wire names an identity,
-  not a schema declaration, so the identity is the guest-side type and its
-  constraints are per provider. The current WIT keeps
+  not a schema declaration, for semantic callback dispatch. Structural identity
+  and member constraints are transported separately and checked by the host. The current WIT keeps
   `validate-custom-type(TypeIdentity, string)`: the guest parses canonical text
   with the binding's stored kind, and aggregate schema admission rejects an
   identity reused with another scalar kind. Resource/config schema walks pass
@@ -635,10 +716,12 @@ A struct type represents a nested object with typed fields.
   `Custom` decoder preserves the first outer record's name as the only
   identity, including an empty name; nested `Custom.name` and primitive-base
   identities never fill it in. Enclosing String/int refinements take
-  precedence over nested/base metadata, falling back to the inner metadata
-  only when the enclosing record omits it. Anonymous legacy `Custom` records
-  with a List base remain ordinary refined lists. A named List base is the one
-  intentional legacy-Custom tightening: core cannot retain that enclosing
+  precedence over nested/base identity-layer metadata, falling back to the inner
+  identity metadata only when the enclosing record omits it. Legacy `Custom`
+  has no member layer: a terminal String/Int base with non-empty member metadata
+  is incompatible and returns a typed decode error, regardless of outer fields.
+  Anonymous legacy `Custom` records with a List base remain ordinary refined
+  lists. A named List base is also rejected: core cannot retain that enclosing
   identity, so decode returns a typed error instead of silently dropping it.
   Metadata incompatible with the terminal shape remains a typed error. The
   `ResourceSchema`, `AttributeSchema`, and `StructField` conversions destructure
@@ -732,329 +815,3 @@ A struct type represents a nested object with typed fields.
   world. Component type scanning rejects a legacy package before linking or
   executing any start/info code, naming the found package and the required
   `carina:provider@0.2.0` and the current host protocol. `ProviderDiagnostics::emit` accepts only typed events borrowing
-  provider errors/diagnostics or carrying structured value candidates. The
-  host binds them through the same private text kernel as returned errors.
-  Only that kernel mints `BoundProviderEvent`; its presenter consumes Bound
-  segments and never constructs `HostText` or uses generic Bound error or
-  partial-reason constructors. Closing those older constructors remains #4301.
-  Value origin is advisory: host-resolved addresses, protected desired-input
-  paths, schema write-only fields and the existing `RedactionSet` decide
-  masking. An unresolved address masks the subtree. Every string leaf and key
-  uses that same redactor; decoded guest values acquire no protection marks.
-  Raw WASI stdout/stderr have discard-only capabilities from metadata through
-  teardown. Host-owned HTTP traces keep the redacting stream. The SDK panic
-  hook precedes construction and exports, preserves string payloads and typed
-  locations, and never invokes the default hook or formats unknown payloads.
-  Only long-lived AWS session credentials and GitHub tokens are registered;
-  adoption requires acknowledgement before operational wrappers reach transport.
-  Registration is idempotent by value, retains old generations, and charges only
-  new credentials. AWS providers enable the SDK `aws` feature and implement
-  `AwsSessionSource`, returning each current generation as
-  `AwsSessionMaterial::new(credentials)`. Material privately retains the complete
-  AWS SDK `Credentials`; registration reads only its key/secret/token. After
-  acknowledgement the same credentials are returned unchanged, preserving expiry,
-  account ID, provider name and feature/custom properties. Material Debug is opaque.
-  The public AWS credential/configuration entry points are `AwsSessionMaterial`,
-  `AwsSessionSource`, `AwsSessionFuture` and `AwsSdkParts`. Registration and its
-  consuming snapshot conversion are internal; snapshots implement no public
-  credentials-provider or unsigned request-preparation API.
-  `AwsSdkParts::new(source, diagnostics)` keeps its registering credentials provider and
-  HTTP client private. Its consuming `apply` installs both together on one AWS
-  SDK config builder; the SDK exposes neither component alone. Every credentials
-  lookup fetches the source, registers the generation before handing it to the
-  signer, and preserves expiry. Registration failure returns a typed credentials
-  error with its source chain. Direct WASI AWS
-  client constructors remain private. This guarantees paired installation on
-  that builder; later changes through AWS APIs remain under caller control.
-  The synchronous WASI HTTP transport accepts only fully buffered request
-  bodies and carries `RequestBody::Empty` / `Sized` through to explicit
-  `Content-Length` framing. `TryFrom<&SdkBody>` rejects streaming or taken
-  bodies with `UnbufferedRequestBody`, retained as the source of a non-retryable
-  `ConnectorError::user` before sending. It never polls or buffers a stream.
-  The generic HTTP path classifies its owned `Vec<u8>` infallibly.
-  Per-request headers and query fields use the existing
-  structural HTTP trace masking, followed by the session `RedactionSet`. Each
-  request the transport accepts emits one completed HTTP event, including early
-  transport failures. A body rejected by `TryFrom<&SdkBody>` is returned to the
-  SDK as a user error without an HTTP event. Signing material and ordinary query
-  values never enter the long-lived inventory.
-  Core owns all diagnostic budgets. Count/rate windows reset per WASM export
-  and native dispatch through the same core call scope,
-  with separate quotas for Error/Warn/Info and Debug/Trace. Only the first panic
-  per call bypasses count/rate limits; later panics consume the ordinary quota.
-  Panic context, message and location share a 256 KiB input cap; over-cap guest
-  text is masked before binding while numeric location fields remain available.
-  Call completion emits one fixed host-authored suppression notice containing
-  only the total count. Rejection has no plaintext fallback. Admission filters
-  invisible levels before budgeting or counting suppression. The default sink
-  shows Error/Warn/Info; Debug/Trace require `CARINA_WASI_HTTP_TRACE=1`, read once
-  by the host and never forwarded to guests. Custom sinks explicitly observe
-  all levels, with the same separate quotas. Call fallback inputs inherit the
-  store's sink and validated schemas.
-  The host chooses the sink on a consumed `ProviderSessionBuilder` before
-  constructing a shared session; cloned sessions have no sink setter. Session
-  construction and budget/presentation plumbing are exposed by `provider-host`
-  (`guest-runtime` includes it for the native plugin host). WASM SDK guests use
-  core without either feature. Enabling `provider-host` on wasm32, directly or
-  transitively, is a compile error: host plumbing is unavailable to guest
-  providers. The in-repo provider manifest check remains an additional lint;
-  it does not resolve transitive features or police external provider repos.
-  Native in-process providers are trusted code linked into the host binary,
-  where host feature unification is accepted.
-  Native factories receive the same typed channel through `ProviderSession`;
-  native calls also finish with one count-only suppression notice when needed.
-  Native `tokio::spawn`, `spawn_blocking` and other threads do not inherit a call
-  scope. Their events share a bounded session budget; the last diagnostic owner
-  flushes its total suppressed count as one fixed host-authored notice on drop.
-  Retained emission handles are weak and cannot keep that owner alive. Every
-  configured normalizer owns live diagnostic inputs and dispatches in a call
-  scope, including fixtures. Custom-type validation inherits the host sink and
-  schemas. Native OS output
-  remains outside this channel. Diagnostics are not persisted and do
-  not change the state format.
-- **Desired normalization is per leaf** (carina#4194). The normalization opacity policy,
-  `carina_core::resource::is_deferred_desired_leaf`, marks every
-  `Value::Deferred` leaf (references, unknowns, secrets, other unresolved
-  expressions) inside concrete lists/maps. The SDK's `DesiredView` presents
-  the same `DesiredValue` tree on the native route (`NativeDesiredNormalization`)
-  and the WASM route (`DesiredResource::into_normalization`), so a provider
-  normalizer is the same code on both. Deferred leaves are opaque
-  `DeferredLeaf` values: providers cannot construct, clone or inspect them,
-  and may only move them within their original top-level attribute. On the
-  wire they are host-issued slots (`desired-value::deferred-val`, or
-  `{"$carina_deferred": <u32>}` inside normalization JSON, whose user keys
-  starting with `$` are escaped only by `carina_provider_protocol::normalization`).
-  The host restores each slot to its original value only after checking that
-  every slot occurs exactly once in its original resource and attribute;
-  otherwise it returns a typed error naming them and applies nothing. CRUD,
-  config and persisted-state values never carry slots, and create/update still
-  deliver real secret values. Don't reintroduce a top-level deferred-name list
-  or let provider code see a deferred leaf's value.
-- **Runtime value knowledge** (carina#4316) is classified by
-  `Value::knowledge()` in `carina-core/src/resource/knowledge.rs`. Concrete
-  lists/maps can have exact membership while their leaves remain pending.
-  Scalar builtin, shape builtin, child-expansion, ordinary wire, import,
-  and resolved function-constraint boundaries take knowledge proofs. The
-  classifier retains Secret as an opaque node. Known means fully evaluable,
-  including a Secret payload. Pending Secret keeps protected child evidence
-  and inherits its timing; payload errors propagate. Inner proofs and data
-  never leave that boundary; named protected operations own payload computation. Knowledge grants no plaintext access or transport
-  permission. Attempted failures are separate Failed nodes: structural checks
-  retain known sibling findings, while known-value, expansion and plan-boundary
-  projections reject failures in active positions. An unselected coalesce
-  alternative stays typed evidence behind its coalesce-pending node, including
-  after plan projection; selecting it reports the original failure. Protected
-  coalesce and expression timing consume the same classified child evidence.
-  Syntax/type
-  judgement and normalization opacity remain separate policies. The plan
-  boundary accepts only `Knowledge<Plan>` and projects pending results to
-  `PlanResolved`, rejecting remaining Plan-phase work. Validation, Plan, and
-  Apply are distinct context markers, and the Plan and Apply contexts both take
-  the same `ResolvedBindings` type. Structural `Classification` views cannot
-  mint stage proofs, but can yield a fully known, stage-independent `KnownValue`
-  through `into_known`. The apply-specific `KnownValue::from_apply` entry point
-  takes only `Knowledge<Apply>`; it is not the only way to obtain `KnownValue`.
-  Resource and data-source dispatch classify their final attributes with
-  `KnowledgeContext::apply(bindings)` and obtain proofs through
-  `KnownValue::from_apply`. Structural serialization checks do not replace
-  this dispatch gate.
-  Reference timing uses the resolver's shared typed
-  plan-reference decision. Per-attribute validation keeps failed inputs present
-  and continues checking their siblings. Pending sites use LeafPath and operand steps, are enumerated
-  from cached classifications on demand, and remain runtime-only. Visitors
-  stay crate-private to Knowledge consumers. Lexical UserFunction body/local
-  analysis shares immutable evidence within one classification, keyed by the
-  existing function Arc identity. The private lookup is discarded on return;
-  arguments and site paths remain specific to each call. Typed plan projection
-  preserves that sharing without reclassifying source values. Saved candidates
-  must be re-admitted by the admission owner.
-- **LSP integration**: when adding Struct validation, update
-  `carina-lsp/src/diagnostics/validation.rs` to validate nested fields;
-  completion should work recursively for struct fields.
-
-## Module Loading
-
-Modules are directory-scoped. An import target must be a directory containing
-one or more `.crn` files; single-file modules are rejected with
-`ModuleError::NotADirectory`. Inside a module directory all `.crn` files are
-merged uniformly — no file name (including `main.crn`) is privileged.
-
-- CLI: `load_module()` / `ModuleResolver::load_module` require a directory path.
-- LSP: Module loading in `diagnostics/checks.rs` handles directory modules for proper validation.
-
-## Plan Concurrency Contract
-
-<!-- constrained-by #key-abstractions -->
-
-`carina plan` **takes no state lock.** `apply`/`destroy` acquire an
-exclusive lock (`backend.acquire_lock(...)`); `plan` deliberately does
-not. A lock on a read-only operation is overkill, and because the
-backend lock API is exclusive-only it would serialize concurrent
-`plan`s and let a long `plan` block deploys — too strong for a command
-whose output is only a prediction. (Deliberate decision for issue #3111;
-options considered were: (1) document as intentional, (2) acquire a
-shared/read lock, (3) detect drift and warn. Option 3 was chosen — option
-1 is weaker than Terraform and leaves the user unaware of staleness;
-option 2 needs a shared-lock mode the backends do not have and is only
-justified once a saved-plan/`plan -out`→`apply` workflow exists.)
-
-Because `plan` reads state once at `T0` and computes the diff against
-that snapshot with no lock held, a concurrent `apply`/`destroy` can
-make the displayed plan stale (a TOCTOU window — *not* a torn read;
-both backends write state atomically). To bound this, `plan`:
-
-1. Fingerprints state at `T0` (`StateFile::serial` + `lineage`) right
-   after the initial read — `StateSnapshot::capture` in
-   `carina-cli/src/commands/plan.rs`.
-2. Re-reads state just before display and compares
-   (`detect_state_drift`). A `lineage` change (state recreated) is
-   reported in preference to a `serial` bump (concurrent write).
-3. On drift, prints a **warning** to stderr and still shows the plan.
-   Drift is never fatal: the plan is a prediction, and `apply`
-   re-acquires the lock and recomputes the diff before mutating
-   anything, so final correctness is enforced on the `apply` side.
-
-`plan --out <file>` still writes the saved plan even when drift is
-detected (the warning goes to stderr; the plan file is the command's
-product). This is safe because the saved-plan apply path
-(`run_apply_from_plan_locked`) records the plan's `state_lineage` /
-`state_serial` and, under the apply lock, hard-errors on a lineage
-mismatch and warns on a serial bump before mutating — so a stale saved
-plan cannot be silently applied.
-
-The contract is "best-effort snapshot with drift warning", not "locked
-read". A failed re-read is also a warning, not an error. Regression
-coverage: pure classification in `commands::plan::state_drift_tests`;
-the real `carina plan` path (concurrent writer slipped into the `T0..T1`
-window via a deterministic file-handshake seam) in
-`carina-cli/tests/plan_state_drift_e2e.rs`.
-
-## Directory-scoped, never single-file
-
-**Carina configurations are directory units.** Every feature that reads DSL
-source — completion, diagnostics, validation, formatting, hover, code lens,
-etc. — must consider sibling `.crn` files in the same directory as
-first-class input, not as an afterthought. A `let` binding in `main.crn`
-must be visible from `exports.crn`; a `provider` block in `providers.crn`
-must apply to `main.crn`. Anything that looks at only one file is a bug.
-
-When implementing or modifying such a feature:
-
-1. **Acceptance test must use multiple files.** A unit test built from a
-   single string is not sufficient evidence. Write a `tempfile::tempdir()`
-   fixture that mirrors the real `infra/aws/management/<dir>/` shape —
-   typically `main.crn` + `exports.crn` + `providers.crn` + `backend.crn` —
-   and assert behavior under that shape. The bare-string variant is fine
-   *in addition to* the directory variant, never *instead of* it.
-2. **Real-infra smoke test.** Where feasible, run the built binary
-   (`carina fmt`, `carina validate`, etc.) against `carina-rs/infra/`
-   directly before declaring the issue done. The acceptance condition
-   in the original issue almost always names a real path; respect it.
-3. **API signal.** Helpers that take a single `&str` of source text
-   (`extract_resource_bindings`, `extract_let_bindings`, similar
-   text-scan utilities) silently invite single-file thinking. When you
-   see one in the call path, the question to ask is "does this caller
-   need the sibling files too?" — most of the time the answer is yes.
-
-> Past breakage: PR #2120 (closed #2043 too early) shipped `exports`
-> value-position completion that scanned only the current buffer; the real
-> `exports.crn` references bindings in `main.crn`, so users got zero LSP
-> candidates. PR #2121 fixed it by threading `base_path` into the same
-> handler. Same class of mistake recurred from PR #2118 (closed #2117
-> prematurely) where the formatter fix passed unit tests but never ran
-> against the real infra fixture.
-
-> Past breakage: PR #3393 made directory parser Pass 2 value-aware for
-> sibling `.crn` let bindings but left Pass 1 single-file, so a
-> sibling-`let` chain (`let B = A` referencing a sibling `let A = '...'`)
-> degraded to `(known after apply)` past one hop. PR #3394 replaced the
-> fixed-pass scaffolding with a fixed-point loop seeded from sibling
-> `let` values: every pass that consumes the directory binding scope
-> must consume it from a representation that has converged, not from a
-> per-file snapshot.
-
----
-
-# Part 4 — Git & Worktree Workflow
-
-## PR Drafting
-
-**In this repo, open PRs as non-draft** (plain `gh pr create`). The global
-default of `gh pr create --draft` does not apply here.
-
-## Worktree Workflow (REQUIRED)
-
-- All PR work must happen in a git worktree, not the main repo.
-- After `cd` into a worktree, verify cwd before running build/test commands.
-- Never stash changes without explicit user instruction.
-- Clean up worktrees after PR merge.
-
-```bash
-# Create worktree for a new task
-git worktree add .worktrees/<branch-name> -b <branch-name> main
-
-git worktree list
-
-# Delete worktree after PR is merged (from the main worktree, not the feature worktree)
-git worktree remove .worktrees/<branch-name>
-```
-
-## Submodule Initialization
-
-This repo uses a git submodule for `carina-plugin-wit/`. After `git pull` or creating a new worktree, initialize the submodule:
-
-```bash
-git submodule update --init --recursive
-```
-
-Without this, builds fail because `wit_bindgen::generate!` cannot find the WIT files.
-
-## Branch Cleanup
-
-After merging a PR:
-```bash
-git checkout main
-git pull
-git branch -d <feature-branch>    # Delete local branch
-git remote prune origin           # Remove stale remote tracking branches
-```
-
----
-
-# Part 5 — Multi-Agent Workflows
-
-Claude Code's `Workflow` tool runs a deterministic script that fans
-work out across many subagents (parallel finders, adversarial
-verifiers, pipeline stages). It can spawn dozens of agents and consume
-a large amount of tokens, so it is **opt-in**: only run it when the
-work explicitly calls for multi-agent orchestration. Default to a
-single agent (or the `Agent` tool for one focused subtask) otherwise.
-
-High-value patterns in this repo:
-
-- **Broad audits / sweeps.** AWS-error-display style sweeps,
-  enum-alias/`snake_case` convention sweeps, or any "apply the same
-  mechanical change across N sibling sites" task. Fan out one agent
-  per file/site, verify each independently. Pairs with the root-cause
-  rule: use a workflow to *find every sibling site* so the one upstream
-  fix is provably complete, not to patch each site.
-- **Blast-radius investigation before a typed reshape.** When deciding
-  whether a newtype/typestate reshape lands in-PR or as a follow-up,
-  fan out readers across the affected crates to enumerate every call site
-  in parallel.
-- **Multi-repo checks.** pick-issue / meta-tracker work that must scan
-  all three carina-rs repos — one agent per repo, then synthesize.
-- **Adversarial self-review.** The 5-round self-review can be structured
-  as a workflow: independent reviewers per dimension (correctness,
-  type-safety, root-cause vs symptom), each finding verified by a skeptic
-  prompted to refute it.
-
-Constraints specific to this repo:
-
-- A workflow does NOT relax any gate. Each agent still runs
-  `scripts/verify.sh --local` as described in the Verify Protocol. Findings
-  still need a reproducing test before a fix lands.
-- Agents that mutate files in parallel must use `isolation: 'worktree'`
-  to avoid clobbering each other; read-only finders do not need it.
-- Have agents return structured output (the `schema` option) rather
-  than prose when you will post-process their results.

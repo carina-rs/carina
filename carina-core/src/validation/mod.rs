@@ -281,11 +281,15 @@ impl<'a> RefSink<'a> {
                     })
                 }
                 Shape::String {
-                    identity: _,
-                    pattern: _,
-                    length: _,
-                    validate: _,
-                    to_dsl: _,
+                    identity_layer:
+                        crate::schema::StringIdentityParts {
+                            identity: _,
+                            pattern: _,
+                            length: _,
+                            validate: _,
+                            to_dsl: _,
+                        },
+                    member_layer: _,
                 }
                 | Shape::Reference {
                     identity: _,
@@ -293,9 +297,13 @@ impl<'a> RefSink<'a> {
                     length: _,
                 }
                 | Shape::Int {
-                    identity: _,
-                    range: _,
-                    validate: _,
+                    identity_layer:
+                        crate::schema::IntIdentityParts {
+                            identity: _,
+                            range: _,
+                            validate: _,
+                        },
+                    member_layer: _,
                 }
                 | Shape::Float {
                     identity: _,
@@ -390,11 +398,15 @@ impl<'a> RefSink<'a> {
                     .map_entry(key)
                 }),
                 Shape::String {
-                    identity: _,
-                    pattern: _,
-                    length: _,
-                    validate: _,
-                    to_dsl: _,
+                    identity_layer:
+                        crate::schema::StringIdentityParts {
+                            identity: _,
+                            pattern: _,
+                            length: _,
+                            validate: _,
+                            to_dsl: _,
+                        },
+                    member_layer: _,
                 }
                 | Shape::Reference {
                     identity: _,
@@ -402,9 +414,13 @@ impl<'a> RefSink<'a> {
                     length: _,
                 }
                 | Shape::Int {
-                    identity: _,
-                    range: _,
-                    validate: _,
+                    identity_layer:
+                        crate::schema::IntIdentityParts {
+                            identity: _,
+                            range: _,
+                            validate: _,
+                        },
+                    member_layer: _,
                 }
                 | Shape::Float {
                     identity: _,
@@ -1084,9 +1100,10 @@ fn enum_target_from_sink<'a>(sink: RefSink<'a>) -> Option<ExpectedEnumTarget<'a>
     }
 }
 
-fn declared_value_assignable_to_sink(
+fn declared_value_assignable_to_sink<B: BindingAddress>(
     name: &str,
     declared_type: &TypeExpr,
+    value: &GenericValue<ParserPlaceholder, B>,
     sink: RefSink<'_>,
     provider_context: typecheck::TypecheckProviderContext<'_>,
     schemas: &SchemaRegistry,
@@ -1141,7 +1158,19 @@ fn declared_value_assignable_to_sink(
         }
     };
     if assignable {
-        return Ok(());
+        // Declaration compatibility does not validate a written value. The
+        // destination owns this check, using its complete original declaration.
+        let ancestry = match sink {
+            RefSink::EffectiveType { ancestry, .. } => ancestry,
+            RefSink::TypeExpr(_) | RefSink::Interpolation => FieldAncestry::WRITABLE,
+        };
+        return crate::schema::validate_attr_with_defs(
+            target.as_type(),
+            value,
+            target.defs(),
+            ancestry,
+        )
+        .map_err(BindingResolutionError::Type);
     }
     // A declared source is still a reference mismatch. Retain its typed
     // identity so module-call diagnostics can own it and cover the resolver's
@@ -1507,6 +1536,7 @@ fn binding_value_constraints<B: BindingAddress>(
         return declared_value_assignable_to_sink(
             &use_site.name,
             declared_type,
+            value,
             sink,
             context.provider_context,
             context.schemas,
@@ -1975,13 +2005,9 @@ where
             let sink = expected.as_ref().unwrap_or(&fallback);
             let sink_judged = expression.for_sink(sink, context.raw_provider_context());
             if sink_judged.is_interpolation() {
-                // Native interpolation keeps main's operand suppression.
-                if matches!(
-                    record.authored.owner,
-                    crate::parser::BindingUseOwner::ModuleArgument { .. }
-                ) {
-                    report.expression_owned_uses.push(record.authored.clone());
-                }
+                // Suppress the operand check without claiming the enclosing
+                // destination: its resolved String still owes the slot check.
+                report.expression_owned_uses.push(record.authored.clone());
                 continue;
             }
             if sink_judged.is_single_string_construction()
@@ -2421,9 +2447,10 @@ enum ReferenceFindingLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReferenceFindingKind {
-    UnknownAttribute(ReferenceDiagnosticMessage),
+    UnknownAttribute(SecretDiagnosticError<RefTypeError>),
     UnknownBinding(ReferenceDiagnosticMessage),
     InvalidValue(ReferenceDiagnosticMessage),
+    SchemaUnavailable(SecretDiagnosticError<Box<crate::parser::CustomTypeValidationError>>),
     TypeMismatch {
         types: MismatchTypeNames,
         path: ReferenceDiagnosticMessage,
@@ -2445,9 +2472,9 @@ impl ReferenceFinding {
             ReferenceFindingKind::UnknownAttribute(_) | ReferenceFindingKind::UnknownBinding(_) => {
                 true
             }
-            ReferenceFindingKind::InvalidValue(_) | ReferenceFindingKind::TypeMismatch { .. } => {
-                false
-            }
+            ReferenceFindingKind::InvalidValue(_)
+            | ReferenceFindingKind::SchemaUnavailable(_)
+            | ReferenceFindingKind::TypeMismatch { .. } => false,
         }
     }
 
@@ -2470,6 +2497,9 @@ impl InsideSecret for ReferenceFinding {
             }
             ReferenceFindingKind::InvalidValue(message) => {
                 ReferenceFindingKind::InvalidValue(message.inside_secret())
+            }
+            ReferenceFindingKind::SchemaUnavailable(error) => {
+                ReferenceFindingKind::SchemaUnavailable(error.inside_secret())
             }
             ReferenceFindingKind::TypeMismatch {
                 types,
@@ -2499,6 +2529,7 @@ impl std::fmt::Display for ReferenceFinding {
                     UnknownAttribute(SecretDiagnosticError::InsideSecret)
                         | UnknownBinding(SecretDiagnosticError::InsideSecret)
                         | InvalidValue(SecretDiagnosticError::InsideSecret)
+                        | SchemaUnavailable(SecretDiagnosticError::InsideSecret)
                 ) {
                     write!(f, "attribute '{attribute}': ")?;
                 }
@@ -2513,9 +2544,9 @@ impl std::fmt::Display for ReferenceFinding {
             UnknownBinding(message @ SecretDiagnosticError::InsideSecret) => {
                 write!(f, "unknown binding: {message}")
             }
-            UnknownAttribute(message) | UnknownBinding(message) | InvalidValue(message) => {
-                message.fmt(f)
-            }
+            UnknownAttribute(error) => error.fmt(f),
+            UnknownBinding(message) | InvalidValue(message) => message.fmt(f),
+            SchemaUnavailable(error) => error.fmt(f),
             TypeMismatch {
                 types,
                 path,
@@ -3387,7 +3418,7 @@ fn check_resource_reference<B: BindingAddress>(
         }
         RefType::UnknownAttribute(error) => {
             return Some(finding(ReferenceFindingKind::UnknownAttribute(
-                SecretDiagnosticError::Public(error.to_string()),
+                SecretDiagnosticError::Public(error),
             )));
         }
     };
@@ -3437,8 +3468,8 @@ fn check_resource_reference<B: BindingAddress>(
         })),
         crate::binding_index::DeclaredValueAssignment::Rejected(
             RefTypeAssignabilityError::Unchecked(reason),
-        ) => Some(finding(ReferenceFindingKind::InvalidValue(
-            SecretDiagnosticError::Public(reason.to_string()),
+        ) => Some(finding(ReferenceFindingKind::SchemaUnavailable(
+            SecretDiagnosticError::Public(reason),
         ))),
     }
 }
@@ -6058,8 +6089,8 @@ fn check_attribute_param_ref<B: BindingAddress>(
                 Ok(()) => return,
                 Err(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
                 Err(RefTypeAssignabilityError::Unchecked(reason)) => {
-                    errors.push(finding(ReferenceFindingKind::InvalidValue(
-                        SecretDiagnosticError::Public(reason.to_string()),
+                    errors.push(finding(ReferenceFindingKind::SchemaUnavailable(
+                        SecretDiagnosticError::Public(reason),
                     )));
                     return;
                 }
@@ -6078,7 +6109,7 @@ fn check_attribute_param_ref<B: BindingAddress>(
             if matches!(unknown_policy, UnknownReferencePolicy::Report) =>
         {
             errors.push(finding(ReferenceFindingKind::UnknownAttribute(
-                SecretDiagnosticError::Public(error.to_string()),
+                SecretDiagnosticError::Public(error),
             )));
         }
         RefType::UnknownAttribute(_) | RefType::Unchecked | RefType::UnknownBinding { .. } => {}
@@ -6347,8 +6378,8 @@ fn check_export_ref<B: BindingAddress>(
                 Ok(()) => return,
                 Err(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
                 Err(RefTypeAssignabilityError::Unchecked(reason)) => {
-                    errors.push(finding(ReferenceFindingKind::InvalidValue(
-                        SecretDiagnosticError::Public(reason.to_string()),
+                    errors.push(finding(ReferenceFindingKind::SchemaUnavailable(
+                        SecretDiagnosticError::Public(reason),
                     )));
                     return;
                 }
@@ -6367,7 +6398,7 @@ fn check_export_ref<B: BindingAddress>(
             if matches!(unknown_policy, UnknownReferencePolicy::Report) =>
         {
             errors.push(finding(ReferenceFindingKind::UnknownAttribute(
-                SecretDiagnosticError::Public(error.to_string()),
+                SecretDiagnosticError::Public(error),
             )));
         }
         RefType::UnknownAttribute(_) | RefType::Unchecked | RefType::UnknownBinding { .. } => {}
@@ -10359,3 +10390,64 @@ mod tests;
 
 #[cfg(test)]
 mod secret_tests;
+
+#[cfg(test)]
+mod review15_error_tests {
+    use super::*;
+
+    #[test]
+    fn round15_resource_reference_preserves_the_typed_schema_failure() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse("let source = test.Source {}\n", &config).unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            crate::schema::ResourceSchema::new("Source")
+                .attribute(
+                    crate::schema::AttributeSchema::provider_populated(
+                        "name",
+                        crate::schema::AttributeType::refined_string(
+                            Some(TypeIdentity::from_dotted("test.SourceName")),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &config);
+        let interpolation = lift_type_expr(&INTERPOLATION_REF_SINK).unwrap();
+        let context = ResourceReferenceContext {
+            location: ReferenceFindingLocation::Attribute("name".into()),
+            bindings: &bindings,
+            declared_source: None,
+            interpolation_sink: &interpolation,
+        };
+        let sink = AttributeType::refined_string(
+            Some(TypeIdentity::from_dotted("test.TargetName")),
+            None,
+            None,
+            None,
+        );
+        let owner = crate::parser::SchemaTypeOwner::Provider("test".into());
+        let reference = crate::resource::AuthoredAccessPath::new("source", "name");
+        let finding = check_resource_reference(
+            &context,
+            ReferencePathRef::Access(&reference),
+            Some(RefSink::EffectiveType {
+                attr_type: &sink,
+                defs: crate::schema::empty_defs_for_schema_walks(),
+                ancestry: FieldAncestry::WRITABLE,
+                owner: &owner,
+            }),
+            crate::resource::ResourceRefUsage::Required,
+        )
+        .expect("the unavailable schema must be reported");
+        assert!(
+            matches!(finding.kind, ReferenceFindingKind::SchemaUnavailable(SecretDiagnosticError::Public(error)) if matches!(*error, crate::parser::CustomTypeValidationError::ProvidersNotLoaded))
+        );
+    }
+}

@@ -913,11 +913,19 @@ pub(super) fn attribute_type_to_type_expr(
     schema_owner: &str,
 ) -> TypeExpr {
     if let AttrTypeKind::String {
-        binding: crate::schema::RefinementBinding::Annotation(witness),
+        identity_layer:
+            crate::schema::StringIdentityLayer {
+                binding: crate::schema::RefinementBinding::Annotation(witness),
+                ..
+            },
         ..
     }
     | AttrTypeKind::Int {
-        binding: crate::schema::RefinementBinding::Annotation(witness),
+        identity_layer:
+            crate::schema::IntIdentityLayer {
+                binding: crate::schema::RefinementBinding::Annotation(witness),
+                ..
+            },
         ..
     }
     | AttrTypeKind::Float {
@@ -934,8 +942,14 @@ pub(super) fn attribute_type_to_type_expr(
             return TypeExpr::UnloadedSchemaType(unloaded.clone());
         }
         AttrTypeKind::Reference { identity, .. } => Some(identity),
-        AttrTypeKind::String { binding, .. }
-        | AttrTypeKind::Int { binding, .. }
+        AttrTypeKind::String {
+            identity_layer: crate::schema::StringIdentityLayer { binding, .. },
+            ..
+        }
+        | AttrTypeKind::Int {
+            identity_layer: crate::schema::IntIdentityLayer { binding, .. },
+            ..
+        }
         | AttrTypeKind::Float { binding, .. } => binding.identity(),
         AttrTypeKind::ResourceHandle { .. }
         | AttrTypeKind::StringLiteralSet { .. }
@@ -1766,13 +1780,14 @@ mod tests {
     }
 
     fn owned_vpc_id_type() -> TypeExpr {
+        let schema = vpc_schema().validate().unwrap();
+        let attribute = schema.effective_attribute("vpc_id").unwrap();
         TypeExpr::SchemaType {
-            owned: crate::parser::OwnedTypeIdentity::provider(
+            owned: crate::parser::ResolvedSchemaType::from_schema_declaration(
                 "awscc",
-                TypeIdentity::bare("VpcId"),
-                crate::schema::RefinedScalarKind::String,
+                attribute.value_type().as_type(),
             )
-            .unbounded_witness_for_test(),
+            .unwrap(),
         }
     }
 
@@ -2123,12 +2138,8 @@ mod tests {
         assert_eq!(
             attribute_type_to_type_expr(&region, "aws"),
             TypeExpr::SchemaType {
-                owned: crate::parser::OwnedTypeIdentity::provider(
-                    "aws",
-                    TypeIdentity::new(Some("aws"), Vec::<String>::new(), "Region"),
-                    crate::schema::RefinedScalarKind::String
-                )
-                .unbounded_witness_for_test(),
+                owned: crate::parser::ResolvedSchemaType::from_schema_declaration("aws", &region)
+                    .unwrap(),
             }
         );
     }
@@ -2845,8 +2856,8 @@ export 'annotated_value': inferred resource handle mock.test.Record cannot cross
         // #2493: an `exports` value referencing `<module_call>.<attr>`
         // (e.g. `role_arn = github_actions_carina.role_arn` where
         // `let github_actions_carina = github_module {...}`) must
-        // resolve to the same `TypeExpr` as if the user had annotated
-        // the export explicitly. The module's `attributes { role_arn =
+        // retain the inner attribute's exact schema projection, including
+        // callback provenance. The module's `attributes { role_arn =
         // role.arn }` block lets the type be inferred transitively
         // through the module-call's composition resource (post-expansion)
         // and the inner role's schema attribute.

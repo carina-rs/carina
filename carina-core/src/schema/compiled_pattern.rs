@@ -831,7 +831,10 @@ mod tests {
             let mut nodes = vec![&draft];
             while let Some(node) = nodes.pop() {
                 match node.raw_shape() {
-                    RawShape::String { pattern, .. } => assert!(pattern.is_none()),
+                    RawShape::String {
+                        identity_layer: crate::schema::StringIdentityParts { pattern, .. },
+                        ..
+                    } => assert!(pattern.is_none()),
                     RawShape::Union(members) => nodes.extend(members),
                     RawShape::Int { .. } => {}
                     other => panic!("unexpected builtin shape: {other:?}"),
