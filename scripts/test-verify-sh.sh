@@ -24,6 +24,9 @@ function allowed_script(script) {
     # Diff classification selects jobs; it does not perform verification.
     if (source == ".github/workflows/ci.yml" && job == "changes" &&
         (script == "scripts/classify-ci-diff.sh" || script == "scripts/touched-crates.sh")) return 1
+    # Release tag classification selects the publication channel.
+    if (source == ".github/workflows/release.yml" && job == "tag" &&
+        script == "scripts/release-tag-channel.sh") return 1
     # Archive consumers must require their downloaded WASM artifacts.
     if (source == ".github/workflows/ci.yml" &&
         (job == "test-partition" || job == "test-isolation") &&
@@ -284,6 +287,16 @@ class VerifyGuardTests(unittest.TestCase):
                                       f"    - shell: bash\n      run: {run}\n")
                     self.guard(f".github/actions/nested/bypass/action.{suffix}:")
             action.unlink()
+
+    def test_release_tag_channel_is_only_allowed_in_release_tag_job(self):
+        self.ci.write_text(self.original_ci.replace(
+            "run: scripts/verify.sh clippy\n",
+            'run: bash scripts/release-tag-channel.sh "$GITHUB_REF_NAME"\n', 1))
+        self.guard("bypasses verify.sh")
+        self.ci.write_text(self.original_ci)
+        release = self.root / ".github/workflows/release.yml"
+        release.write_text(release.read_text().replace("  tag:\n", "  other:\n", 1))
+        self.guard("bypasses verify.sh")
 
     def test_continue_on_error_is_rejected_at_job_and_step_scope(self):
         for value in ("true", "false", "${{ always() }}"):

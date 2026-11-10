@@ -168,6 +168,12 @@ class TouchedCratesTests(unittest.TestCase):
             with self.subTest(filename=filename):
                 self.assertEqual(self.scope(filename), "")
 
+    def test_release_scripts_do_not_select_rust_crates(self):
+        for filename in ("scripts/release-tag-channel.sh", "scripts/test-release-tag-channel.sh",
+                         ".github/workflows/release.yml"):
+            with self.subTest(filename=filename):
+                self.assertEqual(self.scope(filename), "")
+
     def test_known_non_code_paths_from_main_ci_remain_ignorable(self):
         for filename in ("Makefile", "LICENSE", "LICENSE-APACHE", "release.toml", "clippy.toml",
                          "packaging/homebrew/carina.rb.template", "assets/header.png",
