@@ -6841,10 +6841,7 @@ pub(crate) fn assert_default_tag_value_encodable<P: crate::resource::Placeholder
     value: &crate::resource::knowledge::Classification<'_, P>,
 ) -> Result<(), SerializationError> {
     use crate::resource::knowledge::{Classification, KnownValue, KnownView, ShapeView};
-    if crate::resource::knowledge::ClassifiedRef::from(value)
-        .secret()
-        .is_some()
-    {
+    if crate::resource::knowledge::ClassifiedRef::from(value).is_protected() {
         return Ok(());
     }
     fn known<P: crate::resource::PlaceholderKind>(

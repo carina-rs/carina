@@ -5145,36 +5145,39 @@ impl Ord for FitExactness {
 /// The witness owns every nested Union choice and resolved enum value. A
 /// canonicalization caller can therefore walk the chosen tree without running
 /// validation or enum resolution a second time.
+#[derive(Clone)]
 pub(crate) struct Fit<'a> {
     exactness: FitExactness,
     pub(crate) attr: ResolvedAttrType<'a, Compiled>,
     pub(crate) kind: FitKind<'a>,
 }
 
+#[derive(Clone)]
 pub(crate) enum FitKind<'a> {
     PassThrough,
     Deferred(PendingFit),
     Failed,
     HistoricalOpaque,
-    Secret(Box<Fit<'a>>),
+    Secret(Arc<Fit<'a>>),
     Coalesce {
-        value: Box<Fit<'a>>,
-        default: Box<Fit<'a>>,
+        value: Arc<Fit<'a>>,
+        default: Arc<Fit<'a>>,
     },
     Enum {
         canonical: CanonicalEnumValue,
         rewrite: bool,
     },
-    List(Vec<Fit<'a>>),
-    StringList(Vec<Fit<'a>>),
-    Map(Vec<MapEntryFit<'a>>),
-    Struct(Vec<Fit<'a>>),
+    List(Arc<[Fit<'a>]>),
+    StringList(Arc<[Fit<'a>]>),
+    Map(Arc<[MapEntryFit<'a>]>),
+    Struct(Arc<[Fit<'a>]>),
     Union {
         member: &'a CompiledAttributeType,
-        fit: Box<Fit<'a>>,
+        fit: Arc<Fit<'a>>,
     },
 }
 
+#[derive(Clone)]
 pub(crate) struct MapEntryFit<'a> {
     pub(crate) canonical_key: Option<String>,
     pub(crate) value: Fit<'a>,
@@ -5335,6 +5338,26 @@ impl Fit<'_> {
     }
 }
 
+impl InsideSecret for Fit<'_> {
+    fn inside_secret(self) -> Self {
+        Self::with_kind(
+            self.exactness,
+            self.attr.as_attr(),
+            FitKind::Secret(Arc::new(self)),
+        )
+    }
+}
+
+impl InsideSecret for Option<Fit<'_>> {
+    fn inside_secret(self) -> Self {
+        self.map(InsideSecret::inside_secret)
+    }
+}
+
+/// Only the schema walk may open classified protection; its knowledge cursor
+/// requires a result that is protected before leaving the callback.
+pub(crate) struct SchemaEvidenceAuthority(());
+
 impl PartialEq for Fit<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.exactness == other.exactness
@@ -5457,30 +5480,17 @@ fn inspect_value_structure_on_path<
         | AT::Union(_)
         | AT::Ref(_) => {}
     }
-    if let Some(inner) = value.secret() {
-        let inner = inner
-            .try_project_plaintext(|value| {
-                let knowledge = value
-                    .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
-                    .map(|proof| proof.into_classification())
-                    .map_err(|_| ())?;
-                inspect_value_structure_on_path(
-                    attr,
-                    (&knowledge).into(),
-                    defs,
-                    ancestry.inside_secret(),
-                    purpose,
-                    visited_refs,
-                )
-                .ok_or(())
-            })
-            .ok()?;
-        let exactness = inner.exactness;
-        return Some(Fit::with_kind(
-            exactness,
-            attr,
-            FitKind::Secret(Box::new(inner)),
-        ));
+    if let Some(inner) = value.protected_for_schema(&SchemaEvidenceAuthority(())) {
+        return inner.validate(|evidence| {
+            inspect_value_structure_on_path(
+                attr,
+                evidence,
+                defs,
+                ancestry.inside_secret(),
+                purpose,
+                visited_refs,
+            )
+        });
     }
 
     if let Some((value, default)) = value.coalesce() {
@@ -5506,8 +5516,8 @@ fn inspect_value_structure_on_path<
             exactness,
             attr,
             FitKind::Coalesce {
-                value: Box::new(value_fit),
-                default: Box::new(default_fit),
+                value: Arc::new(value_fit),
+                default: Arc::new(default_fit),
             },
         ));
     }
@@ -5541,7 +5551,7 @@ fn inspect_value_structure_on_path<
                         attr,
                         FitKind::Union {
                             member: selected.member,
-                            fit: Box::new(selected.fit),
+                            fit: Arc::new(selected.fit),
                         },
                     ))
                 }
@@ -5650,7 +5660,11 @@ fn inspect_value_structure_on_path<
                 exactness.combine(child.exactness);
                 item_fits.push(child);
             }
-            Some(Fit::with_kind(exactness, attr, FitKind::List(item_fits)))
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::List(item_fits.into()),
+            ))
         }
         (
             AT::List {
@@ -5689,7 +5703,7 @@ fn inspect_value_structure_on_path<
             Some(Fit::with_kind(
                 exactness,
                 attr,
-                FitKind::StringList(item_fits),
+                FitKind::StringList(item_fits.into()),
             ))
         }
         (
@@ -5734,7 +5748,11 @@ fn inspect_value_structure_on_path<
                     value: value_fit,
                 });
             }
-            Some(Fit::with_kind(exactness, attr, FitKind::Map(entry_fits)))
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::Map(entry_fits.into()),
+            ))
         }
         (
             AT::Struct {
@@ -5780,7 +5798,11 @@ fn inspect_value_structure_on_path<
                 exactness.combine(child.exactness);
                 field_fits.push(child);
             }
-            Some(Fit::with_kind(exactness, attr, FitKind::Struct(field_fits)))
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::Struct(field_fits.into()),
+            ))
         }
         (AT::Union(members), _) => {
             let selected = inspect_union_structure_on_path(
@@ -5797,7 +5819,7 @@ fn inspect_value_structure_on_path<
                 attr,
                 FitKind::Union {
                     member: selected.member,
-                    fit: Box::new(selected.fit),
+                    fit: Arc::new(selected.fit),
                 },
             ))
         }
@@ -5934,7 +5956,7 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
         return Some(Fit::with_kind(
             exactness,
             attr,
-            FitKind::Secret(Box::new(inner)),
+            FitKind::Secret(Arc::new(inner)),
         ));
     }
 
@@ -5961,8 +5983,8 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
             exactness,
             attr,
             FitKind::Coalesce {
-                value: Box::new(value_fit),
-                default: Box::new(default_fit),
+                value: Arc::new(value_fit),
+                default: Arc::new(default_fit),
             },
         ));
     }
@@ -5995,7 +6017,7 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
                     attr,
                     FitKind::Union {
                         member: selected.member,
-                        fit: Box::new(selected.fit),
+                        fit: Arc::new(selected.fit),
                     },
                 ))
             }
@@ -6098,7 +6120,11 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
                 exactness.combine(child.exactness);
                 item_fits.push(child);
             }
-            Some(Fit::with_kind(exactness, attr, FitKind::List(item_fits)))
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::List(item_fits.into()),
+            ))
         }
         (
             AT::List {
@@ -6137,7 +6163,7 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
             Some(Fit::with_kind(
                 exactness,
                 attr,
-                FitKind::StringList(item_fits),
+                FitKind::StringList(item_fits.into()),
             ))
         }
         (
@@ -6178,7 +6204,11 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
                     value: value_fit,
                 });
             }
-            Some(Fit::with_kind(exactness, attr, FitKind::Map(entry_fits)))
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::Map(entry_fits.into()),
+            ))
         }
         (
             AT::Struct {
@@ -6223,7 +6253,11 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
                 exactness.combine(child.exactness);
                 field_fits.push(child);
             }
-            Some(Fit::with_kind(exactness, attr, FitKind::Struct(field_fits)))
+            Some(Fit::with_kind(
+                exactness,
+                attr,
+                FitKind::Struct(field_fits.into()),
+            ))
         }
         (AT::Union(members), _) => {
             let selected = inspect_union_structure_on_path_snapshot(
@@ -6240,7 +6274,7 @@ fn inspect_value_structure_on_path_snapshot<'a, P: PlaceholderKind, B: BindingAd
                 attr,
                 FitKind::Union {
                     member: selected.member,
-                    fit: Box::new(selected.fit),
+                    fit: Arc::new(selected.fit),
                 },
             ))
         }
@@ -13178,7 +13212,7 @@ fn block_struct_fits<'fit, 'schema, P: PlaceholderKind, B: BindingAddress>(
         return HashMap::new();
     };
     map.iter()
-        .zip(fits)
+        .zip(fits.iter())
         .filter_map(|((key, value), fit)| {
             fields
                 .canonical_name(

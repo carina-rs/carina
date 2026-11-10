@@ -747,8 +747,25 @@ pub struct KnownValue<
     P: PlaceholderKind = NoPlaceholder,
     B: BindingAddress = AbsoluteBindingAddress,
 > {
+    identity: KnownNodeId,
     node: Arc<kernel::KnownNode<'a, P, B>>,
     source: &'a Value<P, B>,
+}
+
+/// The allocation is retained by memo keys, so a temporary classification's
+/// address cannot be recycled into another node's cached judgement.
+#[derive(Clone)]
+pub(crate) struct KnownNodeId(Arc<()>);
+impl PartialEq for KnownNodeId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for KnownNodeId {}
+impl std::hash::Hash for KnownNodeId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&Arc::as_ptr(&self.0), state);
+    }
 }
 
 #[derive(Clone)]
@@ -1210,6 +1227,9 @@ impl<P: PlaceholderKind> ProtectedSecret<'_, P, AbsoluteBindingAddress> {
     }
 }
 impl<'a, P: PlaceholderKind, B: BindingAddress> KnownValue<'a, P, B> {
+    pub(crate) fn node_id(&self) -> KnownNodeId {
+        self.identity.clone()
+    }
     /// The apply-specific projection accepts only `Knowledge<Apply>`. A fully
     /// known, stage-independent proof can also come from `Classification::into_known`.
     ///
@@ -1500,6 +1520,7 @@ pub(crate) trait StructuralPending<'a, P: PlaceholderKind + 'a, B: BindingAddres
     Sized
 {
     fn structure(&self) -> PendingStructure<'_, 'a, P, B, Self>;
+    fn protected(&self) -> Option<&ProtectedSecret<'a, P, B>>;
     fn source(&self) -> &'a Value<P, B> {
         self.structure().source
     }
@@ -1520,6 +1541,12 @@ pub(crate) trait StructuralPending<'a, P: PlaceholderKind + 'a, B: BindingAddres
     }
 }
 impl<'a, P: PlaceholderKind, B: BindingAddress> StructuralPending<'a, P, B> for Pending<'a, P, B> {
+    fn protected(&self) -> Option<&ProtectedSecret<'a, P, B>> {
+        match self.node.as_ref() {
+            kernel::PendingNode::Secret { protected, .. } => Some(protected),
+            kernel::PendingNode::Ordinary(_) | kernel::PendingNode::Coalesce(_) => None,
+        }
+    }
     fn structure(&self) -> PendingStructure<'_, 'a, P, B, Self> {
         let (coalesce, branches) = match self.node.as_ref() {
             kernel::PendingNode::Coalesce(pending) => (
@@ -1557,6 +1584,12 @@ impl<'a, P: PlaceholderKind, B: BindingAddress> StructuralPending<'a, P, B> for 
 impl<'a, P: PlaceholderKind, B: BindingAddress> StructuralPending<'a, P, B>
     for ApplyPending<'a, P, B>
 {
+    fn protected(&self) -> Option<&ProtectedSecret<'a, P, B>> {
+        match self.node.as_ref() {
+            kernel::PendingNode::Secret { protected, .. } => Some(protected),
+            kernel::PendingNode::Ordinary(_) | kernel::PendingNode::Coalesce(_) => None,
+        }
+    }
     fn structure(&self) -> PendingStructure<'_, 'a, P, B, Self> {
         // Authored alternatives have already been checked before projection.
         PendingStructure {
@@ -1635,7 +1668,10 @@ impl<'s, 'a, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'a, P, 
             Self::Pending(_) | Self::Failed(_) => None,
         }
     }
-    pub(crate) fn secret(self) -> Option<&'a SecretPayload<P, B>> {
+    pub(crate) fn is_protected(self) -> bool {
+        self.secret().is_some()
+    }
+    pub(super) fn secret(self) -> Option<&'a SecretPayload<P, B>> {
         match self {
             Self::Known(value) => match value.node.as_ref() {
                 kernel::KnownNode::Secret(secret) => Some(secret.payload),
@@ -1656,6 +1692,32 @@ impl<'s, 'a, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'a, P, 
                 _ => None,
             },
         }
+    }
+    /// Schema traversal can inspect the cached inner proof only through an
+    /// operation that protects its result before leaving this scope.
+    pub(crate) fn protected_for_schema(
+        self,
+        _authority: &crate::schema::SchemaEvidenceAuthority,
+    ) -> Option<ProtectedSchemaEvidence<'s, 'a, P, B>> {
+        let protected = match self {
+            Self::Known(value) => match value.node.as_ref() {
+                kernel::KnownNode::Secret(protected) => Some(protected),
+                kernel::KnownNode::String(_)
+                | kernel::KnownNode::EnumIdentifier(_)
+                | kernel::KnownNode::CanonicalEnum(_)
+                | kernel::KnownNode::Int(_)
+                | kernel::KnownNode::Float(_)
+                | kernel::KnownNode::Bool(_)
+                | kernel::KnownNode::Duration(_)
+                | kernel::KnownNode::List(_)
+                | kernel::KnownNode::StringList(_)
+                | kernel::KnownNode::Map(_) => None,
+            },
+            Self::Shape(_) => None,
+            Self::Pending(value) => value.protected(),
+            Self::Failed(value) => value.protected.as_ref(),
+        }?;
+        Some(ProtectedSchemaEvidence(protected))
     }
     pub(crate) fn list(self) -> Option<Vec<Self>> {
         match self {
@@ -1764,6 +1826,18 @@ impl<'s, 'a, P: PlaceholderKind, B: BindingAddress, T: StructuralPending<'a, P, 
                 .map(|values| values.into_iter().map(Self::from).collect()),
             Self::Known(_) | Self::Shape(_) | Self::Failed(_) => None,
         }
+    }
+}
+
+pub(crate) struct ProtectedSchemaEvidence<'s, 'a, P: PlaceholderKind, B: BindingAddress>(
+    &'s ProtectedSecret<'a, P, B>,
+);
+impl<'s, 'a, P: PlaceholderKind, B: BindingAddress> ProtectedSchemaEvidence<'s, 'a, P, B> {
+    pub(crate) fn validate<R: InsideSecret>(
+        self,
+        validate: impl FnOnce(ClassifiedRef<'s, 'a, P, B>) -> R,
+    ) -> R {
+        validate(self.0.evidence.as_ref().into()).inside_secret()
     }
 }
 
@@ -2812,6 +2886,7 @@ fn classify_value<
     use kernel::{Input, InputValue, KnownNode as N};
     let known = |node| {
         Ok(Classification::Known(KnownValue {
+            identity: KnownNodeId(Arc::new(())),
             source: value,
             node: Arc::new(node),
         }))

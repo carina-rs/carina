@@ -195,17 +195,17 @@ impl UnionSelections {
                 self.retain(value, selected, graph);
             }
             FitKind::Struct(fits) => {
-                for (value, fit) in graph.children(value).zip(fits) {
+                for (value, fit) in graph.children(value).zip(fits.iter()) {
                     self.retain(value, fit, graph);
                 }
             }
             FitKind::Map(fits) => {
-                for (value, fit) in graph.children(value).zip(fits) {
+                for (value, fit) in graph.children(value).zip(fits.iter()) {
                     self.retain(value, &fit.value, graph);
                 }
             }
             FitKind::List(fits) | FitKind::StringList(fits) => {
-                for (value, fit) in graph.children(value).zip(fits) {
+                for (value, fit) in graph.children(value).zip(fits.iter()) {
                     self.retain(value, fit, graph);
                 }
             }

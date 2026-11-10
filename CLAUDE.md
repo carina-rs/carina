@@ -706,6 +706,11 @@ A struct type represents a nested object with typed fields.
   authority; unavailable provider validation remains pending and never selects
   a branch by structural declaration order alone. The same authority travels
   through admitted provider-ready values and their protected update capability.
+  Recursive admission memoizes declaration/node judgements, including provider
+  callbacks, ancestry and reference guards. Fit children share immutable witnesses
+  rather than copying subtrees on memo hits. Schema walkers consume cached
+  protected classifications through a scoped capability that protects results
+  before returning; they never reopen those payloads for classification.
   Authored checks require immutable parser/admission-minted `AuthoredInputs`;
   mutating public AST fields cannot reseal their snapshot. Every successful module
   publication retains resource authority even if provider configuration fails;

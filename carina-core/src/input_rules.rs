@@ -23,6 +23,8 @@ pub use type_context::{InputCompositions, InputTypeContext};
 pub(crate) use union_fits::{InputSelectionAuthority, InputUnionAdmission};
 
 #[cfg(test)]
+mod admission_budget_tests;
+#[cfg(test)]
 mod boundary_tests;
 #[cfg(test)]
 mod condition_tests;
