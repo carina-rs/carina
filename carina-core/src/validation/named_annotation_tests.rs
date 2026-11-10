@@ -225,16 +225,16 @@ fn declaration<'a>(
         .attr_type()
 }
 
-fn assignment_outcome(
+fn assign(
     source: &AttributeType,
     sink: &AttributeType,
     snapshot: &LoadedProviderSnapshot,
     owner: &str,
-) -> crate::schema::LoadedTypeAssignment {
+) -> bool {
     let owner = crate::parser::SchemaTypeOwner::Provider(owner.into());
     source
         .in_schema(crate::schema::empty_defs_for_schema_walks())
-        .assignment_to(
+        .is_assignable_to(
             sink.in_schema(crate::schema::empty_defs_for_schema_walks())
                 .with_authority(
                     &snapshot
@@ -244,19 +244,6 @@ fn assignment_outcome(
                     crate::schema::SinkAuthority::Owner(&owner),
                 ),
         )
-        .require_loaded()
-        .unwrap()
-}
-
-fn assign(
-    source: &AttributeType,
-    sink: &AttributeType,
-    snapshot: &LoadedProviderSnapshot,
-    owner: &str,
-) -> bool {
-    assignment_outcome(source, sink, snapshot, owner)
-        .require_proven()
-        .expect("test requires a static proof")
 }
 
 #[test]
@@ -345,10 +332,7 @@ fn identity_annotations_ignore_member_order_and_keep_every_owner() {
         assert!(lifted.validate(&text(value)).is_err());
     }
     for (owner, index) in [("p", 0), ("p", 1), ("q", 0)] {
-        assert!(matches!(
-            assignment_outcome(&lifted, declaration(&a, owner, index), &a, owner),
-            crate::schema::LoadedTypeAssignment::NeedsLocal(_)
-        ));
+        assert!(assign(&lifted, declaration(&a, owner, index), &a, owner));
     }
     let restored: TypeExpr =
         serde_json::from_value(serde_json::to_value(annotation(&a)).unwrap()).unwrap();
@@ -397,12 +381,42 @@ fn numeric_annotation_intersections_preserve_effective_ranges() {
             "range 8.5..=64.5",
         ),
     ] {
-        let a = snapshot(vec![("p", declarations.clone())]);
-        let b = snapshot(vec![("p", declarations.into_iter().rev().collect())]);
+        // Float has no member layer: differing reusable definitions belong
+        // to different owners, whose annotation constraints still conjoin.
+        let is_float = matches!(
+            declarations[0].raw_shape(),
+            crate::schema::RawShape::Float { .. }
+        );
+        let (a, b, second_owner, second_index) = if is_float {
+            (
+                snapshot(vec![
+                    ("p", vec![declarations[0].clone()]),
+                    ("q", vec![declarations[1].clone()]),
+                ]),
+                snapshot(vec![
+                    ("q", vec![declarations[1].clone()]),
+                    ("p", vec![declarations[0].clone()]),
+                ]),
+                "q",
+                0,
+            )
+        } else {
+            (
+                snapshot(vec![("p", declarations.clone())]),
+                snapshot(vec![("p", declarations.into_iter().rev().collect())]),
+                "p",
+                1,
+            )
+        };
         assert_eq!(annotation(&a), annotation(&b));
         let lifted = lift_type_expr(&annotation(&a)).unwrap();
         assert!(assign(&lifted, declaration(&a, "p", 0), &a, "p"));
-        assert!(assign(&lifted, declaration(&a, "p", 1), &a, "p"));
+        assert!(assign(
+            &lifted,
+            declaration(&a, second_owner, second_index),
+            &a,
+            second_owner
+        ));
         assert!(lifted.validate(&integer(16)).is_ok());
         assert!(lifted.validate(&integer(7)).is_err());
         assert!(lifted.validate(&integer(65)).is_err());
@@ -578,9 +592,11 @@ fn read_projections_keep_identity_constraints_without_slot_members() {
         }
     ));
     assert_eq!(exact, annotation(&snapshot));
-    assert!(matches!(
-        assignment_outcome(&lifted, declaration(&snapshot, "p", 1), &snapshot, "p"),
-        crate::schema::LoadedTypeAssignment::NeedsLocal(_)
+    assert!(assign(
+        &lifted,
+        declaration(&snapshot, "p", 1),
+        &snapshot,
+        "p"
     ));
     typecheck::check_type_expr_value(
         &exact,
@@ -1255,20 +1271,34 @@ fn unbounded_annotation_constraints_admit_explicitly_unbounded_schema_declaratio
             DraftType::refined_float(Some(identity()), Some((None, None))),
         ],
     ] {
-        let snapshot = snapshot(vec![("p", declarations)]);
+        let is_float = matches!(
+            declarations[0].raw_shape(),
+            crate::schema::RawShape::Float { .. }
+        );
+        let (snapshot, locations) = if is_float {
+            (
+                snapshot(vec![
+                    ("p", vec![declarations[0].clone()]),
+                    ("q", vec![declarations[1].clone()]),
+                ]),
+                [("p", 0), ("q", 0)],
+            )
+        } else {
+            (snapshot(vec![("p", declarations)]), [("p", 0), ("p", 1)])
+        };
         let lifted = lift_type_expr(&annotation(&snapshot)).unwrap();
-        for index in [0, 1] {
+        for (owner, index) in locations {
             assert!(assign(
                 &lifted,
-                declaration(&snapshot, "p", index),
+                declaration(&snapshot, owner, index),
                 &snapshot,
-                "p"
+                owner
             ));
             assert!(assign(
-                declaration(&snapshot, "p", index),
+                declaration(&snapshot, owner, index),
                 &lifted,
                 &snapshot,
-                "p"
+                owner
             ));
         }
     }
@@ -2817,20 +2847,25 @@ fn annotation_records_accept_empty_bounds_with_consistent_evidence() {
 
 #[test]
 fn within_owner_disjoint_float_annotation_round_trips() {
-    let loaded = snapshot(vec![(
+    // Exercise the conjunction record directly, including repeated same-owner
+    // evidence. Such conflicting definitions are no longer provider-admissible.
+    let declaration = |min, max| {
+        AttributeType::refined_float(
+            Some(identity()),
+            Some((Some(crate::finite(min)), Some(crate::finite(max)))),
+        )
+    };
+    let first =
+        crate::parser::ResolvedSchemaType::from_annotation_declaration("p", &declaration(1.0, 4.0))
+            .unwrap();
+    let second = crate::parser::ResolvedSchemaType::from_annotation_declaration(
         "p",
-        vec![
-            DraftType::refined_float(
-                Some(identity()),
-                Some((Some(crate::finite(1.0)), Some(crate::finite(4.0)))),
-            ),
-            DraftType::refined_float(
-                Some(identity()),
-                Some((Some(crate::finite(8.0)), Some(crate::finite(12.0)))),
-            ),
-        ],
-    )]);
-    let original = annotation(&loaded);
+        &declaration(8.0, 12.0),
+    )
+    .unwrap();
+    let original = TypeExpr::SchemaType {
+        owned: first.conjoin(&second),
+    };
     let TypeExpr::SchemaType { owned } = &original else {
         panic!("annotation")
     };
@@ -3015,61 +3050,5 @@ fn round12_unknown_function_return_rechecks_destination_member_at_resolution() {
                 assert_eq!(message.matches("value1:").count(), 1, "{message}");
             }
         });
-    }
-}
-
-#[test]
-fn round14_declared_binding_value_consumer_checks_members_once() {
-    let id = TypeIdentity::from_dotted("aws.Name");
-    let source =
-        DraftType::refined_string(Some(id.clone()), None, Some((Some(1), Some(100))), None);
-    let target = DraftType::string_member(
-        crate::schema::StringIdentityLayer::new(Some(id), None, Some((Some(1), Some(100))), None),
-        crate::schema::StringMemberConstraints::new(None, Some((Some(1), Some(10)))),
-    );
-    let loaded = snapshot(vec![("p", vec![source, target])]);
-    let declared = inference::attribute_type_to_type_expr(declaration(&loaded, "p", 0), "p");
-    let owner = crate::parser::SchemaTypeOwner::Provider("p".into());
-    let sink = RefSink::EffectiveType {
-        attr_type: declaration(&loaded, "p", 1),
-        defs: crate::schema::empty_defs_for_schema_walks(),
-        ancestry: FieldAncestry::WRITABLE,
-        owner: &owner,
-    };
-    for length in [5, 50] {
-        let value = text("A".repeat(length));
-        let result = declared_value_assignable_to_sink(
-            "label",
-            &declared,
-            &value,
-            sink,
-            typecheck::TypecheckProviderContext::loaded(loaded.provider_context()),
-            loaded.schema_registry(),
-        );
-        assert_eq!(result.is_ok(), length == 5, "{result:?}");
-        if let Err(error) = result {
-            assert_eq!(
-                error.to_string().matches("outside allowed range").count(),
-                1
-            );
-        }
-        let assignment = crate::schema::TypeInSchema::schemaless(declaration(&loaded, "p", 0))
-            .assignment_to(
-                crate::schema::TypeInSchema::schemaless(declaration(&loaded, "p", 1))
-                    .with_authority(
-                        &loaded.provider_context().custom_types,
-                        crate::schema::SinkAuthority::Owner(&owner),
-                    ),
-            )
-            .require_loaded()
-            .unwrap();
-        let result = check_loaded_assignment_value(assignment, &value, FieldAncestry::WRITABLE);
-        assert_eq!(result.is_ok(), length == 5, "{result:?}");
-        if let Err(error) = result {
-            assert_eq!(
-                error.to_string().matches("outside allowed range").count(),
-                1
-            );
-        }
     }
 }

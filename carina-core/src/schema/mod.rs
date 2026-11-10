@@ -246,10 +246,6 @@ use crate::value::{
 };
 
 pub(crate) mod assignability;
-mod assignment_obligation;
-pub use assignment_obligation::{
-    AdmittedTypeAssignment, DestinationObligation, LoadedTypeAssignment,
-};
 mod assignability_edges;
 mod fingerprint;
 mod resolved_attr_type;
@@ -3584,13 +3580,12 @@ impl PatternAttributeType<Compiled> {
                     }
                 }
                 validate_string_refinement(binding.identity(), None, *length, s)?;
-                validate_string_refinement(
+                validate_string_member_refinement(
                     binding.identity(),
                     member_layer.pattern.as_ref(),
-                    None,
+                    member_layer.length,
                     s,
                 )?;
-                validate_string_refinement(binding.identity(), None, member_layer.length, s)?;
                 binding
                     .callback()
                     .map_or(Ok(()), |validate| validate(&value.to_owned_value()))
@@ -3883,14 +3878,11 @@ impl<R: PatternForm> TypeInSchema<'_, R> {
     /// source would re-introduce the silent-false-positive class that #2218
     /// closed. Both exceptions above are limited to identity-less sinks and
     /// do not weaken those comparisons.
-    #[cfg(test)]
-    pub(crate) fn is_assignable_to(self, sink: AssignmentSink<'_, R>) -> bool {
+    pub fn is_assignable_to(self, sink: AssignmentSink<'_, R>) -> bool {
         match self.assignment_to(sink) {
             TypeAssignability::Assignable => true,
-            TypeAssignability::Mismatch | TypeAssignability::Unchecked(_) => false,
-            TypeAssignability::NeedsLocal(obligation) => {
-                panic!("test must explicitly check the pending destination: {obligation:?}")
-            }
+            TypeAssignability::Mismatch => false,
+            TypeAssignability::Unchecked(_) => false,
         }
     }
 }
@@ -4798,7 +4790,33 @@ fn validate_string_refinement(
     length: Option<(Option<u64>, Option<u64>)>,
     s: &ValueString,
 ) -> Result<(), TypeError> {
-    let type_name = identity.map(|id| id.kind.clone());
+    inspect_string_refinement(identity.map(|id| id.kind.clone()), pattern, length, s)
+}
+
+fn validate_string_member_refinement(
+    identity: Option<&TypeIdentity>,
+    pattern: Option<&CompiledPattern>,
+    length: Option<(Option<u64>, Option<u64>)>,
+    value: &ValueString,
+) -> Result<(), TypeError> {
+    if pattern.is_none() && length.is_none() {
+        return Ok(());
+    }
+    let identity = identity.map_or_else(|| "String".into(), ToString::to_string);
+    inspect_string_refinement(
+        Some(format!("{identity} (slot member constraint)")),
+        pattern,
+        length,
+        value,
+    )
+}
+
+fn inspect_string_refinement(
+    type_name: Option<String>,
+    pattern: Option<&CompiledPattern>,
+    length: Option<(Option<u64>, Option<u64>)>,
+    s: &ValueString,
+) -> Result<(), TypeError> {
     if let Some(pattern) = pattern
         && !pattern.is_match(s.expose_plaintext())
     {

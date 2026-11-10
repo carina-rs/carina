@@ -232,7 +232,6 @@ pub(crate) struct DeclaredValueSource {
 
 pub(crate) enum DeclaredValueAssignment {
     Assignable,
-    NeedsLocal(crate::schema::DestinationObligation),
     Rejected(RefTypeAssignabilityError),
     /// The incoming module boundary rejects this source before a later sink.
     /// Its existing call-boundary diagnostic owns the failure.
@@ -240,14 +239,9 @@ pub(crate) enum DeclaredValueAssignment {
 }
 
 impl DeclaredValueAssignment {
-    pub(crate) fn from_result(
-        result: Result<crate::schema::AdmittedTypeAssignment, RefTypeAssignabilityError>,
-    ) -> Self {
+    pub(crate) fn from_result(result: Result<(), RefTypeAssignabilityError>) -> Self {
         match result {
-            Ok(crate::schema::AdmittedTypeAssignment::Assignable) => Self::Assignable,
-            Ok(crate::schema::AdmittedTypeAssignment::NeedsLocal(obligation)) => {
-                Self::NeedsLocal(obligation)
-            }
+            Ok(()) => Self::Assignable,
             Err(error) => Self::Rejected(error),
         }
     }
@@ -262,11 +256,11 @@ impl DeclaredValueSource {
         &self.original
     }
 
-    pub(crate) fn incoming_assignment<B: BindingAddress>(
+    pub(crate) fn incoming_mismatch<B: BindingAddress>(
         &self,
         bindings: &BindingIndex<'_, B>,
-    ) -> crate::schema::TypeAssignability<'static> {
-        self.original.assignment_at(
+    ) -> bool {
+        self.original.has_proven_mismatch_at(
             self.declaration
                 .assignment_sink(&bindings.provider_context().custom_types),
         )
@@ -346,23 +340,15 @@ impl ResolvedRefType {
         use crate::schema::assignability::AssignmentRelation;
         let mut relations = Vec::new();
         for (index, constraint) in self.constraints().enumerate() {
-            match judge(constraint) {
-                AssignmentRelation::Mismatch => {
-                    return Err(RefTypeMismatch {
-                        types: crate::schema::MismatchTypeNames::for_types(*sink, constraint),
-                        declared: (index > 0
-                            && self.authoritative.is_declared_composition_attribute())
+            let relation = judge(constraint);
+            if let AssignmentRelation::Mismatch = relation {
+                return Err(RefTypeMismatch {
+                    types: crate::schema::MismatchTypeNames::for_types(*sink, constraint),
+                    declared: (index > 0 && self.authoritative.is_declared_composition_attribute())
                         .then(|| self.display_type_name()),
-                    });
-                }
-                AssignmentRelation::Assignable => relations.push(AssignmentRelation::Assignable),
-                AssignmentRelation::NeedsLocal(obligation) => {
-                    relations.push(AssignmentRelation::NeedsLocal(obligation))
-                }
-                AssignmentRelation::Unchecked(schema) => {
-                    relations.push(AssignmentRelation::Unchecked(schema))
-                }
+                });
             }
+            relations.push(relation);
         }
         Ok(AssignmentRelation::all(relations))
     }
@@ -528,22 +514,23 @@ impl ResolvedRefType {
         &self,
         sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
         bindings: &BindingIndex<'_, B>,
-    ) -> Result<crate::schema::AdmittedTypeAssignment, RefTypeAssignabilityError> {
+    ) -> Result<(), RefTypeAssignabilityError> {
         self.check_assignment(*sink, |source| bindings.check_type_assignment(source, sink))
     }
 
-    /// Inspect all incoming evidence without erasing a local obligation or
-    /// recording unavailable-provider evidence. The caller owns the outcome.
-    pub(crate) fn assignment_at(
+    /// Inspect an incoming boundary without consuming or recording deferrals.
+    pub(crate) fn has_proven_mismatch_at(
         &self,
         sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
-    ) -> crate::schema::TypeAssignability<'static> {
-        crate::schema::TypeAssignability::all(
-            std::iter::once(self.authoritative.constraint())
-                .chain(&self.evidence)
-                .map(|source| source.type_in_schema().assignment_to(sink)),
-        )
-        .into_owned()
+    ) -> bool {
+        std::iter::once(self.authoritative.constraint())
+            .chain(&self.evidence)
+            .any(|source| {
+                matches!(
+                    source.type_in_schema().assignment_to(sink),
+                    crate::schema::TypeAssignability::Mismatch,
+                )
+            })
     }
 
     pub(crate) fn check_assignment(
@@ -551,43 +538,33 @@ impl ResolvedRefType {
         expected: TypeInSchema<'_, crate::schema::Compiled>,
         mut judge: impl FnMut(
             TypeInSchema<'_, crate::schema::Compiled>,
-        ) -> Result<
-            crate::schema::LoadedTypeAssignment,
-            crate::parser::CustomTypeValidationError,
-        >,
-    ) -> Result<crate::schema::AdmittedTypeAssignment, RefTypeAssignabilityError> {
-        use crate::schema::{AdmittedTypeAssignment, DestinationObligation, LoadedTypeAssignment};
+        ) -> Result<bool, crate::parser::CustomTypeValidationError>,
+    ) -> Result<(), RefTypeAssignabilityError> {
         let authoritative = self.authoritative.constraint().type_in_schema();
-        let mut local: Option<DestinationObligation> = None;
-        for (source, inferred) in std::iter::once((authoritative, false)).chain(
-            self.evidence
-                .iter()
-                .map(|evidence| (evidence.type_in_schema(), true)),
-        ) {
-            match judge(source)
+        if !judge(authoritative)
+            .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
+        {
+            return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
+                types: crate::schema::MismatchTypeNames::for_types(expected, authoritative),
+                declared: None,
+            }));
+        }
+
+        for evidence in &self.evidence {
+            let evidence = evidence.type_in_schema();
+            if !judge(evidence)
                 .map_err(|reason| RefTypeAssignabilityError::Unchecked(Box::new(reason)))?
             {
-                LoadedTypeAssignment::Assignable => {}
-                LoadedTypeAssignment::Mismatch => {
-                    return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
-                        types: crate::schema::MismatchTypeNames::for_types(expected, source),
-                        declared: (inferred
-                            && self.authoritative.is_declared_composition_attribute())
+                return Err(RefTypeAssignabilityError::Mismatch(RefTypeMismatch {
+                    types: crate::schema::MismatchTypeNames::for_types(expected, evidence),
+                    declared: self
+                        .authoritative
+                        .is_declared_composition_attribute()
                         .then(|| authoritative.resolved_type_name()),
-                    }));
-                }
-                LoadedTypeAssignment::NeedsLocal(obligation) => {
-                    local = Some(match local {
-                        Some(previous) => previous.merge(obligation),
-                        None => obligation,
-                    });
-                }
+                }));
             }
         }
-        Ok(match local {
-            Some(obligation) => AdmittedTypeAssignment::NeedsLocal(obligation),
-            None => AdmittedTypeAssignment::Assignable,
-        })
+        Ok(())
     }
 }
 
@@ -1108,14 +1085,14 @@ impl<'a, B: BindingAddress> BindingIndex<'a, B> {
         &self,
         source: TypeInSchema<'_, crate::schema::Compiled>,
         sink: crate::schema::AssignmentSink<'_, crate::schema::Compiled>,
-    ) -> Result<crate::schema::LoadedTypeAssignment, crate::parser::CustomTypeValidationError> {
+    ) -> Result<bool, crate::parser::CustomTypeValidationError> {
         self.consume_type_assignment(source.assignment_to(sink))
     }
 
     pub(crate) fn consume_type_assignment(
         &self,
         assignment: crate::schema::TypeAssignability<'_>,
-    ) -> Result<crate::schema::LoadedTypeAssignment, crate::parser::CustomTypeValidationError> {
+    ) -> Result<bool, crate::parser::CustomTypeValidationError> {
         if self.provider_context.custom_types_loaded() {
             assignment.require_loaded()
         } else {
@@ -3440,51 +3417,6 @@ mod tests {
 
     use crate::schema::{PatternAttributeSchema, PatternAttributeType, PatternResourceSchema};
     #[test]
-    fn round14_binding_index_preserves_pending_destination_members() {
-        use crate::schema::{CompiledAttributeType, StringIdentityLayer, StringMemberConstraints};
-        let parsed = crate::parser::ParsedFile::default();
-        let schemas = SchemaRegistry::new();
-        let context = crate::parser::LoadedProviderContext::empty_for_test();
-        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &context);
-        let id = TypeIdentity::from_dotted("aws.Name");
-        let source = CompiledAttributeType::refined_string(
-            Some(id.clone()),
-            None,
-            Some((Some(1), Some(100))),
-            None,
-        );
-        let target = CompiledAttributeType::string_member(
-            StringIdentityLayer::new(Some(id), None, None, None),
-            StringMemberConstraints::new(None, Some((Some(1), Some(10)))),
-        );
-        let outcome = bindings
-            .check_type_assignment(
-                TypeInSchema::schemaless(&source),
-                TypeInSchema::schemaless(&target).with_authority(
-                    &context.custom_types,
-                    crate::schema::SinkAuthority::Owner(&TEST_OWNER),
-                ),
-            )
-            .unwrap();
-        let crate::schema::LoadedTypeAssignment::NeedsLocal(obligation) = outcome else {
-            panic!("the index must preserve a member obligation")
-        };
-        for length in [5, 50] {
-            let value: crate::resource::Value = crate::resource::Value::Concrete(
-                crate::resource::ConcreteValue::String("A".repeat(length).into()),
-            );
-            let result = obligation.check_or_defer(&value, crate::schema::FieldAncestry::WRITABLE);
-            assert_eq!(result.is_ok(), length == 5, "{result:?}");
-            if let Err(error) = result {
-                assert_eq!(
-                    error.to_string().matches("outside allowed range").count(),
-                    1
-                );
-            }
-        }
-    }
-
-    #[test]
     fn round11_declared_widening_checks_identity_bound_containment() {
         let context = crate::parser::ProviderContext::new(crate::EnvironmentSnapshot::empty());
         let parsed = crate::parser::ParsedFile::default();
@@ -3961,7 +3893,7 @@ mod tests {
                             crate::schema::SinkAuthority::Owner(&TEST_OWNER)
                         )
                     ),
-                    Ok(crate::schema::LoadedTypeAssignment::Assignable)
+                    Ok(true)
                 );
             },
         )

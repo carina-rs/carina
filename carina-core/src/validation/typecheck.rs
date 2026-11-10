@@ -673,20 +673,10 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
                         .knowledge(&crate::resource::knowledge::KnowledgeContext::validation())
                         .map(|proof| proof.into_classification())
                         .is_ok_and(|value| value.into_known().is_ok())
-                        && match inferred_type_assignment(expected, actual, &config.custom_types) {
-                            crate::schema::TypeAssignability::Mismatch => true,
-                            crate::schema::TypeAssignability::Assignable => false,
-                            crate::schema::TypeAssignability::Unchecked(missing) => {
-                                drop(missing);
-                                false
-                            }
-                            crate::schema::TypeAssignability::NeedsLocal(obligation) => {
-                                // The retained expression is already rejected; a pending local
-                                // check cannot overturn that rejection or claim a type mismatch.
-                                drop(obligation);
-                                false
-                            }
-                        } =>
+                        && matches!(
+                            inferred_type_assignment(expected, actual, &config.custom_types),
+                            crate::schema::TypeAssignability::Mismatch
+                        ) =>
                 {
                     inferred_value_check(expected, actual, value, config)
                 }
@@ -694,33 +684,6 @@ fn check_type_expr_value_inner_with_mode<'s, P: PlaceholderKind, B: BindingAddre
             }
         }
         Ok(admission) => {
-            let admission = match admission {
-                crate::parser::retained::ExpressionAdmission::LocalValueCheck {
-                    destination,
-                    provider,
-                } => {
-                    if let Err(error) =
-                        destination.check_or_defer(value, crate::schema::FieldAncestry::WRITABLE)
-                    {
-                        return Mismatch(validation_mismatch(expected, value, error.to_string()));
-                    }
-                    match provider {
-                        Some(missing) => {
-                            crate::parser::retained::ExpressionAdmission::ProviderPending(missing)
-                        }
-                        None => crate::parser::retained::ExpressionAdmission::ValueCheck,
-                    }
-                }
-                crate::parser::retained::ExpressionAdmission::ValueCheck => {
-                    crate::parser::retained::ExpressionAdmission::ValueCheck
-                }
-                crate::parser::retained::ExpressionAdmission::DeferredInterpolation => {
-                    crate::parser::retained::ExpressionAdmission::DeferredInterpolation
-                }
-                crate::parser::retained::ExpressionAdmission::ProviderPending(missing) => {
-                    crate::parser::retained::ExpressionAdmission::ProviderPending(missing)
-                }
-            };
             if matches!(
                 expression.static_type(),
                 Err(crate::static_type::InferenceIssue::NotInferable(
@@ -1106,51 +1069,13 @@ fn inferred_value_check<'s, P: PlaceholderKind, B: BindingAddress>(
     value: &Value<P, B>,
     config: &ProviderContext,
 ) -> TypeExprValueCheck<'s> {
-    consume_inferred_assignment(
-        inferred_type_assignment(expected, actual, &config.custom_types).into_owned(),
-        expected,
-        actual,
-        value,
-    )
-}
-
-fn consume_inferred_assignment<'s, P: PlaceholderKind, B: BindingAddress>(
-    assignment: crate::schema::TypeAssignability<'s>,
-    expected: &TypeExpr,
-    actual: &TypeExpr,
-    value: &Value<P, B>,
-) -> TypeExprValueCheck<'s> {
-    match assignment {
+    match inferred_type_assignment(expected, actual, &config.custom_types) {
         crate::schema::TypeAssignability::Assignable => TypeExprValueCheck::Assignable,
         crate::schema::TypeAssignability::Mismatch => {
             TypeExprValueCheck::Mismatch(TypeExprValueError::InferredTypeMismatch {
                 path: Vec::new(),
                 types: crate::schema::MismatchTypeNames::for_type_exprs(expected, actual),
             })
-        }
-        crate::schema::TypeAssignability::NeedsLocal(obligation) => {
-            let (destination, missing) = obligation.into_parts();
-            if let Err(error) =
-                destination.check_or_defer(value, crate::schema::FieldAncestry::WRITABLE)
-            {
-                return TypeExprValueCheck::Mismatch(validation_mismatch(
-                    expected,
-                    value,
-                    error.to_string(),
-                ));
-            }
-            match missing {
-                None => TypeExprValueCheck::Assignable,
-                Some(evidence) => TypeExprValueCheck::Deferred(TypeExprValueDeferral {
-                    path: Vec::new(),
-                    expected: Box::new(expected.clone()),
-                    actual: Box::new(ValueDescription::of(value)),
-                    reason: crate::parser::CustomTypeValidationError::ProvidersNotLoaded,
-                    provider_types: evidence.into_types().collect(),
-                    additional: Vec::new(),
-                    brand: std::marker::PhantomData,
-                }),
-            }
         }
         crate::schema::TypeAssignability::Unchecked(evidence) => {
             TypeExprValueCheck::Deferred(TypeExprValueDeferral {
@@ -1280,9 +1205,6 @@ pub(crate) fn inferred_type_assignment<'s>(
                 crate::schema::TypeAssignability::Mismatch => {
                     crate::schema::TypeAssignability::Mismatch
                 }
-                crate::schema::TypeAssignability::NeedsLocal(obligation) => {
-                    crate::schema::TypeAssignability::NeedsLocal(obligation).into_owned()
-                }
                 crate::schema::TypeAssignability::Unchecked(evidence) => {
                     let mut types = evidence.into_types();
                     let first = types
@@ -1308,11 +1230,6 @@ fn inferred_type_fits(expected: &TypeExpr, actual: &TypeExpr) -> bool {
         crate::schema::assignment_catalog_without_edges_for_test(),
     )
     .require_loaded()
-    .map(|assignment| {
-        assignment
-            .require_proven()
-            .expect("test expects a static assignment proof")
-    })
     .unwrap_or(false)
 }
 
@@ -1361,42 +1278,6 @@ mod tests {
             expression,
         )
         .require_provider_schemas()
-    }
-
-    #[test]
-    fn round14_inferred_assignment_consumer_checks_its_pending_destination() {
-        use crate::schema::{
-            CompiledAttributeType as Ty, SinkAuthority, StringIdentityLayer,
-            StringMemberConstraints, TypeInSchema,
-        };
-        let id = TypeIdentity::from_dotted("aws.Name");
-        let source = Ty::refined_string(Some(id.clone()), None, Some((Some(1), Some(100))), None);
-        let target = Ty::string_member(
-            StringIdentityLayer::new(Some(id), None, Some((Some(1), Some(100))), None),
-            StringMemberConstraints::new(None, Some((Some(1), Some(10)))),
-        );
-        let ty = TypeExpr::SchemaType {
-            owned: crate::parser::ResolvedSchemaType::from_schema_declaration("test", &source)
-                .unwrap(),
-        };
-        let catalog = crate::parser::ProviderCustomTypes::default();
-        let owner = crate::parser::SchemaTypeOwner::Provider("test".into());
-        for length in [5, 50] {
-            let pending = TypeInSchema::schemaless(&source).assignment_to(
-                TypeInSchema::schemaless(&target)
-                    .with_authority(&catalog, SinkAuthority::Owner(&owner)),
-            );
-            let value = Value::Concrete(ConcreteValue::String("A".repeat(length).into()));
-            let result =
-                consume_inferred_assignment(pending, &ty, &ty, &value).require_provider_schemas();
-            assert_eq!(result.is_ok(), length == 5, "{result:?}");
-            if let Err(error) = result {
-                assert_eq!(
-                    error.to_string().matches("outside allowed range").count(),
-                    1
-                );
-            }
-        }
     }
 
     #[test]

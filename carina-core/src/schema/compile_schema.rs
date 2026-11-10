@@ -19,7 +19,8 @@ impl PatternAttributeType<Draft> {
         location: SchemaValidationIssueLocation,
         issues: &mut Vec<SchemaDefinitionIssue>,
     ) -> Option<CompiledAttributeType> {
-        if self.has_empty_refinement_bounds() {
+        let empty_bounds = self.has_empty_refinement_bounds();
+        if empty_bounds {
             push_schema_issue(
                 issues,
                 &location,
@@ -28,7 +29,6 @@ impl PatternAttributeType<Draft> {
                     self.type_name()
                 ),
             );
-            return None;
         }
         let kind = match self.kind {
             AttrTypeKind::UnloadedSchemaType(unloaded) => {
@@ -170,7 +170,7 @@ impl PatternAttributeType<Draft> {
             }
             AttrTypeKind::Ref(name) => AttrTypeKind::Ref(name),
         };
-        Some(PatternAttributeType { kind })
+        (!empty_bounds).then_some(PatternAttributeType { kind })
     }
 }
 

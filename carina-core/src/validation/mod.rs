@@ -908,66 +908,6 @@ impl BindingUseReport {
     }
 }
 
-fn check_loaded_assignment_value<P: PlaceholderKind, B: BindingAddress>(
-    assignment: crate::schema::LoadedTypeAssignment,
-    value: &GenericValue<P, B>,
-    ancestry: FieldAncestry,
-) -> Result<bool, TypeError> {
-    match assignment {
-        crate::schema::LoadedTypeAssignment::Assignable => Ok(true),
-        crate::schema::LoadedTypeAssignment::Mismatch => Ok(false),
-        crate::schema::LoadedTypeAssignment::NeedsLocal(obligation) => {
-            obligation.check_or_defer(value, ancestry)?;
-            Ok(true) // A value check, including ordinary pending-value deferral, has run.
-        }
-    }
-}
-
-fn reference_assignment_value<B: BindingAddress>(
-    reference: ReferencePathRef<'_, B>,
-) -> Result<GenericValue<ParserPlaceholder, B>, TypeError> {
-    use crate::resource::{AccessMissPolicy, DeferredValue};
-    match reference {
-        ReferencePathRef::Access(path) => Ok(GenericValue::Deferred(DeferredValue::ResourceRef {
-            path: path.clone(),
-        })),
-        ReferencePathRef::Binding(binding) => {
-            Ok(GenericValue::Deferred(DeferredValue::BindingRef {
-                binding: binding.clone(),
-            }))
-        }
-        ReferencePathRef::BindingAccess { binding, segments } => {
-            let mut value = GenericValue::Deferred(DeferredValue::BindingRef {
-                binding: binding.clone(),
-            });
-            for segment in segments {
-                value = crate::resource::apply_postfix_access(
-                    value,
-                    segment.clone(),
-                    0,
-                    AccessMissPolicy::Error,
-                )
-                .map_err(|error| TypeError::ValidationFailed {
-                    message: error.to_string().into(),
-                })?;
-            }
-            Ok(value)
-        }
-    }
-}
-
-fn ref_sink_ancestry(sink: RefSink<'_>) -> FieldAncestry {
-    match sink {
-        RefSink::EffectiveType {
-            ancestry,
-            attr_type: _,
-            defs: _,
-            owner: _,
-        } => ancestry,
-        RefSink::TypeExpr(_) | RefSink::Interpolation => FieldAncestry::WRITABLE,
-    }
-}
-
 fn binding_value_assignable_to_enum<B: BindingAddress>(
     value: &GenericValue<ParserPlaceholder, B>,
     declared_type: Option<&TypeExpr>,
@@ -994,7 +934,7 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
                 crate::schema::SinkAuthority::Owner(target.owner),
             );
         let assignment = crate::schema::TypeInSchema::schemaless(source).assignment_to(sink);
-        let assignment = if config.custom_types_loaded() {
+        if config.custom_types_loaded() {
             assignment
                 .require_loaded()
                 .map_err(|error| BindingResolutionError::CustomType(Box::new(error)))
@@ -1005,9 +945,7 @@ fn binding_value_assignable_to_enum<B: BindingAddress>(
                     .require_loaded()
                     .map_err(|error| BindingResolutionError::CustomType(Box::new(error))),
             }
-        }?;
-        check_loaded_assignment_value(assignment, value, FieldAncestry::WRITABLE)
-            .map_err(BindingResolutionError::Type)
+        }
     };
     if let Some(declared_type) = declared_type {
         let resolved = resolve_type_expr(declared_type, config)
@@ -1219,10 +1157,20 @@ fn declared_value_assignable_to_sink<B: BindingAddress>(
                 .map_err(|error| BindingResolutionError::CustomType(Box::new(error)))?,
         }
     };
-    if check_loaded_assignment_value(assignable, value, ref_sink_ancestry(sink))
-        .map_err(BindingResolutionError::Type)?
-    {
-        return Ok(());
+    if assignable {
+        // Declaration compatibility does not validate a written value. The
+        // destination owns this check, using its complete original declaration.
+        let ancestry = match sink {
+            RefSink::EffectiveType { ancestry, .. } => ancestry,
+            RefSink::TypeExpr(_) | RefSink::Interpolation => FieldAncestry::WRITABLE,
+        };
+        return crate::schema::validate_attr_with_defs(
+            target.as_type(),
+            value,
+            target.defs(),
+            ancestry,
+        )
+        .map_err(BindingResolutionError::Type);
     }
     // A declared source is still a reference mismatch. Retain its typed
     // identity so module-call diagnostics can own it and cover the resolver's
@@ -1266,14 +1214,6 @@ fn reference_value_mismatch<B: BindingAddress>(
                 ),
             };
             match checked {
-                crate::binding_index::DeclaredValueAssignment::NeedsLocal(obligation) => {
-                    reference_assignment_value(reference)
-                        .and_then(|value| {
-                            obligation.check_or_defer(&value, FieldAncestry::WRITABLE)
-                        })
-                        .err()
-                        .map(BindingResolutionError::Type)
-                }
                 crate::binding_index::DeclaredValueAssignment::Assignable
                 | crate::binding_index::DeclaredValueAssignment::IncomingBoundaryMismatch => None,
                 crate::binding_index::DeclaredValueAssignment::Rejected(
@@ -1400,9 +1340,6 @@ fn deferred_value_mismatch<B: BindingAddress>(
                         declared_constraint: false,
                     }))
                 }
-                DeferredAccessTypeError::LocalConstraint { error } => {
-                    BindingResolutionError::Type(*error)
-                }
                 DeferredAccessTypeError::InvalidAccess { error } => {
                     BindingResolutionError::DeferredAccess(Box::new(
                         DeferredAccessTypeError::InvalidAccess { error },
@@ -1520,30 +1457,7 @@ fn precheck_value_source<B: BindingAddress>(
         } else {
             error
         }),
-        Ok(crate::parser::retained::ExpressionAdmission::LocalValueCheck {
-            destination,
-            provider,
-        }) => {
-            let local = destination
-                .check_or_defer(value, ref_sink_ancestry(sink))
-                .err()
-                .map(BindingResolutionError::Type);
-            match provider {
-                Some(missing) => {
-                    drop(missing);
-                    diagnostic.or(local)
-                }
-                None => diagnostic.or(local),
-            }
-        }
-        Ok(
-            crate::parser::retained::ExpressionAdmission::ValueCheck
-            | crate::parser::retained::ExpressionAdmission::DeferredInterpolation,
-        ) => diagnostic,
-        Ok(crate::parser::retained::ExpressionAdmission::ProviderPending(missing)) => {
-            drop(missing);
-            diagnostic
-        }
+        Ok(_) => diagnostic,
     }
 }
 
@@ -2537,9 +2451,10 @@ enum ReferenceFindingLocation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReferenceFindingKind {
-    UnknownAttribute(ReferenceDiagnosticMessage),
+    UnknownAttribute(SecretDiagnosticError<RefTypeError>),
     UnknownBinding(ReferenceDiagnosticMessage),
     InvalidValue(ReferenceDiagnosticMessage),
+    SchemaUnavailable(SecretDiagnosticError<Box<crate::parser::CustomTypeValidationError>>),
     TypeMismatch {
         types: MismatchTypeNames,
         path: ReferenceDiagnosticMessage,
@@ -2561,9 +2476,9 @@ impl ReferenceFinding {
             ReferenceFindingKind::UnknownAttribute(_) | ReferenceFindingKind::UnknownBinding(_) => {
                 true
             }
-            ReferenceFindingKind::InvalidValue(_) | ReferenceFindingKind::TypeMismatch { .. } => {
-                false
-            }
+            ReferenceFindingKind::InvalidValue(_)
+            | ReferenceFindingKind::SchemaUnavailable(_)
+            | ReferenceFindingKind::TypeMismatch { .. } => false,
         }
     }
 
@@ -2586,6 +2501,9 @@ impl InsideSecret for ReferenceFinding {
             }
             ReferenceFindingKind::InvalidValue(message) => {
                 ReferenceFindingKind::InvalidValue(message.inside_secret())
+            }
+            ReferenceFindingKind::SchemaUnavailable(error) => {
+                ReferenceFindingKind::SchemaUnavailable(error.inside_secret())
             }
             ReferenceFindingKind::TypeMismatch {
                 types,
@@ -2615,6 +2533,7 @@ impl std::fmt::Display for ReferenceFinding {
                     UnknownAttribute(SecretDiagnosticError::InsideSecret)
                         | UnknownBinding(SecretDiagnosticError::InsideSecret)
                         | InvalidValue(SecretDiagnosticError::InsideSecret)
+                        | SchemaUnavailable(SecretDiagnosticError::InsideSecret)
                 ) {
                     write!(f, "attribute '{attribute}': ")?;
                 }
@@ -2629,9 +2548,9 @@ impl std::fmt::Display for ReferenceFinding {
             UnknownBinding(message @ SecretDiagnosticError::InsideSecret) => {
                 write!(f, "unknown binding: {message}")
             }
-            UnknownAttribute(message) | UnknownBinding(message) | InvalidValue(message) => {
-                message.fmt(f)
-            }
+            UnknownAttribute(error) => error.fmt(f),
+            UnknownBinding(message) | InvalidValue(message) => message.fmt(f),
+            SchemaUnavailable(error) => error.fmt(f),
             TypeMismatch {
                 types,
                 path,
@@ -2773,11 +2692,8 @@ fn visit_computed_accesses_with_sink<'a, B: BindingAddress, E: InsideSecret>(
 /// A statically-known postfix access error shared by CLI validation and LSP
 /// diagnostics. Keeping the inference/error selection here prevents editor
 /// callers from silently treating a new inference error variant as success.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeferredAccessTypeError {
-    LocalConstraint {
-        error: Box<TypeError>,
-    },
     InvalidAccess {
         error: inference::InferenceError,
     },
@@ -2787,13 +2703,9 @@ pub enum DeferredAccessTypeError {
     },
 }
 
-// TypeError contains reflexive diagnostic metadata, as in AdmissionFindings.
-impl Eq for DeferredAccessTypeError {}
-
 impl std::fmt::Display for DeferredAccessTypeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::LocalConstraint { error } => error.fmt(f),
             Self::InvalidAccess { error } => error.fmt(f),
             Self::TypeMismatch { types, origin } => write!(f, "Type mismatch: {types} ({origin})"),
         }
@@ -2803,9 +2715,6 @@ impl std::fmt::Display for DeferredAccessTypeError {
 impl InsideSecret for DeferredAccessTypeError {
     fn inside_secret(self) -> Self {
         match self {
-            Self::LocalConstraint { error } => Self::LocalConstraint {
-                error: Box::new((*error).inside_secret()),
-            },
             Self::InvalidAccess { error } => Self::InvalidAccess {
                 error: error.inside_secret(),
             },
@@ -2827,9 +2736,7 @@ impl DeferredAccessTypeError {
                 error:
                     inference::InferenceError::InvalidIntegerArithmeticOperand { operator_span, .. },
             } => Some(operator_span.clone()),
-            Self::InvalidAccess { .. }
-            | Self::TypeMismatch { .. }
-            | Self::LocalConstraint { .. } => None,
+            Self::InvalidAccess { .. } | Self::TypeMismatch { .. } => None,
         }
     }
 }
@@ -2894,11 +2801,7 @@ pub fn check_deferred_access_type<B: BindingAddress>(
     if let GenericValue::Deferred(crate::resource::DeferredValue::ResourceRef { path }) = value {
         return match binding_index.postfix_ref_type(path) {
             RefType::Typed(source) => match source.is_assignable_to_sink(expected, binding_index) {
-                Ok(proof) => proof
-                    .check_or_defer(value, FieldAncestry::WRITABLE)
-                    .map_err(|error| DeferredAccessTypeError::LocalConstraint {
-                        error: Box::new(error),
-                    }),
+                Ok(()) => Ok(()),
                 Err(RefTypeAssignabilityError::Unchecked(reason)) => {
                     Err(unchecked_assignment_error(reason))
                 }
@@ -3014,16 +2917,10 @@ fn check_inferred_assignment<P: PlaceholderKind, B: BindingAddress>(
         return Ok(());
     };
     let actual = crate::schema::TypeInSchema::schemaless(&actual);
-    if check_loaded_assignment_value(
-        binding_index
-            .check_type_assignment(actual, expected)
-            .map_err(unchecked_assignment_error)?,
-        value,
-        FieldAncestry::WRITABLE,
-    )
-    .map_err(|error| DeferredAccessTypeError::LocalConstraint {
-        error: Box::new(error),
-    })? {
+    if binding_index
+        .check_type_assignment(actual, expected)
+        .map_err(unchecked_assignment_error)?
+    {
         return Ok(());
     }
     Err(DeferredAccessTypeError::TypeMismatch {
@@ -3135,13 +3032,6 @@ fn prove_integer_operand<B: BindingAddress>(
                     mismatch.actual_type_name().to_string(),
                 ),
                 RefTypeAssignabilityError::Unchecked(reason) => unchecked_assignment_error(reason),
-            })
-            .and_then(|proof| {
-                proof
-                    .check_or_defer(value, FieldAncestry::WRITABLE)
-                    .map_err(|error| DeferredAccessTypeError::LocalConstraint {
-                        error: Box::new(error),
-                    })
             });
     }
 
@@ -3213,19 +3103,13 @@ fn check_integer_result_sink<B: BindingAddress>(
             let Some(expected) = lift_type_expr(&resolved) else {
                 return Ok(());
             };
-            if check_loaded_assignment_value(
-                binding_index
-                    .check_type_assignment(
-                        actual,
-                        expected.assignment_sink(&binding_index.provider_context().custom_types),
-                    )
-                    .map_err(unchecked_assignment_error)?,
-                value,
-                FieldAncestry::WRITABLE,
-            )
-            .map_err(|error| DeferredAccessTypeError::LocalConstraint {
-                error: Box::new(error),
-            })? {
+            if binding_index
+                .check_type_assignment(
+                    actual,
+                    expected.assignment_sink(&binding_index.provider_context().custom_types),
+                )
+                .map_err(unchecked_assignment_error)?
+            {
                 return Ok(());
             }
             return Err(DeferredAccessTypeError::TypeMismatch {
@@ -3241,16 +3125,10 @@ fn check_integer_result_sink<B: BindingAddress>(
         // intrinsic Int contract is sufficient.
         Some(RefSink::Interpolation) | None => return Ok(()),
     };
-    if check_loaded_assignment_value(
-        binding_index
-            .check_type_assignment(actual, expected)
-            .map_err(unchecked_assignment_error)?,
-        value,
-        FieldAncestry::WRITABLE,
-    )
-    .map_err(|error| DeferredAccessTypeError::LocalConstraint {
-        error: Box::new(error),
-    })? {
+    if binding_index
+        .check_type_assignment(actual, expected)
+        .map_err(unchecked_assignment_error)?
+    {
         Ok(())
     } else {
         Err(DeferredAccessTypeError::TypeMismatch {
@@ -3544,7 +3422,7 @@ fn check_resource_reference<B: BindingAddress>(
         }
         RefType::UnknownAttribute(error) => {
             return Some(finding(ReferenceFindingKind::UnknownAttribute(
-                SecretDiagnosticError::Public(error.to_string()),
+                SecretDiagnosticError::Public(error),
             )));
         }
     };
@@ -3581,19 +3459,6 @@ fn check_resource_reference<B: BindingAddress>(
         ),
     };
     match checked {
-        crate::binding_index::DeclaredValueAssignment::NeedsLocal(obligation) => {
-            let ancestry = sink
-                .map(ref_sink_ancestry)
-                .unwrap_or(FieldAncestry::WRITABLE);
-            reference_assignment_value(reference)
-                .and_then(|value| obligation.check_or_defer(&value, ancestry))
-                .err()
-                .map(|error| {
-                    finding(ReferenceFindingKind::InvalidValue(
-                        SecretDiagnosticError::Public(error.to_string()),
-                    ))
-                })
-        }
         crate::binding_index::DeclaredValueAssignment::Assignable
         | crate::binding_index::DeclaredValueAssignment::IncomingBoundaryMismatch => None,
         crate::binding_index::DeclaredValueAssignment::Rejected(
@@ -3607,8 +3472,8 @@ fn check_resource_reference<B: BindingAddress>(
         })),
         crate::binding_index::DeclaredValueAssignment::Rejected(
             RefTypeAssignabilityError::Unchecked(reason),
-        ) => Some(finding(ReferenceFindingKind::InvalidValue(
-            SecretDiagnosticError::Public(reason.to_string()),
+        ) => Some(finding(ReferenceFindingKind::SchemaUnavailable(
+            SecretDiagnosticError::Public(reason),
         ))),
     }
 }
@@ -4193,16 +4058,10 @@ fn composition_ref_error_kind<B: BindingAddress>(
             };
             let sink = lift_type_expr(&declared)?;
             let sink_type = sink.assignment_sink(&bindings.provider_context().custom_types);
-            match source.is_assignable_to_sink(sink_type, bindings) {
-                Ok(proof) => match reference_assignment_value(path)
-                    .and_then(|value| proof.check_or_defer(&value, FieldAncestry::WRITABLE))
-                {
-                    Ok(()) => None,
-                    Err(error) => Some(ModuleCallRefErrorKind::ProviderSchemaUnavailable {
-                        reason: error.to_string(),
-                    }),
-                },
-                Err(error) => Some(match error {
+            source
+                .is_assignable_to_sink(sink_type, bindings)
+                .err()
+                .map(|error| match error {
                     RefTypeAssignabilityError::Mismatch(mismatch) => {
                         ModuleCallRefErrorKind::TypeMismatch {
                             types: mismatch.type_names().clone(),
@@ -4214,8 +4073,7 @@ fn composition_ref_error_kind<B: BindingAddress>(
                             reason: reason.to_string(),
                         }
                     }
-                }),
-            }
+                })
         }
         RefType::UnknownAttribute(error) if suppress_coalesce_existence_error(&error, usage) => {
             None
@@ -4382,16 +4240,7 @@ mod user_function_refs {
         let assignable = bindings
             .check_type_assignment(source, sink)
             .map_err(|error| error.to_string())?;
-        match assignable {
-            crate::schema::LoadedTypeAssignment::Assignable => Ok(None),
-            crate::schema::LoadedTypeAssignment::Mismatch => {
-                Ok(Some(MismatchTypeNames::for_types(*sink, source)))
-            }
-            crate::schema::LoadedTypeAssignment::NeedsLocal(obligation) => Err(format!(
-                "resolved return value requires validation against {}",
-                obligation.destination_name()
-            )),
-        }
+        Ok((!assignable).then(|| MismatchTypeNames::for_types(*sink, source)))
     }
 
     fn list_sink(type_expr: &TypeExpr) -> Option<&TypeExpr> {
@@ -6241,20 +6090,11 @@ fn check_attribute_param_ref<B: BindingAddress>(
             };
             let sink_type = sink.assignment_sink(&bindings.provider_context().custom_types);
             let mismatch = match source.is_assignable_to_sink(sink_type, bindings) {
-                Ok(proof) => {
-                    if let Err(error) = reference_assignment_value(path)
-                        .and_then(|value| proof.check_or_defer(&value, FieldAncestry::WRITABLE))
-                    {
-                        errors.push(finding(ReferenceFindingKind::InvalidValue(
-                            SecretDiagnosticError::Public(error.to_string()),
-                        )));
-                    }
-                    return;
-                }
+                Ok(()) => return,
                 Err(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
                 Err(RefTypeAssignabilityError::Unchecked(reason)) => {
-                    errors.push(finding(ReferenceFindingKind::InvalidValue(
-                        SecretDiagnosticError::Public(reason.to_string()),
+                    errors.push(finding(ReferenceFindingKind::SchemaUnavailable(
+                        SecretDiagnosticError::Public(reason),
                     )));
                     return;
                 }
@@ -6273,7 +6113,7 @@ fn check_attribute_param_ref<B: BindingAddress>(
             if matches!(unknown_policy, UnknownReferencePolicy::Report) =>
         {
             errors.push(finding(ReferenceFindingKind::UnknownAttribute(
-                SecretDiagnosticError::Public(error.to_string()),
+                SecretDiagnosticError::Public(error),
             )));
         }
         RefType::UnknownAttribute(_) | RefType::Unchecked | RefType::UnknownBinding { .. } => {}
@@ -6539,20 +6379,11 @@ fn check_export_ref<B: BindingAddress>(
             };
             let sink_type = sink.assignment_sink(&bindings.provider_context().custom_types);
             let mismatch = match source.is_assignable_to_sink(sink_type, bindings) {
-                Ok(proof) => {
-                    if let Err(error) = reference_assignment_value(path)
-                        .and_then(|value| proof.check_or_defer(&value, FieldAncestry::WRITABLE))
-                    {
-                        errors.push(finding(ReferenceFindingKind::InvalidValue(
-                            SecretDiagnosticError::Public(error.to_string()),
-                        )));
-                    }
-                    return;
-                }
+                Ok(()) => return,
                 Err(RefTypeAssignabilityError::Mismatch(mismatch)) => mismatch,
                 Err(RefTypeAssignabilityError::Unchecked(reason)) => {
-                    errors.push(finding(ReferenceFindingKind::InvalidValue(
-                        SecretDiagnosticError::Public(reason.to_string()),
+                    errors.push(finding(ReferenceFindingKind::SchemaUnavailable(
+                        SecretDiagnosticError::Public(reason),
                     )));
                     return;
                 }
@@ -6571,7 +6402,7 @@ fn check_export_ref<B: BindingAddress>(
             if matches!(unknown_policy, UnknownReferencePolicy::Report) =>
         {
             errors.push(finding(ReferenceFindingKind::UnknownAttribute(
-                SecretDiagnosticError::Public(error.to_string()),
+                SecretDiagnosticError::Public(error),
             )));
         }
         RefType::UnknownAttribute(_) | RefType::Unchecked | RefType::UnknownBinding { .. } => {}
@@ -10563,3 +10394,64 @@ mod tests;
 
 #[cfg(test)]
 mod secret_tests;
+
+#[cfg(test)]
+mod review15_error_tests {
+    use super::*;
+
+    #[test]
+    fn round15_resource_reference_preserves_the_typed_schema_failure() {
+        let config = ProviderContext::new(crate::EnvironmentSnapshot::empty());
+        let parsed = crate::parser::parse("let source = test.Source {}\n", &config).unwrap();
+        let mut schemas = SchemaRegistry::new();
+        schemas.insert(
+            "test",
+            crate::schema::ResourceSchema::new("Source")
+                .attribute(
+                    crate::schema::AttributeSchema::provider_populated(
+                        "name",
+                        crate::schema::AttributeType::refined_string(
+                            Some(TypeIdentity::from_dotted("test.SourceName")),
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
+                    .build(),
+                )
+                .validate()
+                .unwrap(),
+        );
+        let bindings = BindingIndex::from_parsed(&parsed, &schemas, &config);
+        let interpolation = lift_type_expr(&INTERPOLATION_REF_SINK).unwrap();
+        let context = ResourceReferenceContext {
+            location: ReferenceFindingLocation::Attribute("name".into()),
+            bindings: &bindings,
+            declared_source: None,
+            interpolation_sink: &interpolation,
+        };
+        let sink = AttributeType::refined_string(
+            Some(TypeIdentity::from_dotted("test.TargetName")),
+            None,
+            None,
+            None,
+        );
+        let owner = crate::parser::SchemaTypeOwner::Provider("test".into());
+        let reference = crate::resource::AuthoredAccessPath::new("source", "name");
+        let finding = check_resource_reference(
+            &context,
+            ReferencePathRef::Access(&reference),
+            Some(RefSink::EffectiveType {
+                attr_type: &sink,
+                defs: crate::schema::empty_defs_for_schema_walks(),
+                ancestry: FieldAncestry::WRITABLE,
+                owner: &owner,
+            }),
+            crate::resource::ResourceRefUsage::Required,
+        )
+        .expect("the unavailable schema must be reported");
+        assert!(
+            matches!(finding.kind, ReferenceFindingKind::SchemaUnavailable(SecretDiagnosticError::Public(error)) if matches!(*error, crate::parser::CustomTypeValidationError::ProvidersNotLoaded))
+        );
+    }
+}

@@ -620,7 +620,8 @@ A struct type represents a nested object with typed fields.
   is unchanged. Validate the identity pattern then bounds, member pattern then
   bounds, and finally the semantic callback; retain first-failure diagnostics.
   Never repeat structural checks in callbacks. Within one provider, every
-  occurrence of an identity must have the same identity-layer definition;
+  occurrence of a String/Int/Float identity must have the same identity-layer
+  definition (including Float ranges);
   aggregate admission rejects `ConflictingIdentityDeclarations`. Provider
   migrations must move resource-specific bounds into the member layer rather
   than redeclaring an identity with different constraints. Across different
@@ -675,12 +676,15 @@ A struct type represents a nested object with typed fields.
   to the local check; provably disjoint bounds reject statically. Different-identity
   widening requires source identity bounds to be contained by destination identity
   bounds. Strict declaration compatibility retains main's containment checks.
-  Member constraints yield `Assignable` only when source identity evidence proves
-  containment; otherwise `NeedsLocal` carries the admitted destination check.
-  Proven disjointness yields `Mismatch`. Loading or recording unavailable schemas
-  preserves local obligations. Consumers exhaustively choose an existing resolved
-  value check, explicit deferral, or diagnostic; a boolean type check cannot erase
-  `NeedsLocal`. Completion may offer such candidates with a pending-check label.
+  Declaration compatibility admits types; only value admission grants placement.
+  `NeedsLocal` exists only in the admission-facing reference relation, requiring
+  a `ReferenceCandidate`; it cannot convert back into general type compatibility.
+  Admission consumes it by registering the existing `LocalPath` on the destination
+  contract. `PendingAdmission::discharge` re-enters `admit_apply`, checking the
+  resolved value against that destination's complete declaration and both layers.
+  Known binding values also enter the destination's ordinary value validator after
+  declaration compatibility. Member String failures keep their structured pattern/
+  length category and label the slot's member constraint; identity failures run first.
   Int-to-Float widening uses identity-bound
   containment too. Float retains main's strict range containment and same-identity
   reference deferral; Enum/unloaded reference leaves retain that deferral too.

@@ -980,6 +980,9 @@ impl PartialEq for CustomTypeValidationError {
     }
 }
 
+// All variants compare reflexive, immutable diagnostic metadata.
+impl Eq for CustomTypeValidationError {}
+
 impl CustomTypeValidationError {
     pub(crate) fn diagnostic_shape(&self) -> crate::schema::ValidationDiagnostic<'_> {
         use crate::provider_text::DiagnosticText;

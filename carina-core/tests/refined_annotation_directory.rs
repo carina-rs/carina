@@ -67,3 +67,38 @@ fn round14_declared_directory_binding_discharges_members_once() {
         }
     }
 }
+
+#[path = "support/refined_destinations.rs"]
+mod destinations;
+
+macro_rules! boundary_test {
+    ($name:ident, $boundary:ident) => {
+        #[test]
+        fn $name() {
+            let snapshot = fixture::snapshot();
+            let boundary = destinations::Boundary::$boundary;
+            for length in [None, Some(5), Some(50)] {
+                let result = destinations::check(boundary, &snapshot, length);
+                assert_eq!(
+                    result.is_ok(),
+                    length != Some(50),
+                    "{boundary:?} {length:?}: {result:?}"
+                );
+                if let Err(error) = result {
+                    assert_eq!(
+                        error.matches("outside allowed range").count(),
+                        1,
+                        "{boundary:?}: {error}"
+                    );
+                }
+            }
+        }
+    };
+}
+boundary_test!(round15_resource_attribute, Resource);
+boundary_test!(round15_let_forwarding, Let);
+boundary_test!(round15_export, Export);
+boundary_test!(round15_module_argument, ModuleArgument);
+boundary_test!(round15_function_parameter, FunctionParameter);
+boundary_test!(round15_function_return, FunctionReturn);
+boundary_test!(round15_attributes_block, Attributes);

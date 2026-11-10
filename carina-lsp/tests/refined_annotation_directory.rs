@@ -96,3 +96,59 @@ fn round14_member_obligation_has_validate_and_lsp_parity() {
         }
     }
 }
+
+#[path = "../../carina-core/tests/support/refined_destinations.rs"]
+mod destinations;
+
+fn boundary_parity(boundary: destinations::Boundary) {
+    let snapshot = Arc::new(fixture::snapshot());
+    let engine = DiagnosticEngine::new(Arc::clone(&snapshot), vec!["awscc".into()]);
+    for length in [None, Some(5), Some(50)] {
+        let applied = destinations::check(boundary, &snapshot, length);
+        assert_eq!(
+            applied.is_ok(),
+            length != Some(50),
+            "{boundary:?}: {applied:?}"
+        );
+        // The editor has no apply phase: known literals are its resolved-value oracle.
+        let dir = destinations::directory(boundary, length);
+        let path = dir.path().join("main.crn");
+        let doc = Document::new_with_path(
+            std::fs::read_to_string(&path).unwrap(),
+            path.clone(),
+            Arc::new(snapshot.provider_context().as_provider_context().clone()),
+        );
+        let diagnostics = engine.analyze(&doc, Some(&path));
+        let errors: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.severity == Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR))
+            .collect();
+        assert_eq!(
+            errors.len(),
+            usize::from(length == Some(50)),
+            "{boundary:?}, {length:?}: {errors:#?}"
+        );
+        if let Some(error) = errors.first() {
+            assert_eq!(
+                error.message.matches("outside allowed range").count(),
+                1,
+                "{error:?}"
+            );
+        }
+    }
+}
+macro_rules! boundary_test {
+    ($name:ident, $boundary:ident) => {
+        #[test]
+        fn $name() {
+            boundary_parity(destinations::Boundary::$boundary);
+        }
+    };
+}
+boundary_test!(round15_resource_attribute, Resource);
+boundary_test!(round15_let_forwarding, Let);
+boundary_test!(round15_export, Export);
+boundary_test!(round15_module_argument, ModuleArgument);
+boundary_test!(round15_function_parameter, FunctionParameter);
+boundary_test!(round15_function_return, FunctionReturn);
+boundary_test!(round15_attributes_block, Attributes);

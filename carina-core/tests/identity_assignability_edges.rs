@@ -94,15 +94,12 @@ static Q_OWNER: std::sync::LazyLock<SchemaTypeOwner> =
     std::sync::LazyLock::new(|| SchemaTypeOwner::Provider("q".into()));
 
 // Construct sinks through a registered resource owner, as production callers do.
-fn assignment_outcome(
+fn assignment(
     source: &AttributeType,
     sink: &AttributeType,
     catalog: &ProviderCustomTypes,
     owner: &SchemaTypeOwner,
-) -> Result<
-    carina_core::schema::LoadedTypeAssignment,
-    Box<carina_core::parser::CustomTypeValidationError>,
-> {
+) -> Result<bool, Box<carina_core::parser::CustomTypeValidationError>> {
     let SchemaTypeOwner::Provider(owner) = owner;
     let mut registry = carina_core::schema::SchemaRegistry::new();
     registry.insert(
@@ -128,19 +125,6 @@ fn assignment_outcome(
         .map_err(Box::new)
 }
 
-fn assignment(
-    source: &AttributeType,
-    sink: &AttributeType,
-    catalog: &ProviderCustomTypes,
-    owner: &SchemaTypeOwner,
-) -> Result<bool, Box<carina_core::parser::CustomTypeValidationError>> {
-    assignment_outcome(source, sink, catalog, owner).map(|outcome| {
-        outcome
-            .require_proven()
-            .expect("test expects a static assignment proof")
-    })
-}
-
 #[test]
 fn builtin_annotation_leaves_compare_without_provider_owner_evidence() {
     use carina_core::schema::CompiledAttributeType;
@@ -153,19 +137,13 @@ fn builtin_annotation_leaves_compare_without_provider_owner_evidence() {
     assert_eq!(
         TypeInSchema::schemaless(&custom)
             .assignment_to(sink.assignment_sink(&catalog))
-            .require_loaded()
-            .map(|assignment| assignment
-                .require_proven()
-                .expect("test expects a static assignment proof")),
+            .require_loaded(),
         Ok(false)
     );
     assert_eq!(
         TypeInSchema::schemaless(&sink)
             .assignment_to(sink.assignment_sink(&catalog))
-            .require_loaded()
-            .map(|assignment| assignment
-                .require_proven()
-                .expect("test expects a static assignment proof")),
+            .require_loaded(),
         Ok(true)
     );
     let mut schemas = carina_core::schema::SchemaRegistry::new();
@@ -183,10 +161,7 @@ fn builtin_annotation_leaves_compare_without_provider_owner_evidence() {
     assert!(matches!(
         TypeInSchema::schemaless(&custom)
             .assignment_to(schema.assignment_sink(&provider_sink, &catalog))
-            .require_loaded()
-            .map(|assignment| assignment
-                .require_proven()
-                .expect("test expects a static assignment proof")),
+            .require_loaded(),
         Err(carina_core::parser::CustomTypeValidationError::ProvidersNotLoaded),
     ));
 }
@@ -214,10 +189,7 @@ fn resource_and_data_source_sinks_retain_registered_typed_owners() {
                     .assignment_to(
                         schema.assignment_sink(sink, &loaded.provider_context().custom_types)
                     )
-                    .require_loaded()
-                    .map(|assignment| assignment
-                        .require_proven()
-                        .expect("test expects a static assignment proof")),
+                    .require_loaded(),
                 Ok(accepted)
             );
         }
@@ -310,10 +282,7 @@ fn identity_edges_require_every_annotation_owner() {
         assert_eq!(
             TypeInSchema::schemaless(source)
                 .assignment_to(sink.assignment_sink(catalog))
-                .require_loaded()
-                .map(|assignment| assignment
-                    .require_proven()
-                    .expect("test expects a static assignment proof")),
+                .require_loaded(),
             Ok(q_edges)
         );
     }
@@ -332,28 +301,28 @@ fn identity_edges_defer_member_containment_but_reject_disjointness() {
         carina_core::schema::StringIdentityLayer::new(Some(identity("Name")), None, None, None),
         carina_core::schema::StringMemberConstraints::new(None, Some((Some(1), Some(10)))),
     );
-    assert!(matches!(
-        assignment_outcome(
+    assert_eq!(
+        assignment(
             &source,
             &sink,
             &loaded.provider_context().custom_types,
             &P_OWNER
         ),
-        Ok(carina_core::schema::LoadedTypeAssignment::NeedsLocal(_))
-    ));
+        Ok(true)
+    );
     let disjoint = AttributeType::string_member(
         carina_core::schema::StringIdentityLayer::new(Some(identity("NewName")), None, None, None),
         carina_core::schema::StringMemberConstraints::new(None, Some((Some(100), Some(128)))),
     );
-    assert!(matches!(
-        assignment_outcome(
+    assert_eq!(
+        assignment(
             &disjoint,
             &sink,
             &loaded.provider_context().custom_types,
             &P_OWNER
         ),
-        Ok(carina_core::schema::LoadedTypeAssignment::NeedsLocal(_))
-    ));
+        Ok(true)
+    );
     let identity_disjoint = AttributeType::refined_string(
         Some(identity("NewName")),
         None,
@@ -548,23 +517,4 @@ fn identity_edges_preserve_union_all_and_any_rules() {
         assignment(&string("NewName"), &sink, catalog, &P_OWNER),
         Ok(true)
     );
-}
-
-trait StaticAssignmentForTest<R: carina_core::schema::PatternForm> {
-    fn is_assignable_to(&self, sink: carina_core::schema::AssignmentSink<'_, R>) -> bool;
-}
-impl<R: carina_core::schema::PatternForm> StaticAssignmentForTest<R> for TypeInSchema<'_, R> {
-    fn is_assignable_to(&self, sink: carina_core::schema::AssignmentSink<'_, R>) -> bool {
-        match self.assignment_to(sink) {
-            carina_core::schema::TypeAssignability::Assignable => true,
-            carina_core::schema::TypeAssignability::Mismatch => false,
-            carina_core::schema::TypeAssignability::Unchecked(missing) => {
-                drop(missing);
-                false
-            }
-            carina_core::schema::TypeAssignability::NeedsLocal(obligation) => {
-                panic!("test must explicitly check its destination: {obligation:?}")
-            }
-        }
-    }
 }

@@ -41,7 +41,8 @@ A core Email identity with a member length is valid, while changing Email's
 identity definition remains a built-in collision.
 
 Provider migration requirement: within one provider's aggregate resource and
-configuration schemas, an identity has one reusable identity-layer definition.
+configuration schemas, a String/Int/Float identity has one reusable identity-layer
+definition, including its Float range.
 Different definitions fail with `ConflictingIdentityDeclarations`; move
 resource-specific restrictions into the member layer. Across different schema
 owners, such as AWS and AWSCC, annotations conjoin the owners' identity
@@ -97,12 +98,15 @@ Same-identity value admission, including admission with a declared source,
 defers overlapping identity bounds through `NeedsLocal`; provably disjoint bounds
 reject statically. Different-identity widening retains String length / Int range
 containment checks. Strict declaration compatibility retains main's containment
-checks. Destination member constraints yield `Assignable` only when the source's
-identity evidence proves containment. Otherwise `NeedsLocal` carries the admitted
-destination obligation; proven disjointness yields `Mismatch`. Loading schemas
-preserves this distinction. Every consumer must explicitly check the resolved
-value, defer that check through its existing admission path, or report the pending
-obligation. Completion can offer pending candidates with a value-check label.
+checks. General declaration compatibility is distinct from value admission.
+Only the admission-facing reference relation produces `NeedsLocal`; callers need
+reference evidence, and the result cannot convert to a general type-compatibility
+result. Admission registers its existing `LocalPath` under the actual destination
+contract. On resolution, `PendingAdmission::discharge` re-enters `admit_apply` and
+validates against the complete destination declaration, including both layers.
+Known binding values use that destination's ordinary value check too. String
+pattern/length errors retain their structured category and identify member failures
+as the slot's member constraint; identity failures still run first.
 Unproven pattern containment defers (#4349). Int-to-Float widening uses identity
 bound containment too. Float retains main's strict range containment and
 same-identity reference deferral, also retained for Enum/unloaded leaves. Annotated

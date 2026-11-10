@@ -88,7 +88,7 @@ impl StructuralTypeForCompletion<TypeExpr> {
     ) -> bool {
         match self {
             Self::Known(type_expr) => {
-                type_expr_source_is_completion_candidate(type_expr, target, schemas, provider_ctx)
+                type_expr_source_is_assignable_to(type_expr, target, schemas, provider_ctx)
             }
             Self::Unnameable(_type_expr) => true,
         }
@@ -144,7 +144,7 @@ impl<'a> UpstreamCompletionStaticType<'a> {
     ) -> bool {
         match self {
             Self::Known(type_expr) => {
-                type_expr_source_is_completion_candidate(type_expr, target, schemas, provider_ctx)
+                type_expr_source_is_assignable_to(type_expr, target, schemas, provider_ctx)
             }
             Self::DeclaredUnnameable(_reason) | Self::InferredUnnameable(_reason) => true,
             Self::NotInferable(_reason) => false,
@@ -215,39 +215,10 @@ impl<'a> UpstreamCompletionStaticType<'a> {
     }
 }
 
-#[derive(Debug)]
-enum CompletionConstraint {
-    Proven,
-    NeedsLocal(carina_core::schema::DestinationObligation),
-}
-impl CompletionConstraint {
-    fn detail_suffix(&self) -> String {
-        match self {
-            Self::Proven => String::new(),
-            Self::NeedsLocal(obligation) => format!(
-                "; requires resolved value check for {}",
-                obligation.destination_name()
-            ),
-        }
-    }
-}
-
-fn completion_constraint(
-    assignment: carina_core::schema::LoadedTypeAssignment,
-) -> Option<CompletionConstraint> {
-    match assignment {
-        carina_core::schema::LoadedTypeAssignment::Assignable => Some(CompletionConstraint::Proven),
-        carina_core::schema::LoadedTypeAssignment::Mismatch => None,
-        carina_core::schema::LoadedTypeAssignment::NeedsLocal(obligation) => {
-            Some(CompletionConstraint::NeedsLocal(obligation))
-        }
-    }
-}
-
 /// Resolve authored declarations with the available schema evidence, then
 /// exclude proven mismatches through the shared directional relation. Missing
 /// scalar evidence remains unchecked while nominal mismatches are decidable.
-fn type_expr_source_is_completion_candidate(
+fn type_expr_source_is_assignable_to(
     source: &TypeExpr,
     sink: AssignmentSink<'_, carina_core::schema::Compiled>,
     schemas: &SchemaRegistry,
@@ -268,19 +239,13 @@ fn type_expr_source_is_completion_candidate(
         return true;
     };
     let assignment = TypeInSchema::schemaless(&source).assignment_to(sink);
-    let candidate = if provider_ctx.catalog().custom_types_loaded() {
-        match assignment.require_loaded() {
-            Ok(loaded) => completion_constraint(loaded),
-            Err(missing) => {
-                drop(missing);
-                None
-            }
-        }
+    if provider_ctx.catalog().custom_types_loaded() {
+        // Completion has no diagnostic channel; missing loaded evidence must
+        // exclude the candidate rather than suggest an unproven assignment.
+        assignment.require_loaded().unwrap_or(false)
     } else {
-        completion_constraint(assignment.record_unchecked(provider_ctx))
-    };
-    // This is only an editor offer, never evidence of a proven assignment.
-    candidate.is_some()
+        assignment.record_unchecked(provider_ctx)
+    }
 }
 
 /// Context when the user has typed `binding_name.` after `=`.
@@ -594,28 +559,24 @@ impl CompletionProvider {
                         for binding_attr in
                             binding_schema.schema().as_schema().attributes().values()
                         {
-                            let constraint = binding_schema
+                            if binding_schema
                                 .schema()
                                 .as_schema()
                                 .type_in_schema(binding_attr.attr_type())
-                                .assignment_to(schema.assignment_sink(
+                                .is_assignable_to(schema.assignment_sink(
                                     attr_schema.attr_type(),
                                     &provider_ctx.catalog().custom_types,
                                 ))
-                                .require_loaded()
-                                .ok()
-                                .and_then(completion_constraint);
-                            if let Some(constraint) = constraint {
+                            {
                                 let full_ref = format!("{}.{}", binding_name, binding_attr.name());
                                 completions.push(CompletionItem {
                                     label: full_ref.clone(),
                                     kind: Some(CompletionItemKind::REFERENCE),
                                     detail: Some(format!(
-                                        "Reference to {}'s {} ({}){}",
+                                        "Reference to {}'s {} ({})",
                                         binding_name,
                                         binding_attr.name(),
-                                        target_name,
-                                        constraint.detail_suffix()
+                                        target_name
                                     )),
                                     text_edit: Some(
                                         tower_lsp::lsp_types::CompletionTextEdit::Edit(TextEdit {
@@ -732,7 +693,7 @@ impl CompletionProvider {
                     else {
                         return true;
                     };
-                    type_expr_source_is_completion_candidate(
+                    type_expr_source_is_assignable_to(
                         arg_type_expr,
                         assignment_sink.expect("a known attribute has an owner-bound sink"),
                         &self.schemas,
@@ -1952,12 +1913,7 @@ impl CompletionProvider {
             else {
                 continue;
             };
-            if type_expr_source_is_completion_candidate(
-                &declared,
-                target,
-                &self.schemas,
-                provider_ctx,
-            ) {
+            if type_expr_source_is_assignable_to(&declared, target, &self.schemas, provider_ctx) {
                 items.push(CompletionItem {
                     label: name.clone(),
                     kind: Some(CompletionItemKind::VARIABLE),
@@ -2048,24 +2004,18 @@ impl CompletionProvider {
             };
             for attr in schema.schema().as_schema().attributes().values() {
                 let source_type = schema.schema().as_schema().type_in_schema(attr.attr_type());
-                let Some(constraint) = source_type
-                    .assignment_to(target)
-                    .require_loaded()
-                    .ok()
-                    .and_then(completion_constraint)
-                else {
+                if !source_type.is_assignable_to(target) {
                     continue;
-                };
+                }
                 let full_ref = format!("{}.{}", binding_name, attr.name());
                 items.push(CompletionItem {
                     label: full_ref.clone(),
                     kind: Some(CompletionItemKind::REFERENCE),
                     detail: Some(format!(
-                        "Reference to {}'s {} ({}){}",
+                        "Reference to {}'s {} ({})",
                         binding_name,
                         attr.name(),
-                        source_type.resolved_type_name(),
-                        constraint.detail_suffix()
+                        source_type.resolved_type_name()
                     )),
                     insert_text: Some(full_ref),
                     ..Default::default()
@@ -2116,7 +2066,7 @@ impl CompletionProvider {
                 let Some(export_ty) = export.static_type.as_ref() else {
                     continue;
                 };
-                if !type_expr_source_is_completion_candidate(
+                if !type_expr_source_is_assignable_to(
                     export_ty,
                     target,
                     &self.schemas,
@@ -2848,75 +2798,6 @@ mod return_type_fits_tests {
     use super::*;
 
     #[test]
-    fn round14_completion_offers_pending_members_without_claiming_proof() {
-        use carina_core::schema::{
-            AttributeSchema, AttributeType as Draft, ResourceSchema, SchemaKind,
-            StringIdentityLayer, StringMemberConstraints,
-        };
-        let id = TypeIdentity::from_dotted("aws.Name");
-        let identity =
-            || StringIdentityLayer::new(Some(id.clone()), None, Some((Some(1), Some(100))), None);
-        let mut schemas = SchemaRegistry::new();
-        schemas.insert(
-            "test",
-            ResourceSchema::new("Source")
-                .attribute(
-                    AttributeSchema::provider_populated(
-                        "name",
-                        Draft::string_member(identity(), Default::default()),
-                    )
-                    .build(),
-                )
-                .validate()
-                .unwrap(),
-        );
-        schemas.insert(
-            "test",
-            ResourceSchema::new("Target")
-                .attribute(
-                    AttributeSchema::optional(
-                        "name",
-                        Draft::string_member(
-                            identity(),
-                            StringMemberConstraints::new(None, Some((Some(1), Some(10)))),
-                        ),
-                    )
-                    .build(),
-                )
-                .validate()
-                .unwrap(),
-        );
-        let provider = CompletionProvider::new(
-            std::sync::Arc::new(schemas),
-            vec!["test".into()],
-            vec![],
-            vec![],
-        );
-        let context = carina_core::parser::LoadedProviderContext::empty_for_test();
-        let target = provider
-            .schemas
-            .get("test", "Target", SchemaKind::Resource)
-            .unwrap();
-        let sink = target.assignment_sink(
-            target.as_schema().attributes()["name"].attr_type(),
-            &context.custom_types,
-        );
-        let items =
-            provider.resource_ref_completions_for_type(sink, "let source = test.Source {}\n", None);
-        let item = items
-            .iter()
-            .find(|item| item.label == "source.name")
-            .expect("pending members remain useful completion candidates");
-        assert!(
-            item.detail
-                .as_ref()
-                .unwrap()
-                .contains("requires resolved value check"),
-            "{item:?}"
-        );
-    }
-
-    #[test]
     fn member_refined_strings_offer_only_constructed_string_builtins() {
         use carina_core::schema::{
             CompiledPattern, PatternMatch, PatternSpec, StringIdentityLayer,
@@ -2996,7 +2877,7 @@ mod return_type_fits_tests {
                 &carina_core::parser::ProviderContext::new(
                     carina_core::EnvironmentSnapshot::empty()
                 ),
-                |session| type_expr_source_is_completion_candidate(
+                |session| type_expr_source_is_assignable_to(
                     &source,
                     nominal("KmsKeyArn").assignment_sink(&session.catalog().custom_types),
                     &schemas,
@@ -3011,7 +2892,7 @@ mod return_type_fits_tests {
                 &carina_core::parser::ProviderContext::new(
                     carina_core::EnvironmentSnapshot::empty()
                 ),
-                |session| type_expr_source_is_completion_candidate(
+                |session| type_expr_source_is_assignable_to(
                     &source,
                     nominal("Arn").assignment_sink(&session.catalog().custom_types),
                     &schemas,
@@ -3024,7 +2905,7 @@ mod return_type_fits_tests {
                 &carina_core::parser::ProviderContext::new(
                     carina_core::EnvironmentSnapshot::empty()
                 ),
-                |session| type_expr_source_is_completion_candidate(
+                |session| type_expr_source_is_assignable_to(
                     &source,
                     carina_core::validation::lift_type_expr(&TypeExpr::String)
                         .unwrap()
@@ -3039,7 +2920,7 @@ mod return_type_fits_tests {
                 &carina_core::parser::ProviderContext::new(
                     carina_core::EnvironmentSnapshot::empty()
                 ),
-                |session| type_expr_source_is_completion_candidate(
+                |session| type_expr_source_is_assignable_to(
                     &source,
                     nominal("PositiveInt").assignment_sink(&session.catalog().custom_types),
                     &schemas,
@@ -3052,7 +2933,7 @@ mod return_type_fits_tests {
                 &carina_core::parser::ProviderContext::new(
                     carina_core::EnvironmentSnapshot::empty()
                 ),
-                |session| type_expr_source_is_completion_candidate(
+                |session| type_expr_source_is_assignable_to(
                     &TypeExpr::String,
                     nominal("KmsKeyArn").assignment_sink(&session.catalog().custom_types),
                     &schemas,

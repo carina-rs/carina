@@ -1415,6 +1415,51 @@ impl DiagnosticRun<'_> {
                     );
                 }
             }
+            if let Some(inputs) = expanded_validation_inputs.as_ref() {
+                // A rejected call already owns the diagnostic. Do not add a
+                // downstream resource consequence of that same rejection.
+                let rejected_calls: Vec<_> = diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR))
+                    .map(|diagnostic| diagnostic.range)
+                    .collect();
+                let authored_ids: HashSet<_> = tree
+                    .project_resources()
+                    .map(|resource| resource.id().clone())
+                    .collect();
+                for resource in &inputs.configuration.file().resources {
+                    if authored_ids.contains(&resource.id) {
+                        continue;
+                    }
+                    let Some(carina_core::resource::ModuleSource::Module(origin)) =
+                        &resource.module_source
+                    else {
+                        continue;
+                    };
+                    let call = &origin.module_call_path().root().id;
+                    let Some(report) =
+                        inputs.resource_admissions(&resource.id, self.provider_context)
+                    else {
+                        continue;
+                    };
+                    for error in report.errors() {
+                        let finding = carina_core::parser::Located::new(
+                            call.declaration_location().clone(),
+                            error,
+                        );
+                        if let Some(diagnostic) = render_merged(
+                            doc,
+                            &finding,
+                            DiagnosticSeverity::ERROR,
+                            format!("{}: {}", resource.id, finding.detail()),
+                        ) && !rejected_calls.contains(&diagnostic.range)
+                            && !diagnostics.contains(&diagnostic)
+                        {
+                            diagnostics.push(diagnostic);
+                        }
+                    }
+                }
+            }
             // The document AST intentionally preserves function calls for
             // source-oriented checks. Build a parallel, same-order view with
             // locally resolvable calls evaluated so schema diagnostics see
@@ -1823,9 +1868,6 @@ impl DiagnosticRun<'_> {
                                             rref.attribute_key_location(attr_name),
                                             match error {
                                                 DeferredAccessTypeError::InvalidAccess {
-                                                    ..
-                                                }
-                                                | DeferredAccessTypeError::LocalConstraint {
                                                     ..
                                                 } => DiagnosticSeverity::ERROR,
                                                 DeferredAccessTypeError::TypeMismatch {

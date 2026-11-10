@@ -219,40 +219,25 @@ impl<'a> ScalarIdentityParts<'a> {
                     validate: _,
                 }),
             ) => left_identity == right_identity && left_range == right_range,
-            // Float keeps its existing owner-range conjunction policy.
             (
                 Self::Float {
                     identity: left,
-                    range: _,
-                    validate: _,
-                },
-                Self::Float {
-                    identity: right,
-                    range: _,
-                    validate: _,
-                },
-            ) => left == right,
-            _ => false,
-        }
-    }
-
-    /// Built-ins additionally require the canonical Float range.
-    pub(crate) fn same_definition(self, other: Self) -> bool {
-        match (self, other) {
-            (
-                Self::Float {
-                    identity: left_identity,
                     range: left_range,
                     validate: _,
                 },
                 Self::Float {
-                    identity: right_identity,
+                    identity: right,
                     range: right_range,
                     validate: _,
                 },
-            ) => left_identity == right_identity && left_range == right_range,
-            (left, right) => left.agrees_with(right),
+            ) => left == right && left_range == right_range,
+            _ => false,
         }
+    }
+
+    /// Built-in and aggregate admission compare the same identity metadata.
+    pub(crate) fn same_definition(self, other: Self) -> bool {
+        self.agrees_with(other)
     }
 }
 

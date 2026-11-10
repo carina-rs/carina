@@ -1861,9 +1861,7 @@ fn lift_unloaded_schema_nominals_preserves_identity_without_guessing_kind() {
             )
         );
         assert_eq!(
-            assignment.require_loaded().map(|assignment| assignment
-                .require_proven()
-                .expect("test expects a static assignment proof")),
+            assignment.require_loaded(),
             Err(crate::parser::CustomTypeValidationError::ProvidersNotLoaded)
         );
     }
