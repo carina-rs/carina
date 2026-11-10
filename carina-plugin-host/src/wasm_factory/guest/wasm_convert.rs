@@ -5459,7 +5459,13 @@ mod tests {
         )
         .expect_err("protocol 25 cannot carry required refinement layers");
         assert!(error.contains("protocol version 25"), "{error}");
-        assert!(error.contains("requires at least version 27"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "requires at least version {}",
+                carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION
+            )),
+            "{error}"
+        );
     }
 
     #[test]
@@ -5469,7 +5475,13 @@ mod tests {
         )
         .expect_err("protocol 26 cannot carry required refinement layers");
         assert!(error.contains("protocol version 26"), "{error}");
-        assert!(error.contains("requires at least version 27"), "{error}");
+        assert!(
+            error.contains(&format!(
+                "requires at least version {}",
+                carina_provider_protocol::MIN_SUPPORTED_PROTOCOL_VERSION
+            )),
+            "{error}"
+        );
     }
 
     #[test]
